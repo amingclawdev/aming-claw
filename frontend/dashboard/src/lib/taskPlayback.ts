@@ -326,7 +326,7 @@ export interface ContractRuntimeAuthorityViewModel {
   cache_identity: ContractRuntimeAuthorityCacheIdentity;
   contract_execution_progress: Omit<ContractRuntimeVisualizationResponse["contract_execution_progress"], "line_states"> & {
     current_action: ContractRuntimeVisualizationNextAction;
-    current_action_source: "contract_runtime_current" | "backlog_contract_chain_current" | "none";
+    current_action_source: string;
     display_status: ContractRuntimeAuthorityDisplayStatus;
     line_states: Array<ContractRuntimeVisualizationResponse["contract_execution_progress"]["line_states"][number] & {
       display_status: ContractRuntimeAuthorityDisplayStatus;
@@ -399,11 +399,15 @@ export function projectContractRuntimeAuthorityViewModel(
   const runtimeActionPresent = Object.keys(runtimeAction).length > 0;
   const chainActionPresent = Object.keys(chainAction).length > 0;
   const currentAction = runtimeActionPresent ? runtimeAction : chainActionPresent ? chainAction : {};
-  const currentActionSource = runtimeActionPresent
-    ? "contract_runtime_current"
+  const projectedActionSource = runtimeActionPresent
+    ? runtimeAction.source
     : chainActionPresent
-      ? "backlog_contract_chain_current"
-      : "none";
+      ? chainAction.source
+      : "";
+  const currentActionSource = runtimeActionPresent || chainActionPresent
+    ? safeText(projectedActionSource || response.authority.authority_decision_source)
+      || (runtimeActionPresent ? "contract_runtime_current" : "backlog_contract_chain_current")
+    : "none";
   const contractExecutionId = safeText(
     response.contract_execution_progress.contract_execution_id
       || response.contract_chain.current_contract_execution_id,

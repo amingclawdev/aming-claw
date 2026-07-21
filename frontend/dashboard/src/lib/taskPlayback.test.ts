@@ -1214,7 +1214,11 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
       contract_execution_id: "cex-current-1",
       execution_state_revision: 17,
       readiness_state: "contract_active",
-      next_legal_action: { id: "worker_implementation", action: "record implementation evidence" },
+      next_legal_action: {
+        id: "worker_implementation",
+        action: "record implementation evidence",
+        source: "backlog_contract_chain_current",
+      },
       line_states: [{
         id: "contract-line:cex-current-1:1:qa",
         contract_execution_id: "cex-current-1",
@@ -1276,7 +1280,11 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
 
   const view = projectContractRuntimeAuthorityViewModel(response);
   assertFixture(view.contract_execution_progress.current_action.id === "worker_implementation", "authority adapter should prefer ContractRuntime current action over historical/legacy candidates");
-  assertFixture(view.contract_execution_progress.current_action_source === "contract_runtime_current", "authority adapter should identify the current action authority source");
+  assertFixture(
+    view.contract_execution_progress.current_action_source === response.contract_execution_progress.next_legal_action?.source
+      && view.contract_execution_progress.current_action_source === response.authority.authority_decision_source,
+    "authority adapter should preserve the live/read-model current action source",
+  );
   assertFixture(view.cache_identity.backlog_id === response.backlog_id && view.cache_identity.contract_execution_id === "cex-current-1", "authority cache identity should include backlog and execution ids");
   assertFixture(view.cache_identity.execution_state_revision === 17 && view.cache_identity.event_id === "42", "authority cache identity should include revision and event id");
   assertFixture(view.cache_identity.key === "AC-FRONTEND-AUTHORITY-FIXTURE:cex-current-1:17:42", "authority cache key should contain all four canonical identity parts");
