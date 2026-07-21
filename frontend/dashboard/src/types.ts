@@ -880,6 +880,8 @@ export interface TaskTimelineResponse {
   trace_id?: string;
   events: TaskTimelineEvent[];
   count: number;
+  compact_ledger?: Record<string, unknown>;
+  compactLedger?: Record<string, unknown>;
   contract_runtime_visualization?: ContractRuntimeVisualizationResponse;
   request_id?: string;
 }

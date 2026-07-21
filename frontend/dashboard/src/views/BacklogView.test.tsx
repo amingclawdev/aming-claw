@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import type { BacklogBug } from "../types";
 
 const projectedCommandBug: BacklogBug = {
@@ -37,3 +39,27 @@ export function projectedCommandCardLabel(bug: BacklogBug = projectedCommandBug)
 }
 
 export const projectedCommandCardFixtureLabel = projectedCommandCardLabel();
+
+const backlogViewSource = readFileSync(new URL("./BacklogView.tsx", import.meta.url), "utf8");
+const playbackPanelSource = readFileSync(new URL("../components/TaskPlaybackPanel.tsx", import.meta.url), "utf8");
+
+function assertBacklogAuthority(condition: boolean, message: string): void {
+  if (!condition) throw new Error(`Backlog authority fixture failed: ${message}`);
+}
+
+assertBacklogAuthority(
+  backlogViewSource.includes("projectContractRuntimeAuthorityViewModel")
+    && backlogViewSource.includes("ContractRuntimeAuthorityPanel"),
+  "Backlog detail and Timeline DAG must consume the canonical three-axis authority view",
+);
+assertBacklogAuthority(
+  backlogViewSource.includes("Historical compact ledger (advisory)")
+    && backlogViewSource.includes("Historical ledger action (advisory)"),
+  "legacy compact-ledger actions must be labeled advisory when canonical authority is present",
+);
+assertBacklogAuthority(
+  playbackPanelSource.includes("Backlog row close authority")
+    && playbackPanelSource.includes("partial / continuation required")
+    && playbackPanelSource.includes("diagnostic_backlog_id"),
+  "shared authority presentation must separate row close, pagination, and bypass diagnostics",
+);

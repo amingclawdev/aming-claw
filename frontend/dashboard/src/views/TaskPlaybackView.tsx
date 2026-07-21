@@ -24,7 +24,7 @@ import {
   type TaskPlaybackTrace,
   type ActivityEventCard,
 } from "../lib/taskPlayback";
-import TaskPlaybackPanel from "../components/TaskPlaybackPanel";
+import TaskPlaybackPanel, { contractRuntimeAuthorityActionLabel } from "../components/TaskPlaybackPanel";
 import type { BacklogBug, BacklogResponse, BacklogTimelineGateResponse, TaskTimelineEvent, TaskTimelineResponse } from "../types";
 
 interface Props {
@@ -57,6 +57,7 @@ interface PlaybackLoadState {
   trace: TaskPlaybackTrace;
   taskTimeline?: TaskTimelineResponse | null;
   gate?: BacklogTimelineGateResponse | null;
+  authorityCacheKey?: string;
 }
 
 interface BacklogDetailLoadState {
@@ -138,6 +139,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const playbackByBugRef = useRef<Record<string, PlaybackLoadState>>({});
+  const authorityTraceCacheRef = useRef<Record<string, TaskPlaybackTrace>>({});
   const activityByBugRef = useRef<Record<string, ActivityLoadState>>({});
   const selectedBacklogDetailByIdRef = useRef<Record<string, BacklogDetailLoadState>>({});
   const selectedBugRef = useRef<BacklogBug | null>(null);
@@ -168,6 +170,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     playbackControllersRef.current.clear();
     inFlightPlaybackKeysRef.current.clear();
     playbackByBugRef.current = {};
+    authorityTraceCacheRef.current = {};
     activityByBugRef.current = {};
     selectedBacklogDetailByIdRef.current = {};
     setPlaybackByBug({});
@@ -379,6 +382,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
           bug: states[bugId]?.bug ?? bug,
           taskTimeline: states[bugId]?.taskTimeline,
           gate: states[bugId]?.gate,
+          authorityCacheKey: states[bugId]?.authorityCacheKey,
           refreshedAt: states[bugId]?.refreshedAt,
         },
       }));
@@ -405,6 +409,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         gateResponse: gate,
         source: taskTimeline && gate ? "governed" : "governed_partial",
       });
+      const authorityCacheKey = trace.authority_view?.cache_identity.key;
+      if (authorityCacheKey) authorityTraceCacheRef.current[authorityCacheKey] = trace;
       // Merge new events without duplicating (deduplication by event id is
       // handled inside normalizeTaskPlaybackTrace via mergeTimelineEvents).
       setActivityByBug((states) => {
@@ -421,6 +427,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
             bug: detailBug,
             taskTimeline,
             gate,
+            authorityCacheKey,
             refreshedAt: new Date().toISOString(),
             // Preserve existing frame selection when merging poll results
             ...(prev?.loaded && isFallbackPoll ? { _preserveFrameId: true } : {}),
@@ -603,6 +610,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
           gateResponse: gate,
           source: taskTimeline && gate ? "governed" : "governed_partial",
         });
+        const authorityCacheKey = trace.authority_view?.cache_identity.key;
+        if (authorityCacheKey) authorityTraceCacheRef.current[authorityCacheKey] = trace;
         setPlaybackByBug((states) => ({
           ...states,
           [bugId]: {
@@ -612,6 +621,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
             trace,
             taskTimeline,
             gate,
+            authorityCacheKey,
           },
         }));
         if (selectedBugRef.current?.bug_id === bugId) {
@@ -973,6 +983,8 @@ function SegmentedButton<T extends string>({
 }
 
 function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; trace: TaskPlaybackTrace }) {
+  const authority = trace.authority_view;
+  const currentAction = authority?.contract_execution_progress.current_action;
   const latestFrame = trace.frames[trace.frames.length - 1] ?? null;
   const latestEvent = hint?.latest_event ?? {};
   const latestEventText = compactJoin([
@@ -986,13 +998,22 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
     laneStatusSummary(trace, "verification", "QA"),
     laneStatusSummary(trace, "gate", "close gate"),
   ]);
-  const nextExpected = trace.close_gate_summary.next_expected_evidence.length > 0
+  const nextExpected = authority
+    ? currentAction?.evidence_kind || "none recorded"
+    : trace.close_gate_summary.next_expected_evidence.length > 0
     ? trace.close_gate_summary.next_expected_evidence.join(", ")
     : firstHintValue(latestEvent, ["next_expected_evidence", "missing_event_kinds", "missing_requirement_ids"]) || "none recorded";
-  const nextAction = trace.close_gate_summary.next_expected_action
-    || firstHintValue(latestEvent, ["next_legal_action", "next_expected_action", "next_action"])
-    || "none recorded";
-  const blocker = latestFrame?.failure_diagnosis[0]
+  const nextAction = authority
+    ? contractRuntimeAuthorityActionLabel(authority)
+    : trace.close_gate_summary.next_expected_action
+      || firstHintValue(latestEvent, ["next_legal_action", "next_expected_action", "next_action"])
+      || "none recorded";
+  const authorityBlocker = currentAction?.block_reason
+    || authority?.contract_execution_progress.line_states.find((line) => line.display_status === "BLOCKED" || line.display_status === "FAILED")?.line_id
+    || "";
+  const blocker = authority
+    ? authorityBlocker || "none recorded"
+    : latestFrame?.failure_diagnosis[0]
     ? `${latestFrame.failure_diagnosis[0].label}: ${latestFrame.failure_diagnosis[0].value}`
     : firstHintValue(latestEvent, ["blocker_ids", "blockers", "missing_event_kinds", "missing_requirement_ids"])
       || (trace.close_gate_summary.blocked ? trace.close_gate_summary.reason_sentence : "none recorded");
@@ -1006,6 +1027,14 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
         {singleActive ? <span>{singleActive}</span> : null}
         <span>Latest event: {latestEventText || "none recorded"}</span>
         <span>Worker/QA/close gate: {laneState || "none recorded"}</span>
+        {authority ? <span>Contract progress: {authority.contract_execution_progress.display_status}</span> : null}
+        {authority ? <span>Backlog row close authority: {authority.backlog_close_readiness.display_status}</span> : null}
+        {authority ? (
+          <span>
+            Historical diagnostics: {authority.historical_diagnostics.timeline_events.length} events
+            {authority.historical_diagnostics.truncated ? `; partial; next cursor ${authority.historical_diagnostics.next_cursor || "available"}` : "; response complete"}
+          </span>
+        ) : null}
         <span>Next expected evidence: {nextExpected}</span>
         <span>Blocker/next legal action: {blocker}; {nextAction}</span>
       </div>

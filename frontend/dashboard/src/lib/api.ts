@@ -65,6 +65,7 @@ function backlogTimelineQuery(backlogId: string, limit: number): string {
   return new URLSearchParams({
     backlog_id: backlogId,
     limit: String(limit),
+    include_compact_ledger: "true",
   }).toString();
 }
 

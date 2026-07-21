@@ -1330,6 +1330,54 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
   });
   assertFixture(chainFallback.contract_execution_progress.current_action.id === "legacy_chain_action" && chainFallback.contract_execution_progress.current_action_source === "backlog_contract_chain_current", "contract-chain current should be the fallback current-action authority");
 
+  const dogfoodModes = [
+    { contractId: "direct_main.v1", actionId: "direct_main_implementation", ownerRole: "observer" },
+    { contractId: "mf_parallel.v2", actionId: "parallel_worker_handoff", ownerRole: "mf_sub" },
+    { contractId: "mf_batch_parallel.v1", actionId: "ordered_batch_merge", ownerRole: "observer" },
+  ];
+  const dogfoodViews = dogfoodModes.map((mode, index) => projectContractRuntimeAuthorityViewModel({
+    ...response,
+    contract_execution_progress: {
+      ...response.contract_execution_progress,
+      contract_execution_id: `cex-dogfood-${index}`,
+      contract_id: mode.contractId,
+      execution_state_revision: 20 + index,
+      next_legal_action: {
+        id: mode.actionId,
+        action: mode.actionId.replaceAll("_", " "),
+        owner_role: mode.ownerRole,
+        lane_id: mode.ownerRole === "mf_sub" ? "worker-1" : "observer",
+      },
+      line_states: mode.contractId === "mf_parallel.v2"
+        ? [
+          { ...response.contract_execution_progress.line_states[0], id: "parallel-worker", owner_role: "mf_sub", line_id: "worker_implementation", bypassed: false },
+          { ...response.contract_execution_progress.line_states[0], id: "parallel-qa", owner_role: "qa", line_id: "independent_verification", bypassed: false },
+        ]
+        : response.contract_execution_progress.line_states,
+    },
+    backlog: { ...response.backlog, status: "OPEN" },
+    backlog_close_readiness: { ...response.backlog_close_readiness, state: "blocked", backlog_status: "OPEN" },
+    timeline: {
+      ...response.timeline,
+      events: [{ ...response.timeline.events[0], event_id: `dogfood-${index}`, id: 100 + index }],
+    },
+  }));
+  assertFixture(
+    dogfoodViews.map((view) => view.contract_execution_progress.current_action.id).join(",")
+      === "direct_main_implementation,parallel_worker_handoff,ordered_batch_merge",
+    "direct-main, mf_parallel, and mf_batch_parallel fixtures should retain their canonical continuation actions",
+  );
+  assertFixture(
+    dogfoodViews[1].contract_execution_progress.line_states.some((line) => line.owner_role === "mf_sub")
+      && dogfoodViews[1].contract_execution_progress.line_states.some((line) => line.owner_role === "qa"),
+    "mf_parallel fixture should retain distinct worker and QA lanes",
+  );
+  assertFixture(
+    new Set(dogfoodViews.map((view) => view.cache_identity.key)).size === dogfoodViews.length
+      && dogfoodViews.every((view) => view.backlog_close_readiness.display_status === "BLOCKED"),
+    "dogfood executions/revisions/events should remain cache-distinct while OPEN row close stays blocked",
+  );
+
   return [
     "canonical visualization projects ContractRuntime current action before chain fallback",
     "authority cache identity includes backlog, execution, revision, and event",
@@ -1337,6 +1385,7 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
     "contract_complete remains neutral while backlog close readiness stays independent",
     "task timeline consumer carries canonical authority axes without adding playback frames",
     "current authority snapshot stays out of playback history",
+    "direct-main, mf_parallel, and mf_batch_parallel dogfood modes retain canonical actions and cache identities",
   ];
 }
 

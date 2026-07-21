@@ -3,11 +3,13 @@ import { api, ApiError } from "../lib/api";
 import {
   buildPlaybackUrl,
   normalizeTaskPlaybackCompactLedger,
+  projectContractRuntimeAuthorityViewModel,
   taskPlaybackCompactLedgerDisplayState,
   taskPlaybackCompactLedgerNextActionLabel,
   taskPlaybackCompactLedgerRowForBacklog,
   taskPlaybackLedgerRowsToTimelineEvents,
   taskPlaybackLedgerRowRefs,
+  type ContractRuntimeAuthorityViewModel,
   type TaskPlaybackCompactLedger,
   type TaskPlaybackCompactLedgerRow,
 } from "../lib/taskPlayback";
@@ -19,7 +21,12 @@ import {
   semanticLaneLabel,
 } from "../lib/taskTimelineSemantics";
 import type { GateMatrixRow, GateMatrixProjection, TaskTimelineSemanticRelation } from "../lib/taskTimelineSemantics";
-import { ReferencesAndEvidenceSection, EventSemanticDetail } from "../components/TaskPlaybackPanel";
+import {
+  ContractRuntimeAuthorityPanel,
+  contractRuntimeAuthorityActionLabel,
+  ReferencesAndEvidenceSection,
+  EventSemanticDetail,
+} from "../components/TaskPlaybackPanel";
 import type {
   BacklogBug,
   BacklogAuditArchive,
@@ -68,8 +75,6 @@ const ROUTE_LEGACY_ADVISORY_REQUIREMENTS = ["route_action_precheck", "mf_timelin
 const ROUTE_WORKER_REQUIREMENTS = ["bounded_implementation_worker_dispatch", "mf_subagent_startup"];
 const ROUTE_QA_REQUIREMENTS = ["independent_verification_lane"];
 const ROUTE_IDENTITY_REQUIREMENTS = ["route_identity_mismatch", "same_route_identity", "route_identity_cleanup"];
-const DIRECT_API = (import.meta.env.VITE_DIRECT_API as string | undefined) === "true";
-const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined) || "http://localhost:40000";
 
 function playbackHref(projectId: string): string {
   return `?project_id=${encodeURIComponent(projectId)}&view=activity&activity_tab=history`;
@@ -214,37 +219,7 @@ interface TimelineState {
   count?: number;
   gate?: BacklogTimelineGateResponse;
   compactLedger?: TaskPlaybackCompactLedger;
-}
-
-interface CompactLedgerTimelineResponse {
-  ok?: boolean;
-  project_id?: string;
-  backlog_id?: string;
-  events?: TaskTimelineEvent[];
-  count?: number;
-  compact_ledger?: unknown;
-  compactLedger?: unknown;
-}
-
-async function fetchTaskTimelineWithCompactLedger(
-  projectId: string,
-  backlogId: string,
-  limit: number,
-  signal?: AbortSignal,
-): Promise<CompactLedgerTimelineResponse> {
-  const params = new URLSearchParams({
-    backlog_id: backlogId,
-    limit: String(limit),
-    include_compact_ledger: "true",
-  });
-  const base = DIRECT_API ? BACKEND_URL.replace(/\/$/, "") : "";
-  const url = `${base}/api/task/${encodeURIComponent(projectId)}/timeline?${params.toString()}`;
-  const response = await fetch(url, { signal });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`${response.status} ${response.statusText}${body ? ` ${body}` : ""}`);
-  }
-  return response.json() as Promise<CompactLedgerTimelineResponse>;
+  authorityView?: ContractRuntimeAuthorityViewModel;
 }
 
 function compactLedgerFromResponses(projectId: string, ...sources: unknown[]): TaskPlaybackCompactLedger {
@@ -412,6 +387,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
           count: existing?.count,
           gate: existing?.gate,
           compactLedger: existing?.compactLedger,
+          authorityView: existing?.authorityView,
         },
       };
     });
@@ -420,12 +396,15 @@ export default function BacklogView({ backlog, projectId }: Props) {
 
     Promise.allSettled([
       api.backlogTimelineGateFor(projectId, bugId, BACKLOG_DETAIL_TIMELINE_LIMIT),
-      fetchTaskTimelineWithCompactLedger(projectId, bugId, BACKLOG_DETAIL_TIMELINE_LIMIT),
+      api.taskTimelineFor(projectId, bugId, BACKLOG_DETAIL_TIMELINE_LIMIT),
     ])
       .then(([gateResult, compactResult]) => {
         const gate = gateResult.status === "fulfilled" ? gateResult.value : undefined;
         const compactTimeline = compactResult.status === "fulfilled" ? compactResult.value : undefined;
         const compactLedger = compactLedgerFromResponses(projectId, compactTimeline, gate);
+        const authorityView = compactTimeline?.contract_runtime_visualization
+          ? projectContractRuntimeAuthorityViewModel(compactTimeline.contract_runtime_visualization)
+          : undefined;
         const baseEvents = stableTimelineEvents([
           ...(gate?.events ?? []),
           ...(compactTimeline?.events ?? []),
@@ -449,6 +428,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
               count: compactTimeline?.count ?? gate?.event_count ?? events.length,
               gate,
               compactLedger,
+              authorityView,
             },
           };
         });
@@ -468,6 +448,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
               count: existing?.count,
               gate: existing?.gate,
               compactLedger: existing?.compactLedger,
+              authorityView: existing?.authorityView,
             },
           };
         });
@@ -838,7 +819,16 @@ function BacklogDetailModal({
 
         {loadingBug ? <div className="timeline-empty">Loading backlog detail...</div> : null}
         {error ? <div className="timeline-empty timeline-error">Backlog detail load failed: {error}</div> : null}
-        {bug ? <BacklogDetailSummary bug={bug} gate={gate} response={timeline?.gate} compactLedgerRow={compactLedgerRow} /> : null}
+        {bug ? (
+          <BacklogDetailSummary
+            bug={bug}
+            gate={gate}
+            response={timeline?.gate}
+            compactLedgerRow={compactLedgerRow}
+            authority={timeline?.authorityView}
+          />
+        ) : null}
+        <ContractRuntimeAuthorityPanel authority={timeline?.authorityView} compact />
 
         <div className="backlog-modal-tabs" role="tablist" aria-label="Backlog detail sections">
           <button
@@ -863,7 +853,12 @@ function BacklogDetailModal({
 
         {activeTab === "timeline" ? (
           <div className="backlog-modal-tab-panel" role="tabpanel">
-            <CompactLedgerPanel ledger={compactLedger} row={compactLedgerRow} backlogId={fallbackBugId} />
+            <CompactLedgerPanel
+              ledger={compactLedger}
+              row={compactLedgerRow}
+              backlogId={fallbackBugId}
+              canonicalAuthorityPresent={Boolean(timeline?.authorityView)}
+            />
 
             <div className="backlog-modal-section">
               <div className="backlog-modal-section-head">
@@ -948,11 +943,13 @@ function BacklogDetailSummary({
   gate,
   response,
   compactLedgerRow,
+  authority,
 }: {
   bug: BacklogBug;
   gate?: MfCloseTimelineGate;
   response?: BacklogTimelineGateResponse;
   compactLedgerRow?: TaskPlaybackCompactLedgerRow | null;
+  authority?: ContractRuntimeAuthorityViewModel;
 }) {
   const contract = gate?.contract_gate;
   const routeGate = gate?.route_context_gate;
@@ -976,6 +973,25 @@ function BacklogDetailSummary({
       <SummaryItem label="Priority" value={normalizePriority(bug.priority)} tone={priorityTone(bug.priority)} />
       <SummaryItem label="Status" value={normalizeStatus(bug.status)} tone={statusClass(bug.status)} />
       <SummaryItem label="Commit" value={bug.commit ? shortCommit(bug.commit) : "none"} mono />
+      {authority ? (
+        <>
+          <SummaryItem
+            label="Contract progress"
+            value={authority.contract_execution_progress.display_status}
+            tone={statusClass(authority.contract_execution_progress.display_status)}
+          />
+          <SummaryItem
+            label="Row close authority"
+            value={authority.backlog_close_readiness.display_status}
+            tone={statusClass(authority.backlog_close_readiness.display_status)}
+          />
+          <SummaryItem
+            label="History"
+            value={authority.historical_diagnostics.truncated ? "partial; continue" : "response complete"}
+            tone={authority.historical_diagnostics.truncated ? "status-running" : "status-complete"}
+          />
+        </>
+      ) : null}
       {compactLedgerRow ? (
         <>
           <SummaryItem label="Contract exec" value={compactLedgerRow.contract_execution_id || "none"} mono />
@@ -1004,7 +1020,14 @@ function BacklogDetailSummary({
       <DetailList label="Tests" values={listFrom(bug.test_files)} />
       <DetailList label="Required docs" values={listFrom(bug.required_docs)} />
       <DetailList label="Provenance / related" values={related} />
-      {compactLedgerRow ? <DetailList label="Next legal action" values={ledgerNextAction ? [ledgerNextAction] : []} /> : null}
+      {authority ? (
+        <DetailList label="Current legal action (ContractRuntime)" values={[contractRuntimeAuthorityActionLabel(authority)]} />
+      ) : compactLedgerRow ? (
+        <DetailList label="Next legal action" values={ledgerNextAction ? [ledgerNextAction] : []} />
+      ) : null}
+      {authority && compactLedgerRow && ledgerNextAction ? (
+        <DetailList label="Historical ledger action (advisory)" values={[ledgerNextAction]} />
+      ) : null}
       {auditClose.present ? <DetailList label="Audit close reason" values={auditClose.reason ? [auditClose.reason] : []} /> : null}
       {commandRecovery ? <DetailList label="Command recovery" values={commandRecoveryDetailValues(commandRecovery)} /> : null}
     </div>
@@ -1015,10 +1038,12 @@ function CompactLedgerPanel({
   ledger,
   row,
   backlogId,
+  canonicalAuthorityPresent,
 }: {
   ledger?: TaskPlaybackCompactLedger;
   row?: TaskPlaybackCompactLedgerRow | null;
   backlogId: string;
+  canonicalAuthorityPresent: boolean;
 }) {
   const refs = row ? taskPlaybackLedgerRowRefs(row) : [];
   const nextAction = taskPlaybackCompactLedgerNextActionLabel(row?.next_legal_action);
@@ -1028,7 +1053,7 @@ function CompactLedgerPanel({
   return (
     <div className="backlog-modal-section">
       <div className="backlog-modal-section-head">
-        <span>Contract runtime ledger</span>
+        <span>{canonicalAuthorityPresent ? "Historical compact ledger (advisory)" : "Contract runtime ledger"}</span>
         <span className="mono">
           {ledger?.row_count ?? 0} row{ledger?.row_count === 1 ? "" : "s"} · {ledger?.source_event_count ?? 0} source event{ledger?.source_event_count === 1 ? "" : "s"}
         </span>
@@ -1069,7 +1094,7 @@ function CompactLedgerPanel({
 
           <div className={`backlog-gate-card ${nextAction ? "neutral" : "fail"}`}>
             <div className="backlog-gate-title">
-              <span>Next legal action</span>
+              <span>{canonicalAuthorityPresent ? "Historical action (advisory)" : "Next legal action"}</span>
               <span className={`status-badge ${nextAction ? "status-running" : "status-failed"}`}>{nextAction ? "available" : "missing"}</span>
             </div>
             <div className="backlog-gate-facts">

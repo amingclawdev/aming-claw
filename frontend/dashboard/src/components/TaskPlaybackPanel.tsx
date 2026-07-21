@@ -1,6 +1,13 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 
-import type { TaskPlaybackFrame, TaskPlaybackTrace, PlaybackNavEntry, TaskPlaybackEvidenceRef, ReferenceCategory } from "../lib/taskPlayback";
+import type {
+  ContractRuntimeAuthorityViewModel,
+  TaskPlaybackFrame,
+  TaskPlaybackTrace,
+  PlaybackNavEntry,
+  TaskPlaybackEvidenceRef,
+  ReferenceCategory,
+} from "../lib/taskPlayback";
 import {
   buildPlaybackUrl,
   displayPlaybackFrames,
@@ -40,6 +47,106 @@ interface Props {
   compact?: boolean;
   /** When true, the event list renders newest event at the top (Current tab). */
   newestFirst?: boolean;
+}
+
+export function contractRuntimeAuthorityActionLabel(authority: ContractRuntimeAuthorityViewModel): string {
+  const action = authority.contract_execution_progress.current_action;
+  return [action.action || action.id, action.stage_id, action.line_id, action.owner_role]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .join(" · ") || "none recorded";
+}
+
+function authorityRecordText(record: Record<string, unknown>, key: string): string {
+  const value = record[key];
+  return typeof value === "string" || typeof value === "number" ? String(value).trim() : "";
+}
+
+function authorityRecordRefs(record: Record<string, unknown>): string[] {
+  const values = record.evidence_refs ?? record.source_refs ?? record.artifact_refs;
+  if (!Array.isArray(values)) return [];
+  return values.flatMap((value) => {
+    if (typeof value === "string" || typeof value === "number") return [String(value)];
+    if (!value || typeof value !== "object") return [];
+    const item = value as Record<string, unknown>;
+    const ref = item.ref ?? item.event_ref ?? item.source_ref ?? item.request_id ?? item.id;
+    return typeof ref === "string" || typeof ref === "number" ? [String(ref)] : [];
+  });
+}
+
+function authorityBypassRecordLabel(record: Record<string, unknown>, index: number): string {
+  const status = authorityRecordText(record, "status") || authorityRecordText(record, "decision") || "BYPASSED";
+  const stage = authorityRecordText(record, "stage_id");
+  const line = authorityRecordText(record, "line_id");
+  const reason = authorityRecordText(record, "reason");
+  const diagnostic = authorityRecordText(record, "diagnostic_backlog_id");
+  const evidence = authorityRecordRefs(record);
+  return [
+    status.toUpperCase(),
+    stage || line ? `${stage || "stage"}/${line || "line"}` : `record ${index + 1}`,
+    reason,
+    diagnostic ? `diagnostic ${diagnostic}` : "",
+    evidence.length > 0 ? `evidence ${evidence.join(", ")}` : "",
+  ].filter(Boolean).join(" · ");
+}
+
+/** Shared projection for Backlog, Timeline DAG, Activity Current, and Playback History. */
+export function ContractRuntimeAuthorityPanel({
+  authority,
+  compact = false,
+}: {
+  authority?: ContractRuntimeAuthorityViewModel | null;
+  compact?: boolean;
+}) {
+  if (!authority) return null;
+  const progress = authority.contract_execution_progress;
+  const close = authority.backlog_close_readiness;
+  const diagnostics = authority.historical_diagnostics;
+  const bypassedLines = progress.line_states.filter((line) => line.display_status === "BYPASSED" || line.display_status === "WAIVED");
+  const partialHistory = diagnostics.truncated || progress.line_states_truncated || progress.runtime_records_truncated;
+
+  return (
+    <section
+      className={`task-playback-chip-section${compact ? " compact" : ""}`}
+      aria-label="ContractRuntime authority axes"
+      data-cache-identity={authority.cache_identity.key}
+    >
+      <strong>ContractRuntime authority</strong>
+      <div>
+        <span>
+          Contract progress: <b className={`status-badge ${statusClass(progress.display_status)}`}>{progress.display_status}</b>
+          {progress.contract_execution_id ? ` · ${progress.contract_execution_id}` : ""}
+          {progress.execution_state_revision != null ? ` · revision ${progress.execution_state_revision}` : ""}
+        </span>
+        <span>Current legal action ({progress.current_action_source}): {contractRuntimeAuthorityActionLabel(authority)}</span>
+        <span>
+          Backlog row close authority: <b className={`status-badge ${statusClass(close.display_status)}`}>{close.display_status}</b>
+          {close.state ? ` · ${close.state}` : ""}
+          {close.backlog_status ? ` · row ${close.backlog_status}` : ""}
+        </span>
+        <span>
+          Historical diagnostics: {diagnostics.timeline_events.length} timeline event{diagnostics.timeline_events.length === 1 ? "" : "s"}
+          {` · ${diagnostics.bypass_records.length} bypass record${diagnostics.bypass_records.length === 1 ? "" : "s"}`}
+          {` · ${diagnostics.legacy_advisories.length} legacy advisor${diagnostics.legacy_advisories.length === 1 ? "y" : "ies"}`}
+        </span>
+        <span>
+          History completeness: {partialHistory ? "partial / continuation required" : "complete for this response"}
+          {diagnostics.next_cursor ? ` · next cursor ${diagnostics.next_cursor}` : ""}
+        </span>
+        {bypassedLines.map((line) => (
+          <span key={line.id || `${line.stage_id}:${line.line_id}`}>
+            {line.display_status}: {line.stage_id}/{line.line_id}
+            {line.bypass?.reason ? ` · ${line.bypass.reason}` : ""}
+            {line.bypass?.diagnostic_backlog_id ? ` · diagnostic ${line.bypass.diagnostic_backlog_id}` : ""}
+            {line.source_ref ? ` · evidence ${line.source_ref}` : ""}
+          </span>
+        ))}
+        {diagnostics.bypass_records.map((record, index) => (
+          <span key={`bypass-record:${index}`}>{authorityBypassRecordLabel(record, index)}</span>
+        ))}
+      </div>
+    </section>
+  );
 }
 
 export default function TaskPlaybackPanel({
@@ -223,6 +330,8 @@ export default function TaskPlaybackPanel({
           <span className={`status-badge ${statusClass(gate.status)}`}>{gate.label}</span>
         </div>
       </div>
+
+      <ContractRuntimeAuthorityPanel authority={trace.authority_view} compact={compact} />
 
       {loading ? <div className="timeline-empty"><span className="spinner" /> Loading governed timeline data...</div> : null}
       {error ? <div className="timeline-empty timeline-error">Playback load failed: {error}</div> : null}

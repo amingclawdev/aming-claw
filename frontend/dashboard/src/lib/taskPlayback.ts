@@ -324,7 +324,7 @@ export interface ContractRuntimeAuthorityViewModel {
   generated_at: string;
   authority_source: "contract_runtime";
   cache_identity: ContractRuntimeAuthorityCacheIdentity;
-  contract_execution_progress: ContractRuntimeVisualizationResponse["contract_execution_progress"] & {
+  contract_execution_progress: Omit<ContractRuntimeVisualizationResponse["contract_execution_progress"], "line_states"> & {
     current_action: ContractRuntimeVisualizationNextAction;
     current_action_source: "contract_runtime_current" | "backlog_contract_chain_current" | "none";
     display_status: ContractRuntimeAuthorityDisplayStatus;
@@ -416,6 +416,17 @@ export function projectContractRuntimeAuthorityViewModel(
     ...line,
     display_status: contractRuntimeAuthorityDisplayStatus(line.status, { bypassed: line.bypassed }),
   }));
+  const closeAuthorityStatus = contractRuntimeAuthorityDisplayStatus(response.backlog_close_readiness.state, {
+    waived: response.backlog_close_readiness.state.toLowerCase().includes("waiv"),
+  });
+  const backlogRowStatus = contractRuntimeAuthorityDisplayStatus(
+    response.backlog.status || response.backlog_close_readiness.backlog_status,
+  );
+  const backlogCloseDisplayStatus = backlogRowStatus === "WAIVED" || backlogRowStatus === "BYPASSED"
+    ? backlogRowStatus
+    : closeAuthorityStatus !== "UNKNOWN"
+      ? closeAuthorityStatus
+      : backlogRowStatus;
 
   return {
     schema_version: "contract_runtime.authority_view_model.v1",
@@ -440,9 +451,7 @@ export function projectContractRuntimeAuthorityViewModel(
     },
     backlog_close_readiness: {
       ...response.backlog_close_readiness,
-      display_status: contractRuntimeAuthorityDisplayStatus(
-        response.backlog.status || response.backlog_close_readiness.backlog_status || response.backlog_close_readiness.state,
-      ),
+      display_status: backlogCloseDisplayStatus,
     },
     historical_diagnostics: {
       timeline_events: [...response.timeline.events],
