@@ -66350,6 +66350,17 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert stored_authority["candidate_diff_hash"] == expected_graph_evidence[
         "candidate_diff_hash"
     ]
+    assert stored_authority["base_commit_sha"] == head_commit
+    assert stored_authority["candidate_commit_sha"] == head_commit
+    assert stored_authority["comparison_base_commit_sha"] == base_commit
+    assert stored_authority["exact_candidate_snapshot_commit_sha"] == (
+        head_commit
+    )
+    assert stored_authority["graph_snapshot_base_commit_sha"] == head_commit
+    assert stored_authority["comparison_base_commit_source"] == (
+        "ContractRuntime.completed_lines.worker_commit+"
+        "parallel_branch_runtime_context.base_commit"
+    )
     assert stored_authority["authority_hash"].startswith("sha256:")
 
     def count_key(value, key):
@@ -66479,7 +66490,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         },
         "payload": {
             "schema_version": "qa_independent_verification.v1",
-            "base_commit_sha": expected_graph_evidence["base_commit_sha"],
+            "base_commit_sha": base_commit,
             "candidate_commit_sha": head_commit,
             "acceptance_scope": "candidate_regression_and_acceptance_criteria",
             "verdict": "accepted",
@@ -66535,9 +66546,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
                 "schema_version": (
                     "contract_runtime.external_no_pass_baseline_ledger.v2"
                 ),
-                "base_commit_sha": expected_graph_evidence[
-                    "base_commit_sha"
-                ],
+                "base_commit_sha": base_commit,
                 "candidate_commit_sha": head_commit,
                 "base_failure_identities": ["test_inherited_non_green"],
                 "candidate_failure_identities": [
@@ -66841,7 +66850,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     # Even a fully redundant, internally consistent current candidate line is
     # not legacy authority after only its normalization markers are removed.
     freshly_normalized_redundant = json.loads(json.dumps(historical_line))
-    fresh_base_commit = expected_graph_evidence["base_commit_sha"]
+    fresh_base_commit = base_commit
     fresh_candidate_commit = head_commit
     freshly_normalized_redundant.update(
         {
