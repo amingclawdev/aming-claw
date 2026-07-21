@@ -817,10 +817,16 @@ function verifyBacklogEvidenceContract() {
   assert(apiSource.includes("/timeline-gate?"), "Backlog API client should call the timeline-gate endpoint");
   assert(apiSource.includes("contractRuntimeVisualizationFor") && apiSource.includes("/visualization/backlogs/"), "Dashboard API should use the canonical ContractRuntime visualization endpoint");
   assert(apiSource.includes("Promise.all([taskTimelineRequest, authorityRequest])") && apiSource.includes("contract_runtime_visualization: contractRuntimeVisualization"), "The existing task timeline fetch path should carry the canonical visualization response to Activity/Playback consumers");
+  assert(apiSource.includes("requirePublicSafeTypedDag") && apiSource.includes("response.dag?.typed_edges !== true") && apiSource.includes("typedDagRawSecretPath(response.dag)"), "The dashboard API boundary should reject visualization payloads that are not public-safe, read-only typed DAGs or contain raw secrets");
   assert(typeSource.includes("ContractRuntimeVisualizationResponse") && typeSource.includes("contract_runtime.visualization.v1"), "Dashboard types should expose the public-safe ContractRuntime visualization schema");
   assert(playbackSource.includes("projectContractRuntimeAuthorityViewModel") && playbackSource.includes("contract_runtime.authority_view_model.v1"), "Playback library should expose the canonical three-axis authority adapter");
   assert((playbackSource.match(/projectContractRuntimeAuthorityViewModel\(/g) || []).length >= 2 && playbackSource.includes("authority_view: authorityView"), "The production playback normalizer should consume and retain the canonical authority view");
+  assert(typeSource.includes("ContractRuntimeDagEdge") && typeSource.includes("ContractRuntimeDagRelationship") && typeSource.includes("authority_source") && typeSource.includes("evidence_ref"), "Dashboard types should expose stable typed DAG edge authority and evidence fields");
+  assert(playbackSource.includes("normalizeTaskPlaybackDag") && playbackSource.includes('schema_version: "task_playback.typed_dag.v1"') && playbackSource.includes("dagLifecycleRelationship"), "Playback should normalize explicit and inferred ContractRuntime DAG relationships into one public-safe read model");
+  assert(playbackTestSource.includes('"direct_main.v1"') && playbackTestSource.includes('"mf_parallel.v2"') && playbackTestSource.includes('"mf_batch_parallel.v1"') && playbackTestSource.includes("worker_qa_rework") && playbackTestSource.includes("ordered_merge_queue") && playbackTestSource.includes("parent_event"), "Typed DAG fixtures should cover distinct direct, parallel QA/rework, and ordered batch/causality topologies");
+  assert(playbackSource.includes("RAW_TYPED_DAG_SECRET_TEXT") && playbackSource.includes("typedDagRawSecretPath") && playbackTestSource.includes("raw-session-token-should-not-render") && playbackTestSource.includes("raw-route-token-should-not-render"), "Typed DAG security fixtures should reject and redact raw route/session secrets across node and edge display fields");
   assert(viewSource.includes("projectContractRuntimeAuthorityViewModel") && viewSource.includes("ContractRuntimeAuthorityPanel"), "Backlog detail and Timeline DAG should consume the canonical authority adapter");
+  assert(viewSource.includes("normalizeTaskPlaybackDag") && viewSource.includes("Typed edges") && viewSource.includes("edge.authority_source") && viewSource.includes("edge.evidence_ref") && viewSource.includes("edge.inferred"), "Backlog detail should consume the same normalized typed DAG identities and label explicit versus inferred authority");
   assert(playbackPanelSource.includes("ContractRuntime authority") && playbackPanelSource.includes("Backlog row close authority") && playbackPanelSource.includes("partial / continuation required"), "Playback History should render independent contract, close, and paginated-history axes");
   assert(playbackViewSource.includes("contractRuntimeAuthorityActionLabel") && playbackViewSource.includes("Backlog row close authority"), "Activity Current should use the same canonical current action and separate close authority");
   assert(playbackViewSource.includes("authorityTraceCacheRef.current[authorityCacheKey]") && playbackViewSource.includes("trace.authority_view?.cache_identity.key"), "Activity and Playback caches should retain distinct execution/revision/event authority identities");
@@ -866,8 +872,8 @@ function verifyBacklogEvidenceContract() {
   verifyRuntimeGuideDocsContract({ announce: false });
   assert(viewSource.includes("function sanitizeRouteGuidanceDisplayText"), "Backlog route guidance should define a UI display sanitizer");
   assert(viewSource.includes("command: sanitizeRouteGuidanceDisplayText(command || id)"), "Backend route action commands should be sanitized before display");
-  assert(viewSource.includes("label: sanitizeRouteGuidanceDisplayText(firstText(record.label, record.title) || titleizeLane(id))"), "Backend route action labels should be sanitized before display");
-  assert(viewSource.includes("detail: sanitizeRouteGuidanceDisplayText(firstText(record.detail, record.next_action, record.reason))"), "Backend route action details should be sanitized before display");
+  assert(viewSource.includes("sanitizeRouteGuidanceDisplayText(firstText(record.label, record.title) || titleizeLane(id))"), "Backend route action labels should be sanitized before display");
+  assert(viewSource.includes("sanitizeRouteGuidanceDisplayText(firstText(record.detail, record.next_action, record.reason))"), "Backend route action details should be sanitized before display");
   assert(viewSource.includes("\"Judgment\" + \" Brain\"") && viewSource.includes("private advisory context"), "Route guidance sanitizer should map private advisory names to public context language");
   assert(viewSource.includes("\"jud\" + \"ge\"") && viewSource.includes("\"jud\" + \"ger\""), "Route guidance sanitizer should map private review role wording");
   assert(viewSource.includes("\"raw \" + \"prompt\"") && viewSource.includes("private request text"), "Route guidance sanitizer should map private request wording");
@@ -1142,13 +1148,31 @@ function verifyBacklogEvidenceContract() {
   ok("backlog evidence row exposes timeline gate, contract, modal DAG, and inspector");
 }
 
+function verifyTypedDagContract() {
+  phase("public-safe typed DAG contract");
+  const apiSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/api.ts"), "utf8");
+  const playbackSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/taskPlayback.ts"), "utf8");
+  const playbackTestSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/taskPlayback.test.ts"), "utf8");
+  const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/BacklogView.tsx"), "utf8");
+  const typeSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/types.ts"), "utf8");
+  assert(apiSource.includes("requirePublicSafeTypedDag") && apiSource.includes("response.dag?.typed_edges !== true") && apiSource.includes("typedDagRawSecretPath(response.dag)"), "API boundary should require a public-safe read-only typed DAG without raw secrets");
+  assert(typeSource.includes("ContractRuntimeDagEdge") && typeSource.includes("ContractRuntimeDagRelationship") && typeSource.includes("authority_source") && typeSource.includes("evidence_ref"), "Typed DAG edge schema should retain authority and evidence");
+  assert(playbackSource.includes("normalizeTaskPlaybackDag") && playbackSource.includes('schema_version: "task_playback.typed_dag.v1"') && playbackSource.includes("dagLifecycleRelationship"), "Playback should normalize explicit and inferred DAG edges");
+  assert(playbackTestSource.includes('"direct_main.v1"') && playbackTestSource.includes('"mf_parallel.v2"') && playbackTestSource.includes('"mf_batch_parallel.v1"') && playbackTestSource.includes("worker_qa_rework") && playbackTestSource.includes("ordered_merge_queue") && playbackTestSource.includes("parent_event"), "Fixtures should cover distinct direct, parallel QA/rework, and ordered batch topologies");
+  assert(playbackSource.includes("RAW_TYPED_DAG_SECRET_TEXT") && playbackSource.includes("typedDagRawSecretPath") && playbackTestSource.includes("raw-session-token-should-not-render") && playbackTestSource.includes("raw-route-token-should-not-render"), "Typed DAG security probe should cover raw route/session secret rejection and redaction");
+  assert(viewSource.includes("normalizeTaskPlaybackDag") && viewSource.includes("Typed edges") && viewSource.includes("edge.authority_source") && viewSource.includes("edge.evidence_ref") && viewSource.includes("edge.inferred"), "Backlog detail should consume the shared normalized typed DAG identity space");
+  ok("public-safe typed DAG contract is wired through API, Playback, Backlog detail, and reusable fixtures");
+}
+
 async function main() {
   console.log(c("bold", "dashboard-projects-e2e"));
   console.log(c("dim", `backend=${BACKEND} project=${PROJECT} workspace=${WORKSPACE} apply=${APPLY}`));
 
   try {
     if (ONLY) {
-      if (ONLY === "simple-mode-request-first-desktop") {
+      if (ONLY === "typed-dag-contract") {
+        verifyTypedDagContract();
+      } else if (ONLY === "simple-mode-request-first-desktop") {
         verifySimpleModeRequestFirstDesktopContract();
       } else if (ONLY === "runtime-guide-docs") {
         verifyRuntimeGuideDocsContract();

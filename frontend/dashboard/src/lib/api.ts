@@ -27,6 +27,7 @@ import type {
   TaskTimelineResponse,
   UnbindFileHintResponse,
 } from "../types";
+import { typedDagRawSecretPath } from "./taskPlayback";
 
 const DEFAULT_PROJECT_ID = (import.meta.env.VITE_PROJECT_ID as string | undefined) || "aming-claw";
 const DIRECT = (import.meta.env.VITE_DIRECT_API as string | undefined) === "true";
@@ -74,6 +75,23 @@ function backlogTimelineGateQuery(limit: number): string {
     include_events: "true",
     limit: String(limit),
   }).toString();
+}
+
+function requirePublicSafeTypedDag(response: ContractRuntimeVisualizationResponse): ContractRuntimeVisualizationResponse {
+  const rawSecretPath = typedDagRawSecretPath(response.dag);
+  if (response.public_safe !== true || response.read_only !== true || response.dag?.typed_edges !== true || rawSecretPath) {
+    throw new ApiError(
+      502,
+      "ContractRuntime visualization is missing the public-safe typed DAG contract",
+      JSON.stringify({
+        public_safe: response.public_safe,
+        read_only: response.read_only,
+        typed_edges: response.dag?.typed_edges,
+        raw_secret_path: rawSecretPath,
+      }),
+    );
+  }
+  return response;
 }
 
 function assetImpactReminderQuery(opts: { asset_kind?: string; status?: string } = {}): string {
@@ -497,7 +515,7 @@ export const api = {
     return getJSON<ContractRuntimeVisualizationResponse>(
       `/api/projects/${pidFor(projectId)}/visualization/backlogs/${encodeURIComponent(backlogId)}?${q}`,
       signal,
-    );
+    ).then(requirePublicSafeTypedDag);
   },
   snapshotFiles(
     snapshotId: string,

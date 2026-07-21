@@ -4,12 +4,14 @@ import {
   contractRuntimeAuthorityDisplayStatus,
   isBacklogRowPrivate,
   normalizeTaskPlaybackTrace,
+  normalizeTaskPlaybackDag,
   normalizeTaskPlaybackCompactLedger,
   projectRecentTimelineEvents,
   projectContractRuntimeAuthorityViewModel,
   taskPlaybackLedgerRowsToTimelineEvents,
   taskPlaybackCompactLedgerBlockingLabel,
   taskPlaybackCompactLedgerDisplayState,
+  typedDagRawSecretPath,
   displayPlaybackFrames,
   latestPlaybackFrameId,
   pushPlaybackNavStack,
@@ -1180,11 +1182,171 @@ export const taskPlaybackHistoricalSemanticFixtureSummary = [
   ...taskPlaybackWorkModeFixtureAssertions(),
   ...taskPlaybackRouteContextEvidenceFixtureAssertions(),
   ...taskPlaybackAuthorityAdapterAssertions(),
+  ...taskPlaybackTypedDagAssertions(),
   ...taskPlaybackCompactLedgerProjectionAssertions(),
 ];
 
 function assertFixture(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
+}
+
+function typedDagVisualizationFixture(
+  contractId: "direct_main.v1" | "mf_parallel.v2" | "mf_batch_parallel.v1",
+  nodes: ContractRuntimeVisualizationResponse["dag"]["nodes"],
+  edges: ContractRuntimeVisualizationResponse["dag"]["edges"],
+): ContractRuntimeVisualizationResponse {
+  return {
+    public_safe: true,
+    contract_execution_progress: { contract_id: contractId },
+    contract_chain: { current_contract_id: contractId },
+    dag: {
+      schema_version: "contract_runtime.visualization.dag.v1",
+      nodes,
+      edges,
+      node_count: nodes.length,
+      edge_count: edges.length,
+      typed_edges: true,
+    },
+  } as unknown as ContractRuntimeVisualizationResponse;
+}
+
+function taskPlaybackTypedDagAssertions(): string[] {
+  const backlog: BacklogBug = {
+    bug_id: "AC-TYPED-DAG-CONSUMER",
+    title: "Typed DAG consumer fixture",
+    status: "OPEN",
+    priority: "P1",
+    chain_trigger_json: {
+      parent_backlog_id: "AC-TYPED-DAG-PARENT",
+      child_backlog_id: "AC-TYPED-DAG-CHILD",
+      successor_backlog_id: "AC-TYPED-DAG-SUCCESSOR",
+    },
+  };
+  const node = (id: string, kind: string) => ({ id, kind, label: id, authority_source: "contract_runtime" });
+  const edge = (
+    relationship: ContractRuntimeVisualizationResponse["dag"]["edges"][number]["relationship"],
+    source: string,
+    target: string,
+    inferred = false,
+  ) => ({
+    id: `${relationship}:${source}:${target}`,
+    source,
+    target,
+    relationship,
+    authority_source: "contract_runtime.completed_lines",
+    evidence_ref: `timeline:${relationship}`,
+    inferred,
+  });
+
+  const direct = typedDagVisualizationFixture(
+    "direct_main.v1",
+    [node("backlog:AC-TYPED-DAG-CONSUMER", "backlog"), node("contract-execution:direct", "contract_execution"), node("line:reconcile", "contract_line"), node("line:settlement", "contract_line"), node("line:close", "contract_line")],
+    [
+      edge("backlog_contract_root", "backlog:AC-TYPED-DAG-CONSUMER", "contract-execution:direct"),
+      edge("reconcile", "contract-execution:direct", "line:reconcile"),
+      edge("settlement", "line:reconcile", "line:settlement"),
+      edge("close", "line:settlement", "line:close"),
+      edge("bypass", "contract-execution:direct", "line:settlement", true),
+      edge("waiver", "contract-execution:direct", "line:close", true),
+    ],
+  );
+  const parallel = typedDagVisualizationFixture(
+    "mf_parallel.v2",
+    [node("worker:one", "worker"), node("qa:failed", "qa"), node("worker:rework", "worker"), node("qa:passed", "qa"), node("contract-execution:parent", "contract_execution"), node("contract-execution:child", "contract_execution")],
+    [
+      edge("contract_successor", "contract-execution:parent", "contract-execution:child"),
+      edge("worker_qa_failed", "worker:one", "qa:failed"),
+      edge("worker_qa_rework", "qa:failed", "worker:rework"),
+      edge("worker_qa_passed", "worker:rework", "qa:passed"),
+    ],
+  );
+  const batch = typedDagVisualizationFixture(
+    "mf_batch_parallel.v1",
+    [node("batch:parent", "batch"), node("batch:row-1", "batch_row"), node("batch:row-2", "batch_row"), node("merge:item-1", "merge_queue_item"), node("merge:item-2", "merge_queue_item"), node("timeline-event:parent", "timeline_event"), node("timeline-event:child", "timeline_event")],
+    [
+      edge("batch_row_dispatch", "batch:parent", "batch:row-1"),
+      edge("batch_row_dispatch", "batch:parent", "batch:row-2"),
+      edge("ordered_merge_queue", "merge:item-1", "merge:item-2"),
+      edge("parent_event", "timeline-event:parent", "timeline-event:child"),
+    ],
+  );
+
+  const fixtures = [direct, parallel, batch].map((visualization) => normalizeTaskPlaybackDag({
+    projectId: "aming-claw",
+    backlog,
+    events: [],
+    visualization,
+  }));
+  assertFixture(fixtures.map((fixture) => fixture.topology).join(",") === "direct_main,mf_parallel,mf_batch_parallel", "typed DAG fixtures should preserve three distinct reusable topologies");
+  assertFixture(fixtures.every((fixture) => fixture.public_safe && fixture.typed_edges), "typed DAG consumer must preserve the public-safe typed-edge boundary");
+  assertFixture(fixtures.flatMap((fixture) => fixture.edges).every((item) => item.source && item.target && item.relationship && item.authority_source && item.evidence_ref), "every typed edge must retain stable endpoints, relationship, authority, and evidence ref");
+  assertFixture(direct.dag.edges.some((item) => item.inferred) && fixtures[0].edges.some((item) => item.inferred), "inferred bypass/waiver edges must remain visibly marked");
+
+  const relationTypes = new Set(fixtures.flatMap((fixture) => fixture.edges.map((item) => item.relationship)));
+  for (const required of ["backlog_parent", "backlog_child", "backlog_successor", "batch_row_dispatch", "worker_qa_failed", "worker_qa_rework", "worker_qa_passed", "ordered_merge_queue", "reconcile", "settlement", "close", "bypass", "waiver", "parent_event"]) {
+    assertFixture(relationTypes.has(required), `typed DAG consumer should expose ${required}`);
+  }
+
+  const rawSessionSecret = "raw-session-token-should-not-render";
+  const rawRouteSecret = "raw-route-token-should-not-render";
+  const unsafeVisualization = typedDagVisualizationFixture(
+    "mf_parallel.v2",
+    [
+      {
+        id: "node:unsafe",
+        kind: "worker",
+        label: rawSessionSecret,
+        authority_source: `route_token:${rawRouteSecret}`,
+        evidence_ref: `session_token=${rawSessionSecret}`,
+      },
+      node("node:safe-target", "qa"),
+    ],
+    [
+      {
+        ...edge("worker_qa_failed", "node:unsafe", "node:safe-target"),
+        authority_source: `route_token:${rawRouteSecret}`,
+        evidence_ref: `session_token=${rawSessionSecret}`,
+      },
+    ],
+  );
+  assertFixture(
+    typedDagRawSecretPath(unsafeVisualization.dag) === "contract_runtime.visualization.dag.nodes.0.label",
+    "API boundary helper should locate the first falsely public-safe raw DAG secret field",
+  );
+  const sanitizedUnsafeDag = normalizeTaskPlaybackDag({ projectId: "aming-claw", backlog, events: [], visualization: unsafeVisualization });
+  const sanitizedUnsafeNode = sanitizedUnsafeDag.nodes.find((item) => item.id === "node:unsafe");
+  const sanitizedUnsafeEdge = sanitizedUnsafeDag.edges.find((item) => item.source === "node:unsafe" && item.target === "node:safe-target");
+  assertFixture(Boolean(sanitizedUnsafeNode && sanitizedUnsafeEdge), "unsafe DAG fixture should remain structurally inspectable after redaction");
+  for (const [field, value] of Object.entries({
+    "node.label": sanitizedUnsafeNode?.label,
+    "node.authority_source": sanitizedUnsafeNode?.authority_source,
+    "node.evidence_ref": sanitizedUnsafeNode?.evidence_ref,
+    "edge.authority_source": sanitizedUnsafeEdge?.authority_source,
+    "edge.evidence_ref": sanitizedUnsafeEdge?.evidence_ref,
+  })) {
+    assertFixture(value === "[private detail redacted]", `${field} should redact raw route/session secret material`);
+  }
+  const sanitizedUnsafeJson = JSON.stringify(sanitizedUnsafeDag);
+  assertFixture(!sanitizedUnsafeJson.includes(rawSessionSecret) && !sanitizedUnsafeJson.includes(rawRouteSecret), "public-safe typed DAG normalization must not retain raw route/session secrets");
+
+  const sharedEvent: TaskTimelineEvent = {
+    event_id: "shared-event-1",
+    event_type: "worker.implementation",
+    event_kind: "implementation",
+    status: "passed",
+    actor: "mf_sub",
+    payload: { worker_id: "worker-one" },
+  };
+  const sharedDag = normalizeTaskPlaybackDag({ projectId: "aming-claw", backlog, events: [sharedEvent], visualization: parallel });
+  const sharedTrace = normalizeTaskPlaybackTrace({
+    projectId: "aming-claw",
+    backlog,
+    taskTimeline: { project_id: "aming-claw", backlog_id: backlog.bug_id, events: [sharedEvent], count: 1 },
+    gateResponse: null,
+    source: "governed",
+  });
+  assertFixture(sharedDag.nodes.some((item) => item.id === "timeline-event:shared-event-1") && sharedTrace.dag.nodes.some((item) => item.id === "timeline-event:shared-event-1"), "Backlog detail and Playback must use the same normalized event identity");
+  return fixtures.map((fixture) => `${fixture.topology}:${fixture.edge_count}`);
 }
 
 function taskPlaybackAuthorityAdapterAssertions(): string[] {
