@@ -1157,9 +1157,16 @@ def _project_current_contract_state(
                         return returned_state
                 return _project_record_state(root_record)
             return direct_state
-    incomplete = [
+    superseded_execution_ids = _recovery_superseded_execution_ids(records)
+    selectable_records = [
         record
         for record in records
+        if str(record.get("contract_execution_id") or "").strip()
+        not in superseded_execution_ids
+    ]
+    incomplete = [
+        record
+        for record in selectable_records
         if not _record_is_complete(record)
     ]
     incomplete_children = [
@@ -1168,12 +1175,41 @@ def _project_current_contract_state(
         if str(record.get("parent_contract_execution_id") or "").strip()
     ]
     current_record = _latest_record(
-        incomplete_children or incomplete or records,
+        incomplete_children or incomplete or selectable_records or records,
         row_times=row_times,
     )
     if not current_record:
         return _empty_projected_state("missing_contract_runtime_execution")
     return _project_record_state(current_record)
+
+
+def _recovery_superseded_execution_ids(
+    records: list[dict[str, Any]],
+) -> set[str]:
+    execution_ids = {
+        str(record.get("contract_execution_id") or "").strip()
+        for record in records
+        if str(record.get("contract_execution_id") or "").strip()
+    }
+    superseded: set[str] = set()
+    for record in records:
+        recovery_execution_id = str(
+            record.get("contract_execution_id") or ""
+        ).strip()
+        for lineage_field in ("metadata", "backlog_lineage"):
+            lineage = record.get(lineage_field)
+            if not isinstance(lineage, Mapping):
+                continue
+            stale_execution_id = str(
+                lineage.get("stale_contract_execution_id") or ""
+            ).strip()
+            if (
+                stale_execution_id
+                and stale_execution_id != recovery_execution_id
+                and stale_execution_id in execution_ids
+            ):
+                superseded.add(stale_execution_id)
+    return superseded
 
 
 def _project_record_state(record: Mapping[str, Any]) -> dict[str, Any]:

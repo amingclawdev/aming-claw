@@ -41233,6 +41233,95 @@ def test_mf_parallel_close_authority_selects_current_recovery_before_stale_last_
     assert gate["authoritative_selector_present"] is True
 
 
+def test_mf_parallel_close_authority_uses_projected_completed_recovery_over_named_stale(
+    conn,
+):
+    backlog_id = "AC-MF-PARALLEL-CLOSE-AUTHORITY-RECOVERY-PROJECTION"
+    close_commit = "aa49e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "bb49e8bdf9b100f28fb5843f61ef83ed82618f18"
+    root_execution_id = "cex-a-close-authority-root"
+    stale_execution_id = "cex-b-close-authority-stale"
+    recovery_execution_id = "cex-z-close-authority-recovery"
+    contract_chain_id = "cchain-close-authority-recovery"
+    runtime = server._contract_runtime(conn)
+    runtime.store.create(
+        {
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "contract_execution_id": root_execution_id,
+            "contract_id": "observer_onboard",
+            "root_contract_execution_id": root_execution_id,
+            "contract_chain_id": contract_chain_id,
+            "execution_state_revision": 2,
+            "completed_lines": [],
+            "runtime_guide": {"completed_lines": [], "next_legal_action": None},
+        }
+    )
+    stale = _mf_parallel_close_authority_v2_record(
+        stale_execution_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=False,
+    )
+    stale.update(
+        {
+            "backlog_id": backlog_id,
+            "parent_contract_execution_id": root_execution_id,
+            "root_contract_execution_id": root_execution_id,
+            "contract_chain_id": contract_chain_id,
+            "execution_state_revision": 7,
+        }
+    )
+    stale["runtime_guide"]["next_legal_action"] = {
+        "stage_id": "observer_close",
+        "line_id": "observer_close_ready",
+    }
+    runtime.store.create(stale)
+    recovery = _mf_parallel_close_authority_v2_record(
+        recovery_execution_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=True,
+    )
+    recovery.update(
+        {
+            "backlog_id": backlog_id,
+            "parent_contract_execution_id": root_execution_id,
+            "root_contract_execution_id": root_execution_id,
+            "contract_chain_id": contract_chain_id,
+            "execution_state_revision": 8,
+            "metadata": {
+                "recovery_policy": "start_new_execution",
+                "stale_contract_execution_id": stale_execution_id,
+            },
+        }
+    )
+    runtime.store.create(recovery)
+
+    projection = server.read_backlog_contract_chain_current(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    records = runtime.store.list_by_backlog(
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    gate = server._contract_runtime_mf_parallel_close_authority_gate(
+        records,
+        chain_projection=projection,
+        close_commit=close_commit,
+    )
+
+    assert projection["current_contract_execution_id"] == recovery_execution_id
+    assert stale_execution_id in projection["active_chain"]["execution_ids"]
+    assert gate["passed"] is True
+    assert gate["contract_execution_id"] == recovery_execution_id
+    assert gate["record_selection_source"] == (
+        "chain_projection.active_child_contract_execution_id"
+    )
+
+
 def test_mf_parallel_close_authority_fails_current_recovery_before_stale_complete_record(
 ):
     close_commit = "c149e8bdf9b100f28fb5843f61ef83ed82618f18"
