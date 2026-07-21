@@ -39,6 +39,7 @@ from agent.governance.contracts.instructions import resolve_instruction_bundle
 from agent.governance.contracts import write_gate as contract_write_gate
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
+    _line_status_allows_contract_completion,
     _mf_parallel_worker_commit_errors,
     _next_action_from_record,
     _worker_implementation_lineage,
@@ -66388,6 +66389,8 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         },
         "payload": {
             "schema_version": "qa_independent_verification.v1",
+            "base_commit_sha": expected_graph_evidence["base_commit_sha"],
+            "candidate_commit_sha": head_commit,
             "acceptance_scope": "candidate_regression_and_acceptance_criteria",
             "verdict": "accepted",
             "full_suite_claim": "not_claimed",
@@ -66401,6 +66404,22 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
             "status": "accepted",
             "contract_execution_id": successor["contract_execution_id"],
             "tests": ["pytest agent/tests/test_graph_governance_api.py"],
+            "test_results": {
+                "baseline": {
+                    "failed": 1,
+                    "passed": 712,
+                    "failure_identities": ["test_inherited_non_green"],
+                },
+                "candidate": {
+                    "failed": 1,
+                    "passed": 712,
+                    "failure_identities": ["test_inherited_non_green"],
+                },
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+            },
         },
         "test_results": {
             "scope": "candidate_regression_and_acceptance_criteria",
@@ -66608,6 +66627,68 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     ]
     assert canonical_ledger["candidate_new_failures"] == 0
     assert canonical_ledger["overall_release_pass_claimed"] is False
+    assert _line_status_allows_contract_completion(qa_line) is True
+
+    # Source-runtime eligibility is narrow: the inherited non-green counts may
+    # advance only while every authenticated canonical ledger invariant holds.
+    invalid_runtime_lines = []
+    unnormalized = json.loads(json.dumps(qa_line))
+    unnormalized["artifact_refs"]["external_no_pass_baseline_ledger"][
+        "server_normalized"
+    ] = False
+    invalid_runtime_lines.append(unnormalized)
+    unauthenticated = json.loads(json.dumps(qa_line))
+    unauthenticated["qa_evidence_provenance"]["server_derived"] = False
+    invalid_runtime_lines.append(unauthenticated)
+    forged_pass = json.loads(json.dumps(qa_line))
+    forged_pass["payload"]["test_results"]["candidate"]["passed"] = True
+    invalid_runtime_lines.append(forged_pass)
+    wrong_base = json.loads(json.dumps(qa_line))
+    wrong_base["payload"]["base_commit_sha"] = "f" * 40
+    invalid_runtime_lines.append(wrong_base)
+    wrong_candidate = json.loads(json.dumps(qa_line))
+    wrong_candidate["artifact_refs"]["external_no_pass_baseline_ledger"][
+        "candidate_commit_sha"
+    ] = "e" * 40
+    invalid_runtime_lines.append(wrong_candidate)
+    changed_identities = json.loads(json.dumps(qa_line))
+    changed_identities["artifact_refs"]["external_no_pass_baseline_ledger"][
+        "candidate_failure_identities"
+    ] = ["test_candidate_only"]
+    invalid_runtime_lines.append(changed_identities)
+    duplicate_identities = json.loads(json.dumps(qa_line))
+    duplicate_ledger = duplicate_identities["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]
+    for field in ("base_failure_identities", "candidate_failure_identities"):
+        duplicate_ledger[field] = [
+            "test_inherited_non_green",
+            "test_inherited_non_green",
+        ]
+    duplicate_ledger["base_reproduction"]["failure_identities"] = [
+        "test_inherited_non_green",
+        "test_inherited_non_green",
+    ]
+    invalid_runtime_lines.append(duplicate_identities)
+    wrong_count = json.loads(json.dumps(qa_line))
+    wrong_count["artifact_refs"]["external_no_pass_baseline_ledger"][
+        "candidate_suite_counts"
+    ]["failed"] = 2
+    invalid_runtime_lines.append(wrong_count)
+    candidate_new = json.loads(json.dumps(qa_line))
+    for source in (
+        candidate_new["payload"],
+        candidate_new["test_results"],
+        candidate_new["verification"],
+        candidate_new["artifact_refs"]["external_no_pass_baseline_ledger"],
+    ):
+        source["candidate_new_failures"] = 1
+    candidate_new["payload"]["test_results"]["candidate_new_failures"] = 1
+    invalid_runtime_lines.append(candidate_new)
+    assert all(
+        not _line_status_allows_contract_completion(candidate_line)
+        for candidate_line in invalid_runtime_lines
+    )
 
     duplicate_result = server.handle_task_timeline_append(
         _ctx(
