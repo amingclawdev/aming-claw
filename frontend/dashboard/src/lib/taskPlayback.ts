@@ -1,6 +1,9 @@
 import type {
   BacklogBug,
   BacklogTimelineGateResponse,
+  ContractRuntimeDagEdge,
+  ContractRuntimeDagNode,
+  ContractRuntimeDagRelationship,
   ContractRuntimeVisualizationNextAction,
   ContractRuntimeVisualizationResponse,
   TaskTimelineEvent,
@@ -276,6 +279,45 @@ export interface TaskPlaybackCurrentSnapshot {
   current_snapshot_in_playback: false;
 }
 
+export type TaskPlaybackTopology = "direct_main" | "mf_parallel" | "mf_batch_parallel" | "unknown";
+
+export interface TaskPlaybackDagNode extends ContractRuntimeDagNode {
+  id: string;
+  kind: string;
+  label: string;
+  authority_source: string;
+  inferred: boolean;
+}
+
+export interface TaskPlaybackDagEdge extends ContractRuntimeDagEdge {
+  id: string;
+  source: string;
+  target: string;
+  relationship: ContractRuntimeDagRelationship;
+  authority_source: string;
+  evidence_ref: string;
+  inferred: boolean;
+}
+
+export interface TaskPlaybackDag {
+  schema_version: "task_playback.typed_dag.v1";
+  source_schema_version: string;
+  topology: TaskPlaybackTopology;
+  public_safe: true;
+  typed_edges: true;
+  nodes: TaskPlaybackDagNode[];
+  edges: TaskPlaybackDagEdge[];
+  node_count: number;
+  edge_count: number;
+}
+
+export interface NormalizeTaskPlaybackDagInput {
+  projectId: string;
+  backlog: BacklogBug;
+  events: TaskTimelineEvent[];
+  visualization?: ContractRuntimeVisualizationResponse | null;
+}
+
 export interface TaskPlaybackTrace {
   schema_version: typeof TASK_PLAYBACK_TRACE_SCHEMA;
   project_id: string;
@@ -293,6 +335,8 @@ export interface TaskPlaybackTrace {
   /** Mutable compact-ledger state. Never projected into playback frames. */
   current_snapshot: TaskPlaybackCurrentSnapshot;
   compact_ledger: TaskPlaybackCompactLedger;
+  /** Public-safe typed causal topology shared with Backlog detail. */
+  dag: TaskPlaybackDag;
   privacy_boundary: TaskPlaybackPrivacyBoundary;
   close_gate_summary: TaskPlaybackCloseGateSummary;
   close_gate_matrix: GateMatrixProjection;
@@ -491,6 +535,266 @@ export function projectContractRuntimeAuthorityViewModel(
   };
 }
 
+/** Normalize the backend visual read model into one public-safe identity space. */
+export function normalizeTaskPlaybackDag(input: NormalizeTaskPlaybackDagInput): TaskPlaybackDag {
+  const visualization = input.visualization ?? null;
+  const rawDag = visualization?.dag;
+  const nodes = new Map<string, TaskPlaybackDagNode>();
+  const edges = new Map<string, TaskPlaybackDagEdge>();
+  const rawIdentityMap = new Map<string, string>();
+
+  const addNode = (node: TaskPlaybackDagNode): string => {
+    const id = safeText(node.id);
+    if (!id) return "";
+    const normalized: TaskPlaybackDagNode = {
+      ...node,
+      id,
+      kind: safeText(node.kind) || "reference",
+      label: safeText(node.label) || id,
+      status: safeText(String(node.status ?? "")),
+      authority_source: safeText(node.authority_source) || "contract_runtime.visualization.dag",
+      evidence_ref: safeText(String(node.evidence_ref ?? "")),
+      inferred: Boolean(node.inferred),
+    };
+    const existing = nodes.get(id);
+    if (!existing || (existing.inferred && !normalized.inferred)) nodes.set(id, normalized);
+    return id;
+  };
+
+  for (const rawNode of rawDag?.nodes ?? []) {
+    const raw = rawNode as ContractRuntimeDagNode;
+    const id = normalizedDagNodeId(raw);
+    if (!id) continue;
+    rawIdentityMap.set(safeText(String(raw.id ?? "")), id);
+    addNode({
+      id,
+      kind: safeText(String(raw.kind ?? "reference")),
+      label: safeText(String(raw.label ?? id)),
+      status: safeText(String(raw.status ?? "")),
+      authority_source: safeText(String(raw.authority_source ?? "contract_runtime.visualization.dag")),
+      evidence_ref: safeText(String(raw.evidence_ref ?? "")),
+      backlog_id: safeText(String(raw.backlog_id ?? "")),
+      contract_execution_id: safeText(String(raw.contract_execution_id ?? "")),
+      contract_id: safeText(String(raw.contract_id ?? "")),
+      event_id: safeText(String(raw.event_id ?? "")),
+      task_id: safeText(String(raw.task_id ?? "")),
+      worker_id: safeText(String(raw.worker_id ?? "")),
+      merge_queue_id: safeText(String(raw.merge_queue_id ?? "")),
+      merge_queue_index: numberFrom(raw.merge_queue_index) ?? undefined,
+      inferred: Boolean(raw.inferred),
+    });
+  }
+
+  const backlogNodeId = addNode({
+    id: `backlog:${safeText(input.backlog.bug_id)}`,
+    kind: "backlog",
+    label: safeText(input.backlog.title || input.backlog.bug_id),
+    status: safeText(input.backlog.status),
+    authority_source: "backlog_bugs",
+    evidence_ref: `backlog:${safeText(input.backlog.bug_id)}`,
+    backlog_id: safeText(input.backlog.bug_id),
+    inferred: !rawIdentityMap.has(`backlog:${input.backlog.bug_id}`),
+  });
+
+  const orderedEvents = input.events.slice().sort(compareTimelineEvents);
+  const eventNodeIds = new Map<string, string>();
+  orderedEvents.forEach((event, index) => {
+    const eventId = eventIdentity(event, index);
+    const nodeId = addNode({
+      id: `timeline-event:${safeText(eventId)}`,
+      kind: "timeline_event",
+      label: safeText(projectTaskTimelineEvent(event, index).headline || event.event_kind || event.event_type),
+      status: safeText(event.status || event.decision || ""),
+      authority_source: "task_timeline_events",
+      evidence_ref: `timeline:${safeText(eventId)}`,
+      event_id: safeText(eventId),
+      task_id: safeText(event.task_id || ""),
+      inferred: !(rawDag?.nodes ?? []).some((node) => safeText(String(node.id ?? "")) === `timeline-event:${safeText(eventId)}`),
+    });
+    eventNodeIds.set(eventId, nodeId);
+  });
+
+  const ensureReferenceNode = (id: string, authoritySource: string): string => {
+    const normalized = rawIdentityMap.get(id) || safeText(id);
+    if (!normalized) return "";
+    if (!nodes.has(normalized)) {
+      addNode({
+        id: normalized,
+        kind: normalized.split(":", 1)[0] || "reference",
+        label: normalized,
+        authority_source: authoritySource,
+        evidence_ref: "",
+        inferred: true,
+      });
+    }
+    return normalized;
+  };
+
+  const addEdge = (edge: {
+    id?: string;
+    source: string;
+    target: string;
+    relationship: ContractRuntimeDagRelationship;
+    authority_source: string;
+    evidence_ref: string;
+    inferred: boolean;
+  }): void => {
+    const source = ensureReferenceNode(safeText(edge.source), edge.authority_source);
+    const target = ensureReferenceNode(safeText(edge.target), edge.authority_source);
+    const relationship = safeText(String(edge.relationship)) as ContractRuntimeDagRelationship;
+    if (!source || !target || !relationship || source === target) return;
+    const stableId = `${relationship}:${source}:${target}`;
+    const authoritySource = safeText(edge.authority_source) || "contract_runtime.visualization.dag";
+    const normalized: TaskPlaybackDagEdge = {
+      id: stableId,
+      source,
+      target,
+      relationship,
+      authority_source: authoritySource,
+      evidence_ref: safeText(edge.evidence_ref || "") || `${authoritySource}:${target}`,
+      inferred: Boolean(edge.inferred),
+    };
+    const existing = edges.get(stableId);
+    if (!existing || (existing.inferred && !normalized.inferred)) edges.set(stableId, normalized);
+  };
+
+  for (const rawEdge of rawDag?.edges ?? []) {
+    addEdge({
+      id: safeText(String(rawEdge.id ?? "")),
+      source: rawIdentityMap.get(safeText(String(rawEdge.source ?? ""))) || safeText(String(rawEdge.source ?? "")),
+      target: rawIdentityMap.get(safeText(String(rawEdge.target ?? ""))) || safeText(String(rawEdge.target ?? "")),
+      relationship: safeText(String(rawEdge.relationship ?? "related")),
+      authority_source: safeText(String(rawEdge.authority_source ?? "contract_runtime.visualization.dag")),
+      evidence_ref: safeText(String(rawEdge.evidence_ref ?? "")),
+      inferred: Boolean(rawEdge.inferred),
+    });
+  }
+
+  const addBacklogRelation = (
+    relationship: "backlog_parent" | "backlog_child" | "backlog_successor",
+    relatedId: string,
+  ): void => {
+    const related = safeText(relatedId);
+    if (!backlogNodeId || !related || related === input.backlog.bug_id) return;
+    const relatedNodeId = addNode({
+      id: `backlog:${related}`,
+      kind: "backlog",
+      label: related,
+      authority_source: "backlog_bugs.chain_trigger_json",
+      evidence_ref: `backlog:${safeText(input.backlog.bug_id)}`,
+      backlog_id: related,
+      inferred: true,
+    });
+    addEdge({
+      source: relationship === "backlog_parent" ? relatedNodeId : backlogNodeId,
+      target: relationship === "backlog_parent" ? backlogNodeId : relatedNodeId,
+      relationship,
+      authority_source: "backlog_bugs.chain_trigger_json",
+      evidence_ref: `backlog:${safeText(input.backlog.bug_id)}`,
+      inferred: true,
+    });
+  };
+
+  for (const parent of dagDeepValues(input.backlog, ["parent_backlog_id", "parent_bug_id"])) addBacklogRelation("backlog_parent", parent);
+  for (const child of dagDeepValues(input.backlog, ["child_backlog_id", "child_bug_id"])) addBacklogRelation("backlog_child", child);
+  for (const successor of dagDeepValues(input.backlog, ["successor_backlog_id", "successor_bug_id"])) addBacklogRelation("backlog_successor", successor);
+
+  let lastWorkerNode = "";
+  let failedQaNode = "";
+  let previousEventNode = "";
+  const mergeQueueEvents: Array<{ nodeId: string; queueId: string; index: number; evidenceRef: string }> = [];
+  orderedEvents.forEach((event, index) => {
+    const eventId = eventIdentity(event, index);
+    const nodeId = eventNodeIds.get(eventId) || "";
+    if (!nodeId) return;
+    const evidenceRef = `timeline:${safeText(eventId)}`;
+    const eventRecord = event as unknown as Record<string, unknown>;
+    const eventText = dagSearchText(event);
+    const parentEventId = firstDagDeepText(eventRecord, ["parent_event_id"]);
+    if (parentEventId) {
+      addEdge({
+        source: eventNodeIds.get(parentEventId) || `timeline-event:${safeText(parentEventId)}`,
+        target: nodeId,
+        relationship: "parent_event",
+        authority_source: "task_timeline_events",
+        evidence_ref: evidenceRef,
+        inferred: true,
+      });
+    }
+
+    const isWorker = /worker|mf_sub|subagent|implementation/.test(eventText) && !/independent[_\s-]?qa/.test(eventText);
+    const isQa = /independent[_\s-]?qa|qa[_\s-]?verification|qa[_\s-]?verdict|verification/.test(eventText);
+    const failed = /fail|block|reject/.test(eventText);
+    const passed = /pass|accept|approved|success/.test(eventText) && !failed;
+    if (isWorker) {
+      if (failedQaNode) {
+        addEdge({
+          source: failedQaNode,
+          target: nodeId,
+          relationship: "worker_qa_rework",
+          authority_source: "task_timeline_events",
+          evidence_ref: evidenceRef,
+          inferred: true,
+        });
+        failedQaNode = "";
+      }
+      lastWorkerNode = nodeId;
+    } else if (isQa && lastWorkerNode) {
+      addEdge({
+        source: lastWorkerNode,
+        target: nodeId,
+        relationship: failed ? "worker_qa_failed" : passed ? "worker_qa_passed" : "worker_qa_verification",
+        authority_source: "task_timeline_events",
+        evidence_ref: evidenceRef,
+        inferred: true,
+      });
+      if (failed) failedQaNode = nodeId;
+    }
+
+    const parentTaskId = firstDagDeepText(eventRecord, ["batch_parent_task_id", "parent_task_id"]);
+    const rowTaskId = firstDagDeepText(eventRecord, ["row_task_id", "worker_task_id", "child_task_id"])
+      || (eventText.includes("dispatch") ? safeText(event.task_id || "") : "");
+    if (eventText.includes("dispatch") && parentTaskId && rowTaskId && parentTaskId !== rowTaskId) {
+      const parentNode = addNode({ id: `task:${parentTaskId}`, kind: "task", label: parentTaskId, authority_source: "task_timeline_events", evidence_ref: evidenceRef, task_id: parentTaskId, inferred: true });
+      const rowNode = addNode({ id: `task:${rowTaskId}`, kind: "task", label: rowTaskId, authority_source: "task_timeline_events", evidence_ref: evidenceRef, task_id: rowTaskId, inferred: true });
+      addEdge({ source: parentNode, target: rowNode, relationship: "batch_row_dispatch", authority_source: "task_timeline_events", evidence_ref: evidenceRef, inferred: true });
+    }
+
+    const queueIndex = firstDagDeepNumber(eventRecord, ["merge_queue_index", "queue_index", "order_index"]);
+    const queueId = firstDagDeepText(eventRecord, ["merge_queue_id"]);
+    if (queueIndex != null && queueId) mergeQueueEvents.push({ nodeId, queueId, index: queueIndex, evidenceRef });
+
+    if (previousEventNode) {
+      const lifecycleRelationship = dagLifecycleRelationship(eventText);
+      if (lifecycleRelationship) {
+        addEdge({ source: previousEventNode, target: nodeId, relationship: lifecycleRelationship, authority_source: "task_timeline_events", evidence_ref: evidenceRef, inferred: true });
+      }
+    }
+    previousEventNode = nodeId;
+  });
+
+  for (const queueId of stableStringValues(mergeQueueEvents.map((event) => event.queueId))) {
+    const ordered = mergeQueueEvents.filter((event) => event.queueId === queueId).sort((a, b) => a.index - b.index || a.nodeId.localeCompare(b.nodeId));
+    for (let index = 1; index < ordered.length; index += 1) {
+      addEdge({ source: ordered[index - 1].nodeId, target: ordered[index].nodeId, relationship: "ordered_merge_queue", authority_source: "task_timeline_events", evidence_ref: ordered[index].evidenceRef, inferred: true });
+    }
+  }
+
+  const normalizedNodes = Array.from(nodes.values()).sort((a, b) => a.id.localeCompare(b.id));
+  const normalizedEdges = Array.from(edges.values()).sort((a, b) => a.id.localeCompare(b.id));
+  return {
+    schema_version: "task_playback.typed_dag.v1",
+    source_schema_version: safeText(rawDag?.schema_version || "task_timeline.inferred_dag.v1"),
+    topology: taskPlaybackTopology(visualization),
+    public_safe: true,
+    typed_edges: true,
+    nodes: normalizedNodes,
+    edges: normalizedEdges,
+    node_count: normalizedNodes.length,
+    edge_count: normalizedEdges.length,
+  };
+}
+
 export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): TaskPlaybackTrace {
   const timelineEvents = (input.taskTimeline?.events ?? []).filter(isStablePlaybackSourceEvent);
   const authorityView = input.taskTimeline?.contract_runtime_visualization
@@ -510,6 +814,12 @@ export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): T
   const evidenceRefs = stableEvidence(frames.flatMap((frame) => frame.evidence_refs));
   const artifactRefs = stableArtifacts(frames.flatMap((frame) => frame.artifact_refs));
   const statuses = summarizeFrames(frames, closeGateSummary, source);
+  const dag = normalizeTaskPlaybackDag({
+    projectId: input.projectId,
+    backlog: input.backlog,
+    events,
+    visualization: input.taskTimeline?.contract_runtime_visualization,
+  });
 
   return {
     schema_version: TASK_PLAYBACK_TRACE_SCHEMA,
@@ -526,6 +836,7 @@ export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): T
     authority_view: authorityView,
     current_snapshot: taskPlaybackCurrentSnapshot(compactLedger, input.backlog.bug_id),
     compact_ledger: compactLedger,
+    dag,
     privacy_boundary: {
       raw_prompt_text: "not_displayed",
       host_private_paths: "redacted",
@@ -4050,6 +4361,102 @@ function isSensitiveEvidenceText(value: string, path = ""): boolean {
 
 function safeText(value: string): string {
   return sanitizeEvidenceString(value);
+}
+
+function normalizedDagNodeId(node: ContractRuntimeDagNode): string {
+  const explicit = safeText(String(node.id ?? ""));
+  if (explicit) return explicit;
+  const kind = safeText(String(node.kind ?? "reference")) || "reference";
+  const identity = safeText(String(
+    node.backlog_id
+      ?? node.contract_execution_id
+      ?? node.event_id
+      ?? node.task_id
+      ?? node.worker_id
+      ?? node.merge_queue_id
+      ?? node.label
+      ?? "",
+  ));
+  return identity ? `${kind.replace(/_/g, "-")}:${identity}` : "";
+}
+
+function dagDeepValues(value: unknown, keys: string[]): string[] {
+  const accepted = new Set(keys.map((key) => key.toLowerCase()));
+  const values: string[] = [];
+  const seen = new WeakSet<object>();
+  const visit = (candidate: unknown, depth: number): void => {
+    if (candidate == null || depth > 8) return;
+    if (Array.isArray(candidate)) {
+      candidate.forEach((item) => visit(item, depth + 1));
+      return;
+    }
+    if (typeof candidate !== "object") return;
+    if (seen.has(candidate)) return;
+    seen.add(candidate);
+    for (const [key, item] of Object.entries(candidate as Record<string, unknown>)) {
+      if (accepted.has(key.toLowerCase())) {
+        if (Array.isArray(item)) {
+          item.forEach((entry) => {
+            const text = safeText(String(entry ?? ""));
+            if (text) values.push(text);
+          });
+        } else {
+          const text = safeText(String(item ?? ""));
+          if (text && text !== "[object Object]") values.push(text);
+        }
+      }
+      visit(item, depth + 1);
+    }
+  };
+  visit(value, 0);
+  return stableStringValues(values);
+}
+
+function firstDagDeepText(value: unknown, keys: string[]): string {
+  return dagDeepValues(value, keys)[0] ?? "";
+}
+
+function firstDagDeepNumber(value: unknown, keys: string[]): number | null {
+  const text = firstDagDeepText(value, keys);
+  return text ? numberFrom(text) : null;
+}
+
+function stableStringValues(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => safeText(value)).filter(Boolean)));
+}
+
+function dagSearchText(event: TaskTimelineEvent): string {
+  let nested = "";
+  try {
+    nested = JSON.stringify([event.payload ?? {}, event.verification ?? {}, event.artifact_refs ?? {}]);
+  } catch {
+    nested = "";
+  }
+  return [event.event_type, event.event_kind, event.phase, event.actor, event.status, event.decision, nested]
+    .map((value) => String(value ?? ""))
+    .join(" ")
+    .toLowerCase();
+}
+
+function dagLifecycleRelationship(text: string): ContractRuntimeDagRelationship | "" {
+  if (/waiv/.test(text)) return "waiver";
+  if (/bypass/.test(text)) return "bypass";
+  if (/reconcile|update[_\s-]?graph/.test(text)) return "reconcile";
+  if (/settlement|settled|merge[_\s-]?queue[_\s-]?apply|merge[_\s-]?applied/.test(text)) return "settlement";
+  if (/backlog[_\s-]?close|close[_\s-]?ready|row[_\s-]?closed|status[_\s-]?closed/.test(text)) return "close";
+  return "";
+}
+
+function taskPlaybackTopology(visualization?: ContractRuntimeVisualizationResponse | null): TaskPlaybackTopology {
+  const contractId = safeText(
+    visualization?.contract_execution_progress.contract_id
+      || visualization?.contract_chain.current_contract_id
+      || "",
+  ).toLowerCase();
+  if (contractId.includes("mf_batch_parallel")) return "mf_batch_parallel";
+  if (contractId.includes("mf_parallel")) return "mf_parallel";
+  if (contractId.includes("direct_main") || contractId.includes("direct_fix")) return "direct_main";
+  return "unknown";
 }
 
 function stringFrom(value: unknown): string {

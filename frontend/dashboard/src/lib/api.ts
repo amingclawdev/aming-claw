@@ -76,6 +76,21 @@ function backlogTimelineGateQuery(limit: number): string {
   }).toString();
 }
 
+function requirePublicSafeTypedDag(response: ContractRuntimeVisualizationResponse): ContractRuntimeVisualizationResponse {
+  if (response.public_safe !== true || response.read_only !== true || response.dag?.typed_edges !== true) {
+    throw new ApiError(
+      502,
+      "ContractRuntime visualization is missing the public-safe typed DAG contract",
+      JSON.stringify({
+        public_safe: response.public_safe,
+        read_only: response.read_only,
+        typed_edges: response.dag?.typed_edges,
+      }),
+    );
+  }
+  return response;
+}
+
 function assetImpactReminderQuery(opts: { asset_kind?: string; status?: string } = {}): string {
   const q = new URLSearchParams();
   q.set("asset_kind", opts.asset_kind ?? "");
@@ -497,7 +512,7 @@ export const api = {
     return getJSON<ContractRuntimeVisualizationResponse>(
       `/api/projects/${pidFor(projectId)}/visualization/backlogs/${encodeURIComponent(backlogId)}?${q}`,
       signal,
-    );
+    ).then(requirePublicSafeTypedDag);
   },
   snapshotFiles(
     snapshotId: string,

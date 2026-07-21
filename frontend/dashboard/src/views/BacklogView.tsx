@@ -3,6 +3,7 @@ import { api, ApiError } from "../lib/api";
 import {
   buildPlaybackUrl,
   normalizeTaskPlaybackCompactLedger,
+  normalizeTaskPlaybackDag,
   projectContractRuntimeAuthorityViewModel,
   taskPlaybackCompactLedgerDisplayState,
   taskPlaybackCompactLedgerNextActionLabel,
@@ -12,6 +13,8 @@ import {
   type ContractRuntimeAuthorityViewModel,
   type TaskPlaybackCompactLedger,
   type TaskPlaybackCompactLedgerRow,
+  type TaskPlaybackDag,
+  type TaskPlaybackDagEdge,
 } from "../lib/taskPlayback";
 import {
   projectTaskTimelineEvent,
@@ -35,6 +38,7 @@ import type {
   BacklogTimelineGateResponse,
   BacklogQaAcceptance,
   ContentSysDemoVisualizationEvidence,
+  ContractRuntimeVisualizationResponse,
   AgentTaskContractProjection,
   MfCloseTimelineGate,
   ObserverCommandRecoveryProjection,
@@ -220,6 +224,7 @@ interface TimelineState {
   gate?: BacklogTimelineGateResponse;
   compactLedger?: TaskPlaybackCompactLedger;
   authorityView?: ContractRuntimeAuthorityViewModel;
+  visualization?: ContractRuntimeVisualizationResponse;
 }
 
 function compactLedgerFromResponses(projectId: string, ...sources: unknown[]): TaskPlaybackCompactLedger {
@@ -388,6 +393,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
           gate: existing?.gate,
           compactLedger: existing?.compactLedger,
           authorityView: existing?.authorityView,
+          visualization: existing?.visualization,
         },
       };
     });
@@ -429,6 +435,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
               gate,
               compactLedger,
               authorityView,
+              visualization: compactTimeline?.contract_runtime_visualization,
             },
           };
         });
@@ -449,6 +456,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
               gate: existing?.gate,
               compactLedger: existing?.compactLedger,
               authorityView: existing?.authorityView,
+              visualization: existing?.visualization,
             },
           };
         });
@@ -772,7 +780,13 @@ function BacklogDetailModal({
   const compactLedger = timeline?.compactLedger ?? compactLedgerFromResponses(projectId, timeline?.gate);
   const compactLedgerRow = taskPlaybackCompactLedgerRowForBacklog(compactLedger, fallbackBugId);
   const gate = timeline?.gate?.timeline_gate;
-  const dag = useMemo(() => buildTimelineDag(bug, events, gate), [bug, events, gate]);
+  const typedDag = useMemo(() => normalizeTaskPlaybackDag({
+    projectId,
+    backlog: bug ?? { bug_id: fallbackBugId, title: fallbackBugId, status: "OPEN", priority: "P2" },
+    events,
+    visualization: timeline?.visualization,
+  }), [bug, events, fallbackBugId, projectId, timeline?.visualization]);
+  const dag = useMemo(() => buildTimelineDag(bug, events, gate, typedDag), [bug, events, gate, typedDag]);
   const contractAudit = useMemo(() => buildContractAudit(bug, events, gate, timeline?.gate), [bug, events, gate, timeline?.gate]);
   const gateMatrix = useMemo(
     () => projectGateMatrix(timelineGateWithAuditClose(gate, timeline?.gate), timeline?.gate?.applicable !== false),
@@ -922,6 +936,25 @@ function BacklogDetailModal({
                           ))}
                         </div>
                       </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              {dag.edges.length > 0 ? (
+                <div className="backlog-modal-section" aria-label="Typed DAG edges">
+                  <div className="backlog-modal-section-head">
+                    <span>Typed edges</span>
+                    <span className="mono">{dag.topology} · {dag.edges.length} edge{dag.edges.length === 1 ? "" : "s"}</span>
+                  </div>
+                  <div className="backlog-token-list tone-neutral">
+                    {dag.edges.map((edge) => (
+                      <span key={edge.id} title={`${edge.authority_source}${edge.evidence_ref ? ` · ${edge.evidence_ref}` : ""}`}>
+                        <b>{edge.relationship}</b>
+                        {` · ${dag.edgeNodeLabels[edge.source] || edge.source} → ${dag.edgeNodeLabels[edge.target] || edge.target}`}
+                        {` · authority ${edge.authority_source}`}
+                        {edge.evidence_ref ? ` · evidence ${edge.evidence_ref}` : ""}
+                        {edge.inferred ? " · inferred" : " · explicit"}
+                      </span>
                     ))}
                   </div>
                 </div>
@@ -2793,6 +2826,9 @@ function TokenList({
 interface TimelineDag {
   lanes: TimelineDagLane[];
   nodes: TimelineDagNode[];
+  edges: TaskPlaybackDagEdge[];
+  edgeNodeLabels: Record<string, string>;
+  topology: TaskPlaybackDag["topology"];
   phaseLabels: string[];
   relatedIds: string[];
   workerLaneCount: number;
@@ -2824,33 +2860,41 @@ interface TimelineDagNode {
 }
 
 export function buildBacklogParallelTimelineFixtureDagForTest(): TimelineDag {
-  return buildTimelineDag(
-    {
-      bug_id: "FIXTURE-BACKLOG-PARALLEL-TIMELINE",
-      title: "Fixture backlog parallel timeline",
-      status: "OPEN",
-      priority: "P0",
-      provenance_paths: ["FIXTURE-RELATED-BACKLOG"],
-    },
-    BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS,
-    {
+  const backlog: BacklogBug = {
+    bug_id: "FIXTURE-BACKLOG-PARALLEL-TIMELINE",
+    title: "Fixture backlog parallel timeline",
+    status: "OPEN",
+    priority: "P0",
+    provenance_paths: ["FIXTURE-RELATED-BACKLOG"],
+  };
+  const gate: MfCloseTimelineGate = {
+    passed: false,
+    status: "blocked",
+    required_event_kinds: ["implementation", "verification", "close_ready"],
+    present_event_kinds: ["implementation", "verification"],
+    missing_event_kinds: ["close_ready"],
+    contract_gate: {
       passed: false,
       status: "blocked",
-      required_event_kinds: ["implementation", "verification", "close_ready"],
-      present_event_kinds: ["implementation", "verification"],
-      missing_event_kinds: ["close_ready"],
-      contract_gate: {
-        passed: false,
-        status: "blocked",
-        required_requirement_ids: ["parallel_timeline_dag", "evidence_inspector", "contract_missing_visualization"],
-        present_requirement_ids: ["parallel_timeline_dag", "evidence_inspector"],
-        missing_requirement_ids: ["contract_missing_visualization"],
-      },
+      required_requirement_ids: ["parallel_timeline_dag", "evidence_inspector", "contract_missing_visualization"],
+      present_requirement_ids: ["parallel_timeline_dag", "evidence_inspector"],
+      missing_requirement_ids: ["contract_missing_visualization"],
     },
+  };
+  return buildTimelineDag(
+    backlog,
+    BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS,
+    gate,
+    normalizeTaskPlaybackDag({ projectId: "aming-claw", backlog, events: BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS }),
   );
 }
 
-function buildTimelineDag(bug: BacklogBug | null, events: TaskTimelineEvent[], _gate?: MfCloseTimelineGate): TimelineDag {
+function buildTimelineDag(
+  bug: BacklogBug | null,
+  events: TaskTimelineEvent[],
+  _gate: MfCloseTimelineGate | undefined,
+  typedDag: TaskPlaybackDag,
+): TimelineDag {
   const phaseLabels: string[] = [];
   const nodes: TimelineDagNode[] = [];
   const orderedEvents = events.slice().sort(compareTimelineEvents);
@@ -2863,7 +2907,7 @@ function buildTimelineDag(bug: BacklogBug | null, events: TaskTimelineEvent[], _
     const fullHeadline = semantic.headline || timelineNodeLabel(event, index);
     const truncatedLabel = fullHeadline.length > 52 ? `${fullHeadline.slice(0, 49)}…` : fullHeadline;
     const eventNode: TimelineDagNode = {
-      id: `event:${timelineEventKey(event, index)}`,
+      id: `timeline-event:${timelineEventKey(event, index)}`,
       label: truncatedLabel,
       headline: fullHeadline,
       lane,
@@ -2900,6 +2944,9 @@ function buildTimelineDag(bug: BacklogBug | null, events: TaskTimelineEvent[], _
   return {
     lanes,
     nodes,
+    edges: typedDag.edges,
+    edgeNodeLabels: Object.fromEntries(typedDag.nodes.map((node) => [node.id, node.label])),
+    topology: typedDag.topology,
     phaseLabels,
     relatedIds: relatedIdsFromBug(bug, events),
     workerLaneCount: laneContext.workerKeys.length,

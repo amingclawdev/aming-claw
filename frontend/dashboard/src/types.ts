@@ -952,6 +952,66 @@ export interface ContractRuntimeVisualizationLineState {
   };
 }
 
+export type ContractRuntimeDagRelationship =
+  | "backlog_contract_root"
+  | "backlog_parent"
+  | "backlog_child"
+  | "backlog_successor"
+  | "contract_successor"
+  | "contains_line"
+  | "precedes"
+  | "batch_row_dispatch"
+  | "worker_qa_failed"
+  | "worker_qa_rework"
+  | "worker_qa_passed"
+  | "ordered_merge_queue"
+  | "reconcile"
+  | "settlement"
+  | "close"
+  | "bypass"
+  | "waiver"
+  | "parent_event"
+  | (string & {});
+
+export interface ContractRuntimeDagNode {
+  id: string;
+  kind: string;
+  label: string;
+  status?: string;
+  authority_source: string;
+  evidence_ref?: string;
+  backlog_id?: string;
+  contract_execution_id?: string;
+  contract_id?: string;
+  event_id?: string;
+  task_id?: string;
+  worker_id?: string;
+  merge_queue_id?: string;
+  merge_queue_index?: number;
+  inferred?: boolean;
+  [key: string]: unknown;
+}
+
+export interface ContractRuntimeDagEdge {
+  id: string;
+  source: string;
+  target: string;
+  relationship: ContractRuntimeDagRelationship;
+  authority_source: string;
+  evidence_ref?: string;
+  inferred: boolean;
+  [key: string]: unknown;
+}
+
+export interface ContractRuntimeVisualizationDag {
+  schema_version: string;
+  nodes: ContractRuntimeDagNode[];
+  edges: ContractRuntimeDagEdge[];
+  node_count: number;
+  edge_count: number;
+  typed_edges: boolean;
+}
+
 export interface ContractRuntimeVisualizationResponse {
   schema_version: "contract_runtime.visualization.v1" | string;
   ok: boolean;
@@ -1028,14 +1088,7 @@ export interface ContractRuntimeVisualizationResponse {
     append_only: boolean;
     current_snapshot_in_playback: false;
   };
-  dag: {
-    schema_version: string;
-    nodes: Record<string, unknown>[];
-    edges: Record<string, unknown>[];
-    node_count: number;
-    edge_count: number;
-    typed_edges: boolean;
-  };
+  dag: ContractRuntimeVisualizationDag;
   compact_ledger: Record<string, unknown>;
   bypass_records: Record<string, unknown>[];
   legacy_advisories: Record<string, unknown>[];

@@ -56,6 +56,20 @@ assertBacklogAuthority(
   "Backlog detail and Timeline DAG must consume the canonical three-axis authority view",
 );
 assertBacklogAuthority(
+  backlogViewSource.includes("normalizeTaskPlaybackDag")
+    && backlogViewSource.includes("visualization: compactTimeline?.contract_runtime_visualization")
+    && backlogViewSource.includes("timeline-event:${timelineEventKey(event, index)}"),
+  "Backlog detail and Playback must share the canonical typed-DAG normalizer and event identities",
+);
+assertBacklogAuthority(
+  backlogViewSource.includes("Typed edges")
+    && backlogViewSource.includes("edge.relationship")
+    && backlogViewSource.includes("edge.authority_source")
+    && backlogViewSource.includes("edge.evidence_ref")
+    && backlogViewSource.includes('edge.inferred ? " · inferred" : " · explicit"'),
+  "Backlog detail must visibly consume relationship, authority, evidence, and inference fields",
+);
+assertBacklogAuthority(
   backlogViewSource.includes("Historical compact ledger (advisory)")
     && backlogViewSource.includes("Historical ledger action (advisory)"),
   "legacy compact-ledger actions must be labeled advisory when canonical authority is present",
