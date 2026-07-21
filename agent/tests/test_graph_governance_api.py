@@ -61690,10 +61690,20 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
             "observer_impersonation": False,
             "qa_evidence_provenance": {
                 "schema_version": "qa_evidence_provenance.v1",
+                "server_derived": True,
                 "authorization_source": "qa_session_token_ref",
                 "evidence_owner_role": "qa",
                 "observer_impersonation": False,
                 "parent_materialization_authorized": False,
+                "authenticated_qa_binding": {
+                    "schema_version": (
+                        "contract_runtime.authenticated_qa_binding.v1"
+                    ),
+                    "server_derived": True,
+                    "qa_principal": "qa:merge-authority",
+                    "qa_session_id": "ses-qa-merge-authority",
+                    "independent_verification_session_matched": True,
+                },
                 "completion_status_gate": {
                     "schema_version": (
                         "contract_runtime.qa_completion_status_gate.v1"
@@ -61706,8 +61716,29 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
             },
             "artifact_refs": {
                 "external_no_pass_baseline_ledger": {
-                    "base_reproduction": {"reproduced": 17, "total": 17},
+                    "schema_version": (
+                        "contract_runtime.external_no_pass_baseline_ledger.v2"
+                    ),
+                    "base_commit_sha": qa_graph_line["payload"][
+                        "graph_trace_evidence"
+                    ]["base_commit_sha"],
+                    "candidate_commit_sha": qa_commit,
+                    "base_failure_identities": [
+                        f"test_inherited_{index}" for index in range(17)
+                    ],
+                    "candidate_failure_identities": [
+                        f"test_inherited_{index}" for index in range(17)
+                    ],
+                    "base_reproduction": {
+                        "reproduced": 17,
+                        "total": 17,
+                        "failure_identities": [
+                            f"test_inherited_{index}"
+                            for index in range(17)
+                        ],
+                    },
                     "candidate_new_failures": 0,
+                    "candidate_specific_issues": [],
                     "candidate_suite_counts": {
                         "baseline_known_non_green": 17,
                         "failed": 17,
@@ -61773,10 +61804,11 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         "candidate_regression_and_acceptance_criteria"
     )
     assert no_pass_authority["candidate_new_failures"] == 0
-    assert no_pass_authority["base_reproduction"] == {
-        "reproduced": 17,
-        "total": 17,
-    }
+    assert no_pass_authority["base_reproduction"]["reproduced"] == 17
+    assert no_pass_authority["base_reproduction"]["total"] == 17
+    assert no_pass_authority["base_reproduction"][
+        "failure_identities"
+    ] == [f"test_inherited_{index}" for index in range(17)]
     trusted_no_pass_projection = (
         server._contract_runtime_trusted_merge_projection(
             conn,
@@ -61829,10 +61861,12 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         record["completed_lines"][10]
     ) is True
     assert server._contract_runtime_candidate_scoped_no_pass_line(
-        record["completed_lines"][10]
+        record["completed_lines"][10],
+        record=record,
     ) is True
     assert server._contract_runtime_line_reports_disqualifying_failed_qa(
-        record["completed_lines"][10]
+        record["completed_lines"][10],
+        record=record,
     ) is False
     assert server._contract_runtime_completed_line_acceptance(
         conn,
@@ -61925,10 +61959,12 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     for field in ("payload", "test_results", "verification"):
         genuine_qa[field]["candidate_new_failures"] = 1
     assert server._contract_runtime_candidate_scoped_no_pass_line(
-        genuine_qa
+        genuine_qa,
+        record=genuine_candidate_failure,
     ) is False
     assert server._contract_runtime_line_reports_disqualifying_failed_qa(
-        genuine_qa
+        genuine_qa,
+        record=genuine_candidate_failure,
     ) is True
     assert_no_durable_authority(genuine_candidate_failure)
 
@@ -61936,7 +61972,8 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     malformed_qa = malformed_no_pass["completed_lines"][10]
     malformed_qa["artifact_refs"].pop("external_no_pass_baseline_ledger")
     assert server._contract_runtime_candidate_scoped_no_pass_line(
-        malformed_qa
+        malformed_qa,
+        record=malformed_no_pass,
     ) is False
     assert_no_durable_authority(malformed_no_pass)
 
@@ -61946,10 +61983,12 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         invalid_qa["payload"]["verdict"] = verdict
         invalid_qa["verification"]["verdict"] = verdict
         assert server._contract_runtime_candidate_scoped_no_pass_line(
-            invalid_qa
+            invalid_qa,
+            record=invalid_verdict,
         ) is False
         assert server._contract_runtime_line_reports_disqualifying_failed_qa(
-            invalid_qa
+            invalid_qa,
+            record=invalid_verdict,
         ) is True
         assert_no_durable_authority(invalid_verdict)
 
@@ -61959,12 +61998,133 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     non_candidate_qa["test_results"]["scope"] = "full_suite"
     non_candidate_qa["verification"]["acceptance_scope"] = "full_suite"
     assert server._contract_runtime_candidate_scoped_no_pass_line(
-        non_candidate_qa
+        non_candidate_qa,
+        record=non_candidate_scoped,
     ) is False
     assert server._contract_runtime_line_reports_disqualifying_failed_qa(
-        non_candidate_qa
+        non_candidate_qa,
+        record=non_candidate_scoped,
     ) is True
     assert_no_durable_authority(non_candidate_scoped)
+
+    # Compatibility is read-only and exact: this reproduces the immutable
+    # accepted no-PASS line shape that predates the canonical ledger.  Its
+    # authenticated QA binding and DB-verified graph tuple remain authority,
+    # but any identity, commit, provenance, candidate-new, or PASS drift fails.
+    immutable_record = json.loads(json.dumps(record))
+    immutable_qa = immutable_record["completed_lines"][10]
+    canonical_ledger = immutable_qa["artifact_refs"].pop(
+        "external_no_pass_baseline_ledger"
+    )
+    failure_identities = canonical_ledger["base_failure_identities"]
+    immutable_results = {
+        "schema_version": "mf_parallel.qa_test_results.v1",
+        "status": "accepted_with_known_baseline_failure",
+        "baseline_failed": len(failure_identities),
+        "baseline_passed": 712,
+        "baseline_failure_node_ids": failure_identities,
+        "baseline_only_failure_node_ids": [],
+        "candidate_failed": len(failure_identities),
+        "candidate_passed": 714,
+        "candidate_failure_node_ids": failure_identities,
+        "candidate_only_failure_node_ids": [],
+        "candidate_new_failures": 0,
+        "candidate_specific_issues": [],
+        "no_pass": True,
+        "passed": False,
+        "overall_release_pass": False,
+        "overall_release_pass_claimed": False,
+        "full_suite_claim": "not_claimed",
+    }
+    immutable_verification = {
+        "schema_version": "mf_parallel.qa_independent_verification.v1",
+        "verdict": "accepted",
+        "candidate_specific_new_failures": 0,
+        "candidate_specific_issues": [],
+        "no_pass_claim": True,
+        "overall_release_pass_claimed": False,
+        "full_suite_claim": "not_claimed",
+        "row_scoped_qa_pass": True,
+    }
+    immutable_qa["payload"] = {
+        "schema_version": "mf_parallel.qa_independent_verification.v1",
+        "base_commit_sha": canonical_ledger["base_commit_sha"],
+        "candidate_commit_sha": qa_commit,
+        "candidate_new_failures": 0,
+        "candidate_specific_issues": [],
+        "full_suite_claim": "not_claimed",
+        "no_pass_claim": True,
+        "overall_release_pass_claimed": False,
+        "row_scoped_qa_pass": True,
+        "test_results": immutable_results,
+        "verdict": "accepted",
+        "verification": immutable_verification,
+    }
+    immutable_qa["test_results"] = immutable_results
+    immutable_qa["verification"] = immutable_verification
+    assert not server._contract_runtime_candidate_scoped_no_pass_line(
+        immutable_qa
+    )
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        immutable_qa,
+        record=immutable_record,
+    )
+
+    immutable_mutations = []
+    unauthenticated = json.loads(json.dumps(immutable_record))
+    unauthenticated["completed_lines"][10]["qa_evidence_provenance"][
+        "server_derived"
+    ] = False
+    immutable_mutations.append(unauthenticated)
+    wrong_base = json.loads(json.dumps(immutable_record))
+    wrong_base["completed_lines"][10]["payload"]["base_commit_sha"] = "f" * 40
+    immutable_mutations.append(wrong_base)
+    changed_identity = json.loads(json.dumps(immutable_record))
+    changed_identity["completed_lines"][10]["test_results"][
+        "candidate_failure_node_ids"
+    ][0] = "test_candidate_only"
+    changed_identity["completed_lines"][10]["payload"]["test_results"] = (
+        changed_identity["completed_lines"][10]["test_results"]
+    )
+    immutable_mutations.append(changed_identity)
+    candidate_new = json.loads(json.dumps(immutable_record))
+    for source in (
+        candidate_new["completed_lines"][10]["payload"],
+        candidate_new["completed_lines"][10]["test_results"],
+        candidate_new["completed_lines"][10]["payload"]["test_results"],
+    ):
+        source["candidate_new_failures"] = 1
+    immutable_mutations.append(candidate_new)
+    forged_pass = json.loads(json.dumps(immutable_record))
+    forged_pass["completed_lines"][10]["test_results"]["passed"] = True
+    forged_pass["completed_lines"][10]["payload"]["test_results"] = (
+        forged_pass["completed_lines"][10]["test_results"]
+    )
+    immutable_mutations.append(forged_pass)
+    for invalid_record in immutable_mutations:
+        invalid_qa = invalid_record["completed_lines"][10]
+        assert not server._contract_runtime_candidate_scoped_no_pass_line(
+            invalid_qa,
+            record=invalid_record,
+        )
+
+    runtime.store.update(
+        contract_execution_id,
+        immutable_record,
+        expected_revision=int(record["execution_state_revision"]),
+    )
+    record = runtime.store.get(contract_execution_id)
+    authority = server._contract_runtime_completed_merge_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        context=context,
+        timeline_events=timeline_events,
+    )
+    assert authority["authority_verified"] is True
+    assert authority["no_pass_claim"] is True
+    assert authority["candidate_new_failures"] == 0
+    assert authority["overall_release_pass_claimed"] is False
 
     composed_authority = (
         server._contract_runtime_current_full_reconcile_authority_from_merge(
@@ -66263,12 +66423,29 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         },
         "artifact_refs": {
             "external_no_pass_baseline_ledger": {
+                "schema_version": (
+                    "contract_runtime.external_no_pass_baseline_ledger.v2"
+                ),
+                "base_commit_sha": expected_graph_evidence[
+                    "base_commit_sha"
+                ],
+                "candidate_commit_sha": head_commit,
+                "base_failure_identities": ["test_inherited_non_green"],
+                "candidate_failure_identities": [
+                    "test_inherited_non_green"
+                ],
                 "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
                 "no_pass_claim": True,
                 "overall_release_pass_claimed": False,
-                "base_reproduction": {"reproduced": 17, "total": 17},
+                "base_reproduction": {
+                    "reproduced": 1,
+                    "total": 1,
+                    "failure_identities": ["test_inherited_non_green"],
+                },
                 "candidate_suite_counts": {
-                    "baseline_known_non_green": 17,
+                    "baseline_known_non_green": 1,
+                    "failed": 1,
                     "passed": 712,
                 },
                 "refs": ["pytest:agent/tests/test_graph_governance_api.py"],
@@ -66287,6 +66464,27 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
                 body=qa_independent_body,
             )
         )
+    mismatched_failures = json.loads(json.dumps(qa_independent_body))
+    mismatched_failures["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]["candidate_failure_identities"] = ["test_candidate_only_failure"]
+    with pytest.raises(GovernanceError) as no_pass_shape:
+        server.handle_project_contract_runtime_line_write_precheck(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor[
+                        "contract_execution_id"
+                    ],
+                },
+                "qa",
+                method="POST",
+                body=mismatched_failures,
+            )
+        )
+    assert no_pass_shape.value.code == (
+        "contract_runtime_qa_no_pass_authority_shape_invalid"
+    )
     precheck = server.handle_project_contract_runtime_line_write_precheck(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
@@ -66394,7 +66592,22 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         "nested_payload_decision_satisfies": False,
         "server_derived": True,
     }
-    assert server._contract_runtime_candidate_scoped_no_pass_line(qa_line) is True
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        qa_line,
+        record=stored_after_qa,
+    ) is True
+    canonical_ledger = qa_line["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]
+    assert canonical_ledger["server_normalized"] is True
+    assert canonical_ledger["base_failure_identities"] == [
+        "test_inherited_non_green"
+    ]
+    assert canonical_ledger["candidate_failure_identities"] == [
+        "test_inherited_non_green"
+    ]
+    assert canonical_ledger["candidate_new_failures"] == 0
+    assert canonical_ledger["overall_release_pass_claimed"] is False
 
     duplicate_result = server.handle_task_timeline_append(
         _ctx(
