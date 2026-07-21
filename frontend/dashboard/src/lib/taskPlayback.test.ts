@@ -12,6 +12,7 @@ import {
   taskPlaybackLedgerRowsToTimelineEvents,
   taskPlaybackCompactLedgerBlockingLabel,
   taskPlaybackCompactLedgerDisplayState,
+  taskPlaybackNextLegalActionPresentations,
   typedDagRawSecretPath,
   displayPlaybackFrames,
   latestPlaybackFrameId,
@@ -1436,7 +1437,11 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
     dag: { schema_version: "contract_runtime.visualization.dag.v1", nodes: [], edges: [], node_count: 0, edge_count: 0, typed_edges: true },
     compact_ledger: {},
     bypass_records: [{ status: "bypassed", no_pass_claim: true }],
-    legacy_advisories: [{ id: "route_action_precheck", advisory_only: true }],
+    legacy_advisories: [{
+      id: "route_action_precheck",
+      advisory_only: true,
+      next_legal_action: "run the legacy route precheck only as a diagnostic",
+    }],
     projection_freshness: { status: "current" },
     projection_conflicts: [],
     projection_conflict_count: 0,
@@ -1457,6 +1462,100 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
   assertFixture(contractRuntimeAuthorityDisplayStatus("BYPASSED") !== "PASS" && contractRuntimeAuthorityDisplayStatus("WAIVED") !== "PASS", "bypassed/waived authority statuses must never normalize to PASS");
   assertFixture(timelineStatusFromEvent(response.timeline.events[0]) === "recorded", "bypassed timeline text must not be misclassified by the passed substring");
   assertFixture(view.historical_diagnostics.timeline_events.length === 1 && view.historical_diagnostics.current_snapshot_in_playback === false, "current authority snapshot must stay separate from append-only playback history");
+  assertFixture(
+    view.authoritative_next_actions.length === 2
+      && view.authoritative_next_actions[0]?.action.id === "worker_implementation"
+      && view.authoritative_next_actions[0]?.primary === true
+      && view.authoritative_next_actions[1]?.action.id === "legacy_chain_action"
+      && view.authoritative_next_actions[1]?.primary === false,
+    "authority adapter should preserve every ContractRuntime/current-chain next_legal_action while keeping runtime current primary",
+  );
+
+  const selectedActionEvent: TaskTimelineEvent = {
+    event_id: "43",
+    event_type: "qa.verification",
+    event_kind: "verification",
+    status: "blocked",
+    actor: "qa",
+    payload: {
+      blocker_ids: ["qa_new_operator_acceptance_missing"],
+      next_legal_action: "add the dedicated Current and Playback action callout",
+    },
+  };
+  const nextActionTrace = normalizeTaskPlaybackTrace({
+    projectId: response.project_id,
+    backlog: { bug_id: response.backlog_id, title: response.backlog.title, status: "OPEN", priority: "P1" },
+    taskTimeline: {
+      project_id: response.project_id,
+      backlog_id: response.backlog_id,
+      events: [selectedActionEvent],
+      count: 1,
+      contract_runtime_visualization: response,
+    },
+    gateResponse: null,
+    source: "governed",
+  });
+  const selectedActionFrame = nextActionTrace.frames.find((frame) => frame.source_event_id === "43");
+  const nextActionPresentations = taskPlaybackNextLegalActionPresentations(nextActionTrace, selectedActionFrame?.id);
+  assertFixture(
+    nextActionPresentations.filter((item) => !item.advisory_only).map((item) => item.action_text).join(" | ").includes("record implementation evidence")
+      && nextActionPresentations.filter((item) => !item.advisory_only).some((item) => item.action_text.includes("legacy_chain_action")),
+    "Current and Playback presentation data should retain every canonical runtime/current-chain next action",
+  );
+  assertFixture(
+    nextActionPresentations.some((item) => item.label === "Selected event next legal action (advisory)" && item.action_text.includes("dedicated Current and Playback action callout"))
+      && nextActionPresentations.some((item) => item.label === "Legacy next legal action (advisory)" && item.advisory_only),
+    "Playback selected-event and legacy next actions should remain explicit advisory callouts",
+  );
+  const legacyFallbackPresentations = taskPlaybackNextLegalActionPresentations({
+    ...nextActionTrace,
+    authority_view: null,
+    frames: [],
+    current_snapshot: { ...nextActionTrace.current_snapshot, row: null },
+    close_gate_summary: {
+      ...nextActionTrace.close_gate_summary,
+      next_expected_action: "legacy close-gate repair remains visible",
+    },
+  });
+  assertFixture(
+    legacyFallbackPresentations.some((item) => item.source === "legacy_close_gate_summary" && item.disposition === "ADVISORY" && item.action_text.includes("legacy close-gate repair remains visible")),
+    "legacy/no-authority Current data should retain close-gate next action as an advisory callout",
+  );
+
+  for (const dispositionFixture of [
+    { status: "blocked", block_reason: "new operator acceptance missing", expected: "BLOCKED" },
+    { status: "bypassed", block_reason: "", expected: "BYPASSED" },
+    { status: "waived", block_reason: "", expected: "WAIVED" },
+  ]) {
+    const dispositionTrace = normalizeTaskPlaybackTrace({
+      projectId: response.project_id,
+      backlog: { bug_id: response.backlog_id, title: response.backlog.title, status: "OPEN", priority: "P1" },
+      taskTimeline: {
+        project_id: response.project_id,
+        backlog_id: response.backlog_id,
+        events: [],
+        count: 0,
+        contract_runtime_visualization: {
+          ...response,
+          contract_execution_progress: {
+            ...response.contract_execution_progress,
+            next_legal_action: {
+              ...response.contract_execution_progress.next_legal_action,
+              status: dispositionFixture.status,
+              block_reason: dispositionFixture.block_reason,
+            },
+          },
+        },
+      },
+      gateResponse: null,
+      source: "governed",
+    });
+    const primary = taskPlaybackNextLegalActionPresentations(dispositionTrace)[0];
+    assertFixture(
+      primary?.disposition === dispositionFixture.expected && primary.disposition !== ("PASS" as typeof primary.disposition),
+      `${dispositionFixture.status} next action should render ${dispositionFixture.expected}, never PASS`,
+    );
+  }
 
   for (const blocked of [false, 0, ""]) {
     const nonBlockingCompatibility = projectContractRuntimeAuthorityViewModel({
@@ -1723,6 +1822,22 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
     );
   });
 
+  const activityPlaybackSource = readFileSync(new URL("../views/TaskPlaybackView.tsx", import.meta.url), "utf8");
+  assertFixture(
+    activityPlaybackSource.includes("function NextLegalActionCallout")
+      && activityPlaybackSource.includes("selectedFrameId={activityTrace.frames[activityTrace.frames.length - 1]?.id")
+      && activityPlaybackSource.includes('surface="Current"')
+      && activityPlaybackSource.includes('<NextLegalActionCallout trace={activeTrace} selectedFrameId={activeFrameId} surface="Playback"'),
+    "Activity Current and Playback should reuse one dedicated NextLegalActionCallout presentation",
+  );
+  assertFixture(
+    activityPlaybackSource.includes("data-next-legal-action-callout")
+      && activityPlaybackSource.includes("data-next-legal-action-authority")
+      && activityPlaybackSource.includes("data-next-legal-action-disposition")
+      && activityPlaybackSource.includes("overflowWrap: \"anywhere\""),
+    "Current and Playback next actions should use semantic prominent callout markup with readable full text",
+  );
+
   return [
     "canonical visualization projects ContractRuntime current action before chain fallback",
     "authority cache identity includes backlog, execution, revision, and event",
@@ -1732,6 +1847,7 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
     "current authority snapshot stays out of playback history",
     "direct-main, mf_parallel, and mf_batch_parallel dogfood modes retain canonical actions and cache identities",
     "direct-main, mf_parallel, and mf_batch_parallel refresh snapshots advance without rewriting history",
+    "Current and Playback share a prominent semantic next-legal-action callout",
   ];
 }
 

@@ -426,6 +426,11 @@ export interface ContractRuntimeAuthorityViewModel {
   generated_at: string;
   authority_source: "contract_runtime";
   cache_identity: ContractRuntimeAuthorityCacheIdentity;
+  authoritative_next_actions: Array<{
+    authority_source: string;
+    primary: boolean;
+    action: ContractRuntimeVisualizationNextAction;
+  }>;
   contract_execution_progress: Omit<ContractRuntimeVisualizationResponse["contract_execution_progress"], "line_states"> & {
     current_action: ContractRuntimeVisualizationNextAction;
     current_action_source: string;
@@ -449,6 +454,23 @@ export interface ContractRuntimeAuthorityViewModel {
     truncated: boolean;
     next_cursor: string;
   };
+}
+
+export type TaskPlaybackNextLegalActionDisposition =
+  | "AUTHORITATIVE"
+  | "BLOCKED"
+  | "BYPASSED"
+  | "WAIVED"
+  | "ADVISORY";
+
+export interface TaskPlaybackNextLegalActionPresentation {
+  key: string;
+  label: string;
+  action_text: string;
+  detail: string;
+  source: string;
+  disposition: TaskPlaybackNextLegalActionDisposition;
+  advisory_only: boolean;
 }
 
 const FRAME_STATUS_ORDER: TaskPlaybackFrameStatus[] = ["blocked", "failed", "missing", "running", "waiting", "passed", "recorded", "unknown"];
@@ -506,6 +528,18 @@ export function projectContractRuntimeAuthorityViewModel(
   const runtimeActionPresent = Object.keys(runtimeAction).length > 0;
   const chainActionPresent = Object.keys(chainAction).length > 0;
   const currentAction = runtimeActionPresent ? runtimeAction : chainActionPresent ? chainAction : {};
+  const authoritativeNextActions = [
+    runtimeActionPresent ? {
+      authority_source: safeText(String(runtimeAction.source ?? "")) || "contract_runtime_current",
+      primary: true,
+      action: runtimeAction,
+    } : null,
+    chainActionPresent ? {
+      authority_source: safeText(String(chainAction.source ?? "")) || "backlog_contract_chain_current",
+      primary: !runtimeActionPresent,
+      action: chainAction,
+    } : null,
+  ].filter((item): item is NonNullable<typeof item> => item != null);
   const projectedActionSource = runtimeActionPresent
     ? runtimeAction.source
     : chainActionPresent
@@ -552,6 +586,7 @@ export function projectContractRuntimeAuthorityViewModel(
       event_id: eventId,
       key: identityParts.map((part) => encodeURIComponent(part)).join(":"),
     },
+    authoritative_next_actions: authoritativeNextActions,
     contract_execution_progress: {
       ...response.contract_execution_progress,
       next_legal_action: currentAction,
@@ -577,6 +612,123 @@ export function projectContractRuntimeAuthorityViewModel(
       next_cursor: response.timeline.next_cursor,
     },
   };
+}
+
+/**
+ * Public-safe next-action presentation shared by Activity Current and Playback.
+ * Canonical ContractRuntime/current-chain actions lead; selected-event and
+ * legacy timeline actions remain advisory and can never override the primary.
+ */
+export function taskPlaybackNextLegalActionPresentations(
+  trace: TaskPlaybackTrace,
+  selectedFrameId = "",
+): TaskPlaybackNextLegalActionPresentation[] {
+  const items: TaskPlaybackNextLegalActionPresentation[] = [];
+  const authority = trace.authority_view;
+
+  const pushAction = (
+    action: Record<string, unknown>,
+    source: string,
+    label: string,
+    advisoryOnly: boolean,
+  ) => {
+    const actionValue = sanitizeTaskPlaybackEvidenceText(
+      safeText(String(action.action ?? "")),
+      `${source}.next_legal_action.action`,
+    );
+    const actionId = sanitizeTaskPlaybackEvidenceText(
+      safeText(String(action.id ?? "")),
+      `${source}.next_legal_action.id`,
+    );
+    const description = sanitizeTaskPlaybackEvidenceText(
+      safeText(String(action.description ?? "")),
+      `${source}.next_legal_action.description`,
+    );
+    const actionText = actionValue
+      ? actionId && actionId !== actionValue ? `${actionValue} (${actionId})` : actionValue
+      : actionId || description;
+    if (!actionText) return;
+    const detail = [
+      safeText(String(action.stage_id ?? "")) ? `stage ${safeText(String(action.stage_id ?? ""))}` : "",
+      safeText(String(action.line_id ?? "")) ? `line ${safeText(String(action.line_id ?? ""))}` : "",
+      safeText(String(action.owner_role ?? "")) ? `owner ${safeText(String(action.owner_role ?? ""))}` : "",
+      description && description !== actionText ? description : "",
+      safeText(String(action.block_reason ?? "")),
+    ].filter(Boolean).map((value) => sanitizeTaskPlaybackEvidenceText(value, `${source}.next_legal_action.detail`)).join(" · ");
+    const statusText = [action.status, action.disposition, action.decision].map((value) => safeText(String(value ?? "")).toLowerCase()).join(" ");
+    const disposition: TaskPlaybackNextLegalActionDisposition = advisoryOnly
+      ? "ADVISORY"
+      : statusText.includes("waiv")
+        ? "WAIVED"
+        : statusText.includes("bypass")
+          ? "BYPASSED"
+          : safeText(String(action.block_reason ?? "")) || /block|fail|reject|missing|error/.test(statusText)
+            ? "BLOCKED"
+            : "AUTHORITATIVE";
+    const key = [source, actionId, actionValue, description].join(":");
+    if (items.some((item) => item.key === key)) return;
+    items.push({ key, label, action_text: actionText, detail, source, disposition, advisory_only: advisoryOnly });
+  };
+
+  if (authority) {
+    const authoritativeActions = authority.authoritative_next_actions ?? [];
+    const authoritative = authoritativeActions.length > 0
+      ? authoritativeActions
+      : [{
+        authority_source: authority.contract_execution_progress.current_action_source,
+        primary: true,
+        action: authority.contract_execution_progress.current_action,
+      }];
+    authoritative.forEach((entry) => pushAction(
+      entry.action as unknown as Record<string, unknown>,
+      entry.authority_source,
+      entry.primary ? "Primary next legal action" : "Current-chain next legal action",
+      false,
+    ));
+  } else if (trace.current_snapshot.row) {
+    pushAction(
+      trace.current_snapshot.row.next_legal_action as unknown as Record<string, unknown>,
+      "current_snapshot",
+      "Primary next legal action",
+      false,
+    );
+  }
+
+  if (selectedFrameId) {
+    const selectedFrame = trace.frames.find((frame) => frame.id === selectedFrameId);
+    selectedFrame?.failure_diagnosis
+      .filter((fact) => fact.kind === "next_legal_action" || fact.label.toLowerCase() === "next legal action")
+      .forEach((fact, index) => pushAction(
+        { action: fact.value, id: `selected-event-${selectedFrame.source_event_id || selectedFrame.id}-${index + 1}` },
+        `selected_event:${selectedFrame.source_event_id || selectedFrame.id}`,
+        "Selected event next legal action (advisory)",
+        true,
+      ));
+  }
+
+  if (trace.close_gate_summary.next_expected_action) {
+    pushAction(
+      { action: trace.close_gate_summary.next_expected_action, id: "close-gate-next-expected-action" },
+      "legacy_close_gate_summary",
+      "Legacy next legal action (advisory)",
+      true,
+    );
+  }
+
+  authority?.historical_diagnostics.legacy_advisories.forEach((record, index) => {
+    const raw = record.next_legal_action;
+    const action = typeof raw === "string" || typeof raw === "number"
+      ? { action: String(raw), id: safeText(String(record.id ?? "")) || `legacy-${index + 1}` }
+      : asRecord(raw);
+    pushAction(
+      action,
+      `legacy_advisory:${safeText(String(record.id ?? "")) || index + 1}`,
+      "Legacy next legal action (advisory)",
+      true,
+    );
+  });
+
+  return items;
 }
 
 const CONTRACT_RUNTIME_REPAIR_LABELS: Record<string, string> = {

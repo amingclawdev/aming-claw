@@ -21,11 +21,12 @@ import {
   resolveInitialPlaybackFrameId,
   resolveSelectedFrameIdForEventParam,
   contractRuntimeCompatibilityRepairValues,
+  taskPlaybackNextLegalActionPresentations,
   PLAYBACK_URL_PARAMS,
   type TaskPlaybackTrace,
   type ActivityEventCard,
 } from "../lib/taskPlayback";
-import TaskPlaybackPanel, { contractRuntimeAuthorityActionLabel } from "../components/TaskPlaybackPanel";
+import TaskPlaybackPanel from "../components/TaskPlaybackPanel";
 import type { BacklogBug, BacklogResponse, BacklogTimelineGateResponse, TaskTimelineEvent, TaskTimelineResponse } from "../types";
 
 interface Props {
@@ -829,6 +830,12 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
             </div>
           </div>
 
+          <NextLegalActionCallout
+            trace={activityTrace}
+            selectedFrameId={activityTrace.frames[activityTrace.frames.length - 1]?.id || ""}
+            surface="Current"
+          />
+
           {/* Full-width event card list (IA item A) */}
           {/* F3: animateNew is only true when the user is on page 0 (following latest).
               On page>1 or when browsing, the banner pulse is the only animation. */}
@@ -945,6 +952,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                 <span className="mono">Select a backlog row to fetch governed timeline APIs</span>
               )}
             </div>
+            <NextLegalActionCallout trace={activeTrace} selectedFrameId={activeFrameId} surface="Playback" />
             <CompatibilityRepairTargets trace={activeTrace} surface="Playback" />
             <TaskPlaybackPanel
               trace={activeTrace}
@@ -984,6 +992,73 @@ function SegmentedButton<T extends string>({
   );
 }
 
+/**
+ * Dedicated next-action surface shared by Activity Current and Playback.
+ * It intentionally uses semantic block markup and full-width text instead of
+ * the compact metadata-chip treatment used by surrounding runtime details.
+ */
+function NextLegalActionCallout({
+  trace,
+  surface,
+  selectedFrameId = "",
+}: {
+  trace: TaskPlaybackTrace;
+  surface: "Current" | "Playback";
+  selectedFrameId?: string;
+}) {
+  const actions = taskPlaybackNextLegalActionPresentations(trace, selectedFrameId);
+  if (actions.length === 0) return null;
+  return (
+    <section
+      aria-label={`${surface} next legal actions`}
+      data-next-legal-action-callout={surface.toLowerCase()}
+      style={{
+        background: "var(--ink-50)",
+        border: "1px solid var(--blue)",
+        borderLeft: "5px solid var(--blue)",
+        borderRadius: "var(--radius-card)",
+        boxShadow: "var(--shadow-card)",
+        display: "grid",
+        gap: 10,
+        margin: "12px 0",
+        padding: "14px 16px",
+      }}
+    >
+      <header style={{ alignItems: "baseline", display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "space-between" }}>
+        <strong style={{ color: "var(--ink-900)", fontSize: 15 }}>{surface} · Next legal action</strong>
+        <small style={{ color: "var(--ink-600)" }}>ContractRuntime/current-chain first · historical actions advisory</small>
+      </header>
+      <div style={{ display: "grid", gap: 8 }}>
+        {actions.map((item) => {
+          const blocked = item.disposition === "BLOCKED";
+          const advisory = item.advisory_only || item.disposition === "BYPASSED" || item.disposition === "WAIVED";
+          const accent = blocked ? "var(--red-strong)" : advisory ? "var(--amber-strong)" : "var(--blue)";
+          const background = blocked ? "var(--red-bg)" : advisory ? "var(--amber-bg)" : "var(--blue-bg)";
+          const foreground = blocked ? "var(--red-fg)" : advisory ? "var(--amber-fg)" : "var(--blue-fg)";
+          return (
+            <article
+              key={item.key}
+              data-next-legal-action-authority={item.advisory_only ? "advisory" : "authoritative"}
+              data-next-legal-action-disposition={item.disposition}
+              style={{ background, border: `1px solid ${accent}`, borderLeft: `4px solid ${accent}`, borderRadius: 8, padding: "11px 12px" }}
+            >
+              <div style={{ alignItems: "baseline", display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "space-between" }}>
+                <strong style={{ color: foreground, fontSize: 12, letterSpacing: ".02em" }}>{item.label}</strong>
+                <b style={{ color: foreground, fontSize: 11 }}>{item.disposition}</b>
+              </div>
+              <p style={{ color: "var(--ink-900)", fontSize: 14, fontWeight: 650, lineHeight: 1.45, margin: "6px 0 0", overflowWrap: "anywhere", whiteSpace: "normal" }}>
+                {item.action_text}
+              </p>
+              {item.detail ? <p style={{ color: "var(--ink-700)", lineHeight: 1.4, margin: "5px 0 0", overflowWrap: "anywhere" }}>{item.detail}</p> : null}
+              <small style={{ color: "var(--ink-600)", display: "block", marginTop: 5, overflowWrap: "anywhere" }}>Source: {item.source}</small>
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; trace: TaskPlaybackTrace }) {
   const authority = trace.authority_view;
   const currentSnapshot = trace.current_snapshot.row;
@@ -1006,11 +1081,6 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
     : trace.close_gate_summary.next_expected_evidence.length > 0
     ? trace.close_gate_summary.next_expected_evidence.join(", ")
     : firstHintValue(latestEvent, ["next_expected_evidence", "missing_event_kinds", "missing_requirement_ids"]) || "none recorded";
-  const nextAction = authority
-    ? contractRuntimeAuthorityActionLabel(authority)
-    : trace.close_gate_summary.next_expected_action
-      || firstHintValue(latestEvent, ["next_legal_action", "next_expected_action", "next_action"])
-      || "none recorded";
   const authorityBlocker = currentAction?.block_reason
     || authority?.contract_execution_progress.line_states.find((line) => line.display_status === "BLOCKED" || line.display_status === "FAILED")?.line_id
     || "";
@@ -1049,7 +1119,7 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
           </span>
         ) : null}
         <span>Next expected evidence: {nextExpected}</span>
-        <span>Blocker/next legal action: {blocker}; {nextAction}</span>
+        <span>Blocker: {blocker}</span>
         {compatibilityRepairTargets.map((target) => (
           <span key={target}>Compatibility repair target (advisory): {target}</span>
         ))}
