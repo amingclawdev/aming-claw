@@ -902,6 +902,10 @@ function verifyBacklogEvidenceContract() {
   assert(playbackViewSource.includes("<h2>Activity</h2>"), "Activity view should own the task/runtime stream heading");
   assert(playbackViewSource.includes("Current task/runtime event stream with task playback history as a reachable detail."), "Activity view should describe current events as the primary surface");
   assert(playbackViewSource.includes("Current activity") && playbackViewSource.includes("Playback history"), "Activity view should expose current stream and playback history tabs");
+  assert(viewSource.includes("api.backlogSearchFor(projectId") && viewSource.includes('data-server-search-results="backlog"') && viewSource.includes("local facet of the labeled server result set"), "Backlog lookup should use a labeled debounced server result set with only explicit local facets");
+  assert(playbackViewSource.includes("api.taskTimelineSearchFor(projectId") && playbackViewSource.includes('data-timeline-search-results="public-safe"') && playbackViewSource.includes("event.deep_link || buildPlaybackUrl(projectId, backlogId, eventId)"), "Playback lookup should search bounded public-safe timeline history and preserve exact event deep links");
+  assert(taskTimelineSource.includes("task_timeline.public_search.v1") && taskTimelineSource.includes("PUBLIC_TIMELINE_SEARCH_MAX_SCAN_LIMIT") && taskTimelineSource.includes("raw_evidence_omitted"), "Timeline search should be bounded and expose only sanitized public-safe evidence");
+  assert(taskTimelineSource.includes("task_timeline.public_blocker_semantics.v1") && taskTimelineSource.includes("blocker ids:"), "Historical blocked results should name concrete blocker ids and governed repair targets");
   assert(playbackViewSource.includes("currentTaskHintFor"), "Activity view should fetch the backend current-task hint");
   assert(playbackViewSource.includes("/current-task?limit=10"), "Activity view should use the current-task API fallback");
   assert(playbackViewSource.includes("useEventStreamWithFreshness(projectId"), "Activity view should reuse the dashboard SSE stream");

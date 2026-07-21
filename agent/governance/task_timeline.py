@@ -17,6 +17,7 @@ import sqlite3
 import threading
 import time
 from typing import Any, Mapping
+from urllib.parse import urlencode
 
 from .contracts.runtime import (
     ensure_contract_chain_mapping_schema,
@@ -70,6 +71,49 @@ CREATE INDEX IF NOT EXISTS idx_task_timeline_kind
 """
 
 TIMELINE_SCHEMA_VERSION = 2
+
+PUBLIC_TIMELINE_SEARCH_SCHEMA_VERSION = "task_timeline.public_search.v1"
+PUBLIC_TIMELINE_SEARCH_DEFAULT_LIMIT = 50
+PUBLIC_TIMELINE_SEARCH_MAX_LIMIT = 200
+PUBLIC_TIMELINE_SEARCH_DEFAULT_SCAN_LIMIT = 5000
+PUBLIC_TIMELINE_SEARCH_MAX_SCAN_LIMIT = 10000
+PUBLIC_TIMELINE_SEARCH_MAX_QUERY_CHARS = 256
+PUBLIC_TIMELINE_SEARCH_MAX_TEXT_CHARS = 2000
+PUBLIC_TIMELINE_SEARCH_MAX_DEPTH = 8
+PUBLIC_TIMELINE_SEARCH_MAX_ITEMS = 80
+_PUBLIC_TIMELINE_CLOSED_BACKLOG_STATUSES = {
+    "fixed",
+    "closed",
+    "done",
+    "resolved",
+    "cancelled",
+    "merged",
+    "superseded",
+    "waived",
+}
+
+_PUBLIC_TIMELINE_PRIVATE_FIELD = re.compile(
+    r"(^|[._\s-])(?:raw_prompt|raw_private_prompt_text|private_prompt|prompt_text|"
+    r"prompt_body|prompt_payload|hidden_prompt|hidden_context|system_prompt|"
+    r"developer_prompt|secret|credential|credentials|password|api_key|access_token|"
+    r"refresh_token|auth_token|one_time_auth|authorization|cookie|private_key|"
+    r"launch_text|worker_auth|session_token|fence_token|route_token|"
+    r"filesystem|cwd|worktree_path|host_path|host_paths|host_home|raw_private_context|"
+    r"raw_private_route_body|private_route_context_body|private_body|"
+    r"observer_only_context|unmanifested_prompt_text)([._\s-]|$)",
+    re.IGNORECASE,
+)
+_PUBLIC_TIMELINE_TOKEN_FIELD = re.compile(
+    r"(^|[._\s-])token([._\s-]|$)",
+    re.IGNORECASE,
+)
+_PUBLIC_TIMELINE_ABSOLUTE_PATH = re.compile(
+    r"(^|\s)(/Users/[^\s,;]+|/home/[^\s,;]+|/var/folders/[^\s,;]+|[A-Za-z]:\\[^\s,;]+)"
+)
+_PUBLIC_TIMELINE_TOKEN_VALUE = re.compile(
+    r"\b(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{8,}\b",
+    re.IGNORECASE,
+)
 
 _V2_COLUMNS = {
     "phase": "TEXT NOT NULL DEFAULT ''",
@@ -13999,6 +14043,505 @@ def list_events(
         params,
     ).fetchall()
     return [_row_to_dict(row) for row in rows]
+
+
+def _public_timeline_field_is_private(path: str) -> bool:
+    normalized = re.sub(
+        r"([a-z0-9])([A-Z])",
+        r"\1_\2",
+        str(path or "").strip(),
+    ).lower()
+    if not normalized:
+        return False
+    leaf = normalized.split(".")[-1]
+    if leaf.endswith(
+        (
+            "_token_ref",
+            "_token_hash",
+            "_token_redacted",
+            "_token_present",
+            "_token_exposed",
+            "_token_persisted",
+            "_token_source",
+        )
+    ):
+        return False
+    return bool(
+        _PUBLIC_TIMELINE_PRIVATE_FIELD.search(normalized)
+        or _PUBLIC_TIMELINE_TOKEN_FIELD.search(normalized)
+    )
+
+
+def _public_timeline_text(value: Any, path: str = "") -> str:
+    if _public_timeline_field_is_private(path):
+        return "[private detail redacted]"
+    text = str(value or "")
+    text = _PUBLIC_TIMELINE_ABSOLUTE_PATH.sub(
+        lambda match: f"{match.group(1)}[local path redacted]",
+        text,
+    )
+    text = _PUBLIC_TIMELINE_TOKEN_VALUE.sub("[token redacted]", text)
+    if re.search(
+        r"(?:system|developer|hidden)[-_\s]?prompt\s*[:=]",
+        text,
+        re.IGNORECASE,
+    ) or re.search(
+        r"(?:one[-_\s]?time[-_\s]?auth|credential|password|api[-_\s]?key|secret)\s*[:=]",
+        text,
+        re.IGNORECASE,
+    ):
+        return "[private detail redacted]"
+    if len(text) > PUBLIC_TIMELINE_SEARCH_MAX_TEXT_CHARS:
+        return text[:PUBLIC_TIMELINE_SEARCH_MAX_TEXT_CHARS] + "…[truncated]"
+    return text
+
+
+def public_safe_timeline_value(
+    value: Any,
+    path: str = "",
+    *,
+    depth: int = 0,
+) -> Any:
+    """Return a bounded public-safe copy for searchable timeline evidence."""
+
+    if _public_timeline_field_is_private(path):
+        return "[private detail redacted]"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if depth >= PUBLIC_TIMELINE_SEARCH_MAX_DEPTH:
+        return "[nested data truncated]"
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        entries = list(value.items())
+        for raw_key, child in entries[:PUBLIC_TIMELINE_SEARCH_MAX_ITEMS]:
+            key = str(raw_key)
+            child_path = f"{path}.{key}" if path else key
+            result[key] = public_safe_timeline_value(
+                child,
+                child_path,
+                depth=depth + 1,
+            )
+        if len(entries) > PUBLIC_TIMELINE_SEARCH_MAX_ITEMS:
+            result["_truncated_fields"] = len(entries) - PUBLIC_TIMELINE_SEARCH_MAX_ITEMS
+        return result
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+        result = [
+            public_safe_timeline_value(
+                child,
+                f"{path}.{index}" if path else str(index),
+                depth=depth + 1,
+            )
+            for index, child in enumerate(items[:PUBLIC_TIMELINE_SEARCH_MAX_ITEMS])
+        ]
+        if len(items) > PUBLIC_TIMELINE_SEARCH_MAX_ITEMS:
+            result.append(
+                f"[+{len(items) - PUBLIC_TIMELINE_SEARCH_MAX_ITEMS} items truncated]"
+            )
+        return result
+    return _public_timeline_text(value, path)
+
+
+def _public_timeline_string_values(
+    value: Any,
+    *,
+    keys: set[str],
+    depth: int = 0,
+) -> list[str]:
+    if depth > PUBLIC_TIMELINE_SEARCH_MAX_DEPTH:
+        return []
+    if isinstance(value, Mapping):
+        values: list[str] = []
+        for raw_key, child in list(value.items())[:PUBLIC_TIMELINE_SEARCH_MAX_ITEMS]:
+            key = str(raw_key).strip().lower()
+            if key in keys:
+                if isinstance(child, (list, tuple, set)):
+                    values.extend(str(item or "").strip() for item in child)
+                elif isinstance(child, Mapping):
+                    values.extend(
+                        str(item or "").strip()
+                        for item in child.values()
+                        if not isinstance(item, (Mapping, list, tuple, set))
+                    )
+                else:
+                    values.append(str(child or "").strip())
+            values.extend(
+                _public_timeline_string_values(
+                    child,
+                    keys=keys,
+                    depth=depth + 1,
+                )
+            )
+        return [item for item in values if item]
+    if isinstance(value, (list, tuple, set)):
+        values: list[str] = []
+        for child in list(value)[:PUBLIC_TIMELINE_SEARCH_MAX_ITEMS]:
+            values.extend(
+                _public_timeline_string_values(
+                    child,
+                    keys=keys,
+                    depth=depth + 1,
+                )
+            )
+        return values
+    return []
+
+
+def _public_timeline_unique(values: list[str], *, limit: int = 20) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        value = _public_timeline_text(raw).strip()
+        if not value or value in seen or value == "[private detail redacted]":
+            continue
+        seen.add(value)
+        result.append(value)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _public_timeline_blocker_semantics(event: Mapping[str, Any]) -> dict[str, Any]:
+    status = _normalize_token(event.get("status") or event.get("decision"))
+    if status not in {"blocked", "failed", "error", "rejected"}:
+        return {}
+    blocker_ids = _public_timeline_unique(
+        _public_timeline_string_values(
+            event,
+            keys={
+                "blocker_id",
+                "blocker_ids",
+                "blocked_requirement_id",
+                "blocked_requirement_ids",
+                "missing_requirement_id",
+                "missing_requirement_ids",
+                "missing_event_kind",
+                "missing_event_kinds",
+                "failure_id",
+                "failure_ids",
+            },
+        )
+    )
+    event_id = str(event.get("id") or event.get("event_id") or "").strip()
+    if not blocker_ids and event_id:
+        blocker_ids = [f"timeline:{event_id}"]
+    governed_actions = _public_timeline_unique(
+        _public_timeline_string_values(
+            event,
+            keys={
+                "action",
+                "governed_action",
+                "next_action",
+                "next_legal_action",
+                "repair_action",
+            },
+        )
+    )
+    governed_action = (
+        governed_actions[0]
+        if governed_actions
+        else str(event.get("event_kind") or event.get("event_type") or "timeline_event")
+    )
+    repair_target_id = str(
+        event.get("backlog_id") or event.get("task_id") or event_id
+    ).strip()
+    return {
+        "schema_version": "task_timeline.public_blocker_semantics.v1",
+        "disposition": "BLOCKED",
+        "blocker_ids": blocker_ids,
+        "governed_action": governed_action,
+        "repair_target_id": repair_target_id,
+        "message": (
+            f"Repair {governed_action} for {repair_target_id}; blocker ids: "
+            + ", ".join(blocker_ids)
+        ),
+    }
+
+
+def _public_timeline_deep_link(
+    project_id: str,
+    backlog_id: str,
+    event_id: Any,
+) -> str:
+    query = {
+        "project_id": project_id,
+        "view": "activity",
+        "activity_tab": "history",
+        "playback_backlog": str(backlog_id or ""),
+        "playback_event": str(event_id or ""),
+    }
+    return "/dashboard?" + urlencode(query)
+
+
+def _public_timeline_event(
+    event: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    public_event = {
+        key: event.get(key)
+        for key in (
+            "id",
+            "project_id",
+            "backlog_id",
+            "mf_id",
+            "task_id",
+            "attempt_num",
+            "event_type",
+            "phase",
+            "event_kind",
+            "scenario_id",
+            "parent_event_id",
+            "correlation_id",
+            "severity",
+            "decision",
+            "schema_version",
+            "actor",
+            "status",
+            "trace_id",
+            "commit_sha",
+            "created_at",
+        )
+        if event.get(key) not in (None, "", [], {})
+    }
+    public_event["event_id"] = str(event.get("id") or event.get("event_id") or "")
+    public_event["payload"] = public_safe_timeline_value(event.get("payload") or {}, "payload")
+    public_event["verification"] = public_safe_timeline_value(
+        event.get("verification") or {},
+        "verification",
+    )
+    public_event["artifact_refs"] = public_safe_timeline_value(
+        event.get("artifact_refs") or {},
+        "artifact_refs",
+    )
+    if backlog:
+        # Backlog policy can mark prose private. The search projection needs only
+        # stable identity/facets; the full row remains behind its normal API.
+        public_event["backlog"] = public_safe_timeline_value(
+            {
+                key: backlog.get(key)
+                for key in ("bug_id", "status", "priority", "commit")
+                if backlog.get(key) not in (None, "")
+            },
+            "backlog",
+        )
+    public_event["deep_link"] = _public_timeline_deep_link(
+        project_id,
+        str(event.get("backlog_id") or ""),
+        public_event["event_id"],
+    )
+    blocker_semantics = _public_timeline_blocker_semantics(public_event)
+    if blocker_semantics:
+        public_event["blocker_semantics"] = blocker_semantics
+    public_event["public_safe"] = True
+    public_event["raw_evidence_omitted"] = True
+    return public_event
+
+
+def search_public_events(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    q: str = "",
+    task_id: str = "",
+    backlog_id: str = "",
+    phase: str = "",
+    event_kind: str = "",
+    status: str = "",
+    backlog_status: str = "",
+    priority: str = "",
+    actor: str = "",
+    commit_sha: str = "",
+    limit: int = PUBLIC_TIMELINE_SEARCH_DEFAULT_LIMIT,
+    offset: int = 0,
+    scan_limit: int = PUBLIC_TIMELINE_SEARCH_DEFAULT_SCAN_LIMIT,
+) -> dict[str, Any]:
+    """Search historical timeline evidence without exposing raw event bodies."""
+
+    ensure_schema(conn)
+    query = str(q or "").strip()[:PUBLIC_TIMELINE_SEARCH_MAX_QUERY_CHARS]
+    page_limit = max(1, min(int(limit or 0), PUBLIC_TIMELINE_SEARCH_MAX_LIMIT))
+    page_offset = max(0, int(offset or 0))
+    bounded_scan_limit = max(
+        page_limit,
+        min(int(scan_limit or 0), PUBLIC_TIMELINE_SEARCH_MAX_SCAN_LIMIT),
+    )
+    clauses = ["project_id = ?"]
+    params: list[Any] = [project_id]
+    exact_filters = {
+        "task_id": task_id,
+        "backlog_id": backlog_id,
+        "phase": phase,
+        "status": status,
+        "actor": actor,
+        "commit_sha": commit_sha,
+    }
+    for column, raw_value in exact_filters.items():
+        value = str(raw_value or "").strip()
+        if not value:
+            continue
+        clauses.append(f"LOWER({column}) = LOWER(?)")
+        params.append(value)
+    if event_kind:
+        event_kind_query = _timeline_event_kind_query_parts(event_kind)
+        if event_kind_query is not None:
+            clause, query_params = event_kind_query
+            clauses.append(clause)
+            params.extend(query_params)
+    where_sql = " AND ".join(clauses)
+    source_total = int(
+        conn.execute(
+            f"SELECT COUNT(*) AS count FROM task_timeline_events WHERE {where_sql}",
+            params,
+        ).fetchone()["count"]
+        or 0
+    )
+    search_clauses: list[str] = []
+    search_params: list[Any] = []
+    if query:
+        escaped_query = (
+            query.casefold()
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        needle = f"%{escaped_query}%"
+        for column in (
+            "backlog_id",
+            "task_id",
+            "event_type",
+            "event_kind",
+            "phase",
+            "status",
+            "actor",
+            "commit_sha",
+            "payload_json",
+            "verification_json",
+            "artifact_refs_json",
+        ):
+            search_clauses.append(
+                f"LOWER(COALESCE({column}, '')) LIKE ? ESCAPE '\\'"
+            )
+            search_params.append(needle)
+    candidate_where_sql = where_sql
+    if search_clauses:
+        candidate_where_sql += " AND (" + " OR ".join(search_clauses) + ")"
+    candidate_total = int(
+        conn.execute(
+            f"SELECT COUNT(*) AS count FROM task_timeline_events WHERE {candidate_where_sql}",
+            [*params, *search_params],
+        ).fetchone()["count"]
+        or 0
+    )
+    rows = conn.execute(
+        f"""SELECT * FROM task_timeline_events
+            WHERE {candidate_where_sql}
+            ORDER BY id DESC
+            LIMIT ?""",
+        [*params, *search_params, bounded_scan_limit],
+    ).fetchall()
+    decoded = [_row_to_dict(row) for row in rows]
+    backlog_rows = _compact_backlog_rows(
+        conn,
+        {
+            str(event.get("backlog_id") or "")
+            for event in decoded
+            if str(event.get("backlog_id") or "")
+        },
+    )
+    public_events = [
+        _public_timeline_event(
+            event,
+            project_id=project_id,
+            backlog=backlog_rows.get(str(event.get("backlog_id") or "")),
+        )
+        for event in decoded
+    ]
+    normalized_backlog_status = _normalize_token(backlog_status)
+    normalized_priority = str(priority or "").strip().casefold()
+    if normalized_backlog_status or normalized_priority:
+        filtered_events: list[dict[str, Any]] = []
+        for event in public_events:
+            backlog_row = event.get("backlog")
+            backlog_row = backlog_row if isinstance(backlog_row, Mapping) else {}
+            row_status = _normalize_token(backlog_row.get("status"))
+            row_priority = str(backlog_row.get("priority") or "").strip().casefold()
+            if normalized_backlog_status == "open" and row_status in _PUBLIC_TIMELINE_CLOSED_BACKLOG_STATUSES:
+                continue
+            if normalized_backlog_status == "closed" and row_status not in _PUBLIC_TIMELINE_CLOSED_BACKLOG_STATUSES:
+                continue
+            if normalized_backlog_status not in {"", "all", "open", "closed"} and row_status != normalized_backlog_status:
+                continue
+            if normalized_priority not in {"", "all"} and row_priority != normalized_priority:
+                continue
+            filtered_events.append(event)
+        public_events = filtered_events
+    if query:
+        needle = query.casefold()
+        public_events = [
+            event
+            for event in public_events
+            if needle
+            in json.dumps(event, ensure_ascii=False, sort_keys=True).casefold()
+        ]
+    total = len(public_events)
+    page = public_events[page_offset : page_offset + page_limit]
+    has_more = page_offset + len(page) < total
+    return {
+        "ok": True,
+        "schema_version": PUBLIC_TIMELINE_SEARCH_SCHEMA_VERSION,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "q": query,
+        "events": page,
+        "count": len(page),
+        "total": total,
+        "limit": page_limit,
+        "offset": page_offset,
+        "has_more": has_more,
+        "next_offset": page_offset + len(page) if has_more else None,
+        "scope": {
+            "schema_version": "task_timeline.public_search_scope.v1",
+            "project_id": project_id,
+            "filters": {
+                key: str(value or "")
+                for key, value in {
+                    **exact_filters,
+                    "event_kind": event_kind,
+                    "backlog_status": backlog_status,
+                    "priority": priority,
+                }.items()
+                if str(value or "").strip()
+            },
+            "query_fields": [
+                "backlog_id",
+                "task_id",
+                "event_type",
+                "event_kind",
+                "phase",
+                "status",
+                "actor",
+                "commit_sha",
+                "payload",
+                "verification",
+                "artifact_refs",
+            ],
+            "public_safe": True,
+            "bounded": True,
+            "scan_limit": bounded_scan_limit,
+            "scanned_count": len(rows),
+            "source_total": source_total,
+            "candidate_count": candidate_total,
+            "scan_truncated": candidate_total > len(rows),
+            "total_is_bounded_to_scan": candidate_total > len(rows),
+            "order": "newest_first",
+        },
+        "public_safe": True,
+        "raw_event_payloads_omitted": True,
+        "sanitized_evidence_included": True,
+    }
 
 
 def _compact_payload_ref(event: Mapping[str, Any]) -> dict[str, Any]:

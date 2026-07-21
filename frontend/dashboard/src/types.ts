@@ -699,6 +699,16 @@ export interface BacklogResponse {
   has_more?: boolean;
   next_offset?: number | null;
   truncated?: boolean;
+  q?: string;
+  scope?: {
+    schema_version?: string;
+    project_id?: string;
+    status?: string;
+    priority?: string;
+    view?: string;
+    public_safe?: boolean;
+    bounded?: boolean;
+  };
   summary?: BacklogSummary;
   request_id?: string;
 }
@@ -723,6 +733,7 @@ export interface BacklogBug {
   details_md?: string;
   details_preview?: string;
   commit?: string;
+  deep_link?: string;
   chain_trigger_json?: Record<string, unknown> | string;
   bypass_policy_json?: string;
   bypass_policy?: Record<string, unknown>;
@@ -901,10 +912,46 @@ export interface TaskTimelineResponse {
   trace_id?: string;
   events: TaskTimelineEvent[];
   count: number;
+  q?: string;
+  total?: number;
+  limit?: number;
+  offset?: number;
+  has_more?: boolean;
+  next_offset?: number | null;
+  schema_version?: string;
+  scope?: TaskTimelineSearchScope;
+  public_safe?: boolean;
+  raw_event_payloads_omitted?: boolean;
+  sanitized_evidence_included?: boolean;
   compact_ledger?: TaskTimelineCompactLedger;
   compactLedger?: TaskTimelineCompactLedger;
   contract_runtime_visualization?: ContractRuntimeVisualizationResponse;
   request_id?: string;
+}
+
+export interface TaskTimelineSearchScope {
+  schema_version?: string;
+  project_id?: string;
+  filters?: Record<string, string>;
+  query_fields?: string[];
+  public_safe?: boolean;
+  bounded?: boolean;
+  scan_limit?: number;
+  scanned_count?: number;
+  source_total?: number;
+  candidate_count?: number;
+  scan_truncated?: boolean;
+  total_is_bounded_to_scan?: boolean;
+  order?: string;
+}
+
+export interface TaskTimelineBlockerSemantics {
+  schema_version?: string;
+  disposition?: "BLOCKED" | string;
+  blocker_ids?: string[];
+  governed_action?: string;
+  repair_target_id?: string;
+  message?: string;
 }
 
 export interface ContractRuntimeVisualizationNextAction {
@@ -1219,6 +1266,11 @@ export interface TaskTimelineEvent {
   trace_id?: string;
   commit_sha?: string;
   created_at?: string;
+  deep_link?: string;
+  public_safe?: boolean;
+  raw_evidence_omitted?: boolean;
+  blocker_semantics?: TaskTimelineBlockerSemantics;
+  backlog?: Pick<BacklogBug, "bug_id"> & Partial<Pick<BacklogBug, "title" | "status" | "priority" | "commit">>;
 }
 
 export interface TaskTimelineVerification {

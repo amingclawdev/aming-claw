@@ -53,13 +53,65 @@ function pidFor(projectId: string): string {
   return encodeURIComponent(projectId.trim() || DEFAULT_PROJECT_ID);
 }
 
-function backlogListQuery(): string {
-  return new URLSearchParams({
+export interface BacklogSearchOptions {
+  q?: string;
+  status?: string;
+  priority?: string;
+  limit?: number;
+  offset?: number;
+  include_closed?: boolean;
+}
+
+export interface TaskTimelineSearchOptions {
+  q: string;
+  task_id?: string;
+  backlog_id?: string;
+  event_kind?: string;
+  phase?: string;
+  status?: string;
+  backlog_status?: string;
+  priority?: string;
+  actor?: string;
+  commit_sha?: string;
+  limit?: number;
+  offset?: number;
+  scan_limit?: number;
+}
+
+function backlogListQuery(options: BacklogSearchOptions = {}): string {
+  const query = new URLSearchParams({
     view: "compact",
-    limit: "200",
-    offset: "0",
-    include_closed: "true",
-  }).toString();
+    limit: String(options.limit ?? 200),
+    offset: String(options.offset ?? 0),
+    include_closed: String(options.include_closed ?? true),
+  });
+  if (options.q?.trim()) query.set("q", options.q.trim());
+  if (options.status?.trim() && options.status.toUpperCase() !== "ALL") query.set("status", options.status.trim());
+  if (options.priority?.trim() && options.priority.toUpperCase() !== "ALL") query.set("priority", options.priority.trim());
+  return query.toString();
+}
+
+function taskTimelineSearchQuery(options: TaskTimelineSearchOptions): string {
+  const query = new URLSearchParams({
+    q: options.q.trim(),
+    limit: String(options.limit ?? 50),
+    offset: String(options.offset ?? 0),
+    scan_limit: String(options.scan_limit ?? 5000),
+  });
+  for (const [key, value] of Object.entries({
+    task_id: options.task_id,
+    backlog_id: options.backlog_id,
+    event_kind: options.event_kind,
+    phase: options.phase,
+    status: options.status,
+    backlog_status: options.backlog_status,
+    priority: options.priority,
+    actor: options.actor,
+    commit_sha: options.commit_sha,
+  })) {
+    if (value?.trim()) query.set(key, value.trim());
+  }
+  return query.toString();
 }
 
 function backlogTimelineQuery(backlogId: string, limit: number): string {
@@ -481,6 +533,12 @@ export const api = {
   backlogFor(projectId: string, signal?: AbortSignal) {
     return getJSON<BacklogResponse>(`/api/backlog/${pidFor(projectId)}?${backlogListQuery()}`, signal);
   },
+  backlogSearchFor(projectId: string, options: BacklogSearchOptions, signal?: AbortSignal) {
+    return getJSON<BacklogResponse>(
+      `/api/backlog/${pidFor(projectId)}?${backlogListQuery(options)}`,
+      signal,
+    );
+  },
   backlogBugFor(projectId: string, backlogId: string, signal?: AbortSignal) {
     return getJSON<BacklogBug>(
       `/api/backlog/${pidFor(projectId)}/${encodeURIComponent(backlogId)}`,
@@ -495,6 +553,12 @@ export const api = {
       ...taskTimeline,
       contract_runtime_visualization: contractRuntimeVisualization,
     }));
+  },
+  taskTimelineSearchFor(projectId: string, options: TaskTimelineSearchOptions, signal?: AbortSignal) {
+    return getJSON<TaskTimelineResponse>(
+      `/api/task/${pidFor(projectId)}/timeline?${taskTimelineSearchQuery(options)}`,
+      signal,
+    );
   },
   /** Project-wide recent timeline events, newest-first, cross-row.
    *  Each event carries backlog_id and task_id for row-tag rendering.

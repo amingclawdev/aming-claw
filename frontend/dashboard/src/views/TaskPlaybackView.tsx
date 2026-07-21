@@ -35,6 +35,7 @@ interface Props {
 }
 
 type StatusFilter = "open" | "closed" | "all";
+type PriorityFilter = "all" | "P0" | "P1" | "P2" | "P3";
 type GateFilter = "all" | "gate_candidate" | "timeline_loaded" | "blocked_gate" | "no_timeline";
 type ActivityMode = "activity" | "history";
 
@@ -45,6 +46,8 @@ const ACTIVITY_TIMELINE_LIMIT = 250;
 const CURRENT_TASK_REFRESH_MS = 5000;
 /** Initial + max limit for the project-wide recent events stream in the Current tab. */
 const RECENT_EVENTS_LIMIT = 100;
+const PLAYBACK_SEARCH_DEBOUNCE_MS = 300;
+const PLAYBACK_SEARCH_PAGE_SIZE = 50;
 /** Cards per page for the Current tab event card list (IA item A). */
 const EVENTS_PAGE_SIZE = 10;
 const DIRECT_API = (import.meta.env.VITE_DIRECT_API as string | undefined) === "true";
@@ -99,11 +102,16 @@ interface ActivityLoadState extends PlaybackLoadState {
 
 export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const bugs = backlog.bugs ?? [];
-  const publicBugs = useMemo(() => bugs.filter((bug) => !isPrivatePlaybackBacklog(bug)), [bugs]);
   const [mode, setMode] = useState<ActivityMode>(() => readActivityMode());
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("open");
+  const [priorityFilter, setPriorityFilter] = useState<PriorityFilter>("all");
   const [gateFilter, setGateFilter] = useState<GateFilter>("all");
+  const [searchOffset, setSearchOffset] = useState(0);
+  const [serverBacklog, setServerBacklog] = useState<BacklogResponse>(backlog);
+  const [timelineSearch, setTimelineSearch] = useState<TaskTimelineResponse | null>(null);
+  const [serverSearchLoading, setServerSearchLoading] = useState(false);
+  const [serverSearchError, setServerSearchError] = useState("");
   const [selectedBugId, setSelectedBugId] = useState(() => readSelectedBacklogId());
   const [selectedBacklogDetailById, setSelectedBacklogDetailById] = useState<Record<string, BacklogDetailLoadState>>({});
   const [playbackByBug, setPlaybackByBug] = useState<Record<string, PlaybackLoadState>>({});
@@ -154,6 +162,29 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   // forward-reference issue (useEventStreamWithFreshness is declared later).
   const recordPollRef = useRef<(at: string) => void>(() => undefined);
 
+  const timelineSearchBugs = useMemo<BacklogBug[]>(() => (
+    (timelineSearch?.events ?? [])
+      .map((event) => event.backlog)
+      .filter((bug): bug is NonNullable<TaskTimelineEvent["backlog"]> => Boolean(bug?.bug_id))
+      .map((bug) => ({
+        bug_id: bug.bug_id,
+        title: bug.title || bug.bug_id,
+        status: bug.status || "UNKNOWN",
+        priority: bug.priority || "P3",
+        commit: bug.commit,
+        public_safe: true,
+        compact: true,
+      }))
+  ), [timelineSearch]);
+  const selectorBugs = useMemo(
+    () => mergePublicBacklogRows(serverBacklog.bugs ?? [], timelineSearchBugs),
+    [serverBacklog.bugs, timelineSearchBugs],
+  );
+  const publicBugs = useMemo(
+    () => mergePublicBacklogRows(bugs, selectorBugs),
+    [bugs, selectorBugs],
+  );
+
   useEffect(() => {
     playbackByBugRef.current = playbackByBug;
   }, [playbackByBug]);
@@ -179,6 +210,11 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     setActivityByBug({});
     setSelectedBacklogDetailById({});
     setCurrentTaskHint(null);
+    setServerBacklog(backlog);
+    setTimelineSearch(null);
+    setServerSearchLoading(false);
+    setServerSearchError("");
+    setSearchOffset(0);
     setLocalActivityBugId("");
     setActivityRefreshSeq(0);
     setSelectedBugId(readSelectedBacklogId());
@@ -191,6 +227,53 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     setRecentEventsLoaded(false);
     recentEventIdsRef.current = new Set();
   }, [projectId]);
+
+  useEffect(() => {
+    setSearchOffset(0);
+  }, [priorityFilter, query, statusFilter]);
+
+  useEffect(() => {
+    if (mode !== "history") return undefined;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setServerSearchLoading(true);
+      setServerSearchError("");
+      const backlogRequest = api.backlogSearchFor(projectId, {
+        q: query,
+        status: statusFilter.toUpperCase(),
+        priority: priorityFilter,
+        limit: PLAYBACK_SEARCH_PAGE_SIZE,
+        offset: searchOffset,
+        include_closed: true,
+      }, controller.signal);
+      const timelineRequest = query.trim()
+        ? api.taskTimelineSearchFor(projectId, {
+          q: query,
+          backlog_status: statusFilter.toUpperCase(),
+          priority: priorityFilter,
+          limit: PLAYBACK_SEARCH_PAGE_SIZE,
+          offset: searchOffset,
+          scan_limit: 5000,
+        }, controller.signal)
+        : Promise.resolve(null);
+      Promise.all([backlogRequest, timelineRequest])
+        .then(([backlogResponse, timelineResponse]) => {
+          if (controller.signal.aborted) return;
+          setServerBacklog(backlogResponse);
+          setTimelineSearch(timelineResponse);
+        })
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) setServerSearchError(errorMessage(error));
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setServerSearchLoading(false);
+        });
+    }, PLAYBACK_SEARCH_DEBOUNCE_MS);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [mode, priorityFilter, projectId, query, searchOffset, statusFilter]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -334,29 +417,17 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const activityTrace = activityState?.trace ?? emptyTaskPlaybackTrace(projectId, activityBug ?? activityPlaceholderBug);
 
   const rows = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return publicBugs
+    return selectorBugs
       .filter((bug) => {
         if (statusFilter === "open" && !isOpenBug(bug)) return false;
         if (statusFilter === "closed" && !isClosedBug(bug)) return false;
+        if (priorityFilter !== "all" && bug.priority !== priorityFilter) return false;
         if (!matchesGateFilter(gateFilter, bug, playbackByBug[bug.bug_id])) return false;
-        if (!q) return true;
-        const hay = [
-          bug.bug_id,
-          bug.title,
-          bug.status,
-          bug.priority,
-          bug.runtime_state,
-          bug.chain_stage,
-          bug.mf_type,
-          ...(Array.isArray(bug.target_files) ? bug.target_files : [bug.target_files ?? ""]),
-          ...(Array.isArray(bug.acceptance_criteria) ? bug.acceptance_criteria : [bug.acceptance_criteria ?? ""]),
-        ].join(" ").toLowerCase();
-        return hay.includes(q);
+        return true;
       })
       .slice()
       .sort(compareBacklogRows);
-  }, [publicBugs, gateFilter, playbackByBug, query, statusFilter]);
+  }, [selectorBugs, gateFilter, playbackByBug, priorityFilter, statusFilter]);
 
   const refreshCurrentTaskHint = useCallback((signal: AbortSignal) => {
     return currentTaskHintFor(projectId, signal)
@@ -875,7 +946,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
           <aside className="task-playback-selector" aria-label="Backlog playback selector">
             <div className="task-playback-selector-head">
               <strong>Backlog selector</strong>
-              <span className="mono">{rows.length} / {publicBugs.length}</span>
+              <span className="mono">{rows.length} local facet / {serverBacklog.filtered_count ?? selectorBugs.length} server</span>
             </div>
             <input
               className="backlog-search"
@@ -893,6 +964,17 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                 ]}
                 onChange={setStatusFilter}
               />
+              <select
+                value={priorityFilter}
+                onChange={(event) => setPriorityFilter(event.target.value as PriorityFilter)}
+                aria-label="Backlog priority filter"
+              >
+                <option value="all">All priorities</option>
+                <option value="P0">P0</option>
+                <option value="P1">P1</option>
+                <option value="P2">P2</option>
+                <option value="P3">P3</option>
+              </select>
               <select value={gateFilter} onChange={(event) => setGateFilter(event.target.value as GateFilter)} aria-label="Timeline and gate filter">
                 <option value="all">All timeline states</option>
                 <option value="gate_candidate">Gate candidates</option>
@@ -901,6 +983,70 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                 <option value="no_timeline">No timeline loaded</option>
               </select>
             </div>
+            <div data-server-search-results="playback" aria-live="polite">
+              <strong>Server result set</strong>
+              <p>
+                {serverSearchLoading
+                  ? "Searching backlog and public-safe timeline evidence…"
+                  : `${selectorBugs.length} backlog rows; ${timelineSearch?.total ?? 0} exact timeline matches. Timeline-state filter is a local facet of these server results.`}
+              </p>
+              {serverSearchError ? <p className="timeline-error">{serverSearchError}</p> : null}
+              <div className="task-playback-controls">
+                <button
+                  type="button"
+                  className="action-btn"
+                  disabled={searchOffset <= 0 || serverSearchLoading}
+                  onClick={() => setSearchOffset((offset) => Math.max(0, offset - PLAYBACK_SEARCH_PAGE_SIZE))}
+                >
+                  Previous server page
+                </button>
+                <button
+                  type="button"
+                  className="action-btn"
+                  disabled={!(serverBacklog.has_more || timelineSearch?.has_more) || serverSearchLoading}
+                  onClick={() => setSearchOffset(Math.max(
+                    serverBacklog.next_offset ?? 0,
+                    timelineSearch?.next_offset ?? 0,
+                    searchOffset + PLAYBACK_SEARCH_PAGE_SIZE,
+                  ))}
+                >
+                  Next server page
+                </button>
+              </div>
+            </div>
+            {(timelineSearch?.events.length ?? 0) > 0 ? (
+              <div className="task-playback-row-list" data-timeline-search-results="public-safe">
+                <strong>Timeline server matches</strong>
+                {timelineSearch?.events.map((event, index) => {
+                  const backlogId = event.backlog_id || event.backlog?.bug_id || "";
+                  const eventId = String(event.event_id || event.id || "");
+                  const exactHref = event.deep_link || buildPlaybackUrl(projectId, backlogId, eventId);
+                  return (
+                    <a
+                      key={`timeline-search:${eventId || index}`}
+                      href={exactHref}
+                      onClick={(clickEvent) => {
+                        clickEvent.preventDefault();
+                        navigateToPlaybackEvent(backlogId, eventId);
+                      }}
+                    >
+                      <div>
+                        <strong>{event.backlog?.title || backlogId || "Timeline event"}</strong>
+                        <span className="mono">{backlogId} · event {eventId}</span>
+                      </div>
+                      <span className={`status-badge ${statusClass(event.status || "")}`}>{normalizeStatus(event.status)}</span>
+                      <em>{[event.event_kind, event.event_type, event.phase].filter(Boolean).join(" · ")}</em>
+                      {event.blocker_semantics ? (
+                        <em>
+                          {event.blocker_semantics.message
+                            || `Repair ${event.blocker_semantics.governed_action || "governed action"} for ${event.blocker_semantics.repair_target_id || backlogId}; blocker ids: ${(event.blocker_semantics.blocker_ids ?? []).join(", ")}`}
+                        </em>
+                      ) : null}
+                    </a>
+                  );
+                })}
+              </div>
+            ) : null}
             {rows.length === 0 ? (
               <div className="timeline-empty">No backlog rows match these playback filters.</div>
             ) : (
@@ -1230,6 +1376,15 @@ function matchesGateFilter(filter: GateFilter, bug: BacklogBug, state?: Playback
   if (filter === "blocked_gate") return Boolean(state?.trace.close_gate_summary.blocked);
   if (filter === "no_timeline") return Boolean(state?.loaded && state.trace.frames.length === 0);
   return true;
+}
+
+function mergePublicBacklogRows(...groups: BacklogBug[][]): BacklogBug[] {
+  const rows = new Map<string, BacklogBug>();
+  for (const bug of groups.flat()) {
+    if (!bug?.bug_id || isPrivatePlaybackBacklog(bug)) continue;
+    rows.set(bug.bug_id, { ...(rows.get(bug.bug_id) ?? {}), ...bug });
+  }
+  return [...rows.values()];
 }
 
 function isPrivatePlaybackBacklog(bug: BacklogBug): boolean {

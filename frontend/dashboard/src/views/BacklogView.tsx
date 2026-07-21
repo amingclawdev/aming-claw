@@ -72,6 +72,8 @@ const CLOSED_STATUSES = new Set([
 const AUDIT_ARCHIVED_RUNTIME_STATES = new Set(["audit_archived"]);
 const BACKLOG_URL_PARAM = "backlog";
 const BACKLOG_DETAIL_TIMELINE_LIMIT = 250;
+const BACKLOG_SEARCH_DEBOUNCE_MS = 300;
+const BACKLOG_SEARCH_PAGE_SIZE = 100;
 const CONTENT_SYS_DEMO_VISUALIZATION_SCHEMA = "content_sys.demo_visualization_evidence.v1";
 const ROUTE_GUIDANCE_TEMPLATE_ID = "mf_workflow_runtime.v1";
 const ROUTE_GUIDANCE_ALLOWED_STAGES = ["dispatch", "startup_gate", "implementation_wait", "handoff_gate"];
@@ -273,6 +275,10 @@ export default function BacklogView({ backlog, projectId }: Props) {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("OPEN");
   const [priorityFilter, setPriorityFilter] = useState<PriorityFilter>("ALL");
   const [query, setQuery] = useState("");
+  const [searchOffset, setSearchOffset] = useState(0);
+  const [serverBacklog, setServerBacklog] = useState<BacklogResponse>(backlog);
+  const [serverSearchLoading, setServerSearchLoading] = useState(false);
+  const [serverSearchError, setServerSearchError] = useState("");
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const [timelineByBug, setTimelineByBug] = useState<Record<string, TimelineState>>({});
   const [selectedBugId, setSelectedBugId] = useState(() => readBacklogIdFromUrl());
@@ -315,34 +321,21 @@ export default function BacklogView({ backlog, projectId }: Props) {
     };
   }, [backlog.summary, backlog.total_count, bugs]);
 
+  const serverBugs = serverBacklog.bugs ?? bugs;
   const rows = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return bugs
+    return serverBugs
       .filter((bug) => {
         if (statusFilter === "OPEN" && !isOpenBug(bug)) return false;
         if (statusFilter === "CLOSED" && !isClosedBug(bug)) return false;
         if (priorityFilter !== "ALL" && normalizePriority(bug.priority) !== priorityFilter) return false;
-        if (!q) return true;
-        const hay = [
-          bug.bug_id,
-          bug.title,
-          bug.details_md,
-          bug.status,
-          bug.priority,
-          ...listFrom(bug.target_files),
-          ...listFrom(bug.test_files),
-          ...listFrom(bug.acceptance_criteria),
-        ]
-          .join(" ")
-          .toLowerCase();
-        return hay.includes(q);
+        return true;
       })
       .slice()
       .sort(compareBugs);
-  }, [bugs, priorityFilter, query, statusFilter]);
+  }, [priorityFilter, serverBugs, statusFilter]);
 
-  const filteredCount = backlog.filtered_count ?? stats.total;
-  const pageNote = backlog.has_more ? ` · next offset ${backlog.next_offset ?? rows.length}` : "";
+  const filteredCount = serverBacklog.filtered_count ?? stats.total;
+  const pageNote = serverBacklog.has_more ? ` · next offset ${serverBacklog.next_offset ?? rows.length}` : "";
   const syncCommands = [
     `aming-claw backlog export --project-id ${projectId} --output backlog.json`,
     `aming-claw backlog import --project-id ${projectId} --input backlog.json --dry-run`,
@@ -350,12 +343,49 @@ export default function BacklogView({ backlog, projectId }: Props) {
   ].join("\n");
 
   useEffect(() => {
+    setServerBacklog(backlog);
+    setSearchOffset(0);
+    setServerSearchLoading(false);
+    setServerSearchError("");
     setTimelineByBug({});
     setDetailByBug({});
     setDetailLoadingByBug({});
     setDetailErrorByBug({});
     setModalTrail([]);
   }, [projectId]);
+
+  useEffect(() => {
+    setSearchOffset(0);
+  }, [priorityFilter, query, statusFilter]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setServerSearchLoading(true);
+      setServerSearchError("");
+      api.backlogSearchFor(projectId, {
+        q: query,
+        status: statusFilter,
+        priority: priorityFilter,
+        limit: BACKLOG_SEARCH_PAGE_SIZE,
+        offset: searchOffset,
+        include_closed: true,
+      }, controller.signal)
+        .then((response) => {
+          if (!controller.signal.aborted) setServerBacklog(response);
+        })
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) setServerSearchError(timelineLoadErrorMessage(error));
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setServerSearchLoading(false);
+        });
+    }, BACKLOG_SEARCH_DEBOUNCE_MS);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [priorityFilter, projectId, query, searchOffset, statusFilter]);
 
   useEffect(() => {
     const handlePopState = () => {
@@ -519,7 +549,10 @@ export default function BacklogView({ backlog, projectId }: Props) {
   }, [fetchBugDetail, loadTimeline, selectedBugId]);
 
   const selectedBug = selectedBugId
-    ? detailByBug[selectedBugId] ?? bugs.find((bug) => bug.bug_id === selectedBugId) ?? null
+    ? detailByBug[selectedBugId]
+      ?? serverBugs.find((bug) => bug.bug_id === selectedBugId)
+      ?? bugs.find((bug) => bug.bug_id === selectedBugId)
+      ?? null
     : null;
 
   const selectedTimeline = selectedBugId ? timelineByBug[selectedBugId] : undefined;
@@ -587,9 +620,37 @@ export default function BacklogView({ backlog, projectId }: Props) {
         />
       </div>
 
+      <div className="backlog-guidance" data-server-search-results="backlog" aria-live="polite">
+        <div>
+          <strong>Server result set.</strong>{" "}
+          {serverSearchLoading
+            ? "Searching the governance database…"
+            : `${rows.length} local facet rows from ${filteredCount} server matches at offset ${serverBacklog.offset ?? searchOffset}.`}
+          {serverSearchError ? ` Search error: ${serverSearchError}` : ""}
+        </div>
+        <div className="backlog-guidance-actions">
+          <button
+            type="button"
+            className="action-btn"
+            disabled={searchOffset <= 0 || serverSearchLoading}
+            onClick={() => setSearchOffset((offset) => Math.max(0, offset - BACKLOG_SEARCH_PAGE_SIZE))}
+          >
+            Previous server page
+          </button>
+          <button
+            type="button"
+            className="action-btn"
+            disabled={!serverBacklog.has_more || serverSearchLoading}
+            onClick={() => setSearchOffset(serverBacklog.next_offset ?? searchOffset + BACKLOG_SEARCH_PAGE_SIZE)}
+          >
+            Next server page
+          </button>
+        </div>
+      </div>
+
       <div className="section">
         <div className="section-head">
-          Rows <span className="head-hint">read-only, sorted by priority and updated time</span>
+          Rows <span className="head-hint">read-only local facet of the labeled server result set, sorted by priority and updated time</span>
         </div>
         {rows.length === 0 ? (
           <div className="empty">

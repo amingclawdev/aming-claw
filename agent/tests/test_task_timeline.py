@@ -1868,6 +1868,173 @@ class TestTaskTimeline(unittest.TestCase):
         os.environ.pop("SHARED_VOLUME_PATH", None)
         self.tmp.cleanup()
 
+    def test_public_timeline_search_finds_history_beyond_first_200_and_redacts(self):
+        from agent.governance import server, task_timeline
+
+        backlog_id = "AC-HISTORICAL-SEARCH-NINE-ROUND-DRIFT"
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, created_at, updated_at)
+               VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
+            (
+                backlog_id,
+                "Remembered multi-round QA drift",
+                "2026-07-01T00:00:00Z",
+                "2026-07-01T00:00:00Z",
+            ),
+        )
+        remembered = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id=backlog_id,
+            task_id="historical-search-worker",
+            event_type="independent_verification.completed",
+            event_kind="verification",
+            phase="qa",
+            actor="mf_qa",
+            status="blocked",
+            commit_sha="abcdef1234567890",
+            payload={
+                "summary": "Remembered multi-round QA drift after 9 rounds",
+                "qa_round": 9,
+                "blocker_ids": ["qa-round-9-drift"],
+                "governed_action": "rerun_independent_qa",
+                "session_token": "never-return-this-session-secret",
+                "worktree_path": "/Users/example/private/worktree",
+            },
+            verification={
+                "status": "blocked",
+                "governed_repair_target": backlog_id,
+                "raw_prompt": "never-return-this-private-prompt",
+            },
+            artifact_refs={
+                "report_ref": "artifact:qa-round-9",
+                "absolute_path": "/Users/example/private/qa-report.json",
+            },
+            post_commit_hooks=False,
+        )
+        for index in range(225):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=f"AC-FILLER-{index:03d}",
+                task_id=f"filler-{index:03d}",
+                event_type="worker.heartbeat",
+                event_kind="worker_progress",
+                phase="runtime",
+                actor="mf_sub",
+                status="recorded",
+                payload={"sequence": index},
+                post_commit_hooks=False,
+            )
+        self.conn.commit()
+
+        result = server.handle_task_timeline_list(
+            _ctx(
+                {
+                    "q": "remembered multi-round qa drift",
+                    "backlog_status": "OPEN",
+                    "priority": "P1",
+                    "limit": "1",
+                    "offset": "0",
+                    "scan_limit": "500",
+                }
+            )
+        )
+
+        self.assertEqual(result["schema_version"], "task_timeline.public_search.v1")
+        self.assertEqual(result["total"], 1)
+        self.assertFalse(result["has_more"])
+        self.assertTrue(result["scope"]["public_safe"])
+        self.assertEqual(result["scope"]["source_total"], 226)
+        self.assertEqual(result["scope"]["candidate_count"], 1)
+        self.assertEqual(result["scope"]["scanned_count"], 1)
+        event = result["events"][0]
+        self.assertEqual(event["event_id"], str(remembered["id"]))
+        self.assertEqual(event["payload"]["qa_round"], 9)
+        self.assertEqual(event["payload"]["session_token"], "[private detail redacted]")
+        self.assertEqual(event["verification"]["raw_prompt"], "[private detail redacted]")
+        self.assertIn("[local path redacted]", event["artifact_refs"]["absolute_path"])
+        self.assertNotIn("never-return-this", json.dumps(event))
+        self.assertEqual(event["blocker_semantics"]["blocker_ids"], ["qa-round-9-drift"])
+        self.assertEqual(event["blocker_semantics"]["governed_action"], "rerun_independent_qa")
+        self.assertEqual(event["blocker_semantics"]["repair_target_id"], backlog_id)
+        self.assertIn("blocker ids: qa-round-9-drift", event["blocker_semantics"]["message"])
+        self.assertEqual(
+            event["deep_link"],
+            "/dashboard?project_id=proj&view=activity&activity_tab=history"
+            f"&playback_backlog={backlog_id}&playback_event={remembered['id']}",
+        )
+
+    def test_public_timeline_search_paginates_stably_and_preserves_non_pass_dispositions(self):
+        from agent.governance import task_timeline
+
+        backlog_id = "AC-HISTORICAL-PAGINATION"
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, created_at, updated_at)
+               VALUES (?, ?, 'FIXED', 'P2', ?, ?)""",
+            (
+                backlog_id,
+                "Historical pagination fixture",
+                "2026-07-02T00:00:00Z",
+                "2026-07-02T00:00:00Z",
+            ),
+        )
+        created = []
+        for status in ("waived", "bypassed", "blocked"):
+            created.append(
+                task_timeline.record_event(
+                    self.conn,
+                    project_id="proj",
+                    backlog_id=backlog_id,
+                    task_id="historical-pagination-worker",
+                    event_type=f"qa.{status}",
+                    event_kind="verification",
+                    phase="qa",
+                    actor="mf_qa",
+                    status=status,
+                    payload={
+                        "fixture": "remembered pagination marker",
+                        "blocker_id": "qa-concrete-blocker" if status == "blocked" else "",
+                    },
+                    post_commit_hooks=False,
+                )
+            )
+        self.conn.commit()
+
+        first = task_timeline.search_public_events(
+            self.conn,
+            "proj",
+            q="remembered pagination marker",
+            backlog_status="CLOSED",
+            priority="P2",
+            limit=2,
+        )
+        second = task_timeline.search_public_events(
+            self.conn,
+            "proj",
+            q="remembered pagination marker",
+            backlog_status="CLOSED",
+            priority="P2",
+            limit=2,
+            offset=2,
+        )
+
+        self.assertEqual(first["total"], 3)
+        self.assertTrue(first["has_more"])
+        self.assertEqual(first["next_offset"], 2)
+        self.assertFalse(second["has_more"])
+        self.assertEqual(
+            [event["event_id"] for event in [*first["events"], *second["events"]]],
+            [str(event["id"]) for event in reversed(created)],
+        )
+        self.assertEqual(first["events"][0]["status"], "blocked")
+        self.assertEqual(first["events"][1]["status"], "bypassed")
+        self.assertEqual(second["events"][0]["status"], "waived")
+        self.assertNotEqual(first["events"][1]["status"].upper(), "PASS")
+        self.assertNotEqual(second["events"][0]["status"].upper(), "PASS")
+
     def _cli_agent_process_hash(self):
         from agent.cli_agent_service.evidence import hash_text
 
