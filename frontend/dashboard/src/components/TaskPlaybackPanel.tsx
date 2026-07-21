@@ -74,20 +74,37 @@ function authorityRecordRefs(record: Record<string, unknown>): string[] {
   });
 }
 
+function authorityBypassRecordDisplayStatus(record: Record<string, unknown>): "BYPASSED" | "WAIVED" {
+  const disposition = [
+    authorityRecordText(record, "disposition"),
+    authorityRecordText(record, "status"),
+    authorityRecordText(record, "decision"),
+  ].join(" ").toLowerCase();
+  return disposition.includes("waiv") ? "WAIVED" : "BYPASSED";
+}
+
 function authorityBypassRecordLabel(record: Record<string, unknown>, index: number): string {
-  const status = authorityRecordText(record, "status") || authorityRecordText(record, "decision") || "BYPASSED";
+  const status = authorityBypassRecordDisplayStatus(record);
   const stage = authorityRecordText(record, "stage_id");
   const line = authorityRecordText(record, "line_id");
   const reason = authorityRecordText(record, "reason");
   const diagnostic = authorityRecordText(record, "diagnostic_backlog_id");
   const evidence = authorityRecordRefs(record);
   return [
-    status.toUpperCase(),
+    status,
     stage || line ? `${stage || "stage"}/${line || "line"}` : `record ${index + 1}`,
     reason,
     diagnostic ? `diagnostic ${diagnostic}` : "",
     evidence.length > 0 ? `evidence ${evidence.join(", ")}` : "",
   ].filter(Boolean).join(" · ");
+}
+
+export function contractRuntimeAuthorityStatusClass(status: string): string {
+  const normalized = status.trim().toUpperCase();
+  if (normalized === "PASS") return "status-complete";
+  if (normalized === "BLOCKED" || normalized === "FAILED") return "status-failed";
+  if (normalized === "RUNNING" || normalized === "WAITING") return "status-running";
+  return "status-unknown";
 }
 
 /** Shared projection for Backlog, Timeline DAG, Activity Current, and Playback History. */
@@ -114,13 +131,13 @@ export function ContractRuntimeAuthorityPanel({
       <strong>ContractRuntime authority</strong>
       <div>
         <span>
-          Contract progress: <b className={`status-badge ${statusClass(progress.display_status)}`}>{progress.display_status}</b>
+          Contract progress: <b className={`status-badge ${contractRuntimeAuthorityStatusClass(progress.display_status)}`}>{progress.display_status}</b>
           {progress.contract_execution_id ? ` · ${progress.contract_execution_id}` : ""}
           {progress.execution_state_revision != null ? ` · revision ${progress.execution_state_revision}` : ""}
         </span>
         <span>Current legal action ({progress.current_action_source}): {contractRuntimeAuthorityActionLabel(authority)}</span>
         <span>
-          Backlog row close authority: <b className={`status-badge ${statusClass(close.display_status)}`}>{close.display_status}</b>
+          Backlog row close authority: <b className={`status-badge ${contractRuntimeAuthorityStatusClass(close.display_status)}`}>{close.display_status}</b>
           {close.state ? ` · ${close.state}` : ""}
           {close.backlog_status ? ` · row ${close.backlog_status}` : ""}
         </span>
