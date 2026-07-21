@@ -872,6 +872,27 @@ export interface AgentTaskContractProjection {
   read_receipt_gate?: Record<string, unknown>;
 }
 
+export interface TaskTimelineCompactLedgerRow {
+  backlog_id?: string;
+  contract_execution_id?: string;
+  current_contract_execution_id?: string;
+  current_contract_id?: string;
+  readiness_state?: string;
+  next_legal_action?: Record<string, unknown>;
+  /** Snapshot freshness metadata only; never a timeline event timestamp. */
+  projection_updated_at?: string;
+  [key: string]: unknown;
+}
+
+export interface TaskTimelineCompactLedger {
+  schema_version?: string;
+  project_id?: string;
+  row_count?: number;
+  source_event_count?: number;
+  rows?: TaskTimelineCompactLedgerRow[];
+  [key: string]: unknown;
+}
+
 export interface TaskTimelineResponse {
   ok?: boolean;
   project_id: string;
@@ -880,8 +901,8 @@ export interface TaskTimelineResponse {
   trace_id?: string;
   events: TaskTimelineEvent[];
   count: number;
-  compact_ledger?: Record<string, unknown>;
-  compactLedger?: Record<string, unknown>;
+  compact_ledger?: TaskTimelineCompactLedger;
+  compactLedger?: TaskTimelineCompactLedger;
   contract_runtime_visualization?: ContractRuntimeVisualizationResponse;
   request_id?: string;
 }

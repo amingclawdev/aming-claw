@@ -3,6 +3,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import type {
   ContractRuntimeAuthorityViewModel,
   TaskPlaybackFrame,
+  TaskPlaybackCurrentSnapshot,
   TaskPlaybackTrace,
   PlaybackNavEntry,
   TaskPlaybackEvidenceRef,
@@ -18,6 +19,7 @@ import {
   latestPlaybackFrameId,
   popPlaybackNavStack,
   pushPlaybackNavStack,
+  taskPlaybackCompactLedgerDisplayState,
   truncateHash,
 } from "../lib/taskPlayback";
 import type { TaskTimelineSemanticRelation } from "../lib/taskTimelineSemantics";
@@ -161,6 +163,39 @@ export function ContractRuntimeAuthorityPanel({
         {diagnostics.bypass_records.map((record, index) => (
           <span key={`bypass-record:${index}`}>{authorityBypassRecordLabel(record, index)}</span>
         ))}
+      </div>
+    </section>
+  );
+}
+
+export function CurrentSnapshotPanel({
+  snapshot,
+  compact = false,
+}: {
+  snapshot: TaskPlaybackCurrentSnapshot;
+  compact?: boolean;
+}) {
+  const row = snapshot.row;
+  const display = row ? taskPlaybackCompactLedgerDisplayState(row) : null;
+  return (
+    <section
+      className={`task-playback-chip-section${compact ? " compact" : ""}`}
+      aria-label="Current ContractRuntime snapshot"
+      data-current-snapshot-in-playback="false"
+    >
+      <strong>Current snapshot</strong>
+      <div>
+        <span>Freshness: {snapshot.freshness_label}</span>
+        <span>History boundary: current state is not a playback event</span>
+        {row ? <span>Contract: {row.current_contract_id || row.contract_execution_id || "none recorded"}</span> : null}
+        {row ? (
+          <span>
+            Readiness: <b className={`status-badge ${display?.readinessTone ?? "status-unknown"}`}>{display?.readinessLabel ?? "unknown"}</b>
+          </span>
+        ) : <span>State: unavailable</span>}
+        {row?.next_legal_action.action || row?.next_legal_action.id ? (
+          <span>Next legal action: {row.next_legal_action.action || row.next_legal_action.id}</span>
+        ) : null}
       </div>
     </section>
   );
@@ -349,6 +384,7 @@ export default function TaskPlaybackPanel({
       </div>
 
       <ContractRuntimeAuthorityPanel authority={trace.authority_view} compact={compact} />
+      <CurrentSnapshotPanel snapshot={trace.current_snapshot} compact={compact} />
 
       {loading ? <div className="timeline-empty"><span className="spinner" /> Loading governed timeline data...</div> : null}
       {error ? <div className="timeline-empty timeline-error">Playback load failed: {error}</div> : null}

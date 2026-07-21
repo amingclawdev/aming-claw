@@ -5,6 +5,7 @@ import {
   isBacklogRowPrivate,
   normalizeTaskPlaybackTrace,
   normalizeTaskPlaybackCompactLedger,
+  projectRecentTimelineEvents,
   projectContractRuntimeAuthorityViewModel,
   taskPlaybackLedgerRowsToTimelineEvents,
   taskPlaybackCompactLedgerBlockingLabel,
@@ -1385,6 +1386,65 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
       && dogfoodViews.every((view) => view.backlog_close_readiness.display_status === "BLOCKED"),
     "dogfood executions/revisions/events should remain cache-distinct while OPEN row close stays blocked",
   );
+  dogfoodModes.forEach((mode, index) => {
+    const backlogId = `AC-SNAPSHOT-REFRESH-${mode.contractId}`;
+    const sourceEvent: TaskTimelineEvent = {
+      event_id: `stable-source-${index}`,
+      event_type: "runtime_context.worker_progress",
+      event_kind: "implementation",
+      status: "accepted",
+      created_at: `2026-07-18T19:5${index}:00Z`,
+    };
+    const traceAt = (generation: number, updatedAt: string, generatedAt: string) => normalizeTaskPlaybackTrace({
+      projectId: response.project_id,
+      backlog: { bug_id: backlogId, title: `${mode.contractId} refresh fixture`, status: "OPEN", priority: "P1" },
+      taskTimeline: { project_id: response.project_id, backlog_id: backlogId, events: [sourceEvent], count: 1 },
+      compactLedger: {
+        schema_version: "task_timeline.compact_multi_backlog_ledger.v1",
+        project_id: response.project_id,
+        row_count: 1,
+        source_event_count: 1,
+        rows: [{
+          backlog_id: backlogId,
+          current_contract_id: mode.contractId,
+          current_contract_execution_id: `cex-refresh-${index}`,
+          projection_generation: generation,
+          projection_watermark: 100 + generation,
+          projection_hash: `sha256:${mode.contractId}:${generation}`,
+          projection_updated_at: updatedAt,
+          next_legal_action: { id: mode.actionId, action: mode.actionId },
+          readiness_state: "contract_active",
+        }],
+      },
+      gateResponse: null,
+      source: "governed",
+      generatedAt,
+    });
+    const beforeRefresh = traceAt(1, "2026-07-18T20:00:00Z", "2026-07-18T20:00:01Z");
+    const afterRefresh = traceAt(2, "2026-07-18T20:05:00Z", "2026-07-18T20:05:01Z");
+    const history = (trace: ReturnType<typeof traceAt>) => trace.frames.map((frame) => ({
+      id: frame.id,
+      at: frame.at,
+      event_type: frame.event_type,
+      status: frame.status,
+    }));
+    assertFixture(
+      JSON.stringify(history(beforeRefresh)) === JSON.stringify(history(afterRefresh)),
+      `${mode.contractId}: refresh should keep append-only source history stable`,
+    );
+    assertFixture(
+      beforeRefresh.current_snapshot.row?.projection_generation === 1
+        && afterRefresh.current_snapshot.row?.projection_generation === 2
+        && afterRefresh.current_snapshot.projection_updated_at === "2026-07-18T20:05:00Z",
+      `${mode.contractId}: refresh should advance the separate current snapshot`,
+    );
+    assertFixture(
+      afterRefresh.frames[0]?.at === sourceEvent.created_at
+        && afterRefresh.frames[0]?.at !== afterRefresh.current_snapshot.projection_updated_at
+        && afterRefresh.frames[0]?.at !== afterRefresh.generated_at,
+      `${mode.contractId}: projection freshness and page-load time must never become event time`,
+    );
+  });
 
   return [
     "canonical visualization projects ContractRuntime current action before chain fallback",
@@ -1394,6 +1454,7 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
     "task timeline consumer carries canonical authority axes without adding playback frames",
     "current authority snapshot stays out of playback history",
     "direct-main, mf_parallel, and mf_batch_parallel dogfood modes retain canonical actions and cache identities",
+    "direct-main, mf_parallel, and mf_batch_parallel refresh snapshots advance without rewriting history",
   ];
 }
 
@@ -1426,6 +1487,7 @@ function taskPlaybackCompactLedgerProjectionAssertions(): string[] {
         projection_generation: 7,
         projection_watermark: 312,
         projection_hash: "sha256:fixture-contract-chain-current",
+        projection_updated_at: "2026-06-27T21:44:00Z",
         projection_degraded: false,
         projection_degraded_flags: {
           current_graph_resource_degraded: false,
@@ -1489,44 +1551,58 @@ function taskPlaybackCompactLedgerProjectionAssertions(): string[] {
   assertFixture(row.projection_generation === 7, "compact ledger: projection_generation should normalize");
   assertFixture(row.projection_watermark === 312, "compact ledger: projection_watermark should normalize");
   assertFixture(row.projection_hash === "sha256:fixture-contract-chain-current", "compact ledger: projection_hash should normalize");
+  assertFixture(row.projection_updated_at === "2026-06-27T21:44:00Z", "compact ledger: projection_updated_at should normalize as freshness metadata");
   assertFixture(row.projection_degraded === false, "compact ledger: projection_degraded should normalize");
   assertFixture(row.contract_chain_current.route_token_ref === "[private detail redacted]", "compact ledger: nested current projection should redact token refs");
   assertFixture(row.projection_degraded_flags.route_token_ref === "[private detail redacted]", "compact ledger: degraded flags should redact token refs");
 
   const ledgerEvents = taskPlaybackLedgerRowsToTimelineEvents(ledger, "2026-06-27T21:45:00Z");
-  assertFixture(ledgerEvents.length === 1, "compact ledger: one row should produce one timeline event");
-  const event = ledgerEvents[0];
-  const containers = [
-    ["payload", event.payload],
-    ["verification", event.verification],
-    ["artifact_refs", event.artifact_refs],
-  ] as const;
-  for (const [label, value] of containers) {
-    const record = value as Record<string, unknown>;
-    assertFixture(record.contract_chain_id === row.contract_chain_id, `compact ledger: ${label} should carry contract_chain_id`);
-    assertFixture(record.current_contract_execution_id === row.current_contract_execution_id, `compact ledger: ${label} should carry current_contract_execution_id`);
-    assertFixture(record.projection_generation === row.projection_generation, `compact ledger: ${label} should carry projection_generation`);
-    assertFixture(record.projection_watermark === row.projection_watermark, `compact ledger: ${label} should carry projection_watermark`);
-    assertFixture(record.projection_hash === row.projection_hash, `compact ledger: ${label} should carry projection_hash`);
-    assertFixture(record.contract_chain_current === row.contract_chain_current, `compact ledger: ${label} should carry contract_chain_current`);
-  }
+  assertFixture(ledgerEvents.length === 0, "compact ledger: mutable rows must not produce timeline events");
+
+  const stableSourceEvent: TaskTimelineEvent = {
+    event_id: "source-event-7312",
+    event_type: "runtime_context.implementation_evidence",
+    event_kind: "implementation",
+    status: "accepted",
+    created_at: "2026-06-27T21:40:00Z",
+  };
 
   const trace = normalizeTaskPlaybackTrace({
     projectId: "aming-claw",
     backlog,
     compactLedger: ledger,
-    taskTimeline: { project_id: "aming-claw", backlog_id: backlog.bug_id, events: [], count: 0 },
+    taskTimeline: { project_id: "aming-claw", backlog_id: backlog.bug_id, events: [stableSourceEvent], count: 1 },
     gateResponse: null,
     source: "governed",
     generatedAt: "2026-06-27T21:45:00Z",
   });
-  const frame = trace.frames.find((item) => item.event_type === "task_timeline.compact_ledger");
-  assertFixture(Boolean(frame), "compact ledger: generated frame should be present in playback trace");
-  assertFixture(frame?.specific_facts.some((fact) => fact.kind === "contract_chain_id" && fact.value === row.contract_chain_id) === true, "compact ledger: frame facts should expose chain id");
-  assertFixture(frame?.specific_facts.some((fact) => fact.kind === "projection_hash" && fact.value === row.projection_hash) === true, "compact ledger: frame facts should expose projection hash");
-  const rawSections = JSON.stringify(frame?.detail_inspector.raw_sections ?? []);
-  assertFixture(rawSections.includes("contract_chain_current") && rawSections.includes("projection_watermark"), "compact ledger: inspector raw sections should include compact projection fields");
-  assertFixture(!rawSections.includes("rtok-private-fixture"), "compact ledger: inspector raw sections should not expose token refs");
+  assertFixture(trace.frames.length === 1 && trace.frames[0]?.source_event_id === "source-event-7312", "compact ledger: playback should retain only the stable source event");
+  assertFixture(trace.frames[0]?.at === "2026-06-27T21:40:00Z", "compact ledger: source event time must survive without generatedAt/projection substitution");
+  assertFixture(trace.current_snapshot.row?.projection_hash === row.projection_hash, "compact ledger: current projection should remain available through the separate snapshot");
+  assertFixture(trace.current_snapshot.projection_updated_at === "2026-06-27T21:44:00Z" && trace.current_snapshot.freshness === "reported", "compact ledger: projection_updated_at should drive snapshot freshness only");
+  assertFixture(trace.current_snapshot.current_snapshot_in_playback === false, "compact ledger: current snapshot must declare that it is outside playback");
+  assertFixture(!JSON.stringify(trace.current_snapshot.row).includes("rtok-private-fixture"), "compact ledger: current snapshot should not expose token refs");
+  const syntheticProjectionEvent: TaskTimelineEvent = {
+    event_id: "ledger:synthetic-current",
+    event_type: "contract_runtime.current_state",
+    event_kind: "contract_runtime_compact_ledger",
+    status: "recorded",
+    created_at: "2026-06-27T21:44:00Z",
+    payload: { source: "task_timeline_compact_ledger" },
+  };
+  const recentEvents = projectRecentTimelineEvents({
+    project_id: "aming-claw",
+    events: [stableSourceEvent, syntheticProjectionEvent],
+    compact_ledger: ledger,
+    contract_runtime_projection_events: [syntheticProjectionEvent],
+    generated_at: "2026-06-27T21:45:00Z",
+  });
+  assertFixture(
+    recentEvents.length === 1
+      && recentEvents[0]?.event_id === stableSourceEvent.event_id
+      && recentEvents[0]?.created_at === stableSourceEvent.created_at,
+    "compact ledger: project-wide recent history should ignore current projection events and keep stable source time",
+  );
 
   const legacyOnlyBacklog: BacklogBug = {
     bug_id: "AC-DASHBOARD-LEGACY-ROUTE-PRECHECK-ADVISORY-20260629",
@@ -1583,12 +1659,12 @@ function taskPlaybackCompactLedgerProjectionAssertions(): string[] {
     source: "governed",
     generatedAt: "2026-06-29T16:00:00Z",
   });
-  const legacyOnlyFrame = legacyOnlyTrace.frames.find((item) => item.event_type === "task_timeline.compact_ledger");
-  assertFixture(legacyOnlyFrame?.status === "recorded", `compact ledger: legacy-only precheck blockers should be advisory/recorded, got ${legacyOnlyFrame?.status}`);
+  assertFixture(legacyOnlyTrace.frames.length === 0, "compact ledger: legacy-only current state should not create a historical frame");
   assertFixture(
-    !JSON.stringify(legacyOnlyFrame?.failure_diagnosis ?? []).includes("route_action_precheck"),
-    "compact ledger: legacy route_action_precheck should not appear in failure diagnosis",
+    legacyOnlyTrace.current_snapshot.row?.backlog_id === legacyOnlyBacklog.bug_id,
+    "compact ledger: legacy advisory state should remain available in the current snapshot",
   );
+  assertFixture(legacyOnlyTrace.current_snapshot.freshness_label.includes("unknown / stale"), "compact ledger: missing projection freshness should display unknown/stale");
 
   const authorityLedger = normalizeTaskPlaybackCompactLedger({
     schema_version: "task_timeline.compact_multi_backlog_ledger.v1",
@@ -1648,17 +1724,16 @@ function taskPlaybackCompactLedgerProjectionAssertions(): string[] {
     source: "governed",
     generatedAt: "2026-06-29T16:01:00Z",
   });
-  const authorityFrame = authorityTrace.frames.find((item) => item.event_type === "task_timeline.compact_ledger");
-  assertFixture(authorityFrame?.status === "blocked", `compact ledger: ContractRuntime authority blocker should keep frame blocked, got ${authorityFrame?.status}`);
+  assertFixture(authorityTrace.frames.length === 0, "compact ledger: ContractRuntime current blockers should not become historical frames");
   assertFixture(
-    JSON.stringify(authorityFrame?.failure_diagnosis ?? []).includes("contract_runtime.worker_finish_gate"),
-    "compact ledger: ContractRuntime authority missing evidence should appear in failure diagnosis",
+    taskPlaybackCompactLedgerBlockingLabel(authorityTrace.current_snapshot.row!).includes("contract_runtime.worker_finish_gate"),
+    "compact ledger: ContractRuntime authority missing evidence should remain visible in current snapshot state",
   );
 
   return [
-    "compact ledger projection fields normalize and project into timeline payload/verification/artifacts",
-    "compact ledger generated frame exposes chain/projection facts and safe inspector data",
-    "compact ledger legacy route/mf prechecks are advisory unless ContractRuntime authority reports a blocker",
+    "compact ledger projection fields normalize into a separate current snapshot",
+    "playback retains stable source-event time and never synthesizes compact-ledger frames",
+    "missing projection freshness displays unknown/stale while current blockers remain inspectable",
   ];
 }
 

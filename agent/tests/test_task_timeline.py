@@ -2339,6 +2339,21 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(current["projection_source"], "backlog_contract_chain_current")
         self.assertEqual(current["projection_hash"], row["projection_hash"])
 
+        current_ledger = task_timeline.build_contract_runtime_current_ledger(
+            self.conn,
+            "proj",
+        )
+        [current_row] = current_ledger["rows"]
+        self.assertTrue(current_row["projection_updated_at"])
+        self.assertEqual(current_ledger["source_event_count"], 0)
+        self.assertEqual(
+            task_timeline.compact_ledger_to_timeline_events(
+                current_ledger,
+                generated_at="2026-06-27T21:45:00Z",
+            ),
+            [],
+        )
+
     def test_compact_ledger_contract_complete_suppresses_stale_blocker(self):
         from agent.governance import server, task_timeline
 
@@ -2414,12 +2429,7 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertNotIn("blocker_summary", row["contract_chain_current"])
         self.assertNotIn("close_blocked_by_next_legal_action", row["contract_chain_current"])
 
-        [projected] = task_timeline.compact_ledger_to_timeline_events(ledger)
-        self.assertEqual(projected["status"], "passed")
-        self.assertFalse(projected["verification"]["blocked"])
-        self.assertEqual(projected["payload"]["next_legal_action"], {})
-        self.assertEqual(projected["payload"]["blocker_summary"], {})
-        self.assertNotIn("worker_read_runtime_guide", json.dumps(projected))
+        self.assertEqual(task_timeline.compact_ledger_to_timeline_events(ledger), [])
 
     def test_compact_ledger_merge_complete_projection_clears_stale_action(self):
         from agent.governance import task_timeline
@@ -2479,10 +2489,13 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(row["blocker_summary"], {})
         self.assertTrue(row["legacy_advisory_blocker_suppressed"])
 
-        [projected] = task_timeline.compact_ledger_to_timeline_events(merged)
-        self.assertEqual(projected["status"], "passed")
-        self.assertFalse(projected["verification"]["blocked"])
-        self.assertEqual(projected["payload"]["next_legal_action"], {})
+        self.assertEqual(
+            task_timeline.compact_ledger_to_timeline_events(
+                merged,
+                generated_at="2026-06-27T21:45:00Z",
+            ),
+            [],
+        )
 
     def _record_route_owned_source_lineage(self, bug_id, *, task_id="", identity=None):
         from agent.governance import task_timeline

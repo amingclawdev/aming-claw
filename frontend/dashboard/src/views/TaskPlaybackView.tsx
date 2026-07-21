@@ -1025,6 +1025,7 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
       <div>
         {activeCount ? <span>{activeCount}</span> : null}
         {singleActive ? <span>{singleActive}</span> : null}
+        <span>Current snapshot freshness: {trace.current_snapshot.freshness_label}</span>
         <span>Latest event: {latestEventText || "none recorded"}</span>
         <span>Worker/QA/close gate: {laneState || "none recorded"}</span>
         {authority ? <span>Contract progress: {authority.contract_execution_progress.display_status}</span> : null}

@@ -14540,153 +14540,16 @@ def compact_ledger_to_timeline_events(
     *,
     generated_at: str = "",
 ) -> list[dict[str, Any]]:
-    """Project compact ContractRuntime rows into timeline-like Current events."""
+    """Return no events because compact-ledger rows are mutable snapshots.
 
-    project_id = str(ledger.get("project_id") or "")
-    rows = [row for row in ledger.get("rows") or [] if isinstance(row, Mapping)]
-    events: list[dict[str, Any]] = []
-    for index, row in enumerate(rows):
-        backlog_id = str(row.get("backlog_id") or "")
-        contract_execution_id = str(row.get("contract_execution_id") or "")
-        event_id = f"ledger:{backlog_id or contract_execution_id or index + 1}"
-        at = str(row.get("projection_updated_at") or generated_at or _utc_iso())
-        projection_fields = {
-            "contract_chain_id": str(row.get("contract_chain_id") or ""),
-            "root_contract_execution_id": str(row.get("root_contract_execution_id") or ""),
-            "current_contract_execution_id": str(row.get("current_contract_execution_id") or ""),
-            "current_contract_id": str(row.get("current_contract_id") or ""),
-            "parent_to_resume_contract_execution_id": str(
-                row.get("parent_to_resume_contract_execution_id") or ""
-            ),
-            "active_child_contract_execution_id": str(
-                row.get("active_child_contract_execution_id") or ""
-            ),
-            "projection_generation": int(row.get("projection_generation") or 0),
-            "projection_watermark": int(row.get("projection_watermark") or 0),
-            "projection_hash": str(row.get("projection_hash") or ""),
-            "projection_degraded": bool(row.get("projection_degraded")),
-            "projection_degraded_flags": dict(row.get("projection_degraded_flags") or {}),
-            "contract_chain_current": dict(row.get("contract_chain_current") or {}),
-        }
-        next_action = (
-            dict(row.get("next_legal_action"))
-            if isinstance(row.get("next_legal_action"), Mapping)
-            else {}
-        )
-        blocker_summary = (
-            dict(row.get("blocker_summary"))
-            if isinstance(row.get("blocker_summary"), Mapping)
-            else {}
-        )
-        payload = {
-            "schema_version": str(
-                ledger.get("schema_version")
-                or "task_timeline.compact_multi_backlog_ledger.v1"
-            ),
-            "source": "task_timeline_compact_ledger",
-            "source_backed": True,
-            "contract_runtime_projection": True,
-            "lane": "gate",
-            "backlog_id": backlog_id,
-            "title": str(row.get("title") or ""),
-            "priority": str(row.get("priority") or ""),
-            "row_status": str(row.get("status") or ""),
-            "contract_execution_id": contract_execution_id,
-            **projection_fields,
-            "merge_queue_id": str(row.get("merge_queue_id") or ""),
-            "merge_queue_index": int(row.get("merge_queue_index") or 0),
-            "merge_queue_item_id": str(row.get("merge_queue_item_id") or ""),
-            "merge_queue_task_id": str(row.get("merge_queue_task_id") or ""),
-            "merge_queue_status": str(row.get("merge_queue_status") or ""),
-            "latest_event_id": str(row.get("latest_event_id") or ""),
-            "latest_event_kind": str(row.get("latest_event_kind") or ""),
-            "latest_event_type": str(row.get("latest_event_type") or ""),
-            "latest_status": str(row.get("latest_status") or ""),
-            "latest_payload_ref": dict(row.get("latest_payload_ref") or {}),
-            "next_legal_action": next_action,
-            "blocker_summary": blocker_summary,
-            "head_commit": str(row.get("head_commit") or ""),
-            "readiness_state": str(row.get("readiness_state") or ""),
-            "source_event_count": int(ledger.get("source_event_count") or 0),
-            "ledger_row_count": int(ledger.get("row_count") or len(rows)),
-        }
-        events.append(
-            {
-                "event_id": event_id,
-                "project_id": project_id,
-                "backlog_id": backlog_id,
-                "task_id": str(row.get("merge_queue_task_id") or contract_execution_id),
-                "event_type": "contract_runtime.current_state",
-                "event_kind": "contract_runtime_compact_ledger",
-                "phase": "contract_runtime",
-                "actor": "ContractRuntime",
-                "status": _compact_ledger_event_status(row),
-                "commit_sha": str(row.get("head_commit") or row.get("commit") or ""),
-                "payload": payload,
-                "verification": {
-                    "contract_execution_id": contract_execution_id,
-                    **projection_fields,
-                    "readiness_state": str(row.get("readiness_state") or ""),
-                    "close_ready": str(row.get("readiness_state") or "") == "close_ready",
-                    "blocked": _compact_ledger_event_status(row) == "blocked",
-                    "latest_event_id": str(row.get("latest_event_id") or ""),
-                    "latest_event_kind": str(row.get("latest_event_kind") or ""),
-                    "latest_event_type": str(row.get("latest_event_type") or ""),
-                    "latest_status": str(row.get("latest_status") or ""),
-                    "latest_payload_ref": dict(row.get("latest_payload_ref") or {}),
-                    "head_commit": str(row.get("head_commit") or ""),
-                    "next_legal_action": next_action,
-                    "blocker_summary": blocker_summary,
-                },
-                "artifact_refs": {
-                    "compact_ledger_schema": str(
-                        ledger.get("schema_version")
-                        or "task_timeline.compact_multi_backlog_ledger.v1"
-                    ),
-                    "contract_execution_id": contract_execution_id,
-                    **projection_fields,
-                    "latest_payload_ref": dict(row.get("latest_payload_ref") or {}),
-                    "merge_queue_id": str(row.get("merge_queue_id") or ""),
-                    "merge_queue_index": int(row.get("merge_queue_index") or 0),
-                    "merge_queue_item_id": str(row.get("merge_queue_item_id") or ""),
-                    "merge_queue_task_id": str(row.get("merge_queue_task_id") or ""),
-                    "merge_queue_status": str(row.get("merge_queue_status") or ""),
-                    "source_event_id": str(row.get("latest_event_id") or ""),
-                    "source_event_refs": [
-                        str(row.get("latest_event_id") or ""),
-                        *[str(ref) for ref in row.get("projection_source_refs") or []],
-                    ],
-                },
-                "created_at": at,
-            }
-        )
-    return events
+    The compatibility helper remains for callers during the response-schema
+    transition, but current ContractRuntime projections must never enter the
+    append-only timeline. In particular, neither ``projection_updated_at`` nor
+    response generation time is an event timestamp.
+    """
 
-
-def _compact_ledger_event_status(row: Mapping[str, Any]) -> str:
-    readiness = str(row.get("readiness_state") or "").lower()
-    latest_status = str(row.get("latest_status") or "").lower()
-    blocker = row.get("blocker_summary") if isinstance(row.get("blocker_summary"), Mapping) else {}
-    blocker_text = " ".join(
-        str(value or "")
-        for value in (
-            blocker.get("kind"),
-            blocker.get("summary"),
-            blocker.get("reason"),
-            " ".join(str(item) for item in blocker.get("keys") or []),
-        )
-    ).lower()
-    if readiness == "contract_complete" or row.get("legacy_advisory_blocker_suppressed"):
-        return "passed"
-    if "block" in readiness or "block" in latest_status or "block" in blocker_text:
-        return "blocked"
-    if "fail" in readiness or "fail" in latest_status:
-        return "failed"
-    if any(token in readiness for token in ("close_ready", "verified", "implemented")):
-        return "passed"
-    if any(token in readiness for token in ("planned", "pending")) or "pending" in latest_status:
-        return "waiting"
-    return "recorded"
+    del ledger, generated_at
+    return []
 
 
 def _priority_sort_key(priority: Any) -> int:
