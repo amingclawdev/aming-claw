@@ -45,6 +45,9 @@ from agent.governance.contracts.runtime import (
     _next_action_from_record,
     _worker_implementation_lineage,
 )
+from agent.governance.contract_runtime_visualization import (
+    build_contract_runtime_visualization,
+)
 from agent.governance.db import _ensure_schema
 from agent.governance.errors import GovernanceError, PermissionDeniedError, ValidationError
 from agent.mcp.schema_contract import MCP_TOOL_SCHEMA_VERSION
@@ -72347,3 +72350,51 @@ def test_coordination_close_rejects_child_fixed_before_canonical_epoch_barrier(
     assert active_epoch.status == (
         parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILED
     )
+
+
+def test_contract_runtime_visualization_emits_all_typed_legacy_repair_targets():
+    result = build_contract_runtime_visualization(
+        project_id="proj",
+        backlog={"bug_id": "AC-COMPAT-TARGETS", "status": "OPEN"},
+        runtime_records=[],
+        chain_current={},
+        chain_edges=[],
+        timeline_events=[],
+        legacy_compatibility_sources=[
+            {
+                "id": 15441,
+                "status": "recorded",
+                "source_authority": "legacy_contract_gate",
+                "payload": {
+                    "blocked": True,
+                    "blocker_ids": ["blocker-a", "blocker-b"],
+                    "diagnostic_backlog_id": "AC-DIAGNOSTIC",
+                    "missing_requirement_ids": ["qa", "finish_gate"],
+                    "missing_event_kinds": ["verification", "close_ready"],
+                    "contract_gate": {
+                        "stage_id": "qa",
+                        "line_id": "qa_independent_verification",
+                    },
+                    "source_event_ids": ["external-event-7"],
+                    "source_of_authority": "legacy_gate_kernel",
+                },
+            }
+        ],
+    )
+
+    targets = result["repair_targets"]
+    target_types = {item["type"] for item in targets}
+    assert target_types >= {
+        "blocker_id",
+        "diagnostic_backlog_id",
+        "missing_requirement_id",
+        "missing_event_kind",
+        "contract_stage",
+        "contract_line",
+        "source_event_id",
+        "source_authority",
+    }
+    assert len({item["id"] for item in targets}) == len(targets)
+    assert not any(item["type"] == "source_missing_repair_id" for item in targets)
+    assert all(item["advisory_only"] is True for item in targets)
+    assert all(item["overrides_current_authority"] is False for item in targets)

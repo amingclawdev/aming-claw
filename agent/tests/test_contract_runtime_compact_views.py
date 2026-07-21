@@ -247,6 +247,12 @@ def test_visualization_builder_is_public_safe_and_keeps_authority_axes_separate(
         "backlog_close_readiness",
         "historical_diagnostics",
     ]
+    assert result["authority"]["source_order"] == [
+        "contract_runtime_current",
+        "backlog_contract_chain_current",
+        "task_timeline_compact_ledger",
+        "legacy_diagnostics",
+    ]
     assert result["backlog_close_readiness"]["state"] == "open"
     assert result["backlog_close_readiness"][
         "contract_complete_implies_backlog_close"
@@ -289,6 +295,107 @@ def test_visualization_builder_is_public_safe_and_keeps_authority_axes_separate(
         "session_token",
     ):
         assert forbidden_key not in encoded
+
+
+@pytest.mark.parametrize("blocked_value", [False, 0, ""])
+def test_visualization_legacy_blocked_false_values_are_non_blocking(blocked_value):
+    from agent.governance.contract_runtime_visualization import (
+        build_contract_runtime_visualization,
+    )
+
+    result = build_contract_runtime_visualization(
+        project_id="proj",
+        backlog={"bug_id": "AC-COMPAT", "status": "OPEN"},
+        runtime_records=[],
+        chain_current={},
+        chain_edges=[],
+        timeline_events=[],
+        legacy_compatibility_sources=[
+            {
+                "id": 15440,
+                "status": "blocked",
+                "event_kind": "legacy_gate",
+                "payload": {
+                    "blocked": blocked_value,
+                    "diagnostic_backlog_id": "AC-MUST-NOT-BLOCK",
+                },
+            }
+        ],
+    )
+
+    assert result["raw_compatibility"]["source_count"] == 1
+    assert result["raw_compatibility"]["sources"][0]["blocked"] is False
+    assert result["repair_targets"] == []
+
+
+def test_visualization_projects_event_15441_repair_id_and_missing_id_fallback():
+    from agent.governance.contract_runtime_visualization import (
+        build_contract_runtime_visualization,
+    )
+
+    diagnostic_id = (
+        "AC-SYSTEM-PARENTLESS-DIRECT-MAIN-QA-TIMELINE-"
+        "ONBOARD-CONTRACT-DEFINITION-R1-20260719"
+    )
+    result = build_contract_runtime_visualization(
+        project_id="proj",
+        backlog={"bug_id": "AC-COMPAT", "status": "OPEN"},
+        runtime_records=[],
+        chain_current={},
+        chain_edges=[],
+        timeline_events=[],
+        legacy_compatibility_sources=[
+            {
+                "id": 15441,
+                "status": "blocked",
+                "event_kind": "system_block",
+                "payload": {
+                    "blocker": "QA append failed with an unknown contract definition",
+                    "diagnostic_backlog_id": diagnostic_id,
+                    "route_token_ref": "rtok-must-not-leak",
+                },
+            },
+            {
+                "id": 15442,
+                "status": "blocked",
+                "event_kind": "legacy_gate",
+                "payload": {
+                    "blocker": "A public legacy gate failed without a stable id",
+                    "session_token": "session-must-not-leak",
+                },
+            },
+        ],
+    )
+
+    sources = result["raw_compatibility"]["sources"]
+    event_15441 = next(item for item in sources if item["source_event_id"] == "15441")
+    assert event_15441["source_authority"] == "task_timeline_events"
+    assert event_15441["advisory_only"] is True
+    assert event_15441["overrides_current_authority"] is False
+    assert event_15441["raw_fields"]["payload.diagnostic_backlog_id"] == diagnostic_id
+
+    targets_15441 = [
+        item for item in result["repair_targets"]
+        if item["source_event_id"] == "15441"
+    ]
+    assert {item["type"] for item in targets_15441} >= {
+        "diagnostic_backlog_id",
+        "source_event_id",
+        "source_authority",
+    }
+    assert any(item["repair_id"] == diagnostic_id for item in targets_15441)
+
+    targets_15442 = [
+        item for item in result["repair_targets"]
+        if item["source_event_id"] == "15442"
+    ]
+    assert any(item["type"] == "source_missing_repair_id" for item in targets_15442)
+    encoded = json.dumps(result)
+    assert "listed ids" not in encoded.lower()
+    assert "route_token_ref" not in encoded
+    assert "rtok-must-not-leak" not in encoded
+    assert "session_token" not in encoded
+    assert "session-must-not-leak" not in encoded
 
 
 def test_visualization_selects_chain_current_before_runtime_record_cap():
@@ -409,6 +516,34 @@ def test_visualization_endpoint_returns_cursor_bounded_runtime_projection(
                 status="passed",
                 payload={"raw_secret": "must-not-leak"},
             )
+        conn.execute(
+            """
+            INSERT INTO task_timeline_events (
+                project_id, backlog_id, task_id, event_type, phase,
+                event_kind, actor, status, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "proj",
+                "AC-VISUAL-ENDPOINT",
+                "task-visual-endpoint",
+                "system.block.qa_timeline_onboard_contract_definition",
+                "qa",
+                "system_block",
+                "observer:codex",
+                "blocked",
+                json.dumps(
+                    {
+                        "blocker": (
+                            "QA append failed with an unknown contract definition"
+                        ),
+                        "diagnostic_backlog_id": "AC-ENDPOINT-DIAGNOSTIC",
+                        "route_token_ref": "rtok-endpoint-must-not-leak",
+                    }
+                ),
+                "2026-07-18T00:00:03Z",
+            ),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -436,11 +571,18 @@ def test_visualization_endpoint_returns_cursor_bounded_runtime_projection(
     )
     assert response["backlog_close_readiness"]["state"] == "open"
     assert response["timeline"]["returned_count"] == 1
-    assert response["timeline"]["total_count"] == 2
+    assert response["timeline"]["total_count"] == 3
     assert response["timeline"]["truncated"] is True
     assert response["timeline"]["next_cursor"]
     assert response["dag"]["edge_count"] >= 2
+    assert response["raw_compatibility"]["source_count"] == 1
+    assert any(
+        target["type"] == "diagnostic_backlog_id"
+        and target["repair_id"] == "AC-ENDPOINT-DIAGNOSTIC"
+        for target in response["repair_targets"]
+    )
     assert "rtok-must-not-leak" not in encoded
+    assert "rtok-endpoint-must-not-leak" not in encoded
     assert "must-not-leak" not in encoded
     assert "route_token_ref" not in encoded
 

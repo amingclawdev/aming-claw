@@ -14,6 +14,99 @@ from typing import Any
 
 SCHEMA_VERSION = "contract_runtime.visualization.v1"
 
+_PRIVATE_COMPAT_TERMS = (
+    "credential",
+    "fence",
+    "password",
+    "private",
+    "secret",
+    "session",
+    "token",
+    "worktree",
+)
+_PRIVATE_COMPAT_VALUE_MARKERS = (
+    "/.worktrees/",
+    "api_key",
+    "bearer ",
+    "fence-",
+    "route-20",
+    "route_id=",
+    "rtok-",
+    "sesref-",
+    "session-",
+    "wstok-",
+)
+_RAW_COMPAT_SCALAR_FIELDS = {
+    "blocked",
+    "authorization_blocker",
+    "blocker",
+    "blocker_id",
+    "block_reason",
+    "blocked_line_id",
+    "blocked_stage_id",
+    "bypassed_line_id",
+    "bypassed_stage_id",
+    "decision",
+    "diagnostic_backlog_id",
+    "diagnostic_bug_id",
+    "event_kind",
+    "line_id",
+    "message",
+    "missing_event_kind",
+    "missing_requirement_id",
+    "reason",
+    "source",
+    "source_authority",
+    "source_event_id",
+    "source_of_authority",
+    "authority_source",
+    "stage_id",
+    "status",
+}
+_RAW_COMPAT_SEQUENCE_FIELDS = {
+    "blocked_event_kinds",
+    "blocked_protected_event_kinds",
+    "blocker_ids",
+    "errors",
+    "line_ids",
+    "missing_event_kinds",
+    "missing_lines",
+    "missing_proof_fields",
+    "missing_required_fields",
+    "missing_required_evidence",
+    "missing_requirement_ids",
+    "source_event_ids",
+    "stage_ids",
+    "warnings",
+}
+_REPAIR_TARGET_FIELDS = {
+    "blocker_id": "blocker_id",
+    "blocker_ids": "blocker_id",
+    "diagnostic_backlog_id": "diagnostic_backlog_id",
+    "diagnostic_bug_id": "diagnostic_backlog_id",
+    "missing_requirement_id": "missing_requirement_id",
+    "missing_requirement_ids": "missing_requirement_id",
+    "missing_required_fields": "missing_requirement_id",
+    "missing_required_evidence": "missing_requirement_id",
+    "missing_event_kind": "missing_event_kind",
+    "missing_event_kinds": "missing_event_kind",
+    "blocked_event_kinds": "missing_event_kind",
+    "blocked_protected_event_kinds": "missing_event_kind",
+    "stage_id": "contract_stage",
+    "stage_ids": "contract_stage",
+    "blocked_stage_id": "contract_stage",
+    "bypassed_stage_id": "contract_stage",
+    "line_id": "contract_line",
+    "line_ids": "contract_line",
+    "blocked_line_id": "contract_line",
+    "bypassed_line_id": "contract_line",
+    "source_event_id": "source_event_id",
+    "source_event_ids": "source_event_id",
+    "source_authority": "source_authority",
+    "source_of_authority": "source_authority",
+    "authority_source": "source_authority",
+}
+
 
 def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
@@ -84,6 +177,289 @@ def _safe_refs(values: Any, *, limit: int = 24) -> list[str]:
 def _safe_ref(value: Any) -> str:
     refs = _safe_refs([value], limit=1)
     return refs[0] if refs else ""
+
+
+def _public_compat_scalar(value: Any) -> str | int | float | bool | None:
+    """Return one bounded public-safe legacy scalar, or ``None``."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    lowered = text.lower()
+    if not text or len(text) > 512:
+        return None
+    if any(term in lowered for term in _PRIVATE_COMPAT_TERMS):
+        return None
+    if any(marker in lowered for marker in _PRIVATE_COMPAT_VALUE_MARKERS):
+        return None
+    if text.startswith(("/", "~/")):
+        return None
+    return text
+
+
+def _public_compat_value(value: Any) -> Any:
+    scalar = _public_compat_scalar(value)
+    if scalar is not None:
+        return scalar
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return None
+    result: list[Any] = []
+    for item in value:
+        safe = _public_compat_scalar(item)
+        if safe is None or safe in result:
+            continue
+        result.append(safe)
+        if len(result) >= 24:
+            break
+    return result or None
+
+
+def _compatibility_fields(value: Any, *, path: str = "") -> dict[str, Any]:
+    """Flatten only explicitly allow-listed legacy diagnostic fields."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    fields: dict[str, Any] = {}
+    for raw_key in sorted(value, key=lambda item: str(item)):
+        key = str(raw_key or "").strip()
+        if not key or any(term in key.lower() for term in _PRIVATE_COMPAT_TERMS):
+            continue
+        item = value.get(raw_key)
+        field_path = f"{path}.{key}" if path else key
+        blocked_field = key == "blocked" or key.endswith("_blocked")
+        if key in _RAW_COMPAT_SCALAR_FIELDS or key in _RAW_COMPAT_SEQUENCE_FIELDS:
+            safe = _public_compat_value(item)
+            if blocked_field and item in (None, "", [], {}):
+                fields[field_path] = item
+            elif safe is not None:
+                fields[field_path] = safe
+        if isinstance(item, Mapping) and field_path.count(".") < 6:
+            fields.update(_compatibility_fields(item, path=field_path))
+        elif (
+            isinstance(item, Sequence)
+            and not isinstance(item, (str, bytes))
+            and field_path.count(".") < 6
+        ):
+            for item_index, nested in enumerate(item[:24]):
+                if not isinstance(nested, Mapping):
+                    continue
+                nested_path = f"{field_path}[{item_index}]"
+                fields.update(_compatibility_fields(nested, path=nested_path))
+                if key in {"missing_required_evidence", "missing_proof_fields"}:
+                    missing_id = _public_compat_scalar(
+                        nested.get("id")
+                        or nested.get("field")
+                        or nested.get("evidence_kind")
+                        or nested.get("kind")
+                    )
+                    if missing_id is not None:
+                        fields[f"{nested_path}.missing_requirement_id"] = missing_id
+    return fields
+
+
+def _blocked_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "blocked", "on", "true", "yes"}
+    return False
+
+
+def _compatibility_is_blocked(
+    value: Mapping[str, Any],
+    fields: Mapping[str, Any],
+) -> bool:
+    blocked_values = [
+        field_value
+        for field_path, field_value in fields.items()
+        if field_path.rsplit(".", 1)[-1] == "blocked"
+        or field_path.rsplit(".", 1)[-1].endswith("_blocked")
+        or field_path.rsplit(".", 1)[-1] == "authorization_blocker"
+    ]
+    if blocked_values:
+        return any(_blocked_value(item) for item in blocked_values)
+    return str(value.get("status") or value.get("decision") or "").strip().lower() in {
+        "blocked",
+        "failed",
+        "missing",
+        "rejected",
+    }
+
+
+def _repair_values(value: Any) -> list[str]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        raw_values = value
+    else:
+        raw_values = [value]
+    result: list[str] = []
+    for item in raw_values:
+        safe = _public_compat_scalar(item)
+        if safe is None:
+            continue
+        text = str(safe).strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _raw_compatibility_projection(
+    sources: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Project legacy diagnostics without granting them current authority."""
+
+    projected_sources: list[dict[str, Any]] = []
+    repair_targets: list[dict[str, Any]] = []
+    repair_target_keys: set[tuple[str, str, str]] = set()
+    for index, source in enumerate(sources, start=1):
+        if not isinstance(source, Mapping):
+            continue
+        fields = _compatibility_fields(source)
+        has_blocked_field = any(
+            path.rsplit(".", 1)[-1] == "blocked"
+            or path.rsplit(".", 1)[-1].endswith("_blocked")
+            for path in fields
+        )
+        has_repair_field = any(
+            path.rsplit(".", 1)[-1] in _REPAIR_TARGET_FIELDS
+            for path in fields
+        )
+        blocked = _compatibility_is_blocked(source, fields)
+        if not blocked and not has_blocked_field and not has_repair_field:
+            continue
+
+        source_event_id = _public_compat_scalar(
+            source.get("source_event_id")
+            or source.get("event_id")
+            or source.get("id")
+        )
+        source_event_text = str(source_event_id or "").strip()
+        source_authority = _public_compat_scalar(
+            source.get("source_authority") or source.get("authority_source")
+        )
+        source_authority_text = str(
+            source_authority or "task_timeline_events"
+        ).strip()
+        source_event_ref = (
+            f"timeline:{source_event_text}" if source_event_text else ""
+        )
+        source_identity = (
+            source_event_ref
+            or f"{source_authority_text}:compatibility-source:{index}"
+        )
+        projected_sources.append(
+            {
+                "id": source_identity,
+                "source_authority": source_authority_text,
+                "source_event_id": source_event_text,
+                "source_event_ref": source_event_ref,
+                "source_event_kind": str(
+                    _public_compat_scalar(
+                        source.get("event_kind") or source.get("event_type")
+                    )
+                    or ""
+                ),
+                "blocked": blocked,
+                "advisory_only": True,
+                "overrides_current_authority": False,
+                "public_safe": True,
+                "raw_fields": fields,
+            }
+        )
+        if not blocked:
+            continue
+
+        stable_repair_target = False
+        for field_path, field_value in sorted(fields.items()):
+            leaf = field_path.rsplit(".", 1)[-1]
+            target_type = _REPAIR_TARGET_FIELDS.get(leaf)
+            if not target_type:
+                continue
+            for repair_value in _repair_values(field_value):
+                if target_type not in {"source_event_id", "source_authority"}:
+                    stable_repair_target = True
+                key = (
+                    source_identity,
+                    target_type,
+                    repair_value,
+                )
+                if key in repair_target_keys:
+                    continue
+                repair_target_keys.add(key)
+                repair_targets.append(
+                    {
+                        "id": (
+                            f"repair-target:{source_identity}:"
+                            f"{target_type}:{repair_value}"
+                        ),
+                        "type": target_type,
+                        "repair_id": repair_value,
+                        "source_field": field_path,
+                        "source_authority": source_authority_text,
+                        "source_event_id": source_event_text,
+                        "source_event_ref": source_event_ref,
+                        "advisory_only": True,
+                        "overrides_current_authority": False,
+                    }
+                )
+
+        for target_type, repair_value in (
+            ("source_event_id", source_event_text),
+            ("source_authority", source_authority_text),
+        ):
+            if not repair_value:
+                continue
+            key = (source_identity, target_type, repair_value)
+            if key in repair_target_keys:
+                continue
+            repair_target_keys.add(key)
+            repair_targets.append(
+                {
+                    "id": (
+                        f"repair-target:{source_identity}:"
+                        f"{target_type}:{repair_value}"
+                    ),
+                    "type": target_type,
+                    "repair_id": repair_value,
+                    "source_field": target_type,
+                    "source_authority": source_authority_text,
+                    "source_event_id": source_event_text,
+                    "source_event_ref": source_event_ref,
+                    "advisory_only": True,
+                    "overrides_current_authority": False,
+                }
+            )
+        if not stable_repair_target:
+            repair_targets.append(
+                {
+                    "id": f"repair-target:{source_identity}:source_missing_repair_id",
+                    "type": "source_missing_repair_id",
+                    "repair_id": "source_missing_repair_id",
+                    "source_field": "",
+                    "source_authority": source_authority_text,
+                    "source_event_id": source_event_text,
+                    "source_event_ref": source_event_ref,
+                    "advisory_only": True,
+                    "overrides_current_authority": False,
+                }
+            )
+
+    return (
+        {
+            "schema_version": "contract_runtime.visualization.raw_compatibility.v1",
+            "public_safe": True,
+            "advisory_only": True,
+            "overrides_current_authority": False,
+            "sources": projected_sources,
+            "source_count": len(projected_sources),
+        },
+        repair_targets,
+    )
 
 
 def _next_action_summary(value: Any) -> dict[str, Any]:
@@ -313,6 +689,7 @@ def build_contract_runtime_visualization(
     chain_current: Mapping[str, Any],
     chain_edges: Sequence[Mapping[str, Any]],
     timeline_events: Sequence[Mapping[str, Any]],
+    legacy_compatibility_sources: Sequence[Mapping[str, Any]] | None = None,
     compact_ledger_row: Mapping[str, Any] | None = None,
     timeline_total: int | None = None,
     timeline_limit: int = 100,
@@ -406,6 +783,11 @@ def build_contract_runtime_visualization(
 
     event_summaries = [_event_summary(event) for event in timeline_events]
     ledger = _mapping(compact_ledger_row)
+    raw_compatibility, repair_targets = _raw_compatibility_projection(
+        legacy_compatibility_sources
+        if legacy_compatibility_sources is not None
+        else timeline_events
+    )
 
     advisories: list[dict[str, Any]] = []
     for candidate in (
@@ -579,7 +961,7 @@ def build_contract_runtime_visualization(
                 "contract_runtime_current",
                 "backlog_contract_chain_current",
                 "task_timeline_compact_ledger",
-                "legacy_contract_state_and_timeline_gate",
+                "legacy_diagnostics",
             ],
             "source_of_authority": "contract_runtime",
             "authority_decision_source": "backlog_contract_chain_current",
@@ -668,6 +1050,8 @@ def build_contract_runtime_visualization(
         },
         "bypass_records": bypass_records,
         "legacy_advisories": advisories,
+        "raw_compatibility": raw_compatibility,
+        "repair_targets": repair_targets,
         "projection_freshness": {
             "status": (
                 "missing"

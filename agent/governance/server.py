@@ -92294,6 +92294,7 @@ def handle_project_contract_runtime_visualization(ctx: RequestContext):
             chain_current=current,
             chain_edges=chain_edges,
             timeline_events=compact_events,
+            legacy_compatibility_sources=events,
             compact_ledger_row=compact_row,
             timeline_total=timeline_total,
             timeline_limit=limit,
