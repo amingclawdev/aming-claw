@@ -61710,6 +61710,113 @@ def _contract_runtime_server_candidate_commit(
     return ""
 
 
+def _contract_runtime_server_candidate_base_commit(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    expected_candidate_commit: str,
+) -> str:
+    """Return the trusted cumulative diff base for the candidate commit."""
+
+    if str(record.get("project_id") or "").strip() != str(
+        project_id or ""
+    ).strip():
+        return ""
+    identity = _contract_runtime_server_line_identity(record)
+    runtime_context_id = str(identity.get("runtime_context_id") or "").strip()
+    task_id = str(identity.get("task_id") or "").strip()
+    if not runtime_context_id or not task_id:
+        return ""
+    expected_candidate_commit = str(
+        expected_candidate_commit or ""
+    ).strip().lower()
+    worker_commit_matched = False
+    worker_commit_base = ""
+    for line in reversed(
+        [
+            item
+            for item in record.get("completed_lines") or []
+            if isinstance(item, Mapping)
+        ]
+    ):
+        if str(line.get("line_id") or "").strip() != "worker_commit":
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        if str(line.get("evidence_kind") or "").strip() == "contract_line_bypass":
+            payload = _contract_runtime_worker_commit_bypass_continuation_authority(
+                conn,
+                project_id=project_id,
+                record=record,
+                request=line,
+            )
+            if payload.get("server_derived") is not True:
+                continue
+        if (
+            _timeline_first_deep_text(line, "runtime_context_id")
+            != runtime_context_id
+            or _timeline_first_deep_text(line, "task_id") != task_id
+        ):
+            continue
+        commit_values = {
+            str(value or "").strip().lower()
+            for value in (
+                line.get("commit_sha"),
+                payload.get("commit_sha"),
+                payload.get("worker_commit_sha"),
+                payload.get("validated_head_commit"),
+            )
+            if str(value or "").strip()
+        }
+        if commit_values != {expected_candidate_commit}:
+            continue
+        worker_commit_matched = True
+        worker_commit_base = str(
+            payload.get("diff_base_commit") or ""
+        ).strip().lower()
+        break
+    if not worker_commit_matched:
+        return ""
+
+    context_bases: set[str] = set()
+    for dispatch_line in record.get("completed_lines") or []:
+        if not isinstance(dispatch_line, Mapping) or str(
+            dispatch_line.get("line_id") or ""
+        ).strip() != "observer_dispatch_bounded_workers":
+            continue
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=dispatch_line,
+        ):
+            context_id, context_task_id, _ = _contract_runtime_context_identity(
+                context
+            )
+            if (
+                context_id == runtime_context_id
+                and context_task_id == task_id
+            ):
+                context_bases.add(
+                    str(getattr(context, "base_commit", "") or "")
+                    .strip()
+                    .lower()
+                )
+    base_commits = {
+        value
+        for value in {worker_commit_base, *context_bases}
+        if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value)
+        and value != expected_candidate_commit
+    }
+    if len(base_commits) != 1:
+        return ""
+    return next(iter(base_commits))
+
+
 def _contract_runtime_strip_authority_claims(
     value: Any,
     *,
@@ -61908,12 +62015,18 @@ def _contract_runtime_no_pass_graph_scope(
             if isinstance(payload.get("graph_trace_evidence"), Mapping)
             else {}
         )
-        base_commit = str(evidence.get("base_commit_sha") or "").strip().lower()
+        graph_base_commit = str(
+            evidence.get("base_commit_sha") or ""
+        ).strip().lower()
+        comparison_base_commit = str(
+            evidence.get("comparison_base_commit_sha") or ""
+        ).strip().lower()
         candidate_commit = str(
             evidence.get("candidate_commit_sha")
             or evidence.get("candidate_commit")
             or ""
         ).strip().lower()
+        base_commit = comparison_base_commit or graph_base_commit
         line_commit = str(line.get("commit_sha") or "").strip().lower()
         trace_ids = _runtime_context_service_dedupe(
             _runtime_context_service_query_values(
@@ -61926,6 +62039,26 @@ def _contract_runtime_no_pass_graph_scope(
             re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base_commit)
             and re.fullmatch(
                 r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_commit
+            )
+            and (
+                not comparison_base_commit
+                or (
+                    str(evidence.get("graph_basis") or "").strip()
+                    == "exact_candidate_snapshot"
+                    and graph_base_commit == candidate_commit
+                    and comparison_base_commit != candidate_commit
+                    and str(
+                        evidence.get("graph_snapshot_base_commit_sha") or ""
+                    ).strip().lower()
+                    == candidate_commit
+                    and str(
+                        evidence.get("comparison_base_commit_source") or ""
+                    ).strip()
+                    == (
+                        "ContractRuntime.completed_lines.worker_commit+"
+                        "parallel_branch_runtime_context.base_commit"
+                    )
+                )
             )
             and line_commit == candidate_commit
             and evidence.get("db_verified") is True
@@ -62370,6 +62503,34 @@ def _contract_runtime_bind_qa_graph_authority(
         container_names=_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS,
     )
     evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
+    if evidence.get("graph_basis"):
+        _qa_validate_candidate_review_claims(body, evidence)
+    if (
+        str(evidence.get("graph_basis") or "").strip()
+        == "exact_candidate_snapshot"
+        and str(evidence.get("base_commit_sha") or "").strip().lower()
+        == expected_candidate_commit
+    ):
+        canonical_base_commit = _contract_runtime_server_candidate_base_commit(
+            conn,
+            project_id=project_id,
+            record=record,
+            expected_candidate_commit=expected_candidate_commit,
+        )
+        if canonical_base_commit:
+            evidence.update(
+                {
+                    "exact_candidate_snapshot_commit_sha": (
+                        expected_candidate_commit
+                    ),
+                    "graph_snapshot_base_commit_sha": expected_candidate_commit,
+                    "comparison_base_commit_sha": canonical_base_commit,
+                    "comparison_base_commit_source": (
+                        "ContractRuntime.completed_lines.worker_commit+"
+                        "parallel_branch_runtime_context.base_commit"
+                    ),
+                }
+            )
     evidence.update(
         {
             "contract_execution_id": str(
@@ -62387,8 +62548,6 @@ def _contract_runtime_bind_qa_graph_authority(
             ),
         }
     )
-    if evidence.get("graph_basis"):
-        _qa_validate_candidate_review_claims(body, evidence)
     evidence["authority_hash"] = stable_sha256(evidence)
 
     authority_key = str(policy.get("authority_object_path") or "").split(".", 1)[-1]
