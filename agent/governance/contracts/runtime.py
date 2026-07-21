@@ -2615,13 +2615,14 @@ _QA_NO_PASS_PAYLOAD_SCHEMA_VERSIONS = frozenset(
 def _qa_independent_verification_canonical_no_pass_completion(
     line: Mapping[str, Any],
 ) -> bool:
-    """Recognize only the authenticated, server-normalized no-PASS ledger.
+    """Recognize only the authenticated canonical no-PASS ledger.
 
     The generic completion blocker intentionally treats any nested non-zero
     failure count as failed QA.  This shape is the single exception: the
     candidate reproduces the exact non-empty baseline failures, adds none, and
-    explicitly makes no overall PASS claim.  The server-normalized marker and
-    authenticated QA binding are required because source runtime cannot
+    explicitly makes no overall PASS claim.  Current lines require the
+    server-normalized marker.  Immutable pre-marker lines require the complete
+    redundant server-derived authority shape because source runtime cannot
     independently reconstruct the DB-verified graph tuple used at write time.
     """
 
@@ -2734,7 +2735,6 @@ def _qa_independent_verification_canonical_no_pass_completion(
         == "accepted"
         and str(ledger.get("schema_version") or "")
         == _QA_NO_PASS_LEDGER_SCHEMA_VERSION
-        and ledger.get("server_normalized") is True
         and ledger.get("candidate_new_failures") == 0
         and not list(ledger.get("candidate_specific_issues") or [])
         and ledger.get("no_pass_claim") is True
@@ -2798,6 +2798,24 @@ def _qa_independent_verification_canonical_no_pass_completion(
     ):
         return False
 
+    if not _qa_no_pass_ledger_marker_allows_completion(
+        line,
+        payload=payload,
+        test_results=test_results,
+        payload_test_results=payload_test_results,
+        verification=verification,
+        provenance=provenance,
+        binding=binding,
+        status_gate=status_gate,
+        ledger=ledger,
+        base_commit=base_commit,
+        candidate_commit=candidate_commit,
+        base_failures=base_failures,
+        candidate_failures=candidate_failures,
+        passed=passed,
+    ):
+        return False
+
     for result_source in (test_results, payload_test_results):
         if result_source and not _qa_no_pass_result_counts_match_ledger(
             result_source,
@@ -2821,6 +2839,192 @@ def _qa_independent_verification_canonical_no_pass_completion(
     ):
         return False
     return True
+
+
+def _qa_no_pass_ledger_marker_allows_completion(
+    line: Mapping[str, Any],
+    *,
+    payload: Mapping[str, Any],
+    test_results: Mapping[str, Any],
+    payload_test_results: Mapping[str, Any],
+    verification: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    status_gate: Mapping[str, Any],
+    ledger: Mapping[str, Any],
+    base_commit: str,
+    candidate_commit: str,
+    base_failures: tuple[str, ...],
+    candidate_failures: tuple[str, ...],
+    passed: int,
+) -> bool:
+    """Accept current normalization or the immutable pre-marker line shape.
+
+    The marker-absent branch is read-only compatibility for persisted lines
+    written by the server before the ledger marker could be stored.  It binds
+    the duplicated commit tuple, result ledger, authenticated QA principal,
+    and status gate instead of treating marker absence as caller authority.
+    An explicit false marker is never legacy evidence.
+    """
+
+    if ledger.get("server_normalized") is True:
+        return True
+    if "server_normalized" in ledger:
+        return False
+
+    principal = str(binding.get("qa_principal") or "").strip()
+    session_id = str(binding.get("qa_session_id") or "").strip()
+    if not (
+        str(provenance.get("source") or "")
+        == "contract_runtime_qa_independent_verification_binding"
+        and str(status_gate.get("source") or "")
+        == "contract_runtime_line_write_normalization"
+        and principal
+        and session_id
+        and all(
+            str(source.get(field) or "").strip() == principal
+            for source, field in (
+                (line, "actor_session_principal"),
+                (line, "evidence_owner_actor"),
+                (line, "submitter_principal"),
+                (provenance, "evidence_owner_actor"),
+                (provenance, "submitter_principal"),
+            )
+        )
+        and all(
+            str(source.get(field) or "").strip() == session_id
+            for source, field in (
+                (line, "evidence_owner_session"),
+                (line, "submitter_session"),
+                (provenance, "evidence_owner_session"),
+                (provenance, "submitter_session"),
+            )
+        )
+        and all(
+            str(line.get(field) or "").strip().lower() == candidate_commit
+            for field in (
+                "commit_sha",
+                "immutable_head_commit",
+                "validated_head_commit",
+            )
+        )
+        and verification.get("exact_commit_tuple_verified") is True
+    ):
+        return False
+
+    payload_verification = (
+        payload.get("verification")
+        if isinstance(payload.get("verification"), Mapping)
+        else {}
+    )
+    payload_artifact_refs = (
+        payload.get("artifact_refs")
+        if isinstance(payload.get("artifact_refs"), Mapping)
+        else {}
+    )
+    payload_ledger = (
+        payload_artifact_refs.get("external_no_pass_baseline_ledger")
+        if isinstance(
+            payload_artifact_refs.get("external_no_pass_baseline_ledger"),
+            Mapping,
+        )
+        else {}
+    )
+    commit_sources = (
+        (payload, "base_commit_sha"),
+        (test_results, "baseline_commit_sha"),
+        (payload_test_results, "baseline_commit_sha"),
+        (payload_ledger, "base_commit_sha"),
+    )
+    if not (
+        payload_verification.get("exact_commit_tuple_verified") is True
+        and all(
+            str(source.get(base_field) or "").strip().lower()
+            == base_commit
+            and str(source.get("candidate_commit_sha") or "").strip().lower()
+            == candidate_commit
+            for source, base_field in commit_sources
+        )
+        and str(payload_ledger.get("schema_version") or "")
+        == _QA_NO_PASS_LEDGER_SCHEMA_VERSION
+        and "server_normalized" not in payload_ledger
+        and list(line.get("graph_trace_ids") or [])
+        and list(
+            (
+                line.get("artifact_refs")
+                if isinstance(line.get("artifact_refs"), Mapping)
+                else {}
+            ).get("durable_authority_refs")
+            or []
+        )
+    ):
+        return False
+
+    payload_base_reproduction = (
+        payload_ledger.get("base_reproduction")
+        if isinstance(payload_ledger.get("base_reproduction"), Mapping)
+        else {}
+    )
+    payload_candidate_counts = (
+        payload_ledger.get("candidate_suite_counts")
+        if isinstance(payload_ledger.get("candidate_suite_counts"), Mapping)
+        else {}
+    )
+    expected_count = len(base_failures)
+    return bool(
+        base_failures == candidate_failures
+        and _qa_no_pass_failure_identities(
+            test_results.get("baseline_failure_node_ids")
+        )
+        == base_failures
+        and _qa_no_pass_failure_identities(
+            test_results.get("candidate_failure_node_ids")
+        )
+        == candidate_failures
+        and _qa_no_pass_failure_identities(
+            payload_test_results.get("baseline_failure_node_ids")
+        )
+        == base_failures
+        and _qa_no_pass_failure_identities(
+            payload_test_results.get("candidate_failure_node_ids")
+        )
+        == candidate_failures
+        and _qa_no_pass_failure_identities(
+            payload_ledger.get("base_failure_identities")
+        )
+        == base_failures
+        and _qa_no_pass_failure_identities(
+            payload_ledger.get("candidate_failure_identities")
+        )
+        == candidate_failures
+        and _qa_no_pass_failure_identities(
+            payload_base_reproduction.get("failure_identities")
+        )
+        == base_failures
+        and all(
+            _qa_no_pass_exact_positive_count(source.get(field), expected_count)
+            for source, field in (
+                (test_results, "baseline_failed"),
+                (test_results, "candidate_failed"),
+                (payload_test_results, "baseline_failed"),
+                (payload_test_results, "candidate_failed"),
+                (payload_base_reproduction, "reproduced"),
+                (payload_base_reproduction, "total"),
+                (payload_candidate_counts, "baseline_known_non_green"),
+                (payload_candidate_counts, "failed"),
+            )
+        )
+        and test_results.get("baseline_passed") == passed
+        and test_results.get("candidate_passed") == passed
+        and payload_test_results.get("baseline_passed") == passed
+        and payload_test_results.get("candidate_passed") == passed
+        and payload_candidate_counts.get("passed") == passed
+        and payload_ledger.get("candidate_new_failures") == 0
+        and not list(payload_ledger.get("candidate_specific_issues") or [])
+        and payload_ledger.get("no_pass_claim") is True
+        and payload_ledger.get("overall_release_pass_claimed") is False
+        and list(payload_ledger.get("refs") or [])
+    )
 
 
 def _qa_no_pass_failure_identities(value: Any) -> tuple[str, ...]:

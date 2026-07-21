@@ -66471,6 +66471,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
             }
         },
     }
+    assert _line_status_allows_contract_completion(qa_independent_body) is False
     with pytest.raises((ContractRuntimeError, PermissionDeniedError)):
         server.handle_project_contract_runtime_line_write_precheck(
             _ctx_with_role(
@@ -66629,9 +66630,197 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert canonical_ledger["overall_release_pass_claimed"] is False
     assert _line_status_allows_contract_completion(qa_line) is True
 
+    # Runtime 469e accepted and authenticated this exact no-PASS shape before
+    # it could persist the server_normalized ledger marker.  Its redundant
+    # server-derived bindings remain sufficient for read-only compatibility.
+    historical_base_commit = "469e167f3b1f48bb1dbdf83cc696057be39d0959"
+    historical_candidate_commit = "6d26c32d8347863ba3049a02c1ad722fec9fb489"
+    historical_failure_ids = [
+        "agent/tests/test_graph_governance_api.py::test_parallel_branch_finish_gate_graph_trace_gap_is_non_closeable_recovery",
+        "agent/tests/test_graph_governance_api.py::test_bounded_worker_dispatch_recovery_projects_host_envelope_handoff",
+        "agent/tests/test_graph_governance_api.py::test_backlog_close_applies_runtime_context_projection_before_current_state",
+        "agent/tests/test_graph_governance_api.py::test_backlog_close_projects_successor_runtime_lines_when_close_scoped_to_parent",
+        "agent/tests/test_graph_governance_api.py::test_backlog_close_contract_runtime_authority_keeps_legacy_gate_advisory",
+        "agent/tests/test_graph_governance_api.py::test_backlog_close_contract_runtime_authority_ignores_legacy_advisory_gaps",
+        "agent/tests/test_graph_governance_api.py::test_backlog_close_projects_child_authority_from_completed_overlap_component",
+        "agent/tests/test_graph_governance_api.py::test_multi_backlog_parallel_templates_are_row_scoped",
+        "agent/tests/test_graph_governance_api.py::test_onboard_contract_facade_rejects_worker_writing_observer_line",
+        "agent/tests/test_graph_governance_api.py::test_contract_add_facade_starts_guided_runtime_and_rejects_forged_roles",
+        "agent/tests/test_graph_governance_api.py::test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles",
+        "agent/tests/test_graph_governance_api.py::test_contract_update_blocked_precheck_pauses_until_hotfix_successor_complete",
+        "agent/tests/test_graph_governance_api.py::test_contract_runtime_generic_facade_preserves_role_and_order_gates",
+        "agent/tests/test_graph_governance_api.py::test_hotfix_enter_source_backed_returns_successor_runtime_shape",
+        "agent/tests/test_graph_governance_api.py::test_source_backed_mf_parallel_dispatch_issues_ticket_only_before_worker_read",
+        "agent/tests/test_graph_governance_api.py::test_contract_runtime_current_accepts_copy_safe_mf_sub_worker_proof",
+        "agent/tests/test_graph_governance_api.py::test_mf_parallel_enter_source_backed_returns_successor_runtime_shape",
+        "agent/tests/test_graph_governance_api.py::test_timeline_append_contract_runtime_projects_completed_hotfix_lines",
+        "agent/tests/test_graph_governance_api.py::test_timeline_append_completed_runtime_projection_precedes_legacy_route_gate",
+        "agent/tests/test_graph_governance_api.py::test_timeline_append_contract_runtime_projection_rejects_wrong_role",
+    ]
+    historical_test_results = {
+        "baseline_commit_sha": historical_base_commit,
+        "candidate_commit_sha": historical_candidate_commit,
+        "baseline_failed": 20,
+        "baseline_passed": 723,
+        "candidate_failed": 20,
+        "candidate_passed": 723,
+        "baseline_failure_node_ids": historical_failure_ids,
+        "candidate_failure_node_ids": historical_failure_ids,
+        "baseline_only_failure_node_ids": [],
+        "candidate_only_failure_node_ids": [],
+        "candidate_new_failures": 0,
+        "candidate_specific_issues": [],
+        "no_pass_claim": True,
+        "overall_release_pass": False,
+        "overall_release_pass_claimed": False,
+        "passed": False,
+    }
+    historical_ledger = {
+        "schema_version": "contract_runtime.external_no_pass_baseline_ledger.v2",
+        "base_commit_sha": historical_base_commit,
+        "candidate_commit_sha": historical_candidate_commit,
+        "base_failure_identities": historical_failure_ids,
+        "candidate_failure_identities": historical_failure_ids,
+        "base_reproduction": {
+            "reproduced": 20,
+            "total": 20,
+            "failure_identities": historical_failure_ids,
+        },
+        "candidate_suite_counts": {
+            "baseline_known_non_green": 20,
+            "failed": 20,
+            "passed": 723,
+        },
+        "candidate_new_failures": 0,
+        "candidate_specific_issues": [],
+        "no_pass_claim": True,
+        "overall_release_pass_claimed": False,
+        "refs": ["pytest:agent/tests/test_graph_governance_api.py"],
+    }
+    historical_verification = {
+        "verdict": "accepted",
+        "candidate_new_failures": 0,
+        "candidate_specific_new_failures": 0,
+        "candidate_specific_issues": [],
+        "full_suite_claim": "not_claimed",
+        "no_pass_claim": True,
+        "overall_release_pass_claimed": False,
+        "exact_commit_tuple_verified": True,
+    }
+    historical_line = json.loads(json.dumps(qa_line))
+    historical_line.update(
+        {
+            "commit_sha": historical_candidate_commit,
+            "immutable_head_commit": historical_candidate_commit,
+            "validated_head_commit": historical_candidate_commit,
+            "graph_trace_ids": ["gqt-20260709-182a0772cb"],
+            "test_results": historical_test_results,
+            "verification": historical_verification,
+            "artifact_refs": {
+                "durable_authority_refs": [
+                    "graph_snapshot:full-469e167-12d6",
+                    "graph_query_trace:gqt-20260709-182a0772cb",
+                ],
+                "external_no_pass_baseline_ledger": historical_ledger,
+            },
+        }
+    )
+    historical_line["payload"] = {
+        "schema_version": "mf_parallel.qa_independent_verification.v1",
+        "base_commit_sha": historical_base_commit,
+        "candidate_commit_sha": historical_candidate_commit,
+        "acceptance_scope": "candidate_regression_and_acceptance_criteria",
+        "row_scoped_qa_pass": True,
+        "verdict": "accepted",
+        "full_suite_claim": "not_claimed",
+        "candidate_new_failures": 0,
+        "candidate_specific_issues": [],
+        "no_pass_claim": True,
+        "overall_release_pass_claimed": False,
+        "test_results": historical_test_results,
+        "verification": historical_verification,
+        "artifact_refs": {
+            "external_no_pass_baseline_ledger": historical_ledger,
+        },
+    }
+    assert "server_normalized" not in historical_ledger
+    assert _line_status_allows_contract_completion(historical_line) is True
+
+    invalid_historical_lines = []
+    historical_explicit_false = json.loads(json.dumps(historical_line))
+    historical_explicit_false["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]["server_normalized"] = False
+    invalid_historical_lines.append(historical_explicit_false)
+    historical_caller_provenance = json.loads(json.dumps(historical_line))
+    historical_caller_provenance["qa_evidence_provenance"]["source"] = "caller"
+    invalid_historical_lines.append(historical_caller_provenance)
+    historical_wrong_commit = json.loads(json.dumps(historical_line))
+    historical_wrong_commit["payload"]["test_results"][
+        "candidate_commit_sha"
+    ] = "e" * 40
+    invalid_historical_lines.append(historical_wrong_commit)
+    historical_changed_identities = json.loads(json.dumps(historical_line))
+    historical_changed_identities["payload"]["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]["candidate_failure_identities"] = ["test_candidate_only"]
+    invalid_historical_lines.append(historical_changed_identities)
+    historical_wrong_count = json.loads(json.dumps(historical_line))
+    historical_wrong_count["payload"]["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]["candidate_suite_counts"]["failed"] = 21
+    invalid_historical_lines.append(historical_wrong_count)
+    historical_candidate_new = json.loads(json.dumps(historical_line))
+    historical_candidate_new["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]["candidate_new_failures"] = 1
+    invalid_historical_lines.append(historical_candidate_new)
+    historical_forged_pass = json.loads(json.dumps(historical_line))
+    historical_forged_pass["payload"]["test_results"]["passed"] = True
+    invalid_historical_lines.append(historical_forged_pass)
+    assert all(
+        not _line_status_allows_contract_completion(candidate_line)
+        for candidate_line in invalid_historical_lines
+    )
+
+    # Exercise the candidate source runtime against a persisted historical
+    # line, not only the predicate: the next projected owner is observer_merge.
+    historical_record = json.loads(json.dumps(stored_after_qa))
+    historical_record["completed_lines"] = [
+        historical_line if line["line_id"] == "qa_independent_verification" else line
+        for line in historical_record["completed_lines"]
+    ]
+    runtime_store = server._contract_runtime_store(conn)
+    runtime_store.update(successor["contract_execution_id"], historical_record)
+    persisted_historical = runtime_store.get(successor["contract_execution_id"])
+    persisted_historical_line = [
+        line
+        for line in persisted_historical["completed_lines"]
+        if line["line_id"] == "qa_independent_verification"
+    ][0]
+    assert "server_normalized" not in persisted_historical_line["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]
+    historical_projection = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            "observer",
+        )
+    )
+    assert historical_projection["next_legal_action"]["line_id"] == "observer_merge"
+    runtime_store.update(successor["contract_execution_id"], stored_after_qa)
+
     # Source-runtime eligibility is narrow: the inherited non-green counts may
     # advance only while every authenticated canonical ledger invariant holds.
     invalid_runtime_lines = []
+    marker_absent_fresh = json.loads(json.dumps(qa_line))
+    marker_absent_fresh["artifact_refs"]["external_no_pass_baseline_ledger"].pop(
+        "server_normalized"
+    )
+    invalid_runtime_lines.append(marker_absent_fresh)
     unnormalized = json.loads(json.dumps(qa_line))
     unnormalized["artifact_refs"]["external_no_pass_baseline_ledger"][
         "server_normalized"
