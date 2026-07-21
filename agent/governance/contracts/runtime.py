@@ -3152,7 +3152,8 @@ def _qa_no_pass_persisted_legacy_source_context(
 
     payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
     execution_id = str(source_record.get("contract_execution_id") or "").strip()
-    if str(payload.get("contract_execution_id") or "").strip() != execution_id:
+    payload_execution_id = str(payload.get("contract_execution_id") or "").strip()
+    if payload_execution_id and payload_execution_id != execution_id:
         return False
     line_trace_ids = _qa_no_pass_failure_identities(line.get("graph_trace_ids"))
     if not line_trace_ids:
@@ -3202,9 +3203,12 @@ def _qa_no_pass_persisted_legacy_source_context(
             graph_evidence.get("verified_trace_ids")
             or graph_evidence.get("trace_ids")
         )
+        graph_status = str(
+            graph_line.get("status") or graph_payload.get("status") or ""
+        ).strip().lower()
         if (
             str(graph_line.get("actor_role") or "").strip() == "qa"
-            and str(graph_line.get("status") or "").strip().lower() == "accepted"
+            and graph_status in {"", "accepted"}
             and str(graph_line.get("authorization_source") or "")
             == "qa_session_token_ref"
             and graph_line.get("observer_impersonation") is False

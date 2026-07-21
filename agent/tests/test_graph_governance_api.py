@@ -66728,7 +66728,6 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     )
     historical_line["payload"] = {
         "schema_version": "mf_parallel.qa_independent_verification.v1",
-        "contract_execution_id": historical_contract_execution_id,
         "base_commit_sha": historical_base_commit,
         "candidate_commit_sha": historical_candidate_commit,
         "acceptance_scope": "candidate_regression_and_acceptance_criteria",
@@ -66745,6 +66744,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
             "external_no_pass_baseline_ledger": historical_ledger,
         },
     }
+    assert "contract_execution_id" not in historical_line["payload"]
     assert "server_normalized" not in historical_ledger
     assert _line_status_allows_contract_completion(historical_line) is False
 
@@ -66877,6 +66877,10 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         for line in historical_record["completed_lines"]
         if line["line_id"] == "qa_graph_context"
     ][0]
+    historical_graph_line.pop("status", None)
+    historical_graph_line["payload"].pop("status", None)
+    assert "status" not in historical_graph_line
+    assert "status" not in historical_graph_line["payload"]
     historical_graph_line["commit_sha"] = historical_candidate_commit
     historical_graph_line["graph_trace_ids"] = historical_line["graph_trace_ids"]
     historical_graph_line["graph_query_trace_ids"] = historical_line[
