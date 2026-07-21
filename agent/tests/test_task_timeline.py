@@ -13538,6 +13538,134 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(filtered["count"], 1)
         self.assertEqual(filtered["events"][0]["task_id"], "task-b")
 
+    def test_timeline_slow_paths_use_bounded_fresh_warm_cache(self):
+        from agent.governance import server, task_timeline
+
+        server._timeline_warm_cache_clear()
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, created_at, updated_at)
+               VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
+            (
+                "BUG-CACHE",
+                "Warm cache fixture",
+                "2026-07-21T20:00:00Z",
+                "2026-07-21T20:00:00Z",
+            ),
+        )
+        first_event = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-CACHE",
+            task_id="task-cache",
+            event_type="worker.startup",
+            event_kind="mf_subagent_startup",
+            phase="startup_gate",
+            actor="mf_sub",
+            status="running",
+        )
+        self.conn.commit()
+
+        recent_miss = server.handle_task_timeline_recent(_ctx({"limit": "10"}))
+        recent_hit = server.handle_task_timeline_recent(_ctx({"limit": "10"}))
+        self.assertEqual(recent_miss["warm_cache"]["status"], "miss")
+        self.assertEqual(recent_hit["warm_cache"]["status"], "hit")
+        self.assertTrue(recent_hit["warm_cache"]["hit"])
+        self.assertGreaterEqual(recent_hit["warm_cache"]["age_ms"], 0)
+        self.assertEqual(
+            recent_miss["warm_cache"]["identity_hash"],
+            recent_hit["warm_cache"]["identity_hash"],
+        )
+        self.assertEqual(recent_hit["events"][0]["id"], first_event["id"])
+        self.assertLessEqual(
+            recent_hit["warm_cache"]["entry_count"],
+            recent_hit["warm_cache"]["max_entries"],
+        )
+
+        list_query = {"backlog_id": "BUG-CACHE", "limit": ["5"]}
+        list_miss = server.handle_task_timeline_list(_ctx(list_query))
+        list_hit = server.handle_task_timeline_list(_ctx(list_query))
+        list_other_query = server.handle_task_timeline_list(
+            _ctx({"backlog_id": "BUG-CACHE", "limit": ["10"]})
+        )
+        self.assertEqual(list_miss["warm_cache"]["status"], "miss")
+        self.assertEqual(list_hit["warm_cache"]["status"], "hit")
+        self.assertNotEqual(
+            list_hit["warm_cache"]["identity_hash"],
+            list_other_query["warm_cache"]["identity_hash"],
+        )
+        self.assertEqual(list_hit["count"], 1)
+
+        search_query = {
+            "q": "worker",
+            "backlog_status": "OPEN",
+            "limit": "1",
+            "offset": "0",
+            "scan_limit": "100",
+        }
+        search_miss = server.handle_task_timeline_list(_ctx(search_query))
+        search_hit = server.handle_task_timeline_list(_ctx(search_query))
+        self.assertEqual(search_miss["warm_cache"]["status"], "miss")
+        self.assertEqual(search_hit["warm_cache"]["status"], "hit")
+        self.assertEqual(search_hit["total"], 1)
+        self.assertFalse(search_hit["has_more"])
+
+        get_context = _ctx(
+            {"limit": "10"},
+            path_params={"task_id": "task-cache"},
+        )
+        get_miss = server.handle_task_timeline_get(get_context)
+        get_hit = server.handle_task_timeline_get(get_context)
+        self.assertEqual(get_miss["warm_cache"]["status"], "miss")
+        self.assertEqual(get_hit["warm_cache"]["status"], "hit")
+        self.assertEqual(get_hit["count"], 1)
+
+        current_miss = server.handle_backlog_current_task(_ctx({"limit": "10"}))
+        current_hit = server.handle_backlog_current_task(_ctx({"limit": "10"}))
+        self.assertEqual(current_miss["warm_cache"]["status"], "miss")
+        self.assertEqual(current_hit["warm_cache"]["status"], "hit")
+        self.assertEqual(current_hit["backlog_id"], "BUG-CACHE")
+
+        conn = _conn(self.tmp.name)
+        try:
+            newest_event = task_timeline.record_event(
+                conn,
+                project_id="proj",
+                backlog_id="BUG-CACHE",
+                task_id="task-cache",
+                event_type="worker.progress",
+                event_kind="implementation",
+                phase="implementation",
+                actor="mf_sub",
+                status="running",
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        recent_fresh = server.handle_task_timeline_recent(_ctx({"limit": "10"}))
+        list_fresh = server.handle_task_timeline_list(_ctx(list_query))
+        search_fresh = server.handle_task_timeline_list(_ctx(search_query))
+        get_fresh = server.handle_task_timeline_get(get_context)
+        current_fresh = server.handle_backlog_current_task(_ctx({"limit": "10"}))
+        for response in (
+            recent_fresh,
+            list_fresh,
+            search_fresh,
+            get_fresh,
+            current_fresh,
+        ):
+            self.assertEqual(response["warm_cache"]["status"], "miss")
+            self.assertEqual(response["warm_cache"]["miss_reason"], "freshness_changed")
+        self.assertEqual(recent_fresh["events"][0]["id"], newest_event["id"])
+        self.assertEqual(list_fresh["count"], 2)
+        self.assertEqual(search_fresh["total"], 2)
+        self.assertTrue(search_fresh["has_more"])
+        self.assertEqual(search_fresh["offset"], 0)
+        self.assertEqual(search_fresh["limit"], 1)
+        self.assertEqual(get_fresh["count"], 2)
+        self.assertEqual(current_fresh["latest_event"]["id"], newest_event["id"])
+
     def test_backlog_current_task_endpoint_uses_timeline_fallback(self):
         from agent.governance import server, task_timeline
 

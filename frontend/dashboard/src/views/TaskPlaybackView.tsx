@@ -1156,6 +1156,7 @@ function NextLegalActionCallout({
   if (actions.length === 0) return null;
   return (
     <section
+      className="task-playback-next-action-callout"
       aria-label={`${surface} next legal actions`}
       data-next-legal-action-callout={surface.toLowerCase()}
       style={{
@@ -1278,12 +1279,17 @@ function CompatibilityRepairTargets({ trace, surface }: { trace: TaskPlaybackTra
   const targets = contractRuntimeCompatibilityRepairValues(trace.authority_view);
   if (targets.length === 0) return null;
   return (
-    <div className="task-playback-chip-section" aria-label={`${surface} compatibility repair targets`}>
-      <strong>{surface} compatibility repair targets (advisory)</strong>
-      <div>
-        {targets.map((target) => <span key={target}>{target}</span>)}
+    <details className="task-playback-compatibility-details" aria-label={`${surface} compatibility repair targets`}>
+      <summary>
+        <strong>{surface} compatibility repair targets (advisory)</strong>
+        <span>{targets.length}</span>
+      </summary>
+      <div className="task-playback-chip-section">
+        <div>
+          {targets.map((target) => <span key={target}>{target}</span>)}
+        </div>
       </div>
-    </div>
+    </details>
   );
 }
 
@@ -1598,6 +1604,17 @@ function ActivityEventCardList({
                   <strong className="activity-event-card-kind">{card.event_kind}</strong>
                   <p className="activity-event-card-headline">{card.headline}</p>
                 </div>
+                {card.next_legal_action ? (
+                  <div
+                    className={`activity-event-card-next-action activity-event-card-next-action--${card.next_legal_action_disposition.toLowerCase()}`}
+                    data-next-legal-action-authority="advisory"
+                    data-next-legal-action-disposition={card.next_legal_action_disposition}
+                  >
+                    <strong>Advisory next legal action</strong>
+                    <b>{card.next_legal_action_disposition}</b>
+                    <span>{card.next_legal_action}</span>
+                  </div>
+                ) : null}
                 {card.evidence_count > 0 ? (
                   <div className="activity-event-card-evidence">
                     <span>{card.evidence_count} ref{card.evidence_count === 1 ? "" : "s"}</span>
