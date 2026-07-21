@@ -1543,7 +1543,7 @@ def _find_direct_fix_repair_line(record: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(record.get("completed_lines"), list)
         else []
     )
-    after_index = _last_failed_qa_line_index(lines)
+    after_index = _last_failed_qa_line_index(lines, source_record=record)
     if _direct_fix_graph_gates_active(record):
         worker_graph = _find_completed_line(
             record,
@@ -1607,7 +1607,11 @@ def _find_direct_fix_qa_line(
             continue
         if str(line.get("evidence_kind") or "").strip() not in DIRECT_FIX_QA_EVIDENCE_KINDS:
             continue
-        if not _line_status_allows_direct_fix_qa(line):
+        if not _line_status_allows_direct_fix_qa(
+            line,
+            source_record=record,
+            source_line_index=_source_record_completed_line_index(line, record),
+        ):
             continue
         explicit_scope_matches = _line_scope_matches_direct_fix_child(
             line,
@@ -1730,8 +1734,17 @@ def _parent_resume_ack_line_matches(
     return True
 
 
-def _line_status_allows_direct_fix_qa(line: Mapping[str, Any]) -> bool:
-    return _line_status_allows_contract_completion(line)
+def _line_status_allows_direct_fix_qa(
+    line: Mapping[str, Any],
+    *,
+    source_record: Mapping[str, Any] | None = None,
+    source_line_index: int = -1,
+) -> bool:
+    return _line_status_allows_contract_completion(
+        line,
+        source_record=source_record,
+        source_line_index=source_line_index,
+    )
 
 
 _CONTRACT_COMPLETION_BLOCKING_STATUSES = frozenset(
@@ -1764,13 +1777,18 @@ _CONTRACT_COMPLETION_FAILURE_COUNT_FIELDS = frozenset(
 def _contract_completion_satisfying_lines(
     lines: Sequence[Mapping[str, Any]],
     *,
+    source_record: Mapping[str, Any] | None = None,
     failed_qa_rejoin_contexts: set[tuple[str, str]] | None = None,
     failed_qa_rejoin_markers: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[Mapping[str, Any]]:
-    last_failed_qa_index = _last_failed_qa_line_index(lines)
+    last_failed_qa_index = _last_failed_qa_line_index(
+        lines,
+        source_record=source_record,
+    )
     post_failed_retry_contexts = _post_failed_qa_retry_context_keys(
         lines,
         failed_qa_index=last_failed_qa_index,
+        source_record=source_record,
     )
     post_failed_retry_contexts.update(failed_qa_rejoin_contexts or set())
     failed_qa_rejoin_boundaries = _failed_qa_rejoin_boundaries(
@@ -1805,11 +1823,37 @@ def _contract_completion_satisfying_lines(
             ):
                 continue
         if isinstance(line, Mapping) and not _line_status_allows_contract_completion(
-            line
+            line,
+            source_record=source_record,
+            source_line_index=_source_record_completed_line_index(
+                line,
+                source_record,
+            ),
         ):
             continue
         satisfying.append(line)
     return satisfying
+
+
+def _source_record_completed_line_index(
+    line: Mapping[str, Any],
+    source_record: Mapping[str, Any] | None,
+) -> int:
+    """Map a projected line to its unique persisted source member."""
+
+    if not isinstance(source_record, Mapping):
+        return -1
+    stored_lines = source_record.get("completed_lines")
+    if not isinstance(stored_lines, list):
+        return -1
+    persisted_line_indexes = [
+        index
+        for index, stored_line in enumerate(stored_lines)
+        if stored_line is line or stored_line == line
+    ]
+    if len(persisted_line_indexes) != 1:
+        return -1
+    return persisted_line_indexes[0]
 
 
 def _line_id_present(
@@ -1924,8 +1968,15 @@ def _compat_completion_lines_for_record(
     return [*list(line_items), *additions]
 
 
-def _active_failed_qa_line_index(lines: Sequence[Mapping[str, Any]]) -> int:
-    failed_index = _last_failed_qa_line_index(lines)
+def _active_failed_qa_line_index(
+    lines: Sequence[Mapping[str, Any]],
+    *,
+    source_record: Mapping[str, Any] | None = None,
+) -> int:
+    failed_index = _last_failed_qa_line_index(
+        lines,
+        source_record=source_record,
+    )
     if failed_index < 0:
         return -1
     for index, line in enumerate(lines):
@@ -1935,7 +1986,14 @@ def _active_failed_qa_line_index(lines: Sequence[Mapping[str, Any]]) -> int:
             continue
         if not _line_shape_allows_contract_completion(line):
             continue
-        if _line_status_allows_contract_completion(line):
+        if _line_status_allows_contract_completion(
+            line,
+            source_record=source_record,
+            source_line_index=_source_record_completed_line_index(
+                line,
+                source_record,
+            ),
+        ):
             return -1
     return failed_index
 
@@ -1944,8 +2002,12 @@ def _attach_failed_qa_rework_guidance(
     guide: dict[str, Any],
     *,
     line_items: Sequence[Mapping[str, Any]],
+    source_record: Mapping[str, Any] | None = None,
 ) -> None:
-    failed_index = _active_failed_qa_line_index(line_items)
+    failed_index = _active_failed_qa_line_index(
+        line_items,
+        source_record=source_record,
+    )
     if failed_index < 0:
         return
     next_action = guide.get("next_legal_action")
@@ -1977,14 +2039,25 @@ def _attach_failed_qa_rework_guidance(
     guide.setdefault("failed_qa_rework", blocker)
 
 
-def _last_failed_qa_line_index(lines: Sequence[Mapping[str, Any]]) -> int:
+def _last_failed_qa_line_index(
+    lines: Sequence[Mapping[str, Any]],
+    *,
+    source_record: Mapping[str, Any] | None = None,
+) -> int:
     failed_index = -1
     for index, line in enumerate(lines):
         if not isinstance(line, Mapping):
             continue
         if str(line.get("line_id") or "").strip() != "qa_independent_verification":
             continue
-        if not _line_status_allows_contract_completion(line):
+        if not _line_status_allows_contract_completion(
+            line,
+            source_record=source_record,
+            source_line_index=_source_record_completed_line_index(
+                line,
+                source_record,
+            ),
+        ):
             failed_index = index
     return failed_index
 
@@ -2035,16 +2108,27 @@ def _post_failed_qa_retry_context_keys(
     lines: Sequence[Mapping[str, Any]],
     *,
     failed_qa_index: int,
+    source_record: Mapping[str, Any] | None = None,
 ) -> set[tuple[str, str]]:
     if failed_qa_index < 0:
         return set()
     contexts: set[tuple[str, str]] = set()
-    for line in lines[failed_qa_index + 1 :]:
+    for index, line in enumerate(
+        lines[failed_qa_index + 1 :],
+        start=failed_qa_index + 1,
+    ):
         if not isinstance(line, Mapping):
             continue
         if str(line.get("line_id") or "").strip() not in _FAILED_QA_RETRY_PROOF_LINE_IDS:
             continue
-        if not _line_status_allows_contract_completion(line):
+        if not _line_status_allows_contract_completion(
+            line,
+            source_record=source_record,
+            source_line_index=_source_record_completed_line_index(
+                line,
+                source_record,
+            ),
+        ):
             continue
         contexts.update(_line_retry_context_keys(line))
     return contexts
@@ -2554,13 +2638,30 @@ def _line_shape_allows_contract_completion(line: Mapping[str, Any]) -> bool:
     return not (blocked_schemas and schema_version in blocked_schemas)
 
 
-def _line_status_allows_contract_completion(line: Mapping[str, Any]) -> bool:
+def _line_status_allows_contract_completion(
+    line: Mapping[str, Any],
+    *,
+    source_record: Mapping[str, Any] | None = None,
+    source_line_index: int = -1,
+) -> bool:
     if _mapping_own_fields_contain_contract_completion_blocker(line):
         return False
-    for field in ("qa_evidence_provenance", "verification"):
-        if _contains_contract_completion_blocker(line.get(field)):
-            return False
-    if str(line.get("line_id") or "").strip() == "qa_independent_verification":
+    line_id = str(line.get("line_id") or "").strip()
+    canonical_no_pass = bool(
+        line_id == "qa_independent_verification"
+        and _qa_independent_verification_canonical_no_pass_completion(
+            line,
+            source_record=source_record,
+            source_line_index=source_line_index,
+        )
+    )
+    if _contains_contract_completion_blocker(line.get("qa_evidence_provenance")):
+        return False
+    if not canonical_no_pass and _contains_contract_completion_blocker(
+        line.get("verification")
+    ):
+        return False
+    if line_id == "qa_independent_verification":
         provenance = (
             line.get("qa_evidence_provenance")
             if isinstance(line.get("qa_evidence_provenance"), Mapping)
@@ -2584,11 +2685,673 @@ def _line_status_allows_contract_completion(line: Mapping[str, Any]) -> bool:
             ):
                 return False
         payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        if canonical_no_pass:
+            return True
         if _contains_contract_completion_blocker(payload):
             return False
         if _qa_independent_verification_summary_reports_failure(payload):
             return False
     return True
+
+
+_QA_NO_PASS_LEDGER_SCHEMA_VERSION = (
+    "contract_runtime.external_no_pass_baseline_ledger.v2"
+)
+_QA_NO_PASS_PAYLOAD_SCHEMA_VERSIONS = frozenset(
+    {
+        "qa_independent_verification.v1",
+        "mf_parallel.qa_independent_verification.v1",
+    }
+)
+# The migration predates ``server_normalized`` on this one stored QA line.
+# New lines must carry the marker and cannot opt into compatibility by shape.
+_QA_NO_PASS_PRE_MARKER_PERSISTED_LINE_IDENTITIES = frozenset(
+    {
+        ("cex-mf-parallel-87fbdfddeff1876e8617", 10),
+    }
+)
+
+
+def _qa_independent_verification_canonical_no_pass_completion(
+    line: Mapping[str, Any],
+    *,
+    source_record: Mapping[str, Any] | None = None,
+    source_line_index: int = -1,
+) -> bool:
+    """Recognize only the authenticated canonical no-PASS ledger.
+
+    The generic completion blocker intentionally treats any nested non-zero
+    failure count as failed QA.  This shape is the single exception: the
+    candidate reproduces the exact non-empty baseline failures, adds none, and
+    explicitly makes no overall PASS claim.  Current lines require the
+    server-normalized marker.  Immutable pre-marker lines require the complete
+    redundant server-derived authority shape because source runtime cannot
+    independently reconstruct the DB-verified graph tuple used at write time.
+    """
+
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    test_results = (
+        line.get("test_results")
+        if isinstance(line.get("test_results"), Mapping)
+        else {}
+    )
+    payload_test_results = (
+        payload.get("test_results")
+        if isinstance(payload.get("test_results"), Mapping)
+        else {}
+    )
+    verification = (
+        line.get("verification")
+        if isinstance(line.get("verification"), Mapping)
+        else (
+            payload.get("verification")
+            if isinstance(payload.get("verification"), Mapping)
+            else {}
+        )
+    )
+    provenance = (
+        line.get("qa_evidence_provenance")
+        if isinstance(line.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    binding = (
+        provenance.get("authenticated_qa_binding")
+        if isinstance(provenance.get("authenticated_qa_binding"), Mapping)
+        else {}
+    )
+    status_gate = (
+        provenance.get("completion_status_gate")
+        if isinstance(provenance.get("completion_status_gate"), Mapping)
+        else {}
+    )
+    artifact_refs = (
+        line.get("artifact_refs")
+        if isinstance(line.get("artifact_refs"), Mapping)
+        else {}
+    )
+    ledger = (
+        artifact_refs.get("external_no_pass_baseline_ledger")
+        if isinstance(
+            artifact_refs.get("external_no_pass_baseline_ledger"), Mapping
+        )
+        else {}
+    )
+    if not (
+        str(line.get("actor_role") or "").strip() == "qa"
+        and str(line.get("evidence_kind") or "").strip()
+        == "independent_verification"
+        and str(line.get("status") or "").strip().lower() == "accepted"
+        and str(line.get("authorization_source") or "")
+        == "qa_session_token_ref"
+        and line.get("observer_impersonation") is False
+        and line.get("parent_materialization_authorized") is False
+        and str(provenance.get("schema_version") or "")
+        == "qa_evidence_provenance.v1"
+        and provenance.get("server_derived") is True
+        and str(provenance.get("authorization_source") or "")
+        == "qa_session_token_ref"
+        and str(provenance.get("evidence_owner_role") or "") == "qa"
+        and provenance.get("observer_impersonation") is False
+        and provenance.get("parent_materialization_authorized") is False
+        and str(binding.get("schema_version") or "")
+        == "contract_runtime.authenticated_qa_binding.v1"
+        and binding.get("server_derived") is True
+        and binding.get("independent_verification_session_matched") is True
+        and str(binding.get("qa_principal") or "").strip()
+        and str(binding.get("qa_session_id") or "").strip()
+        and str(status_gate.get("schema_version") or "")
+        == _QA_COMPLETION_STATUS_GATE_SCHEMA_VERSION
+        and status_gate.get("server_derived") is True
+        and status_gate.get("top_level_status_present") is True
+        and status_gate.get("top_level_status_passing") is True
+        and str(status_gate.get("normalized_status") or "") == "accepted"
+        and status_gate.get("nested_payload_decision_satisfies") is False
+        and str(payload.get("schema_version") or "")
+        in _QA_NO_PASS_PAYLOAD_SCHEMA_VERSIONS
+        and (
+            str(payload.get("acceptance_scope") or "")
+            == "candidate_regression_and_acceptance_criteria"
+            or payload.get("row_scoped_qa_pass") is True
+        )
+        and str(payload.get("verdict") or "").strip().lower() == "accepted"
+        and str(payload.get("full_suite_claim") or "") == "not_claimed"
+        and payload.get("candidate_new_failures") == 0
+        and not list(payload.get("candidate_specific_issues") or [])
+        and payload.get("no_pass_claim") is True
+        and payload.get("overall_release_pass_claimed") is False
+        and test_results.get("candidate_new_failures") == 0
+        and not list(test_results.get("candidate_specific_issues") or [])
+        and (
+            test_results.get("no_pass_claim") is True
+            or test_results.get("no_pass") is True
+        )
+        and test_results.get("overall_release_pass_claimed") is False
+        and verification.get(
+            "candidate_new_failures",
+            verification.get("candidate_specific_new_failures"),
+        )
+        == 0
+        and not list(verification.get("candidate_specific_issues") or [])
+        and verification.get("no_pass_claim") is True
+        and verification.get("overall_release_pass_claimed") is False
+        and str(verification.get("verdict") or "").strip().lower()
+        == "accepted"
+        and str(ledger.get("schema_version") or "")
+        == _QA_NO_PASS_LEDGER_SCHEMA_VERSION
+        and ledger.get("candidate_new_failures") == 0
+        and not list(ledger.get("candidate_specific_issues") or [])
+        and ledger.get("no_pass_claim") is True
+        and ledger.get("overall_release_pass_claimed") is False
+        and list(ledger.get("refs") or [])
+    ):
+        return False
+
+    base_commit = str(ledger.get("base_commit_sha") or "").strip().lower()
+    candidate_commit = str(
+        ledger.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    line_commit = str(line.get("commit_sha") or "").strip().lower()
+    payload_base_commit = str(payload.get("base_commit_sha") or "").strip().lower()
+    payload_candidate_commit = str(
+        payload.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    if not (
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base_commit)
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_commit)
+        and line_commit == candidate_commit
+        and payload_base_commit == base_commit
+        and payload_candidate_commit == candidate_commit
+    ):
+        return False
+
+    base_failures = _qa_no_pass_failure_identities(
+        ledger.get("base_failure_identities")
+    )
+    candidate_failures = _qa_no_pass_failure_identities(
+        ledger.get("candidate_failure_identities")
+    )
+    base_reproduction = (
+        ledger.get("base_reproduction")
+        if isinstance(ledger.get("base_reproduction"), Mapping)
+        else {}
+    )
+    reproduced_failures = _qa_no_pass_failure_identities(
+        base_reproduction.get("failure_identities")
+    )
+    candidate_counts = (
+        ledger.get("candidate_suite_counts")
+        if isinstance(ledger.get("candidate_suite_counts"), Mapping)
+        else {}
+    )
+    reproduced = base_reproduction.get("reproduced")
+    total = base_reproduction.get("total")
+    baseline_known = candidate_counts.get("baseline_known_non_green")
+    failed = candidate_counts.get("failed")
+    passed = candidate_counts.get("passed")
+    if not (
+        base_failures
+        and base_failures == candidate_failures == reproduced_failures
+        and _qa_no_pass_exact_positive_count(reproduced, len(base_failures))
+        and _qa_no_pass_exact_positive_count(total, len(base_failures))
+        and _qa_no_pass_exact_positive_count(baseline_known, len(base_failures))
+        and _qa_no_pass_exact_positive_count(failed, len(base_failures))
+        and isinstance(passed, int)
+        and not isinstance(passed, bool)
+        and passed > 0
+    ):
+        return False
+
+    if not _qa_no_pass_ledger_marker_allows_completion(
+        line,
+        payload=payload,
+        test_results=test_results,
+        payload_test_results=payload_test_results,
+        verification=verification,
+        provenance=provenance,
+        binding=binding,
+        status_gate=status_gate,
+        ledger=ledger,
+        base_commit=base_commit,
+        candidate_commit=candidate_commit,
+        base_failures=base_failures,
+        candidate_failures=candidate_failures,
+        passed=passed,
+        source_record=source_record,
+        source_line_index=source_line_index,
+    ):
+        return False
+
+    for result_source in (test_results, payload_test_results):
+        if result_source and not _qa_no_pass_result_counts_match_ledger(
+            result_source,
+            base_failures=base_failures,
+            candidate_failures=candidate_failures,
+        ):
+            return False
+    for result_source in (
+        line,
+        payload,
+        test_results,
+        payload_test_results,
+        verification,
+        ledger,
+    ):
+        if _qa_no_pass_source_claims_pass(result_source):
+            return False
+    if any(
+        _qa_independent_verification_summary_reports_failure(source)
+        for source in (payload, test_results, verification)
+    ):
+        return False
+    return True
+
+
+def _qa_no_pass_ledger_marker_allows_completion(
+    line: Mapping[str, Any],
+    *,
+    payload: Mapping[str, Any],
+    test_results: Mapping[str, Any],
+    payload_test_results: Mapping[str, Any],
+    verification: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    status_gate: Mapping[str, Any],
+    ledger: Mapping[str, Any],
+    base_commit: str,
+    candidate_commit: str,
+    base_failures: tuple[str, ...],
+    candidate_failures: tuple[str, ...],
+    passed: int,
+    source_record: Mapping[str, Any] | None,
+    source_line_index: int,
+) -> bool:
+    """Accept current normalization or the immutable pre-marker line shape.
+
+    The marker-absent branch is read-only compatibility for persisted lines
+    written by the server before the ledger marker could be stored.  It binds
+    the duplicated commit tuple, result ledger, authenticated QA principal,
+    and status gate instead of treating marker absence as caller authority.
+    An explicit false marker is never legacy evidence.
+    """
+
+    if ledger.get("server_normalized") is True:
+        return True
+    if "server_normalized" in ledger:
+        return False
+    if not _qa_no_pass_persisted_legacy_source_context(
+        line,
+        source_record=source_record,
+        source_line_index=source_line_index,
+        base_commit=base_commit,
+        candidate_commit=candidate_commit,
+    ):
+        return False
+
+    principal = str(binding.get("qa_principal") or "").strip()
+    session_id = str(binding.get("qa_session_id") or "").strip()
+    if not (
+        str(provenance.get("source") or "")
+        == "contract_runtime_qa_independent_verification_binding"
+        and str(status_gate.get("source") or "")
+        == "contract_runtime_line_write_normalization"
+        and principal
+        and session_id
+        and all(
+            str(source.get(field) or "").strip() == principal
+            for source, field in (
+                (line, "actor_session_principal"),
+                (line, "evidence_owner_actor"),
+                (line, "submitter_principal"),
+                (provenance, "evidence_owner_actor"),
+                (provenance, "submitter_principal"),
+            )
+        )
+        and all(
+            str(source.get(field) or "").strip() == session_id
+            for source, field in (
+                (line, "evidence_owner_session"),
+                (line, "submitter_session"),
+                (provenance, "evidence_owner_session"),
+                (provenance, "submitter_session"),
+            )
+        )
+        and all(
+            str(line.get(field) or "").strip().lower() == candidate_commit
+            for field in (
+                "commit_sha",
+                "immutable_head_commit",
+                "validated_head_commit",
+            )
+        )
+        and verification.get("exact_commit_tuple_verified") is True
+    ):
+        return False
+
+    payload_verification = (
+        payload.get("verification")
+        if isinstance(payload.get("verification"), Mapping)
+        else {}
+    )
+    payload_artifact_refs = (
+        payload.get("artifact_refs")
+        if isinstance(payload.get("artifact_refs"), Mapping)
+        else {}
+    )
+    payload_ledger = (
+        payload_artifact_refs.get("external_no_pass_baseline_ledger")
+        if isinstance(
+            payload_artifact_refs.get("external_no_pass_baseline_ledger"),
+            Mapping,
+        )
+        else {}
+    )
+    commit_sources = (
+        (payload, "base_commit_sha"),
+        (test_results, "baseline_commit_sha"),
+        (payload_test_results, "baseline_commit_sha"),
+        (payload_ledger, "base_commit_sha"),
+    )
+    if not (
+        payload_verification.get("exact_commit_tuple_verified") is True
+        and all(
+            str(source.get(base_field) or "").strip().lower()
+            == base_commit
+            and str(source.get("candidate_commit_sha") or "").strip().lower()
+            == candidate_commit
+            for source, base_field in commit_sources
+        )
+        and str(payload_ledger.get("schema_version") or "")
+        == _QA_NO_PASS_LEDGER_SCHEMA_VERSION
+        and "server_normalized" not in payload_ledger
+        and list(line.get("graph_trace_ids") or [])
+        and list(
+            (
+                line.get("artifact_refs")
+                if isinstance(line.get("artifact_refs"), Mapping)
+                else {}
+            ).get("durable_authority_refs")
+            or []
+        )
+    ):
+        return False
+
+    payload_base_reproduction = (
+        payload_ledger.get("base_reproduction")
+        if isinstance(payload_ledger.get("base_reproduction"), Mapping)
+        else {}
+    )
+    payload_candidate_counts = (
+        payload_ledger.get("candidate_suite_counts")
+        if isinstance(payload_ledger.get("candidate_suite_counts"), Mapping)
+        else {}
+    )
+    expected_count = len(base_failures)
+    return bool(
+        base_failures == candidate_failures
+        and _qa_no_pass_failure_identities(
+            test_results.get("baseline_failure_node_ids")
+        )
+        == base_failures
+        and _qa_no_pass_failure_identities(
+            test_results.get("candidate_failure_node_ids")
+        )
+        == candidate_failures
+        and _qa_no_pass_failure_identities(
+            payload_test_results.get("baseline_failure_node_ids")
+        )
+        == base_failures
+        and _qa_no_pass_failure_identities(
+            payload_test_results.get("candidate_failure_node_ids")
+        )
+        == candidate_failures
+        and _qa_no_pass_failure_identities(
+            payload_ledger.get("base_failure_identities")
+        )
+        == base_failures
+        and _qa_no_pass_failure_identities(
+            payload_ledger.get("candidate_failure_identities")
+        )
+        == candidate_failures
+        and _qa_no_pass_failure_identities(
+            payload_base_reproduction.get("failure_identities")
+        )
+        == base_failures
+        and all(
+            _qa_no_pass_exact_positive_count(source.get(field), expected_count)
+            for source, field in (
+                (test_results, "baseline_failed"),
+                (test_results, "candidate_failed"),
+                (payload_test_results, "baseline_failed"),
+                (payload_test_results, "candidate_failed"),
+                (payload_base_reproduction, "reproduced"),
+                (payload_base_reproduction, "total"),
+                (payload_candidate_counts, "baseline_known_non_green"),
+                (payload_candidate_counts, "failed"),
+            )
+        )
+        and test_results.get("baseline_passed") == passed
+        and test_results.get("candidate_passed") == passed
+        and payload_test_results.get("baseline_passed") == passed
+        and payload_test_results.get("candidate_passed") == passed
+        and payload_candidate_counts.get("passed") == passed
+        and payload_ledger.get("candidate_new_failures") == 0
+        and not list(payload_ledger.get("candidate_specific_issues") or [])
+        and payload_ledger.get("no_pass_claim") is True
+        and payload_ledger.get("overall_release_pass_claimed") is False
+        and list(payload_ledger.get("refs") or [])
+    )
+
+
+def _qa_no_pass_persisted_legacy_source_context(
+    line: Mapping[str, Any],
+    *,
+    source_record: Mapping[str, Any] | None,
+    source_line_index: int,
+    base_commit: str,
+    candidate_commit: str,
+) -> bool:
+    """Bind pre-marker compatibility to one trusted persisted record member."""
+
+    if not isinstance(source_record, Mapping):
+        return False
+    persisted_line_index = _source_record_completed_line_index(line, source_record)
+    if persisted_line_index < 0 or source_line_index != persisted_line_index:
+        return False
+    stored_lines = source_record.get("completed_lines")
+    if not isinstance(stored_lines, list):
+        return False
+    persisted_identity = (
+        str(source_record.get("contract_execution_id") or "").strip(),
+        persisted_line_index,
+    )
+    if persisted_identity not in _QA_NO_PASS_PRE_MARKER_PERSISTED_LINE_IDENTITIES:
+        return False
+    if not (
+        str(source_record.get("schema_version") or "")
+        == "contract_runtime_execution_record.v1"
+        and _record_contract_id(source_record) in {"mf_parallel", "mf_parallel.v2"}
+        and str(source_record.get("project_id") or "").strip()
+        and str(source_record.get("backlog_id") or "").strip()
+        and str(source_record.get("contract_execution_id") or "").strip()
+    ):
+        return False
+
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    execution_id = str(source_record.get("contract_execution_id") or "").strip()
+    payload_execution_id = str(payload.get("contract_execution_id") or "").strip()
+    if payload_execution_id and payload_execution_id != execution_id:
+        return False
+    line_trace_ids = _qa_no_pass_failure_identities(line.get("graph_trace_ids"))
+    if not line_trace_ids:
+        return False
+
+    provenance = (
+        line.get("qa_evidence_provenance")
+        if isinstance(line.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    binding = (
+        provenance.get("authenticated_qa_binding")
+        if isinstance(provenance.get("authenticated_qa_binding"), Mapping)
+        else {}
+    )
+    principal = str(binding.get("qa_principal") or "").strip()
+    session_id = str(binding.get("qa_session_id") or "").strip()
+
+    for graph_line in reversed(stored_lines[:persisted_line_index]):
+        if not isinstance(graph_line, Mapping):
+            continue
+        if str(graph_line.get("line_id") or "").strip() != "qa_graph_context":
+            continue
+        graph_payload = (
+            graph_line.get("payload")
+            if isinstance(graph_line.get("payload"), Mapping)
+            else {}
+        )
+        graph_evidence = (
+            graph_payload.get("graph_trace_evidence")
+            if isinstance(graph_payload.get("graph_trace_evidence"), Mapping)
+            else {}
+        )
+        graph_provenance = (
+            graph_line.get("qa_evidence_provenance")
+            if isinstance(graph_line.get("qa_evidence_provenance"), Mapping)
+            else {}
+        )
+        graph_binding = (
+            graph_provenance.get("authenticated_qa_binding")
+            if isinstance(
+                graph_provenance.get("authenticated_qa_binding"), Mapping
+            )
+            else {}
+        )
+        graph_trace_ids = _qa_no_pass_failure_identities(
+            graph_evidence.get("verified_trace_ids")
+            or graph_evidence.get("trace_ids")
+        )
+        graph_status = str(
+            graph_line.get("status") or graph_payload.get("status") or ""
+        ).strip().lower()
+        if (
+            str(graph_line.get("actor_role") or "").strip() == "qa"
+            and graph_status in {"", "accepted"}
+            and str(graph_line.get("authorization_source") or "")
+            == "qa_session_token_ref"
+            and graph_line.get("observer_impersonation") is False
+            and graph_line.get("parent_materialization_authorized") is False
+            and str(graph_provenance.get("schema_version") or "")
+            == "qa_evidence_provenance.v1"
+            and str(graph_provenance.get("source") or "")
+            == "contract_runtime_qa_graph_authority_binding"
+            and graph_provenance.get("server_derived") is True
+            and str(graph_binding.get("schema_version") or "")
+            == "contract_runtime.authenticated_qa_binding.v1"
+            and graph_binding.get("server_derived") is True
+            and graph_binding.get("graph_trace_session_matched") is True
+            and str(graph_binding.get("qa_principal") or "").strip() == principal
+            and str(graph_binding.get("qa_session_id") or "").strip() == session_id
+            and str(graph_line.get("commit_sha") or "").strip().lower()
+            == candidate_commit
+            and str(graph_evidence.get("base_commit_sha") or "").strip().lower()
+            == base_commit
+            and str(
+                graph_evidence.get("candidate_commit_sha")
+                or graph_evidence.get("candidate_commit")
+                or ""
+            )
+            .strip()
+            .lower()
+            == candidate_commit
+            and graph_evidence.get("db_verified") is True
+            and not list(graph_evidence.get("missing_trace_ids") or [])
+            and not list(graph_evidence.get("identity_mismatches") or [])
+            and graph_trace_ids
+            and set(line_trace_ids).issubset(set(graph_trace_ids))
+            and str(graph_evidence.get("project_id") or "").strip()
+            == str(source_record.get("project_id") or "").strip()
+            and str(graph_evidence.get("backlog_id") or "").strip()
+            == str(source_record.get("backlog_id") or "").strip()
+        ):
+            return True
+    return False
+
+
+def _qa_no_pass_failure_identities(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    identities = tuple(str(item or "").strip() for item in value)
+    if not identities or any(not item for item in identities):
+        return ()
+    if len(set(identities)) != len(identities):
+        return ()
+    return identities
+
+
+def _qa_no_pass_exact_positive_count(value: Any, expected: int) -> bool:
+    return bool(
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+        and value == expected
+    )
+
+
+def _qa_no_pass_result_counts_match_ledger(
+    value: Mapping[str, Any],
+    *,
+    base_failures: tuple[str, ...],
+    candidate_failures: tuple[str, ...],
+) -> bool:
+    expected = len(base_failures)
+    for field, identities in (
+        ("baseline_failure_node_ids", base_failures),
+        ("base_failure_identities", base_failures),
+        ("candidate_failure_node_ids", candidate_failures),
+        ("candidate_failure_identities", candidate_failures),
+    ):
+        if field in value and _qa_no_pass_failure_identities(value.get(field)) != identities:
+            return False
+    for field in ("baseline_failed", "candidate_failed", "failed"):
+        if field in value and not _qa_no_pass_exact_positive_count(
+            value.get(field), expected
+        ):
+            return False
+    for branch_name, identities in (
+        ("base", base_failures),
+        ("baseline", base_failures),
+        ("candidate", candidate_failures),
+    ):
+        branch = value.get(branch_name)
+        if not isinstance(branch, Mapping):
+            continue
+        if "failed" in branch and not _qa_no_pass_exact_positive_count(
+            branch.get("failed"), len(identities)
+        ):
+            return False
+        for field in ("failure_identities", "failure_node_ids"):
+            if field in branch and _qa_no_pass_failure_identities(
+                branch.get(field)
+            ) != identities:
+                return False
+    return True
+
+
+def _qa_no_pass_source_claims_pass(value: Mapping[str, Any]) -> bool:
+    if any(
+        value.get(field) is True
+        for field in (
+            "passed",
+            "overall_release_pass",
+            "overall_release_pass_claimed",
+            "full_suite_passed",
+        )
+    ):
+        return True
+    for field in ("base", "baseline", "candidate"):
+        nested = value.get(field)
+        if isinstance(nested, Mapping) and nested.get("passed") is True:
+            return True
+    return False
 
 
 _QA_FAILURE_SUMMARY_FIELDS = frozenset(
@@ -3464,6 +4227,7 @@ class ContractRuntime:
         )
         completion_satisfying_lines = _contract_completion_satisfying_lines(
             completion_input_lines,
+            source_record=record,
             failed_qa_rejoin_contexts=(
                 _failed_qa_rejoin_context_keys_from_projection(projection)
             ),
@@ -3488,7 +4252,11 @@ class ContractRuntime:
             instruction_bundle=instruction_bundle,
             judgment_hints=_record_judgment_hints(record),
         )
-        _attach_failed_qa_rework_guidance(guide, line_items=line_items)
+        _attach_failed_qa_rework_guidance(
+            guide,
+            line_items=line_items,
+            source_record=record,
+        )
         _attach_completed_line_evidence(guide, line_items)
         sanitized_projection: dict[str, Any] = {}
         if projection:
@@ -3695,7 +4463,10 @@ class ContractRuntime:
 
         record = self.store.get(contract_execution_id)
         lines = list(record.get("completed_lines") or [])
-        failed_qa_index = _active_failed_qa_line_index(lines)
+        failed_qa_index = _active_failed_qa_line_index(
+            lines,
+            source_record=record,
+        )
         payload = (
             dict(effective_write.get("payload"))
             if isinstance(effective_write.get("payload"), Mapping)

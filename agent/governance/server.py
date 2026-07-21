@@ -61822,10 +61822,432 @@ def _contract_runtime_bind_authenticated_qa_provenance(
     return effective
 
 
+_CONTRACT_RUNTIME_NO_PASS_LEDGER_SCHEMA_VERSION = (
+    "contract_runtime.external_no_pass_baseline_ledger.v2"
+)
+
+
+def _contract_runtime_authenticated_qa_provenance(
+    line: Mapping[str, Any],
+) -> bool:
+    provenance = (
+        line.get("qa_evidence_provenance")
+        if isinstance(line.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    binding = (
+        provenance.get("authenticated_qa_binding")
+        if isinstance(provenance.get("authenticated_qa_binding"), Mapping)
+        else {}
+    )
+    return bool(
+        str(line.get("authorization_source") or "")
+        == "qa_session_token_ref"
+        and line.get("observer_impersonation") is False
+        and str(provenance.get("schema_version") or "")
+        == "qa_evidence_provenance.v1"
+        and provenance.get("server_derived") is True
+        and str(provenance.get("authorization_source") or "")
+        == "qa_session_token_ref"
+        and str(provenance.get("evidence_owner_role") or "") == "qa"
+        and provenance.get("observer_impersonation") is False
+        and provenance.get("parent_materialization_authorized") is False
+        and str(binding.get("schema_version") or "")
+        == "contract_runtime.authenticated_qa_binding.v1"
+        and binding.get("server_derived") is True
+        and (
+            binding.get("independent_verification_session_matched") is True
+            or binding.get("graph_trace_session_matched") is True
+        )
+        and str(binding.get("qa_principal") or "").strip()
+        and str(binding.get("qa_session_id") or "").strip()
+    )
+
+
+def _contract_runtime_no_pass_requested(line: Mapping[str, Any]) -> bool:
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    test_results = (
+        line.get("test_results")
+        if isinstance(line.get("test_results"), Mapping)
+        else {}
+    )
+    payload_test_results = (
+        payload.get("test_results")
+        if isinstance(payload.get("test_results"), Mapping)
+        else {}
+    )
+    return any(
+        source.get("no_pass_claim") is True or source.get("no_pass") is True
+        for source in (payload, test_results, payload_test_results)
+    )
+
+
+def _contract_runtime_no_pass_graph_scope(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the last DB-verified QA graph base/candidate tuple."""
+
+    for line in reversed(
+        [
+            item
+            for item in record.get("completed_lines") or []
+            if isinstance(item, Mapping)
+        ]
+    ):
+        if str(line.get("line_id") or "").strip() != "qa_graph_context":
+            continue
+        if not _contract_runtime_authenticated_qa_provenance(line):
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        evidence = (
+            payload.get("graph_trace_evidence")
+            if isinstance(payload.get("graph_trace_evidence"), Mapping)
+            else {}
+        )
+        base_commit = str(evidence.get("base_commit_sha") or "").strip().lower()
+        candidate_commit = str(
+            evidence.get("candidate_commit_sha")
+            or evidence.get("candidate_commit")
+            or ""
+        ).strip().lower()
+        line_commit = str(line.get("commit_sha") or "").strip().lower()
+        trace_ids = _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(
+                evidence,
+                "verified_trace_ids",
+                "trace_ids",
+            )
+        )
+        if not (
+            re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base_commit)
+            and re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_commit
+            )
+            and line_commit == candidate_commit
+            and evidence.get("db_verified") is True
+            and not list(evidence.get("identity_mismatches") or [])
+            and trace_ids
+        ):
+            continue
+        return {
+            "base_commit_sha": base_commit,
+            "candidate_commit_sha": candidate_commit,
+            "graph_trace_ids": trace_ids,
+        }
+    return {}
+
+
+def _contract_runtime_failure_identities(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    identities = [str(item or "").strip() for item in value]
+    if any(not item for item in identities) or len(set(identities)) != len(
+        identities
+    ):
+        return []
+    return sorted(identities)
+
+
+def _contract_runtime_qa_no_pass_ledger_authority(
+    line: Mapping[str, Any],
+    *,
+    record: Mapping[str, Any] | None = None,
+    allow_immutable_legacy: bool = False,
+) -> dict[str, Any]:
+    """Validate one no-PASS line and return its canonical baseline ledger.
+
+    New writes carry the v2 ledger.  The legacy branch is read-only
+    compatibility for immutable, server-accepted QA lines; it still requires
+    authenticated QA provenance and the exact DB-verified graph commit tuple.
+    """
+
+    if not _contract_runtime_authenticated_qa_provenance(line):
+        return {}
+    provenance = line["qa_evidence_provenance"]
+    authenticated_binding = provenance["authenticated_qa_binding"]
+    if authenticated_binding.get("independent_verification_session_matched") is not True:
+        return {}
+    graph_scope = (
+        _contract_runtime_no_pass_graph_scope(record)
+        if isinstance(record, Mapping)
+        else {}
+    )
+    if not graph_scope:
+        return {}
+    base_commit = graph_scope["base_commit_sha"]
+    candidate_commit = graph_scope["candidate_commit_sha"]
+    if str(line.get("commit_sha") or "").strip().lower() != candidate_commit:
+        return {}
+
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    test_results = (
+        line.get("test_results")
+        if isinstance(line.get("test_results"), Mapping)
+        else {}
+    )
+    verification = (
+        line.get("verification")
+        if isinstance(line.get("verification"), Mapping)
+        else (
+            payload.get("verification")
+            if isinstance(payload.get("verification"), Mapping)
+            else {}
+        )
+    )
+    verification_candidate_new = verification.get(
+        "candidate_new_failures",
+        verification.get("candidate_specific_new_failures"),
+    )
+    if not (
+        str(line.get("line_id") or "").strip()
+        == "qa_independent_verification"
+        and str(line.get("actor_role") or "").strip() == "qa"
+        and str(line.get("evidence_kind") or "").strip()
+        == "independent_verification"
+        and str(line.get("status") or "").strip().lower() == "accepted"
+        and str(payload.get("schema_version") or "")
+        in {
+            "qa_independent_verification.v1",
+            "mf_parallel.qa_independent_verification.v1",
+        }
+        and (
+            str(payload.get("acceptance_scope") or "")
+            == "candidate_regression_and_acceptance_criteria"
+            or payload.get("row_scoped_qa_pass") is True
+        )
+        and str(payload.get("verdict") or "").strip().lower() == "accepted"
+        and str(payload.get("full_suite_claim") or "") == "not_claimed"
+        and payload.get("candidate_new_failures") == 0
+        and test_results.get("candidate_new_failures") == 0
+        and verification_candidate_new == 0
+        and not list(payload.get("candidate_specific_issues") or [])
+        and not list(test_results.get("candidate_specific_issues") or [])
+        and not list(verification.get("candidate_specific_issues") or [])
+        and payload.get("no_pass_claim") is True
+        and payload.get("overall_release_pass_claimed") is False
+        and (
+            test_results.get("no_pass_claim") is True
+            or test_results.get("no_pass") is True
+        )
+        and test_results.get("passed") is not True
+        and test_results.get("overall_release_pass") is not True
+        and test_results.get("overall_release_pass_claimed") is False
+        and verification.get("no_pass_claim") is True
+        and verification.get("overall_release_pass_claimed") is False
+        and str(verification.get("verdict") or "").strip().lower()
+        == "accepted"
+    ):
+        return {}
+    artifact_refs = (
+        line.get("artifact_refs")
+        if isinstance(line.get("artifact_refs"), Mapping)
+        else {}
+    )
+    ledger = (
+        artifact_refs.get("external_no_pass_baseline_ledger")
+        if isinstance(
+            artifact_refs.get("external_no_pass_baseline_ledger"), Mapping
+        )
+        else {}
+    )
+    if ledger:
+        base_reproduction = (
+            ledger.get("base_reproduction")
+            if isinstance(ledger.get("base_reproduction"), Mapping)
+            else {}
+        )
+        candidate_counts = (
+            ledger.get("candidate_suite_counts")
+            if isinstance(ledger.get("candidate_suite_counts"), Mapping)
+            else {}
+        )
+        base_failures = _contract_runtime_failure_identities(
+            ledger.get("base_failure_identities")
+            or base_reproduction.get("failure_identities")
+        )
+        candidate_failures = _contract_runtime_failure_identities(
+            ledger.get("candidate_failure_identities")
+        )
+        failed_count = candidate_counts.get("failed")
+        passed_count = candidate_counts.get("passed")
+        reproduced = base_reproduction.get("reproduced")
+        total = base_reproduction.get("total")
+        if not (
+            str(ledger.get("schema_version") or "")
+            == _CONTRACT_RUNTIME_NO_PASS_LEDGER_SCHEMA_VERSION
+            and str(ledger.get("base_commit_sha") or "").strip().lower()
+            == base_commit
+            and str(ledger.get("candidate_commit_sha") or "").strip().lower()
+            == candidate_commit
+            and base_failures
+            and base_failures == candidate_failures
+            and isinstance(reproduced, int)
+            and not isinstance(reproduced, bool)
+            and isinstance(total, int)
+            and not isinstance(total, bool)
+            and reproduced == total == len(base_failures)
+            and candidate_counts.get("baseline_known_non_green")
+            == len(base_failures)
+            and failed_count == len(candidate_failures)
+            and isinstance(passed_count, int)
+            and not isinstance(passed_count, bool)
+            and passed_count > 0
+            and ledger.get("candidate_new_failures") == 0
+            and not list(ledger.get("candidate_specific_issues") or [])
+            and ledger.get("no_pass_claim") is True
+            and ledger.get("overall_release_pass_claimed") is False
+            and list(ledger.get("refs") or [])
+        ):
+            return {}
+        return {
+            **dict(ledger),
+            "server_normalized": True,
+            "base_failure_identities": base_failures,
+            "candidate_failure_identities": candidate_failures,
+            "base_reproduction": {
+                **dict(base_reproduction),
+                "failure_identities": base_failures,
+            },
+        }
+
+    if not allow_immutable_legacy:
+        return {}
+    nested_results = (
+        payload.get("test_results")
+        if isinstance(payload.get("test_results"), Mapping)
+        else {}
+    )
+    if not test_results or stable_sha256(test_results) != stable_sha256(
+        nested_results
+    ):
+        return {}
+    base_failures = _contract_runtime_failure_identities(
+        test_results.get("baseline_failure_node_ids")
+    )
+    candidate_failures = _contract_runtime_failure_identities(
+        test_results.get("candidate_failure_node_ids")
+    )
+    base_failed = test_results.get("baseline_failed")
+    candidate_failed = test_results.get("candidate_failed")
+    base_passed = test_results.get("baseline_passed")
+    candidate_passed = test_results.get("candidate_passed")
+    if not (
+        str(payload.get("base_commit_sha") or "").strip().lower()
+        == base_commit
+        and str(payload.get("candidate_commit_sha") or "").strip().lower()
+        == candidate_commit
+        and base_failures
+        and base_failures == candidate_failures
+        and base_failed == candidate_failed == len(base_failures)
+        and isinstance(base_passed, int)
+        and not isinstance(base_passed, bool)
+        and isinstance(candidate_passed, int)
+        and not isinstance(candidate_passed, bool)
+        and base_passed > 0
+        and candidate_passed > 0
+        and payload.get("candidate_new_failures") == 0
+        and test_results.get("candidate_new_failures") == 0
+        and not list(payload.get("candidate_specific_issues") or [])
+        and not list(test_results.get("candidate_specific_issues") or [])
+        and not list(test_results.get("baseline_only_failure_node_ids") or [])
+        and not list(test_results.get("candidate_only_failure_node_ids") or [])
+        and test_results.get("passed") is False
+        and test_results.get("overall_release_pass") is False
+        and verification.get("candidate_specific_new_failures") == 0
+        and str(verification.get("full_suite_claim") or "") == "not_claimed"
+    ):
+        return {}
+    return {
+        "schema_version": _CONTRACT_RUNTIME_NO_PASS_LEDGER_SCHEMA_VERSION,
+        "server_normalized": True,
+        "source": "immutable_authenticated_qa_line+db_verified_qa_graph_context",
+        "base_commit_sha": base_commit,
+        "candidate_commit_sha": candidate_commit,
+        "base_failure_identities": base_failures,
+        "candidate_failure_identities": candidate_failures,
+        "base_reproduction": {
+            "reproduced": len(base_failures),
+            "total": len(base_failures),
+            "failure_identities": base_failures,
+        },
+        "candidate_suite_counts": {
+            "baseline_known_non_green": len(base_failures),
+            "failed": len(candidate_failures),
+            "passed": candidate_passed,
+        },
+        "candidate_new_failures": 0,
+        "candidate_specific_issues": [],
+        "no_pass_claim": True,
+        "overall_release_pass_claimed": False,
+        "refs": list(graph_scope["graph_trace_ids"]),
+    }
+
+
+def _contract_runtime_bind_qa_no_pass_ledger_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+) -> dict[str, Any]:
+    effective = dict(write)
+    if not _contract_runtime_no_pass_requested(effective):
+        return effective
+    ledger = _contract_runtime_qa_no_pass_ledger_authority(
+        effective,
+        record=record,
+        allow_immutable_legacy=True,
+    )
+    expected_candidate_commit = _contract_runtime_server_candidate_commit(
+        conn,
+        project_id=project_id,
+        record=record,
+    )
+    if not ledger or (
+        str(ledger.get("candidate_commit_sha") or "").strip().lower()
+        != expected_candidate_commit
+    ):
+        raise GovernanceError(
+            "contract_runtime_qa_no_pass_authority_shape_invalid",
+            (
+                "no-PASS QA requires authenticated exact base/candidate commits, "
+                "identical non-green failure identities, zero candidate-new "
+                "failures, and no overall PASS claim"
+            ),
+            409,
+            {
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "line_id": str(write.get("line_id") or ""),
+                "canonical_ledger_path": (
+                    "artifact_refs.external_no_pass_baseline_ledger"
+                ),
+                "required_schema_version": (
+                    _CONTRACT_RUNTIME_NO_PASS_LEDGER_SCHEMA_VERSION
+                ),
+                "fail_closed": True,
+            },
+        )
+    artifact_refs = (
+        dict(effective.get("artifact_refs"))
+        if isinstance(effective.get("artifact_refs"), Mapping)
+        else {}
+    )
+    artifact_refs["external_no_pass_baseline_ledger"] = ledger
+    effective["artifact_refs"] = artifact_refs
+    return effective
+
+
 def _contract_runtime_bind_qa_independent_verification_authority(
     ctx: RequestContext,
     conn,
     *,
+    project_id: str,
     record: Mapping[str, Any],
     write: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -61843,11 +62265,17 @@ def _contract_runtime_bind_qa_independent_verification_authority(
                 "authority_source": "authenticated_qa_session",
             },
         )
-    return _contract_runtime_bind_authenticated_qa_provenance(
+    effective = _contract_runtime_bind_authenticated_qa_provenance(
         session,
         write=write,
         source="contract_runtime_qa_independent_verification_binding",
         binding_claims={"independent_verification_session_matched": True},
+    )
+    return _contract_runtime_bind_qa_no_pass_ledger_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        write=effective,
     )
 
 
@@ -62560,6 +62988,8 @@ def _contract_runtime_bind_observer_merge_authority(
 
 def _contract_runtime_candidate_scoped_no_pass_line(
     line: Mapping[str, Any],
+    *,
+    record: Mapping[str, Any] | None = None,
 ) -> bool:
     """Accept only the bounded, non-release-PASS no-PASS evidence shapes.
 
@@ -62643,89 +63073,13 @@ def _contract_runtime_candidate_scoped_no_pass_line(
             if isinstance(provenance.get("completion_status_gate"), Mapping)
             else {}
         )
-        artifact_refs = (
-            line.get("artifact_refs")
-            if isinstance(line.get("artifact_refs"), Mapping)
-            else {}
-        )
-        baseline_ledger = (
-            artifact_refs.get("external_no_pass_baseline_ledger")
-            if isinstance(
-                artifact_refs.get("external_no_pass_baseline_ledger"), Mapping
-            )
-            else {}
-        )
-        base_reproduction = (
-            baseline_ledger.get("base_reproduction")
-            if isinstance(baseline_ledger.get("base_reproduction"), Mapping)
-            else {}
-        )
-        test_results = (
-            line.get("test_results")
-            if isinstance(line.get("test_results"), Mapping)
-            else {}
-        )
-        verification = (
-            line.get("verification")
-            if isinstance(line.get("verification"), Mapping)
-            else {}
-        )
-        reproduced = base_reproduction.get("reproduced")
-        total = base_reproduction.get("total")
-        candidate_suite_counts = (
-            baseline_ledger.get("candidate_suite_counts")
-            if isinstance(baseline_ledger.get("candidate_suite_counts"), Mapping)
-            else {}
-        )
-        baseline_reproduced = bool(
-            isinstance(reproduced, int)
-            and not isinstance(reproduced, bool)
-            and isinstance(total, int)
-            and not isinstance(total, bool)
-            and reproduced == total
-            and total > 0
-        )
-        candidate_fields_match = all(
-            value.get("candidate_new_failures") == 0
-            and not list(value.get("candidate_specific_issues") or [])
-            and value.get("no_pass_claim") is True
-            and value.get("overall_release_pass_claimed") is False
-            and str(value.get("status") or "").strip().lower() == "accepted"
-            for value in (payload, test_results, verification)
+        ledger = _contract_runtime_qa_no_pass_ledger_authority(
+            line,
+            record=record,
+            allow_immutable_legacy=isinstance(record, Mapping),
         )
         return bool(
-            str(line.get("actor_role") or "").strip() == "qa"
-            and str(line.get("evidence_kind") or "").strip()
-            == "independent_verification"
-            and str(line.get("authorization_source") or "")
-            == "qa_session_token_ref"
-            and str(line.get("status") or "").strip().lower() == "accepted"
-            and str(payload.get("schema_version") or "")
-            == "qa_independent_verification.v1"
-            and str(payload.get("acceptance_scope") or "") == candidate_scope
-            and str(payload.get("verdict") or "").strip().lower() == "accepted"
-            and str(payload.get("full_suite_claim") or "") == "not_claimed"
-            and str(payload.get("external_full_suite_ledger_location") or "")
-            == "artifact_refs.external_no_pass_baseline_ledger"
-            and candidate_fields_match
-            and str(test_results.get("scope") or "") == candidate_scope
-            and test_results.get("focused_failed") == 0
-            and isinstance(test_results.get("focused_passed"), int)
-            and not isinstance(test_results.get("focused_passed"), bool)
-            and test_results.get("focused_passed") > 0
-            and str(verification.get("acceptance_scope") or "") == candidate_scope
-            and str(verification.get("verdict") or "").strip().lower()
-            == "accepted"
-            and baseline_ledger.get("candidate_new_failures") == 0
-            and baseline_ledger.get("no_pass_claim") is True
-            and baseline_ledger.get("overall_release_pass_claimed") is False
-            and baseline_reproduced
-            and candidate_suite_counts.get("baseline_known_non_green") == total
-            and isinstance(candidate_suite_counts.get("passed"), int)
-            and not isinstance(candidate_suite_counts.get("passed"), bool)
-            and candidate_suite_counts.get("passed") > 0
-            and list(baseline_ledger.get("refs") or [])
-            and qa_provenance_verified
+            ledger
             and completion_gate.get("server_derived") is True
             and completion_gate.get("top_level_status_present") is True
             and completion_gate.get("top_level_status_passing") is True
@@ -62759,6 +63113,8 @@ def _contract_runtime_candidate_scoped_no_pass_line(
 
 def _contract_runtime_line_reports_disqualifying_failed_qa(
     line: Mapping[str, Any],
+    *,
+    record: Mapping[str, Any] | None = None,
 ) -> bool:
     """Separate inherited no-PASS failures from candidate QA failures.
 
@@ -62768,7 +63124,7 @@ def _contract_runtime_line_reports_disqualifying_failed_qa(
     failures are inherited while candidate-new failures remain zero.
     """
 
-    if _contract_runtime_candidate_scoped_no_pass_line(line):
+    if _contract_runtime_candidate_scoped_no_pass_line(line, record=record):
         return False
     return _contract_runtime_value_reports_failed_qa(line)
 
@@ -62856,7 +63212,10 @@ def _contract_runtime_completed_merge_authority(
                         line
                     )
                     if line_id == "observer_merge"
-                    else _contract_runtime_candidate_scoped_no_pass_line(line)
+                    else _contract_runtime_candidate_scoped_no_pass_line(
+                        line,
+                        record=record,
+                    )
                 )
             )
             and str(payload.get("disposition") or "").strip()
@@ -62907,7 +63266,8 @@ def _contract_runtime_completed_merge_authority(
     if (
         not _contract_runtime_line_status_passes(qa_verification[1])
         or _contract_runtime_line_reports_disqualifying_failed_qa(
-            qa_verification[1]
+            qa_verification[1],
+            record=record,
         )
     ):
         return {}
@@ -63183,13 +63543,17 @@ def _contract_runtime_completed_line_acceptance(
     if (
         not _contract_runtime_line_status_passes(canonical_line)
         or _contract_runtime_line_reports_disqualifying_failed_qa(
-            canonical_line
+            canonical_line,
+            record=record,
         )
         or str(canonical_line.get("status") or "").strip().lower()
         in {"waived", "bypassed"}
         or (
             payload.get("no_pass_claim") is True
-            and not _contract_runtime_candidate_scoped_no_pass_line(canonical_line)
+            and not _contract_runtime_candidate_scoped_no_pass_line(
+                canonical_line,
+                record=record,
+            )
         )
         or str(payload.get("disposition") or "").strip()
         == "proceeded_with_exception"
@@ -64114,6 +64478,7 @@ def _contract_runtime_bind_server_line_authority(
         return _contract_runtime_bind_qa_independent_verification_authority(
             ctx,
             conn,
+            project_id=project_id,
             record=record,
             write=write,
         )
@@ -75093,6 +75458,12 @@ def _contract_runtime_close_gate(
             write=write,
             source="contract_runtime_qa_independent_verification_binding",
             binding_claims={"independent_verification_session_matched": True},
+        )
+        write = _contract_runtime_bind_qa_no_pass_ledger_authority(
+            conn,
+            project_id=project_id,
+            record=authority_record,
+            write=write,
         )
     result = runtime.submit_line_write(
         contract_execution_id,
