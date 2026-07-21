@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import {
   buildPlaybackUrl,
+  contractRuntimeCompatibilityRepairValues,
   normalizeTaskPlaybackCompactLedger,
   normalizeTaskPlaybackDag,
   projectContractRuntimeAuthorityViewModel,
@@ -843,6 +844,7 @@ function BacklogDetailModal({
           />
         ) : null}
         <ContractRuntimeAuthorityPanel authority={timeline?.authorityView} compact />
+        <ContractRuntimeCompatibilityRepairPanel authority={timeline?.authorityView} />
 
         <div className="backlog-modal-tabs" role="tablist" aria-label="Backlog detail sections">
           <button
@@ -1001,6 +1003,7 @@ function BacklogDetailSummary({
   const ledgerNextAction = taskPlaybackCompactLedgerNextActionLabel(compactLedgerRow?.next_legal_action);
   const ledgerDisplay = taskPlaybackCompactLedgerDisplayState(compactLedgerRow);
   const ledgerProjectionStatus = compactLedgerProjectionReadiness(compactLedgerRow);
+  const compatibilityRepairTargets = contractRuntimeCompatibilityRepairValues(authority);
   return (
     <div className="backlog-modal-summary">
       <SummaryItem label="Priority" value={normalizePriority(bug.priority)} tone={priorityTone(bug.priority)} />
@@ -1035,6 +1038,9 @@ function BacklogDetailSummary({
           <SummaryItem label="Latest event" value={compactLedgerRow.latest_event_id ? `${compactLedgerRow.latest_event_id} ${compactLedgerRow.latest_event_kind || ""}`.trim() : "none"} mono />
         </>
       ) : null}
+      {compatibilityRepairTargets.length > 0 ? (
+        <SummaryItem label="Compatibility repairs" value={`${compatibilityRepairTargets.length} advisory`} tone="status-failed" />
+      ) : null}
       <SummaryItem label="Contract" value={contract?.status || (bug.contract_summary?.has_contract ? "declared" : "not declared")} tone={contract?.passed ? "status-complete" : contract ? "status-failed" : "status-unknown"} />
       <SummaryItem label="Projection" value={projection?.status || "not loaded"} tone={projectionTone(projection)} />
       <SummaryItem label="Command" value={commandProjectionStatus} tone={commandProjectionTone(commandProjectionStatus, commandDivergence)} />
@@ -1058,11 +1064,32 @@ function BacklogDetailSummary({
       ) : compactLedgerRow ? (
         <DetailList label="Next legal action" values={ledgerNextAction ? [ledgerNextAction] : []} />
       ) : null}
+      {compatibilityRepairTargets.length > 0 ? (
+        <DetailList label="Compatibility repair targets (advisory)" values={compatibilityRepairTargets} />
+      ) : null}
       {authority && compactLedgerRow && ledgerNextAction ? (
         <DetailList label="Historical ledger action (advisory)" values={[ledgerNextAction]} />
       ) : null}
       {auditClose.present ? <DetailList label="Audit close reason" values={auditClose.reason ? [auditClose.reason] : []} /> : null}
       {commandRecovery ? <DetailList label="Command recovery" values={commandRecoveryDetailValues(commandRecovery)} /> : null}
+    </div>
+  );
+}
+
+function ContractRuntimeCompatibilityRepairPanel({
+  authority,
+}: {
+  authority?: ContractRuntimeAuthorityViewModel;
+}) {
+  const targets = contractRuntimeCompatibilityRepairValues(authority);
+  if (targets.length === 0) return null;
+  return (
+    <div className="backlog-gate-card fail" aria-label="Backlog compatibility repair targets">
+      <div className="backlog-gate-title">
+        <span>Compatibility repair targets (advisory)</span>
+        <span className="status-badge status-failed">{targets.length} blocked-source target{targets.length === 1 ? "" : "s"}</span>
+      </div>
+      <TokenList label="repair targets" values={targets} empty="none" tone="red" />
     </div>
   );
 }
