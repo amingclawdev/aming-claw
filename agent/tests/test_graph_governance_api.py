@@ -39,6 +39,7 @@ from agent.governance.contracts.instructions import resolve_instruction_bundle
 from agent.governance.contracts import write_gate as contract_write_gate
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
+    _contract_completion_satisfying_lines,
     _line_status_allows_contract_completion,
     _mf_parallel_worker_commit_errors,
     _next_action_from_record,
@@ -66938,6 +66939,51 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         if line["line_id"] == "qa_independent_verification"
     )
     assert historical_qa_index == 10
+    projected_only_line = {
+        "stage_id": "historical_context",
+        "line_id": "projected_only_index_shift",
+        "actor_role": "observer",
+        "evidence_kind": "historical_context",
+        "status": "accepted",
+    }
+    shifted_historical_lines = [
+        *historical_record["completed_lines"][:historical_qa_index],
+        projected_only_line,
+        historical_record["completed_lines"][historical_qa_index],
+    ]
+    assert shifted_historical_lines.index(
+        historical_record["completed_lines"][historical_qa_index]
+    ) == 11
+    shifted_satisfying_lines = _contract_completion_satisfying_lines(
+        shifted_historical_lines,
+        source_record=historical_record,
+    )
+    assert any(
+        line is historical_record["completed_lines"][historical_qa_index]
+        for line in shifted_satisfying_lines
+    )
+    assert (
+        _line_status_allows_contract_completion(
+            historical_record["completed_lines"][historical_qa_index],
+            source_record=historical_record,
+            source_line_index=9,
+        )
+        is False
+    )
+    nonstored_legacy_line = json.loads(
+        json.dumps(historical_record["completed_lines"][historical_qa_index])
+    )
+    nonstored_legacy_line["projection_only"] = True
+    nonstored_satisfying_lines = _contract_completion_satisfying_lines(
+        [
+            *historical_record["completed_lines"][:historical_qa_index],
+            nonstored_legacy_line,
+        ],
+        source_record=historical_record,
+    )
+    assert all(
+        line is not nonstored_legacy_line for line in nonstored_satisfying_lines
+    )
     assert (
         _line_status_allows_contract_completion(
             historical_record["completed_lines"][historical_qa_index],

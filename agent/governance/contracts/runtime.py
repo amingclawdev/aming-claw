@@ -1610,7 +1610,7 @@ def _find_direct_fix_qa_line(
         if not _line_status_allows_direct_fix_qa(
             line,
             source_record=record,
-            source_line_index=index,
+            source_line_index=_source_record_completed_line_index(line, record),
         ):
             continue
         explicit_scope_matches = _line_scope_matches_direct_fix_child(
@@ -1825,11 +1825,35 @@ def _contract_completion_satisfying_lines(
         if isinstance(line, Mapping) and not _line_status_allows_contract_completion(
             line,
             source_record=source_record,
-            source_line_index=index,
+            source_line_index=_source_record_completed_line_index(
+                line,
+                source_record,
+            ),
         ):
             continue
         satisfying.append(line)
     return satisfying
+
+
+def _source_record_completed_line_index(
+    line: Mapping[str, Any],
+    source_record: Mapping[str, Any] | None,
+) -> int:
+    """Map a projected line to its unique persisted source member."""
+
+    if not isinstance(source_record, Mapping):
+        return -1
+    stored_lines = source_record.get("completed_lines")
+    if not isinstance(stored_lines, list):
+        return -1
+    persisted_line_indexes = [
+        index
+        for index, stored_line in enumerate(stored_lines)
+        if stored_line is line or stored_line == line
+    ]
+    if len(persisted_line_indexes) != 1:
+        return -1
+    return persisted_line_indexes[0]
 
 
 def _line_id_present(
@@ -1965,7 +1989,10 @@ def _active_failed_qa_line_index(
         if _line_status_allows_contract_completion(
             line,
             source_record=source_record,
-            source_line_index=index,
+            source_line_index=_source_record_completed_line_index(
+                line,
+                source_record,
+            ),
         ):
             return -1
     return failed_index
@@ -2026,7 +2053,10 @@ def _last_failed_qa_line_index(
         if not _line_status_allows_contract_completion(
             line,
             source_record=source_record,
-            source_line_index=index,
+            source_line_index=_source_record_completed_line_index(
+                line,
+                source_record,
+            ),
         ):
             failed_index = index
     return failed_index
@@ -2094,7 +2124,10 @@ def _post_failed_qa_retry_context_keys(
         if not _line_status_allows_contract_completion(
             line,
             source_record=source_record,
-            source_line_index=index,
+            source_line_index=_source_record_completed_line_index(
+                line,
+                source_record,
+            ),
         ):
             continue
         contexts.update(_line_retry_context_keys(line))
@@ -3121,18 +3154,11 @@ def _qa_no_pass_persisted_legacy_source_context(
 
     if not isinstance(source_record, Mapping):
         return False
+    persisted_line_index = _source_record_completed_line_index(line, source_record)
+    if persisted_line_index < 0 or source_line_index != persisted_line_index:
+        return False
     stored_lines = source_record.get("completed_lines")
     if not isinstance(stored_lines, list):
-        return False
-    persisted_line_indexes = [
-        index
-        for index, stored_line in enumerate(stored_lines)
-        if stored_line is line or stored_line == line
-    ]
-    if len(persisted_line_indexes) != 1:
-        return False
-    persisted_line_index = persisted_line_indexes[0]
-    if source_line_index < 0:
         return False
     persisted_identity = (
         str(source_record.get("contract_execution_id") or "").strip(),
