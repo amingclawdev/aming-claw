@@ -75,6 +75,21 @@ assertBacklogAuthority(
   "legacy compact-ledger actions must be labeled advisory when canonical authority is present",
 );
 assertBacklogAuthority(
+  backlogViewSource.includes("BACKLOG_SEARCH_DEBOUNCE_MS = 300")
+    && backlogViewSource.includes("api.backlogSearchFor(projectId")
+    && backlogViewSource.includes("status: statusFilter")
+    && backlogViewSource.includes("priority: priorityFilter")
+    && backlogViewSource.includes("offset: searchOffset"),
+  "backlog lookup must debounce a status/priority/paginated server query",
+);
+assertBacklogAuthority(
+  backlogViewSource.includes('data-server-search-results="backlog"')
+    && backlogViewSource.includes("Server result set.")
+    && backlogViewSource.includes("local facet of the labeled server result set")
+    && backlogViewSource.includes("Next server page"),
+  "backlog lookup must label the server result scope and local facet pagination",
+);
+assertBacklogAuthority(
   playbackPanelSource.includes("Backlog row close authority")
     && playbackPanelSource.includes("partial / continuation required")
     && playbackPanelSource.includes("diagnostic_backlog_id"),

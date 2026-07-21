@@ -4883,6 +4883,37 @@ function ueBlockerUrlAssertions(): string[] {
   assertFixture(initialFallbackSelection === "abc-def", `missing playback_event should fall back to first frame, got '${initialFallbackSelection}'`);
   results.push("direct reload playback_event selects event frame before first-frame fallback");
 
+  // ── Historical server search and stable exact-event deep links ──────────
+  assertFixture(
+    viewSource.includes("PLAYBACK_SEARCH_DEBOUNCE_MS = 300")
+      && viewSource.includes("api.backlogSearchFor(projectId")
+      && viewSource.includes("api.taskTimelineSearchFor(projectId")
+      && viewSource.includes("backlog_status: statusFilter.toUpperCase()")
+      && viewSource.includes("priority: priorityFilter")
+      && viewSource.includes("offset: searchOffset"),
+    "Playback history lookup should debounce bounded server searches with status, priority, and pagination",
+  );
+  assertFixture(
+    viewSource.includes('data-server-search-results="playback"')
+      && viewSource.includes('data-timeline-search-results="public-safe"')
+      && viewSource.includes("Timeline-state filter is a local facet of these server results.")
+      && viewSource.includes("event.deep_link || buildPlaybackUrl(projectId, backlogId, eventId)"),
+    "Playback history should label server/local scope and preserve exact backlog/event deep links",
+  );
+  assertFixture(
+    viewSource.includes("event.blocker_semantics.blocker_ids")
+      && viewSource.includes("event.blocker_semantics.governed_action")
+      && viewSource.includes("event.blocker_semantics.repair_target_id"),
+    "historical blocked matches should name concrete blocker ids and their governed repair target",
+  );
+  assertFixture(
+    viewSource.includes("function NextLegalActionCallout")
+      && viewSource.includes('item.disposition === "BYPASSED"')
+      && viewSource.includes('item.disposition === "WAIVED"'),
+    "server search must preserve Current/Playback next-legal-action callouts and non-PASS bypass semantics",
+  );
+  results.push("historical Playback search is server-scoped, paginated, public-safe, and exact-linkable");
+
   return results;
 }
 

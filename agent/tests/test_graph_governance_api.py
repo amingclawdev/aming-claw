@@ -6214,6 +6214,71 @@ def test_audit_recovery_backlog_close_uses_archive_and_qa_without_mf_worker_gate
     assert exc_info.value.code == "mf_timeline_gate_failed"
 
 
+def test_backlog_list_server_search_supports_status_priority_and_pagination(conn):
+    rows = (
+        ("AC-HISTORICAL-LOOKUP-OPEN", "Historical governance lookup open", "OPEN", "P1", "2026-07-01T00:00:00Z"),
+        ("AC-HISTORICAL-LOOKUP-WIP", "Historical governance lookup active", "IN_PROGRESS", "P1", "2026-07-02T00:00:00Z"),
+        ("AC-HISTORICAL-LOOKUP-CLOSED", "Historical governance lookup closed", "FIXED", "P1", "2026-07-03T00:00:00Z"),
+        ("AC-HISTORICAL-LOOKUP-P2", "Historical governance lookup other priority", "OPEN", "P2", "2026-07-04T00:00:00Z"),
+    )
+    conn.executemany(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [(*row, row[-1]) for row in rows],
+    )
+    conn.commit()
+
+    first = server.handle_backlog_list(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "view": "compact",
+                "q": "historical governance lookup",
+                "status": "OPEN",
+                "priority": "P1",
+                "limit": "1",
+                "offset": "0",
+                "include_closed": "true",
+            },
+        )
+    )
+    second = server.handle_backlog_list(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "view": "compact",
+                "q": "historical governance lookup",
+                "status": "OPEN",
+                "priority": "P1",
+                "limit": "1",
+                "offset": "1",
+                "include_closed": "true",
+            },
+        )
+    )
+
+    assert first["filtered_count"] == 2
+    assert first["has_more"] is True
+    assert first["next_offset"] == 1
+    assert first["scope"] == {
+        "schema_version": "backlog.public_search_scope.v1",
+        "project_id": PID,
+        "status": "OPEN",
+        "priority": "P1",
+        "view": "compact",
+        "public_safe": True,
+        "bounded": True,
+    }
+    assert first["bugs"][0]["bug_id"] == "AC-HISTORICAL-LOOKUP-WIP"
+    assert second["bugs"][0]["bug_id"] == "AC-HISTORICAL-LOOKUP-OPEN"
+    assert second["has_more"] is False
+    assert second["bugs"][0]["deep_link"] == (
+        "/dashboard?project_id=graph-api-test&view=backlog"
+        "&backlog=AC-HISTORICAL-LOOKUP-OPEN"
+    )
+
+
 def test_backlog_list_compact_includes_observer_command_terminal_projection(conn):
     observer_session.ensure_schema(conn)
     backlog_id = "AC-OBSERVER-COMMAND-TERMINAL-PROJECTION-FROM-CONTRACT-20260604"

@@ -17,7 +17,7 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, quote, unquote
+from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -81688,6 +81688,7 @@ def handle_task_timeline_append(ctx: RequestContext):
 def handle_task_timeline_list(ctx: RequestContext):
     """List append-only task implementation timeline events by query filters."""
     project_id = ctx.get_project_id()
+    search = _first_query_value(ctx.query, "q").strip()
     task_id = _first_query_value(ctx.query, "task_id")
     backlog_id = _first_query_value(ctx.query, "backlog_id")
     trace_id = _first_query_value(ctx.query, "trace_id")
@@ -81709,6 +81710,17 @@ def handle_task_timeline_list(ctx: RequestContext):
         limit = int(_first_query_value(ctx.query, "limit", "200") or "200")
     except (TypeError, ValueError):
         limit = 200
+    try:
+        offset = max(0, int(_first_query_value(ctx.query, "offset", "0") or "0"))
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        scan_limit = int(
+            _first_query_value(ctx.query, "scan_limit", "5000")
+            or "5000"
+        )
+    except (TypeError, ValueError):
+        scan_limit = 5000
     filtered_request = any(
         [
             task_id,
@@ -81727,6 +81739,24 @@ def handle_task_timeline_list(ctx: RequestContext):
     from . import task_timeline
 
     with DBContext(project_id) as conn:
+        if search:
+            return task_timeline.search_public_events(
+                conn,
+                project_id,
+                q=search,
+                task_id=task_id,
+                backlog_id=backlog_id,
+                phase=phase,
+                event_kind=event_kind,
+                status=_first_query_value(ctx.query, "status"),
+                backlog_status=_first_query_value(ctx.query, "backlog_status"),
+                priority=_first_query_value(ctx.query, "priority"),
+                actor=_first_query_value(ctx.query, "actor"),
+                commit_sha=_first_query_value(ctx.query, "commit_sha"),
+                limit=limit,
+                offset=offset,
+                scan_limit=scan_limit,
+            )
         events = task_timeline.list_events(
             conn,
             project_id,
@@ -87079,10 +87109,19 @@ def _append_backlog_filters(sql: str, params: list[Any], ctx: RequestContext) ->
     status_filter = _first_query_value(ctx.query, "status")
     priority_filter = _first_query_value(ctx.query, "priority")
     search = _first_query_value(ctx.query, "q").strip()
-    if status_filter:
-        sql += " AND status = ?"
-        params.append(status_filter)
-    if priority_filter:
+    normalized_status = status_filter.strip().upper()
+    if normalized_status == "OPEN":
+        placeholders = ",".join("?" for _ in _BACKLOG_CLOSED_STATUSES)
+        sql += f" AND UPPER(status) NOT IN ({placeholders})"
+        params.extend(_BACKLOG_CLOSED_STATUSES)
+    elif normalized_status == "CLOSED":
+        placeholders = ",".join("?" for _ in _BACKLOG_CLOSED_STATUSES)
+        sql += f" AND UPPER(status) IN ({placeholders})"
+        params.extend(_BACKLOG_CLOSED_STATUSES)
+    elif normalized_status and normalized_status != "ALL":
+        sql += " AND UPPER(status) = ?"
+        params.append(normalized_status)
+    if priority_filter and priority_filter.strip().upper() != "ALL":
         sql += " AND priority = ?"
         params.append(priority_filter)
     if _query_has_key(ctx.query, "include_closed") and not _query_bool(ctx.query, "include_closed", True):
@@ -87145,6 +87184,15 @@ def handle_backlog_list(ctx: RequestContext):
             _backlog_compact_bug(r) if view == "compact" else _backlog_full_bug(r)
             for r in rows
         ]
+        for bug in bugs:
+            bug_id = str(bug.get("bug_id") or "")
+            bug["deep_link"] = "/dashboard?" + urlencode(
+                {
+                    "project_id": pid,
+                    "view": "backlog",
+                    "backlog": bug_id,
+                }
+            )
         _attach_observer_command_projections(conn, pid, bugs)
         total_count = int(conn.execute("SELECT COUNT(*) AS count FROM backlog_bugs").fetchone()["count"] or 0)
         next_offset = offset + len(bugs)
@@ -87160,6 +87208,16 @@ def handle_backlog_list(ctx: RequestContext):
             "has_more": has_more,
             "next_offset": next_offset if has_more else None,
             "truncated": has_more,
+            "q": _first_query_value(query, "q").strip(),
+            "scope": {
+                "schema_version": "backlog.public_search_scope.v1",
+                "project_id": pid,
+                "status": _first_query_value(query, "status").strip(),
+                "priority": _first_query_value(query, "priority").strip(),
+                "view": view,
+                "public_safe": True,
+                "bounded": limit is not None,
+            },
             "summary": _backlog_summary(conn),
         }
         return result
