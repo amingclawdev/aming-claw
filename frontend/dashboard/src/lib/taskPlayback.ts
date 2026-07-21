@@ -5074,6 +5074,10 @@ export interface ActivityEventCard {
   evidence_count: number;
   /** Evidence kind types present (deduplicated). */
   evidence_types: string[];
+  /** Public-safe historical action surfaced as advisory context. */
+  next_legal_action: string;
+  /** Historical disposition; intentionally never PASS/AUTHORITATIVE. */
+  next_legal_action_disposition: Exclude<TaskPlaybackNextLegalActionDisposition, "AUTHORITATIVE">;
 }
 
 /**
@@ -5114,6 +5118,50 @@ export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard 
     "verification.task_id",
     "artifact_refs.task_id",
   ])?.value ?? "";
+  const next_legal_action = firstPublicValueAtPaths(publicEvent, [
+    "next_legal_action.action",
+    "payload.next_legal_action.action",
+    "verification.next_legal_action.action",
+    "artifact_refs.next_legal_action.action",
+    "next_legal_action.id",
+    "payload.next_legal_action.id",
+    "verification.next_legal_action.id",
+    "artifact_refs.next_legal_action.id",
+    "next_legal_action.description",
+    "payload.next_legal_action.description",
+    "verification.next_legal_action.description",
+    "artifact_refs.next_legal_action.description",
+    "next_legal_action",
+    "payload.next_legal_action",
+    "verification.next_legal_action",
+    "artifact_refs.next_legal_action",
+  ])?.value ?? "";
+  const nextActionState = publicValuesAtPaths(publicEvent, [
+    "next_legal_action.status",
+    "next_legal_action.disposition",
+    "next_legal_action.decision",
+    "next_legal_action.block_reason",
+    "payload.next_legal_action.status",
+    "payload.next_legal_action.disposition",
+    "payload.next_legal_action.decision",
+    "payload.next_legal_action.block_reason",
+    "verification.next_legal_action.status",
+    "verification.next_legal_action.disposition",
+    "verification.next_legal_action.decision",
+    "verification.next_legal_action.block_reason",
+  ]).map((item) => item.value).join(" ").toLowerCase();
+  const eventState = [status, publicEvent.decision, event_kind, event_type]
+    .map((value) => String(value ?? "").toLowerCase())
+    .join(" ");
+  const dispositionText = `${nextActionState} ${eventState}`;
+  const next_legal_action_disposition: ActivityEventCard["next_legal_action_disposition"] =
+    dispositionText.includes("waiv")
+      ? "WAIVED"
+      : dispositionText.includes("bypass")
+        ? "BYPASSED"
+        : /block|fail|reject|missing|error/.test(dispositionText)
+          ? "BLOCKED"
+          : "ADVISORY";
   // Build a headline from the semantic projection helper; fall back to compact
   // event_kind / status text when the projection is unavailable.
   let headline = "";
@@ -5152,7 +5200,21 @@ export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard 
       if (!seen.has(ref.kind)) { seen.add(ref.kind); evidence_types.push(ref.kind); }
     }
   } catch { /* no-op */ }
-  return { id, at, event_kind, event_type, status, actor, backlog_id, task_id, headline, evidence_count, evidence_types };
+  return {
+    id,
+    at,
+    event_kind,
+    event_type,
+    status,
+    actor,
+    backlog_id,
+    task_id,
+    headline,
+    evidence_count,
+    evidence_types,
+    next_legal_action,
+    next_legal_action_disposition,
+  };
 }
 
 /**

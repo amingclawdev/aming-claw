@@ -1168,6 +1168,75 @@ function verifyBacklogEvidenceContract() {
   ok("backlog evidence row exposes timeline gate, contract, modal DAG, and inspector");
 }
 
+function verifyActivityPlaybackViewportWarmCacheContract() {
+  phase("activity/playback viewport and warm-cache contract");
+  const playbackSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/taskPlayback.ts"), "utf8");
+  const playbackTestSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/taskPlayback.test.ts"), "utf8");
+  const playbackViewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/TaskPlaybackView.tsx"), "utf8");
+  const cssSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/styles.css"), "utf8");
+  const serverSource = readFileSync(path.join(REPO_ROOT, "agent/governance/server.py"), "utf8");
+  const timelineTestSource = readFileSync(path.join(REPO_ROOT, "agent/tests/test_task_timeline.py"), "utf8");
+  const packagedIndexSource = readFileSync(path.join(REPO_ROOT, "agent/governance/dashboard_dist/index.html"), "utf8");
+  const packagedCssSource = readFileSync(path.join(REPO_ROOT, "agent/governance/dashboard_dist/assets/index-DTkNP_Kn.css"), "utf8");
+
+  assert(
+    playbackSource.includes("next_legal_action_disposition")
+      && playbackViewSource.includes("activity-event-card-next-action")
+      && playbackViewSource.includes('data-next-legal-action-authority="advisory"'),
+    "Activity event cards should expose public-safe next actions as explicit historical advisories",
+  );
+  assert(
+    playbackViewSource.includes('<details className="task-playback-compatibility-details"')
+      && playbackViewSource.includes('className="task-playback-next-action-callout"'),
+    "Playback should keep compatibility diagnostics collapsible and identify the prominent next-action surface",
+  );
+  assert(
+    /\.task-playback-main\s*\{[\s\S]*?overflow-y:\s*auto;[\s\S]*?scrollbar-gutter:\s*stable;/.test(cssSource)
+      && cssSource.includes(".task-playback-main > .task-playback-next-action-callout")
+      && cssSource.includes("position: sticky;"),
+    "Laptop and desktop Playback should provide vertical right-column access while keeping next action prominent",
+  );
+  assert(
+    /@media \(min-width: 981px\)[\s\S]*?\.task-playback-main > \.task-playback-panel \{[\s\S]*?height:\s*auto;[\s\S]*?min-height:\s*max-content;[\s\S]*?overflow:\s*visible;/.test(cssSource)
+      && /\.task-playback-main > \.task-playback-panel \.task-playback-body \{[\s\S]*?flex:\s*0 0 clamp\(300px, 42vh, 520px\);[\s\S]*?min-height:\s*300px;/.test(cssSource)
+      && /\.task-playback-frame-list \{[\s\S]*?overflow-y:\s*auto;/.test(cssSource)
+      && /\.task-playback-detail-column \{[\s\S]*?overflow-y:\s*auto;/.test(cssSource),
+    "Desktop Playback panel must expand the outer scroll range while reserving nonzero independently scrollable frame and inspector columns",
+  );
+  assert(
+    packagedIndexSource.includes("/dashboard/assets/index-CxdqAXM1.js?v=JMCch3sD")
+      && packagedIndexSource.includes("/dashboard/assets/index-DTkNP_Kn.css?v=Lagx07Hp")
+      && !packagedIndexSource.includes("/dashboard/assets/index-JMCch3sD.js")
+      && !packagedIndexSource.includes("/dashboard/assets/index-Lagx07Hp.css")
+      && packagedCssSource.includes("min-height:max-content")
+      && packagedCssSource.includes("flex:0 0 clamp(300px,42vh,520px)"),
+    "Compatibility packaging should cache-bust authorized asset paths while serving the non-collapsing viewport CSS bytes",
+  );
+  assert(
+    serverSource.includes('endpoint="timeline_list"')
+      && serverSource.includes('endpoint="timeline_recent"')
+      && serverSource.includes('endpoint="timeline_get"')
+      && serverSource.includes('endpoint="backlog_current_task"')
+      && serverSource.includes('"storage": "process_memory"'),
+    "Timeline list/recent/get/current slow paths should share the in-process warm cache",
+  );
+  assert(
+    serverSource.includes("_TIMELINE_WARM_CACHE_MAX_ENTRIES")
+      && serverSource.includes("_TIMELINE_WARM_CACHE_TTL_SECONDS")
+      && serverSource.includes('"freshness_watermark"')
+      && serverSource.includes('"age_ms"'),
+    "Warm cache should be bounded, expiring, freshness-aware, and observable",
+  );
+  assert(
+    playbackTestSource.includes("bypassed, waived, and blocked dispositions never render PASS")
+      && playbackTestSource.includes("sticky action, collapsible diagnostics, and vertical right-column access")
+      && timelineTestSource.includes("test_timeline_slow_paths_use_bounded_fresh_warm_cache")
+      && timelineTestSource.includes('"freshness_changed"'),
+    "Focused fixtures should guard action disposition, viewport access, query identity, and new-event invalidation",
+  );
+  ok("Activity/Playback actions, non-collapsing viewport access, and bounded warm-cache contract are covered");
+}
+
 function verifyTypedDagContract() {
   phase("public-safe typed DAG contract");
   const apiSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/api.ts"), "utf8");
@@ -1196,6 +1265,8 @@ async function main() {
         verifySimpleModeRequestFirstDesktopContract();
       } else if (ONLY === "runtime-guide-docs") {
         verifyRuntimeGuideDocsContract();
+      } else if (ONLY === "activity-playback-warm-cache") {
+        verifyActivityPlaybackViewportWarmCacheContract();
       } else if (
         ONLY === "ordinary-user-entry-desktop" ||
         ONLY === "engineer-homepage-entry-desktop" ||

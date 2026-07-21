@@ -3406,6 +3406,7 @@ function taskPlaybackProjectEventToCardAssertions(): string[] {
   assertIa(typeof card.headline === "string" && card.headline.length > 0, `card.headline should be non-empty string`);
   assertIa(typeof card.evidence_count === "number", `card.evidence_count should be a number`);
   assertIa(Array.isArray(card.evidence_types), `card.evidence_types should be an array`);
+  assertIa(card.next_legal_action === "", "event without a public action should not render a placeholder");
 
   // String id coercion: id field as string
   const strEvent: TaskTimelineEvent = { ...event, id: "str-id-9002" as unknown as number };
@@ -3435,6 +3436,53 @@ function taskPlaybackProjectEventToCardAssertions(): string[] {
     `payload backlog_id fallback, got ${payloadBacklogCard.backlog_id}`,
   );
 
+  const advisoryCard = projectEventToCard({
+    ...event,
+    id: 9003,
+    payload: { next_legal_action: { action: "Run focused verification", status: "recorded" } },
+  });
+  assertIa(advisoryCard.next_legal_action === "Run focused verification", "public action should project onto the event card");
+  assertIa(advisoryCard.next_legal_action_disposition === "ADVISORY", "ordinary historical action should remain advisory");
+
+  const dispositionCases = [
+    ["bypassed", "BYPASSED"],
+    ["waived", "WAIVED"],
+    ["blocked", "BLOCKED"],
+  ] as const;
+  for (const [state, expected] of dispositionCases) {
+    const dispositionCard = projectEventToCard({
+      ...event,
+      id: `action-${state}` as unknown as number,
+      status: state,
+      payload: { next_legal_action: { action: `Repair ${state} evidence`, status: state } },
+    });
+    assertIa(dispositionCard.next_legal_action_disposition === expected, `${state} action should render as ${expected}`);
+    assertIa(dispositionCard.next_legal_action_disposition !== ("PASS" as typeof expected), `${state} action must never render PASS`);
+  }
+
+  const activityViewSource = readFileSync(new URL("../views/TaskPlaybackView.tsx", import.meta.url), "utf8");
+  const activityStylesSource = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+  assertIa(
+    activityViewSource.includes("card.next_legal_action ?")
+      && activityViewSource.includes("activity-event-card-next-action")
+      && activityViewSource.includes('data-next-legal-action-authority="advisory"'),
+    "Current event cards should render only non-empty actions with explicit advisory authority",
+  );
+  assertIa(
+    activityViewSource.includes('<details className="task-playback-compatibility-details"')
+      && activityStylesSource.includes(".task-playback-main > .task-playback-next-action-callout")
+      && activityStylesSource.includes("overflow-y: auto;")
+      && activityStylesSource.includes("position: sticky;"),
+    "Playback should keep the action prominent, collapse compatibility diagnostics, and make the right column vertically accessible",
+  );
+  assertIa(
+    /@media \(min-width: 981px\)[\s\S]*?\.task-playback-main > \.task-playback-panel \{[\s\S]*?height:\s*auto;[\s\S]*?min-height:\s*max-content;[\s\S]*?overflow:\s*visible;/.test(activityStylesSource)
+      && /\.task-playback-main > \.task-playback-panel \.task-playback-body \{[\s\S]*?flex:\s*0 0 clamp\(300px, 42vh, 520px\);[\s\S]*?min-height:\s*300px;/.test(activityStylesSource)
+      && /\.task-playback-frame-list \{[\s\S]*?overflow-y:\s*auto;/.test(activityStylesSource)
+      && /\.task-playback-detail-column \{[\s\S]*?overflow-y:\s*auto;/.test(activityStylesSource),
+    "Desktop Playback should reserve a nonzero body viewport while the outer panel and both inner columns remain scroll-reachable",
+  );
+
   return [
     "projectEventToCard: id field projected correctly (number)",
     "projectEventToCard: id field projected correctly (string coercion)",
@@ -3444,6 +3492,10 @@ function taskPlaybackProjectEventToCardAssertions(): string[] {
     "projectEventToCard: evidence_count is number, evidence_types is array",
     "projectEventToCard: minimal event: graceful fallback for all fields",
     "projectEventToCard: payload backlog_id fallback keeps linked card affordance",
+    "projectEventToCard: public next action renders only when present and remains advisory",
+    "projectEventToCard: bypassed, waived, and blocked dispositions never render PASS",
+    "Playback viewport: sticky action, collapsible diagnostics, and vertical right-column access",
+    "Playback viewport: nonzero desktop body plus independent frame/detail scrolling",
   ];
 }
 

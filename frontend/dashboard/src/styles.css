@@ -3337,9 +3337,48 @@ a:hover { text-decoration: underline; }
   gap: 8px;
   /* Right column: independently bounded so controls stay above the list and
      the list/detail pane scrolls inside the viewport. */
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   height: 100%;
   min-height: 0;
+}
+
+.task-playback-main > .task-playback-next-action-callout {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+}
+
+.task-playback-compatibility-details {
+  border: 1px solid var(--ink-200);
+  border-radius: 6px;
+  background: var(--ink-50);
+}
+
+.task-playback-compatibility-details > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  color: var(--ink-600);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.task-playback-compatibility-details > summary span {
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--ink-200);
+  color: var(--ink-700);
+  text-align: center;
+}
+
+.task-playback-compatibility-details > .task-playback-chip-section {
+  margin: 0 8px 8px;
 }
 
 .task-playback-event-column {
@@ -3456,6 +3495,37 @@ a:hover { text-decoration: underline; }
 .task-playback-panel.close-gate-expanded .task-playback-body {
   flex-basis: 320px;
   min-height: 260px;
+}
+
+/* Desktop playback has two nested scroll responsibilities:
+   - .task-playback-main scrolls the complete right-hand surface (controls,
+     sticky next action, compatibility details, and the playback panel), and
+   - the frame list and selected-event detail scroll independently inside a
+     body that always has usable viewport-relative height.
+
+   Keeping the direct child panel at height: 100% made its flex body absorb
+   all shrink pressure from the authority/snapshot/summary sections. At real
+   laptop and desktop viewport heights the body could therefore collapse to
+   zero while the panel hid the remaining content from the outer scroller.
+   Let the panel contribute its natural height to the outer scroll range and
+   reserve a bounded body viewport for both inner columns. */
+@media (min-width: 981px) {
+  .task-playback-main > .task-playback-panel {
+    flex: 0 0 auto;
+    height: auto;
+    min-height: max-content;
+    overflow: visible;
+  }
+
+  .task-playback-main > .task-playback-panel.close-gate-expanded {
+    overflow: visible;
+  }
+
+  .task-playback-main > .task-playback-panel .task-playback-body {
+    flex: 0 0 clamp(300px, 42vh, 520px);
+    height: clamp(300px, 42vh, 520px);
+    min-height: 300px;
+  }
 }
 
 .task-playback-eyebrow {
@@ -9922,6 +9992,39 @@ svg.graph-svg path.ghit:hover {
   padding: 0 4px;
   font-size: 10px;
   color: var(--ink-500, #64748b);
+}
+
+.activity-event-card-next-action {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--amber, #d97706);
+  border-left-width: 4px;
+  border-radius: 6px;
+  background: var(--amber-bg, #fffbeb);
+  color: var(--amber-fg, #92400e);
+}
+
+.activity-event-card-next-action > strong,
+.activity-event-card-next-action > b {
+  font-size: 11px;
+  letter-spacing: .02em;
+}
+
+.activity-event-card-next-action > span {
+  grid-column: 1 / -1;
+  color: var(--ink-900, #0f172a);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.activity-event-card-next-action--blocked {
+  border-color: var(--red, #dc2626);
+  background: var(--red-bg, #fef2f2);
+  color: var(--red-fg, #991b1b);
 }
 
 /* ── Pager (IA item A — 10 cards/page) ─────────────────────────────────── */
