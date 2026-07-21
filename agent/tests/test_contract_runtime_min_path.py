@@ -532,6 +532,33 @@ def _write_from(record, *, actor_role, stage_id, line_id, evidence_kind=None):
     }
 
 
+def _start_completed_chain_projection_root(
+    runtime: ContractRuntime,
+    *,
+    backlog_id: str,
+    contract_execution_id: str,
+) -> dict:
+    root = runtime.start_execution(
+        "mf_parallel.v1",
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        actor_role="observer",
+    )
+    completed = runtime.submit_line_write(
+        contract_execution_id,
+        _write_from(
+            root,
+            actor_role="observer",
+            stage_id="observer_prefill",
+            line_id="observer_prefill_child_contracts",
+        ),
+        actor_role="observer",
+    )
+    assert completed["ok"] is True
+    return completed["record"]
+
+
 def _direct_fix_graph_payload(
     *,
     actor_role: str,
@@ -1670,6 +1697,164 @@ def test_contract_chain_mapping_schema_idempotent_and_rebuilds_projection(tmp_pa
     assert conn.execute("SELECT COUNT(*) FROM contract_chain_edges").fetchone()[0] == (
         edge_count + 1
     )
+
+
+def test_completed_recovery_supersedes_only_named_stale_predecessor(tmp_path):
+    _write_chain_projection_contracts(tmp_path)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    backlog_id = "AC-CHAIN-COMPLETED-RECOVERY-CURRENT"
+    root = _start_completed_chain_projection_root(
+        runtime,
+        backlog_id=backlog_id,
+        contract_execution_id="cex-a-recovery-root",
+    )
+    stale = runtime.start_execution(
+        "mf_parallel.v1",
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        contract_execution_id="cex-b-stale-predecessor",
+        actor_role="observer",
+        parent_contract_execution_id=root["contract_execution_id"],
+        root_contract_execution_id=root["root_contract_execution_id"],
+        contract_chain_id=root["contract_chain_id"],
+    )
+    recovery = runtime.start_execution(
+        "mf_parallel.v1",
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        contract_execution_id="cex-z-completed-recovery",
+        actor_role="observer",
+        parent_contract_execution_id=root["contract_execution_id"],
+        root_contract_execution_id=root["root_contract_execution_id"],
+        contract_chain_id=root["contract_chain_id"],
+        metadata={
+            "recovery_policy": "start_new_execution",
+            "stale_contract_execution_id": stale["contract_execution_id"],
+        },
+    )
+    completed_recovery = runtime.submit_line_write(
+        recovery["contract_execution_id"],
+        _write_from(
+            recovery,
+            actor_role="observer",
+            stage_id="observer_prefill",
+            line_id="observer_prefill_child_contracts",
+        ),
+        actor_role="observer",
+    )
+    assert completed_recovery["ok"] is True
+
+    current = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+    )
+
+    assert current["current_contract_execution_id"] == recovery[
+        "contract_execution_id"
+    ]
+    assert current["readiness_state"] == "contract_complete"
+    assert current["next_legal_action"] == {}
+    assert set(current["active_chain"]["execution_ids"]) == {
+        root["contract_execution_id"],
+        stale["contract_execution_id"],
+        recovery["contract_execution_id"],
+    }
+    assert any(
+        ref.startswith(
+            f"contract_runtime:{stale['contract_execution_id']}:revision:"
+        )
+        for ref in current["source_refs"]
+    )
+    assert runtime.store.get(stale["contract_execution_id"])["runtime_guide"][
+        "next_legal_action"
+    ] is not None
+
+    unrelated = runtime.start_execution(
+        "mf_parallel.v1",
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        contract_execution_id="cex-zz-unrelated-incomplete",
+        actor_role="observer",
+        parent_contract_execution_id=root["contract_execution_id"],
+        root_contract_execution_id=root["root_contract_execution_id"],
+        contract_chain_id=root["contract_chain_id"],
+    )
+    current_with_unrelated = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+    )
+    assert current_with_unrelated["current_contract_execution_id"] == unrelated[
+        "contract_execution_id"
+    ]
+    assert current_with_unrelated["readiness_state"] == "contract_active"
+
+
+def test_incomplete_recovery_remains_current_and_fail_closed(tmp_path):
+    _write_chain_projection_contracts(tmp_path)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    backlog_id = "AC-CHAIN-INCOMPLETE-RECOVERY-CURRENT"
+    root = _start_completed_chain_projection_root(
+        runtime,
+        backlog_id=backlog_id,
+        contract_execution_id="cex-a-incomplete-recovery-root",
+    )
+    stale = runtime.start_execution(
+        "mf_parallel.v1",
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        contract_execution_id="cex-b-incomplete-stale",
+        actor_role="observer",
+        parent_contract_execution_id=root["contract_execution_id"],
+        root_contract_execution_id=root["root_contract_execution_id"],
+        contract_chain_id=root["contract_chain_id"],
+    )
+    recovery = runtime.start_execution(
+        "mf_parallel.v1",
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        contract_execution_id="cex-z-incomplete-recovery",
+        actor_role="observer",
+        parent_contract_execution_id=root["contract_execution_id"],
+        root_contract_execution_id=root["root_contract_execution_id"],
+        contract_chain_id=root["contract_chain_id"],
+        backlog_lineage={
+            "recovery_policy": "start_new_execution",
+            "stale_contract_execution_id": stale["contract_execution_id"],
+        },
+    )
+
+    current = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+    )
+
+    assert current["current_contract_execution_id"] == recovery[
+        "contract_execution_id"
+    ]
+    assert current["readiness_state"] == "contract_active"
+    assert current["next_legal_action"]["line_id"] == (
+        "observer_prefill_child_contracts"
+    )
+    assert set(current["active_chain"]["execution_ids"]) == {
+        root["contract_execution_id"],
+        stale["contract_execution_id"],
+        recovery["contract_execution_id"],
+    }
 
 
 def test_direct_fix_qa_without_explicit_binding_counts_after_repair(tmp_path):
