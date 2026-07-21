@@ -4013,6 +4013,54 @@ def _current_full_direct_main_route_fixture(
     return execution_id, observer_session_id
 
 
+def _current_full_parallel_route_without_merge_authority_fixture(
+    conn,
+    *,
+    backlog_id: str,
+    task_id: str,
+    runtime_context_id: str,
+    merge_queue_id: str,
+    head_commit: str,
+    observer_session_id: str,
+    route_token_ref: str,
+) -> str:
+    _insert_active_observer_session_ref(
+        conn,
+        session_id=observer_session_id,
+    )
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=backlog_id,
+            parent_task_id=f"cex-{task_id}",
+            branch_ref=f"refs/heads/codex/{task_id}",
+            status=STATE_VALIDATED,
+            target_head_commit=head_commit,
+            merge_queue_id=merge_queue_id,
+        ),
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id=f"crev-{task_id}",
+        contract_version=server.MF_PARALLEL_CONTRACT_ID,
+        payload={"contract_id": server.MF_PARALLEL_RECORD_CONTRACT_ID},
+        actor="observer",
+    )
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["graph_current_full_reconcile"],
+    )
+    conn.commit()
+    return observer_session_id
+
+
 def test_current_full_reconcile_atomic_finalization_rolls_back_activation_and_timeline(
     conn,
     monkeypatch,
@@ -4220,6 +4268,106 @@ def test_current_full_reconcile_same_run_id_returns_terminal_without_duplicate_e
     assert third["error"] == "reconcile_terminal_timeline_missing"
     assert third["fail_closed"] is True
     assert len(calls) == 1
+
+
+def test_current_full_reconcile_parallel_route_without_merge_authority_is_idempotent(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-PARALLEL-NO-MERGE-AUTHORITY"
+    task_id = "worker-current-full-parallel-no-merge-authority"
+    runtime_context_id = "mfrctx-current-full-parallel-no-merge-authority"
+    merge_queue_id = "mq-current-full-parallel-no-merge-authority"
+    route_token_ref = "rtok-current-full-parallel-no-merge-authority"
+    observer_session_id = _current_full_parallel_route_without_merge_authority_fixture(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        runtime_context_id=runtime_context_id,
+        merge_queue_id=merge_queue_id,
+        head_commit=head,
+        observer_session_id="obs-current-full-parallel-no-merge-authority",
+        route_token_ref=route_token_ref,
+    )
+    assert server._current_full_reconcile_runtime_successor_contract_kind(
+        conn,
+        project_id=PID,
+        context=get_branch_context(conn, PID, task_id),
+    ) == "mf_parallel"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'contract_runtime_executions'"
+    ).fetchone()[0] == 0
+    body = {
+        "target_commit_sha": head,
+        "activate": True,
+        "semantic_enrich": False,
+        "run_id": "current-full-parallel-no-merge-authority-run",
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "runtime_context_id": runtime_context_id,
+        "merge_queue_id": merge_queue_id,
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": route_token_ref,
+    }
+
+    first_status, first = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    first_event_count = len(
+        [
+            event
+            for event in task_timeline.list_events(
+                conn,
+                PID,
+                task_id=task_id,
+                backlog_id=backlog_id,
+            )
+            if event.get("event_kind") == "reconcile"
+        ]
+    )
+    first_provenance_count = conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance "
+        "WHERE project_id = ? AND target_commit_sha = ?",
+        (PID, head),
+    ).fetchone()[0]
+
+    second_status, second = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    assert first_status == 201
+    assert first["activated"] is True
+    assert first["active_graph_commit"] == head
+    runtime_scope = first["current_full_reconcile_runtime_context_scope"]
+    assert runtime_scope["runtime_context_id"] == runtime_context_id
+    assert runtime_scope["merge_queue_id"] == merge_queue_id
+    assert "contract_merge_authority" not in runtime_scope
+    assert second_status == 200
+    assert second["idempotent_replay"] is True
+    assert second["rebuild_skipped"] is True
+    assert second["snapshot_id"] == first["snapshot_id"]
+    assert len(calls) == 1
+    assert first_event_count == 1
+    assert len(
+        [
+            event
+            for event in task_timeline.list_events(
+                conn,
+                PID,
+                task_id=task_id,
+                backlog_id=backlog_id,
+            )
+            if event.get("event_kind") == "reconcile"
+        ]
+    ) == first_event_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance "
+        "WHERE project_id = ? AND target_commit_sha = ?",
+        (PID, head),
+    ).fetchone()[0] == first_provenance_count == 1
 
 
 def test_current_full_reconcile_reuses_generated_snapshot_id_for_metric_lifecycle(
@@ -40919,6 +41067,37 @@ def _mf_parallel_close_authority_v2_record(
     return record
 
 
+def test_mf_parallel_close_authority_still_requires_reconcile_evidence():
+    close_commit = "9" * 40
+    worker_commit = "8" * 40
+    contract_execution_id = "cex-mf-parallel-missing-reconcile-evidence"
+    record = _mf_parallel_close_authority_v2_record(
+        contract_execution_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=True,
+    )
+    record["completed_lines"] = [
+        line
+        for line in record["completed_lines"]
+        if line["line_id"] != "observer_reconcile"
+    ]
+    record["runtime_guide"]["completed_lines"] = record["completed_lines"]
+
+    gate = server._contract_runtime_mf_parallel_close_authority_gate(
+        [record],
+        chain_projection=_mf_parallel_close_authority_chain_projection(
+            contract_execution_id
+        ),
+        close_commit=close_commit,
+    )
+
+    assert gate["passed"] is False
+    assert "contract_runtime.observer_reconcile" in gate[
+        "missing_requirement_ids"
+    ]
+
+
 def _insert_non_mf_backlog(conn, backlog_id: str) -> None:
     conn.execute(
         """INSERT INTO backlog_bugs
@@ -61302,36 +61481,28 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     assert route_bound_scope["contract_merge_authority"][
         "merged_commit_sha"
     ] == merged_commit
-    with pytest.raises(GovernanceError) as wrong_commit:
-        server._current_full_reconcile_runtime_context_scope(
-            conn,
-            project_id=project_id,
-            body={
+    current_commit_scope = server._current_full_reconcile_runtime_context_scope(
+        conn,
+        project_id=project_id,
+        body={
+            "backlog_id": context.backlog_id,
+            "task_id": task_id,
+        },
+        auth={
+            "role_source": "observer_session_route_token_ref",
+            "route_token_scope": {
+                "project_id": project_id,
                 "backlog_id": context.backlog_id,
                 "task_id": task_id,
             },
-            auth={
-                "role_source": "observer_session_route_token_ref",
-                "route_token_scope": {
-                    "project_id": project_id,
-                    "backlog_id": context.backlog_id,
-                    "task_id": task_id,
-                },
-                "route_token_allowed_actions": [
-                    "graph_current_full_reconcile"
-                ],
-            },
-            target_commit_sha="f" * 40,
-        )
-    assert wrong_commit.value.code == (
-        "current_full_reconcile_contract_merge_authority_required"
+            "route_token_allowed_actions": [
+                "graph_current_full_reconcile"
+            ],
+        },
+        target_commit_sha="f" * 40,
     )
-    assert wrong_commit.value.details["fail_closed"] is True
-    recovery = wrong_commit.value.details["copy_safe_recovery"]
-    assert recovery["mcp_tool"] == "parallel_branch_merge_queue_materialize"
-    assert recovery["no_pass_claim"] is True
-    assert recovery["authoritative_pass_synthesized"] is False
-    assert "fence_token" in recovery["forbidden_fields"]
+    assert current_commit_scope["runtime_context_id"] == runtime_context_id
+    assert "contract_merge_authority" not in current_commit_scope
 
     candidate_scope = server._current_full_reconcile_runtime_context_scope(
         conn,
@@ -62540,7 +62711,7 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
         (project_id, merge_queue_id, queue_item_id),
     )
     conn.commit()
-    with pytest.raises(GovernanceError) as missing_durable_recovery_marker:
+    missing_durable_recovery_marker = (
         server._current_full_reconcile_runtime_context_scope(
             conn,
             project_id=project_id,
@@ -62558,9 +62729,8 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
             },
             target_commit_sha=merged_commit,
         )
-    assert missing_durable_recovery_marker.value.code == (
-        "current_full_reconcile_contract_merge_authority_required"
     )
+    assert "contract_merge_authority" not in missing_durable_recovery_marker
     conn.execute(
         """
         UPDATE parallel_branch_merge_queue_items
@@ -62644,54 +62814,48 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
     ]
     assert repaired_authority["repair_descendant_verified"] is True
     repair_git["files"] = "README.md"
-    with pytest.raises(GovernanceError) as out_of_scope_repair:
-        server._current_full_reconcile_runtime_context_scope(
-            conn,
-            project_id=project_id,
-            body={"backlog_id": backlog_id, "task_id": task_id},
-            auth={
-                "role_source": "observer_session_route_token_ref",
-                "route_token_scope": {
-                    "project_id": project_id,
-                    "backlog_id": backlog_id,
-                    "task_id": task_id,
-                },
-                "route_token_allowed_actions": [
-                    "graph_current_full_reconcile"
-                ],
+    out_of_scope_repair = server._current_full_reconcile_runtime_context_scope(
+        conn,
+        project_id=project_id,
+        body={"backlog_id": backlog_id, "task_id": task_id},
+        auth={
+            "role_source": "observer_session_route_token_ref",
+            "route_token_scope": {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
             },
-            target_commit_sha=repair_commit,
-        )
-    assert out_of_scope_repair.value.code == (
-        "current_full_reconcile_contract_merge_authority_required"
+            "route_token_allowed_actions": [
+                "graph_current_full_reconcile"
+            ],
+        },
+        target_commit_sha=repair_commit,
     )
+    assert "contract_merge_authority" not in out_of_scope_repair
     repair_git["files"] = "agent/governance/server.py"
     repair_git["body"] = (
         "system repair\n\n"
         "Chain-Source-Task: forged-cex\n"
         f"Chain-Bug-Id: {diagnostic_id}\n"
     )
-    with pytest.raises(GovernanceError) as wrong_repair_source:
-        server._current_full_reconcile_runtime_context_scope(
-            conn,
-            project_id=project_id,
-            body={"backlog_id": backlog_id, "task_id": task_id},
-            auth={
-                "role_source": "observer_session_route_token_ref",
-                "route_token_scope": {
-                    "project_id": project_id,
-                    "backlog_id": backlog_id,
-                    "task_id": task_id,
-                },
-                "route_token_allowed_actions": [
-                    "graph_current_full_reconcile"
-                ],
+    wrong_repair_source = server._current_full_reconcile_runtime_context_scope(
+        conn,
+        project_id=project_id,
+        body={"backlog_id": backlog_id, "task_id": task_id},
+        auth={
+            "role_source": "observer_session_route_token_ref",
+            "route_token_scope": {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
             },
-            target_commit_sha=repair_commit,
-        )
-    assert wrong_repair_source.value.code == (
-        "current_full_reconcile_contract_merge_authority_required"
+            "route_token_allowed_actions": [
+                "graph_current_full_reconcile"
+            ],
+        },
+        target_commit_sha=repair_commit,
     )
+    assert "contract_merge_authority" not in wrong_repair_source
     forged_recovery_payload = json.loads(json.dumps(recovery_merge_payload))
     forged_recovery_payload["audited_postmerge_recovery_authority"][
         "candidate_commit"
@@ -62701,27 +62865,24 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
         (json.dumps(forged_recovery_payload), merge_event["id"]),
     )
     conn.commit()
-    with pytest.raises(GovernanceError) as forged_recovery:
-        server._current_full_reconcile_runtime_context_scope(
-            conn,
-            project_id=project_id,
-            body={"backlog_id": backlog_id, "task_id": task_id},
-            auth={
-                "role_source": "observer_session_route_token_ref",
-                "route_token_scope": {
-                    "project_id": project_id,
-                    "backlog_id": backlog_id,
-                    "task_id": task_id,
-                },
-                "route_token_allowed_actions": [
-                    "graph_current_full_reconcile"
-                ],
+    forged_recovery = server._current_full_reconcile_runtime_context_scope(
+        conn,
+        project_id=project_id,
+        body={"backlog_id": backlog_id, "task_id": task_id},
+        auth={
+            "role_source": "observer_session_route_token_ref",
+            "route_token_scope": {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
             },
-            target_commit_sha=merged_commit,
-        )
-    assert forged_recovery.value.code == (
-        "current_full_reconcile_contract_merge_authority_required"
+            "route_token_allowed_actions": [
+                "graph_current_full_reconcile"
+            ],
+        },
+        target_commit_sha=merged_commit,
     )
+    assert "contract_merge_authority" not in forged_recovery
     conn.execute(
         "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
         (json.dumps(recovery_merge_payload), merge_event["id"]),
@@ -62733,27 +62894,24 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
         (diagnostic_id,),
     )
     conn.commit()
-    with pytest.raises(GovernanceError) as closed_diagnostic:
-        server._current_full_reconcile_runtime_context_scope(
-            conn,
-            project_id=project_id,
-            body={"backlog_id": backlog_id, "task_id": task_id},
-            auth={
-                "role_source": "observer_session_route_token_ref",
-                "route_token_scope": {
-                    "project_id": project_id,
-                    "backlog_id": backlog_id,
-                    "task_id": task_id,
-                },
-                "route_token_allowed_actions": [
-                    "graph_current_full_reconcile"
-                ],
+    closed_diagnostic = server._current_full_reconcile_runtime_context_scope(
+        conn,
+        project_id=project_id,
+        body={"backlog_id": backlog_id, "task_id": task_id},
+        auth={
+            "role_source": "observer_session_route_token_ref",
+            "route_token_scope": {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
             },
-            target_commit_sha=merged_commit,
-        )
-    assert closed_diagnostic.value.code == (
-        "current_full_reconcile_contract_merge_authority_required"
+            "route_token_allowed_actions": [
+                "graph_current_full_reconcile"
+            ],
+        },
+        target_commit_sha=merged_commit,
     )
+    assert "contract_merge_authority" not in closed_diagnostic
     conn.execute(
         "UPDATE backlog_bugs SET status = 'OPEN' WHERE bug_id = ?",
         (diagnostic_id,),

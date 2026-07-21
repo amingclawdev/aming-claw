@@ -40748,11 +40748,12 @@ def _current_full_reconcile_runtime_context_scope(
 ) -> dict[str, Any]:
     """Resolve current-full runtime provenance from persisted branch identity.
 
-    A non-activated full snapshot may be materialized before QA so an exact
-    branch candidate can be reviewed when a canonical-base overlay is unsafe.
-    That candidate-only operation is not a merge or a post-merge reconcile, so
-    it must not require (or claim) durable merge authority.  Activated
-    current-full reconcile keeps the stricter post-merge authority gate.
+    Current-full materializes the canonical clean HEAD under an authorized
+    route; it does not itself prove that a worker commit was merged.  Durable
+    merge/reconcile ordering remains authoritative in ContractRuntime and the
+    backlog close gates.  Merge authority may be attached here as compatible
+    provenance when it already exists, but it is never a prerequisite for
+    rebuilding the canonical current graph.
     """
 
     body_scope = _contract_timeline_scope_from_graph_body(body)
@@ -40990,55 +40991,6 @@ def _current_full_reconcile_runtime_context_scope(
                 contract_record=contract_record,
             )
         )
-    if (
-        successor_contract_kind == "mf_parallel"
-        and not candidate_only
-        and not contract_merge_authority
-    ):
-        raise GovernanceError(
-            "current_full_reconcile_contract_merge_authority_required",
-            (
-                "runtime-context-bound current-full reconcile requires one "
-                "server-derived ContractRuntime durable merge matching the "
-                "authorized worker/contract route and target HEAD"
-            ),
-            409,
-            {
-                "project_id": project_id,
-                "backlog_id": canonical_scope["backlog_id"],
-                "task_id": canonical_scope["task_id"],
-                "runtime_context_id": canonical_scope["runtime_context_id"],
-                "merge_queue_id": canonical_scope["merge_queue_id"],
-                "target_commit_sha": str(target_commit_sha or "").strip(),
-                "fail_closed": True,
-                "copy_safe_recovery": {
-                    "schema_version": (
-                        "current_full_reconcile.postmerge_authority_recovery.v1"
-                    ),
-                    "ordinary_happy_path": False,
-                    "system_gate_exception_only": True,
-                    "authoritative_pass_synthesized": False,
-                    "business_qa_bypassed": False,
-                    "no_pass_claim": True,
-                    "one_shot": True,
-                    "next_action": (
-                        "parallel_branch_merge_queue_materialize_with_"
-                        "audited_postmerge_recovery_evidence_refs"
-                    ),
-                    "mcp_tool": "parallel_branch_merge_queue_materialize",
-                    "forbidden_fields": [
-                        "fence_token",
-                        "checkpoint_id",
-                        "require_finish_gate=true",
-                    ],
-                    "required_evidence_refs": [
-                        "independent_qa_receipt_ref",
-                        "manual_merge_event_ref",
-                        "diagnostic_backlog_id",
-                    ],
-                },
-            },
-        )
     if contract_merge_authority:
         resolved_contract_execution_id = str(
             contract_merge_authority.get("contract_execution_id") or ""
@@ -41046,19 +40998,14 @@ def _current_full_reconcile_runtime_context_scope(
         if contract_execution_id and (
             resolved_contract_execution_id != contract_execution_id
         ):
-            raise GovernanceError(
-                "current_full_reconcile_contract_execution_scope_mismatch",
-                "current-full reconcile contract route does not match durable merge authority",
-                409,
-                {
-                    "expected": resolved_contract_execution_id,
-                    "actual": contract_execution_id,
-                    "fail_closed": True,
-                },
+            # This is optional merge provenance, not graph-rebuild authority.
+            # A stale ContractRuntime projection must not block a canonical
+            # route-bound current-full reconcile.
+            contract_merge_authority = {}
+        elif resolved_contract_execution_id:
+            canonical_scope["contract_execution_id"] = (
+                resolved_contract_execution_id
             )
-        canonical_scope["contract_execution_id"] = (
-            resolved_contract_execution_id
-        )
     result = {
         **canonical_scope,
         "source": "parallel_branch_runtime_context",
