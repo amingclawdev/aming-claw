@@ -61832,7 +61832,11 @@ def test_finish_gate_handler_binds_latest_canonical_attestation_round(
             },
         }
 
-    def attestation_line(label: str) -> dict[str, Any]:
+    def attestation_line(
+        label: str,
+        *,
+        session_id: str = worker_session_id,
+    ) -> dict[str, Any]:
         attestation = {
             "schema_version": "worker_transcript_self_attestation.v1",
             "attestation_phase": "finish",
@@ -61842,16 +61846,16 @@ def test_finish_gate_handler_binds_latest_canonical_attestation_round(
             "self_attesting": True,
             "finish_time_self_attesting": True,
             "finish_time_blockers": [],
-            "worker_session_id": worker_session_id,
-            "filer_principal": worker_session_id,
-            "worker_transcript_ref": f"codex:{worker_session_id}:{label}",
+            "worker_session_id": session_id,
+            "filer_principal": session_id,
+            "worker_transcript_ref": f"codex:{session_id}:{label}",
             "harness_type": "codex",
             "blockers": [],
         }
         payload = {
             **context_payload,
-            "worker_session_id": worker_session_id,
-            "filer_principal": worker_session_id,
+            "worker_session_id": session_id,
+            "filer_principal": session_id,
             "head_commit": head_commit,
             "changed_files": changed_files,
             "test_results": test_results,
@@ -61966,6 +61970,42 @@ def test_finish_gate_handler_binds_latest_canonical_attestation_round(
     assert forwarded_bodies[-1]["finish_time_worker_self_attestation"][
         "worker_transcript_ref"
     ].endswith(":round-4")
+
+    identity_mismatch_record = runtime.store.get(contract_execution_id)
+    identity_mismatch_record["completed_lines"] = [
+        *completed_lines[:-1],
+        attestation_line("round-4-worker-b", session_id="worker-session-B"),
+    ]
+    identity_mismatch_record["runtime_guide"] = {
+        **dict(identity_mismatch_record.get("runtime_guide") or {}),
+        "completed_lines": list(identity_mismatch_record["completed_lines"]),
+    }
+    identity_mismatch_record["execution_state_revision"] += 1
+    runtime.store.update(contract_execution_id, identity_mismatch_record)
+    conn.commit()
+    omitted_identity_body = dict(finish_request.body or {})
+    omitted_identity_body.pop("worker_session_id")
+    omitted_identity_body.pop("filer_principal")
+    omitted_identity_request = _ctx_with_role(
+        {
+            "project_id": PID,
+            "runtime_context_id": runtime_context.runtime_context_id,
+        },
+        "mf_sub",
+        method="POST",
+        body=omitted_identity_body,
+    )
+    with pytest.raises(GovernanceError) as omitted_identity_mismatch:
+        server.handle_graph_governance_runtime_context_finish_gate(
+            omitted_identity_request
+        )
+    assert omitted_identity_mismatch.value.code == (
+        "contract_worker_finish_attestation_mismatch"
+    )
+    assert omitted_identity_mismatch.value.details["mismatched_fields"] == [
+        "worker_session_id",
+        "filer_principal",
+    ]
 
     ambiguous_record = runtime.store.get(contract_execution_id)
     ambiguous_record["completed_lines"] = [

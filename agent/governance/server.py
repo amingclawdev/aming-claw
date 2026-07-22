@@ -23272,6 +23272,8 @@ def _runtime_context_contract_finish_attestation_projection(
     )
     requested_head = str(head_commit or "").strip()
     round_mismatched_fields: list[str] = []
+    active_commit_session = ""
+    active_commit_filer = ""
     if context_worker_commits:
         _, active_worker_commit = context_worker_commits[-1]
         active_commit_payload = (
@@ -23293,11 +23295,15 @@ def _runtime_context_contract_finish_attestation_projection(
         if not active_commit_head or active_commit_head != requested_head:
             round_mismatched_fields.append("head_commit")
         active_commit_session = _runtime_context_finish_attestation_text(
-            active_commit_payload, "worker_session_id"
+            active_worker_commit, "worker_session_id"
         )
         active_commit_filer = _runtime_context_finish_attestation_text(
-            active_commit_payload, "filer_principal"
+            active_worker_commit, "filer_principal"
         )
+        if not active_commit_session:
+            round_mismatched_fields.append("worker_session_id")
+        if not active_commit_filer or active_commit_filer != active_commit_session:
+            round_mismatched_fields.append("filer_principal")
         if (
             supplied_worker_session_id
             and active_commit_session
@@ -23385,12 +23391,14 @@ def _runtime_context_contract_finish_attestation_projection(
         )
         and _runtime_context_test_results_compatible(canonical_tests, test_results),
         "worker_session_id": bool(canonical_session)
+        and canonical_session == active_commit_session
         and (
             not supplied_worker_session_id
             or supplied_worker_session_id == canonical_session
         ),
         "filer_principal": bool(canonical_filer)
         and canonical_filer == canonical_session
+        and canonical_filer == active_commit_filer
         and (
             not supplied_filer_principal
             or supplied_filer_principal == canonical_filer
