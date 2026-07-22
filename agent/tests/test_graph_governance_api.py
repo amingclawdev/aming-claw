@@ -62964,6 +62964,31 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         event["created_at"] = created_at
     timeline_events = [merge_event, reconcile_event]
 
+    # A later recovery read is lifecycle evidence only.  It must not replace
+    # the already accepted worker/QA round identity used by observer_merge.
+    late_read_record = json.loads(json.dumps(record))
+    late_read_record["completed_lines"].insert(
+        -1,
+        {
+            "stage_id": "worker_read",
+            "line_id": "worker_read_runtime_guide",
+            "actor_role": "mf_sub",
+            "evidence_kind": "read_receipt",
+            "runtime_context_id": "mfrctx-late-recovery-read",
+            "task_id": "worker-late-recovery-read",
+            "parent_task_id": context.parent_task_id,
+            "payload": {
+                "runtime_context_id": "mfrctx-late-recovery-read",
+                "task_id": "worker-late-recovery-read",
+                "parent_task_id": context.parent_task_id,
+                "worker_role": "mf_sub",
+            },
+        },
+    )
+    assert server._contract_runtime_server_line_identity(late_read_record)[
+        "runtime_context_id"
+    ] == "mfrctx-late-recovery-read"
+
     r6_like_merge_write = {
         "stage_id": "observer_integration",
         "line_id": "observer_merge",
@@ -62989,7 +63014,7 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
             _ctx({"project_id": project_id}),
             conn,
             project_id=project_id,
-            record=record,
+            record=late_read_record,
             write=r6_like_merge_write,
             body=r6_like_merge_write,
         )
@@ -63021,7 +63046,7 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         _ctx({"project_id": project_id}),
         conn,
         project_id=project_id,
-        record=record,
+        record=late_read_record,
         write=r6_like_merge_write,
         body=r6_like_merge_write,
     )
@@ -63037,6 +63062,53 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         f"timeline:{merge_event['id']}"
     ]
     assert durable_merge["merge_event_id"] == int(merge_event["id"])
+    assert durable_merge["runtime_context_id"] == runtime_context_id
+    assert durable_merge["task_id"] == task_id
+    assert durable_merge["worker_commit_completed_line_index"] == 6
+    assert durable_merge["qa_graph_completed_line_index"] == 9
+    assert durable_merge["qa_completed_line_index"] == 10
+
+    cross_runtime_round = json.loads(json.dumps(late_read_record))
+    cross_runtime_round["completed_lines"][6]["runtime_context_id"] = (
+        "mfrctx-cross-runtime-worker-commit"
+    )
+    cross_runtime_round["completed_lines"][6]["task_id"] = (
+        "worker-cross-runtime-worker-commit"
+    )
+    with pytest.raises(GovernanceError) as cross_runtime_rejection:
+        server._contract_runtime_bind_server_line_authority(
+            _ctx({"project_id": project_id}),
+            conn,
+            project_id=project_id,
+            record=cross_runtime_round,
+            write=r6_like_merge_write,
+            body=r6_like_merge_write,
+        )
+    assert cross_runtime_rejection.value.code == (
+        "contract_runtime_observer_merge_durable_authority_required"
+    )
+
+    ambiguous_round = json.loads(json.dumps(late_read_record))
+    ambiguous_round["completed_lines"].insert(
+        11,
+        json.loads(json.dumps(ambiguous_round["completed_lines"][10])),
+    )
+    with monkeypatch.context() as ambiguity_patch:
+        ambiguity_patch.setattr(
+            server,
+            "_contract_runtime_completed_line_acceptance",
+            lambda *_args, **_kwargs: {
+                "db_verified": True,
+                "acceptance_ref": "contract_runtime:test:accepted",
+            },
+        )
+        assert server._contract_runtime_observer_merge_completed_round(
+            conn,
+            project_id=project_id,
+            record=ambiguous_round,
+            context=context,
+            branch_head=qa_commit,
+        ) == {}
     record = json.loads(json.dumps(record))
     record["completed_lines"][-1] = bound_merge_write
     runtime.store.update(

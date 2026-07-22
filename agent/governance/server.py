@@ -63443,6 +63443,167 @@ _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION = (
 )
 
 
+def _contract_runtime_observer_merge_completed_round(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    branch_head: str,
+) -> dict[str, Any]:
+    """Resolve the source-backed worker/QA round that owns ``branch_head``."""
+
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    branch_head = str(branch_head or "").strip().lower()
+    if not (
+        runtime_context_id
+        and task_id
+        and parent_task_id
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", branch_head)
+    ):
+        return {}
+
+    completed = [
+        line
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+
+    def values(line: Mapping[str, Any], *keys: str) -> set[str]:
+        return {
+            str(candidate.get(key) or "").strip()
+            for candidate in _contract_runtime_mapping_candidates(line)
+            for key in keys
+            if str(candidate.get(key) or "").strip()
+        }
+
+    def commit_values(line: Mapping[str, Any]) -> set[str]:
+        return {
+            value.lower()
+            for value in values(
+                line,
+                "commit_sha",
+                "worker_commit_sha",
+                "candidate_commit_sha",
+                "head_commit",
+                "validated_head_commit",
+                "immutable_head_commit",
+            )
+            if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value)
+        }
+
+    def has_no_identity_conflict(line: Mapping[str, Any]) -> bool:
+        return all(
+            not supplied or supplied == {expected}
+            for supplied, expected in (
+                (values(line, "runtime_context_id"), runtime_context_id),
+                (values(line, "task_id", "worker_task_id"), task_id),
+                (values(line, "parent_task_id"), parent_task_id),
+            )
+        )
+
+    worker_commit_indexes = [
+        index
+        for index, line in enumerate(completed)
+        if str(line.get("line_id") or "").strip() == "worker_commit"
+        and str(line.get("actor_role") or "").strip() == "mf_sub"
+        and str(line.get("evidence_kind") or "").strip() == "worker_commit"
+        and str(line.get("status") or "").strip().lower()
+        not in {"waived", "bypassed"}
+        and _contract_runtime_line_status_passes(line)
+        and commit_values(line) == {branch_head}
+        and has_no_identity_conflict(line)
+        and _contract_runtime_mapping_matches_context(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            task_id_keys=("task_id", "worker_task_id"),
+        )
+    ]
+    if not worker_commit_indexes:
+        return {}
+    worker_commit_index = max(worker_commit_indexes)
+    next_worker_commit_index = next(
+        (
+            index
+            for index in range(worker_commit_index + 1, len(completed))
+            if str(completed[index].get("line_id") or "").strip()
+            == "worker_commit"
+        ),
+        len(completed),
+    )
+
+    round_lines = list(
+        enumerate(
+            completed[worker_commit_index + 1 : next_worker_commit_index],
+            start=worker_commit_index + 1,
+        )
+    )
+    qa_graph_lines = [
+        (index, line)
+        for index, line in round_lines
+        if str(line.get("line_id") or "").strip() == "qa_graph_context"
+        and str(line.get("actor_role") or "").strip() == "qa"
+        and str(line.get("evidence_kind") or "").strip() == "graph_trace"
+        and _contract_runtime_line_status_passes(line)
+        and commit_values(line) == {branch_head}
+        and has_no_identity_conflict(line)
+        and isinstance(line.get("payload"), Mapping)
+        and isinstance(line["payload"].get("graph_trace_evidence"), Mapping)
+        and line["payload"]["graph_trace_evidence"].get("db_verified") is True
+        and list(
+            line["payload"]["graph_trace_evidence"].get("verified_trace_ids")
+            or line["payload"]["graph_trace_evidence"].get("trace_ids")
+            or []
+        )
+    ]
+    qa_verification_lines = []
+    for index, line in round_lines:
+        if not (
+            str(line.get("line_id") or "").strip()
+            == "qa_independent_verification"
+            and str(line.get("actor_role") or "").strip() == "qa"
+            and str(line.get("evidence_kind") or "").strip()
+            == "independent_verification"
+            and _contract_runtime_line_status_passes(line)
+            and not _contract_runtime_line_reports_disqualifying_failed_qa(
+                line,
+                record=record,
+            )
+            and commit_values(line) == {branch_head}
+            and has_no_identity_conflict(line)
+        ):
+            continue
+        acceptance = _contract_runtime_completed_line_acceptance(
+            conn,
+            project_id=project_id,
+            record=record,
+            completed_line_index=index,
+            expected_line=line,
+        )
+        if acceptance.get("db_verified") is True:
+            qa_verification_lines.append((index, line, acceptance))
+    if len(qa_graph_lines) != 1 or len(qa_verification_lines) != 1:
+        return {}
+    qa_graph_index, _qa_graph = qa_graph_lines[0]
+    qa_index, _qa, qa_acceptance = qa_verification_lines[0]
+    if qa_graph_index >= qa_index:
+        return {}
+    return {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "branch_head": branch_head,
+        "worker_commit_completed_line_index": worker_commit_index,
+        "qa_graph_completed_line_index": qa_graph_index,
+        "qa_completed_line_index": qa_index,
+        "qa_acceptance_ref": str(qa_acceptance.get("acceptance_ref") or ""),
+    }
+
+
 def _contract_runtime_observer_merge_durable_authority(
     conn,
     *,
@@ -63459,7 +63620,6 @@ def _contract_runtime_observer_merge_durable_authority(
 
     from .parallel_branch_runtime import get_merge_queue_item_for_branch_context
 
-    expected_identity = _contract_runtime_server_line_identity(record)
     dispatch_lines = [
         line
         for line in record.get("completed_lines") or []
@@ -63478,14 +63638,6 @@ def _contract_runtime_observer_merge_durable_authority(
             runtime_context_id, task_id, parent_task_id = (
                 _contract_runtime_context_identity(context)
             )
-            if expected_identity["runtime_context_id"] and (
-                runtime_context_id != expected_identity["runtime_context_id"]
-            ):
-                continue
-            if expected_identity["task_id"] and (
-                task_id != expected_identity["task_id"]
-            ):
-                continue
             backlog_id = str(
                 getattr(context, "backlog_id", "")
                 or record.get("backlog_id")
@@ -63516,6 +63668,15 @@ def _contract_runtime_observer_merge_durable_authority(
                 or target_head_after_merge != merged_commit
                 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", branch_head)
             ):
+                continue
+            completed_round = _contract_runtime_observer_merge_completed_round(
+                conn,
+                project_id=project_id,
+                record=record,
+                context=context,
+                branch_head=branch_head,
+            )
+            if not completed_round:
                 continue
             timeline_events = _runtime_context_service_timeline_events(
                 conn,
@@ -63589,6 +63750,18 @@ def _contract_runtime_observer_merge_durable_authority(
                     "merge_queue_id": durable_item.merge_queue_id,
                     "queue_item_id": durable_item.queue_item_id,
                     "queue_item_status": durable_item.status,
+                    "worker_commit_completed_line_index": completed_round[
+                        "worker_commit_completed_line_index"
+                    ],
+                    "qa_graph_completed_line_index": completed_round[
+                        "qa_graph_completed_line_index"
+                    ],
+                    "qa_completed_line_index": completed_round[
+                        "qa_completed_line_index"
+                    ],
+                    "qa_acceptance_ref": completed_round[
+                        "qa_acceptance_ref"
+                    ],
                     "timeline_event_refs": [event_ref],
                     "merge_event_ref": event_ref,
                     "merge_event_id": event_id,
