@@ -17,8 +17,9 @@ from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
+from functools import wraps
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
-from threading import RLock
+from threading import Event, RLock, local
 from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -81710,14 +81711,93 @@ except (TypeError, ValueError):
     _TIMELINE_WARM_CACHE_MAX_ENTRIES = 128
 
 _TIMELINE_WARM_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_TIMELINE_WARM_CACHE_RESOURCE_KEYS: OrderedDict[str, str] = OrderedDict()
+_TIMELINE_WARM_CACHE_IN_FLIGHT: dict[str, dict[str, Any]] = {}
 _TIMELINE_WARM_CACHE_LOCK = RLock()
+_TIMELINE_WARM_CACHE_LOCAL = local()
+_TIMELINE_WARM_CACHE_EVICTION_COUNT = 0
+try:
+    _TIMELINE_WARM_CACHE_SINGLE_FLIGHT_WAIT_SECONDS = max(
+        0.1,
+        min(
+            float(
+                os.environ.get(
+                    "AMING_TIMELINE_WARM_CACHE_SINGLE_FLIGHT_WAIT_SECONDS",
+                    "5",
+                )
+            ),
+            30.0,
+        ),
+    )
+except (TypeError, ValueError):
+    _TIMELINE_WARM_CACHE_SINGLE_FLIGHT_WAIT_SECONDS = 5.0
 
 
 def _timeline_warm_cache_clear() -> None:
     """Clear process-local timeline responses (tests and controlled recovery)."""
 
+    global _TIMELINE_WARM_CACHE_EVICTION_COUNT
     with _TIMELINE_WARM_CACHE_LOCK:
+        pending = [
+            item.get("event")
+            for item in _TIMELINE_WARM_CACHE_IN_FLIGHT.values()
+            if isinstance(item.get("event"), Event)
+        ]
         _TIMELINE_WARM_CACHE.clear()
+        _TIMELINE_WARM_CACHE_RESOURCE_KEYS.clear()
+        _TIMELINE_WARM_CACHE_IN_FLIGHT.clear()
+        _TIMELINE_WARM_CACHE_EVICTION_COUNT = 0
+    for event in pending:
+        event.set()
+
+
+def _timeline_warm_cache_cancel(identity_hash: str, leader_token: str) -> None:
+    """Release a failed leader without retaining its partial/exception state."""
+
+    release_event: Event | None = None
+    with _TIMELINE_WARM_CACHE_LOCK:
+        in_flight = _TIMELINE_WARM_CACHE_IN_FLIGHT.get(identity_hash)
+        # A timed-out waiter may already have promoted itself.  The old
+        # leader must never cancel or overwrite that newer lease.
+        if (
+            isinstance(in_flight, Mapping)
+            and str(in_flight.get("leader_token") or "") == leader_token
+        ):
+            _TIMELINE_WARM_CACHE_IN_FLIGHT.pop(identity_hash, None)
+            if isinstance(in_flight.get("event"), Event):
+                release_event = in_flight.get("event")
+    if release_event is not None:
+        release_event.set()
+
+
+def _timeline_warm_cache_endpoint(handler):
+    """Release every cache leadership lease if an endpoint computation fails."""
+
+    @wraps(handler)
+    def wrapped(*args, **kwargs):
+        previous_leaders = getattr(
+            _TIMELINE_WARM_CACHE_LOCAL,
+            "leader_identity_hashes",
+            None,
+        )
+        leader_leases: list[tuple[str, str]] = []
+        _TIMELINE_WARM_CACHE_LOCAL.leader_identity_hashes = leader_leases
+        try:
+            return handler(*args, **kwargs)
+        except BaseException:
+            for identity_hash, leader_token in list(leader_leases):
+                _timeline_warm_cache_cancel(identity_hash, leader_token)
+            raise
+        finally:
+            if previous_leaders is None:
+                try:
+                    del _TIMELINE_WARM_CACHE_LOCAL.leader_identity_hashes
+                except AttributeError:
+                    pass
+            else:
+                _TIMELINE_WARM_CACHE_LOCAL.leader_identity_hashes = previous_leaders
+
+    return wrapped
 
 
 def _timeline_warm_cache_query_identity(query: Mapping[str, Any]) -> list[list[Any]]:
@@ -81776,24 +81856,190 @@ def _timeline_warm_cache_scalar(
     return str(value if value is not None else "")
 
 
-def _timeline_warm_cache_freshness_watermark(
+def _timeline_warm_cache_query_value(
+    query: Mapping[str, Any],
+    key: str,
+) -> str:
+    raw = query.get(key)
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else ""
+    return str(raw or "").strip()
+
+
+def _timeline_warm_cache_resource_generation(
     conn: sqlite3.Connection,
     project_id: str,
+    *,
+    query: Mapping[str, Any],
+    resource_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
-    """Cheap DB state vector used to invalidate cached public projections.
+    """Return a cheap generation scoped to one public playback resource.
 
-    Timeline ids and contract revisions are append-only. The updated-at values
-    cover mutable current/backlog projections. A new event or current-state
-    change therefore invalidates a warm response before its TTL elapses.
+    Backlog playback, visualization, and gate requests must not be invalidated
+    by an event appended to an unrelated row. Project-wide Current requests
+    intentionally retain the global generation path.
     """
 
+    resource = dict(resource_identity or {})
+    backlog_id = str(
+        resource.get("backlog_id")
+        or _timeline_warm_cache_query_value(query, "backlog_id")
+        or _timeline_warm_cache_query_value(query, "bug_id")
+    ).strip()
+    task_id = str(
+        resource.get("task_id")
+        or _timeline_warm_cache_query_value(query, "task_id")
+    ).strip()
+    contract_execution_id = str(
+        resource.get("contract_execution_id")
+        or _timeline_warm_cache_query_value(query, "contract_execution_id")
+    ).strip()
+    db_scope = _timeline_warm_cache_db_scope(conn)
+
+    if contract_execution_id and not backlog_id:
+        backlog_id = _timeline_warm_cache_scalar(
+            conn,
+            "SELECT backlog_id FROM contract_runtime_executions WHERE project_id = ? AND contract_execution_id = ? LIMIT 1",
+            (project_id, contract_execution_id),
+        ).strip()
+
+    if backlog_id:
+        chain_row = None
+        try:
+            chain_row = conn.execute(
+                """
+                SELECT contract_chain_id, current_contract_execution_id,
+                       generation, projection_watermark, projection_hash,
+                       updated_at
+                FROM backlog_contract_chain_current
+                WHERE project_id = ? AND backlog_id = ?
+                """,
+                (project_id, backlog_id),
+            ).fetchone()
+        except sqlite3.Error:
+            chain_row = None
+        current_execution_id = str(
+            contract_execution_id
+            or (_row_get(chain_row, "current_contract_execution_id", "") if chain_row else "")
+        ).strip()
+        return {
+            "db_scope": db_scope,
+            "scope": "backlog_contract_chain",
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "contract_execution_id": current_execution_id,
+            "contract_chain_id": str(
+                _row_get(chain_row, "contract_chain_id", "") if chain_row else ""
+            ),
+            "contract_chain_generation": str(
+                _row_get(chain_row, "generation", 0) if chain_row else 0
+            ),
+            "projection_watermark": str(
+                _row_get(chain_row, "projection_watermark", 0) if chain_row else 0
+            ),
+            "projection_hash": str(
+                _row_get(chain_row, "projection_hash", "") if chain_row else ""
+            ),
+            "timeline_event_id": _timeline_warm_cache_scalar(
+                conn,
+                "SELECT COALESCE(MAX(id), 0) FROM task_timeline_events WHERE project_id = ? AND backlog_id = ?",
+                (project_id, backlog_id),
+            ),
+            "runtime_revision_rowid": _timeline_warm_cache_scalar(
+                conn,
+                """
+                SELECT COALESCE(MAX(revisions.rowid), 0)
+                FROM parallel_branch_runtime_contract_revisions revisions
+                JOIN parallel_branch_runtime_contexts contexts
+                  ON contexts.project_id = revisions.project_id
+                 AND contexts.runtime_context_id = revisions.runtime_context_id
+                WHERE contexts.project_id = ? AND contexts.backlog_id = ?
+                """,
+                (project_id, backlog_id),
+            ),
+            "runtime_context_updated_at": _timeline_warm_cache_scalar(
+                conn,
+                "SELECT COALESCE(MAX(updated_at), '') FROM parallel_branch_runtime_contexts WHERE project_id = ? AND backlog_id = ?",
+                (project_id, backlog_id),
+            ),
+            "contract_runtime_updated_at": _timeline_warm_cache_scalar(
+                conn,
+                "SELECT COALESCE(MAX(updated_at), '') FROM contract_runtime_executions "
+                "WHERE project_id = ? AND backlog_id = ?",
+                (project_id, backlog_id),
+            ),
+            "contract_chain_edge_id": _timeline_warm_cache_scalar(
+                conn,
+                "SELECT COALESCE(MAX(id), 0) FROM contract_chain_edges WHERE project_id = ? AND backlog_id = ?",
+                (project_id, backlog_id),
+            ) or "0",
+            "contract_chain_updated_at": str(
+                _row_get(chain_row, "updated_at", "") if chain_row else ""
+            ),
+            "backlog_updated_at": _timeline_warm_cache_scalar(
+                conn,
+                "SELECT COALESCE(updated_at, '') FROM backlog_bugs WHERE bug_id = ?",
+                (backlog_id,),
+            ),
+        }
+
+    if task_id:
+        return {
+            "db_scope": db_scope,
+            "scope": "task",
+            "backlog_id": "",
+            "task_id": task_id,
+            "contract_execution_id": contract_execution_id,
+            "contract_chain_id": "",
+            "contract_chain_generation": "0",
+            "projection_watermark": "0",
+            "projection_hash": "",
+            "timeline_event_id": _timeline_warm_cache_scalar(
+                conn,
+                "SELECT COALESCE(MAX(id), 0) FROM task_timeline_events WHERE project_id = ? AND task_id = ?",
+                (project_id, task_id),
+            ),
+            "runtime_revision_rowid": _timeline_warm_cache_scalar(
+                conn,
+                """
+                SELECT COALESCE(MAX(revisions.rowid), 0)
+                FROM parallel_branch_runtime_contract_revisions revisions
+                JOIN parallel_branch_runtime_contexts contexts
+                  ON contexts.project_id = revisions.project_id
+                 AND contexts.runtime_context_id = revisions.runtime_context_id
+                WHERE contexts.project_id = ? AND contexts.task_id = ?
+                """,
+                (project_id, task_id),
+            ),
+            "runtime_context_updated_at": _timeline_warm_cache_scalar(
+                conn,
+                "SELECT COALESCE(MAX(updated_at), '') FROM parallel_branch_runtime_contexts WHERE project_id = ? AND task_id = ?",
+                (project_id, task_id),
+            ),
+            "contract_runtime_updated_at": _timeline_warm_cache_scalar(
+                conn,
+                "SELECT COALESCE(MAX(updated_at), '') FROM contract_runtime_executions WHERE project_id = ? AND contract_execution_id = ?",
+                (project_id, contract_execution_id),
+            ) if contract_execution_id else "",
+            "contract_chain_updated_at": "",
+            "contract_chain_edge_id": "0",
+            "backlog_updated_at": "",
+        }
+
     return {
-        "db_scope": _timeline_warm_cache_db_scope(conn),
-        # Project DBs are isolated; omitting a project predicate preserves the
-        # SQLite MAX(rowid) fast path even for very large timeline tables.
+        "db_scope": db_scope,
+        "scope": "project",
+        "backlog_id": "",
+        "task_id": "",
+        "contract_execution_id": contract_execution_id,
+        "contract_chain_id": "",
+        "contract_chain_generation": "0",
+        "projection_watermark": "0",
+        "projection_hash": "",
         "timeline_event_id": _timeline_warm_cache_scalar(
             conn,
-            "SELECT COALESCE(MAX(id), 0) FROM task_timeline_events",
+            "SELECT COALESCE(MAX(id), 0) FROM task_timeline_events WHERE project_id = ?",
+            (project_id,),
         ),
         "runtime_revision_rowid": _timeline_warm_cache_scalar(
             conn,
@@ -81815,6 +82061,11 @@ def _timeline_warm_cache_freshness_watermark(
             "SELECT COALESCE(MAX(updated_at), '') FROM backlog_contract_chain_current WHERE project_id = ?",
             (project_id,),
         ),
+        "contract_chain_edge_id": _timeline_warm_cache_scalar(
+            conn,
+            "SELECT COALESCE(MAX(id), 0) FROM contract_chain_edges WHERE project_id = ?",
+            (project_id,),
+        ) or "0",
         "backlog_updated_at": _timeline_warm_cache_scalar(
             conn,
             "SELECT COALESCE(MAX(updated_at), '') FROM backlog_bugs",
@@ -81830,28 +82081,53 @@ def _timeline_warm_cache_prepare(
     query: Mapping[str, Any],
     resource_identity: Mapping[str, Any] | None = None,
 ) -> tuple[str, dict[str, str], dict[str, Any] | None, dict[str, Any]]:
-    watermark = _timeline_warm_cache_freshness_watermark(conn, project_id)
-    identity = {
+    prepare_started = time.monotonic()
+    generation = _timeline_warm_cache_resource_generation(
+        conn,
+        project_id,
+        query=query,
+        resource_identity=resource_identity,
+    )
+    resource = dict(resource_identity or {})
+    resource.setdefault("backlog_id", generation.get("backlog_id", ""))
+    resource.setdefault("task_id", generation.get("task_id", ""))
+    resource.setdefault(
+        "contract_execution_id",
+        generation.get("contract_execution_id", ""),
+    )
+    resource.setdefault("public_authority", "public_safe")
+    query_identity = _timeline_warm_cache_query_identity(query)
+    stable_identity = {
         "endpoint": endpoint,
         "project_id": project_id,
-        "resource": dict(resource_identity or {}),
-        "query": _timeline_warm_cache_query_identity(query),
-        "db_scope": watermark["db_scope"],
+        "resource": resource,
+        "query": query_identity,
+        "db_scope": generation["db_scope"],
+    }
+    identity = {
+        **stable_identity,
+        "current_generation": generation,
     }
     identity_hash = "sha256:" + hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    resource_key_hash = "sha256:" + hashlib.sha256(
+        json.dumps(stable_identity, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
     ).hexdigest()
     now = time.monotonic()
     miss_reason = "cold"
     cached_payload: dict[str, Any] | None = None
     age_ms = 0
+    single_flight_status = "leader"
+    single_flight_joined = False
+    single_flight_wait_ms = 0
+    wait_event: Event | None = None
+    wait_record: dict[str, Any] | None = None
+    leader_token = ""
+    response_bytes = 0
     with _TIMELINE_WARM_CACHE_LOCK:
-        requested_entry = _TIMELINE_WARM_CACHE.get(identity_hash)
-        if requested_entry is not None and (
-            now - float(requested_entry.get("stored_at") or 0.0)
-            >= _TIMELINE_WARM_CACHE_TTL_SECONDS
-        ):
-            miss_reason = "expired"
         expired_keys = [
             key
             for key, entry in _TIMELINE_WARM_CACHE.items()
@@ -81860,20 +82136,130 @@ def _timeline_warm_cache_prepare(
         ]
         for key in expired_keys:
             _TIMELINE_WARM_CACHE.pop(key, None)
+        previous_identity_hash = _TIMELINE_WARM_CACHE_RESOURCE_KEYS.get(
+            resource_key_hash
+        )
+        if previous_identity_hash and previous_identity_hash != identity_hash:
+            miss_reason = "freshness_changed"
+            _TIMELINE_WARM_CACHE.pop(previous_identity_hash, None)
+        _TIMELINE_WARM_CACHE_RESOURCE_KEYS[resource_key_hash] = identity_hash
+        _TIMELINE_WARM_CACHE_RESOURCE_KEYS.move_to_end(resource_key_hash)
+        while (
+            len(_TIMELINE_WARM_CACHE_RESOURCE_KEYS)
+            > _TIMELINE_WARM_CACHE_MAX_ENTRIES
+        ):
+            _TIMELINE_WARM_CACHE_RESOURCE_KEYS.popitem(last=False)
         entry = _TIMELINE_WARM_CACHE.get(identity_hash)
         if entry is not None:
             age_seconds = max(0.0, now - float(entry.get("stored_at") or now))
-            if entry.get("watermark") != watermark:
-                miss_reason = "freshness_changed"
-                _TIMELINE_WARM_CACHE.pop(identity_hash, None)
-            elif age_seconds >= _TIMELINE_WARM_CACHE_TTL_SECONDS:
+            if age_seconds >= _TIMELINE_WARM_CACHE_TTL_SECONDS:
                 miss_reason = "expired"
                 _TIMELINE_WARM_CACHE.pop(identity_hash, None)
             else:
                 cached_payload = deepcopy(entry.get("payload") or {})
+                response_bytes = int(entry.get("response_bytes") or 0)
                 age_ms = int(age_seconds * 1000)
                 _TIMELINE_WARM_CACHE.move_to_end(identity_hash)
+                single_flight_status = "cache_hit"
+        if cached_payload is None:
+            wait_record = _TIMELINE_WARM_CACHE_IN_FLIGHT.get(identity_hash)
+            if wait_record is None:
+                leader_token = uuid.uuid4().hex
+                wait_record = {
+                    "event": Event(),
+                    "started_at": now,
+                    "leader_token": leader_token,
+                }
+                _TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash] = wait_record
+            else:
+                wait_event = wait_record.get("event")
+                single_flight_status = "waiting"
         entry_count = len(_TIMELINE_WARM_CACHE)
+        in_flight_count = len(_TIMELINE_WARM_CACHE_IN_FLIGHT)
+
+    while cached_payload is None and isinstance(wait_event, Event):
+        wait_started = time.monotonic()
+        wait_event.wait(_TIMELINE_WARM_CACHE_SINGLE_FLIGHT_WAIT_SECONDS)
+        single_flight_wait_ms += int(
+            max(0.0, time.monotonic() - wait_started) * 1000
+        )
+        with _TIMELINE_WARM_CACHE_LOCK:
+            entry = _TIMELINE_WARM_CACHE.get(identity_hash)
+            if entry is not None:
+                age_seconds = max(
+                    0.0,
+                    time.monotonic()
+                    - float(entry.get("stored_at") or time.monotonic()),
+                )
+                if age_seconds < _TIMELINE_WARM_CACHE_TTL_SECONDS:
+                    cached_payload = deepcopy(entry.get("payload") or {})
+                    response_bytes = int(entry.get("response_bytes") or 0)
+                    age_ms = int(age_seconds * 1000)
+                    _TIMELINE_WARM_CACHE.move_to_end(identity_hash)
+                    single_flight_status = "joined"
+                    single_flight_joined = True
+            if cached_payload is None:
+                leader_failed = wait_event.is_set()
+                current_record = _TIMELINE_WARM_CACHE_IN_FLIGHT.get(identity_hash)
+                if current_record is wait_record:
+                    # CAS promotion: only the waiter still observing the same
+                    # lease may replace it.  A waiter that lost this race joins
+                    # the new leader below instead of clobbering it.
+                    leader_token = uuid.uuid4().hex
+                    promoted_record = {
+                        "event": Event(),
+                        "started_at": time.monotonic(),
+                        "leader_token": leader_token,
+                    }
+                    _TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash] = promoted_record
+                    wait_record = promoted_record
+                    wait_event = None
+                    single_flight_status = (
+                        "retry_after_failure"
+                        if leader_failed
+                        else "wait_timeout_leader"
+                    )
+                    miss_reason = (
+                        "single_flight_leader_failed"
+                        if leader_failed
+                        else "single_flight_timeout"
+                    )
+                elif isinstance(current_record, Mapping) and isinstance(
+                    current_record.get("event"), Event
+                ):
+                    # Preserve object identity for the next CAS comparison.
+                    wait_record = current_record
+                    wait_event = current_record.get("event")
+                    single_flight_status = "waiting_on_promoted_leader"
+                else:
+                    # The previous leader failed and removed its lease before
+                    # this waiter reacquired the lock.  Claim the empty slot.
+                    leader_token = uuid.uuid4().hex
+                    promoted_record = {
+                        "event": Event(),
+                        "started_at": time.monotonic(),
+                        "leader_token": leader_token,
+                    }
+                    _TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash] = promoted_record
+                    wait_record = promoted_record
+                    wait_event = None
+                    single_flight_status = "retry_after_failure"
+                    miss_reason = "single_flight_leader_failed"
+            entry_count = len(_TIMELINE_WARM_CACHE)
+            in_flight_count = len(_TIMELINE_WARM_CACHE_IN_FLIGHT)
+    if cached_payload is None:
+        leader_identity_hashes = getattr(
+            _TIMELINE_WARM_CACHE_LOCAL,
+            "leader_identity_hashes",
+            None,
+        )
+        if (
+            isinstance(leader_identity_hashes, list)
+            and leader_token
+            and (identity_hash, leader_token) not in leader_identity_hashes
+        ):
+            leader_identity_hashes.append((identity_hash, leader_token))
+    lookup_ms = int(max(0.0, time.monotonic() - prepare_started) * 1000)
     metadata = {
         "schema_version": _TIMELINE_WARM_CACHE_SCHEMA_VERSION,
         "status": "hit" if cached_payload is not None else "miss",
@@ -81884,12 +82270,30 @@ def _timeline_warm_cache_prepare(
         "max_entries": _TIMELINE_WARM_CACHE_MAX_ENTRIES,
         "entry_count": entry_count,
         "identity_hash": identity_hash,
-        "freshness_watermark": dict(watermark),
+        "identity": identity,
+        "freshness_watermark": dict(generation),
+        "resource_generation": dict(generation),
+        "single_flight_status": single_flight_status,
+        "single_flight_joined": single_flight_joined,
+        "single_flight_wait_ms": single_flight_wait_ms,
+        "in_flight_count": in_flight_count,
+        "eviction_count": _TIMELINE_WARM_CACHE_EVICTION_COUNT,
+        "lookup_ms": lookup_ms,
+        "compute_ms": 0,
+        "cold_latency_ms": 0,
+        "warm_latency_ms": lookup_ms if cached_payload is not None else 0,
+        "response_bytes": response_bytes,
         "storage": "process_memory",
+        "_leader_token": leader_token,
+        "_prepared_at": prepare_started,
     }
     if cached_payload is not None:
-        cached_payload["warm_cache"] = metadata
-    return identity_hash, watermark, cached_payload, metadata
+        cached_payload["warm_cache"] = {
+            key: value
+            for key, value in metadata.items()
+            if not str(key).startswith("_")
+        }
+    return identity_hash, generation, cached_payload, metadata
 
 
 def _timeline_warm_cache_store(
@@ -81898,30 +82302,85 @@ def _timeline_warm_cache_store(
     response: Mapping[str, Any],
     miss_metadata: Mapping[str, Any],
 ) -> dict[str, Any]:
+    global _TIMELINE_WARM_CACHE_EVICTION_COUNT
     payload = deepcopy(dict(response))
     payload.pop("warm_cache", None)
+    try:
+        response_bytes = len(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+    except (TypeError, ValueError):
+        response_bytes = 0
+    prepared_at = float(miss_metadata.get("_prepared_at") or time.monotonic())
+    compute_ms = int(max(0.0, time.monotonic() - prepared_at) * 1000)
+    release_event: Event | None = None
+    evicted_count = 0
+    leader_token = str(miss_metadata.get("_leader_token") or "")
     with _TIMELINE_WARM_CACHE_LOCK:
         _TIMELINE_WARM_CACHE[identity_hash] = {
             "stored_at": time.monotonic(),
             "watermark": dict(watermark),
             "payload": deepcopy(payload),
+            "response_bytes": response_bytes,
         }
         _TIMELINE_WARM_CACHE.move_to_end(identity_hash)
         while len(_TIMELINE_WARM_CACHE) > _TIMELINE_WARM_CACHE_MAX_ENTRIES:
             _TIMELINE_WARM_CACHE.popitem(last=False)
+            evicted_count += 1
+        _TIMELINE_WARM_CACHE_EVICTION_COUNT += evicted_count
+        in_flight = _TIMELINE_WARM_CACHE_IN_FLIGHT.get(identity_hash)
+        if (
+            isinstance(in_flight, Mapping)
+            and str(in_flight.get("leader_token") or "") == leader_token
+        ):
+            _TIMELINE_WARM_CACHE_IN_FLIGHT.pop(identity_hash, None)
+            if isinstance(in_flight.get("event"), Event):
+                release_event = in_flight.get("event")
         entry_count = len(_TIMELINE_WARM_CACHE)
+        in_flight_count = len(_TIMELINE_WARM_CACHE_IN_FLIGHT)
+        eviction_count = _TIMELINE_WARM_CACHE_EVICTION_COUNT
+    if release_event is not None:
+        release_event.set()
+    leader_identity_hashes = getattr(
+        _TIMELINE_WARM_CACHE_LOCAL,
+        "leader_identity_hashes",
+        None,
+    )
+    if isinstance(leader_identity_hashes, list):
+        try:
+            leader_identity_hashes.remove((identity_hash, leader_token))
+        except ValueError:
+            pass
     result = deepcopy(payload)
+    public_miss_metadata = {
+        key: value
+        for key, value in miss_metadata.items()
+        if not str(key).startswith("_")
+    }
     result["warm_cache"] = {
-        **dict(miss_metadata),
+        **public_miss_metadata,
         "status": "miss",
         "hit": False,
         "age_ms": 0,
         "entry_count": entry_count,
+        "in_flight_count": in_flight_count,
+        "evicted_count": evicted_count,
+        "eviction_count": eviction_count,
+        "compute_ms": compute_ms,
+        "cold_latency_ms": compute_ms,
+        "warm_latency_ms": 0,
+        "response_bytes": response_bytes,
     }
     return result
 
 
 @route("GET", "/api/task/{project_id}/timeline")
+@_timeline_warm_cache_endpoint
 def handle_task_timeline_list(ctx: RequestContext):
     """List append-only task implementation timeline events by query filters."""
     project_id = ctx.get_project_id()
@@ -81958,6 +82417,12 @@ def handle_task_timeline_list(ctx: RequestContext):
         )
     except (TypeError, ValueError):
         scan_limit = 5000
+    try:
+        exact_event_id = int(
+            _first_query_value(ctx.query, "exact_event_id", "0") or "0"
+        )
+    except (TypeError, ValueError):
+        exact_event_id = 0
     filtered_request = any(
         [
             task_id,
@@ -81983,6 +82448,15 @@ def handle_task_timeline_list(ctx: RequestContext):
                 endpoint="timeline_list",
                 project_id=project_id,
                 query=ctx.query,
+                resource_identity={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "contract_execution_id": _first_query_value(
+                        ctx.query,
+                        "contract_execution_id",
+                    ),
+                    "public_authority": "public_safe_timeline",
+                },
             )
         )
         if cached_response is not None:
@@ -82026,6 +82500,17 @@ def handle_task_timeline_list(ctx: RequestContext):
             parent_event_id=parent_event_id,
             limit=limit,
         )
+        exact_event: dict[str, Any] | None = None
+        if exact_event_id > 0 and backlog_id:
+            exact_row = conn.execute(
+                """
+                SELECT * FROM task_timeline_events
+                WHERE project_id = ? AND backlog_id = ? AND id = ?
+                """,
+                (project_id, backlog_id, exact_event_id),
+            ).fetchone()
+            if exact_row is not None:
+                exact_event = task_timeline._row_to_dict(exact_row)
         compact_ledger = None
         if include_compact_ledger:
             event_ledger = task_timeline.build_compact_ledger(
@@ -82080,6 +82565,10 @@ def handle_task_timeline_list(ctx: RequestContext):
     }
     if compact_ledger is not None:
         response["compact_ledger"] = compact_ledger
+    if exact_event is not None:
+        response["exact_event"] = exact_event
+        response["exact_event_id"] = exact_event_id
+        response["exact_event_raw_loaded"] = True
     return _timeline_warm_cache_store(
         cache_key,
         cache_watermark,
@@ -82310,6 +82799,7 @@ def _task_timeline_merge_current_stream_events(
 
 
 @route("GET", "/api/task/{project_id}/timeline/recent")
+@_timeline_warm_cache_endpoint
 def handle_task_timeline_recent(ctx: RequestContext):
     """Project-wide recent timeline events, newest-first, cross-row.
 
@@ -82347,6 +82837,10 @@ def handle_task_timeline_recent(ctx: RequestContext):
                 endpoint="timeline_recent",
                 project_id=project_id,
                 query=ctx.query,
+                resource_identity={
+                    "scope": "project_current_stream",
+                    "public_authority": "public_safe_timeline",
+                },
             )
         )
         if cached_response is not None:
@@ -82420,6 +82914,7 @@ def handle_task_timeline_recent(ctx: RequestContext):
 
 
 @route("GET", "/api/task/{project_id}/{task_id}/timeline")
+@_timeline_warm_cache_endpoint
 def handle_task_timeline_get(ctx: RequestContext):
     """List append-only task implementation timeline events."""
     project_id = ctx.get_project_id()
@@ -82442,7 +82937,15 @@ def handle_task_timeline_get(ctx: RequestContext):
                 endpoint="timeline_get",
                 project_id=project_id,
                 query=ctx.query,
-                resource_identity={"task_id": task_id},
+                resource_identity={
+                    "task_id": task_id,
+                    "backlog_id": _first_query_value(ctx.query, "backlog_id"),
+                    "contract_execution_id": _first_query_value(
+                        ctx.query,
+                        "contract_execution_id",
+                    ),
+                    "public_authority": "public_safe_timeline",
+                },
             )
         )
         if cached_response is not None:
@@ -88073,6 +88576,7 @@ def _current_task_active_backlog(
 
 
 @route("GET", "/api/backlog/{project_id}/current-task")
+@_timeline_warm_cache_endpoint
 def handle_backlog_current_task(ctx: RequestContext):
     """Return the current backlog task from the newest active evidence.
 
@@ -88098,6 +88602,10 @@ def handle_backlog_current_task(ctx: RequestContext):
                 endpoint="backlog_current_task",
                 project_id=pid,
                 query=ctx.query,
+                resource_identity={
+                    "scope": "project_current_task",
+                    "public_authority": "public_safe_current_task",
+                },
             )
         )
         if cached_response is not None:
@@ -88390,6 +88898,7 @@ def _timeline_gate_contract_runtime_projection_body(
 
 
 @route("GET", "/api/backlog/{project_id}/{bug_id}/timeline-gate")
+@_timeline_warm_cache_endpoint
 def handle_backlog_timeline_gate(ctx: RequestContext):
     """Read-only MF close-gate precheck for backlog timeline evidence.
 
@@ -88417,6 +88926,39 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
 
         applicable = _mf_close_timeline_applicability(row)
         from . import task_timeline
+
+        task_timeline.ensure_schema(conn)
+        cache_query = dict(ctx.query or {})
+        cache_query.update(
+            {
+                "view": view,
+                "limit": str(limit),
+                "include_events": str(bool(include_events)).lower(),
+                "include_compact_ledger": str(
+                    bool(include_compact_ledger)
+                ).lower(),
+                "public_authority": "legacy_advisory",
+            }
+        )
+        cache_key, cache_watermark, cached_response, cache_metadata = (
+            _timeline_warm_cache_prepare(
+                conn,
+                endpoint="timeline_gate",
+                project_id=pid,
+                query=cache_query,
+                resource_identity={
+                    "backlog_id": bug_id,
+                    "contract_execution_id": _first_query_value(
+                        ctx.query,
+                        "contract_execution_id",
+                    ),
+                    "public_authority": "legacy_advisory",
+                },
+            )
+        )
+        if cached_response is not None:
+            cached_response["request_id"] = ctx.request_id
+            return cached_response
 
         events = task_timeline.list_backlog_gate_events(
             conn,
@@ -88705,7 +89247,13 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             )
         if include_events:
             result["events"] = events
-        return result
+        result["request_id"] = ctx.request_id
+        return _timeline_warm_cache_store(
+            cache_key,
+            cache_watermark,
+            result,
+            cache_metadata,
+        )
     finally:
         conn.close()
 
@@ -92526,6 +93074,7 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
 
 
 @route("GET", "/api/projects/{project_id}/visualization/backlogs/{backlog_id}")
+@_timeline_warm_cache_endpoint
 def handle_project_contract_runtime_visualization(ctx: RequestContext):
     """Return the canonical public-safe visualization read model for one row."""
 
@@ -92569,6 +93118,37 @@ def handle_project_contract_runtime_visualization(ctx: RequestContext):
             )
 
         task_timeline.ensure_schema(conn)
+        cache_query = dict(ctx.query or {})
+        cache_query.update(
+            {
+                "view": str(
+                    _first_query_value(ctx.query, "view") or "public"
+                ).strip().lower(),
+                "limit": str(limit),
+                "before_event_id": str(before_event_id),
+                "public_authority": "contract_runtime",
+            }
+        )
+        cache_key, cache_watermark, cached_response, cache_metadata = (
+            _timeline_warm_cache_prepare(
+                conn,
+                endpoint="contract_runtime_visualization",
+                project_id=project_id,
+                query=cache_query,
+                resource_identity={
+                    "backlog_id": backlog_id,
+                    "contract_execution_id": _first_query_value(
+                        ctx.query,
+                        "contract_execution_id",
+                    ),
+                    "public_authority": "contract_runtime",
+                },
+            )
+        )
+        if cached_response is not None:
+            cached_response["request_id"] = ctx.request_id
+            return cached_response
+
         current = _contract_chain_current_projection(
             conn,
             project_id=project_id,
@@ -92682,7 +93262,12 @@ def handle_project_contract_runtime_visualization(ctx: RequestContext):
             generated_at=_utc_now(),
         )
     response["request_id"] = ctx.request_id
-    return response
+    return _timeline_warm_cache_store(
+        cache_key,
+        cache_watermark,
+        response,
+        cache_metadata,
+    )
 
 
 @route("POST", "/api/projects/{project_id}/contract-runtime/{contract_execution_id}/line-writes")

@@ -115,11 +115,22 @@ function taskTimelineSearchQuery(options: TaskTimelineSearchOptions): string {
 }
 
 function backlogTimelineQuery(backlogId: string, limit: number): string {
-  return new URLSearchParams({
+  const query = new URLSearchParams({
     backlog_id: backlogId,
     limit: String(limit),
     include_compact_ledger: "true",
-  }).toString();
+    playback_bootstrap: "compact",
+    public_authority: "contract_runtime",
+  });
+  if (typeof window !== "undefined") {
+    const locationQuery = new URLSearchParams(window.location.search);
+    const exactEventId = locationQuery.get("playback_event")?.trim();
+    const selectedBacklogId = locationQuery.get("playback_backlog")?.trim();
+    if (exactEventId && selectedBacklogId === backlogId) {
+      query.set("exact_event_id", exactEventId);
+    }
+  }
+  return query.toString();
 }
 
 function backlogTimelineGateQuery(limit: number): string {
@@ -169,6 +180,38 @@ async function getJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
     throw new ApiError(res.status, `GET ${path} → ${res.status}`, text);
   }
   return (await res.json()) as T;
+}
+
+const PUBLIC_READ_SINGLE_FLIGHT_MAX_ENTRIES = 128;
+const publicReadSingleFlights = new Map<string, Promise<unknown>>();
+
+function awaitPublicRead<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
+/** Coalesce byte-identical public GETs without sharing caller abort semantics. */
+function getPublicJSONSingleFlight<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const key = `GET:${path}`;
+  let shared = publicReadSingleFlights.get(key) as Promise<T> | undefined;
+  if (!shared) {
+    while (publicReadSingleFlights.size >= PUBLIC_READ_SINGLE_FLIGHT_MAX_ENTRIES) {
+      const oldest = publicReadSingleFlights.keys().next().value as string | undefined;
+      if (!oldest) break;
+      publicReadSingleFlights.delete(oldest);
+    }
+    shared = getJSON<T>(path);
+    publicReadSingleFlights.set(key, shared);
+    void shared.finally(() => {
+      if (publicReadSingleFlights.get(key) === shared) publicReadSingleFlights.delete(key);
+    }).catch(() => undefined);
+  }
+  return awaitPublicRead(shared, signal);
 }
 
 async function postJSON<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
@@ -547,12 +590,29 @@ export const api = {
   },
   taskTimelineFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
     const q = backlogTimelineQuery(backlogId, limit);
-    const taskTimelineRequest = getJSON<TaskTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline?${q}`, signal);
+    const taskTimelineRequest = getPublicJSONSingleFlight<TaskTimelineResponse & {
+      exact_event?: import("../types").TaskTimelineEvent;
+    }>(`/api/task/${pidFor(projectId)}/timeline?${q}`, signal);
     const authorityRequest = api.contractRuntimeVisualizationFor(projectId, backlogId, limit, signal);
-    return Promise.all([taskTimelineRequest, authorityRequest]).then(([taskTimeline, contractRuntimeVisualization]) => ({
-      ...taskTimeline,
-      contract_runtime_visualization: contractRuntimeVisualization,
-    }));
+    return Promise.all([taskTimelineRequest, authorityRequest]).then(([taskTimeline, contractRuntimeVisualization]) => {
+      const exactEvent = taskTimeline.exact_event;
+      const events = exactEvent && !taskTimeline.events.some((event) => String(event.event_id ?? event.id ?? "") === String(exactEvent.event_id ?? exactEvent.id ?? ""))
+        ? [exactEvent, ...taskTimeline.events]
+        : taskTimeline.events;
+      return {
+        ...taskTimeline,
+        events,
+        contract_runtime_visualization: contractRuntimeVisualization,
+        playback_bootstrap: {
+          schema_version: "task_playback.bootstrap.v1",
+          source: "contract_runtime_visualization",
+          compact_timeline: contractRuntimeVisualization.timeline,
+          compact_ledger: contractRuntimeVisualization.compact_ledger,
+          exact_event_loaded: Boolean(exactEvent),
+          raw_compatibility: "timeline_response_preserved",
+        },
+      };
+    });
   },
   taskTimelineSearchFor(projectId: string, options: TaskTimelineSearchOptions, signal?: AbortSignal) {
     return getJSON<TaskTimelineResponse>(
@@ -569,14 +629,19 @@ export const api = {
   },
   backlogTimelineGateFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
     const q = backlogTimelineGateQuery(limit);
-    return getJSON<BacklogTimelineGateResponse>(
+    return getPublicJSONSingleFlight<BacklogTimelineGateResponse>(
       `/api/backlog/${pidFor(projectId)}/${encodeURIComponent(backlogId)}/timeline-gate?${q}`,
       signal,
     );
   },
   contractRuntimeVisualizationFor(projectId: string, backlogId: string, limit = 100, signal?: AbortSignal) {
-    const q = new URLSearchParams({ limit: String(limit) }).toString();
-    return getJSON<ContractRuntimeVisualizationResponse>(
+    const q = new URLSearchParams({
+      view: "public",
+      limit: String(limit),
+      before_event_id: "0",
+      public_authority: "contract_runtime",
+    }).toString();
+    return getPublicJSONSingleFlight<ContractRuntimeVisualizationResponse>(
       `/api/projects/${pidFor(projectId)}/visualization/backlogs/${encodeURIComponent(backlogId)}?${q}`,
       signal,
     ).then(requirePublicSafeTypedDag);

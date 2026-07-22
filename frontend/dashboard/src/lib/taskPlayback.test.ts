@@ -1445,6 +1445,26 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
     projection_freshness: { status: "current" },
     projection_conflicts: [],
     projection_conflict_count: 0,
+    warm_cache: {
+      identity_hash: "sha256:authority-fixture",
+      identity: {
+        resource: {
+          backlog_id: "AC-FRONTEND-AUTHORITY-FIXTURE",
+          contract_execution_id: "cex-current-1",
+          public_authority: "contract_runtime",
+        },
+        query: [
+          ["before_event_id", ["0"]],
+          ["limit", ["100"]],
+          ["public_authority", ["contract_runtime"]],
+          ["view", ["public"]],
+        ],
+      },
+      resource_generation: {
+        contract_chain_generation: "23",
+        projection_watermark: "42",
+      },
+    },
   } as ContractRuntimeVisualizationResponse;
 
   const view = projectContractRuntimeAuthorityViewModel(response);
@@ -1456,7 +1476,33 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
   );
   assertFixture(view.cache_identity.backlog_id === response.backlog_id && view.cache_identity.contract_execution_id === "cex-current-1", "authority cache identity should include backlog and execution ids");
   assertFixture(view.cache_identity.execution_state_revision === 17 && view.cache_identity.event_id === "42", "authority cache identity should include revision and event id");
-  assertFixture(view.cache_identity.key === "AC-FRONTEND-AUTHORITY-FIXTURE:cex-current-1:17:42", "authority cache key should contain all four canonical identity parts");
+  assertFixture(
+    view.cache_identity.project_id === "aming-claw"
+      && view.cache_identity.current_generation === 23
+      && view.cache_identity.view === "public"
+      && view.cache_identity.limit === 100
+      && view.cache_identity.before_event_id === "0"
+      && view.cache_identity.public_authority === "contract_runtime"
+      && view.cache_identity.identity_hash === "sha256:authority-fixture",
+    "authority cache identity should expose project, generation, pagination, view, and public-authority axes",
+  );
+  assertFixture(
+    view.cache_identity.key === "aming-claw:AC-FRONTEND-AUTHORITY-FIXTURE:cex-current-1:17:23:public:100:0:contract_runtime:42",
+    "authority cache key should contain the full canonical query and generation identity",
+  );
+  const shiftedAuthorityView = projectContractRuntimeAuthorityViewModel({
+    ...response,
+    warm_cache: {
+      ...(response as unknown as { warm_cache: Record<string, unknown> }).warm_cache,
+      identity_hash: "sha256:authority-fixture-shifted",
+      resource_generation: { contract_chain_generation: "24", projection_watermark: "43" },
+    },
+  } as ContractRuntimeVisualizationResponse);
+  assertFixture(
+    shiftedAuthorityView.cache_identity.key !== view.cache_identity.key
+      && shiftedAuthorityView.cache_identity.current_generation === 24,
+    "authority cache identity should change when the current contract-chain generation changes",
+  );
   assertFixture(view.contract_execution_progress.line_states[0]?.display_status === "BYPASSED", "bypassed contract lines must not display PASS");
   assertFixture(view.backlog_close_readiness.display_status === "WAIVED", "waived backlog rows must not display PASS");
   assertFixture(contractRuntimeAuthorityDisplayStatus("BYPASSED") !== "PASS" && contractRuntimeAuthorityDisplayStatus("WAIVED") !== "PASS", "bypassed/waived authority statuses must never normalize to PASS");
@@ -1495,6 +1541,69 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
     gateResponse: null,
     source: "governed",
   });
+  const nextActionTraceWarm = normalizeTaskPlaybackTrace({
+    projectId: response.project_id,
+    backlog: { bug_id: response.backlog_id, title: response.backlog.title, status: "OPEN", priority: "P1" },
+    taskTimeline: {
+      project_id: response.project_id,
+      backlog_id: response.backlog_id,
+      events: [selectedActionEvent],
+      count: 1,
+      contract_runtime_visualization: response,
+    },
+    gateResponse: null,
+    source: "governed",
+  });
+  assertFixture(
+    nextActionTrace.computation_cache.status === "miss"
+      && nextActionTraceWarm.computation_cache.status === "hit"
+      && nextActionTraceWarm.computation_cache.identity === nextActionTrace.computation_cache.identity
+      && nextActionTraceWarm.computation_cache.entry_count <= nextActionTraceWarm.computation_cache.max_entries,
+    "byte-identical playback inputs should reuse one bounded shared computation",
+  );
+  const boundedInputs = Array.from({ length: 65 }, (_, index) => ({
+    projectId: "aming-claw",
+    backlog: {
+      bug_id: `AC-PLAYBACK-CACHE-LRU-${index}`,
+      title: `Playback cache LRU ${index}`,
+      status: "OPEN",
+      priority: "P1",
+    } as BacklogBug,
+    taskTimeline: {
+      project_id: "aming-claw",
+      backlog_id: `AC-PLAYBACK-CACHE-LRU-${index}`,
+      events: [{
+        event_id: `lru-event-${index}`,
+        event_type: "mf_subagent.implementation",
+        event_kind: "implementation",
+        status: "accepted",
+      }],
+      count: 1,
+    },
+    gateResponse: null,
+    source: "governed" as const,
+  }));
+  const boundedTraces = boundedInputs.map((input) => normalizeTaskPlaybackTrace(input));
+  const firstAfterEviction = normalizeTaskPlaybackTrace(boundedInputs[0]);
+  assertFixture(
+    boundedTraces.every((trace) => trace.computation_cache.entry_count <= trace.computation_cache.max_entries)
+      && boundedTraces[0].computation_cache.status === "miss"
+      && firstAfterEviction.computation_cache.status === "miss"
+      && firstAfterEviction.computation_cache.entry_count <= 64,
+    "playback shared computations should remain bounded and evict the least-recently-used identity",
+  );
+  const apiSource = readFileSync(new URL("./api.ts", import.meta.url), "utf8");
+  assertFixture(
+    apiSource.includes("const publicReadSingleFlights = new Map")
+      && apiSource.includes("function getPublicJSONSingleFlight")
+      && apiSource.includes("playback_bootstrap: \"compact\"")
+      && apiSource.includes("exact_event_id")
+      && apiSource.includes("public_authority: \"contract_runtime\"")
+      && apiSource.includes("before_event_id: \"0\"")
+      && apiSource.includes("view: \"public\"")
+      && apiSource.includes("if (publicReadSingleFlights.get(key) === shared) publicReadSingleFlights.delete(key)"),
+    "public playback reads should single-flight exact endpoint/query identities and release both fulfilled and failed flights",
+  );
   const selectedActionFrame = nextActionTrace.frames.find((frame) => frame.source_event_id === "43");
   const nextActionPresentations = taskPlaybackNextLegalActionPresentations(nextActionTrace, selectedActionFrame?.id);
   assertFixture(
