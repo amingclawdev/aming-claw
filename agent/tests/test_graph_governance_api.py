@@ -41385,6 +41385,129 @@ def test_visualization_and_timeline_gate_warm_cache_are_backlog_scoped_and_page_
     server._timeline_warm_cache_clear()
 
 
+def test_endpoint_cache_order_never_reuses_anonymous_connection_authority(
+    conn,
+    monkeypatch,
+):
+    server._timeline_warm_cache_clear()
+    backlog_id = "AC-CACHE-ENDPOINT-ORDER-REUSE"
+    stale_conn = sqlite3.connect(":memory:")
+    fresh_conn = sqlite3.connect(":memory:")
+    stale_conn.row_factory = sqlite3.Row
+    fresh_conn.row_factory = sqlite3.Row
+    for candidate in (stale_conn, fresh_conn):
+        _ensure_schema(candidate)
+        store.ensure_schema(candidate)
+        _insert_non_mf_backlog(candidate, backlog_id)
+    task_timeline.record_event(
+        stale_conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="same-task",
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="blocked",
+        payload={
+            "summary": "stale-first-connection-authority",
+            "blocked": True,
+            "blocker_ids": ["stale-authority"],
+        },
+    )
+    task_timeline.record_event(
+        fresh_conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="same-task",
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="accepted",
+        payload={"summary": "fresh-second-connection-authority"},
+    )
+    stale_conn.commit()
+    fresh_conn.commit()
+
+    active = {"conn": stale_conn}
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(active["conn"]),
+    )
+    monkeypatch.setattr(
+        "agent.governance.db.get_connection",
+        lambda _project_id: _NoCloseConn(active["conn"]),
+    )
+    visualization_ctx = _ctx(
+        {"project_id": PID, "backlog_id": backlog_id},
+        query={
+            "view": "public",
+            "limit": "10",
+            "before_event_id": "0",
+            "public_authority": "contract_runtime",
+        },
+    )
+    gate_ctx = _ctx(
+        {"project_id": PID, "bug_id": backlog_id},
+        query={"view": "full", "limit": "10"},
+    )
+    try:
+        stale_visualization = (
+            server.handle_project_contract_runtime_visualization(
+                visualization_ctx
+            )
+        )
+        stale_gate = server.handle_backlog_timeline_gate(gate_ctx)
+        assert stale_visualization["warm_cache"]["status"] == "miss"
+        assert stale_gate["warm_cache"]["status"] == "miss"
+        assert any(
+            target.get("repair_id") == "stale-authority"
+            for target in stale_visualization["repair_targets"]
+        )
+
+        active["conn"] = fresh_conn
+        fresh_visualization = (
+            server.handle_project_contract_runtime_visualization(
+                visualization_ctx
+            )
+        )
+        fresh_gate = server.handle_backlog_timeline_gate(gate_ctx)
+        assert fresh_visualization["warm_cache"]["status"] == "miss"
+        assert fresh_gate["warm_cache"]["status"] == "miss"
+        assert fresh_visualization["warm_cache"]["identity_hash"] != (
+            stale_visualization["warm_cache"]["identity_hash"]
+        )
+        assert fresh_gate["warm_cache"]["identity_hash"] != (
+            stale_gate["warm_cache"]["identity_hash"]
+        )
+        assert not any(
+            target.get("repair_id") == "stale-authority"
+            for target in fresh_visualization["repair_targets"]
+        )
+
+        for selected, expects_stale_repair in (
+            (stale_conn, True),
+            (fresh_conn, False),
+            (stale_conn, True),
+            (fresh_conn, False),
+        ):
+            active["conn"] = selected
+            repeated = server.handle_project_contract_runtime_visualization(
+                visualization_ctx
+            )
+            assert repeated["warm_cache"]["status"] == "hit"
+            assert any(
+                target.get("repair_id") == "stale-authority"
+                for target in repeated["repair_targets"]
+            ) is expects_stale_repair
+    finally:
+        server._timeline_warm_cache_clear()
+        stale_conn.close()
+        fresh_conn.close()
+
+
 def test_timeline_gate_authoritatively_accepts_completed_mf_parallel_runtime_chain(
     conn,
     tmp_path,

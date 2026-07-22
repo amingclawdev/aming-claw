@@ -13769,6 +13769,272 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertGreater(fresh_a["warm_cache"]["response_bytes"], 0)
         self.assertGreaterEqual(fresh_a["warm_cache"]["cold_latency_ms"], 0)
 
+    def test_warm_cache_db_scope_isolated_for_memory_and_shared_for_file(self):
+        from agent.governance import server
+
+        server._timeline_warm_cache_clear()
+        memory_a = sqlite3.connect(":memory:")
+        memory_b = sqlite3.connect(":memory:")
+        try:
+            self.assertFalse(memory_a.in_transaction)
+            scope_a = server._timeline_warm_cache_db_scope(memory_a)
+            scope_a_again = server._timeline_warm_cache_db_scope(memory_a)
+            scope_b = server._timeline_warm_cache_db_scope(memory_b)
+            self.assertEqual(scope_a, scope_a_again)
+            self.assertNotEqual(scope_a, scope_b)
+            self.assertFalse(memory_a.in_transaction)
+            self.assertFalse(memory_b.in_transaction)
+
+            identity_a, generation_a, cached_a, metadata_a = (
+                server._timeline_warm_cache_prepare(
+                    memory_a,
+                    endpoint="timeline_list",
+                    project_id="same-project",
+                    query={"limit": "1"},
+                )
+            )
+            self.assertIsNone(cached_a)
+            server._timeline_warm_cache_store(
+                identity_a,
+                generation_a,
+                {"ok": True, "source": "memory-a"},
+                metadata_a,
+            )
+            _, _, cached_b, metadata_b = server._timeline_warm_cache_prepare(
+                memory_b,
+                endpoint="timeline_list",
+                project_id="same-project",
+                query={"limit": "1"},
+            )
+            self.assertIsNone(cached_b)
+            self.assertEqual(metadata_b["status"], "miss")
+            self.assertNotEqual(
+                metadata_a["identity_hash"],
+                metadata_b["identity_hash"],
+            )
+        finally:
+            memory_a.close()
+            memory_b.close()
+            server._timeline_warm_cache_clear()
+
+        shared_path = Path(self.tmp.name) / "same-file-cache.db"
+        file_a = sqlite3.connect(shared_path)
+        file_b = sqlite3.connect(shared_path)
+        try:
+            self.assertEqual(
+                server._timeline_warm_cache_db_scope(file_a),
+                server._timeline_warm_cache_db_scope(file_b),
+            )
+            identity_a, generation_a, cached_a, metadata_a = (
+                server._timeline_warm_cache_prepare(
+                    file_a,
+                    endpoint="timeline_list",
+                    project_id="same-project",
+                    query={"limit": "1"},
+                )
+            )
+            self.assertIsNone(cached_a)
+            server._timeline_warm_cache_store(
+                identity_a,
+                generation_a,
+                {"ok": True, "source": "same-file"},
+                metadata_a,
+            )
+            _, _, cached_b, metadata_b = server._timeline_warm_cache_prepare(
+                file_b,
+                endpoint="timeline_list",
+                project_id="same-project",
+                query={"limit": "1"},
+            )
+            self.assertEqual(cached_b["source"], "same-file")
+            self.assertEqual(metadata_b["status"], "hit")
+        finally:
+            file_a.close()
+            file_b.close()
+            server._timeline_warm_cache_clear()
+
+    def test_backlog_generation_tracks_same_second_runtime_authority_and_edges(self):
+        from agent.governance import server
+
+        server._timeline_warm_cache_clear()
+        server._contract_runtime_store(self.conn)
+        fixed_time = "2026-07-22T05:00:00Z"
+        for suffix in ("A", "B"):
+            backlog_id = f"BUG-CACHE-AUTHORITY-{suffix}"
+            execution_id = f"cex-cache-authority-{suffix.lower()}"
+            chain_id = f"chain-cache-authority-{suffix.lower()}"
+            self.conn.execute(
+                """INSERT INTO backlog_bugs
+                   (bug_id, title, status, priority, created_at, updated_at)
+                   VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
+                (backlog_id, backlog_id, fixed_time, fixed_time),
+            )
+            record = {
+                "contract_execution_id": execution_id,
+                "project_id": "proj",
+                "backlog_id": backlog_id,
+                "contract_id": "mf_parallel.v2",
+                "version": "2",
+                "revision": "r1",
+                "contract_chain_id": chain_id,
+                "execution_state_revision": 5,
+                "state": "active",
+                "authority_marker": f"{suffix}-old",
+            }
+            self.conn.execute(
+                """INSERT INTO contract_runtime_executions
+                   (contract_execution_id, project_id, backlog_id, contract_id,
+                    version, revision, parent_contract_execution_id,
+                    root_contract_execution_id, contract_chain_id,
+                    execution_state_revision, record_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)""",
+                (
+                    execution_id,
+                    "proj",
+                    backlog_id,
+                    "mf_parallel.v2",
+                    "2",
+                    "r1",
+                    execution_id,
+                    chain_id,
+                    5,
+                    json.dumps(record, sort_keys=True),
+                    fixed_time,
+                    fixed_time,
+                ),
+            )
+            self.conn.execute(
+                """INSERT INTO backlog_contract_chain_current
+                   (project_id, backlog_id, contract_chain_id,
+                    root_contract_execution_id, current_contract_execution_id,
+                    current_contract_id, readiness_state, generation,
+                    projection_watermark, projection_hash, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'mf_parallel.v2', 'active', 5, 5, ?, ?)""",
+                (
+                    "proj",
+                    backlog_id,
+                    chain_id,
+                    execution_id,
+                    execution_id,
+                    f"projection-{suffix}",
+                    fixed_time,
+                ),
+            )
+        self.conn.execute(
+            """INSERT INTO contract_chain_edges
+               (edge_key, project_id, backlog_id, contract_chain_id,
+                parent_contract_execution_id, child_contract_execution_id,
+                root_contract_execution_id, edge_kind, generation,
+                source_ref, source_hash, metadata_json, created_at)
+               VALUES (?, 'proj', 'BUG-CACHE-AUTHORITY-A', ?, ?, ?, ?,
+                       'successor', 5, 'fixture', 'edge-old', '{}', ?)""",
+            (
+                "edge-cache-authority-a",
+                "chain-cache-authority-a",
+                "cex-cache-authority-a",
+                "cex-cache-authority-a",
+                "cex-cache-authority-a",
+                fixed_time,
+            ),
+        )
+        self.conn.commit()
+
+        query = {"backlog_id": "BUG-CACHE-AUTHORITY-A", "limit": "10"}
+        resource = {
+            "backlog_id": "BUG-CACHE-AUTHORITY-A",
+            "public_authority": "contract_runtime",
+        }
+
+        def prepare():
+            return server._timeline_warm_cache_prepare(
+                self.conn,
+                endpoint="contract_runtime_visualization",
+                project_id="proj",
+                query=query,
+                resource_identity=resource,
+            )
+
+        identity, generation, cached, metadata = prepare()
+        self.assertIsNone(cached)
+        server._timeline_warm_cache_store(
+            identity,
+            generation,
+            {"ok": True, "authority": "A-old"},
+            metadata,
+        )
+
+        unrelated_record = json.loads(
+            self.conn.execute(
+                """SELECT record_json FROM contract_runtime_executions
+                   WHERE contract_execution_id = 'cex-cache-authority-b'"""
+            ).fetchone()[0]
+        )
+        unrelated_record["execution_state_revision"] = 6
+        unrelated_record["authority_marker"] = "B-new-same-second"
+        self.conn.execute(
+            """UPDATE contract_runtime_executions
+               SET execution_state_revision = 6, record_json = ?
+               WHERE contract_execution_id = 'cex-cache-authority-b'""",
+            (json.dumps(unrelated_record, sort_keys=True),),
+        )
+        self.conn.commit()
+        _, _, unrelated_cached, unrelated_metadata = prepare()
+        self.assertEqual(unrelated_cached["authority"], "A-old")
+        self.assertEqual(unrelated_metadata["status"], "hit")
+
+        authority_record = json.loads(
+            self.conn.execute(
+                """SELECT record_json FROM contract_runtime_executions
+                   WHERE contract_execution_id = 'cex-cache-authority-a'"""
+            ).fetchone()[0]
+        )
+        authority_record["execution_state_revision"] = 6
+        authority_record["authority_marker"] = "A-new-same-second"
+        self.conn.execute(
+            """UPDATE contract_runtime_executions
+               SET execution_state_revision = 6, record_json = ?
+               WHERE contract_execution_id = 'cex-cache-authority-a'""",
+            (json.dumps(authority_record, sort_keys=True),),
+        )
+        self.conn.commit()
+        fresh_identity, fresh_generation, fresh_cached, fresh_metadata = prepare()
+        self.assertIsNone(fresh_cached)
+        self.assertEqual(fresh_metadata["miss_reason"], "freshness_changed")
+        self.assertEqual(generation["contract_runtime_updated_at"], fixed_time)
+        self.assertEqual(fresh_generation["contract_runtime_updated_at"], fixed_time)
+        self.assertEqual(generation["contract_chain_edge_id"], fresh_generation["contract_chain_edge_id"])
+        self.assertEqual(generation["current_runtime_execution_revision"], "5")
+        self.assertEqual(fresh_generation["current_runtime_execution_revision"], "6")
+        self.assertNotEqual(
+            generation["current_runtime_record_digest"],
+            fresh_generation["current_runtime_record_digest"],
+        )
+        server._timeline_warm_cache_store(
+            fresh_identity,
+            fresh_generation,
+            {"ok": True, "authority": "A-new"},
+            fresh_metadata,
+        )
+
+        self.conn.execute(
+            """UPDATE contract_chain_edges
+               SET source_hash = 'edge-new-same-id'
+               WHERE edge_key = 'edge-cache-authority-a'"""
+        )
+        self.conn.commit()
+        _, edge_generation, edge_cached, edge_metadata = prepare()
+        self.assertIsNone(edge_cached)
+        self.assertEqual(edge_metadata["miss_reason"], "freshness_changed")
+        self.assertEqual(
+            fresh_generation["contract_chain_edge_id"],
+            edge_generation["contract_chain_edge_id"],
+        )
+        self.assertNotEqual(
+            fresh_generation["contract_chain_edge_digest"],
+            edge_generation["contract_chain_edge_digest"],
+        )
+        server._timeline_warm_cache_clear()
+
     def test_backlog_warm_cache_is_bounded_and_query_exact(self):
         from agent.governance import server, task_timeline
 

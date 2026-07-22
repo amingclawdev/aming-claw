@@ -81688,7 +81688,7 @@ def handle_task_timeline_append(ctx: RequestContext):
         return result
 
 
-_TIMELINE_WARM_CACHE_SCHEMA_VERSION = "task_timeline.warm_cache.v1"
+_TIMELINE_WARM_CACHE_SCHEMA_VERSION = "task_timeline.warm_cache.v2"
 try:
     _TIMELINE_WARM_CACHE_TTL_SECONDS = max(
         0.1,
@@ -81713,6 +81713,9 @@ except (TypeError, ValueError):
 _TIMELINE_WARM_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _TIMELINE_WARM_CACHE_RESOURCE_KEYS: OrderedDict[str, str] = OrderedDict()
 _TIMELINE_WARM_CACHE_IN_FLIGHT: dict[str, dict[str, Any]] = {}
+_TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES: OrderedDict[
+    int, tuple[sqlite3.Connection, str]
+] = OrderedDict()
 _TIMELINE_WARM_CACHE_LOCK = RLock()
 _TIMELINE_WARM_CACHE_LOCAL = local()
 _TIMELINE_WARM_CACHE_EVICTION_COUNT = 0
@@ -81746,6 +81749,7 @@ def _timeline_warm_cache_clear() -> None:
         _TIMELINE_WARM_CACHE.clear()
         _TIMELINE_WARM_CACHE_RESOURCE_KEYS.clear()
         _TIMELINE_WARM_CACHE_IN_FLIGHT.clear()
+        _TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES.clear()
         _TIMELINE_WARM_CACHE_EVICTION_COUNT = 0
     for event in pending:
         event.set()
@@ -81820,8 +81824,56 @@ def _timeline_warm_cache_query_identity(query: Mapping[str, Any]) -> list[list[A
     return normalized
 
 
+def _timeline_warm_cache_anonymous_db_scope(conn: sqlite3.Connection) -> str:
+    """Return one connection-lifetime scope for a pathless SQLite database.
+
+    sqlite3.Connection cannot be weak-referenced or assigned arbitrary Python
+    attributes.  A TEMP view is connection-local and is dropped automatically
+    when the connection closes, so its random suffix is a natural lifetime
+    identity with no global retention or ``id()`` reuse risk.  The bounded
+    object registry is only a fail-safe for unusual connections that reject
+    TEMP DDL; retaining the object alongside its id makes reuse impossible
+    while an entry is live, and eviction only causes a safe cache miss.
+    """
+
+    marker_prefix = "__aming_timeline_warm_cache_scope_"
+    try:
+        row = conn.execute(
+            """
+            SELECT name
+            FROM sqlite_temp_master
+            WHERE type = 'view' AND name LIKE ?
+            ORDER BY name
+            LIMIT 1
+            """,
+            (f"{marker_prefix}%",),
+        ).fetchone()
+        marker_name = str(row[0] or "") if row is not None else ""
+        if not marker_name:
+            marker_name = f"{marker_prefix}{uuid.uuid4().hex}"
+            conn.execute(f'CREATE TEMP VIEW "{marker_name}" AS SELECT 1 AS scope')
+        marker_token = marker_name[len(marker_prefix) :]
+    except (sqlite3.Error, TypeError, IndexError):
+        connection_id = id(conn)
+        with _TIMELINE_WARM_CACHE_LOCK:
+            entry = _TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES.get(connection_id)
+            if entry is None or entry[0] is not conn:
+                entry = (conn, uuid.uuid4().hex)
+                _TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES[connection_id] = entry
+            _TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES.move_to_end(connection_id)
+            while (
+                len(_TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES)
+                > _TIMELINE_WARM_CACHE_MAX_ENTRIES
+            ):
+                _TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES.popitem(last=False)
+            marker_token = entry[1]
+    return hashlib.sha256(
+        f"anonymous-sqlite:{marker_token}".encode("utf-8")
+    ).hexdigest()[:20]
+
+
 def _timeline_warm_cache_db_scope(conn: sqlite3.Connection) -> str:
-    """Hash the backing DB path so same-named test/project DBs never collide."""
+    """Scope file DBs by canonical path and pathless DBs by connection."""
 
     try:
         rows = conn.execute("PRAGMA database_list").fetchall()
@@ -81835,7 +81887,42 @@ def _timeline_warm_cache_db_scope(conn: sqlite3.Connection) -> str:
         )
     except (sqlite3.Error, TypeError, IndexError):
         database_path = ""
-    return hashlib.sha256(database_path.encode("utf-8")).hexdigest()[:20]
+    if not database_path or database_path == ":memory:":
+        return _timeline_warm_cache_anonymous_db_scope(conn)
+    canonical_path = str(Path(database_path).expanduser().resolve(strict=False))
+    return hashlib.sha256(
+        f"sqlite-file:{canonical_path}".encode("utf-8")
+    ).hexdigest()[:20]
+
+
+def _timeline_warm_cache_rows_digest(
+    conn: sqlite3.Connection,
+    sql: str,
+    params: Sequence[Any] = (),
+) -> tuple[str, str]:
+    """Return a stable row count and digest without retaining record bodies."""
+
+    try:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    except sqlite3.Error:
+        return "0", ""
+    digest = hashlib.sha256()
+    for row in rows:
+        values = (
+            list(row)
+            if not isinstance(row, Mapping)
+            else list(dict(row).values())
+        )
+        digest.update(
+            json.dumps(
+                values,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return str(len(rows)), digest.hexdigest() if rows else ""
 
 
 def _timeline_warm_cache_scalar(
@@ -81922,6 +82009,47 @@ def _timeline_warm_cache_resource_generation(
             contract_execution_id
             or (_row_get(chain_row, "current_contract_execution_id", "") if chain_row else "")
         ).strip()
+        current_runtime_count, current_runtime_digest = (
+            _timeline_warm_cache_rows_digest(
+                conn,
+                """
+                SELECT contract_execution_id, execution_state_revision,
+                       record_json
+                FROM contract_runtime_executions
+                WHERE project_id = ? AND backlog_id = ?
+                  AND contract_execution_id = ?
+                ORDER BY contract_execution_id
+                """,
+                (project_id, backlog_id, current_execution_id),
+            )
+            if current_execution_id
+            else ("0", "")
+        )
+        runtime_record_count, runtime_record_digest = (
+            _timeline_warm_cache_rows_digest(
+                conn,
+                """
+                SELECT contract_execution_id, execution_state_revision
+                FROM contract_runtime_executions
+                WHERE project_id = ? AND backlog_id = ?
+                ORDER BY contract_execution_id
+                """,
+                (project_id, backlog_id),
+            )
+        )
+        chain_edge_count, chain_edge_digest = _timeline_warm_cache_rows_digest(
+            conn,
+            """
+            SELECT id, edge_key, contract_chain_id,
+                   parent_contract_execution_id,
+                   child_contract_execution_id, edge_kind,
+                   generation, source_ref, source_hash, metadata_json
+            FROM contract_chain_edges
+            WHERE project_id = ? AND backlog_id = ?
+            ORDER BY id
+            """,
+            (project_id, backlog_id),
+        )
         return {
             "db_scope": db_scope,
             "scope": "backlog_contract_chain",
@@ -81940,6 +82068,21 @@ def _timeline_warm_cache_resource_generation(
             "projection_hash": str(
                 _row_get(chain_row, "projection_hash", "") if chain_row else ""
             ),
+            "current_runtime_record_count": current_runtime_count,
+            "current_runtime_execution_revision": _timeline_warm_cache_scalar(
+                conn,
+                """
+                SELECT execution_state_revision
+                FROM contract_runtime_executions
+                WHERE project_id = ? AND backlog_id = ?
+                  AND contract_execution_id = ?
+                LIMIT 1
+                """,
+                (project_id, backlog_id, current_execution_id),
+            ) if current_execution_id else "",
+            "current_runtime_record_digest": current_runtime_digest,
+            "contract_runtime_record_count": runtime_record_count,
+            "contract_runtime_record_digest": runtime_record_digest,
             "timeline_event_id": _timeline_warm_cache_scalar(
                 conn,
                 "SELECT COALESCE(MAX(id), 0) FROM task_timeline_events WHERE project_id = ? AND backlog_id = ?",
@@ -81973,6 +82116,8 @@ def _timeline_warm_cache_resource_generation(
                 "SELECT COALESCE(MAX(id), 0) FROM contract_chain_edges WHERE project_id = ? AND backlog_id = ?",
                 (project_id, backlog_id),
             ) or "0",
+            "contract_chain_edge_count": chain_edge_count,
+            "contract_chain_edge_digest": chain_edge_digest,
             "contract_chain_updated_at": str(
                 _row_get(chain_row, "updated_at", "") if chain_row else ""
             ),
