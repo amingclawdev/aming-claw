@@ -2899,7 +2899,24 @@ def _qa_independent_verification_canonical_no_pass_completion(
         re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base_commit)
         and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_commit)
         and line_commit == candidate_commit
-        and payload_base_commit == base_commit
+    ):
+        return False
+    # The canonical v2 ledger is written by the server from the DB-verified QA
+    # graph tuple.  Payload copies of that tuple are compatibility fields, not
+    # a second authority source: current accepted lines may omit either copy.
+    # Preserve fail-closed handling for contradictory copies when present.
+    if (
+        ("base_commit_sha" in payload and payload_base_commit != base_commit)
+        or (
+            "candidate_commit_sha" in payload
+            and payload_candidate_commit != candidate_commit
+        )
+    ):
+        return False
+    # Marker-absent compatibility remains pinned to the immutable historical
+    # line and its complete redundant server-derived authority shape.
+    if ledger.get("server_normalized") is not True and not (
+        payload_base_commit == base_commit
         and payload_candidate_commit == candidate_commit
     ):
         return False
