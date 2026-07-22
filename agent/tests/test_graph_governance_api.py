@@ -62089,7 +62089,9 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
         )
     )
     actual_worker_id = runtime_context.worker_slot_id
-    native_worker_session_id = "codex-session-contract-canonical-worker"
+    native_worker_session_id = (
+        "codex-subagent-failed_qa_rejoin_boundary_worker"
+    )
     runtime_context = upsert_branch_context(
         conn,
         replace(
@@ -62209,6 +62211,13 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
         )
     )
     assert startup_response["ok"] is True
+    startup_event = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=worker_task_id,
+        event_kind="mf_subagent_startup",
+    )[-1]
+    assert startup_event["payload"]["meta_contract_gate"]["role"] == "mf_sub"
     contract_record = server._contract_runtime_store(conn).get(
         contract_execution_id
     )

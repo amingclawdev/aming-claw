@@ -1043,6 +1043,57 @@ def test_meta_contract_allows_host_adapter_server_verified_session_startup() -> 
     assert gate["action"] == "mf_subagent_startup"
 
 
+@pytest.mark.parametrize(
+    "principal",
+    [
+        "codex-subagent-failed_qa_rejoin_boundary_worker",
+        "codex-subagent-qa_drift_repair_worker",
+    ],
+)
+def test_meta_contract_worker_principal_ignores_incidental_qa_token(
+    principal: str,
+) -> None:
+    gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "mf_subagent.startup",
+            "event_kind": "mf_subagent_startup",
+            "actor": principal,
+            "status": "accepted",
+            "payload": {
+                "mf_subagent_startup_gate": {
+                    "schema_version": "mf_subagent_startup_gate.v1",
+                    "agent_id_match_mode": "initial_join_actual_host_worker",
+                    "session_token_evidence_type": "server_verified",
+                    "server_issued_session_token_verified": True,
+                    "close_satisfying": True,
+                }
+            },
+        }
+    )
+
+    assert gate["allowed"] is True
+    assert gate["role"] == MF_SUB_ROLE
+    assert gate["action"] == "mf_subagent_startup"
+
+
+@pytest.mark.parametrize("principal", ["qa-repair-worker", "reviewer-worker"])
+def test_meta_contract_explicit_qa_principal_stays_fail_closed(
+    principal: str,
+) -> None:
+    with pytest.raises(
+        MfSubagentContractError,
+        match="role=qa action=implementation",
+    ):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "implementation",
+                "event_kind": "implementation",
+                "actor": principal,
+                "status": "passed",
+            }
+        )
+
+
 def test_meta_contract_ignores_forged_payload_gate_for_action_derivation() -> None:
     with pytest.raises(MfSubagentContractError, match="unknown timeline action"):
         validate_meta_contract_timeline_event(

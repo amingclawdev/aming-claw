@@ -5749,10 +5749,23 @@ def _meta_normalize_role(value: Any) -> str:
         return "judge"
     if any(token in role for token in _META_OBSERVER_ROLE_TOKENS):
         return OBSERVER_COORDINATOR_ROLE
-    if role.startswith("qa") or any(token in role for token in _META_QA_ROLE_TOKENS):
+    explicit_qa_role = any(
+        role == token
+        or role.startswith(f"{token}_")
+        or role.startswith(f"{token}:")
+        or role.startswith(f"{token}/")
+        for token in _META_QA_ROLE_TOKENS
+    )
+    if explicit_qa_role:
         return "qa"
+    # Host-created worker principals can include the name of the repair they
+    # are executing (for example ``failed_qa_rejoin``).  A QA token inside
+    # that task-derived suffix must not override an explicit subagent/worker
+    # identity.  Explicit leading QA/reviewer/verifier roles remain QA above.
     if any(token in role for token in _META_WORKER_ROLE_TOKENS):
         return MF_SUB_ROLE
+    if any(token in role for token in _META_QA_ROLE_TOKENS):
+        return "qa"
     if "operator" in role:
         return "operator"
     return role
