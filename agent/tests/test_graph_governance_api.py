@@ -69324,6 +69324,36 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert canonical_ledger["overall_release_pass_claimed"] is False
     assert _line_status_allows_contract_completion(qa_line) is True
 
+    # Current server-normalized authority lives in the canonical ledger.  The
+    # QA caller may omit the redundant payload commit tuple without turning an
+    # accepted no-PASS line into failed QA in the source-runtime projection.
+    canonical_without_payload_commit_copies = json.loads(json.dumps(qa_line))
+    canonical_without_payload_commit_copies["payload"].pop("base_commit_sha")
+    canonical_without_payload_commit_copies["payload"].pop(
+        "candidate_commit_sha"
+    )
+    assert (
+        _line_status_allows_contract_completion(
+            canonical_without_payload_commit_copies
+        )
+        is True
+    )
+    completion_projection = _contract_completion_satisfying_lines(
+        [canonical_without_payload_commit_copies]
+    )
+    assert completion_projection == [canonical_without_payload_commit_copies]
+
+    # Redundant copies remain consistency checks when supplied; a partial or
+    # full contradictory tuple still fails closed.
+    contradictory_payload_copy = json.loads(
+        json.dumps(canonical_without_payload_commit_copies)
+    )
+    contradictory_payload_copy["payload"]["base_commit_sha"] = "f" * 40
+    assert (
+        _line_status_allows_contract_completion(contradictory_payload_copy)
+        is False
+    )
+
     # Runtime 469e accepted and authenticated this exact no-PASS shape before
     # it could persist the server_normalized ledger marker.  Its redundant
     # server-derived bindings remain sufficient for read-only compatibility.
