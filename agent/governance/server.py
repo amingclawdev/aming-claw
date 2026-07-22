@@ -81700,6 +81700,21 @@ try:
 except (TypeError, ValueError):
     _TIMELINE_WARM_CACHE_TTL_SECONDS = 5.0
 try:
+    _TIMELINE_HISTORICAL_CACHE_TTL_SECONDS = max(
+        120.0,
+        min(
+            float(
+                os.environ.get(
+                    "AMING_TIMELINE_HISTORICAL_CACHE_TTL_SECONDS",
+                    "180",
+                )
+            ),
+            300.0,
+        ),
+    )
+except (TypeError, ValueError):
+    _TIMELINE_HISTORICAL_CACHE_TTL_SECONDS = 180.0
+try:
     _TIMELINE_WARM_CACHE_MAX_ENTRIES = max(
         1,
         min(
@@ -81709,6 +81724,21 @@ try:
     )
 except (TypeError, ValueError):
     _TIMELINE_WARM_CACHE_MAX_ENTRIES = 128
+try:
+    _TIMELINE_HISTORICAL_CACHE_MAX_ENTRIES = max(
+        8,
+        min(
+            int(
+                os.environ.get(
+                    "AMING_TIMELINE_HISTORICAL_CACHE_MAX_ENTRIES",
+                    "64",
+                )
+            ),
+            512,
+        ),
+    )
+except (TypeError, ValueError):
+    _TIMELINE_HISTORICAL_CACHE_MAX_ENTRIES = 64
 
 _TIMELINE_WARM_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _TIMELINE_WARM_CACHE_RESOURCE_KEYS: OrderedDict[str, str] = OrderedDict()
@@ -81951,6 +81981,37 @@ def _timeline_warm_cache_query_value(
     if isinstance(raw, (list, tuple)):
         raw = raw[0] if raw else ""
     return str(raw or "").strip()
+
+
+def _timeline_warm_cache_policy(
+    *,
+    endpoint: str,
+    query: Mapping[str, Any],
+) -> tuple[str, float, int]:
+    """Keep historical/search LRU entries separate from the live hot window."""
+
+    try:
+        offset = int(_timeline_warm_cache_query_value(query, "offset") or "0")
+    except (TypeError, ValueError):
+        offset = 0
+    historical = bool(
+        _timeline_warm_cache_query_value(query, "q")
+        or _timeline_warm_cache_query_value(query, "exact_event_id")
+        or _timeline_warm_cache_query_value(query, "before_event_id")
+        or offset > 0
+        or endpoint in {"timeline_get"}
+    )
+    if historical:
+        return (
+            "historical_ttl_lru",
+            _TIMELINE_HISTORICAL_CACHE_TTL_SECONDS,
+            _TIMELINE_HISTORICAL_CACHE_MAX_ENTRIES,
+        )
+    return (
+        "hot_window",
+        _TIMELINE_WARM_CACHE_TTL_SECONDS,
+        _TIMELINE_WARM_CACHE_MAX_ENTRIES,
+    )
 
 
 def _timeline_warm_cache_resource_generation(
@@ -82227,6 +82288,9 @@ def _timeline_warm_cache_prepare(
     resource_identity: Mapping[str, Any] | None = None,
 ) -> tuple[str, dict[str, str], dict[str, Any] | None, dict[str, Any]]:
     prepare_started = time.monotonic()
+    cache_pool, cache_ttl_seconds, cache_max_entries = (
+        _timeline_warm_cache_policy(endpoint=endpoint, query=query)
+    )
     generation = _timeline_warm_cache_resource_generation(
         conn,
         project_id,
@@ -82245,6 +82309,7 @@ def _timeline_warm_cache_prepare(
     stable_identity = {
         "endpoint": endpoint,
         "project_id": project_id,
+        "cache_pool": cache_pool,
         "resource": resource,
         "query": query_identity,
         "db_scope": generation["db_scope"],
@@ -82277,7 +82342,7 @@ def _timeline_warm_cache_prepare(
             key
             for key, entry in _TIMELINE_WARM_CACHE.items()
             if now - float(entry.get("stored_at") or 0.0)
-            >= _TIMELINE_WARM_CACHE_TTL_SECONDS
+            >= float(entry.get("ttl_seconds") or _TIMELINE_WARM_CACHE_TTL_SECONDS)
         ]
         for key in expired_keys:
             _TIMELINE_WARM_CACHE.pop(key, None)
@@ -82297,7 +82362,10 @@ def _timeline_warm_cache_prepare(
         entry = _TIMELINE_WARM_CACHE.get(identity_hash)
         if entry is not None:
             age_seconds = max(0.0, now - float(entry.get("stored_at") or now))
-            if age_seconds >= _TIMELINE_WARM_CACHE_TTL_SECONDS:
+            entry_ttl_seconds = float(
+                entry.get("ttl_seconds") or _TIMELINE_WARM_CACHE_TTL_SECONDS
+            )
+            if age_seconds >= entry_ttl_seconds:
                 miss_reason = "expired"
                 _TIMELINE_WARM_CACHE.pop(identity_hash, None)
             else:
@@ -82336,7 +82404,10 @@ def _timeline_warm_cache_prepare(
                     time.monotonic()
                     - float(entry.get("stored_at") or time.monotonic()),
                 )
-                if age_seconds < _TIMELINE_WARM_CACHE_TTL_SECONDS:
+                entry_ttl_seconds = float(
+                    entry.get("ttl_seconds") or _TIMELINE_WARM_CACHE_TTL_SECONDS
+                )
+                if age_seconds < entry_ttl_seconds:
                     cached_payload = deepcopy(entry.get("payload") or {})
                     response_bytes = int(entry.get("response_bytes") or 0)
                     age_ms = int(age_seconds * 1000)
@@ -82411,8 +82482,9 @@ def _timeline_warm_cache_prepare(
         "hit": cached_payload is not None,
         "miss_reason": "" if cached_payload is not None else miss_reason,
         "age_ms": age_ms,
-        "ttl_ms": int(_TIMELINE_WARM_CACHE_TTL_SECONDS * 1000),
-        "max_entries": _TIMELINE_WARM_CACHE_MAX_ENTRIES,
+        "ttl_ms": int(cache_ttl_seconds * 1000),
+        "max_entries": cache_max_entries,
+        "cache_pool": cache_pool,
         "entry_count": entry_count,
         "identity_hash": identity_hash,
         "identity": identity,
@@ -82481,13 +82553,24 @@ def _timeline_warm_cache_store(
             # running, and that old leader must not overwrite or release it.
             _TIMELINE_WARM_CACHE[identity_hash] = {
                 "stored_at": time.monotonic(),
+                "ttl_seconds": float(miss_metadata.get("ttl_ms") or 0) / 1000.0,
+                "cache_pool": str(miss_metadata.get("cache_pool") or "hot_window"),
                 "watermark": dict(watermark),
                 "payload": deepcopy(payload),
                 "response_bytes": response_bytes,
             }
             _TIMELINE_WARM_CACHE.move_to_end(identity_hash)
-            while len(_TIMELINE_WARM_CACHE) > _TIMELINE_WARM_CACHE_MAX_ENTRIES:
-                _TIMELINE_WARM_CACHE.popitem(last=False)
+            cache_pool = str(miss_metadata.get("cache_pool") or "hot_window")
+            cache_pool_limit = int(
+                miss_metadata.get("max_entries") or _TIMELINE_WARM_CACHE_MAX_ENTRIES
+            )
+            pool_keys = [
+                key
+                for key, entry in _TIMELINE_WARM_CACHE.items()
+                if str(entry.get("cache_pool") or "hot_window") == cache_pool
+            ]
+            while len(pool_keys) > cache_pool_limit:
+                _TIMELINE_WARM_CACHE.pop(pool_keys.pop(0), None)
                 evicted_count += 1
             _TIMELINE_WARM_CACHE_EVICTION_COUNT += evicted_count
             _TIMELINE_WARM_CACHE_IN_FLIGHT.pop(identity_hash, None)

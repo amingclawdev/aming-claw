@@ -1746,12 +1746,15 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
       && apiSource.includes("public_authority: \"contract_runtime\"")
       && apiSource.includes("before_event_id: \"0\"")
       && apiSource.includes("view: \"public\"")
-      && apiSource.match(/taskTimelineFor\([\s\S]*?taskPlaybackBootstrapFor\(projectId, backlogId, limit, signal\)/) !== null
-      && apiSource.match(/backlogTimelineGateFor\([\s\S]*?taskPlaybackBootstrapFor\(projectId, backlogId, limit, signal\)/) !== null
+      && apiSource.includes("const TASK_PLAYBACK_HOT_WINDOW_LIMIT = 50")
+      && apiSource.includes("function taskPlaybackHotWindowLimit")
+      && apiSource.match(/taskTimelineFor\([\s\S]*?taskPlaybackBootstrapFor\(projectId, backlogId, boundedLimit, signal\)/) !== null
+      && apiSource.match(/backlogTimelineGateFor\([\s\S]*?taskPlaybackBootstrapFor\(projectId, backlogId, boundedLimit, signal\)/) !== null
+      && apiSource.match(/recentTimelineFor\([\s\S]*?taskPlaybackHotWindowLimit\(limit\)/) !== null
       && apiSource.includes("bootstrap.backlog_timeline_gate")
       && !apiSource.includes("const authorityRequest = api.contractRuntimeVisualizationFor")
       && apiSource.includes("if (publicReadSingleFlights.get(key) === shared) publicReadSingleFlights.delete(key)"),
-    "playback timeline, visualization, and gate reads should share one compact bootstrap GET while preserving exact-event identity and independent caller abort semantics",
+    "Activity and Playback should use 50-row hot windows and share one compact bootstrap GET while preserving exact-event identity and independent caller abort semantics",
   );
   const selectedActionFrame = nextActionTrace.frames.find((frame) => frame.source_event_id === "43");
   const nextActionPresentations = taskPlaybackNextLegalActionPresentations(nextActionTrace, selectedActionFrame?.id);

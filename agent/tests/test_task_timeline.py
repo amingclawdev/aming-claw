@@ -14035,6 +14035,68 @@ class TestTaskTimeline(unittest.TestCase):
         )
         server._timeline_warm_cache_clear()
 
+    def test_historical_cache_uses_separate_180_second_lru_pool(self):
+        from agent.governance import server
+
+        server._timeline_warm_cache_clear()
+        hot_identity, hot_generation, hot_cached, hot_metadata = (
+            server._timeline_warm_cache_prepare(
+                self.conn,
+                endpoint="timeline_recent",
+                project_id="proj",
+                query={"limit": "50"},
+            )
+        )
+        self.assertIsNone(hot_cached)
+        self.assertEqual(hot_metadata["cache_pool"], "hot_window")
+        server._timeline_warm_cache_store(
+            hot_identity,
+            hot_generation,
+            {"ok": True, "source": "hot"},
+            hot_metadata,
+        )
+
+        with mock.patch.object(server, "_TIMELINE_HISTORICAL_CACHE_MAX_ENTRIES", 1):
+            for query in (
+                {"q": "older event", "offset": "0", "limit": "50"},
+                {"exact_event_id": "41", "limit": "50"},
+            ):
+                identity, generation, cached, metadata = (
+                    server._timeline_warm_cache_prepare(
+                        self.conn,
+                        endpoint="timeline_list",
+                        project_id="proj",
+                        query=query,
+                    )
+                )
+                self.assertIsNone(cached)
+                self.assertEqual(metadata["cache_pool"], "historical_ttl_lru")
+                self.assertEqual(metadata["ttl_ms"], 180_000)
+                server._timeline_warm_cache_store(
+                    identity,
+                    generation,
+                    {"ok": True, "source": str(query)},
+                    metadata,
+                )
+
+        _, _, hot_again, hot_again_metadata = server._timeline_warm_cache_prepare(
+            self.conn,
+            endpoint="timeline_recent",
+            project_id="proj",
+            query={"limit": "50"},
+        )
+        self.assertEqual(hot_again["source"], "hot")
+        self.assertEqual(hot_again_metadata["status"], "hit")
+        self.assertLessEqual(
+            sum(
+                1
+                for entry in server._TIMELINE_WARM_CACHE.values()
+                if entry.get("cache_pool") == "historical_ttl_lru"
+            ),
+            1,
+        )
+        server._timeline_warm_cache_clear()
+
     def test_backlog_warm_cache_is_bounded_and_query_exact(self):
         from agent.governance import server, task_timeline
 

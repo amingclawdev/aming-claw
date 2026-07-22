@@ -186,7 +186,12 @@ async function getJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
 }
 
 const PUBLIC_READ_SINGLE_FLIGHT_MAX_ENTRIES = 128;
+const TASK_PLAYBACK_HOT_WINDOW_LIMIT = 50;
 const publicReadSingleFlights = new Map<string, Promise<unknown>>();
+
+function taskPlaybackHotWindowLimit(limit: number): number {
+  return Math.max(1, Math.min(limit, TASK_PLAYBACK_HOT_WINDOW_LIMIT));
+}
 
 function awaitPublicRead<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
@@ -229,7 +234,7 @@ function taskPlaybackBootstrapFor(
   limit: number,
   signal?: AbortSignal,
 ): Promise<TaskPlaybackBootstrapResponse> {
-  const query = backlogTimelineQuery(backlogId, limit);
+  const query = backlogTimelineQuery(backlogId, taskPlaybackHotWindowLimit(limit));
   return getPublicJSONSingleFlight<TaskPlaybackBootstrapResponse>(
     `/api/task/${pidFor(projectId)}/timeline?${query}`,
     signal,
@@ -611,10 +616,11 @@ export const api = {
     );
   },
   taskTimelineFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
-    return taskPlaybackBootstrapFor(projectId, backlogId, limit, signal).then(async (taskTimeline) => {
+    const boundedLimit = taskPlaybackHotWindowLimit(limit);
+    return taskPlaybackBootstrapFor(projectId, backlogId, boundedLimit, signal).then(async (taskTimeline) => {
       const contractRuntimeVisualization = taskTimeline.contract_runtime_visualization
         ? requirePublicSafeTypedDag(taskTimeline.contract_runtime_visualization)
-        : await api.contractRuntimeVisualizationFor(projectId, backlogId, limit, signal);
+        : await api.contractRuntimeVisualizationFor(projectId, backlogId, boundedLimit, signal);
       const exactEvent = taskTimeline.exact_event;
       const events = exactEvent && !taskTimeline.events.some((event) => String(event.event_id ?? event.id ?? "") === String(exactEvent.event_id ?? exactEvent.id ?? ""))
         ? [exactEvent, ...taskTimeline.events]
@@ -641,13 +647,14 @@ export const api = {
   /** Project-wide recent timeline events, newest-first, cross-row.
    *  Each event carries backlog_id and task_id for row-tag rendering.
    */
-  recentTimelineFor(projectId: string, limit = 100, signal?: AbortSignal) {
-    const q = new URLSearchParams({ limit: String(limit) }).toString();
+  recentTimelineFor(projectId: string, limit = 50, signal?: AbortSignal) {
+    const q = new URLSearchParams({ limit: String(taskPlaybackHotWindowLimit(limit)) }).toString();
     return getJSON<RecentTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline/recent?${q}`, signal);
   },
   backlogTimelineGateFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
-    const q = backlogTimelineGateQuery(limit);
-    return taskPlaybackBootstrapFor(projectId, backlogId, limit, signal).then(
+    const boundedLimit = taskPlaybackHotWindowLimit(limit);
+    const q = backlogTimelineGateQuery(boundedLimit);
+    return taskPlaybackBootstrapFor(projectId, backlogId, boundedLimit, signal).then(
       (bootstrap) => bootstrap.backlog_timeline_gate ?? getPublicJSONSingleFlight<BacklogTimelineGateResponse>(
         `/api/backlog/${pidFor(projectId)}/${encodeURIComponent(backlogId)}/timeline-gate?${q}`,
         signal,
