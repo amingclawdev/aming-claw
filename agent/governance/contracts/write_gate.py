@@ -294,7 +294,7 @@ def validate_contract_write(
         line_id=line_id,
     )
     if reconcile_policy:
-        _validate_current_full_reconcile_evidence(
+        _validate_reconcile_record_evidence(
             errors,
             write,
             execution_state=execution_state,
@@ -696,6 +696,96 @@ def _validate_current_full_reconcile_evidence(
         == str(authority.get("reconcile_event_created_at") or "").strip()
     ):
         errors.append(f"{line_id} current-full provenance does not match marker")
+
+
+def _validate_reconcile_record_evidence(
+    errors: list[str],
+    write: Mapping[str, Any],
+    *,
+    execution_state: Mapping[str, Any],
+    line_id: str,
+    policy: Mapping[str, Any],
+) -> None:
+    """Validate the server-owned progress receipt for observer_reconcile.
+
+    Full current-full provenance, active-snapshot, commit, and scope checks are
+    close authority.  The line write only records that the observer reached
+    the reconcile step after one durable merge; it must not duplicate the
+    close gate.  Caller-shaped authority is removed before this validator is
+    reached, so the compact receipt remains server owned.
+    """
+
+    authority = _canonical_authority_object(write, policy)
+    if not authority:
+        errors.append(f"{line_id} requires one canonical reconcile record receipt")
+        return
+    if str(authority.get("schema_version") or "").strip() != (
+        "contract_runtime.observer_reconcile_record_authority.v1"
+    ):
+        errors.append(f"{line_id} requires canonical reconcile record receipt")
+    if str(authority.get("source") or "").strip() != (
+        "contract_runtime.server_reconcile_record_projection"
+    ):
+        errors.append(f"{line_id} requires server-derived reconcile record receipt")
+    for field in (
+        "server_derived",
+        "record_verified",
+        "merge_projection_verified",
+        "dispatch_lineage_verified",
+    ):
+        if authority.get(field) is not True:
+            errors.append(f"{line_id} requires authority.{field}=true")
+
+    for field in (
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "merge_queue_id",
+        "merge_source_ref",
+        "merge_event_created_at",
+    ):
+        if not str(authority.get(field) or "").strip():
+            errors.append(f"{line_id} requires authority.{field}")
+    for field in ("project_id", "backlog_id", "contract_execution_id"):
+        expected = str(execution_state.get(field) or "").strip()
+        actual = str(authority.get(field) or "").strip()
+        if expected and actual and actual != expected:
+            errors.append(f"{line_id} authority.{field} mismatch")
+    for field in (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "merge_queue_id",
+    ):
+        write_value = _write_field(write, field)
+        authority_value = str(authority.get(field) or "").strip()
+        if write_value and authority_value and write_value != authority_value:
+            errors.append(f"{line_id} authority.{field} mismatch")
+
+    merged_commit = str(authority.get("merged_commit_sha") or "").strip().lower()
+    if not _is_full_commit(merged_commit):
+        errors.append(f"{line_id} requires authority.merged_commit_sha")
+    write_commit = _write_field(write, "commit_sha").lower()
+    if write_commit and merged_commit and write_commit != merged_commit:
+        errors.append(f"{line_id} merge commit mismatch")
+    try:
+        merge_event_id = int(authority.get("merge_event_id") or 0)
+    except (TypeError, ValueError):
+        merge_event_id = 0
+    if merge_event_id <= 0:
+        errors.append(f"{line_id} requires durable merge event identity")
+
+    authority_hash = str(authority.get("authority_hash") or "").strip().lower()
+    unsigned_authority = dict(authority)
+    unsigned_authority.pop("authority_hash", None)
+    if not (
+        _is_sha256(authority_hash)
+        and stable_sha256(unsigned_authority) == authority_hash
+    ):
+        errors.append(f"{line_id} reconcile record receipt hash mismatch")
 
 
 def _verified_historical_reconcile_descendant(
