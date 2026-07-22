@@ -34119,30 +34119,57 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
             "execution_state_revision"
         ] == revision_before_negative_cases
 
-    forged_reopened_guide = json.loads(
+    producer_compatible_reopened_guide = json.loads(
         json.dumps(canonical_reopened["runtime_guide"])
     )
-    forged_reopened_guide["next_legal_action"][
-        "blocked_by_failed_qa"
-    ] = False
-    with pytest.raises(GovernanceError) as forged_guide_rejected:
-        server._runtime_context_revise_failed_qa_implementation_lineage(
-            conn,
-            project_id=PID,
-            context=saved_context,
-            runtime=runtime,
-            record=runtime.store.get(successor["contract_execution_id"]),
-            payload=revision_payload,
-            revision_marker=revision_marker,
-            canonical_reopened_runtime_guide=forged_reopened_guide,
+    producer_compatible_reopened_guide.pop("failed_qa_rework", None)
+    for optional_field in (
+        "semantic_next_action",
+        "blocked_by_failed_qa",
+        "failed_qa_blocker",
+    ):
+        producer_compatible_reopened_guide["next_legal_action"].pop(
+            optional_field,
+            None,
         )
-    assert forged_guide_rejected.value.code == (
-        "contract_runtime_rework_lineage_revision_invalid"
+
+    forged_reopened_guides = {}
+    stale_guide = json.loads(json.dumps(producer_compatible_reopened_guide))
+    stale_guide["execution"]["execution_state_revision"] -= 1
+    forged_reopened_guides["stale_execution_revision"] = stale_guide
+    missing_identity_guide = json.loads(
+        json.dumps(producer_compatible_reopened_guide)
     )
-    assert "canonical reopened guide" in str(forged_guide_rejected.value)
-    assert runtime.store.get(successor["contract_execution_id"])[
-        "execution_state_revision"
-    ] == revision_before_negative_cases
+    missing_identity_guide["execution"].pop("contract_execution_id", None)
+    forged_reopened_guides["missing_execution_identity"] = (
+        missing_identity_guide
+    )
+    forged_line_guide = json.loads(
+        json.dumps(producer_compatible_reopened_guide)
+    )
+    forged_line_guide["next_legal_action"]["line_id"] = "observer_merge"
+    forged_reopened_guides["forged_next_line"] = forged_line_guide
+    for case_name, forged_reopened_guide in forged_reopened_guides.items():
+        with pytest.raises(GovernanceError) as forged_guide_rejected:
+            server._runtime_context_revise_failed_qa_implementation_lineage(
+                conn,
+                project_id=PID,
+                context=saved_context,
+                runtime=runtime,
+                record=runtime.store.get(successor["contract_execution_id"]),
+                payload=revision_payload,
+                revision_marker=revision_marker,
+                canonical_reopened_runtime_guide=forged_reopened_guide,
+            )
+        assert forged_guide_rejected.value.code == (
+            "contract_runtime_rework_lineage_revision_invalid"
+        ), case_name
+        assert "canonical reopened guide" in str(
+            forged_guide_rejected.value
+        ), case_name
+        assert runtime.store.get(successor["contract_execution_id"])[
+            "execution_state_revision"
+        ] == revision_before_negative_cases, case_name
 
     def mutation_state():
         record = runtime.store.get(successor["contract_execution_id"])
@@ -34171,9 +34198,9 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
             record=runtime.store.get(successor["contract_execution_id"]),
             payload=revision_payload,
             revision_marker={},
-            canonical_reopened_runtime_guide=canonical_reopened[
-                "runtime_guide"
-            ],
+            canonical_reopened_runtime_guide=(
+                producer_compatible_reopened_guide
+            ),
         )
     )
     assert prevalidation["status"] == (
@@ -34194,7 +34221,19 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
 
     def projection_without_runtime_rejoin(*args, **kwargs):
         projected, projection = original_projection(*args, **kwargs)
+        projected = json.loads(json.dumps(projected))
         projection = json.loads(json.dumps(projection))
+        projected_guide = projected.get("runtime_guide")
+        if isinstance(projected_guide, dict):
+            projected_guide.pop("failed_qa_rework", None)
+            projected_next_action = projected_guide.get("next_legal_action")
+            if isinstance(projected_next_action, dict):
+                for optional_field in (
+                    "semantic_next_action",
+                    "blocked_by_failed_qa",
+                    "failed_qa_blocker",
+                ):
+                    projected_next_action.pop(optional_field, None)
         projection["failed_qa_revision_rejoin_contexts"] = []
         return projected, projection
 
