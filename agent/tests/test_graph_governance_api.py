@@ -64311,6 +64311,20 @@ def test_contract_runtime_recovers_exact_audit_only_qa_bypass_round(
         "audit_only"
     ] is True
     assert qa_event["payload"]["base_commit_sha"] == base_commit
+    assert qa_event["payload"]["source_backed_contract_gate_authority"][
+        "qa_session_proof"
+    ]["observer_impersonation"] is False
+
+    # Historical QA events may predate the duplicated top-level field.  The
+    # immutable server-authenticated QA proof remains the only compatibility
+    # authority for accepting that omission.
+    legacy_qa_event_payload = json.loads(json.dumps(qa_event["payload"]))
+    legacy_qa_event_payload.pop("observer_impersonation")
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(legacy_qa_event_payload), int(qa_event["id"])),
+    )
+    conn.commit()
 
     bypass_revision = 11
     bypass_identity = (
@@ -64556,6 +64570,34 @@ def test_contract_runtime_recovers_exact_audit_only_qa_bypass_round(
             "source_merge_event_ref": f"timeline:{merge_event['id']}",
         }
     )
+    for observer_impersonation_case in (
+        "explicit_top_level_true",
+        "trusted_proof_missing",
+        "trusted_proof_true",
+    ):
+        rejected_payload = json.loads(original_qa_event_json)
+        if observer_impersonation_case == "explicit_top_level_true":
+            rejected_payload["observer_impersonation"] = True
+        elif observer_impersonation_case == "trusted_proof_missing":
+            rejected_payload["source_backed_contract_gate_authority"][
+                "qa_session_proof"
+            ].pop("observer_impersonation")
+        else:
+            rejected_payload["source_backed_contract_gate_authority"][
+                "qa_session_proof"
+            ]["observer_impersonation"] = True
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (json.dumps(rejected_payload), int(qa_event["id"])),
+        )
+        conn.commit()
+        assert recover(record) == {}, observer_impersonation_case
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (original_qa_event_json, int(qa_event["id"])),
+        )
+        conn.commit()
+
     for mismatch in (
         "diagnostic",
         "bypass",
