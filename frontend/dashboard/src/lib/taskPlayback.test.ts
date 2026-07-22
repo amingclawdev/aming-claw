@@ -36,7 +36,8 @@ import {
 } from "./taskPlayback";
 import { projectTaskTimelineEvent, projectGateMatrix, timelineStatusFromEvent } from "./taskTimelineSemantics";
 import type { GateMatrixProjection } from "./taskTimelineSemantics";
-// Note: BacklogView cannot be imported in Node (uses import.meta.env via api.ts).
+import { api } from "./api";
+// BacklogView still cannot be imported in Node because it binds React/browser state.
 // Lane attribution (AC-3) and DAG headline (AC-2) are verified below via semantic
 // projections of the same event shapes used by BacklogView's rawWorkerKeyForEvent.
 
@@ -1192,6 +1193,149 @@ function assertFixture(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
 }
 
+async function taskPlaybackApiSingleFlightAssertions(): Promise<string[]> {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  let requestedUrl = "";
+  const bootstrapResponse = {
+    ok: true,
+    project_id: "aming-claw",
+    backlog_id: "AC-BOOTSTRAP-SINGLE-FLIGHT",
+    events: [],
+    count: 0,
+    contract_runtime_visualization: {
+      schema_version: "contract_runtime.visualization.v1",
+      ok: true,
+      public_safe: true,
+      read_only: true,
+      project_id: "aming-claw",
+      backlog_id: "AC-BOOTSTRAP-SINGLE-FLIGHT",
+      generated_at: "2026-07-22T00:00:00Z",
+      authority: {
+        source_order: ["contract_runtime"],
+        source_of_authority: "ContractRuntime",
+        authority_decision_source: "contract_runtime",
+        axes: [],
+        legacy_sources_advisory_only: true,
+      },
+      backlog: {
+        backlog_id: "AC-BOOTSTRAP-SINGLE-FLIGHT",
+        title: "Compact bootstrap",
+        status: "OPEN",
+        priority: "P1",
+        commit: "",
+        updated_at: "",
+      },
+      contract_execution_progress: {
+        line_states: [],
+        line_state_count: 0,
+        line_state_total: 0,
+        line_states_truncated: false,
+        runtime_record_count: 0,
+        runtime_record_total: 0,
+        runtime_records_truncated: false,
+      },
+      backlog_close_readiness: {
+        state: "open",
+        backlog_status: "OPEN",
+        contract_execution_state: "unknown",
+        contract_complete_implies_backlog_close: false,
+        legacy_advisory_count: 0,
+      },
+      contract_chain: {
+        contract_chain_id: "",
+        root_contract_execution_id: "",
+        current_contract_execution_id: "",
+        current_contract_id: "",
+        parent_to_resume_contract_execution_id: "",
+        active_child_contract_execution_id: "",
+        readiness_state: "unknown",
+        next_legal_action: {},
+        degraded: false,
+        source_refs: [],
+      },
+      timeline: {
+        events: [],
+        returned_count: 0,
+        total_count: 0,
+        limit: 25,
+        truncated: false,
+        next_cursor: "",
+        next_cursor_parameter: "before_event_id",
+        append_only: true,
+        current_snapshot_in_playback: false,
+      },
+      dag: {
+        schema_version: "contract_runtime.visualization.dag.v1",
+        nodes: [],
+        edges: [],
+        node_count: 0,
+        edge_count: 0,
+        typed_edges: true,
+      },
+      compact_ledger: {},
+      bypass_records: [],
+      legacy_advisories: [],
+      projection_freshness: {},
+      projection_conflicts: [],
+      projection_conflict_count: 0,
+    },
+    backlog_timeline_gate: {
+      ok: true,
+      project_id: "aming-claw",
+      bug_id: "AC-BOOTSTRAP-SINGLE-FLIGHT",
+      applicable: false,
+      can_close: false,
+      timeline_gate: { status: "not_applicable", passed: false },
+      event_count: 0,
+    },
+    playback_bootstrap: {
+      schema_version: "task_playback.bootstrap.v2",
+      mode: "compact",
+    },
+  };
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    fetchCount += 1;
+    requestedUrl = String(input);
+    await Promise.resolve();
+    return new Response(JSON.stringify(bootstrapResponse), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+  try {
+    const [timeline, gate] = await Promise.all([
+      api.taskTimelineFor(
+        "aming-claw",
+        "AC-BOOTSTRAP-SINGLE-FLIGHT",
+        25,
+      ),
+      api.backlogTimelineGateFor(
+        "aming-claw",
+        "AC-BOOTSTRAP-SINGLE-FLIGHT",
+        25,
+      ),
+    ]);
+    assertFixture(fetchCount === 1, `compact playback API should issue one shared GET, got ${fetchCount}`);
+    assertFixture(
+      requestedUrl.includes("playback_bootstrap=compact")
+        && requestedUrl.includes("before_event_id=0")
+        && requestedUrl.includes("view=public"),
+      `compact playback API should negotiate the server bootstrap identity, got ${requestedUrl}`,
+    );
+    assertFixture(
+      timeline.contract_runtime_visualization?.public_safe === true
+        && gate.bug_id === "AC-BOOTSTRAP-SINGLE-FLIGHT",
+      "the one shared GET should fan out the timeline/visualization and gate views",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  return ["compact playback API coalesces timeline/visualization/gate into one GET"];
+}
+
+export const taskPlaybackApiSingleFlightSummary = await taskPlaybackApiSingleFlightAssertions();
+
 function typedDagVisualizationFixture(
   contractId: "direct_main.v1" | "mf_parallel.v2" | "mf_batch_parallel.v1",
   nodes: ContractRuntimeVisualizationResponse["dag"]["nodes"],
@@ -1596,13 +1740,18 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
   assertFixture(
     apiSource.includes("const publicReadSingleFlights = new Map")
       && apiSource.includes("function getPublicJSONSingleFlight")
+      && apiSource.includes("function taskPlaybackBootstrapFor")
       && apiSource.includes("playback_bootstrap: \"compact\"")
       && apiSource.includes("exact_event_id")
       && apiSource.includes("public_authority: \"contract_runtime\"")
       && apiSource.includes("before_event_id: \"0\"")
       && apiSource.includes("view: \"public\"")
+      && apiSource.match(/taskTimelineFor\([\s\S]*?taskPlaybackBootstrapFor\(projectId, backlogId, limit, signal\)/) !== null
+      && apiSource.match(/backlogTimelineGateFor\([\s\S]*?taskPlaybackBootstrapFor\(projectId, backlogId, limit, signal\)/) !== null
+      && apiSource.includes("bootstrap.backlog_timeline_gate")
+      && !apiSource.includes("const authorityRequest = api.contractRuntimeVisualizationFor")
       && apiSource.includes("if (publicReadSingleFlights.get(key) === shared) publicReadSingleFlights.delete(key)"),
-    "public playback reads should single-flight exact endpoint/query identities and release both fulfilled and failed flights",
+    "playback timeline, visualization, and gate reads should share one compact bootstrap GET while preserving exact-event identity and independent caller abort semantics",
   );
   const selectedActionFrame = nextActionTrace.frames.find((frame) => frame.source_event_id === "43");
   const nextActionPresentations = taskPlaybackNextLegalActionPresentations(nextActionTrace, selectedActionFrame?.id);

@@ -82321,26 +82321,35 @@ def _timeline_warm_cache_store(
     release_event: Event | None = None
     evicted_count = 0
     leader_token = str(miss_metadata.get("_leader_token") or "")
+    store_status = "stored"
     with _TIMELINE_WARM_CACHE_LOCK:
-        _TIMELINE_WARM_CACHE[identity_hash] = {
-            "stored_at": time.monotonic(),
-            "watermark": dict(watermark),
-            "payload": deepcopy(payload),
-            "response_bytes": response_bytes,
-        }
-        _TIMELINE_WARM_CACHE.move_to_end(identity_hash)
-        while len(_TIMELINE_WARM_CACHE) > _TIMELINE_WARM_CACHE_MAX_ENTRIES:
-            _TIMELINE_WARM_CACHE.popitem(last=False)
-            evicted_count += 1
-        _TIMELINE_WARM_CACHE_EVICTION_COUNT += evicted_count
         in_flight = _TIMELINE_WARM_CACHE_IN_FLIGHT.get(identity_hash)
-        if (
-            isinstance(in_flight, Mapping)
+        owns_current_lease = bool(
+            leader_token
+            and isinstance(in_flight, Mapping)
             and str(in_flight.get("leader_token") or "") == leader_token
-        ):
+        )
+        if owns_current_lease:
+            # Store is the commit point for a single-flight lease.  Validate
+            # ownership before touching the cache: a timed-out waiter may have
+            # promoted a newer leader while this computation was still
+            # running, and that old leader must not overwrite or release it.
+            _TIMELINE_WARM_CACHE[identity_hash] = {
+                "stored_at": time.monotonic(),
+                "watermark": dict(watermark),
+                "payload": deepcopy(payload),
+                "response_bytes": response_bytes,
+            }
+            _TIMELINE_WARM_CACHE.move_to_end(identity_hash)
+            while len(_TIMELINE_WARM_CACHE) > _TIMELINE_WARM_CACHE_MAX_ENTRIES:
+                _TIMELINE_WARM_CACHE.popitem(last=False)
+                evicted_count += 1
+            _TIMELINE_WARM_CACHE_EVICTION_COUNT += evicted_count
             _TIMELINE_WARM_CACHE_IN_FLIGHT.pop(identity_hash, None)
             if isinstance(in_flight.get("event"), Event):
                 release_event = in_flight.get("event")
+        else:
+            store_status = "stale_leader_discarded"
         entry_count = len(_TIMELINE_WARM_CACHE)
         in_flight_count = len(_TIMELINE_WARM_CACHE_IN_FLIGHT)
         eviction_count = _TIMELINE_WARM_CACHE_EVICTION_COUNT
@@ -82375,7 +82384,281 @@ def _timeline_warm_cache_store(
         "cold_latency_ms": compute_ms,
         "warm_latency_ms": 0,
         "response_bytes": response_bytes,
+        "store_status": store_status,
+        "stored": store_status == "stored",
     }
+    if store_status == "stale_leader_discarded":
+        result["warm_cache"]["single_flight_status"] = store_status
+    return result
+
+
+def _task_playback_compact_bootstrap_requested(query: Mapping[str, Any]) -> bool:
+    return (
+        _timeline_warm_cache_query_value(query, "playback_bootstrap").lower()
+        == "compact"
+    )
+
+
+def _task_playback_contract_runtime_visualization_from_loaded(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+    row: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]],
+    limit: int,
+    timeline_total: int,
+    has_more: bool,
+) -> dict[str, Any]:
+    """Build the public ContractRuntime view from one loaded event snapshot."""
+
+    from . import task_timeline
+    from .contract_runtime_visualization import (
+        build_contract_runtime_visualization,
+    )
+
+    backlog = _backlog_compact_bug(row)
+    current = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    runtime_store = _contract_runtime_store(conn)
+    records = runtime_store.list_by_backlog(
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    runtime_updated_at = {
+        str(item["contract_execution_id"]): str(item["updated_at"] or "")
+        for item in conn.execute(
+            """
+            SELECT contract_execution_id, updated_at
+            FROM contract_runtime_executions
+            WHERE project_id = ? AND backlog_id = ?
+            """,
+            (project_id, backlog_id),
+        ).fetchall()
+    }
+    for record in records:
+        record["updated_at"] = runtime_updated_at.get(
+            str(record.get("contract_execution_id") or ""),
+            "",
+        )
+    chain_edges = [
+        dict(edge)
+        for edge in conn.execute(
+            """
+            SELECT parent_contract_execution_id,
+                   child_contract_execution_id,
+                   edge_kind,
+                   source_ref,
+                   generation,
+                   created_at
+            FROM contract_chain_edges
+            WHERE project_id = ? AND backlog_id = ?
+            ORDER BY id
+            """,
+            (project_id, backlog_id),
+        ).fetchall()
+    ]
+    raw_events = [dict(event) for event in events]
+    compact_events = [
+        _task_timeline_recent_compact_event(
+            event,
+            task_timeline_module=task_timeline,
+        )
+        for event in raw_events
+    ]
+    event_ledger = task_timeline.build_compact_ledger(
+        conn,
+        project_id,
+        raw_events,
+    )
+    compact_row = next(
+        (
+            item
+            for item in event_ledger.get("rows") or []
+            if str(item.get("backlog_id") or "") == backlog_id
+        ),
+        {},
+    )
+    return build_contract_runtime_visualization(
+        project_id=project_id,
+        backlog=backlog,
+        runtime_records=records,
+        chain_current=current,
+        chain_edges=chain_edges,
+        timeline_events=compact_events,
+        legacy_compatibility_sources=raw_events,
+        compact_ledger_row=compact_row,
+        timeline_total=timeline_total,
+        timeline_limit=limit,
+        timeline_has_more=has_more,
+        next_cursor=(
+            str(compact_events[-1].get("id") or "")
+            if has_more and compact_events
+            else ""
+        ),
+        generated_at=_utc_now(),
+    )
+
+
+def _task_playback_compact_gate_response(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+    row: Mapping[str, Any],
+    events: list[dict[str, Any]],
+    query: Mapping[str, Any],
+    request_id: str,
+) -> dict[str, Any]:
+    """Evaluate the existing gate once for the compact playback bootstrap."""
+
+    from . import task_timeline
+
+    applicable = _mf_close_timeline_applicability(row)
+    contract: dict[str, Any] = {}
+    route_context_gate: dict[str, Any] = {}
+    runtime_projection: dict[str, Any] = {}
+    if applicable["is_mf"]:
+        contract = backlog_runtime.parse_json_object(
+            _row_get(row, "chain_trigger_json", "{}")
+        )
+        contract = _mf_close_contract_with_route_context(contract, row, query)
+        route_context_gate = task_timeline.mf_route_context_gate_verification(
+            events,
+            contract=contract,
+        )
+        projection_body = _timeline_gate_contract_runtime_projection_body(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            query=query,
+            route_gate=route_context_gate,
+        )
+        runtime_projection = _contract_runtime_close_authority_projection(
+            conn,
+            project_id=project_id,
+            bug_id=backlog_id,
+            body=projection_body,
+            route_gate=route_context_gate,
+            close_commit=_audit_recovery_close_commit(row, projection_body),
+            timeline_events=events,
+        )
+        verification_events = events
+        if runtime_projection.get("accepted"):
+            verification_events = (
+                _contract_runtime_close_authority_projected_events_for_gate(
+                    runtime_projection,
+                    events,
+                )
+            )
+        verification = _mf_close_gate_verification(
+            verification_events,
+            contract=contract,
+            conn=conn,
+            project_id=project_id,
+        )
+        if runtime_projection:
+            verification = dict(verification)
+            verification["contract_runtime_close_authority_projection"] = {
+                key: value
+                for key, value in runtime_projection.items()
+                if key != "projected_events"
+            }
+        if runtime_projection.get("accepted"):
+            verification = _contract_runtime_authoritative_close_verification(
+                verification,
+                runtime_projection,
+            )
+    else:
+        verification = {
+            "schema_version": "mf_close_timeline_gate.v1",
+            "passed": False,
+            "can_close": False,
+            "status": "not_applicable",
+            "applicable": False,
+            "reason": applicable["reason"],
+            "required_event_kinds": sorted(
+                task_timeline.MF_CLOSE_REQUIRED_EVENT_KINDS
+            ),
+            "present_event_kinds": [],
+            "missing_event_kinds": [],
+            "event_count": len(events),
+            "ignored_required_events": [],
+            "checks": {
+                "has_implementation": False,
+                "has_verification": False,
+                "has_close_ready": False,
+            },
+        }
+    can_close = bool(applicable["is_mf"] and verification.get("passed"))
+    projection_execution_id = str(
+        runtime_projection.get("contract_execution_id")
+        if isinstance(runtime_projection, Mapping)
+        else ""
+    ).strip()
+    verification = _annotate_legacy_mf_timeline_precheck_authority(
+        verification,
+        source=(
+            "mf_timeline_precheck_contract_runtime_projection"
+            if projection_execution_id
+            else "mf_timeline_precheck"
+        ),
+        contract_execution_id=projection_execution_id,
+    )
+    gate_summary = task_timeline.compact_gate_summary(
+        {
+            **verification,
+            "project_id": project_id,
+            "bug_id": backlog_id,
+            "applicable": applicable["is_mf"],
+            "can_close": can_close,
+        },
+        request_id=request_id,
+    )
+    compact_verification = {
+        key: verification.get(key)
+        for key in (
+            "schema_version",
+            "passed",
+            "status",
+            "required_event_kinds",
+            "present_event_kinds",
+            "missing_event_kinds",
+            "event_count",
+            "checks",
+        )
+        if verification.get(key) not in (None, "", [], {})
+    }
+    compact_verification["raw_gate_evidence_omitted"] = True
+    result = {
+        "ok": True,
+        "project_id": project_id,
+        "bug_id": backlog_id,
+        "applicable": applicable["is_mf"],
+        "reason": applicable["reason"],
+        "can_close": can_close,
+        "close_authority": verification.get("close_authority") or {},
+        "legacy_advisory": True,
+        "authoritative": False,
+        "event_count": len(events),
+        "timeline_gate": compact_verification,
+        "gate_summary": gate_summary,
+        "request_id": request_id,
+        "raw_event_payloads_omitted": True,
+    }
+    fixed_close_alert = task_timeline.mf_fixed_close_waiver_alert(
+        _row_get(row, "status", ""),
+        can_close,
+        events,
+        applicable=applicable["is_mf"],
+    )
+    result["fixed_close_waiver_alert"] = fixed_close_alert
+    if fixed_close_alert.get("alert"):
+        result["governance_alert"] = fixed_close_alert
     return result
 
 
@@ -82423,6 +82706,15 @@ def handle_task_timeline_list(ctx: RequestContext):
         )
     except (TypeError, ValueError):
         exact_event_id = 0
+    compact_playback_bootstrap = _task_playback_compact_bootstrap_requested(
+        ctx.query
+    )
+    try:
+        before_event_id = int(
+            _first_query_value(ctx.query, "before_event_id", "0") or "0"
+        )
+    except (TypeError, ValueError):
+        before_event_id = 0
     filtered_request = any(
         [
             task_id,
@@ -82440,6 +82732,9 @@ def handle_task_timeline_list(ctx: RequestContext):
     include_compact_ledger = explicit_compact_ledger or filtered_request
     from . import task_timeline
 
+    contract_runtime_visualization: dict[str, Any] | None = None
+    backlog_timeline_gate: dict[str, Any] | None = None
+    compact_timeline_events: list[dict[str, Any]] | None = None
     with DBContext(project_id) as conn:
         task_timeline.ensure_schema(conn)
         cache_key, cache_watermark, cached_response, cache_metadata = (
@@ -82485,21 +82780,64 @@ def handle_task_timeline_list(ctx: RequestContext):
                 response,
                 cache_metadata,
             )
-        events = task_timeline.list_events(
-            conn,
-            project_id,
-            task_id=task_id,
-            backlog_id=backlog_id,
-            trace_id=trace_id,
-            phase=phase,
-            event_kind=event_kind,
-            scenario_id=scenario_id,
-            correlation_id=correlation_id,
-            severity=severity,
-            decision=decision,
-            parent_event_id=parent_event_id,
-            limit=limit,
-        )
+        bootstrap_row: Mapping[str, Any] | None = None
+        gate_events: list[dict[str, Any]] = []
+        if compact_playback_bootstrap:
+            if not backlog_id:
+                raise ValidationError(
+                    "playback_bootstrap=compact requires backlog_id"
+                )
+            bootstrap_row = conn.execute(
+                "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+                (backlog_id,),
+            ).fetchone()
+            if not bootstrap_row:
+                raise GovernanceError(
+                    "not_found",
+                    f"Bug {backlog_id} not found",
+                    404,
+                )
+            compact_backlog = _backlog_compact_bug(bootstrap_row)
+            if not compact_backlog.get("public_safe", True):
+                raise PermissionDeniedError(
+                    "anonymous",
+                    "read_private_contract_runtime_visualization",
+                    {"backlog_id": backlog_id, "public_safe": False},
+                )
+            gate_events = task_timeline.list_backlog_gate_events(
+                conn,
+                project_id,
+                backlog_id=backlog_id,
+                limit=max(limit, 1000),
+            )
+            direct_events = [
+                event
+                for event in gate_events
+                if str(event.get("backlog_id") or "") == backlog_id
+            ]
+            if before_event_id > 0:
+                direct_events = [
+                    event
+                    for event in direct_events
+                    if int(event.get("id") or 0) < before_event_id
+                ]
+            events = direct_events[: max(1, min(limit, 1000))]
+        else:
+            events = task_timeline.list_events(
+                conn,
+                project_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+                trace_id=trace_id,
+                phase=phase,
+                event_kind=event_kind,
+                scenario_id=scenario_id,
+                correlation_id=correlation_id,
+                severity=severity,
+                decision=decision,
+                parent_event_id=parent_event_id,
+                limit=limit,
+            )
         exact_event: dict[str, Any] | None = None
         if exact_event_id > 0 and backlog_id:
             exact_row = conn.execute(
@@ -82547,6 +82885,60 @@ def handle_task_timeline_list(ctx: RequestContext):
                 ledger=compact_ledger,
                 task_timeline_module=task_timeline,
             )
+        if compact_playback_bootstrap and bootstrap_row is not None:
+            timeline_total = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM task_timeline_events
+                    WHERE project_id = ? AND backlog_id = ?
+                    """,
+                    (project_id, backlog_id),
+                ).fetchone()["count"]
+                or 0
+            )
+            visualization_limit = max(1, min(limit, 500))
+            visualization_events = sorted(
+                (
+                    event
+                    for event in gate_events
+                    if str(event.get("backlog_id") or "") == backlog_id
+                    and (
+                        before_event_id <= 0
+                        or int(event.get("id") or 0) < before_event_id
+                    )
+                ),
+                key=lambda event: int(event.get("id") or 0),
+                reverse=True,
+            )[:visualization_limit]
+            contract_runtime_visualization = (
+                _task_playback_contract_runtime_visualization_from_loaded(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    row=bootstrap_row,
+                    events=visualization_events,
+                    limit=visualization_limit,
+                    timeline_total=timeline_total,
+                    has_more=timeline_total > visualization_limit,
+                )
+            )
+            backlog_timeline_gate = _task_playback_compact_gate_response(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                row=bootstrap_row,
+                events=gate_events,
+                query=ctx.query,
+                request_id=ctx.request_id,
+            )
+            compact_timeline_events = [
+                _task_timeline_recent_compact_event(
+                    event,
+                    task_timeline_module=task_timeline,
+                )
+                for event in events
+            ]
     response = {
         "ok": True,
         "project_id": project_id,
@@ -82560,7 +82952,7 @@ def handle_task_timeline_list(ctx: RequestContext):
         "severity": severity,
         "decision": decision,
         "parent_event_id": parent_event_id,
-        "events": events,
+        "events": compact_timeline_events or events,
         "count": len(events),
     }
     if compact_ledger is not None:
@@ -82569,6 +82961,46 @@ def handle_task_timeline_list(ctx: RequestContext):
         response["exact_event"] = exact_event
         response["exact_event_id"] = exact_event_id
         response["exact_event_raw_loaded"] = True
+    if (
+        compact_playback_bootstrap
+        and contract_runtime_visualization is not None
+        and backlog_timeline_gate is not None
+    ):
+        shared_identity_hash = str(
+            cache_metadata.get("identity_hash") or ""
+        )
+        contract_runtime_visualization["playback_bootstrap_identity_hash"] = (
+            shared_identity_hash
+        )
+        backlog_timeline_gate["playback_bootstrap_identity_hash"] = (
+            shared_identity_hash
+        )
+        response.update(
+            {
+                "contract_runtime_visualization": (
+                    contract_runtime_visualization
+                ),
+                "backlog_timeline_gate": backlog_timeline_gate,
+                "playback_bootstrap": {
+                    "schema_version": "task_playback.bootstrap.v2",
+                    "mode": "compact",
+                    "source": "timeline_compact_bootstrap",
+                    "identity_hash": shared_identity_hash,
+                    "resource_generation": dict(cache_watermark),
+                    "shared_computation": {
+                        "timeline": True,
+                        "contract_runtime_visualization": True,
+                        "timeline_gate": True,
+                        "cold_compute_paths": 1,
+                    },
+                    "raw_event_payloads_omitted": True,
+                    "exact_event_loaded": exact_event is not None,
+                    "exact_event_raw_loaded": exact_event is not None,
+                    "raw_compatibility": "exact_event_lazy",
+                },
+                "raw_event_payloads_omitted": True,
+            }
+        )
     return _timeline_warm_cache_store(
         cache_key,
         cache_watermark,

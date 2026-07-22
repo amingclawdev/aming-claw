@@ -13861,9 +13861,68 @@ class TestTaskTimeline(unittest.TestCase):
             "playback_bootstrap": "compact",
             "public_authority": "contract_runtime",
         }
-        bootstrap = server.handle_task_timeline_list(_ctx(base_query))
+        server._timeline_warm_cache_clear()
+        with mock.patch.object(
+            server,
+            "_task_playback_contract_runtime_visualization_from_loaded",
+            wraps=server._task_playback_contract_runtime_visualization_from_loaded,
+        ) as visualization_builder, mock.patch.object(
+            server,
+            "_task_playback_compact_gate_response",
+            wraps=server._task_playback_compact_gate_response,
+        ) as gate_builder:
+            bootstrap = server.handle_task_timeline_list(_ctx(base_query))
+            bootstrap_hit = server.handle_task_timeline_list(_ctx(base_query))
+        self.assertEqual(visualization_builder.call_count, 1)
+        self.assertEqual(gate_builder.call_count, 1)
+        self.assertEqual(bootstrap_hit["warm_cache"]["status"], "hit")
         self.assertEqual(bootstrap["count"], 1)
         self.assertNotIn("exact_event", bootstrap)
+        self.assertTrue(bootstrap["raw_event_payloads_omitted"])
+        self.assertTrue(
+            bootstrap["events"][0]["payload"]["raw_payload_omitted"]
+        )
+        self.assertNotIn(
+            "raw_compatibility_marker",
+            bootstrap["events"][0]["payload"],
+        )
+        self.assertEqual(
+            bootstrap["playback_bootstrap"]["shared_computation"],
+            {
+                "timeline": True,
+                "contract_runtime_visualization": True,
+                "timeline_gate": True,
+                "cold_compute_paths": 1,
+            },
+        )
+        bootstrap_identity = bootstrap["playback_bootstrap"]["identity_hash"]
+        self.assertEqual(
+            bootstrap["contract_runtime_visualization"][
+                "playback_bootstrap_identity_hash"
+            ],
+            bootstrap_identity,
+        )
+        self.assertEqual(
+            bootstrap["backlog_timeline_gate"][
+                "playback_bootstrap_identity_hash"
+            ],
+            bootstrap_identity,
+        )
+        self.assertTrue(
+            bootstrap["contract_runtime_visualization"]["public_safe"]
+        )
+        self.assertEqual(
+            bootstrap["backlog_timeline_gate"]["bug_id"],
+            "BUG-CACHE-EXACT",
+        )
+        self.assertTrue(
+            bootstrap["backlog_timeline_gate"]["timeline_gate"][
+                "raw_gate_evidence_omitted"
+            ]
+        )
+        compact_json = json.dumps(bootstrap, sort_keys=True)
+        self.assertNotIn("raw_compatibility_marker", compact_json)
+        self.assertNotIn("preserve-me", compact_json)
 
         deep_link_query = {
             **base_query,
@@ -14013,6 +14072,7 @@ class TestTaskTimeline(unittest.TestCase):
         }
 
         server._timeline_warm_cache_clear()
+
         with mock.patch.object(
             server,
             "_TIMELINE_WARM_CACHE_SINGLE_FLIGHT_WAIT_SECONDS",
@@ -14077,6 +14137,75 @@ class TestTaskTimeline(unittest.TestCase):
                 self.assertIsNotNone(joined[2])
                 self.assertEqual(joined[3]["single_flight_status"], "joined")
                 self.assertTrue(joined[3]["single_flight_joined"])
+        server._timeline_warm_cache_clear()
+
+    def test_stale_leader_store_cannot_overwrite_promoted_result(self):
+        from agent.governance import server
+
+        query = {"backlog_id": "BUG-CACHE-STALE-STORE", "limit": "10"}
+        resource = {
+            "backlog_id": "BUG-CACHE-STALE-STORE",
+            "public_authority": "public_safe_timeline",
+        }
+        server._timeline_warm_cache_clear()
+        identity_hash, watermark, _, stale_metadata = (
+            server._timeline_warm_cache_prepare(
+                self.conn,
+                endpoint="timeline_list",
+                project_id="proj",
+                query=query,
+                resource_identity=resource,
+            )
+        )
+        stale_token = stale_metadata["_leader_token"]
+        promoted_token = "promoted-new-leader-token"
+        promoted_metadata = {
+            **stale_metadata,
+            "_leader_token": promoted_token,
+        }
+        with server._TIMELINE_WARM_CACHE_LOCK:
+            old_record = server._TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash]
+            promoted_event = threading.Event()
+            server._TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash] = {
+                "event": promoted_event,
+                "started_at": time.monotonic(),
+                "leader_token": promoted_token,
+            }
+            self.assertNotEqual(old_record["leader_token"], promoted_token)
+
+        promoted = server._timeline_warm_cache_store(
+            identity_hash,
+            watermark,
+            {"ok": True, "value": "promoted-new"},
+            promoted_metadata,
+        )
+        stale = server._timeline_warm_cache_store(
+            identity_hash,
+            watermark,
+            {"ok": True, "value": "stale-old"},
+            stale_metadata,
+        )
+        self.assertEqual(promoted["warm_cache"]["store_status"], "stored")
+        self.assertEqual(
+            stale["warm_cache"]["store_status"],
+            "stale_leader_discarded",
+        )
+        self.assertFalse(stale["warm_cache"]["stored"])
+        self.assertNotIn(stale_token, json.dumps(stale, sort_keys=True))
+        self.assertNotIn(promoted_token, json.dumps(promoted, sort_keys=True))
+
+        _, _, cached, hit_metadata = server._timeline_warm_cache_prepare(
+            self.conn,
+            endpoint="timeline_list",
+            project_id="proj",
+            query=query,
+            resource_identity=resource,
+        )
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["value"], "promoted-new")
+        self.assertEqual(hit_metadata["single_flight_status"], "cache_hit")
+        with server._TIMELINE_WARM_CACHE_LOCK:
+            self.assertNotIn(identity_hash, server._TIMELINE_WARM_CACHE_IN_FLIGHT)
         server._timeline_warm_cache_clear()
 
     def test_backlog_current_task_endpoint_uses_timeline_fallback(self):
