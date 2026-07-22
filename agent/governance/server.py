@@ -57346,23 +57346,13 @@ def _branch_service_validation_runtime_guide(guide: Mapping[str, Any]) -> dict[s
 def _contract_runtime_guide_for_response(record: Mapping[str, Any]) -> dict[str, Any]:
     guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
     guide = dict(guide)
-    safe_copy = (
-        guide.get("writer_role_safe_copy_payload")
-        if isinstance(guide.get("writer_role_safe_copy_payload"), Mapping)
-        else {}
-    )
-    copy_payload = (
-        safe_copy.get("copy_payload")
-        if isinstance(safe_copy.get("copy_payload"), Mapping)
-        else {}
-    )
-    writer_hash = str(copy_payload.get("runtime_guide_hash") or "").strip()
+    bypass_actor_hash = str(guide.get("runtime_guide_hash") or "").strip()
     bypass_guidance = (
         guide.get("line_bypass_guidance")
         if isinstance(guide.get("line_bypass_guidance"), Mapping)
         else {}
     )
-    if writer_hash and bypass_guidance:
+    if bypass_actor_hash and bypass_guidance:
         aligned_bypass = dict(bypass_guidance)
         for key in (
             "current_line_binding",
@@ -57372,12 +57362,12 @@ def _contract_runtime_guide_for_response(record: Mapping[str, Any]) -> dict[str,
             value = aligned_bypass.get(key)
             if isinstance(value, Mapping):
                 aligned_value = dict(value)
-                aligned_value["runtime_guide_hash"] = writer_hash
+                aligned_value["runtime_guide_hash"] = bypass_actor_hash
                 aligned_bypass[key] = aligned_value
         aligned_bypass["runtime_guide_hash_source"] = (
-            "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash"
+            "runtime_guide.runtime_guide_hash"
         )
-        aligned_bypass["target_writer_role_hash_aligned"] = True
+        aligned_bypass["bypass_actor_role_hash_aligned"] = True
         guide["line_bypass_guidance"] = aligned_bypass
     if str(record.get("contract_id") or "").strip() == "direct_fix":
         return _branch_service_validation_runtime_guide(guide)
@@ -63132,6 +63122,11 @@ def _contract_runtime_bind_qa_graph_authority(
         source="contract_runtime_qa_graph_authority_binding",
         binding_claims={"graph_trace_session_matched": True},
     )
+    # The candidate commit is authenticated by the bounded QA session and the
+    # persisted graph-query rows above.  Persist it at the canonical top level
+    # as well as inside graph_trace_evidence so later no-PASS and merge-round
+    # resolvers never depend on a caller supplying the same identity twice.
+    effective["commit_sha"] = expected_candidate_commit
     for field in ("runtime_context_id", "task_id", "parent_task_id"):
         value = str(evidence.get(field) or identity.get(field) or "").strip()
         if value:
@@ -63441,6 +63436,477 @@ def _contract_runtime_completed_merge_reconcile_authority(
 _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION = (
     "contract_runtime.observer_merge_durable_authority.v1"
 )
+_CONTRACT_RUNTIME_AUDIT_ONLY_BYPASS_ROUND_SCHEMA_VERSION = (
+    "contract_runtime.audit_only_no_pass_bypass_round_authority.v1"
+)
+
+
+def _contract_runtime_audit_only_no_pass_bypass_round_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    branch_head: str,
+    qa_graph: tuple[int, Mapping[str, Any]],
+    round_lines: Sequence[tuple[int, Mapping[str, Any]]],
+) -> dict[str, Any]:
+    """Join the one audited no-PASS bypass shape without synthesizing PASS."""
+
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(
+        getattr(context, "backlog_id", "") or record.get("backlog_id") or ""
+    ).strip()
+    branch_head = str(branch_head or "").strip().lower()
+    if not (
+        execution_id
+        and backlog_id
+        and runtime_context_id
+        and task_id
+        and parent_task_id
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", branch_head)
+    ):
+        return {}
+
+    qa_graph_index, qa_graph_line = qa_graph
+    qa_payload = (
+        qa_graph_line.get("payload")
+        if isinstance(qa_graph_line.get("payload"), Mapping)
+        else {}
+    )
+    graph = (
+        qa_payload.get("graph_trace_evidence")
+        if isinstance(qa_payload.get("graph_trace_evidence"), Mapping)
+        else {}
+    )
+    provenance = (
+        qa_graph_line.get("qa_evidence_provenance")
+        if isinstance(qa_graph_line.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    binding = (
+        provenance.get("authenticated_qa_binding")
+        if isinstance(provenance.get("authenticated_qa_binding"), Mapping)
+        else {}
+    )
+    trace_ids = _runtime_context_service_dedupe(
+        _runtime_context_service_query_values(
+            graph, "verified_trace_ids", "trace_ids"
+        )
+    )
+    base_commit = str(
+        graph.get("comparison_base_commit_sha")
+        or graph.get("base_commit_sha")
+        or ""
+    ).strip().lower()
+    candidate_commit = str(
+        graph.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    qa_principal = str(binding.get("qa_principal") or "").strip()
+    qa_session_id = str(binding.get("qa_session_id") or "").strip()
+    graph_basis = str(graph.get("graph_basis") or "").strip()
+    graph_base = str(graph.get("base_commit_sha") or "").strip().lower()
+    graph_scope_valid = bool(
+        (
+            graph_basis == "canonical_base_plus_candidate_diff"
+            and graph_base == base_commit
+            and base_commit != branch_head
+        )
+        or (
+            graph_basis == "exact_candidate_snapshot"
+            and graph_base == branch_head
+            and (
+                not graph.get("comparison_base_commit_sha")
+                or (
+                    base_commit != branch_head
+                    and str(
+                        graph.get("graph_snapshot_base_commit_sha") or ""
+                    )
+                    .strip()
+                    .lower()
+                    == branch_head
+                )
+            )
+        )
+    )
+    top_commit = str(qa_graph_line.get("commit_sha") or "").strip().lower()
+    if not (
+        _contract_runtime_authenticated_qa_provenance(qa_graph_line)
+        and graph.get("db_verified") is True
+        and not list(graph.get("identity_mismatches") or [])
+        and candidate_commit == branch_head
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base_commit)
+        and graph_scope_valid
+        and trace_ids
+        and qa_principal
+        and qa_session_id
+        and (not top_commit or top_commit == branch_head)
+    ):
+        return {}
+
+    placeholders = ",".join("?" for _ in trace_ids)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT trace_id, actor, commit_sha, qa_session_id,
+                   qa_scope_binding_ref, backlog_id, task_id, status,
+                   query_source, query_purpose, graph_basis,
+                   base_commit_sha, candidate_commit_sha
+            FROM graph_query_traces
+            WHERE project_id = ? AND trace_id IN ({placeholders})
+            """,
+            (project_id, *trace_ids),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    expected_trace_tail = (
+        qa_principal,
+        branch_head,
+        qa_session_id,
+        _qa_scope_binding_ref(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            commit_sha=branch_head,
+        ),
+        backlog_id,
+        task_id,
+        "complete",
+        "qa",
+        "independent_verification",
+        graph_basis,
+        graph_base,
+        branch_head,
+    )
+    actual_traces = {
+        (
+            str(row["trace_id"] or "").strip(),
+            *(
+                str(row[key] or "").strip()
+                for key in (
+                    "actor",
+                    "commit_sha",
+                    "qa_session_id",
+                    "qa_scope_binding_ref",
+                    "backlog_id",
+                    "task_id",
+                    "status",
+                    "query_source",
+                    "query_purpose",
+                    "graph_basis",
+                    "base_commit_sha",
+                    "candidate_commit_sha",
+                )
+            ),
+        )
+        for row in rows
+    }
+    if actual_traces != {
+        (trace_id, *expected_trace_tail) for trace_id in trace_ids
+    }:
+        return {}
+
+    bypasses = [
+        (index, line)
+        for index, line in round_lines
+        if str(line.get("line_id") or "") == "qa_independent_verification"
+        and str(line.get("evidence_kind") or "") == "contract_line_bypass"
+    ]
+    if len(bypasses) != 1:
+        return {}
+    bypass_index, bypass_line = bypasses[0]
+    bypass = (
+        bypass_line.get("payload")
+        if isinstance(bypass_line.get("payload"), Mapping)
+        else {}
+    )
+    try:
+        bypass_revision = int(bypass.get("execution_state_revision") or 0)
+    except (TypeError, ValueError):
+        return {}
+    bypass_identity = str(bypass.get("bypass_identity") or "").strip()
+    diagnostic_id = str(bypass.get("diagnostic_backlog_id") or "").strip()
+    refs = {
+        str(ref or "").strip()
+        for ref in bypass.get("evidence_refs") or []
+        if str(ref or "").strip()
+    }
+    qa_refs = sorted(ref for ref in refs if re.fullmatch(r"timeline:\d+", ref))
+    required_refs = {
+        f"candidate:{branch_head}",
+        f"base:{base_commit}",
+        f"contract-runtime:{execution_id}:revision:{bypass_revision}",
+        *(f"graph-query:{trace_id}" for trace_id in trace_ids),
+    }
+    if not (
+        bypass_index > qa_graph_index
+        and str(bypass_line.get("stage_id") or "") == "qa"
+        and str(bypass_line.get("actor_role") or "") == "observer"
+        and str(bypass_line.get("status") or "") == "waived"
+        and bypass_line.get("no_pass_claim") is True
+        and str(bypass.get("schema_version") or "")
+        == "contract_line_bypass.v1"
+        and str(bypass.get("source_backlog_id") or "") == backlog_id
+        and str(bypass.get("classification") or "") == "system_logic"
+        and str(bypass.get("blocked_owner_role") or "") == "qa"
+        and str(bypass.get("blocked_evidence_kind") or "")
+        == "independent_verification"
+        and str(bypass.get("disposition") or "")
+        == "proceeded_with_exception"
+        and bypass.get("no_pass_claim") is True
+        and bypass_identity
+        == (
+            f"bypass:{execution_id}:revision-{bypass_revision}:"
+            "qa:qa_independent_verification"
+        )
+        and diagnostic_id
+        and len(qa_refs) == 1
+        and required_refs.issubset(refs)
+    ):
+        return {}
+    qa_ref = qa_refs[0]
+    qa_event_id = int(qa_ref.split(":", 1)[1])
+
+    diagnostic = conn.execute(
+        """
+        SELECT status, mf_type, chain_trigger_json, bypass_policy_json
+        FROM backlog_bugs WHERE bug_id = ?
+        """,
+        (diagnostic_id,),
+    ).fetchone()
+    if not diagnostic:
+        return {}
+    diagnostic_status = str(diagnostic["status"] or "").strip().upper()
+    chain = backlog_runtime.parse_json_object(
+        diagnostic["chain_trigger_json"]
+    )
+    policy = backlog_runtime.parse_json_object(
+        diagnostic["bypass_policy_json"]
+    )
+    binding_shape = {
+        "source_backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "line_id": "qa_independent_verification",
+        "execution_state_revision": bypass_revision,
+        "bypass_identity": bypass_identity,
+        "classification": "system_logic",
+        "disposition": "proceeded_with_exception",
+        "no_pass_claim": True,
+    }
+    merge_ref = str(chain.get("source_merge_event_ref") or "").strip()
+    reconcile_ref = str(chain.get("source_reconcile_event_ref") or "").strip()
+    if not (
+        diagnostic_status in {"OPEN", "FIXED"}
+        and str(diagnostic["mf_type"] or "") == "chain_rescue"
+        and all(chain.get(key) == value for key, value in binding_shape.items())
+        and all(policy.get(key) == value for key, value in binding_shape.items())
+        and policy.get("keep_open") is True
+        and str(chain.get("source_qa_event_ref") or "") == qa_ref
+        and re.fullmatch(r"timeline:\d+", merge_ref)
+        and (not reconcile_ref or re.fullmatch(r"timeline:\d+", reconcile_ref))
+    ):
+        return {}
+
+    source_events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
+    events_by_ref = {
+        _runtime_context_event_ref(event): event for event in source_events
+    }
+    qa_event = events_by_ref.get(qa_ref, {})
+    qa_body = (
+        qa_event.get("payload")
+        if isinstance(qa_event.get("payload"), Mapping)
+        else {}
+    )
+    verification = (
+        qa_event.get("verification")
+        if isinstance(qa_event.get("verification"), Mapping)
+        else {}
+    )
+    authority = (
+        qa_body.get("source_backed_contract_gate_authority")
+        if isinstance(
+            qa_body.get("source_backed_contract_gate_authority"), Mapping
+        )
+        else {}
+    )
+    boundary = _runtime_context_authenticated_failed_qa_timeline_boundary(
+        conn=conn,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        timeline_events=source_events,
+    )
+    failures = (
+        qa_body.get("failure_identities")
+        if isinstance(qa_body.get("failure_identities"), Mapping)
+        else {}
+    )
+    base_failures = _contract_runtime_failure_identities(failures.get("base"))
+    candidate_failures = _contract_runtime_failure_identities(
+        failures.get("candidate")
+    )
+    baseline_failures = _contract_runtime_failure_identities(
+        verification.get("known_baseline_failures")
+    )
+    qa_created_at = _contract_runtime_projection_timeline_event_time(qa_event)
+    if not (
+        boundary.get("source_ref") == qa_ref
+        and boundary.get("commit_sha") == branch_head
+        and str(qa_event.get("decision") or "")
+        == "accepted_in_scope_no_pass_system_blocked"
+        and str(qa_event.get("correlation_id") or "") == execution_id
+        and str(qa_body.get("schema_version") or "")
+        == "qa.audit_only_no_pass_system_block.v1"
+        and str(qa_body.get("base_commit_sha") or "").lower() == base_commit
+        and str(qa_body.get("candidate_commit_sha") or "").lower()
+        == branch_head
+        and qa_body.get("candidate_new_failures") == 0
+        and not list(qa_body.get("candidate_specific_issues") or [])
+        and qa_body.get("canonical_contract_acceptance_recorded") is False
+        and qa_body.get("close_satisfying") is False
+        and qa_body.get("no_pass_claim") is True
+        and qa_body.get("overall_release_pass_claimed") is False
+        and _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(
+                qa_body, "graph_trace_ids"
+            )
+        )
+        == trace_ids
+        and authority.get("audit_only") is True
+        and boundary.get("authority_hash")
+        == str(authority.get("authority_hash") or "")
+        and base_failures
+        and base_failures == candidate_failures == baseline_failures
+        and str(verification.get("schema_version") or "")
+        == "qa.audit_only_no_pass_verification.v1"
+        and verification.get("candidate_new_failures") == 0
+        and verification.get("close_satisfying") is False
+        and verification.get("no_pass_claim") is True
+        and verification.get("overall_release_pass_claimed") is False
+        and qa_created_at
+    ):
+        return {}
+
+    correlation_id = f"contract-line-bypass:{bypass_identity}"
+    source_bypass = [
+        event
+        for event in source_events
+        if str(event.get("event_type") or "") == "contract_line_bypass"
+        and str(event.get("correlation_id") or "") == correlation_id
+    ]
+    diagnostic_links = [
+        event
+        for event in _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id=task_id,
+            backlog_id=diagnostic_id,
+        )
+        if str(event.get("event_type") or "")
+        == "contract_line_bypass_diagnostic_linked"
+        and str(event.get("correlation_id") or "") == correlation_id
+    ]
+    if len(source_bypass) != 1 or len(diagnostic_links) != 1:
+        return {}
+
+    def event_identity(event: Mapping[str, Any]) -> tuple[Any, ...]:
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        return (
+            str(event.get("event_kind") or ""),
+            str(event.get("phase") or ""),
+            str(event.get("actor") or ""),
+            str(event.get("commit_sha") or "").lower(),
+            str(payload.get("bypass_identity") or ""),
+            str(payload.get("contract_execution_id") or ""),
+            str(payload.get("source_backlog_id") or ""),
+            str(payload.get("diagnostic_backlog_id") or ""),
+            str(payload.get("classification") or ""),
+            str(payload.get("disposition") or ""),
+            payload.get("no_pass_claim"),
+        )
+
+    expected_event_identity = (
+        "record_blocker",
+        "qa",
+        "observer",
+        branch_head,
+        bypass_identity,
+        execution_id,
+        backlog_id,
+        diagnostic_id,
+        "system_logic",
+        "proceeded_with_exception",
+        True,
+    )
+    bypass_event = source_bypass[0]
+    diagnostic_event = diagnostic_links[0]
+    bypass_event_id = _contract_runtime_projection_timeline_event_id(
+        bypass_event
+    )
+    diagnostic_event_id = _contract_runtime_projection_timeline_event_id(
+        diagnostic_event
+    )
+    merge_event_id = _contract_runtime_projection_timeline_event_id(
+        events_by_ref.get(merge_ref, {})
+    )
+    reconcile_event_id = _contract_runtime_projection_timeline_event_id(
+        events_by_ref.get(reconcile_ref, {})
+    )
+    if not (
+        event_identity(bypass_event) == expected_event_identity
+        and event_identity(diagnostic_event) == expected_event_identity
+        and qa_event_id < bypass_event_id < diagnostic_event_id < merge_event_id
+        and (not reconcile_ref or merge_event_id < reconcile_event_id)
+    ):
+        return {}
+
+    result = {
+        "schema_version": (
+            _CONTRACT_RUNTIME_AUDIT_ONLY_BYPASS_ROUND_SCHEMA_VERSION
+        ),
+        "source": (
+            "ContractRuntime.qa_graph_context+contract_line_bypass+"
+            "backlog_diagnostic+authenticated_qa_timeline+graph_query_traces"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "candidate_commit_sha": branch_head,
+        "base_commit_sha": base_commit,
+        "failure_identities": candidate_failures,
+        "qa_contract_runtime_verified": False,
+        "canonical_contract_acceptance_recorded": False,
+        "authoritative_pass_synthesized": False,
+        "close_satisfying": False,
+        "no_pass_claim": True,
+        "overall_release_pass_claimed": False,
+        "bypass_completed_line_index": bypass_index,
+        "qa_event_ref": qa_ref,
+        "qa_event_id": qa_event_id,
+        "qa_event_created_at": qa_created_at,
+        "diagnostic_backlog_id": diagnostic_id,
+        "diagnostic_status": diagnostic_status,
+        "expected_merge_event_ref": merge_ref,
+        "expected_reconcile_event_ref": reconcile_ref,
+    }
+    result["authority_hash"] = stable_sha256(result)
+    return result
 
 
 def _contract_runtime_observer_merge_completed_round(
@@ -63586,11 +64052,39 @@ def _contract_runtime_observer_merge_completed_round(
         )
         if acceptance.get("db_verified") is True:
             qa_verification_lines.append((index, line, acceptance))
-    if len(qa_graph_lines) != 1 or len(qa_verification_lines) != 1:
+    if len(qa_graph_lines) != 1:
         return {}
     qa_graph_index, _qa_graph = qa_graph_lines[0]
-    qa_index, _qa, qa_acceptance = qa_verification_lines[0]
-    if qa_graph_index >= qa_index:
+    if len(qa_verification_lines) == 1:
+        qa_index, _qa, qa_acceptance = qa_verification_lines[0]
+        if qa_graph_index >= qa_index:
+            return {}
+        return {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "branch_head": branch_head,
+            "worker_commit_completed_line_index": worker_commit_index,
+            "qa_graph_completed_line_index": qa_graph_index,
+            "qa_completed_line_index": qa_index,
+            "qa_acceptance_ref": str(qa_acceptance.get("acceptance_ref") or ""),
+            "qa_contract_runtime_verified": True,
+        }
+    if qa_verification_lines:
+        return {}
+
+    audit_authority = (
+        _contract_runtime_audit_only_no_pass_bypass_round_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+            context=context,
+            branch_head=branch_head,
+            qa_graph=qa_graph_lines[0],
+            round_lines=round_lines,
+        )
+    )
+    if not audit_authority:
         return {}
     return {
         "runtime_context_id": runtime_context_id,
@@ -63599,8 +64093,12 @@ def _contract_runtime_observer_merge_completed_round(
         "branch_head": branch_head,
         "worker_commit_completed_line_index": worker_commit_index,
         "qa_graph_completed_line_index": qa_graph_index,
-        "qa_completed_line_index": qa_index,
-        "qa_acceptance_ref": str(qa_acceptance.get("acceptance_ref") or ""),
+        "qa_completed_line_index": audit_authority[
+            "bypass_completed_line_index"
+        ],
+        "qa_acceptance_ref": audit_authority["authority_hash"],
+        "qa_contract_runtime_verified": False,
+        "qa_audit_only_no_pass_authority": audit_authority,
     }
 
 
@@ -63728,13 +64226,29 @@ def _contract_runtime_observer_merge_durable_authority(
                 or not event_created_at
             ):
                 continue
+            audit_authority = completed_round.get(
+                "qa_audit_only_no_pass_authority"
+            )
+            audit_authority = (
+                dict(audit_authority)
+                if isinstance(audit_authority, Mapping)
+                else {}
+            )
+            expected_merge_event_ref = str(
+                audit_authority.get("expected_merge_event_ref") or ""
+            ).strip()
+            if expected_merge_event_ref and expected_merge_event_ref != event_ref:
+                continue
             candidates.append(
                 {
                     "schema_version": (
                         _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
                     ),
                     "source": (
-                        "parallel_branch_merge_queue+task_timeline_merge"
+                        "parallel_branch_merge_queue+task_timeline_merge+"
+                        "audit_only_no_pass_bypass_round"
+                        if audit_authority
+                        else "parallel_branch_merge_queue+task_timeline_merge"
                     ),
                     "server_derived": True,
                     "db_verified": True,
@@ -63762,6 +64276,14 @@ def _contract_runtime_observer_merge_durable_authority(
                     "qa_acceptance_ref": completed_round[
                         "qa_acceptance_ref"
                     ],
+                    "qa_contract_runtime_verified": bool(
+                        completed_round.get("qa_contract_runtime_verified")
+                    ),
+                    "no_pass_claim": bool(audit_authority),
+                    "overall_release_pass_claimed": False,
+                    "authoritative_pass_synthesized": False,
+                    "close_satisfying": False if audit_authority else True,
+                    "qa_audit_only_no_pass_authority": audit_authority,
                     "timeline_event_refs": [event_ref],
                     "merge_event_ref": event_ref,
                     "merge_event_id": event_id,
@@ -63856,6 +64378,42 @@ def _contract_runtime_bind_observer_merge_authority(
     payload["merge_gate_passed"] = True
     payload["timeline_event_refs"] = list(authority["timeline_event_refs"])
     payload["durable_merge_authority"] = dict(authority)
+    audit_authority = authority.get("qa_audit_only_no_pass_authority")
+    audit_authority = (
+        audit_authority if isinstance(audit_authority, Mapping) else {}
+    )
+    if audit_authority:
+        diagnostic_id = str(
+            audit_authority.get("diagnostic_backlog_id") or ""
+        ).strip()
+        diagnostic_status = str(
+            audit_authority.get("diagnostic_status") or ""
+        ).strip().upper()
+        payload.update(
+            {
+                "schema_version": "observer_merge.no_pass_exception.v1",
+                "disposition": "audit_only_no_pass_bypass_recovery",
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+                "authoritative_pass_synthesized": False,
+                "close_satisfying": False,
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "independent_qa_status": (
+                    "accepted_in_scope_no_pass_system_blocked"
+                ),
+                "system_diagnostics": [
+                    {
+                        "backlog_id": diagnostic_id,
+                        "status": diagnostic_status,
+                    }
+                ],
+                "system_diagnostics_open": (
+                    [diagnostic_id] if diagnostic_status == "OPEN" else []
+                ),
+                "qa_audit_only_no_pass_authority": dict(audit_authority),
+            }
+        )
     effective = dict(write)
     effective["payload"] = payload
     effective["commit_sha"] = authority["merge_commit"]
@@ -63972,6 +64530,69 @@ def _contract_runtime_candidate_scoped_no_pass_line(
             if isinstance(payload.get("durable_merge_authority"), Mapping)
             else {}
         )
+        audit_authority = (
+            payload.get("qa_audit_only_no_pass_authority")
+            if isinstance(
+                payload.get("qa_audit_only_no_pass_authority"), Mapping
+            )
+            else {}
+        )
+        durable_audit = (
+            durable.get("qa_audit_only_no_pass_authority")
+            if isinstance(
+                durable.get("qa_audit_only_no_pass_authority"), Mapping
+            )
+            else {}
+        )
+        if audit_authority or durable_audit:
+            diagnostic_id = str(
+                audit_authority.get("diagnostic_backlog_id") or ""
+            ).strip()
+            diagnostic_status = str(
+                audit_authority.get("diagnostic_status") or ""
+            ).strip().upper()
+            system_diagnostics = payload.get("system_diagnostics")
+            return bool(
+                audit_authority
+                and stable_sha256(audit_authority)
+                == stable_sha256(durable_audit)
+                and str(audit_authority.get("schema_version") or "")
+                == _CONTRACT_RUNTIME_AUDIT_ONLY_BYPASS_ROUND_SCHEMA_VERSION
+                and audit_authority.get("server_derived") is True
+                and audit_authority.get("db_verified") is True
+                and audit_authority.get("qa_contract_runtime_verified") is False
+                and audit_authority.get("canonical_contract_acceptance_recorded")
+                is False
+                and audit_authority.get("authoritative_pass_synthesized") is False
+                and audit_authority.get("close_satisfying") is False
+                and audit_authority.get("no_pass_claim") is True
+                and audit_authority.get("overall_release_pass_claimed") is False
+                and str(audit_authority.get("candidate_commit_sha") or "").lower()
+                == str(durable.get("branch_head") or "").lower()
+                and diagnostic_id
+                and diagnostic_status in {"OPEN", "FIXED"}
+                and system_diagnostics
+                == [{"backlog_id": diagnostic_id, "status": diagnostic_status}]
+                and list(payload.get("system_diagnostics_open") or [])
+                == ([diagnostic_id] if diagnostic_status == "OPEN" else [])
+                and str(line.get("actor_role") or "").strip() == "observer"
+                and str(line.get("evidence_kind") or "").strip() == "merge"
+                and str(line.get("status") or "").strip().lower() == "accepted"
+                and str(payload.get("schema_version") or "")
+                == "observer_merge.no_pass_exception.v1"
+                and str(payload.get("disposition") or "")
+                == "audit_only_no_pass_bypass_recovery"
+                and payload.get("authoritative_pass_synthesized") is False
+                and payload.get("close_satisfying") is False
+                and payload.get("candidate_new_failures") == 0
+                and not list(payload.get("candidate_specific_issues") or [])
+                and str(payload.get("independent_qa_status") or "").strip()
+                == "accepted_in_scope_no_pass_system_blocked"
+                and str(durable.get("schema_version") or "")
+                == _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
+                and durable.get("server_derived") is True
+                and durable.get("db_verified") is True
+            )
         return bool(
             str(line.get("actor_role") or "").strip() == "observer"
             and str(line.get("evidence_kind") or "").strip() == "merge"
@@ -64045,6 +64666,13 @@ def _contract_runtime_server_derived_observer_merge_no_pass_line(
         == _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
         and durable.get("server_derived") is True
         and durable.get("db_verified") is True
+        and (
+            not isinstance(
+                durable.get("qa_audit_only_no_pass_authority"), Mapping
+            )
+            or not durable.get("qa_audit_only_no_pass_authority")
+            or _contract_runtime_candidate_scoped_no_pass_line(line)
+        )
     )
 
 
@@ -64139,28 +64767,83 @@ def _contract_runtime_completed_merge_authority(
         ):
             merge_line = (index, line)
 
-    if not qa_graph or not qa_verification or not merge_line:
+    if not qa_graph or not merge_line:
         return {}
-    if not (qa_graph[0] < qa_verification[0] < merge_line[0]):
-        return {}
-    if (
-        not _contract_runtime_line_status_passes(qa_verification[1])
-        or _contract_runtime_line_reports_disqualifying_failed_qa(
-            qa_verification[1],
+    qa_acceptance: dict[str, Any] = {}
+    audit_authority: dict[str, Any] = {}
+    if qa_verification:
+        if not (qa_graph[0] < qa_verification[0] < merge_line[0]):
+            return {}
+        if (
+            not _contract_runtime_line_status_passes(qa_verification[1])
+            or _contract_runtime_line_reports_disqualifying_failed_qa(
+                qa_verification[1],
+                record=record,
+            )
+        ):
+            return {}
+        qa_acceptance = _contract_runtime_completed_line_acceptance(
+            conn,
+            project_id=project_id,
             record=record,
+            completed_line_index=qa_verification[0],
+            expected_line=qa_verification[1],
         )
-    ):
-        return {}
-
-    qa_acceptance = _contract_runtime_completed_line_acceptance(
-        conn,
-        project_id=project_id,
-        record=record,
-        completed_line_index=qa_verification[0],
-        expected_line=qa_verification[1],
-    )
-    if qa_acceptance.get("db_verified") is not True:
-        return {}
+        if qa_acceptance.get("db_verified") is not True:
+            return {}
+    else:
+        preliminary_merge_payload = (
+            merge_line[1].get("payload")
+            if isinstance(merge_line[1].get("payload"), Mapping)
+            else {}
+        )
+        preliminary_durable = (
+            preliminary_merge_payload.get("durable_merge_authority")
+            if isinstance(
+                preliminary_merge_payload.get("durable_merge_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        preliminary_branch_head = str(
+            preliminary_durable.get("branch_head")
+            or preliminary_merge_payload.get("branch_head")
+            or ""
+        ).strip().lower()
+        completed_round = _contract_runtime_observer_merge_completed_round(
+            conn,
+            project_id=project_id,
+            record=record,
+            context=context,
+            branch_head=preliminary_branch_head,
+        )
+        audit_authority = (
+            dict(completed_round.get("qa_audit_only_no_pass_authority"))
+            if isinstance(
+                completed_round.get("qa_audit_only_no_pass_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        durable_audit = (
+            preliminary_durable.get("qa_audit_only_no_pass_authority")
+            if isinstance(
+                preliminary_durable.get("qa_audit_only_no_pass_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        if not (
+            audit_authority
+            and stable_sha256(audit_authority) == stable_sha256(durable_audit)
+            and completed_round.get("qa_contract_runtime_verified") is False
+            and int(completed_round.get("qa_graph_completed_line_index") or -1)
+            == qa_graph[0]
+            and qa_graph[0]
+            < int(audit_authority.get("bypass_completed_line_index") or -1)
+            < merge_line[0]
+        ):
+            return {}
 
     qa_graph_payload = (
         qa_graph[1].get("payload")
@@ -64174,8 +64857,14 @@ def _contract_runtime_completed_merge_authority(
     )
     qa_payload = (
         qa_verification[1].get("payload")
-        if isinstance(qa_verification[1].get("payload"), Mapping)
-        else {}
+        if qa_verification
+        and isinstance(qa_verification[1].get("payload"), Mapping)
+        else {
+            "acceptance_scope": (
+                "candidate_regression_and_acceptance_criteria"
+            ),
+            "candidate_new_failures": 0,
+        }
     )
     merge_payload = (
         merge_line[1].get("payload")
@@ -64196,7 +64885,12 @@ def _contract_runtime_completed_merge_authority(
         return {}
     merge_schema = durable_merge_authority or merge_payload
     qa_commit = str(
-        qa_verification[1].get("commit_sha")
+        audit_authority.get("candidate_commit_sha")
+        or (
+            qa_verification[1].get("commit_sha")
+            if qa_verification
+            else ""
+        )
         or qa_payload.get("candidate_commit_sha")
         or ""
     ).strip().lower()
@@ -64310,20 +65004,24 @@ def _contract_runtime_completed_merge_authority(
     if merge_event_id <= 0 or not merge_event_created_at:
         return {}
 
-    no_pass_claim = any(
+    no_pass_lines = [qa_graph[1], merge_line[1]]
+    if qa_verification:
+        no_pass_lines.append(qa_verification[1])
+    no_pass_claim = bool(audit_authority) or any(
         (
             line.get("payload")
             if isinstance(line.get("payload"), Mapping)
             else {}
         ).get("no_pass_claim")
         is True
-        for line in (qa_graph[1], qa_verification[1], merge_line[1])
+        for line in no_pass_lines
     )
     baseline_ledger = (
         qa_verification[1].get("artifact_refs", {}).get(
             "external_no_pass_baseline_ledger"
         )
-        if isinstance(qa_verification[1].get("artifact_refs"), Mapping)
+        if qa_verification
+        and isinstance(qa_verification[1].get("artifact_refs"), Mapping)
         and isinstance(
             qa_verification[1].get("artifact_refs", {}).get(
                 "external_no_pass_baseline_ledger"
@@ -64332,6 +65030,16 @@ def _contract_runtime_completed_merge_authority(
         )
         else {}
     )
+    base_reproduction = dict(baseline_ledger.get("base_reproduction") or {})
+    if audit_authority:
+        failure_identities = list(
+            audit_authority.get("failure_identities") or []
+        )
+        base_reproduction = {
+            "reproduced": len(failure_identities),
+            "total": len(failure_identities),
+            "failure_identities": failure_identities,
+        }
     return {
         "timeline_verified": True,
         "authority_verified": True,
@@ -64339,9 +65047,12 @@ def _contract_runtime_completed_merge_authority(
         "overall_release_pass_claimed": False,
         "qa_acceptance_scope": str(qa_payload.get("acceptance_scope") or ""),
         "candidate_new_failures": qa_payload.get("candidate_new_failures"),
-        "base_reproduction": dict(baseline_ledger.get("base_reproduction") or {}),
+        "base_reproduction": base_reproduction,
         "authority_source": (
-            "contract_runtime_completed_lines+server_durable_merge_schema+"
+            "contract_runtime_qa_graph+bypass+authenticated_qa_timeline+"
+            "server_durable_merge_schema+durable_merge_queue+task_timeline_merge"
+            if audit_authority
+            else "contract_runtime_completed_lines+server_durable_merge_schema+"
             "durable_merge_queue+task_timeline_merge"
             if durable_merge_authority
             else "contract_runtime_completed_lines+durable_merge_queue+task_timeline_merge"
@@ -64358,9 +65069,15 @@ def _contract_runtime_completed_merge_authority(
             or ""
         ),
         "merged_commit_sha": merged_commit,
-        "qa_source_ref": str(qa_acceptance.get("completed_line_ref") or ""),
-        "qa_event_id": 0,
-        "qa_event_created_at": "",
+        "qa_source_ref": str(
+            audit_authority.get("qa_event_ref")
+            or qa_acceptance.get("completed_line_ref")
+            or ""
+        ),
+        "qa_event_id": int(audit_authority.get("qa_event_id") or 0),
+        "qa_event_created_at": str(
+            audit_authority.get("qa_event_created_at") or ""
+        ),
         "qa_acceptance_created_at": str(
             qa_acceptance.get("accepted_at") or ""
         ),
@@ -64368,11 +65085,20 @@ def _contract_runtime_completed_merge_authority(
             qa_acceptance.get("execution_state_revision") or 0
         ),
         "qa_acceptance_ref": str(
-            qa_acceptance.get("acceptance_ref") or ""
+            audit_authority.get("authority_hash")
+            or qa_acceptance.get("acceptance_ref")
+            or ""
         ),
-        "qa_contract_runtime_verified": True,
+        "qa_contract_runtime_verified": not bool(audit_authority),
         "qa_graph_completed_line_index": qa_graph[0],
-        "qa_completed_line_index": qa_verification[0],
+        "qa_completed_line_index": (
+            int(audit_authority.get("bypass_completed_line_index") or -1)
+            if audit_authority
+            else qa_verification[0]
+        ),
+        "qa_audit_only_no_pass_authority": audit_authority,
+        "authoritative_pass_synthesized": False,
+        "close_satisfying": False if audit_authority else True,
         "merge_completed_line_index": merge_line[0],
         "merge_source_ref": _runtime_context_event_ref(merge_event),
         "merge_event_id": merge_event_id,
