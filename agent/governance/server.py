@@ -24616,6 +24616,13 @@ def _runtime_context_authenticated_failed_qa_timeline_boundary(
             or qa_proof.get("commit_sha")
             or ""
         ).strip()
+        qa_observer_impersonation_forbidden = (
+            qa_proof.get("observer_impersonation") is False
+            and (
+                "observer_impersonation" not in payload
+                or payload.get("observer_impersonation") is False
+            )
+        )
         authenticated = bool(
             task_timeline._source_backed_qa_session_authority_valid(
                 source_authority,
@@ -24649,7 +24656,7 @@ def _runtime_context_authenticated_failed_qa_timeline_boundary(
             and re.fullmatch(r"[0-9a-f]{40,64}", event_commit)
             and str(qa_proof.get("commit_sha") or "").strip() == event_commit
             and bool(str(source_authority.get("authority_hash") or "").strip())
-            and payload.get("observer_impersonation") is False
+            and qa_observer_impersonation_forbidden
         )
         if not authenticated or status not in blocking_statuses | passing_statuses:
             continue
