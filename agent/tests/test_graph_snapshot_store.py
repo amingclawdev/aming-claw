@@ -1219,6 +1219,53 @@ def test_current_full_state_projects_later_canonical_commit_after_merge(conn):
     assert state["reconcile_snapshot_verified"] is True
     assert state["durable_order_verified"] is True
 
+    later_canonical_commit = "d" * 40
+    later_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-later-canonical-after-reconcile",
+        commit_sha=later_canonical_commit,
+        snapshot_kind="full",
+    )
+    store.activate_graph_snapshot(conn, PID, later_snapshot["snapshot_id"])
+
+    after_later_activation = store.current_full_reconcile_state(
+        conn,
+        PID,
+        historical_merge_commit,
+        current_canonical_commit_sha=later_canonical_commit,
+        merge_event_id=11,
+        merge_event_created_at="2026-07-22T10:01:00Z",
+        reconcile_event_id=12,
+        reconcile_event_created_at="2026-07-22T10:02:00Z",
+    )
+
+    assert after_later_activation["db_verified"] is True
+    assert (
+        after_later_activation["merged_commit_sha"]
+        == historical_merge_commit
+    )
+    assert (
+        after_later_activation["reconciled_commit_sha"]
+        == current_canonical_commit
+    )
+    assert after_later_activation["current_canonical_commit_sha"] == (
+        later_canonical_commit
+    )
+    assert (
+        after_later_activation["reconcile_snapshot_id"]
+        == snapshot["snapshot_id"]
+    )
+    assert after_later_activation["reconcile_snapshot_status"] == (
+        store.SNAPSHOT_STATUS_SUPERSEDED
+    )
+    assert after_later_activation["reconcile_snapshot_verified"] is True
+    assert (
+        after_later_activation["active_snapshot_id"]
+        == later_snapshot["snapshot_id"]
+    )
+    assert after_later_activation["active_snapshot_verified"] is True
+
     historical_target_only = store.current_full_reconcile_state(
         conn,
         PID,

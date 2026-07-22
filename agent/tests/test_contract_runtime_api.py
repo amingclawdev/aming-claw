@@ -368,3 +368,91 @@ def test_current_full_authority_uses_current_canonical_reconcile_target(
     assert authority["active_snapshot_matches_canonical_head"] is True
     assert authority["active_snapshot_verified"] is True
     assert authority["graph_reconciled"] is True
+
+
+def test_current_full_authority_keeps_completed_reconcile_after_later_head(
+    monkeypatch,
+):
+    historical_merge_commit = "a" * 40
+    reconciled_commit = "b" * 40
+    current_canonical_commit = "c" * 40
+    ancestry_calls = []
+
+    def current_full_state(
+        _conn,
+        _project_id,
+        merged_commit_sha,
+        **kwargs,
+    ):
+        assert merged_commit_sha == historical_merge_commit
+        assert (
+            kwargs["current_canonical_commit_sha"] == current_canonical_commit
+        )
+        return {
+            "db_verified": True,
+            "active_snapshot_commit": current_canonical_commit,
+            "active_snapshot_status": "active",
+            "active_snapshot_verified": True,
+            "reconcile_snapshot_verified": True,
+            "current_canonical_commit_sha": current_canonical_commit,
+            "reconciled_commit_sha": reconciled_commit,
+        }
+
+    monkeypatch.setattr(
+        graph_snapshot_store,
+        "current_full_reconcile_state",
+        current_full_state,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: "/canonical/project",
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_head_commit",
+        lambda _root: current_canonical_commit,
+    )
+
+    def is_ancestor(_root, ancestor, descendant):
+        ancestry_calls.append((ancestor, descendant))
+        return (
+            ancestor == reconciled_commit
+            and descendant == current_canonical_commit
+        )
+
+    monkeypatch.setattr(server, "_git_commit_is_ancestor", is_ancestor)
+    authority = (
+        server._contract_runtime_current_full_reconcile_authority_from_merge(
+            object(),
+            project_id="contract-runtime-api-test",
+            record={
+                "backlog_id": "AC-COMPLETED-RECONCILE",
+                "contract_execution_id": "cex-completed-reconcile",
+            },
+            merge={
+                "timeline_verified": True,
+                "merged_commit_sha": historical_merge_commit,
+                "runtime_context_id": "mfrctx-completed-reconcile",
+                "task_id": "worker-completed-reconcile",
+                "parent_task_id": "cex-completed-reconcile",
+                "merge_event_id": 11,
+                "merge_event_created_at": "2026-07-22T10:01:00Z",
+            },
+            reconcile={
+                "reconcile_event_id": 12,
+                "reconcile_event_created_at": "2026-07-22T10:02:00Z",
+                "reconcile_task_id": "worker-completed-reconcile",
+                "reconcile_runtime_context_id": "mfrctx-completed-reconcile",
+            },
+        )
+    )
+
+    assert ancestry_calls == [(reconciled_commit, current_canonical_commit)]
+    assert authority["merged_commit_sha"] == historical_merge_commit
+    assert authority["reconciled_commit_sha"] == reconciled_commit
+    assert authority["canonical_head_commit"] == current_canonical_commit
+    assert authority["canonical_head_equals_merged_commit"] is False
+    assert authority["canonical_head_equals_reconciled_commit"] is False
+    assert authority["reconciled_commit_is_ancestor_of_canonical_head"] is True
+    assert authority["graph_reconciled"] is True

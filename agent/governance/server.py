@@ -65417,15 +65417,18 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
     canonical_head_equals_merged_commit = bool(
         merged_commit and canonical_head_commit == merged_commit
     )
+    canonical_head_equals_reconciled_commit = bool(
+        reconciled_commit and canonical_head_commit == reconciled_commit
+    )
     reconciled_commit_is_ancestor_of_canonical_head = bool(
-        canonical_head_equals_merged_commit
+        canonical_head_equals_reconciled_commit
         or (
             root
-            and merged_commit
+            and reconciled_commit
             and canonical_head_commit
             and _git_commit_is_ancestor(
                 Path(root),
-                merged_commit,
+                reconciled_commit,
                 canonical_head_commit,
             )
         )
@@ -65474,6 +65477,9 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
         "canonical_head_commit": canonical_head_commit,
         "canonical_head_equals_merged_commit": (
             canonical_head_equals_merged_commit
+        ),
+        "canonical_head_equals_reconciled_commit": (
+            canonical_head_equals_reconciled_commit
         ),
         "reconciled_commit_is_ancestor_of_canonical_head": (
             reconciled_commit_is_ancestor_of_canonical_head
