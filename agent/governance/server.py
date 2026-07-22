@@ -26954,6 +26954,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
     record: Mapping[str, Any],
     payload: Mapping[str, Any],
     revision_marker: Mapping[str, Any],
+    canonical_reopened_runtime_guide: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate or version failed-QA implementation from immutable git state."""
 
@@ -27392,9 +27393,73 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             if isinstance(guide.get("next_legal_action"), Mapping)
             else {}
         )
-        if str(next_line.get("line_id") or "").strip() != "observer_merge":
+        reopened_guide = (
+            canonical_reopened_runtime_guide
+            if isinstance(canonical_reopened_runtime_guide, Mapping)
+            else {}
+        )
+        reopened_next_line = (
+            reopened_guide.get("next_legal_action")
+            if isinstance(reopened_guide.get("next_legal_action"), Mapping)
+            else {}
+        )
+        reopened_failed_qa_blocker = (
+            reopened_next_line.get("failed_qa_blocker")
+            if isinstance(reopened_next_line.get("failed_qa_blocker"), Mapping)
+            else {}
+        )
+        reopened_execution = (
+            reopened_guide.get("execution")
+            if isinstance(reopened_guide.get("execution"), Mapping)
+            else {}
+        )
+        reopened_execution_id = str(
+            reopened_execution.get("contract_execution_id") or ""
+        ).strip()
+        reopened_execution_revision = int(
+            reopened_execution.get("execution_state_revision") or 0
+        )
+        canonical_reopened_worker_implementation = bool(
+            reopened_execution_id == contract_execution_id
+            and reopened_execution_revision
+            == int(record.get("execution_state_revision") or 0)
+            and str(reopened_next_line.get("stage_id") or "").strip()
+            == "worker_implementation"
+            and str(reopened_next_line.get("line_id") or "").strip()
+            == "worker_implementation"
+            and str(
+                reopened_next_line.get("semantic_next_action") or ""
+            ).strip()
+            == "revise_after_failed_independent_qa"
+            and reopened_next_line.get("blocked_by_failed_qa") is True
+            and str(reopened_next_line.get("owner_role") or "").strip()
+            == "mf_sub"
+            and "mf_sub"
+            in {
+                str(role or "").strip()
+                for role in (reopened_next_line.get("allowed_writer_roles") or [])
+            }
+            and str(reopened_next_line.get("evidence_kind") or "").strip()
+            == "implementation"
+            and str(reopened_failed_qa_blocker.get("status") or "").strip()
+            == "blocked_by_failed_independent_qa"
+            and str(
+                reopened_failed_qa_blocker.get("next_required_line_id") or ""
+            ).strip()
+            == "worker_implementation"
+            and str(
+                reopened_failed_qa_blocker.get("required_submission") or ""
+            ).strip()
+            == "changed_files=cumulative_runtime_diff"
+        )
+        if (
+            str(next_line.get("line_id") or "").strip() != "observer_merge"
+            and not canonical_reopened_worker_implementation
+        ):
             errors.append(
-                "timeline-backed implementation revision requires stored ContractRuntime at observer_merge"
+                "timeline-backed implementation revision requires stored "
+                "ContractRuntime at observer_merge or the canonical reopened "
+                "guide at worker_implementation"
             )
         if previous is None:
             errors.append(
@@ -28350,6 +28415,7 @@ def _runtime_context_submit_canonical_contract_line(
         }
 
     runtime = _contract_runtime(conn)
+    canonical_projected_runtime_guide: dict[str, Any] = {}
     try:
         if not runtime.pinned_definition_has_line(execution_id, line_id):
             return {
@@ -28370,6 +28436,11 @@ def _runtime_context_submit_canonical_contract_line(
                 record=record,
                 actor_role="mf_sub",
             )
+        )
+        canonical_projected_runtime_guide = (
+            dict(projected_record.get("runtime_guide"))
+            if isinstance(projected_record.get("runtime_guide"), Mapping)
+            else {}
         )
         failed_qa_rejoin_contexts = (
             candidate_projection.get("failed_qa_revision_rejoin_contexts")
@@ -28466,6 +28537,9 @@ def _runtime_context_submit_canonical_contract_line(
                 "failed_qa_revision_rejoin_marker",
                 {},
             ),
+            canonical_reopened_runtime_guide=(
+                canonical_projected_runtime_guide
+            ),
         )
         revision_status = str(revision.get("status") or "").strip()
         if revision_status == "validated_timeline_boundary_submission":
@@ -28513,6 +28587,9 @@ def _runtime_context_submit_canonical_contract_line(
                     record=stored_record,
                     payload=prevalidated_payload,
                     revision_marker=replay_marker,
+                    canonical_reopened_runtime_guide=(
+                        canonical_projected_runtime_guide
+                    ),
                 )
             except Exception:
                 conn.rollback()
@@ -77047,6 +77124,11 @@ def _contract_runtime_close_gate(
                     record=stored_record,
                     payload=canonical_norm_payload,
                     revision_marker={},
+                    canonical_reopened_runtime_guide=(
+                        record.get("runtime_guide")
+                        if isinstance(record.get("runtime_guide"), Mapping)
+                        else {}
+                    ),
                 )
             )
             if prevalidation.get("status") == (

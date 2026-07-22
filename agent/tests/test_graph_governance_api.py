@@ -33601,6 +33601,43 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
         "qa_scope_binding_ref": qa_scope_binding_ref,
     }
 
+    # Reproduce the live contradiction: a legacy failed-QA ContractRuntime
+    # line without canonical QA provenance reopens the stored guide before the
+    # authenticated timeline boundary is projected.  The canonical worker
+    # view below must still advance to worker_implementation from the exact
+    # failed-QA/rejoin marker rather than requiring the stale observer_merge
+    # guide that existed before the failure.
+    reopened_record = runtime.store.get(successor["contract_execution_id"])
+    reopened_record["completed_lines"].append(
+        {
+            **passed_common,
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "actor_role": "qa",
+            "evidence_kind": "independent_verification",
+            "status": "failed",
+            "verification": {"result": "failed", "verdict": "FAIL"},
+            "payload": {
+                **passed_common,
+                "status": "failed",
+                "verdict": "FAIL",
+                "source_ref": f"timeline:{failed_qa['id']}",
+            },
+        }
+    )
+    reopened_record["execution_state_revision"] = int(
+        reopened_record["execution_state_revision"]
+    ) + 1
+    runtime.store.update(successor["contract_execution_id"], reopened_record)
+    stored_reopened_guide = runtime.current_guide(
+        successor["contract_execution_id"],
+        actor_role="mf_sub",
+    )
+    assert stored_reopened_guide["next_legal_action"]["line_id"] == (
+        "worker_read_runtime_guide"
+    )
+    before_rejoin_record = runtime.store.get(successor["contract_execution_id"])
+
     with pytest.raises(GovernanceError) as missing_rejoin:
         server._runtime_context_revise_failed_qa_implementation_lineage(
             conn,
@@ -33799,6 +33836,14 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     assert rejoin["worker_slot_id"] == first_rejoin["worker_slot_id"]
     assert rejoin["fence_token_hash"] == first_rejoin["fence_token_hash"]
     assert rejoin["session_token_ref"] != legacy_rotations[-1]["session_token_ref"]
+    canonical_reopened = server._contract_runtime_read(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        actor_role="mf_sub",
+    )
+    assert canonical_reopened["runtime_guide"]["next_legal_action"][
+        "line_id"
+    ] == "worker_implementation"
     second_rejoin_event_id = int(rejoin["audit_event_id"])
     second_rejoin_row = conn.execute(
         "SELECT payload_json FROM task_timeline_events WHERE id = ?",
@@ -34074,6 +34119,31 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
             "execution_state_revision"
         ] == revision_before_negative_cases
 
+    forged_reopened_guide = json.loads(
+        json.dumps(canonical_reopened["runtime_guide"])
+    )
+    forged_reopened_guide["next_legal_action"][
+        "blocked_by_failed_qa"
+    ] = False
+    with pytest.raises(GovernanceError) as forged_guide_rejected:
+        server._runtime_context_revise_failed_qa_implementation_lineage(
+            conn,
+            project_id=PID,
+            context=saved_context,
+            runtime=runtime,
+            record=runtime.store.get(successor["contract_execution_id"]),
+            payload=revision_payload,
+            revision_marker=revision_marker,
+            canonical_reopened_runtime_guide=forged_reopened_guide,
+        )
+    assert forged_guide_rejected.value.code == (
+        "contract_runtime_rework_lineage_revision_invalid"
+    )
+    assert "canonical reopened guide" in str(forged_guide_rejected.value)
+    assert runtime.store.get(successor["contract_execution_id"])[
+        "execution_state_revision"
+    ] == revision_before_negative_cases
+
     def mutation_state():
         record = runtime.store.get(successor["contract_execution_id"])
         events = task_timeline.list_events(
@@ -34101,6 +34171,9 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
             record=runtime.store.get(successor["contract_execution_id"]),
             payload=revision_payload,
             revision_marker={},
+            canonical_reopened_runtime_guide=canonical_reopened[
+                "runtime_guide"
+            ],
         )
     )
     assert prevalidation["status"] == (
