@@ -60450,6 +60450,672 @@ def test_runtime_context_read_receipt_resolves_source_backed_contract_when_revis
     ] == runtime_context.runtime_context_id
 
 
+def _context_local_rework_receipt_fixture():
+    execution_id = "cex-context-local-rework-receipt"
+    backlog_id = "AC-CONTEXT-LOCAL-REWORK-RECEIPT"
+    route_identity = {
+        "route_id": "route-context-local-rework-receipt",
+        "route_context_hash": "sha256:context-local-rework-receipt-route",
+        "prompt_contract_id": "rprompt-context-local-rework-receipt",
+        "prompt_contract_hash": "sha256:context-local-rework-receipt-prompt",
+        "route_token_ref": "rtok-context-local-rework-receipt",
+        "visible_injection_manifest_hash": (
+            "sha256:context-local-rework-receipt-visible"
+        ),
+    }
+    context = SimpleNamespace(
+        project_id=PID,
+        governance_project_id=PID,
+        runtime_context_id="mfrctx-context-local-rework-receipt-new",
+        task_id="context-local-rework-receipt-new-worker",
+        parent_task_id=execution_id,
+        root_task_id=execution_id,
+        backlog_id=backlog_id,
+        status=STATE_WORKTREE_READY,
+        worker_id="context-local-rework-receipt-worker",
+        worker_slot_id="context-local-rework-receipt-worker",
+        actual_host_worker_id="/root/context-local-rework-receipt-worker",
+        fence_token="fence-context-local-rework-receipt",
+        session_token_hash="sha256:context-local-rework-receipt-session",
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": "worker_startup",
+                "line_id": "worker_startup",
+            }
+        },
+        "completed_lines": [
+            {
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "actor_role": "mf_sub",
+                "evidence_kind": "read_receipt",
+                "line_instance_id": "runtime_context:mfrctx-prior-worker",
+                "payload": {
+                    "runtime_context_id": "mfrctx-prior-worker",
+                    "task_id": "prior-worker-task",
+                },
+            }
+        ],
+    }
+    marker = {
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": execution_id,
+        "contract_execution_id": execution_id,
+        "source": "contract_runtime_completed_lines",
+    }
+    command = {
+        "command_id": "cmd-context-local-rework-receipt",
+        "command_type": "execute_backlog_row",
+        "status": "claimed",
+        "claimed_by_session_id": "obs-context-local-rework-receipt",
+        "payload": {
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "worker_task_id": context.task_id,
+            **route_identity,
+        },
+    }
+    return context, record, marker, command, route_identity
+
+
+def test_fresh_failed_qa_rework_receipt_uses_context_local_timeline_without_resubmitting_contract(
+    conn,
+    monkeypatch,
+):
+    context, record, marker, command, route_identity = (
+        _context_local_rework_receipt_fixture()
+    )
+    execution_id = record["contract_execution_id"]
+    runtime = SimpleNamespace(
+        pinned_definition_has_line=lambda _execution_id, _line_id: True,
+        current_guide=lambda _execution_id, actor_role: None,
+        store=SimpleNamespace(get=lambda _execution_id: record),
+        submit_line_write=lambda *args, **kwargs: pytest.fail(
+            "context-local receipt must not resubmit the global Contract line"
+        ),
+    )
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: runtime)
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_contract_revision_payload",
+        lambda _conn, _context: {"contract_execution_id": execution_id},
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_resolve_contract_execution_identity",
+        lambda *args, **kwargs: (
+            {"contract_execution_id": execution_id},
+            {"status": "resolved"},
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda *args, **kwargs: (
+            record,
+            {"failed_qa_revision_rejoin_contexts": [marker]},
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dispatch_identity_resolution",
+        lambda _record, _context: {
+            "accepted": True,
+            "reconstructable": True,
+            "observer_command_id": command["command_id"],
+        },
+    )
+    monkeypatch.setattr(
+        observer_session,
+        "get_command",
+        lambda *args, **kwargs: command,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_route_identity",
+        lambda _conn, _context: route_identity,
+    )
+
+    result = server._runtime_context_submit_canonical_contract_line(
+        conn,
+        project_id=PID,
+        context=context,
+        contract_execution_id=execution_id,
+        stage_id="worker_read",
+        line_id="worker_read_runtime_guide",
+        evidence_kind="read_receipt",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.parent_task_id,
+            "worker_role": "mf_sub",
+            "actor_role": "mf_sub",
+            "observer_impersonation": False,
+        },
+    )
+
+    assert result["accepted"] is True
+    assert result["status"] == (
+        "context_local_receipt_after_prior_contract_line"
+    )
+    assert result["context_local_timeline_receipt_allowed"] is True
+    assert result["global_contract_line_already_completed"] is True
+    assert result["contract_runtime_mutated"] is False
+    assert result["duplicate_contract_line_submitted"] is False
+    assert result["observer_command"]["status"] == "claimed"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_failed_qa_marker",
+        "wrong_marker_task",
+        "wrong_command_contract",
+        "wrong_command_task",
+        "unclaimed_command",
+        "observer_impersonation",
+        "missing_active_worker",
+        "startup_without_local_receipt",
+    ],
+)
+def test_context_local_rework_receipt_rejects_noncanonical_backfill(
+    conn,
+    monkeypatch,
+    mutation,
+):
+    context, record, marker, command, route_identity = (
+        _context_local_rework_receipt_fixture()
+    )
+    markers = [marker]
+    stage_id = "worker_read"
+    line_id = "worker_read_runtime_guide"
+    evidence_kind = "read_receipt"
+    payload = {
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "worker_role": "mf_sub",
+        "actor_role": "mf_sub",
+        "observer_impersonation": False,
+    }
+    if mutation == "missing_failed_qa_marker":
+        markers = []
+    elif mutation == "wrong_marker_task":
+        markers = [{**marker, "task_id": "different-rework-task"}]
+    elif mutation == "wrong_command_contract":
+        command["payload"]["contract_execution_id"] = "cex-different"
+    elif mutation == "wrong_command_task":
+        command["payload"]["worker_task_id"] = "different-worker-task"
+    elif mutation == "unclaimed_command":
+        command["status"] = "notified"
+        command["claimed_by_session_id"] = ""
+    elif mutation == "observer_impersonation":
+        payload["observer_impersonation"] = True
+        payload["actor_role"] = "observer"
+    elif mutation == "missing_active_worker":
+        context.actual_host_worker_id = ""
+    elif mutation == "startup_without_local_receipt":
+        stage_id = "worker_startup"
+        line_id = "worker_startup"
+        evidence_kind = "mf_subagent_startup"
+        record["completed_lines"].append(
+            {
+                "stage_id": stage_id,
+                "line_id": line_id,
+                "actor_role": "mf_sub",
+                "evidence_kind": evidence_kind,
+                "line_instance_id": "runtime_context:mfrctx-prior-worker",
+                "payload": {
+                    "runtime_context_id": "mfrctx-prior-worker",
+                    "task_id": "prior-worker-task",
+                },
+            }
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dispatch_identity_resolution",
+        lambda _record, _context: {
+            "accepted": True,
+            "reconstructable": True,
+            "observer_command_id": command["command_id"],
+        },
+    )
+    monkeypatch.setattr(
+        observer_session,
+        "get_command",
+        lambda *args, **kwargs: command,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_route_identity",
+        lambda _conn, _context: route_identity,
+    )
+
+    assert server._runtime_context_context_local_setup_authority(
+        conn,
+        project_id=PID,
+        context=context,
+        record=record,
+        stage_id=stage_id,
+        line_id=line_id,
+        evidence_kind=evidence_kind,
+        payload=payload,
+        failed_qa_rejoin_contexts=markers,
+    ) == {}
+
+
+def test_fresh_failed_qa_context_read_receipt_persists_and_startup_discovers_it(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-CONTEXT-LOCAL-REWORK-RECEIPT-HANDLERS"
+    fresh_task_id = "context-local-rework-fresh-worker"
+    old_token = "context-local-rework-old-token"
+    fresh_token = "context-local-rework-fresh-token"
+    old_fence = "fence-context-local-rework-old"
+    fresh_fence = "fence-context-local-rework-fresh"
+    target_root = tmp_path / "context-local-rework-receipt-handlers"
+    head_commit = _init_test_git_repo(target_root)
+    branch_name = subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    branch_ref = f"refs/heads/{branch_name}"
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: target_root,
+    )
+
+    successor, old_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="context-local-rework-parent",
+        worker_task_id="context-local-rework-old-worker",
+        fence_token=old_fence,
+        token=old_token,
+        worktree_path=str(target_root),
+        target_project_root=str(target_root),
+        base_commit=head_commit,
+    )
+    old_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        old_context,
+        backlog_id=backlog_id,
+        fence_token=old_fence,
+        graph_trace_id="gqt-context-local-rework-old-worker",
+        head_commit=head_commit,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=old_context,
+        parent_task_id=backlog_id,
+        graph_trace_id="gqt-context-local-rework-old-worker",
+        head_commit=head_commit,
+        implementation_event_ref=f"timeline:{old_events['implementation']}",
+    )
+    contract_execution_id = successor["contract_execution_id"]
+
+    route_identity = {
+        "route_id": "route-context-local-rework-fresh",
+        "route_context_hash": "sha256:route-context-local-rework-fresh",
+        "prompt_contract_id": "rprompt-context-local-rework-fresh",
+        "prompt_contract_hash": "sha256:prompt-context-local-rework-fresh",
+        "route_token_ref": "rtok-context-local-rework-fresh",
+        "visible_injection_manifest_hash": (
+            "sha256:visible-context-local-rework-fresh"
+        ),
+    }
+    fresh_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id=fresh_task_id,
+        parent_task_id=contract_execution_id,
+        fence_token=fresh_fence,
+        token=fresh_token,
+        worktree_path=str(target_root),
+        target_project_root=str(target_root),
+        base_commit=head_commit,
+        target_head_commit=head_commit,
+        merge_queue_id=f"mq-{fresh_task_id}",
+        owned_files=("agent/governance/server.py",),
+    )
+    fresh_context = upsert_branch_context(
+        conn,
+        replace(
+            fresh_context,
+            branch_ref=branch_ref,
+            actual_host_worker_id="host-context-local-rework-fresh",
+            agent_id="host-context-local-rework-fresh",
+            allocation_owner="host-context-local-rework-fresh",
+            attempt=2,
+            retry_round=1,
+        ),
+        now_iso="2026-07-22T02:02:00Z",
+    )
+    command_id = "cmd-context-local-rework-fresh"
+    observer_session.enqueue_command(
+        conn,
+        project_id=PID,
+        command_type="execute_backlog_row",
+        command_id=command_id,
+        created_by="observer-context-local-rework",
+        notify=True,
+        payload={
+            "backlog_id": backlog_id,
+            "merge_queue_id": fresh_context.merge_queue_id,
+            "contract_execution_id": contract_execution_id,
+            "task_id": contract_execution_id,
+            **route_identity,
+        },
+        now="2026-07-22T02:02:30Z",
+    )
+    conn.execute(
+        """
+        UPDATE observer_command_queue
+        SET status = 'claimed',
+            claimed_by_session_id = 'obs-context-local-rework',
+            claimed_at = '2026-07-22T02:03:00Z'
+        WHERE project_id = ? AND command_id = ?
+        """,
+        (PID, command_id),
+    )
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        **route_identity,
+    )
+    append_branch_contract_revision(
+        conn,
+        fresh_context,
+        revision_id="crev-context-local-rework-fresh",
+        payload={
+            "contract_execution_id": contract_execution_id,
+            "successor_contract_execution_id": contract_execution_id,
+            "parent_contract_execution_id": successor[
+                "parent_contract_execution_id"
+            ],
+            "root_contract_execution_id": successor[
+                "root_contract_execution_id"
+            ],
+            "contract_chain_id": successor["contract_chain_id"],
+            "runtime_context_id": fresh_context.runtime_context_id,
+            "task_id": fresh_context.task_id,
+            "parent_task_id": contract_execution_id,
+            "observer_command_id": command_id,
+            "target_files": ["agent/governance/server.py"],
+        },
+        route_identity=route_identity,
+        now_iso="2026-07-22T02:03:30Z",
+    )
+
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(contract_execution_id)
+    completed_lines = copy.deepcopy(record["completed_lines"])
+    for line in completed_lines:
+        if line.get("line_id") == "observer_dispatch_bounded_workers":
+            worker_identity = fresh_context.worker_slot_id
+            line.update(
+                {
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                    "task_id": fresh_context.task_id,
+                    "parent_task_id": contract_execution_id,
+                    "worker_id": worker_identity,
+                    "worker_slot_id": worker_identity,
+                    "observer_command_id": command_id,
+                }
+            )
+            dispatch_payload = dict(line.get("payload") or {})
+            dispatch_payload.update(
+                {
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                    "task_id": fresh_context.task_id,
+                    "parent_task_id": contract_execution_id,
+                    "worker_id": worker_identity,
+                    "worker_slot_id": worker_identity,
+                    "observer_command_id": command_id,
+                    "target_project_root": str(target_root),
+                    "worktree_path": str(target_root),
+                    "branch_ref": branch_ref,
+                    "base_commit": head_commit,
+                    "target_head_commit": head_commit,
+                    "merge_queue_id": fresh_context.merge_queue_id,
+                    "owned_files": ["agent/governance/server.py"],
+                    "route_identity": route_identity,
+                }
+            )
+            line["payload"] = dispatch_payload
+    updated_record = dict(record)
+    updated_record["completed_lines"] = completed_lines
+    updated_guide = dict(record.get("runtime_guide") or {})
+    updated_guide["completed_lines"] = completed_lines
+    updated_record["runtime_guide"] = updated_guide
+    runtime.store.update(contract_execution_id, updated_record)
+    conn.commit()
+
+    rejoin_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=fresh_context.task_id,
+        backlog_id=backlog_id,
+        event_type="observer.runtime_context_session_token_rejoin",
+        event_kind="observer_command",
+        phase="runtime_context_recovery",
+        status="accepted",
+        actor="observer-context-local-rework",
+        payload={
+            "action": "runtime_context_session_token_rejoin",
+            "reopen_for_revision": True,
+            "timeline_reopen_for_revision": False,
+            "contract_runtime_failed_qa_revision": {
+                "schema_version": (
+                    "runtime_context.contract_runtime_failed_qa_revision_evidence.v1"
+                ),
+                "source": "contract_runtime_completed_lines",
+                "status": "revision_required",
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": fresh_context.runtime_context_id,
+                "task_id": fresh_context.task_id,
+                "parent_task_id": contract_execution_id,
+                "failed_qa_source_ref": (
+                    f"contract_runtime:{contract_execution_id}:qa_failure_boundary"
+                ),
+            },
+            "runtime_context_id": fresh_context.runtime_context_id,
+            "task_id": fresh_context.task_id,
+            "parent_task_id": contract_execution_id,
+            "backlog_id": backlog_id,
+            "attempt": 2,
+            "retry_round": 1,
+            "current_status": STATE_WORKTREE_READY,
+            "session_token_ref": runtime_context_session_token_ref(
+                fresh_context
+            ),
+            "worker_id": fresh_context.worker_id,
+            "worker_slot_id": fresh_context.worker_slot_id,
+            "fence_token_hash": runtime_context_secret_hash(fresh_fence),
+            "route_identity": route_identity,
+            "route_identity_rebound": True,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted_to_timeline": False,
+        },
+    )
+    marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=conn,
+        context=fresh_context,
+        runtime_context_id=fresh_context.runtime_context_id,
+        timeline_events=task_timeline.list_events(
+            conn,
+            PID,
+            task_id=fresh_context.task_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        ),
+    )
+    assert marker["revision_event_ref"] == f"timeline:{rejoin_event['id']}"
+    assert marker["source"] == "accepted_runtime_context_rejoin_event"
+
+    source_backed_record = runtime.store.get(contract_execution_id)
+    dispatch_resolution = server._contract_runtime_dispatch_identity_resolution(
+        source_backed_record,
+        fresh_context,
+    )
+    assert dispatch_resolution["accepted"] is True, dispatch_resolution
+    assert dispatch_resolution["reconstructable"] is True
+    assert dispatch_resolution["observer_command_id"] == command_id
+    before_receipt_revision = source_backed_record["execution_state_revision"]
+    before_worker_read_count = sum(
+        line.get("line_id") == "worker_read_runtime_guide"
+        for line in source_backed_record["completed_lines"]
+    )
+    before_worker_startup_count = sum(
+        line.get("line_id") == "worker_startup"
+        for line in source_backed_record["completed_lines"]
+    )
+    read_response = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": fresh_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": contract_execution_id,
+                "fence_token": fresh_fence,
+                "session_token": fresh_token,
+                "session_token_ref": runtime_context_session_token_ref(
+                    fresh_context
+                ),
+                "target_project_root": str(target_root),
+                "actor": fresh_context.worker_slot_id,
+                "read_receipt_hash": "sha256:context-local-rework-fresh-read",
+                "launch_text_hash": "sha256:context-local-rework-fresh-launch",
+            },
+        )
+    )
+
+    assert read_response["ok"] is True
+    canonical_read = read_response["contract_runtime_canonical_line"]
+    assert canonical_read["status"] == (
+        "context_local_receipt_after_prior_contract_line"
+    )
+    assert canonical_read["context_local_timeline_receipt_allowed"] is True
+    assert canonical_read["duplicate_contract_line_submitted"] is False
+    after_receipt_record = runtime.store.get(contract_execution_id)
+    assert after_receipt_record["execution_state_revision"] == (
+        before_receipt_revision
+    )
+    assert sum(
+        line.get("line_id") == "worker_read_runtime_guide"
+        for line in after_receipt_record["completed_lines"]
+    ) == before_worker_read_count
+    fresh_read_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=fresh_context.task_id,
+        event_kind="mf_subagent_read_receipt",
+    )
+    assert len(fresh_read_events) == 1
+    assert fresh_read_events[0]["payload"]["contract_runtime_canonical_line"][
+        "status"
+    ] == "context_local_receipt_after_prior_contract_line"
+
+    startup_response = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": fresh_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": fresh_context.task_id,
+                "parent_task_id": contract_execution_id,
+                "contract_execution_id": contract_execution_id,
+                "session_token": fresh_token,
+                "session_token_ref": runtime_context_session_token_ref(
+                    fresh_context
+                ),
+                "fence_token": fresh_fence,
+                "agent_id": fresh_context.actual_host_worker_id,
+                "actual_host_worker_id": fresh_context.actual_host_worker_id,
+                "worker_session_id": "session-context-local-rework-fresh",
+                "worker_transcript_ref": (
+                    "codex:session-context-local-rework-fresh"
+                ),
+                "harness_type": "codex",
+                "filer_principal": "session-context-local-rework-fresh",
+                "observer_command_id": command_id,
+                "actual_cwd": str(target_root),
+                "actual_git_root": str(target_root),
+                "branch": branch_ref,
+                "branch_ref": branch_ref,
+                "head_commit": head_commit,
+                "base_commit": head_commit,
+                "target_head_commit": head_commit,
+                "merge_queue_id": fresh_context.merge_queue_id,
+                "owned_files": ["agent/governance/server.py"],
+                "read_receipt_hash": "sha256:context-local-rework-fresh-read",
+                "read_receipt_event_id": str(fresh_read_events[0]["id"]),
+                "startup_source": "codex_desktop_governed_dispatch",
+                **route_identity,
+            },
+        )
+    )
+
+    assert startup_response["ok"] is True
+    assert startup_response["timeline_event"]["event_kind"] == (
+        "mf_subagent_startup"
+    )
+    assert startup_response["context"]["status"] == "running"
+    startup_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=fresh_context.task_id,
+        event_kind="mf_subagent_startup",
+    )
+    assert len(startup_events) == 1
+    canonical_startup = startup_events[0]["payload"][
+        "contract_runtime_canonical_line"
+    ]
+    assert canonical_startup["status"] == (
+        "context_local_startup_after_prior_contract_line"
+    )
+    assert canonical_startup["context_local_timeline_startup_allowed"] is True
+    assert canonical_startup["duplicate_contract_line_submitted"] is False
+    startup_gate = startup_events[0]["payload"]["mf_subagent_startup_gate"]
+    assert startup_gate["read_receipt_event_id"] == str(
+        fresh_read_events[0]["id"]
+    )
+    assert startup_gate["read_receipt_hash"] == (
+        "sha256:context-local-rework-fresh-read"
+    )
+    after_startup_record = runtime.store.get(contract_execution_id)
+    assert after_startup_record["execution_state_revision"] == (
+        before_receipt_revision
+    )
+    assert sum(
+        line.get("line_id") == "worker_read_runtime_guide"
+        for line in after_startup_record["completed_lines"]
+    ) == before_worker_read_count
+    assert sum(
+        line.get("line_id") == "worker_startup"
+        for line in after_startup_record["completed_lines"]
+    ) == before_worker_startup_count
 def test_runtime_context_read_receipt_rolls_back_contract_when_timeline_write_fails(
     conn,
     tmp_path,
