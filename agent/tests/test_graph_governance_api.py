@@ -51714,6 +51714,245 @@ def test_direct_fix_enter_rejects_mf_parallel_when_latest_qa_passed(conn):
         )
 
 
+def _known_baseline_accepted_qa_record() -> dict:
+    base_commit = "a" * 40
+    candidate_commit = "b" * 40
+    failures = ["test_known_baseline_one", "test_known_baseline_two"]
+
+    def provenance(*, graph: bool = False) -> dict:
+        binding = {
+            "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+            "server_derived": True,
+            "qa_principal": "qa:known-baseline",
+            "qa_session_id": "ses-known-baseline",
+            (
+                "graph_trace_session_matched"
+                if graph
+                else "independent_verification_session_matched"
+            ): True,
+        }
+        result = {
+            "schema_version": "qa_evidence_provenance.v1",
+            "server_derived": True,
+            "authorization_source": "qa_session_token_ref",
+            "evidence_owner_role": "qa",
+            "observer_impersonation": False,
+            "parent_materialization_authorized": False,
+            "authenticated_qa_binding": binding,
+        }
+        if not graph:
+            result["completion_status_gate"] = {
+                "server_derived": True,
+                "top_level_status_present": True,
+                "top_level_status_passing": True,
+                "normalized_status": "accepted",
+            }
+        return result
+
+    graph_line = {
+        "line_id": "qa_graph_context",
+        "actor_role": "qa",
+        "evidence_kind": "graph_trace",
+        "authorization_source": "qa_session_token_ref",
+        "observer_impersonation": False,
+        "commit_sha": candidate_commit,
+        "qa_evidence_provenance": provenance(graph=True),
+        "payload": {
+            "graph_trace_evidence": {
+                "base_commit_sha": base_commit,
+                "candidate_commit_sha": candidate_commit,
+                "db_verified": True,
+                "identity_mismatches": [],
+                "verified_trace_ids": ["gqt-known-baseline"],
+            }
+        },
+    }
+    qa_line = {
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "authorization_source": "qa_session_token_ref",
+        "observer_impersonation": False,
+        "commit_sha": candidate_commit,
+        "status": "accepted",
+        "verdict": "accepted",
+        "qa_evidence_provenance": provenance(),
+        "payload": {
+            "schema_version": "mf_parallel.qa_independent_verification.v1",
+            "acceptance_scope": "candidate_regression_and_acceptance_criteria",
+            "verdict": "accepted",
+            "full_suite_claim": "not_claimed",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "test_results": {
+                "baseline": {"failed": len(failures)},
+                "candidate": {"failed": len(failures), "passed": 741},
+            },
+        },
+        "test_results": {
+            "status": "accepted",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "passed": False,
+            "overall_release_pass": False,
+            "overall_release_pass_claimed": False,
+            "baseline": {"failed": len(failures)},
+            "full_module": {"failed": len(failures), "passed": 741},
+        },
+        "verification": {
+            "status": "accepted",
+            "verdict": "accepted",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+        },
+        "artifact_refs": {
+            "external_no_pass_baseline_ledger": {
+                "schema_version": (
+                    "contract_runtime.external_no_pass_baseline_ledger.v2"
+                ),
+                "base_commit_sha": base_commit,
+                "candidate_commit_sha": candidate_commit,
+                "base_failure_identities": failures,
+                "candidate_failure_identities": failures,
+                "base_reproduction": {
+                    "reproduced": len(failures),
+                    "total": len(failures),
+                    "failure_identities": failures,
+                },
+                "candidate_suite_counts": {
+                    "baseline_known_non_green": len(failures),
+                    "failed": len(failures),
+                    "passed": 741,
+                },
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+                "refs": ["base:known", "candidate:known"],
+            }
+        },
+    }
+    return {
+        "project_id": PID,
+        "backlog_id": "AC-KNOWN-BASELINE-QA-SELECTION",
+        "contract_execution_id": "cex-known-baseline-qa-selection",
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [graph_line, qa_line],
+    }
+
+
+def _known_baseline_failed_qa_revision_evidence(
+    monkeypatch,
+    record: dict,
+) -> dict:
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(
+            list_by_backlog=lambda **_kwargs: [record],
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dispatch_line_match",
+        lambda _record, _context: {"source_ref": "contract_runtime:dispatch"},
+    )
+    context = SimpleNamespace(
+        status=STATE_WORKTREE_READY,
+        last_recovery_action="mf_subagent_failed_qa_revision_rejoin_issued",
+        attempt=2,
+        retry_round=1,
+        backlog_id=record["backlog_id"],
+        runtime_context_id="mfrctx-known-baseline-qa-selection",
+        task_id="worker-known-baseline-qa-selection",
+        parent_task_id=record["contract_execution_id"],
+    )
+    return server._runtime_context_failed_qa_revision_contract_runtime_evidence(
+        object(),
+        project_id=PID,
+        context=context,
+    )
+
+
+def test_latest_failed_qa_ignores_authenticated_exact_known_baseline_acceptance(
+    monkeypatch,
+):
+    record = _known_baseline_accepted_qa_record()
+    qa_line = record["completed_lines"][-1]
+
+    assert server._contract_runtime_value_reports_failed_qa(qa_line) is True
+    assert server._contract_runtime_known_baseline_qa_acceptance(
+        qa_line,
+        record=record,
+    ) is True
+    assert server._contract_runtime_latest_failed_qa_line(record) == {}
+    assert _known_baseline_failed_qa_revision_evidence(monkeypatch, record) == {}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "failed_status",
+        "rejected_status",
+        "blocked_status",
+        "candidate_new_failure",
+        "candidate_specific_issue",
+        "contradictory_verdict",
+        "contradictory_decision",
+        "missing_parity",
+        "unproven_parity",
+        "missing_authentication",
+    ],
+)
+def test_latest_failed_qa_keeps_noncanonical_or_candidate_failure_fail_closed(
+    monkeypatch,
+    mutation,
+):
+    record = _known_baseline_accepted_qa_record()
+    qa_line = record["completed_lines"][-1]
+    if mutation in {"failed_status", "rejected_status", "blocked_status"}:
+        qa_line["status"] = mutation.removesuffix("_status")
+    elif mutation == "candidate_new_failure":
+        qa_line["payload"]["candidate_new_failures"] = 1
+    elif mutation == "candidate_specific_issue":
+        qa_line["test_results"]["candidate_specific_issues"] = [
+            "candidate regression"
+        ]
+    elif mutation == "contradictory_verdict":
+        qa_line["verdict"] = "failed"
+    elif mutation == "contradictory_decision":
+        qa_line["decision"] = "blocked"
+    elif mutation == "missing_parity":
+        qa_line["artifact_refs"].pop("external_no_pass_baseline_ledger")
+    elif mutation == "unproven_parity":
+        qa_line["artifact_refs"]["external_no_pass_baseline_ledger"][
+            "candidate_failure_identities"
+        ].append("test_candidate_only")
+    elif mutation == "missing_authentication":
+        qa_line["qa_evidence_provenance"]["authenticated_qa_binding"][
+            "independent_verification_session_matched"
+        ] = False
+
+    assert server._contract_runtime_known_baseline_qa_acceptance(
+        qa_line,
+        record=record,
+    ) is False
+    selected = server._contract_runtime_latest_failed_qa_line(record)
+    assert selected["line_id"] == "qa_independent_verification"
+    assert selected["_completed_line_index"] == 1
+    revision = _known_baseline_failed_qa_revision_evidence(
+        monkeypatch,
+        record,
+    )
+    assert revision["status"] == "revision_required"
+    assert revision["failed_qa_source_ref"].endswith("completed_lines:1")
+
+
 def test_direct_fix_enter_accepts_blocked_onboard_service_parent(conn):
     backlog_id = "AC-DIRECT-FIX-BLOCKED-ONBOARD-SERVICE-PARENT"
     _insert_simple_mf_close_backlog(conn, backlog_id)

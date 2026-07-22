@@ -71864,6 +71864,54 @@ def _contract_runtime_value_reports_failed_qa(value: Any) -> bool:
     return False
 
 
+def _contract_runtime_known_baseline_qa_acceptance(
+    line: Mapping[str, Any],
+    *,
+    record: Mapping[str, Any],
+) -> bool:
+    """Recognize one canonical no-PASS QA result without hiding failures.
+
+    The recursive failure detector must continue to flag arbitrary nested
+    failure counts.  Its only exception here is an authenticated candidate QA
+    line whose server-verified ledger proves exact base parity and zero
+    candidate-specific failures.  Direct status/decision fields remain
+    fail-closed so a contradictory verdict cannot borrow that exception.
+    """
+
+    if not _contract_runtime_candidate_scoped_no_pass_line(
+        line,
+        record=record,
+    ):
+        return False
+    if (
+        str(line.get("status") or "").strip().lower() != "accepted"
+        or str(line.get("verdict") or "").strip().lower() != "accepted"
+    ):
+        return False
+    payload = (
+        line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    )
+    test_results = (
+        line.get("test_results")
+        if isinstance(line.get("test_results"), Mapping)
+        else {}
+    )
+    verification = (
+        line.get("verification")
+        if isinstance(line.get("verification"), Mapping)
+        else {}
+    )
+    for source in (line, payload, test_results, verification):
+        for key in _CONTRACT_RUNTIME_QA_FAILURE_STATUS_FIELDS:
+            if (
+                key in source
+                and str(source.get(key) or "").strip().lower()
+                in _CONTRACT_RUNTIME_QA_FAILURE_STATUSES
+            ):
+                return False
+    return True
+
+
 def _contract_runtime_truthy_failure_count(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -71886,6 +71934,11 @@ def _contract_runtime_latest_failed_qa_line(
             continue
         if str(line.get("line_id") or "").strip() != "qa_independent_verification":
             continue
+        if _contract_runtime_known_baseline_qa_acceptance(
+            line,
+            record=record,
+        ):
+            return {}
         if not _contract_runtime_value_reports_failed_qa(line):
             return {}
         enriched = dict(line)
