@@ -63302,7 +63302,9 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     )
     qa_graph_write.update(
         {
-            "commit_sha": qa_commit,
+            # Caller-shaped top-level commit identity is not authority.  The
+            # server must replace it with the exact authenticated QA candidate.
+            "commit_sha": "f" * 40,
             "status": "accepted",
             "observer_impersonation": False,
             "graph_trace_ids": [qa_graph_trace_id],
@@ -63334,6 +63336,7 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     assert qa_graph_line["payload"]["schema_version"] == (
         "mf_parallel.qa_graph_context.v1"
     )
+    assert qa_graph_line["commit_sha"] == qa_commit
     assert server._contract_runtime_candidate_scoped_no_pass_line(
         qa_graph_line
     ) is True, json.dumps(qa_graph_line, sort_keys=True)
@@ -64061,6 +64064,605 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         context=context,
         timeline_events=timeline_events,
     ) == {}
+
+
+def test_contract_runtime_recovers_exact_audit_only_qa_bypass_round(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    project_id = PID
+    backlog_id = "AC-AUDIT-ONLY-QA-BYPASS-ROUND"
+    diagnostic_id = "AC-CONTRACT-LINE-BYPASS-AUDIT-ONLY-ROUND"
+    execution_id = "cex-audit-only-qa-bypass-round"
+    task_id = "worker-audit-only-qa-bypass-round"
+    runtime_context_id = "mfrctx-audit-only-qa-bypass-round"
+    merge_queue_id = "mq-audit-only-qa-bypass-round"
+    queue_item_id = "mqitem-audit-only-qa-bypass-round"
+    qa_principal = "qa:audit-only-qa-bypass-round"
+    qa_trace_id = "gqt-audit-only-qa-bypass-round"
+    failure_id = "agent/tests/test_mf_subagent_contract.py::baseline_failure"
+    target_root = tmp_path / "audit-only-qa-bypass-target"
+    base_commit = _init_test_git_repo(target_root)
+    (target_root / "candidate.py").write_text(
+        "candidate = True\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "candidate.py"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "candidate"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    merged_commit = "b" * 40
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    context = BranchTaskRuntimeContext(
+        project_id=project_id,
+        task_id=task_id,
+        branch_ref="refs/heads/codex/audit-only-qa-bypass-round",
+        status=STATE_VALIDATED,
+        runtime_context_id=runtime_context_id,
+        backlog_id=backlog_id,
+        parent_task_id=backlog_id,
+        target_project_id="audit-only-target",
+        target_project_root=str(target_root.resolve()),
+        worktree_path=str(target_root.resolve()),
+        merge_queue_id=merge_queue_id,
+    )
+    upsert_branch_context(conn, context)
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=project_id,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=queue_item_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                branch_ref=context.branch_ref,
+                queue_index=0,
+                status="merged",
+                target_ref="refs/heads/main",
+                branch_head=candidate_commit,
+                merge_commit=merged_commit,
+                target_head_before_merge=base_commit,
+                target_head_after_merge=merged_commit,
+            )
+        ],
+    )
+    qa_scope_ref = server._qa_scope_binding_ref(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=candidate_commit,
+    )
+    qa_session = server.role_service.register(
+        conn,
+        qa_principal,
+        project_id,
+        "qa",
+        scope=[
+            f"backlog:{backlog_id}",
+            f"task:{task_id}",
+            f"commit:{candidate_commit}",
+            qa_scope_ref,
+        ],
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: target_root,
+    )
+    snapshot_id = "base-audit-only-qa-bypass-round"
+    _activate_basic_graph(
+        conn,
+        snapshot_id,
+        project_id=project_id,
+        commit_sha=base_commit,
+    )
+    qa_query_ctx = _ctx_with_role(
+        {"project_id": project_id},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": "active",
+            "project_root": str(target_root.resolve()),
+            "tool": "candidate_overlay",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "commit_sha": candidate_commit,
+        },
+    )
+    qa_query_ctx._session = dict(qa_session)
+    queried = server.handle_graph_governance_query(qa_query_ctx)
+    qa_trace_id = queried["trace_id"]
+    graph_evidence = server._runtime_context_service_qa_graph_trace_refs(
+        conn,
+        project_id=project_id,
+        explicit_trace_ids=[qa_trace_id],
+        target_project_root=str(target_root.resolve()),
+        expected_backlog_id=backlog_id,
+        expected_task_id=task_id,
+        expected_candidate_commit_sha=candidate_commit,
+        expected_qa_principal=qa_principal,
+        expected_qa_session_id=qa_session["session_id"],
+        require_complete_authority=True,
+        strict_bounded_qa=True,
+    )
+    assert graph_evidence["graph_basis"] == (
+        "canonical_base_plus_candidate_diff"
+    )
+    graph_evidence.update(
+        {
+            "contract_execution_id": execution_id,
+            "runtime_context_id": runtime_context_id,
+            "parent_task_id": backlog_id,
+        }
+    )
+    qa_graph_line = {
+        "stage_id": "qa_graph_context",
+        "line_id": "qa_graph_context",
+        "actor_role": "qa",
+        "evidence_kind": "graph_trace",
+        # Immutable source shape: the old binder omitted top-level commit_sha.
+        "status": "accepted",
+        "authorization_source": "qa_session_token_ref",
+        "observer_impersonation": False,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": backlog_id,
+        "qa_evidence_provenance": {
+            "schema_version": "qa_evidence_provenance.v1",
+            "server_derived": True,
+            "authorization_source": "qa_session_token_ref",
+            "evidence_owner_actor": qa_principal,
+            "evidence_owner_role": "qa",
+            "evidence_owner_session": qa_session["session_id"],
+            "observer_impersonation": False,
+            "parent_materialization_authorized": False,
+            "authenticated_qa_binding": {
+                "schema_version": (
+                    "contract_runtime.authenticated_qa_binding.v1"
+                ),
+                "server_derived": True,
+                "qa_principal": qa_principal,
+                "qa_session_id": qa_session["session_id"],
+                "graph_trace_session_matched": True,
+            },
+        },
+        "payload": {
+            "schema_version": "mf_parallel.qa_graph_context.v1",
+            "graph_trace_ids": [qa_trace_id],
+            "graph_trace_evidence": graph_evidence,
+        },
+    }
+
+    qa_ctx = _ctx_with_role(
+        {"project_id": project_id},
+        "qa",
+        method="POST",
+        body={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "event_type": "qa.independent_verification.audit_only",
+            "event_kind": "independent_verification",
+            "phase": "qa",
+            "actor": qa_principal,
+            "status": "blocked",
+            "decision": "accepted_in_scope_no_pass_system_blocked",
+            "correlation_id": execution_id,
+            "commit_sha": candidate_commit,
+            "payload": {
+                "schema_version": "qa.audit_only_no_pass_system_block.v1",
+                "runtime_context_id": runtime_context_id,
+                "base_commit_sha": base_commit,
+                "candidate_commit_sha": candidate_commit,
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "candidate_verdict": "accepted_in_scope",
+                "canonical_contract_acceptance_recorded": False,
+                "close_satisfying": False,
+                "disposition": "audit_only",
+                "failure_identities": {
+                    "base": [failure_id],
+                    "candidate": [failure_id],
+                },
+                "graph_trace_ids": [qa_trace_id],
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+                "observer_impersonation": False,
+            },
+            "verification": {
+                "schema_version": "qa.audit_only_no_pass_verification.v1",
+                "result": "accepted_in_scope",
+                "verdict": "accepted_in_scope",
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "canonical_contract_acceptance_recorded": False,
+                "close_satisfying": False,
+                "known_baseline_failures": [failure_id],
+                "full_suite_claim": "not_claimed",
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+            },
+        },
+    )
+    qa_ctx._session = dict(qa_session)
+    qa_event = server.handle_task_timeline_append(qa_ctx)
+    assert qa_event["payload"]["source_backed_contract_gate_authority"][
+        "audit_only"
+    ] is True
+    assert qa_event["payload"]["base_commit_sha"] == base_commit
+
+    bypass_revision = 11
+    bypass_identity = (
+        f"bypass:{execution_id}:revision-{bypass_revision}:"
+        "qa:qa_independent_verification"
+    )
+    bypass_payload = {
+        "schema_version": "contract_line_bypass.v1",
+        "bypass_identity": bypass_identity,
+        "request_hash": "sha256:" + "a" * 64,
+        "source_backlog_id": backlog_id,
+        "diagnostic_backlog_id": diagnostic_id,
+        "classification": "system_logic",
+        "reason": "immutable graph line omitted top-level candidate commit",
+        "decision": "continue with exact authenticated audit-only QA",
+        "blocked_owner_role": "qa",
+        "blocked_evidence_kind": "independent_verification",
+        "execution_state_revision": bypass_revision,
+        "disposition": "proceeded_with_exception",
+        "no_pass_claim": True,
+        "evidence_refs": [
+            f"timeline:{qa_event['id']}",
+            f"graph-query:{qa_trace_id}",
+            f"candidate:{candidate_commit}",
+            f"base:{base_commit}",
+            f"contract-runtime:{execution_id}:revision:{bypass_revision}",
+        ],
+    }
+    bypass_line = {
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "actor_role": "observer",
+        "evidence_kind": "contract_line_bypass",
+        "status": "waived",
+        "no_pass_claim": True,
+        "payload": bypass_payload,
+    }
+    bypass_event_payload = {
+        "bypass_identity": bypass_identity,
+        "classification": "system_logic",
+        "contract_execution_id": execution_id,
+        "diagnostic_backlog_id": diagnostic_id,
+        "disposition": "proceeded_with_exception",
+        "execution_state_revision": bypass_revision,
+        "line_id": "qa_independent_verification",
+        "no_pass_claim": True,
+        "source_backlog_id": backlog_id,
+    }
+    correlation_id = f"contract-line-bypass:{bypass_identity}"
+    source_bypass_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="contract_line_bypass",
+        event_kind="record_blocker",
+        phase="qa",
+        actor="observer",
+        status="proceeded_with_exception",
+        decision="linked_open_diagnostic_no_pass",
+        correlation_id=correlation_id,
+        commit_sha=candidate_commit,
+        payload=bypass_event_payload,
+    )
+    diagnostic_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=diagnostic_id,
+        task_id=task_id,
+        event_type="contract_line_bypass_diagnostic_linked",
+        event_kind="record_blocker",
+        phase="qa",
+        actor="observer",
+        status="open",
+        decision="keep_open_until_block_repaired",
+        correlation_id=correlation_id,
+        commit_sha=candidate_commit,
+        payload=bypass_event_payload,
+    )
+    merge_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="parallel.live_merge",
+        event_kind="live_merge",
+        phase="live_merge",
+        actor="observer",
+        status="passed",
+        commit_sha=merged_commit,
+        payload={
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "merge_commit": merged_commit,
+            "target_head_after_merge": merged_commit,
+        },
+    )
+    exact_binding = {
+        "source_backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "line_id": "qa_independent_verification",
+        "execution_state_revision": bypass_revision,
+        "bypass_identity": bypass_identity,
+        "classification": "system_logic",
+        "disposition": "proceeded_with_exception",
+        "no_pass_claim": True,
+    }
+    conn.execute(
+        """
+        INSERT INTO backlog_bugs (
+          bug_id, title, status, mf_type, chain_trigger_json,
+          bypass_policy_json, target_files, test_files, created_at, updated_at
+        ) VALUES (?, ?, 'OPEN', 'chain_rescue', ?, ?, '[]', '[]', ?, ?)
+        """,
+        (
+            diagnostic_id,
+            "Audit-only QA bypass diagnostic",
+            json.dumps(
+                {
+                    **exact_binding,
+                    "source_qa_event_ref": f"timeline:{qa_event['id']}",
+                    "source_merge_event_ref": f"timeline:{merge_event['id']}",
+                }
+            ),
+            json.dumps({**exact_binding, "keep_open": True}),
+            "2026-07-22T14:18:22Z",
+            "2026-07-22T14:18:22Z",
+        ),
+    )
+    conn.commit()
+
+    worker_commit = {
+        "stage_id": "worker_commit",
+        "line_id": "worker_commit",
+        "actor_role": "mf_sub",
+        "evidence_kind": "worker_commit",
+        "status": "accepted",
+        "commit_sha": candidate_commit,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": backlog_id,
+    }
+    record = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": backlog_id,
+                    "payload": {
+                        "runtime_context_id": runtime_context_id,
+                        "worker_task_id": task_id,
+                        "parent_task_id": backlog_id,
+                        "worker_role": "mf_sub",
+                    },
+            },
+            worker_commit,
+            qa_graph_line,
+            bypass_line,
+        ],
+    }
+    write = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "evidence_kind": "merge",
+        "status": "accepted",
+        "payload": {},
+    }
+    bound = server._contract_runtime_bind_observer_merge_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        write=write,
+    )
+    audit = bound["payload"]["qa_audit_only_no_pass_authority"]
+    assert audit["candidate_commit_sha"] == candidate_commit
+    assert audit["base_commit_sha"] == base_commit
+    assert audit["qa_event_ref"] == f"timeline:{qa_event['id']}"
+    assert audit["diagnostic_status"] == "OPEN"
+    assert audit["qa_contract_runtime_verified"] is False
+    assert audit["authoritative_pass_synthesized"] is False
+    assert bound["payload"]["no_pass_claim"] is True
+    assert bound["payload"]["overall_release_pass_claimed"] is False
+    assert bound["payload"]["close_satisfying"] is False
+
+    merged_record = json.loads(json.dumps(record))
+    merged_record["completed_lines"].append(bound)
+    timeline_events = task_timeline.list_events(
+        conn,
+        project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    )
+    completed = server._contract_runtime_completed_merge_authority(
+        conn,
+        project_id=project_id,
+        record=merged_record,
+        context=context,
+        timeline_events=timeline_events,
+    )
+    assert completed["authority_verified"] is True
+    assert completed["qa_contract_runtime_verified"] is False
+    assert completed["qa_event_id"] == int(qa_event["id"])
+    assert completed["qa_source_ref"] == f"timeline:{qa_event['id']}"
+    assert completed["no_pass_claim"] is True
+    assert completed["overall_release_pass_claimed"] is False
+
+    def recover(candidate_record):
+        lines = candidate_record["completed_lines"]
+        return server._contract_runtime_audit_only_no_pass_bypass_round_authority(
+            conn,
+            project_id=project_id,
+            record=candidate_record,
+            context=context,
+            branch_head=candidate_commit,
+            qa_graph=(2, lines[2]),
+            round_lines=list(enumerate(lines[2:], start=2)),
+        )
+
+    original_bypass_event_json = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (int(source_bypass_event["id"]),),
+    ).fetchone()[0]
+    original_qa_event_json = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (int(qa_event["id"]),),
+    ).fetchone()[0]
+    original_chain_json = json.dumps(
+        {
+            **exact_binding,
+            "source_qa_event_ref": f"timeline:{qa_event['id']}",
+            "source_merge_event_ref": f"timeline:{merge_event['id']}",
+        }
+    )
+    for mismatch in (
+        "diagnostic",
+        "bypass",
+        "event",
+        "trace",
+        "commit",
+        "failure_identities",
+    ):
+        bad_record = json.loads(json.dumps(record))
+        if mismatch == "diagnostic":
+            bad_chain = {**exact_binding, "source_backlog_id": "AC-WRONG"}
+            bad_chain.update(
+                {
+                    "source_qa_event_ref": f"timeline:{qa_event['id']}",
+                    "source_merge_event_ref": f"timeline:{merge_event['id']}",
+                }
+            )
+            conn.execute(
+                "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+                (json.dumps(bad_chain), diagnostic_id),
+            )
+        elif mismatch == "bypass":
+            bad_record["completed_lines"][3]["payload"]["classification"] = (
+                "environment"
+            )
+        elif mismatch == "event":
+            bad_event_payload = {
+                **bypass_event_payload,
+                "contract_execution_id": "cex-wrong",
+            }
+            conn.execute(
+                "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+                (json.dumps(bad_event_payload), int(source_bypass_event["id"])),
+            )
+        elif mismatch == "trace":
+            conn.execute(
+                "UPDATE graph_query_traces SET commit_sha = ? WHERE trace_id = ?",
+                ("f" * 40, qa_trace_id),
+            )
+        elif mismatch == "commit":
+            bad_record["completed_lines"][2]["payload"][
+                "graph_trace_evidence"
+            ]["candidate_commit_sha"] = "f" * 40
+        else:
+            bad_qa_payload = json.loads(json.dumps(qa_event["payload"]))
+            bad_qa_payload["failure_identities"]["candidate"] = [
+                "agent/tests/test_mf_subagent_contract.py::candidate_only"
+            ]
+            conn.execute(
+                "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+                (json.dumps(bad_qa_payload), int(qa_event["id"])),
+            )
+        assert recover(bad_record) == {}, mismatch
+        if mismatch == "diagnostic":
+            conn.execute(
+                "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+                (original_chain_json, diagnostic_id),
+            )
+        elif mismatch == "event":
+            conn.execute(
+                "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+                (original_bypass_event_json, int(source_bypass_event["id"])),
+            )
+        elif mismatch == "trace":
+            conn.execute(
+                "UPDATE graph_query_traces SET commit_sha = ? WHERE trace_id = ?",
+                (candidate_commit, qa_trace_id),
+            )
+        elif mismatch == "failure_identities":
+            conn.execute(
+                "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+                (original_qa_event_json, int(qa_event["id"])),
+            )
+        conn.commit()
+
+    # The same exact binding may be resumed after the repair row is FIXED, but
+    # no unrelated terminal status is accepted as diagnostic authority.
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'FIXED' WHERE bug_id = ?",
+        (diagnostic_id,),
+    )
+    conn.commit()
+    fixed = server._contract_runtime_bind_observer_merge_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        write=write,
+    )
+    assert fixed["payload"]["qa_audit_only_no_pass_authority"][
+        "diagnostic_status"
+    ] == "FIXED"
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'WAIVED' WHERE bug_id = ?",
+        (diagnostic_id,),
+    )
+    conn.commit()
+    with pytest.raises(GovernanceError) as arbitrary_terminal:
+        server._contract_runtime_bind_observer_merge_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+            write=write,
+        )
+    assert arbitrary_terminal.value.code == (
+        "contract_runtime_observer_merge_durable_authority_required"
+    )
+    assert int(source_bypass_event["id"]) < int(diagnostic_event["id"])
 
 
 def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
@@ -64965,16 +65567,16 @@ def test_contract_runtime_cli_views_are_compact_and_role_actionable():
         bypass = projected_guide.get("line_bypass_guidance") or {}
         if not bypass:
             continue
-        assert bypass["target_writer_role_hash_aligned"] is True
+        assert bypass["bypass_actor_role_hash_aligned"] is True
         assert bypass["runtime_guide_hash_source"] == (
-            "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash"
+            "runtime_guide.runtime_guide_hash"
         )
         for key in (
             "current_line_binding",
             "create_new_copy_safe_body",
             "reuse_existing_open_copy_safe_body",
         ):
-            assert bypass[key]["runtime_guide_hash"] == writer_hash
+            assert bypass[key]["runtime_guide_hash"] == reader_hash
 
 
 def test_contract_runtime_write_uses_exact_writer_line_hash_without_mutating_reader_guide():
