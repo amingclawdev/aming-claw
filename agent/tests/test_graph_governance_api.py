@@ -60615,7 +60615,9 @@ def test_fresh_failed_qa_rework_receipt_uses_context_local_timeline_without_resu
     "mutation",
     [
         "missing_failed_qa_marker",
+        "missing_marker_contract",
         "wrong_marker_task",
+        "missing_command_contract",
         "wrong_command_contract",
         "wrong_command_task",
         "unclaimed_command",
@@ -60646,8 +60648,18 @@ def test_context_local_rework_receipt_rejects_noncanonical_backfill(
     }
     if mutation == "missing_failed_qa_marker":
         markers = []
+    elif mutation == "missing_marker_contract":
+        markers = [
+            {
+                key: value
+                for key, value in marker.items()
+                if key != "contract_execution_id"
+            }
+        ]
     elif mutation == "wrong_marker_task":
         markers = [{**marker, "task_id": "different-rework-task"}]
+    elif mutation == "missing_command_contract":
+        command["payload"].pop("contract_execution_id")
     elif mutation == "wrong_command_contract":
         command["payload"]["contract_execution_id"] = "cex-different"
     elif mutation == "wrong_command_task":

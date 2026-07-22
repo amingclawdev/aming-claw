@@ -27871,7 +27871,7 @@ def _runtime_context_context_local_setup_authority(
             and str(item.get("parent_task_id") or "").strip()
             == parent_task_id
             and str(item.get("contract_execution_id") or "").strip()
-            in {"", execution_id}
+            == execution_id
         ),
         {},
     )
@@ -27980,7 +27980,7 @@ def _runtime_context_context_local_setup_authority(
     command_execution_id = str(
         command_payload.get("contract_execution_id") or ""
     ).strip()
-    if command_execution_id and command_execution_id != execution_id:
+    if command_execution_id != execution_id:
         return {}
     command_task_id = str(
         command_payload.get("worker_task_id")
