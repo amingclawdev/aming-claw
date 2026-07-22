@@ -68064,6 +68064,69 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
             "external_no_pass_baseline_ledger": historical_ledger,
         },
     }
+
+    # Persisted QA evidence may preserve the same failure identity set in a
+    # different array order across the top-level results, payload results, and
+    # immutable ledgers.  Order is not authority; membership is.  Canonicalize
+    # each valid non-empty, duplicate-free container before comparing them.
+    order_agnostic_line = json.loads(json.dumps(historical_line))
+    order_agnostic_line["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]["server_normalized"] = True
+    order_agnostic_line["payload"]["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]["server_normalized"] = True
+    top_results = order_agnostic_line["test_results"]
+    payload_results = order_agnostic_line["payload"]["test_results"]
+    top_ledger = order_agnostic_line["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]
+    payload_ledger = order_agnostic_line["payload"]["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]
+    identity_containers = (
+        (top_results, "baseline_failure_node_ids"),
+        (top_results, "candidate_failure_node_ids"),
+        (payload_results, "baseline_failure_node_ids"),
+        (payload_results, "candidate_failure_node_ids"),
+        (top_ledger, "base_failure_identities"),
+        (top_ledger, "candidate_failure_identities"),
+        (top_ledger["base_reproduction"], "failure_identities"),
+        (payload_ledger, "base_failure_identities"),
+        (payload_ledger, "candidate_failure_identities"),
+        (payload_ledger["base_reproduction"], "failure_identities"),
+    )
+    for offset, (container, field) in enumerate(identity_containers, start=1):
+        split = offset % len(historical_failure_ids)
+        container[field] = [
+            *historical_failure_ids[split:],
+            *historical_failure_ids[:split],
+        ]
+    assert _line_status_allows_contract_completion(order_agnostic_line) is True
+
+    empty_identity = json.loads(json.dumps(order_agnostic_line))
+    empty_identity["payload"]["test_results"][
+        "baseline_failure_node_ids"
+    ] = []
+    assert _line_status_allows_contract_completion(empty_identity) is False
+
+    duplicate_identity = json.loads(json.dumps(order_agnostic_line))
+    duplicate_identity["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]["candidate_failure_identities"].append(historical_failure_ids[0])
+    assert _line_status_allows_contract_completion(duplicate_identity) is False
+
+    different_identity_set = json.loads(json.dumps(order_agnostic_line))
+    different_identity_set["payload"]["test_results"][
+        "candidate_failure_node_ids"
+    ][-1] = (
+        "test_different_failure_identity"
+    )
+    assert (
+        _line_status_allows_contract_completion(different_identity_set)
+        is False
+    )
+
     assert "contract_execution_id" not in historical_line["payload"]
     assert "server_normalized" not in historical_ledger
     assert _line_status_allows_contract_completion(historical_line) is False
