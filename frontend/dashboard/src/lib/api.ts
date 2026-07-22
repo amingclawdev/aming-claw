@@ -29,9 +29,10 @@ import type {
 } from "../types";
 import { typedDagRawSecretPath } from "./taskPlayback";
 
-const DEFAULT_PROJECT_ID = (import.meta.env.VITE_PROJECT_ID as string | undefined) || "aming-claw";
-const DIRECT = (import.meta.env.VITE_DIRECT_API as string | undefined) === "true";
-const BACKEND = (import.meta.env.VITE_BACKEND_URL as string | undefined) || "http://localhost:40000";
+const API_ENV = import.meta.env ?? {};
+const DEFAULT_PROJECT_ID = (API_ENV.VITE_PROJECT_ID as string | undefined) || "aming-claw";
+const DIRECT = (API_ENV.VITE_DIRECT_API as string | undefined) === "true";
+const BACKEND = (API_ENV.VITE_BACKEND_URL as string | undefined) || "http://localhost:40000";
 
 let activeProjectId = DEFAULT_PROJECT_ID;
 
@@ -115,11 +116,24 @@ function taskTimelineSearchQuery(options: TaskTimelineSearchOptions): string {
 }
 
 function backlogTimelineQuery(backlogId: string, limit: number): string {
-  return new URLSearchParams({
+  const query = new URLSearchParams({
     backlog_id: backlogId,
     limit: String(limit),
     include_compact_ledger: "true",
-  }).toString();
+    playback_bootstrap: "compact",
+    public_authority: "contract_runtime",
+    before_event_id: "0",
+    view: "public",
+  });
+  if (typeof window !== "undefined") {
+    const locationQuery = new URLSearchParams(window.location.search);
+    const exactEventId = locationQuery.get("playback_event")?.trim();
+    const selectedBacklogId = locationQuery.get("playback_backlog")?.trim();
+    if (exactEventId && selectedBacklogId === backlogId) {
+      query.set("exact_event_id", exactEventId);
+    }
+  }
+  return query.toString();
 }
 
 function backlogTimelineGateQuery(limit: number): string {
@@ -169,6 +183,62 @@ async function getJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
     throw new ApiError(res.status, `GET ${path} → ${res.status}`, text);
   }
   return (await res.json()) as T;
+}
+
+const PUBLIC_READ_SINGLE_FLIGHT_MAX_ENTRIES = 128;
+const TASK_PLAYBACK_HOT_WINDOW_LIMIT = 50;
+const publicReadSingleFlights = new Map<string, Promise<unknown>>();
+
+function taskPlaybackHotWindowLimit(limit: number): number {
+  return Math.max(1, Math.min(limit, TASK_PLAYBACK_HOT_WINDOW_LIMIT));
+}
+
+function awaitPublicRead<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
+/** Coalesce byte-identical public GETs without sharing caller abort semantics. */
+function getPublicJSONSingleFlight<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const key = `GET:${path}`;
+  let shared = publicReadSingleFlights.get(key) as Promise<T> | undefined;
+  if (!shared) {
+    while (publicReadSingleFlights.size >= PUBLIC_READ_SINGLE_FLIGHT_MAX_ENTRIES) {
+      const oldest = publicReadSingleFlights.keys().next().value as string | undefined;
+      if (!oldest) break;
+      publicReadSingleFlights.delete(oldest);
+    }
+    shared = getJSON<T>(path);
+    publicReadSingleFlights.set(key, shared);
+    void shared.finally(() => {
+      if (publicReadSingleFlights.get(key) === shared) publicReadSingleFlights.delete(key);
+    }).catch(() => undefined);
+  }
+  return awaitPublicRead(shared, signal);
+}
+
+type TaskPlaybackBootstrapResponse = TaskTimelineResponse & {
+  exact_event?: TaskTimelineResponse["events"][number];
+  backlog_timeline_gate?: BacklogTimelineGateResponse;
+  playback_bootstrap?: Record<string, unknown>;
+};
+
+function taskPlaybackBootstrapFor(
+  projectId: string,
+  backlogId: string,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<TaskPlaybackBootstrapResponse> {
+  const query = backlogTimelineQuery(backlogId, taskPlaybackHotWindowLimit(limit));
+  return getPublicJSONSingleFlight<TaskPlaybackBootstrapResponse>(
+    `/api/task/${pidFor(projectId)}/timeline?${query}`,
+    signal,
+  );
 }
 
 async function postJSON<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
@@ -546,13 +616,27 @@ export const api = {
     );
   },
   taskTimelineFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
-    const q = backlogTimelineQuery(backlogId, limit);
-    const taskTimelineRequest = getJSON<TaskTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline?${q}`, signal);
-    const authorityRequest = api.contractRuntimeVisualizationFor(projectId, backlogId, limit, signal);
-    return Promise.all([taskTimelineRequest, authorityRequest]).then(([taskTimeline, contractRuntimeVisualization]) => ({
-      ...taskTimeline,
-      contract_runtime_visualization: contractRuntimeVisualization,
-    }));
+    const boundedLimit = taskPlaybackHotWindowLimit(limit);
+    return taskPlaybackBootstrapFor(projectId, backlogId, boundedLimit, signal).then(async (taskTimeline) => {
+      const contractRuntimeVisualization = taskTimeline.contract_runtime_visualization
+        ? requirePublicSafeTypedDag(taskTimeline.contract_runtime_visualization)
+        : await api.contractRuntimeVisualizationFor(projectId, backlogId, boundedLimit, signal);
+      const exactEvent = taskTimeline.exact_event;
+      const events = exactEvent && !taskTimeline.events.some((event) => String(event.event_id ?? event.id ?? "") === String(exactEvent.event_id ?? exactEvent.id ?? ""))
+        ? [exactEvent, ...taskTimeline.events]
+        : taskTimeline.events;
+      return {
+        ...taskTimeline,
+        events,
+        contract_runtime_visualization: contractRuntimeVisualization,
+        playback_bootstrap: taskTimeline.playback_bootstrap ?? {
+          schema_version: "task_playback.bootstrap.v1",
+          source: "legacy_contract_runtime_visualization_fallback",
+          exact_event_loaded: Boolean(exactEvent),
+          raw_compatibility: "timeline_response_preserved",
+        },
+      };
+    });
   },
   taskTimelineSearchFor(projectId: string, options: TaskTimelineSearchOptions, signal?: AbortSignal) {
     return getJSON<TaskTimelineResponse>(
@@ -563,20 +647,32 @@ export const api = {
   /** Project-wide recent timeline events, newest-first, cross-row.
    *  Each event carries backlog_id and task_id for row-tag rendering.
    */
-  recentTimelineFor(projectId: string, limit = 100, signal?: AbortSignal) {
-    const q = new URLSearchParams({ limit: String(limit) }).toString();
+  recentTimelineFor(projectId: string, limit = 50, signal?: AbortSignal) {
+    const q = new URLSearchParams({ limit: String(taskPlaybackHotWindowLimit(limit)) }).toString();
     return getJSON<RecentTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline/recent?${q}`, signal);
   },
   backlogTimelineGateFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
-    const q = backlogTimelineGateQuery(limit);
-    return getJSON<BacklogTimelineGateResponse>(
-      `/api/backlog/${pidFor(projectId)}/${encodeURIComponent(backlogId)}/timeline-gate?${q}`,
-      signal,
+    const boundedLimit = taskPlaybackHotWindowLimit(limit);
+    const q = backlogTimelineGateQuery(boundedLimit);
+    return taskPlaybackBootstrapFor(projectId, backlogId, boundedLimit, signal).then(
+      (bootstrap) => bootstrap.backlog_timeline_gate ?? getPublicJSONSingleFlight<BacklogTimelineGateResponse>(
+        `/api/backlog/${pidFor(projectId)}/${encodeURIComponent(backlogId)}/timeline-gate?${q}`,
+        signal,
+      ),
+      () => getPublicJSONSingleFlight<BacklogTimelineGateResponse>(
+        `/api/backlog/${pidFor(projectId)}/${encodeURIComponent(backlogId)}/timeline-gate?${q}`,
+        signal,
+      ),
     );
   },
   contractRuntimeVisualizationFor(projectId: string, backlogId: string, limit = 100, signal?: AbortSignal) {
-    const q = new URLSearchParams({ limit: String(limit) }).toString();
-    return getJSON<ContractRuntimeVisualizationResponse>(
+    const q = new URLSearchParams({
+      view: "public",
+      limit: String(limit),
+      before_event_id: "0",
+      public_authority: "contract_runtime",
+    }).toString();
+    return getPublicJSONSingleFlight<ContractRuntimeVisualizationResponse>(
       `/api/projects/${pidFor(projectId)}/visualization/backlogs/${encodeURIComponent(backlogId)}?${q}`,
       signal,
     ).then(requirePublicSafeTypedDag);

@@ -41335,6 +41335,291 @@ def test_timeline_gate_non_applicable_open_row_never_reports_can_close_true(conn
     assert repair["repair_summary"]["next_legal_actions"]
 
 
+def test_visualization_and_timeline_gate_warm_cache_are_backlog_scoped_and_page_exact(
+    conn,
+):
+    server._timeline_warm_cache_clear()
+    backlog_a = "AC-CACHE-ENDPOINT-A"
+    backlog_b = "AC-CACHE-ENDPOINT-B"
+    _insert_non_mf_backlog(conn, backlog_a)
+    _insert_non_mf_backlog(conn, backlog_b)
+
+    older_a = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_a,
+        task_id="cache-endpoint-a-worker",
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="accepted",
+        payload={"summary": "older page event"},
+    )
+    latest_a = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_a,
+        task_id="cache-endpoint-a-worker",
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="blocked",
+        payload={
+            "summary": "legacy blocked compatibility event",
+            "blocked": True,
+            "blocker_ids": ["cache-endpoint-blocker-a"],
+            "next_legal_action": "repair cache-endpoint-blocker-a",
+        },
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_b,
+        task_id="cache-endpoint-b-worker",
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="accepted",
+        payload={"summary": "unrelated backlog event"},
+    )
+    conn.commit()
+
+    visualization_query = {
+        "view": "public",
+        "limit": "1",
+        "before_event_id": "0",
+        "public_authority": "contract_runtime",
+    }
+    visualization_ctx = _ctx(
+        {"project_id": PID, "backlog_id": backlog_a},
+        query=visualization_query,
+    )
+    visualization_miss = server.handle_project_contract_runtime_visualization(
+        visualization_ctx
+    )
+    visualization_hit = server.handle_project_contract_runtime_visualization(
+        visualization_ctx
+    )
+    assert visualization_miss["warm_cache"]["status"] == "miss"
+    assert visualization_hit["warm_cache"]["status"] == "hit"
+    assert visualization_hit["timeline"]["events"][0]["event_id"] == latest_a["id"]
+    assert visualization_hit["timeline"]["truncated"] is True
+    assert visualization_hit["timeline"]["next_cursor"] == str(latest_a["id"])
+    assert visualization_hit["warm_cache"]["identity"]["resource"] == {
+        "backlog_id": backlog_a,
+        "contract_execution_id": "",
+        "public_authority": "contract_runtime",
+        "task_id": "",
+    }
+    assert visualization_hit["warm_cache"]["resource_generation"]["backlog_id"] == backlog_a
+    query_identity = dict(visualization_hit["warm_cache"]["identity"]["query"])
+    assert query_identity["view"] == ["public"]
+    assert query_identity["limit"] == ["1"]
+    assert query_identity["before_event_id"] == ["0"]
+    assert query_identity["public_authority"] == ["contract_runtime"]
+    assert visualization_hit["warm_cache"]["response_bytes"] > 0
+    assert any(
+        target.get("repair_id") == "cache-endpoint-blocker-a"
+        for target in visualization_hit["repair_targets"]
+    )
+    assert visualization_hit["raw_compatibility"]["sources"][0]["blocked"] is True
+
+    page_two = server.handle_project_contract_runtime_visualization(
+        _ctx(
+            {"project_id": PID, "backlog_id": backlog_a},
+            query={
+                **visualization_query,
+                "before_event_id": str(latest_a["id"]),
+            },
+        )
+    )
+    assert page_two["warm_cache"]["status"] == "miss"
+    assert page_two["timeline"]["events"][0]["event_id"] == older_a["id"]
+    assert page_two["warm_cache"]["identity_hash"] != visualization_hit["warm_cache"]["identity_hash"]
+
+    gate_query = {"view": "full", "limit": "10"}
+    gate_ctx = _ctx(
+        {"project_id": PID, "bug_id": backlog_a},
+        query=gate_query,
+    )
+    gate_miss = server.handle_backlog_timeline_gate(gate_ctx)
+    gate_hit = server.handle_backlog_timeline_gate(gate_ctx)
+    assert gate_miss["warm_cache"]["status"] == "miss"
+    assert gate_hit["warm_cache"]["status"] == "hit"
+    assert gate_hit["warm_cache"]["identity_hash"] != visualization_hit["warm_cache"]["identity_hash"]
+    assert gate_hit["warm_cache"]["identity"]["resource"]["public_authority"] == "legacy_advisory"
+
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_b,
+        task_id="cache-endpoint-b-worker",
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="accepted",
+        payload={"summary": "unrelated mutation must preserve backlog A"},
+    )
+    conn.commit()
+    unrelated_stable_visualization = (
+        server.handle_project_contract_runtime_visualization(visualization_ctx)
+    )
+    unrelated_stable_gate = server.handle_backlog_timeline_gate(gate_ctx)
+    assert unrelated_stable_visualization["warm_cache"]["status"] == "hit"
+    assert unrelated_stable_gate["warm_cache"]["status"] == "hit"
+
+    newest_a = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_a,
+        task_id="cache-endpoint-a-worker",
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="accepted",
+        payload={"summary": "affected mutation must advance generation"},
+    )
+    conn.commit()
+    fresh_visualization = server.handle_project_contract_runtime_visualization(
+        visualization_ctx
+    )
+    fresh_gate = server.handle_backlog_timeline_gate(gate_ctx)
+    assert fresh_visualization["warm_cache"]["status"] == "miss"
+    assert fresh_visualization["warm_cache"]["miss_reason"] == "freshness_changed"
+    assert fresh_visualization["timeline"]["events"][0]["event_id"] == newest_a["id"]
+    assert fresh_gate["warm_cache"]["status"] == "miss"
+    assert fresh_gate["warm_cache"]["miss_reason"] == "freshness_changed"
+    server._timeline_warm_cache_clear()
+
+
+def test_endpoint_cache_order_never_reuses_anonymous_connection_authority(
+    conn,
+    monkeypatch,
+):
+    server._timeline_warm_cache_clear()
+    backlog_id = "AC-CACHE-ENDPOINT-ORDER-REUSE"
+    stale_conn = sqlite3.connect(":memory:")
+    fresh_conn = sqlite3.connect(":memory:")
+    stale_conn.row_factory = sqlite3.Row
+    fresh_conn.row_factory = sqlite3.Row
+    for candidate in (stale_conn, fresh_conn):
+        _ensure_schema(candidate)
+        store.ensure_schema(candidate)
+        _insert_non_mf_backlog(candidate, backlog_id)
+    task_timeline.record_event(
+        stale_conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="same-task",
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="blocked",
+        payload={
+            "summary": "stale-first-connection-authority",
+            "blocked": True,
+            "blocker_ids": ["stale-authority"],
+        },
+    )
+    task_timeline.record_event(
+        fresh_conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="same-task",
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="accepted",
+        payload={"summary": "fresh-second-connection-authority"},
+    )
+    stale_conn.commit()
+    fresh_conn.commit()
+
+    active = {"conn": stale_conn}
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(active["conn"]),
+    )
+    monkeypatch.setattr(
+        "agent.governance.db.get_connection",
+        lambda _project_id: _NoCloseConn(active["conn"]),
+    )
+    visualization_ctx = _ctx(
+        {"project_id": PID, "backlog_id": backlog_id},
+        query={
+            "view": "public",
+            "limit": "10",
+            "before_event_id": "0",
+            "public_authority": "contract_runtime",
+        },
+    )
+    gate_ctx = _ctx(
+        {"project_id": PID, "bug_id": backlog_id},
+        query={"view": "full", "limit": "10"},
+    )
+    try:
+        stale_visualization = (
+            server.handle_project_contract_runtime_visualization(
+                visualization_ctx
+            )
+        )
+        stale_gate = server.handle_backlog_timeline_gate(gate_ctx)
+        assert stale_visualization["warm_cache"]["status"] == "miss"
+        assert stale_gate["warm_cache"]["status"] == "miss"
+        assert any(
+            target.get("repair_id") == "stale-authority"
+            for target in stale_visualization["repair_targets"]
+        )
+
+        active["conn"] = fresh_conn
+        fresh_visualization = (
+            server.handle_project_contract_runtime_visualization(
+                visualization_ctx
+            )
+        )
+        fresh_gate = server.handle_backlog_timeline_gate(gate_ctx)
+        assert fresh_visualization["warm_cache"]["status"] == "miss"
+        assert fresh_gate["warm_cache"]["status"] == "miss"
+        assert fresh_visualization["warm_cache"]["identity_hash"] != (
+            stale_visualization["warm_cache"]["identity_hash"]
+        )
+        assert fresh_gate["warm_cache"]["identity_hash"] != (
+            stale_gate["warm_cache"]["identity_hash"]
+        )
+        assert not any(
+            target.get("repair_id") == "stale-authority"
+            for target in fresh_visualization["repair_targets"]
+        )
+
+        for selected, expects_stale_repair in (
+            (stale_conn, True),
+            (fresh_conn, False),
+            (stale_conn, True),
+            (fresh_conn, False),
+        ):
+            active["conn"] = selected
+            repeated = server.handle_project_contract_runtime_visualization(
+                visualization_ctx
+            )
+            assert repeated["warm_cache"]["status"] == "hit"
+            assert any(
+                target.get("repair_id") == "stale-authority"
+                for target in repeated["repair_targets"]
+            ) is expects_stale_repair
+    finally:
+        server._timeline_warm_cache_clear()
+        stale_conn.close()
+        fresh_conn.close()
+
+
 def test_timeline_gate_authoritatively_accepts_completed_mf_parallel_runtime_chain(
     conn,
     tmp_path,

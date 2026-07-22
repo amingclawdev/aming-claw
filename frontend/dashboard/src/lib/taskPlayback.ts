@@ -25,6 +25,8 @@ import {
 export const TASK_PLAYBACK_TRACE_SCHEMA = "task_playback_trace.v1";
 export const TASK_COMPACT_LEDGER_SCHEMA = "task_timeline.compact_multi_backlog_ledger.v1";
 export const TASK_COMPACT_LEDGER_EVENT_TYPE = "task_timeline.compact_ledger";
+const TASK_PLAYBACK_SHARED_CACHE_TTL_MS = 5_000;
+const TASK_PLAYBACK_SHARED_CACHE_MAX_ENTRIES = 64;
 
 export type TaskPlaybackSource = "governed" | "governed_partial" | "fallback_sample";
 export type TaskPlaybackFrameStatus = "passed" | "blocked" | "failed" | "running" | "waiting" | "missing" | "recorded" | "unknown";
@@ -340,7 +342,18 @@ export interface TaskPlaybackTrace {
   privacy_boundary: TaskPlaybackPrivacyBoundary;
   close_gate_summary: TaskPlaybackCloseGateSummary;
   close_gate_matrix: GateMatrixProjection;
+  computation_cache: {
+    status: "hit" | "miss";
+    hit: boolean;
+    age_ms: number;
+    entry_count: number;
+    max_entries: number;
+    identity: string;
+    storage: "process_memory";
+  };
 }
+
+const taskPlaybackSharedComputations = new Map<string, { storedAt: number; trace: TaskPlaybackTrace }>();
 
 export interface NormalizeTaskPlaybackInput {
   projectId: string;
@@ -376,10 +389,17 @@ export type ContractRuntimeAuthorityDisplayStatus =
   | "UNKNOWN";
 
 export interface ContractRuntimeAuthorityCacheIdentity {
+  project_id: string;
   backlog_id: string;
   contract_execution_id: string;
   execution_state_revision: number;
+  current_generation: number;
   event_id: string;
+  view: string;
+  limit: number;
+  before_event_id: string;
+  public_authority: string;
+  identity_hash: string;
   key: string;
 }
 
@@ -556,7 +576,44 @@ export function projectContractRuntimeAuthorityViewModel(
   const executionStateRevision = Number(response.contract_execution_progress.execution_state_revision ?? 0) || 0;
   const latestEvent = response.timeline.events[0];
   const eventId = safeText(String(latestEvent?.event_id ?? latestEvent?.id ?? ""));
-  const identityParts = [response.backlog_id, contractExecutionId, String(executionStateRevision), eventId];
+  const responseRecord = asRecord(response);
+  const warmCache = asRecord(responseRecord.warm_cache);
+  const serverIdentity = asRecord(warmCache.identity);
+  const resourceIdentity = asRecord(serverIdentity.resource);
+  const resourceGeneration = asRecord(warmCache.resource_generation || serverIdentity.current_generation);
+  const queryIdentity = Array.isArray(serverIdentity.query) ? serverIdentity.query : [];
+  const queryValue = (key: string): string => {
+    const pair = queryIdentity.find((item) => Array.isArray(item) && String(item[0] ?? "") === key);
+    const values = Array.isArray(pair) && Array.isArray(pair[1]) ? pair[1] : [];
+    return safeText(String(values[0] ?? ""));
+  };
+  const currentGeneration = Number(
+    resourceGeneration.contract_chain_generation
+      ?? resourceGeneration.projection_watermark
+      ?? executionStateRevision,
+  ) || executionStateRevision;
+  const view = queryValue("view") || "public";
+  const limit = Number(queryValue("limit") || response.timeline.limit || 0) || 0;
+  const beforeEventId = queryValue("before_event_id") || "0";
+  const publicAuthority = safeText(String(
+    resourceIdentity.public_authority
+      || queryValue("public_authority")
+      || response.authority.source_of_authority
+      || "contract_runtime",
+  ));
+  const identityHash = safeText(String(warmCache.identity_hash ?? ""));
+  const identityParts = [
+    response.project_id,
+    response.backlog_id,
+    contractExecutionId,
+    String(executionStateRevision),
+    String(currentGeneration),
+    view,
+    String(limit),
+    beforeEventId,
+    publicAuthority,
+    eventId,
+  ];
   const lineStates = response.contract_execution_progress.line_states.map((line) => ({
     ...line,
     display_status: contractRuntimeAuthorityDisplayStatus(line.status, { bypassed: line.bypassed }),
@@ -580,10 +637,17 @@ export function projectContractRuntimeAuthorityViewModel(
     generated_at: response.generated_at,
     authority_source: "contract_runtime",
     cache_identity: {
+      project_id: response.project_id,
       backlog_id: response.backlog_id,
       contract_execution_id: contractExecutionId,
       execution_state_revision: executionStateRevision,
+      current_generation: currentGeneration,
       event_id: eventId,
+      view,
+      limit,
+      before_event_id: beforeEventId,
+      public_authority: publicAuthority,
+      identity_hash: identityHash,
       key: identityParts.map((part) => encodeURIComponent(part)).join(":"),
     },
     authoritative_next_actions: authoritativeNextActions,
@@ -1148,6 +1212,37 @@ export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): T
     input.projectId,
   );
   const events = mergeTimelineEvents(timelineEvents, gateEvents);
+  const currentLedgerRow = compactLedger.rows.find((row) => row.backlog_id === input.backlog.bug_id);
+  const computationIdentity = JSON.stringify({
+    project_id: input.projectId,
+    backlog: input.backlog,
+    authority: authorityView,
+    current_ledger_row: currentLedgerRow ?? null,
+    events,
+    gate_response: input.gateResponse ?? null,
+    source: input.source ?? "",
+  });
+  const computationNow = Date.now();
+  for (const [key, entry] of taskPlaybackSharedComputations) {
+    if (computationNow - entry.storedAt >= TASK_PLAYBACK_SHARED_CACHE_TTL_MS) {
+      taskPlaybackSharedComputations.delete(key);
+    }
+  }
+  const cachedComputation = taskPlaybackSharedComputations.get(computationIdentity);
+  if (cachedComputation) {
+    taskPlaybackSharedComputations.delete(computationIdentity);
+    taskPlaybackSharedComputations.set(computationIdentity, cachedComputation);
+    return {
+      ...cachedComputation.trace,
+      computation_cache: {
+        ...cachedComputation.trace.computation_cache,
+        status: "hit",
+        hit: true,
+        age_ms: Math.max(0, computationNow - cachedComputation.storedAt),
+        entry_count: taskPlaybackSharedComputations.size,
+      },
+    };
+  }
   const frames = events.map((event, index) => frameFromEvent(event, index));
   const closeGateSummary = closeGateSummaryFrom(input.gateResponse);
   const lanes = lanesFromFrames(frames, input.backlog, closeGateSummary);
@@ -1163,7 +1258,7 @@ export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): T
     visualization: input.taskTimeline?.contract_runtime_visualization,
   });
 
-  return {
+  const trace: TaskPlaybackTrace = {
     schema_version: TASK_PLAYBACK_TRACE_SCHEMA,
     project_id: input.projectId,
     backlog_id: input.backlog.bug_id,
@@ -1187,7 +1282,27 @@ export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): T
     },
     close_gate_summary: closeGateSummary,
     close_gate_matrix: closeGateMatrix,
+    computation_cache: {
+      status: "miss",
+      hit: false,
+      age_ms: 0,
+      entry_count: 0,
+      max_entries: TASK_PLAYBACK_SHARED_CACHE_MAX_ENTRIES,
+      identity: computationIdentity,
+      storage: "process_memory",
+    },
   };
+  while (taskPlaybackSharedComputations.size >= TASK_PLAYBACK_SHARED_CACHE_MAX_ENTRIES) {
+    const oldest = taskPlaybackSharedComputations.keys().next().value as string | undefined;
+    if (!oldest) break;
+    taskPlaybackSharedComputations.delete(oldest);
+  }
+  taskPlaybackSharedComputations.set(computationIdentity, {
+    storedAt: computationNow,
+    trace,
+  });
+  trace.computation_cache.entry_count = taskPlaybackSharedComputations.size;
+  return trace;
 }
 
 export function emptyTaskPlaybackTrace(projectId: string, backlog: BacklogBug): TaskPlaybackTrace {

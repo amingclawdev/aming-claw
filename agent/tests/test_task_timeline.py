@@ -1,6 +1,7 @@
 """Tests for task implementation timeline evidence."""
 
 import copy
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13665,6 +13667,874 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(search_fresh["limit"], 1)
         self.assertEqual(get_fresh["count"], 2)
         self.assertEqual(current_fresh["latest_event"]["id"], newest_event["id"])
+
+    def test_backlog_warm_cache_generation_ignores_unrelated_row_writes(self):
+        from agent.governance import server, task_timeline
+
+        server._timeline_warm_cache_clear()
+        for backlog_id in ("BUG-CACHE-A", "BUG-CACHE-B"):
+            self.conn.execute(
+                """INSERT INTO backlog_bugs
+                   (bug_id, title, status, priority, created_at, updated_at)
+                   VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
+                (
+                    backlog_id,
+                    f"Scoped cache {backlog_id}",
+                    "2026-07-22T00:00:00Z",
+                    "2026-07-22T00:00:00Z",
+                ),
+            )
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=backlog_id,
+                task_id=f"task-{backlog_id}",
+                event_type="worker.startup",
+                event_kind="mf_subagent_startup",
+                actor="mf_sub",
+                status="passed",
+            )
+        self.conn.commit()
+
+        query_a = {"backlog_id": "BUG-CACHE-A", "limit": "10"}
+        query_b = {"backlog_id": "BUG-CACHE-B", "limit": "10"}
+        miss_a = server.handle_task_timeline_list(_ctx(query_a))
+        hit_a = server.handle_task_timeline_list(_ctx(query_a))
+        miss_b = server.handle_task_timeline_list(_ctx(query_b))
+        hit_b = server.handle_task_timeline_list(_ctx(query_b))
+
+        self.assertEqual(miss_a["warm_cache"]["status"], "miss")
+        self.assertEqual(hit_a["warm_cache"]["status"], "hit")
+        self.assertEqual(hit_b["warm_cache"]["status"], "hit")
+        self.assertEqual(
+            hit_a["warm_cache"]["resource_generation"]["scope"],
+            "backlog_contract_chain",
+        )
+        self.assertEqual(
+            hit_a["warm_cache"]["resource_generation"]["backlog_id"],
+            "BUG-CACHE-A",
+        )
+        self.assertGreater(hit_a["warm_cache"]["response_bytes"], 0)
+        self.assertGreaterEqual(hit_a["warm_cache"]["warm_latency_ms"], 0)
+        self.assertNotIn("_leader_token", hit_a["warm_cache"])
+
+        conn = _conn(self.tmp.name)
+        try:
+            task_timeline.record_event(
+                conn,
+                project_id="proj",
+                backlog_id="BUG-CACHE-B",
+                task_id="task-BUG-CACHE-B",
+                event_type="worker.progress",
+                event_kind="implementation",
+                actor="mf_sub",
+                status="running",
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        still_hit_a = server.handle_task_timeline_list(_ctx(query_a))
+        fresh_b = server.handle_task_timeline_list(_ctx(query_b))
+        self.assertEqual(still_hit_a["warm_cache"]["status"], "hit")
+        self.assertEqual(
+            still_hit_a["warm_cache"]["identity_hash"],
+            hit_a["warm_cache"]["identity_hash"],
+        )
+        self.assertEqual(fresh_b["warm_cache"]["status"], "miss")
+        self.assertEqual(fresh_b["warm_cache"]["miss_reason"], "freshness_changed")
+        self.assertNotEqual(
+            fresh_b["warm_cache"]["identity_hash"],
+            hit_b["warm_cache"]["identity_hash"],
+        )
+
+        conn = _conn(self.tmp.name)
+        try:
+            task_timeline.record_event(
+                conn,
+                project_id="proj",
+                backlog_id="BUG-CACHE-A",
+                task_id="task-BUG-CACHE-A",
+                event_type="worker.progress",
+                event_kind="implementation",
+                actor="mf_sub",
+                status="running",
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        fresh_a = server.handle_task_timeline_list(_ctx(query_a))
+        self.assertEqual(fresh_a["warm_cache"]["status"], "miss")
+        self.assertEqual(fresh_a["warm_cache"]["miss_reason"], "freshness_changed")
+        self.assertGreater(fresh_a["warm_cache"]["response_bytes"], 0)
+        self.assertGreaterEqual(fresh_a["warm_cache"]["cold_latency_ms"], 0)
+
+    def test_warm_cache_db_scope_isolated_for_memory_and_shared_for_file(self):
+        from agent.governance import server
+
+        server._timeline_warm_cache_clear()
+        memory_a = sqlite3.connect(":memory:")
+        memory_b = sqlite3.connect(":memory:")
+        try:
+            self.assertFalse(memory_a.in_transaction)
+            scope_a = server._timeline_warm_cache_db_scope(memory_a)
+            scope_a_again = server._timeline_warm_cache_db_scope(memory_a)
+            scope_b = server._timeline_warm_cache_db_scope(memory_b)
+            self.assertEqual(scope_a, scope_a_again)
+            self.assertNotEqual(scope_a, scope_b)
+            self.assertFalse(memory_a.in_transaction)
+            self.assertFalse(memory_b.in_transaction)
+
+            identity_a, generation_a, cached_a, metadata_a = (
+                server._timeline_warm_cache_prepare(
+                    memory_a,
+                    endpoint="timeline_list",
+                    project_id="same-project",
+                    query={"limit": "1"},
+                )
+            )
+            self.assertIsNone(cached_a)
+            server._timeline_warm_cache_store(
+                identity_a,
+                generation_a,
+                {"ok": True, "source": "memory-a"},
+                metadata_a,
+            )
+            _, _, cached_b, metadata_b = server._timeline_warm_cache_prepare(
+                memory_b,
+                endpoint="timeline_list",
+                project_id="same-project",
+                query={"limit": "1"},
+            )
+            self.assertIsNone(cached_b)
+            self.assertEqual(metadata_b["status"], "miss")
+            self.assertNotEqual(
+                metadata_a["identity_hash"],
+                metadata_b["identity_hash"],
+            )
+        finally:
+            memory_a.close()
+            memory_b.close()
+            server._timeline_warm_cache_clear()
+
+        shared_path = Path(self.tmp.name) / "same-file-cache.db"
+        file_a = sqlite3.connect(shared_path)
+        file_b = sqlite3.connect(shared_path)
+        try:
+            self.assertEqual(
+                server._timeline_warm_cache_db_scope(file_a),
+                server._timeline_warm_cache_db_scope(file_b),
+            )
+            identity_a, generation_a, cached_a, metadata_a = (
+                server._timeline_warm_cache_prepare(
+                    file_a,
+                    endpoint="timeline_list",
+                    project_id="same-project",
+                    query={"limit": "1"},
+                )
+            )
+            self.assertIsNone(cached_a)
+            server._timeline_warm_cache_store(
+                identity_a,
+                generation_a,
+                {"ok": True, "source": "same-file"},
+                metadata_a,
+            )
+            _, _, cached_b, metadata_b = server._timeline_warm_cache_prepare(
+                file_b,
+                endpoint="timeline_list",
+                project_id="same-project",
+                query={"limit": "1"},
+            )
+            self.assertEqual(cached_b["source"], "same-file")
+            self.assertEqual(metadata_b["status"], "hit")
+        finally:
+            file_a.close()
+            file_b.close()
+            server._timeline_warm_cache_clear()
+
+    def test_backlog_generation_tracks_same_second_runtime_authority_and_edges(self):
+        from agent.governance import server
+
+        server._timeline_warm_cache_clear()
+        server._contract_runtime_store(self.conn)
+        fixed_time = "2026-07-22T05:00:00Z"
+        for suffix in ("A", "B"):
+            backlog_id = f"BUG-CACHE-AUTHORITY-{suffix}"
+            execution_id = f"cex-cache-authority-{suffix.lower()}"
+            chain_id = f"chain-cache-authority-{suffix.lower()}"
+            self.conn.execute(
+                """INSERT INTO backlog_bugs
+                   (bug_id, title, status, priority, created_at, updated_at)
+                   VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
+                (backlog_id, backlog_id, fixed_time, fixed_time),
+            )
+            record = {
+                "contract_execution_id": execution_id,
+                "project_id": "proj",
+                "backlog_id": backlog_id,
+                "contract_id": "mf_parallel.v2",
+                "version": "2",
+                "revision": "r1",
+                "contract_chain_id": chain_id,
+                "execution_state_revision": 5,
+                "state": "active",
+                "authority_marker": f"{suffix}-old",
+            }
+            self.conn.execute(
+                """INSERT INTO contract_runtime_executions
+                   (contract_execution_id, project_id, backlog_id, contract_id,
+                    version, revision, parent_contract_execution_id,
+                    root_contract_execution_id, contract_chain_id,
+                    execution_state_revision, record_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)""",
+                (
+                    execution_id,
+                    "proj",
+                    backlog_id,
+                    "mf_parallel.v2",
+                    "2",
+                    "r1",
+                    execution_id,
+                    chain_id,
+                    5,
+                    json.dumps(record, sort_keys=True),
+                    fixed_time,
+                    fixed_time,
+                ),
+            )
+            self.conn.execute(
+                """INSERT INTO backlog_contract_chain_current
+                   (project_id, backlog_id, contract_chain_id,
+                    root_contract_execution_id, current_contract_execution_id,
+                    current_contract_id, readiness_state, generation,
+                    projection_watermark, projection_hash, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'mf_parallel.v2', 'active', 5, 5, ?, ?)""",
+                (
+                    "proj",
+                    backlog_id,
+                    chain_id,
+                    execution_id,
+                    execution_id,
+                    f"projection-{suffix}",
+                    fixed_time,
+                ),
+            )
+        self.conn.execute(
+            """INSERT INTO contract_chain_edges
+               (edge_key, project_id, backlog_id, contract_chain_id,
+                parent_contract_execution_id, child_contract_execution_id,
+                root_contract_execution_id, edge_kind, generation,
+                source_ref, source_hash, metadata_json, created_at)
+               VALUES (?, 'proj', 'BUG-CACHE-AUTHORITY-A', ?, ?, ?, ?,
+                       'successor', 5, 'fixture', 'edge-old', '{}', ?)""",
+            (
+                "edge-cache-authority-a",
+                "chain-cache-authority-a",
+                "cex-cache-authority-a",
+                "cex-cache-authority-a",
+                "cex-cache-authority-a",
+                fixed_time,
+            ),
+        )
+        self.conn.commit()
+
+        query = {"backlog_id": "BUG-CACHE-AUTHORITY-A", "limit": "10"}
+        resource = {
+            "backlog_id": "BUG-CACHE-AUTHORITY-A",
+            "public_authority": "contract_runtime",
+        }
+
+        def prepare():
+            return server._timeline_warm_cache_prepare(
+                self.conn,
+                endpoint="contract_runtime_visualization",
+                project_id="proj",
+                query=query,
+                resource_identity=resource,
+            )
+
+        identity, generation, cached, metadata = prepare()
+        self.assertIsNone(cached)
+        server._timeline_warm_cache_store(
+            identity,
+            generation,
+            {"ok": True, "authority": "A-old"},
+            metadata,
+        )
+
+        unrelated_record = json.loads(
+            self.conn.execute(
+                """SELECT record_json FROM contract_runtime_executions
+                   WHERE contract_execution_id = 'cex-cache-authority-b'"""
+            ).fetchone()[0]
+        )
+        unrelated_record["execution_state_revision"] = 6
+        unrelated_record["authority_marker"] = "B-new-same-second"
+        self.conn.execute(
+            """UPDATE contract_runtime_executions
+               SET execution_state_revision = 6, record_json = ?
+               WHERE contract_execution_id = 'cex-cache-authority-b'""",
+            (json.dumps(unrelated_record, sort_keys=True),),
+        )
+        self.conn.commit()
+        _, _, unrelated_cached, unrelated_metadata = prepare()
+        self.assertEqual(unrelated_cached["authority"], "A-old")
+        self.assertEqual(unrelated_metadata["status"], "hit")
+
+        authority_record = json.loads(
+            self.conn.execute(
+                """SELECT record_json FROM contract_runtime_executions
+                   WHERE contract_execution_id = 'cex-cache-authority-a'"""
+            ).fetchone()[0]
+        )
+        authority_record["execution_state_revision"] = 6
+        authority_record["authority_marker"] = "A-new-same-second"
+        self.conn.execute(
+            """UPDATE contract_runtime_executions
+               SET execution_state_revision = 6, record_json = ?
+               WHERE contract_execution_id = 'cex-cache-authority-a'""",
+            (json.dumps(authority_record, sort_keys=True),),
+        )
+        self.conn.commit()
+        fresh_identity, fresh_generation, fresh_cached, fresh_metadata = prepare()
+        self.assertIsNone(fresh_cached)
+        self.assertEqual(fresh_metadata["miss_reason"], "freshness_changed")
+        self.assertEqual(generation["contract_runtime_updated_at"], fixed_time)
+        self.assertEqual(fresh_generation["contract_runtime_updated_at"], fixed_time)
+        self.assertEqual(generation["contract_chain_edge_id"], fresh_generation["contract_chain_edge_id"])
+        self.assertEqual(generation["current_runtime_execution_revision"], "5")
+        self.assertEqual(fresh_generation["current_runtime_execution_revision"], "6")
+        self.assertNotEqual(
+            generation["current_runtime_record_digest"],
+            fresh_generation["current_runtime_record_digest"],
+        )
+        server._timeline_warm_cache_store(
+            fresh_identity,
+            fresh_generation,
+            {"ok": True, "authority": "A-new"},
+            fresh_metadata,
+        )
+
+        self.conn.execute(
+            """UPDATE contract_chain_edges
+               SET source_hash = 'edge-new-same-id'
+               WHERE edge_key = 'edge-cache-authority-a'"""
+        )
+        self.conn.commit()
+        _, edge_generation, edge_cached, edge_metadata = prepare()
+        self.assertIsNone(edge_cached)
+        self.assertEqual(edge_metadata["miss_reason"], "freshness_changed")
+        self.assertEqual(
+            fresh_generation["contract_chain_edge_id"],
+            edge_generation["contract_chain_edge_id"],
+        )
+        self.assertNotEqual(
+            fresh_generation["contract_chain_edge_digest"],
+            edge_generation["contract_chain_edge_digest"],
+        )
+        server._timeline_warm_cache_clear()
+
+    def test_historical_cache_uses_separate_180_second_lru_pool(self):
+        from agent.governance import server
+
+        server._timeline_warm_cache_clear()
+        hot_identity, hot_generation, hot_cached, hot_metadata = (
+            server._timeline_warm_cache_prepare(
+                self.conn,
+                endpoint="timeline_recent",
+                project_id="proj",
+                query={"limit": "50"},
+            )
+        )
+        self.assertIsNone(hot_cached)
+        self.assertEqual(hot_metadata["cache_pool"], "hot_window")
+        server._timeline_warm_cache_store(
+            hot_identity,
+            hot_generation,
+            {"ok": True, "source": "hot"},
+            hot_metadata,
+        )
+
+        with mock.patch.object(server, "_TIMELINE_HISTORICAL_CACHE_MAX_ENTRIES", 1):
+            for query in (
+                {"q": "older event", "offset": "0", "limit": "50"},
+                {"exact_event_id": "41", "limit": "50"},
+            ):
+                identity, generation, cached, metadata = (
+                    server._timeline_warm_cache_prepare(
+                        self.conn,
+                        endpoint="timeline_list",
+                        project_id="proj",
+                        query=query,
+                    )
+                )
+                self.assertIsNone(cached)
+                self.assertEqual(metadata["cache_pool"], "historical_ttl_lru")
+                self.assertEqual(metadata["ttl_ms"], 180_000)
+                server._timeline_warm_cache_store(
+                    identity,
+                    generation,
+                    {"ok": True, "source": str(query)},
+                    metadata,
+                )
+
+        _, _, hot_again, hot_again_metadata = server._timeline_warm_cache_prepare(
+            self.conn,
+            endpoint="timeline_recent",
+            project_id="proj",
+            query={"limit": "50"},
+        )
+        self.assertEqual(hot_again["source"], "hot")
+        self.assertEqual(hot_again_metadata["status"], "hit")
+        self.assertLessEqual(
+            sum(
+                1
+                for entry in server._TIMELINE_WARM_CACHE.values()
+                if entry.get("cache_pool") == "historical_ttl_lru"
+            ),
+            1,
+        )
+        server._timeline_warm_cache_clear()
+
+    def test_backlog_warm_cache_is_bounded_and_query_exact(self):
+        from agent.governance import server, task_timeline
+
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, created_at, updated_at)
+               VALUES ('BUG-CACHE-LRU', 'LRU cache fixture', 'OPEN', 'P1', ?, ?)""",
+            ("2026-07-22T00:00:00Z", "2026-07-22T00:00:00Z"),
+        )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-CACHE-LRU",
+            task_id="task-cache-lru",
+            event_type="worker.startup",
+            event_kind="mf_subagent_startup",
+            phase="startup_gate",
+            actor="mf_sub",
+            status="running",
+        )
+        self.conn.commit()
+
+        with mock.patch.object(server, "_TIMELINE_WARM_CACHE_MAX_ENTRIES", 2):
+            server._timeline_warm_cache_clear()
+            responses = [
+                server.handle_task_timeline_list(
+                    _ctx({"backlog_id": "BUG-CACHE-LRU", "limit": str(limit)})
+                )
+                for limit in (1, 2, 3)
+            ]
+            self.assertTrue(all(item["warm_cache"]["status"] == "miss" for item in responses))
+            self.assertEqual(
+                len({item["warm_cache"]["identity_hash"] for item in responses}),
+                3,
+            )
+            self.assertLessEqual(responses[-1]["warm_cache"]["entry_count"], 2)
+            self.assertGreaterEqual(responses[-1]["warm_cache"]["eviction_count"], 1)
+            first_again = server.handle_task_timeline_list(
+                _ctx({"backlog_id": "BUG-CACHE-LRU", "limit": "1"})
+            )
+            self.assertEqual(first_again["warm_cache"]["status"], "miss")
+            self.assertEqual(first_again["warm_cache"]["miss_reason"], "cold")
+        server._timeline_warm_cache_clear()
+
+    def test_playback_exact_event_is_lazy_raw_and_cache_identity_is_exact(self):
+        from agent.governance import server, task_timeline
+
+        server._timeline_warm_cache_clear()
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, created_at, updated_at)
+               VALUES ('BUG-CACHE-EXACT', 'Exact event fixture', 'OPEN', 'P1', ?, ?)""",
+            ("2026-07-22T00:00:00Z", "2026-07-22T00:00:00Z"),
+        )
+        for index in range(2):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id="BUG-CACHE-EXACT",
+                task_id="task-cache-exact",
+                event_type="mf_subagent.implementation",
+                event_kind="implementation",
+                phase="implementation",
+                actor="mf_sub",
+                status="accepted",
+                payload={"summary": f"newer event {index + 1}"},
+            )
+        exact_event = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-CACHE-EXACT",
+            task_id="task-cache-exact",
+            event_type="mf_subagent.implementation",
+            event_kind="implementation",
+            phase="implementation",
+            actor="mf_sub",
+            status="accepted",
+            payload={
+                "summary": "legacy raw detail outside the first page",
+                "blocker_ids": ["legacy-raw-blocker"],
+                "raw_compatibility_marker": "preserve-me",
+            },
+        )
+        self.conn.commit()
+
+        base_query = {
+            "backlog_id": "BUG-CACHE-EXACT",
+            "limit": "1",
+            "include_compact_ledger": "true",
+            "playback_bootstrap": "compact",
+            "public_authority": "contract_runtime",
+        }
+        server._timeline_warm_cache_clear()
+        with mock.patch.object(
+            server,
+            "_task_playback_contract_runtime_visualization_from_loaded",
+            wraps=server._task_playback_contract_runtime_visualization_from_loaded,
+        ) as visualization_builder, mock.patch.object(
+            server,
+            "_task_playback_compact_gate_response",
+            wraps=server._task_playback_compact_gate_response,
+        ) as gate_builder:
+            bootstrap = server.handle_task_timeline_list(_ctx(base_query))
+            bootstrap_hit = server.handle_task_timeline_list(_ctx(base_query))
+        self.assertEqual(visualization_builder.call_count, 1)
+        self.assertEqual(gate_builder.call_count, 1)
+        self.assertEqual(bootstrap_hit["warm_cache"]["status"], "hit")
+        self.assertEqual(bootstrap["count"], 1)
+        self.assertNotIn("exact_event", bootstrap)
+        self.assertTrue(bootstrap["raw_event_payloads_omitted"])
+        self.assertTrue(
+            bootstrap["events"][0]["payload"]["raw_payload_omitted"]
+        )
+        self.assertNotIn(
+            "raw_compatibility_marker",
+            bootstrap["events"][0]["payload"],
+        )
+        self.assertEqual(
+            bootstrap["playback_bootstrap"]["shared_computation"],
+            {
+                "timeline": True,
+                "contract_runtime_visualization": True,
+                "timeline_gate": True,
+                "cold_compute_paths": 1,
+            },
+        )
+        bootstrap_identity = bootstrap["playback_bootstrap"]["identity_hash"]
+        self.assertEqual(
+            bootstrap["contract_runtime_visualization"][
+                "playback_bootstrap_identity_hash"
+            ],
+            bootstrap_identity,
+        )
+        self.assertEqual(
+            bootstrap["backlog_timeline_gate"][
+                "playback_bootstrap_identity_hash"
+            ],
+            bootstrap_identity,
+        )
+        self.assertTrue(
+            bootstrap["contract_runtime_visualization"]["public_safe"]
+        )
+        self.assertEqual(
+            bootstrap["backlog_timeline_gate"]["bug_id"],
+            "BUG-CACHE-EXACT",
+        )
+        self.assertTrue(
+            bootstrap["backlog_timeline_gate"]["timeline_gate"][
+                "raw_gate_evidence_omitted"
+            ]
+        )
+        compact_json = json.dumps(bootstrap, sort_keys=True)
+        self.assertNotIn("raw_compatibility_marker", compact_json)
+        self.assertNotIn("preserve-me", compact_json)
+
+        deep_link_query = {
+            **base_query,
+            "exact_event_id": str(exact_event["id"]),
+        }
+        deep_link = server.handle_task_timeline_list(_ctx(deep_link_query))
+        deep_link_hit = server.handle_task_timeline_list(_ctx(deep_link_query))
+        self.assertEqual(deep_link["warm_cache"]["status"], "miss")
+        self.assertEqual(deep_link_hit["warm_cache"]["status"], "hit")
+        self.assertNotEqual(
+            bootstrap["warm_cache"]["identity_hash"],
+            deep_link["warm_cache"]["identity_hash"],
+        )
+        self.assertEqual(deep_link["exact_event_id"], exact_event["id"])
+        self.assertTrue(deep_link["exact_event_raw_loaded"])
+        self.assertEqual(deep_link["exact_event"]["id"], exact_event["id"])
+        self.assertEqual(
+            deep_link["exact_event"]["payload"]["raw_compatibility_marker"],
+            "preserve-me",
+        )
+        self.assertEqual(
+            deep_link["exact_event"]["payload"]["blocker_ids"],
+            ["legacy-raw-blocker"],
+        )
+        self.assertEqual(deep_link["count"], 1)
+        self.assertNotEqual(deep_link["events"][0]["id"], exact_event["id"])
+        query_identity = dict(deep_link["warm_cache"]["identity"]["query"])
+        self.assertEqual(query_identity["exact_event_id"], [str(exact_event["id"])])
+        self.assertEqual(query_identity["playback_bootstrap"], ["compact"])
+
+    def test_identical_cold_timeline_requests_single_flight_and_failure_retry(self):
+        from agent.governance import server, task_timeline
+
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, created_at, updated_at)
+               VALUES ('BUG-CACHE-FLIGHT', 'Single flight fixture', 'OPEN', 'P1', ?, ?)""",
+            ("2026-07-22T00:00:00Z", "2026-07-22T00:00:00Z"),
+        )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-CACHE-FLIGHT",
+            task_id="task-cache-flight",
+            event_type="worker.startup",
+            event_kind="mf_subagent_startup",
+            phase="startup_gate",
+            actor="mf_sub",
+            status="running",
+        )
+        self.conn.commit()
+        query = {"backlog_id": "BUG-CACHE-FLIGHT", "limit": "10"}
+        original_list_events = task_timeline.list_events
+
+        server._timeline_warm_cache_clear()
+        started = threading.Event()
+        release = threading.Event()
+        call_lock = threading.Lock()
+        call_count = 0
+
+        def slow_list_events(*args, **kwargs):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+            started.set()
+            self.assertTrue(release.wait(2))
+            return original_list_events(*args, **kwargs)
+
+        with mock.patch.object(task_timeline, "list_events", side_effect=slow_list_events):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                leader = pool.submit(server.handle_task_timeline_list, _ctx(query))
+                self.assertTrue(started.wait(2))
+                waiter = pool.submit(server.handle_task_timeline_list, _ctx(query))
+                time.sleep(0.05)
+                release.set()
+                results = [leader.result(timeout=3), waiter.result(timeout=3)]
+        self.assertEqual(call_count, 1)
+        self.assertEqual(sorted(item["warm_cache"]["status"] for item in results), ["hit", "miss"])
+        joined = next(item for item in results if item["warm_cache"]["status"] == "hit")
+        self.assertTrue(joined["warm_cache"]["single_flight_joined"])
+        self.assertEqual(joined["warm_cache"]["single_flight_status"], "joined")
+
+        server._timeline_warm_cache_clear()
+        started.clear()
+        release.clear()
+        call_count = 0
+
+        def fail_once_list_events(*args, **kwargs):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                attempt = call_count
+            if attempt == 1:
+                started.set()
+                self.assertTrue(release.wait(2))
+                raise RuntimeError("synthetic cold leader failure")
+            return original_list_events(*args, **kwargs)
+
+        with mock.patch.object(task_timeline, "list_events", side_effect=fail_once_list_events):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                failed_leader = pool.submit(server.handle_task_timeline_list, _ctx(query))
+                self.assertTrue(started.wait(2))
+                retrying_waiter = pool.submit(server.handle_task_timeline_list, _ctx(query))
+                time.sleep(0.05)
+                release.set()
+                with self.assertRaisesRegex(RuntimeError, "synthetic cold leader failure"):
+                    failed_leader.result(timeout=3)
+                recovered = retrying_waiter.result(timeout=3)
+        self.assertEqual(call_count, 2)
+        self.assertEqual(recovered["warm_cache"]["status"], "miss")
+        self.assertEqual(
+            recovered["warm_cache"]["single_flight_status"],
+            "retry_after_failure",
+        )
+        self.assertEqual(
+            recovered["warm_cache"]["miss_reason"],
+            "single_flight_leader_failed",
+        )
+        cached_after_retry = server.handle_task_timeline_list(_ctx(query))
+        self.assertEqual(cached_after_retry["warm_cache"]["status"], "hit")
+
+    def test_timed_out_waiter_uses_cas_and_cannot_replace_promoted_leader(self):
+        from agent.governance import server, task_timeline
+
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, created_at, updated_at)
+               VALUES ('BUG-CACHE-CAS', 'CAS fixture', 'OPEN', 'P1', ?, ?)""",
+            ("2026-07-22T00:00:00Z", "2026-07-22T00:00:00Z"),
+        )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-CACHE-CAS",
+            task_id="task-cache-cas",
+            event_type="worker.startup",
+            event_kind="mf_subagent_startup",
+            phase="startup_gate",
+            actor="mf_sub",
+            status="running",
+        )
+        self.conn.commit()
+        query = {"backlog_id": "BUG-CACHE-CAS", "limit": "10"}
+        resource = {
+            "backlog_id": "BUG-CACHE-CAS",
+            "public_authority": "public_safe_timeline",
+        }
+
+        server._timeline_warm_cache_clear()
+
+        with mock.patch.object(
+            server,
+            "_TIMELINE_WARM_CACHE_SINGLE_FLIGHT_WAIT_SECONDS",
+            0.05,
+        ):
+            initial = server._timeline_warm_cache_prepare(
+                self.conn,
+                endpoint="timeline_list",
+                project_id="proj",
+                query=query,
+                resource_identity=resource,
+            )
+            identity_hash, watermark, _, initial_metadata = initial
+
+            def wait_for_same_identity():
+                conn = _conn(self.tmp.name)
+                try:
+                    return server._timeline_warm_cache_prepare(
+                        conn,
+                        endpoint="timeline_list",
+                        project_id="proj",
+                        query=query,
+                        resource_identity=resource,
+                    )
+                finally:
+                    conn.close()
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(wait_for_same_identity) for _ in range(2)]
+                done, pending = wait(futures, timeout=2, return_when=FIRST_COMPLETED)
+                self.assertEqual(len(done), 1)
+                promoted = next(iter(done)).result(timeout=1)
+                promoted_metadata = promoted[3]
+                promoted_token = promoted_metadata["_leader_token"]
+                self.assertTrue(promoted_token)
+                self.assertIn(
+                    promoted_metadata["single_flight_status"],
+                    {"wait_timeout_leader", "retry_after_failure"},
+                )
+                with server._TIMELINE_WARM_CACHE_LOCK:
+                    current_record = server._TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash]
+                    self.assertEqual(current_record["leader_token"], promoted_token)
+
+                server._timeline_warm_cache_cancel(
+                    identity_hash,
+                    initial_metadata["_leader_token"],
+                )
+                with server._TIMELINE_WARM_CACHE_LOCK:
+                    self.assertEqual(
+                        server._TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash]["leader_token"],
+                        promoted_token,
+                    )
+
+                stored = server._timeline_warm_cache_store(
+                    identity_hash,
+                    watermark,
+                    {"ok": True, "events": [], "count": 0},
+                    promoted_metadata,
+                )
+                self.assertNotIn("_leader_token", stored["warm_cache"])
+                joined = next(iter(pending)).result(timeout=2)
+                self.assertIsNotNone(joined[2])
+                self.assertEqual(joined[3]["single_flight_status"], "joined")
+                self.assertTrue(joined[3]["single_flight_joined"])
+        server._timeline_warm_cache_clear()
+
+    def test_stale_leader_store_cannot_overwrite_promoted_result(self):
+        from agent.governance import server
+
+        query = {"backlog_id": "BUG-CACHE-STALE-STORE", "limit": "10"}
+        resource = {
+            "backlog_id": "BUG-CACHE-STALE-STORE",
+            "public_authority": "public_safe_timeline",
+        }
+        server._timeline_warm_cache_clear()
+        identity_hash, watermark, _, stale_metadata = (
+            server._timeline_warm_cache_prepare(
+                self.conn,
+                endpoint="timeline_list",
+                project_id="proj",
+                query=query,
+                resource_identity=resource,
+            )
+        )
+        stale_token = stale_metadata["_leader_token"]
+        promoted_token = "promoted-new-leader-token"
+        promoted_metadata = {
+            **stale_metadata,
+            "_leader_token": promoted_token,
+        }
+        with server._TIMELINE_WARM_CACHE_LOCK:
+            old_record = server._TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash]
+            promoted_event = threading.Event()
+            server._TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash] = {
+                "event": promoted_event,
+                "started_at": time.monotonic(),
+                "leader_token": promoted_token,
+            }
+            self.assertNotEqual(old_record["leader_token"], promoted_token)
+
+        promoted = server._timeline_warm_cache_store(
+            identity_hash,
+            watermark,
+            {"ok": True, "value": "promoted-new"},
+            promoted_metadata,
+        )
+        stale = server._timeline_warm_cache_store(
+            identity_hash,
+            watermark,
+            {"ok": True, "value": "stale-old"},
+            stale_metadata,
+        )
+        self.assertEqual(promoted["warm_cache"]["store_status"], "stored")
+        self.assertEqual(
+            stale["warm_cache"]["store_status"],
+            "stale_leader_discarded",
+        )
+        self.assertFalse(stale["warm_cache"]["stored"])
+        self.assertNotIn(stale_token, json.dumps(stale, sort_keys=True))
+        self.assertNotIn(promoted_token, json.dumps(promoted, sort_keys=True))
+
+        _, _, cached, hit_metadata = server._timeline_warm_cache_prepare(
+            self.conn,
+            endpoint="timeline_list",
+            project_id="proj",
+            query=query,
+            resource_identity=resource,
+        )
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["value"], "promoted-new")
+        self.assertEqual(hit_metadata["single_flight_status"], "cache_hit")
+        with server._TIMELINE_WARM_CACHE_LOCK:
+            self.assertNotIn(identity_hash, server._TIMELINE_WARM_CACHE_IN_FLIGHT)
+        server._timeline_warm_cache_clear()
 
     def test_backlog_current_task_endpoint_uses_timeline_fallback(self):
         from agent.governance import server, task_timeline
