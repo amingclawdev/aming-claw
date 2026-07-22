@@ -27811,6 +27811,360 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
     }
 
 
+def _runtime_context_context_local_setup_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    record: Mapping[str, Any],
+    stage_id: str,
+    line_id: str,
+    evidence_kind: str,
+    payload: Mapping[str, Any],
+    failed_qa_rejoin_contexts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Authorize one fresh rework context's local setup projection.
+
+    The mf_parallel Contract has single worker-read and worker-startup lines.
+    A failed-QA rework may allocate a fresh bounded runtime context after those
+    global lines were completed by the previous worker.  The new worker still
+    owes its own authenticated timeline setup evidence, but must not submit a
+    Contract line a second time.  Keep this exception intentionally narrower
+    than ordinary idempotency or evidence backfill.
+    """
+
+    local_setup_kind = {
+        (
+            "worker_read",
+            "worker_read_runtime_guide",
+            "read_receipt",
+        ): "read_receipt",
+        (
+            "worker_startup",
+            "worker_startup",
+            "mf_subagent_startup",
+        ): "startup",
+    }.get((stage_id, line_id, evidence_kind), "")
+    if not local_setup_kind:
+        return {}
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    context_project_id = str(
+        getattr(context, "governance_project_id", "")
+        or getattr(context, "project_id", "")
+        or ""
+    ).strip()
+    marker = next(
+        (
+            dict(item)
+            for item in failed_qa_rejoin_contexts
+            if isinstance(item, Mapping)
+            and str(item.get("runtime_context_id") or "").strip()
+            == runtime_context_id
+            and str(item.get("task_id") or "").strip() == task_id
+            and str(item.get("parent_task_id") or "").strip()
+            == parent_task_id
+            and str(item.get("contract_execution_id") or "").strip()
+            == execution_id
+        ),
+        {},
+    )
+    if (
+        not marker
+        or not all(
+            (
+                runtime_context_id,
+                task_id,
+                parent_task_id,
+                backlog_id,
+                execution_id,
+            )
+        )
+        or context_project_id != project_id
+        or str(record.get("project_id") or "").strip() != project_id
+        or str(record.get("backlog_id") or "").strip() != backlog_id
+        or str(getattr(context, "status", "") or "").strip()
+        not in (
+            {"worktree_ready"}
+            if local_setup_kind == "read_receipt"
+            else {"worktree_ready", "running"}
+        )
+    ):
+        return {}
+
+    from .parallel_branch_runtime import (
+        runtime_context_secret_hash,
+        runtime_context_session_token_ref,
+    )
+
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    active_worker_proof = {
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "actual_host_worker_id": str(
+            getattr(context, "actual_host_worker_id", "") or ""
+        ).strip(),
+        "fence_token_present": bool(
+            str(getattr(context, "fence_token", "") or "").strip()
+        ),
+        "session_token_hash_present": bool(
+            str(getattr(context, "session_token_hash", "") or "").strip()
+        ),
+        "session_token_ref": runtime_context_session_token_ref(context),
+    }
+    if (
+        not worker_id
+        or not worker_slot_id
+        or not active_worker_proof["actual_host_worker_id"]
+        or not active_worker_proof["fence_token_present"]
+        or not active_worker_proof["session_token_hash_present"]
+        or not active_worker_proof["session_token_ref"]
+    ):
+        return {}
+
+    if _truthy_flag(payload.get("observer_impersonation")):
+        return {}
+    for role_field in (
+        "actor_role",
+        "worker_role",
+        "evidence_owner_role",
+    ):
+        role = str(payload.get(role_field) or "").strip()
+        if role and role != "mf_sub":
+            return {}
+
+    dispatch_identity = _contract_runtime_dispatch_identity_resolution(
+        record,
+        context,
+    )
+    observer_command_id = str(
+        dispatch_identity.get("observer_command_id") or ""
+    ).strip()
+    if (
+        dispatch_identity.get("accepted") is not True
+        or dispatch_identity.get("reconstructable") is not True
+        or not observer_command_id
+    ):
+        return {}
+    command = observer_session.get_command(
+        conn,
+        project_id=project_id,
+        command_id=observer_command_id,
+    )
+    if not isinstance(command, Mapping):
+        return {}
+    command_payload = (
+        command.get("payload")
+        if isinstance(command.get("payload"), Mapping)
+        else {}
+    )
+    if (
+        str(command.get("command_type") or "").strip()
+        != "execute_backlog_row"
+        or str(command.get("status") or "").strip()
+        not in {"claimed", "running"}
+        or not str(command.get("claimed_by_session_id") or "").strip()
+        or str(command_payload.get("backlog_id") or "").strip()
+        != backlog_id
+    ):
+        return {}
+    command_execution_id = str(
+        command_payload.get("contract_execution_id") or ""
+    ).strip()
+    if command_execution_id != execution_id:
+        return {}
+    command_task_id = str(
+        command_payload.get("worker_task_id")
+        or command_payload.get("task_id")
+        or ""
+    ).strip()
+    if command_task_id and command_task_id not in {
+        task_id,
+        parent_task_id,
+        execution_id,
+    }:
+        return {}
+
+    latest_route_identity = _runtime_context_latest_route_identity(conn, context)
+    for field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    ):
+        expected = str(latest_route_identity.get(field) or "").strip()
+        actual = _route_request_identity_value(command_payload, field)
+        if expected and actual != expected:
+            return {}
+
+    prior_line: dict[str, Any] = {}
+    for completed in record.get("completed_lines") or []:
+        if not isinstance(completed, Mapping):
+            continue
+        if (
+            str(completed.get("stage_id") or "").strip() != stage_id
+            or str(completed.get("line_id") or "").strip() != line_id
+            or str(completed.get("evidence_kind") or "").strip()
+            != evidence_kind
+            or str(completed.get("actor_role") or "").strip() != "mf_sub"
+        ):
+            continue
+        completed_payload = (
+            completed.get("payload")
+            if isinstance(completed.get("payload"), Mapping)
+            else {}
+        )
+        completed_runtime_context_id = _timeline_first_deep_text(
+            {"line": completed, "payload": completed_payload},
+            "runtime_context_id",
+        )
+        completed_task_id = _timeline_first_deep_text(
+            {"line": completed, "payload": completed_payload},
+            "task_id",
+        )
+        if completed_runtime_context_id == runtime_context_id:
+            continue
+        if not completed_runtime_context_id or not completed_task_id:
+            continue
+        prior_line = dict(completed)
+        break
+    if not prior_line:
+        return {}
+
+    local_read_receipt: dict[str, Any] = {}
+    if local_setup_kind == "startup":
+        expected_session_token_ref = str(
+            active_worker_proof["session_token_ref"] or ""
+        ).strip()
+        expected_fence_token_hash = runtime_context_secret_hash(
+            str(getattr(context, "fence_token", "") or "")
+        )
+        timeline_events = _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+        )
+        for event in reversed(timeline_events):
+            if not isinstance(event, Mapping):
+                continue
+            event_payload = (
+                event.get("payload")
+                if isinstance(event.get("payload"), Mapping)
+                else {}
+            )
+            canonical_line = (
+                event_payload.get("contract_runtime_canonical_line")
+                if isinstance(
+                    event_payload.get("contract_runtime_canonical_line"),
+                    Mapping,
+                )
+                else {}
+            )
+            if (
+                str(event.get("event_kind") or "").strip()
+                != "mf_subagent_read_receipt"
+                or str(event.get("status") or "").strip().lower()
+                not in {"ok", "accepted", "passed", "succeeded"}
+                or str(event_payload.get("runtime_context_id") or "").strip()
+                != runtime_context_id
+                or str(event_payload.get("task_id") or "").strip()
+                != task_id
+                or str(event_payload.get("parent_task_id") or "").strip()
+                != parent_task_id
+                or str(event_payload.get("worker_role") or "").strip()
+                != "mf_sub"
+                or str(event_payload.get("authorization_source") or "").strip()
+                != "runtime_context_copy_safe_worker_proof"
+                or str(event_payload.get("session_token_ref") or "").strip()
+                != expected_session_token_ref
+                or str(event_payload.get("fence_token_hash") or "").strip()
+                != expected_fence_token_hash
+                or event_payload.get("raw_session_token_persisted") is not False
+                or event_payload.get("raw_fence_token_persisted") is not False
+                or canonical_line.get("accepted") is not True
+                or str(canonical_line.get("status") or "").strip()
+                != "context_local_receipt_after_prior_contract_line"
+                or str(canonical_line.get("runtime_context_id") or "").strip()
+                != runtime_context_id
+                or str(canonical_line.get("task_id") or "").strip() != task_id
+                or canonical_line.get("contract_runtime_mutated") is not False
+                or canonical_line.get("duplicate_contract_line_submitted")
+                is not False
+            ):
+                continue
+            local_read_receipt = {
+                "event_id": int(event.get("id") or 0),
+                "event_ref": f"timeline:{int(event.get('id') or 0)}",
+                "read_receipt_hash": str(
+                    event_payload.get("read_receipt_hash") or ""
+                ),
+                "session_token_ref": expected_session_token_ref,
+                "fence_token_hash": expected_fence_token_hash,
+                "source": "task_timeline.mf_subagent_read_receipt",
+                "authenticated": True,
+            }
+            break
+        if not local_read_receipt.get("event_id"):
+            return {}
+
+    return {
+        "schema_version": "runtime_context.canonical_contract_line.v1",
+        "accepted": True,
+        "status": (
+            "context_local_receipt_after_prior_contract_line"
+            if local_setup_kind == "read_receipt"
+            else "context_local_startup_after_prior_contract_line"
+        ),
+        "canonical": True,
+        "source_of_authority": "ContractRuntime.completed_lines",
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "evidence_kind": evidence_kind,
+        "line_instance_id": str(prior_line.get("line_instance_id") or ""),
+        "global_contract_line_already_completed": True,
+        "context_local_timeline_receipt_allowed": (
+            local_setup_kind == "read_receipt"
+        ),
+        "context_local_timeline_startup_allowed": (
+            local_setup_kind == "startup"
+        ),
+        "contract_runtime_mutated": False,
+        "duplicate_contract_line_submitted": False,
+        "failed_qa_rework_authority": marker,
+        "dispatch_identity": {
+            key: value
+            for key, value in dispatch_identity.items()
+            if key not in {"line", "payload"}
+        },
+        "observer_command": {
+            "command_id": observer_command_id,
+            "status": str(command.get("status") or ""),
+            "claimed_by_session_id": str(
+                command.get("claimed_by_session_id") or ""
+            ),
+        },
+        "active_worker_proof": active_worker_proof,
+        "local_read_receipt": local_read_receipt,
+        "timeline_projection_authoritative": False,
+        "timeline_evidence_backfill_allowed": False,
+    }
+
+
 def _runtime_context_submit_canonical_contract_line(
     conn,
     *,
@@ -28151,6 +28505,23 @@ def _runtime_context_submit_canonical_contract_line(
             }
 
     if next_line_id != line_id:
+        context_local_setup = (
+            _runtime_context_context_local_setup_authority(
+                conn,
+                project_id=project_id,
+                context=context,
+                record=stored_record,
+                stage_id=stage_id,
+                line_id=line_id,
+                evidence_kind=evidence_kind,
+                payload=canonical_payload,
+                failed_qa_rejoin_contexts=(
+                    failed_qa_rejoin_contexts or []
+                ),
+            )
+        )
+        if context_local_setup:
+            return context_local_setup
         raise GovernanceError(
             "contract_runtime_canonical_line_out_of_order",
             "runtime-context facade cannot advance a non-current Contract line",
@@ -71493,6 +71864,54 @@ def _contract_runtime_value_reports_failed_qa(value: Any) -> bool:
     return False
 
 
+def _contract_runtime_known_baseline_qa_acceptance(
+    line: Mapping[str, Any],
+    *,
+    record: Mapping[str, Any],
+) -> bool:
+    """Recognize one canonical no-PASS QA result without hiding failures.
+
+    The recursive failure detector must continue to flag arbitrary nested
+    failure counts.  Its only exception here is an authenticated candidate QA
+    line whose server-verified ledger proves exact base parity and zero
+    candidate-specific failures.  Direct status/decision fields remain
+    fail-closed so a contradictory verdict cannot borrow that exception.
+    """
+
+    if not _contract_runtime_candidate_scoped_no_pass_line(
+        line,
+        record=record,
+    ):
+        return False
+    if (
+        str(line.get("status") or "").strip().lower() != "accepted"
+        or str(line.get("verdict") or "").strip().lower() != "accepted"
+    ):
+        return False
+    payload = (
+        line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    )
+    test_results = (
+        line.get("test_results")
+        if isinstance(line.get("test_results"), Mapping)
+        else {}
+    )
+    verification = (
+        line.get("verification")
+        if isinstance(line.get("verification"), Mapping)
+        else {}
+    )
+    for source in (line, payload, test_results, verification):
+        for key in _CONTRACT_RUNTIME_QA_FAILURE_STATUS_FIELDS:
+            if (
+                key in source
+                and str(source.get(key) or "").strip().lower()
+                in _CONTRACT_RUNTIME_QA_FAILURE_STATUSES
+            ):
+                return False
+    return True
+
+
 def _contract_runtime_truthy_failure_count(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -71515,6 +71934,11 @@ def _contract_runtime_latest_failed_qa_line(
             continue
         if str(line.get("line_id") or "").strip() != "qa_independent_verification":
             continue
+        if _contract_runtime_known_baseline_qa_acceptance(
+            line,
+            record=record,
+        ):
+            return {}
         if not _contract_runtime_value_reports_failed_qa(line):
             return {}
         enriched = dict(line)
