@@ -1164,3 +1164,129 @@ def test_pending_scope_force_requeue_reopens_materialized_rows(conn):
     evidence = json.loads(reopened["evidence_json"])
     assert evidence["source"] == "suspect_snapshot_requeue"
     assert evidence["force_requeue"] is True
+
+
+def test_current_full_state_projects_later_canonical_commit_after_merge(conn):
+    _ensure_schema(conn)
+    historical_merge_commit = "a" * 40
+    current_canonical_commit = "b" * 40
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-current-canonical-after-merge",
+        commit_sha=current_canonical_commit,
+        snapshot_kind="full",
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=PID,
+        snapshot_id=snapshot["snapshot_id"],
+        target_commit_sha=current_canonical_commit,
+        request_id="req-current-canonical-after-merge",
+        request_started_at="2026-07-22T10:00:00Z",
+        route_evidence={
+            "schema_version": (
+                "graph_current_full_reconcile.route_evidence.v1"
+            ),
+            "authenticated_role": "observer",
+            "authentication_source": "test_protected_entrypoint",
+            "raw_route_token_persisted": False,
+            "protected_action": "graph_current_full_reconcile",
+        },
+        reconcile_event_id=12,
+        reconcile_event_created_at="2026-07-22T10:02:00Z",
+        marker_created_at="2026-07-22T10:02:01Z",
+    )
+
+    state = store.current_full_reconcile_state(
+        conn,
+        PID,
+        historical_merge_commit,
+        current_canonical_commit_sha=current_canonical_commit,
+        merge_event_id=11,
+        merge_event_created_at="2026-07-22T10:01:00Z",
+        reconcile_event_id=12,
+        reconcile_event_created_at="2026-07-22T10:02:00Z",
+    )
+
+    assert state["db_verified"] is True
+    assert state["merged_commit_sha"] == historical_merge_commit
+    assert state["current_canonical_commit_sha"] == current_canonical_commit
+    assert state["reconciled_commit_sha"] == current_canonical_commit
+    assert state["active_snapshot_commit"] == current_canonical_commit
+    assert state["active_snapshot_verified"] is True
+    assert state["reconcile_snapshot_verified"] is True
+    assert state["durable_order_verified"] is True
+
+    later_canonical_commit = "d" * 40
+    later_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-later-canonical-after-reconcile",
+        commit_sha=later_canonical_commit,
+        snapshot_kind="full",
+    )
+    store.activate_graph_snapshot(conn, PID, later_snapshot["snapshot_id"])
+
+    after_later_activation = store.current_full_reconcile_state(
+        conn,
+        PID,
+        historical_merge_commit,
+        current_canonical_commit_sha=later_canonical_commit,
+        merge_event_id=11,
+        merge_event_created_at="2026-07-22T10:01:00Z",
+        reconcile_event_id=12,
+        reconcile_event_created_at="2026-07-22T10:02:00Z",
+    )
+
+    assert after_later_activation["db_verified"] is True
+    assert (
+        after_later_activation["merged_commit_sha"]
+        == historical_merge_commit
+    )
+    assert (
+        after_later_activation["reconciled_commit_sha"]
+        == current_canonical_commit
+    )
+    assert after_later_activation["current_canonical_commit_sha"] == (
+        later_canonical_commit
+    )
+    assert (
+        after_later_activation["reconcile_snapshot_id"]
+        == snapshot["snapshot_id"]
+    )
+    assert after_later_activation["reconcile_snapshot_status"] == (
+        store.SNAPSHOT_STATUS_SUPERSEDED
+    )
+    assert after_later_activation["reconcile_snapshot_verified"] is True
+    assert (
+        after_later_activation["active_snapshot_id"]
+        == later_snapshot["snapshot_id"]
+    )
+    assert after_later_activation["active_snapshot_verified"] is True
+
+    historical_target_only = store.current_full_reconcile_state(
+        conn,
+        PID,
+        historical_merge_commit,
+        merge_event_id=11,
+        merge_event_created_at="2026-07-22T10:01:00Z",
+        reconcile_event_id=12,
+        reconcile_event_created_at="2026-07-22T10:02:00Z",
+    )
+    assert historical_target_only["db_verified"] is False
+    assert historical_target_only["active_snapshot_verified"] is False
+
+    forged_target = store.current_full_reconcile_state(
+        conn,
+        PID,
+        historical_merge_commit,
+        current_canonical_commit_sha="c" * 40,
+        merge_event_id=11,
+        merge_event_created_at="2026-07-22T10:01:00Z",
+        reconcile_event_id=12,
+        reconcile_event_created_at="2026-07-22T10:02:00Z",
+    )
+    assert forged_target["db_verified"] is False
+    assert forged_target["provenance_verified"] is False

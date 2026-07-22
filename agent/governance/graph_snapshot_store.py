@@ -2403,6 +2403,7 @@ def current_full_reconcile_state(
     project_id: str,
     merged_commit_sha: str,
     *,
+    current_canonical_commit_sha: str = "",
     qa_event_id: int = 0,
     qa_event_created_at: str = "",
     qa_source_ref: str = "",
@@ -2420,14 +2421,31 @@ def current_full_reconcile_state(
     reconcile_runtime_context_id: str = "",
     allow_taskless: bool = False,
 ) -> dict[str, Any]:
-    """Return DB-backed current-full state for one merged canonical commit."""
+    """Return DB-backed current-full state after one historical merge.
+
+    A current-full reconcile always materializes canonical code at the time it
+    runs.  That reconciled commit may be a descendant of
+    ``merged_commit_sha`` when later ordered commits landed before
+    reconciliation, and it may itself be an ancestor of the current canonical
+    commit after later graph activations.  Durable provenance binds the actual
+    reconcile target while active-snapshot checks bind the current canonical
+    target; merge ordering and scope bind the historical merge separately.
+    """
 
     ensure_schema(conn)
     project_id = str(project_id or "").strip()
     merged_commit_sha = str(merged_commit_sha or "").strip().lower()
+    current_canonical_commit_sha = str(
+        current_canonical_commit_sha or merged_commit_sha
+    ).strip().lower()
     active = get_active_graph_snapshot(conn, project_id) or {}
     active_snapshot_id = str(active.get("snapshot_id") or "").strip()
     active_snapshot_commit = str(active.get("commit_sha") or "").strip().lower()
+    active_snapshot_matches_current_canonical = bool(
+        active_snapshot_commit
+        and active_snapshot_commit == current_canonical_commit_sha
+        and str(active.get("status") or "").strip() == SNAPSHOT_STATUS_ACTIVE
+    )
     active_marker = _snapshot_notes(active).get("current_full_reconcile")
     active_marker = (
         dict(active_marker) if isinstance(active_marker, Mapping) else {}
@@ -2456,7 +2474,7 @@ def current_full_reconcile_state(
     ).strip().lower()
     provenance_id = (
         str(active_marker.get("provenance_id") or "").strip()
-        if active_marker_target == merged_commit_sha
+        if active_marker_target == current_canonical_commit_sha
         else ""
     )
     provenance_row = None
@@ -2472,7 +2490,7 @@ def current_full_reconcile_state(
                 provenance_id,
                 project_id,
                 active_snapshot_id,
-                merged_commit_sha,
+                current_canonical_commit_sha,
             ),
         ).fetchone()
     if provenance_row is None and requested_reconcile_event_id > 0:
@@ -2487,9 +2505,32 @@ def current_full_reconcile_state(
             """,
             (
                 project_id,
-                merged_commit_sha,
+                current_canonical_commit_sha,
                 requested_reconcile_event_id,
             ),
+        ).fetchall()
+        if len(provenance_rows) == 1:
+            provenance_row = provenance_rows[0]
+    if (
+        provenance_row is None
+        and requested_reconcile_event_id > 0
+        and active_snapshot_matches_current_canonical
+    ):
+        # A canonically completed reconcile remains durable after a later
+        # current-full snapshot becomes active.  Resolve the unique provenance
+        # row by its immutable reconcile event, while retaining the independent
+        # current-HEAD active-snapshot check above.  Requiring the requested
+        # canonical commit to be the active commit prevents a forged/stale
+        # target from widening this historical lookup.
+        provenance_rows = conn.execute(
+            """
+            SELECT *
+            FROM graph_current_full_reconcile_provenance
+            WHERE project_id = ? AND reconcile_event_id = ?
+            ORDER BY created_at DESC, provenance_id DESC
+            LIMIT 2
+            """,
+            (project_id, requested_reconcile_event_id),
         ).fetchall()
         if len(provenance_rows) == 1:
             provenance_row = provenance_rows[0]
@@ -2502,11 +2543,14 @@ def current_full_reconcile_state(
             ORDER BY created_at DESC, provenance_id DESC
             LIMIT 2
             """,
-            (project_id, merged_commit_sha),
+            (project_id, current_canonical_commit_sha),
         ).fetchall()
         if len(provenance_rows) == 1:
             provenance_row = provenance_rows[0]
     provenance = dict(provenance_row) if provenance_row else {}
+    reconciled_commit_sha = str(
+        provenance.get("target_commit_sha") or current_canonical_commit_sha
+    ).strip().lower()
     reconcile_snapshot_id = str(provenance.get("snapshot_id") or "").strip()
     reconcile_snapshot_row = None
     if reconcile_snapshot_id:
@@ -2521,7 +2565,10 @@ def current_full_reconcile_state(
     reconcile_snapshot = (
         dict(reconcile_snapshot_row) if reconcile_snapshot_row else {}
     )
-    if not reconcile_snapshot and active_snapshot_commit == merged_commit_sha:
+    if (
+        not reconcile_snapshot
+        and active_snapshot_commit == reconciled_commit_sha
+    ):
         reconcile_snapshot = dict(active)
         reconcile_snapshot_id = active_snapshot_id
     marker = _snapshot_notes(reconcile_snapshot).get("current_full_reconcile")
@@ -2621,7 +2668,7 @@ def current_full_reconcile_state(
         == "current_full_reconcile.provenance.v2"
         and marker.get("normal_update_path") is True
         and marker.get("activate") is True
-        and marker_target_commit == merged_commit_sha
+        and marker_target_commit == reconciled_commit_sha
         and str(marker.get("snapshot_id") or "").strip()
         == reconcile_snapshot_id
         and str(marker.get("protected_action") or "").strip()
@@ -2861,18 +2908,20 @@ def current_full_reconcile_state(
     )
     reconcile_snapshot_verified = bool(
         reconcile_snapshot_id
-        and reconcile_snapshot_commit == merged_commit_sha
+        and reconcile_snapshot_commit == reconciled_commit_sha
         and reconcile_snapshot_status
         in {SNAPSHOT_STATUS_ACTIVE, SNAPSHOT_STATUS_SUPERSEDED}
     )
     active_snapshot_verified = bool(
         active_snapshot_id
         and str(active.get("status") or "").strip() == SNAPSHOT_STATUS_ACTIVE
-        and active_snapshot_commit == merged_commit_sha
+        and active_snapshot_commit == current_canonical_commit_sha
     )
     db_verified = bool(
         project_id
         and merged_commit_sha
+        and current_canonical_commit_sha
+        and reconciled_commit_sha
         and marker_verified
         and durable_order_verified
         and provenance_scope_verified
@@ -2885,6 +2934,8 @@ def current_full_reconcile_state(
         "db_verified": db_verified,
         "project_id": project_id,
         "merged_commit_sha": merged_commit_sha,
+        "current_canonical_commit_sha": current_canonical_commit_sha,
+        "reconciled_commit_sha": reconciled_commit_sha,
         "active_snapshot_id": active_snapshot_id,
         "active_snapshot_commit": active_snapshot_commit,
         "active_snapshot_status": str(active.get("status") or "").strip(),

@@ -64510,6 +64510,7 @@ def _contract_runtime_candidate_scoped_no_pass_line(
     line: Mapping[str, Any],
     *,
     record: Mapping[str, Any] | None = None,
+    allow_missing_observer_merge_status: bool = False,
 ) -> bool:
     """Accept only the bounded, non-release-PASS no-PASS evidence shapes.
 
@@ -64607,6 +64608,7 @@ def _contract_runtime_candidate_scoped_no_pass_line(
         )
 
     if line_id == "observer_merge":
+        merge_status = str(line.get("status") or "").strip().lower()
         durable = (
             payload.get("durable_merge_authority")
             if isinstance(payload.get("durable_merge_authority"), Mapping)
@@ -64659,7 +64661,13 @@ def _contract_runtime_candidate_scoped_no_pass_line(
                 == ([diagnostic_id] if diagnostic_status == "OPEN" else [])
                 and str(line.get("actor_role") or "").strip() == "observer"
                 and str(line.get("evidence_kind") or "").strip() == "merge"
-                and str(line.get("status") or "").strip().lower() == "accepted"
+                and (
+                    merge_status == "accepted"
+                    or (
+                        allow_missing_observer_merge_status
+                        and not merge_status
+                    )
+                )
                 and str(payload.get("schema_version") or "")
                 == "observer_merge.no_pass_exception.v1"
                 and str(payload.get("disposition") or "")
@@ -64714,6 +64722,8 @@ def _contract_runtime_line_reports_disqualifying_failed_qa(
 
 def _contract_runtime_server_derived_observer_merge_no_pass_line(
     line: Mapping[str, Any],
+    *,
+    allow_missing_top_level_status: bool = False,
 ) -> bool:
     """Allow no-PASS on merge only with the server's durable authority.
 
@@ -64753,7 +64763,12 @@ def _contract_runtime_server_derived_observer_merge_no_pass_line(
                 durable.get("qa_audit_only_no_pass_authority"), Mapping
             )
             or not durable.get("qa_audit_only_no_pass_authority")
-            or _contract_runtime_candidate_scoped_no_pass_line(line)
+            or _contract_runtime_candidate_scoped_no_pass_line(
+                line,
+                allow_missing_observer_merge_status=(
+                    allow_missing_top_level_status
+                ),
+            )
         )
     )
 
@@ -64799,7 +64814,14 @@ def _contract_runtime_completed_merge_authority(
                 payload.get("no_pass_claim") is not True
                 or (
                     _contract_runtime_server_derived_observer_merge_no_pass_line(
-                        line
+                        line,
+                        # Historical accepted observer-merge writes may have
+                        # been persisted without copying the optional
+                        # top-level status.  This only admits the exact
+                        # server-derived no-PASS shape into the candidate scan;
+                        # the canonical acceptance-revision join below remains
+                        # mandatory before it becomes trusted authority.
+                        allow_missing_top_level_status=True,
                     )
                     if line_id == "observer_merge"
                     else _contract_runtime_candidate_scoped_no_pass_line(
@@ -64851,6 +64873,28 @@ def _contract_runtime_completed_merge_authority(
 
     if not qa_graph or not merge_line:
         return {}
+    merge_top_level_status = str(
+        merge_line[1].get("status") or ""
+    ).strip().lower()
+    merge_payload_for_acceptance = (
+        merge_line[1].get("payload")
+        if isinstance(merge_line[1].get("payload"), Mapping)
+        else {}
+    )
+    if (
+        not merge_top_level_status
+        and merge_payload_for_acceptance.get("no_pass_claim") is True
+    ):
+        merge_acceptance = _contract_runtime_completed_line_acceptance(
+            conn,
+            project_id=project_id,
+            record=record,
+            completed_line_index=merge_line[0],
+            expected_line=merge_line[1],
+            allow_missing_observer_merge_status=True,
+        )
+        if merge_acceptance.get("db_verified") is not True:
+            return {}
     qa_acceptance: dict[str, Any] = {}
     audit_authority: dict[str, Any] = {}
     if qa_verification:
@@ -65197,6 +65241,7 @@ def _contract_runtime_completed_line_acceptance(
     record: Mapping[str, Any],
     completed_line_index: int,
     expected_line: Mapping[str, Any],
+    allow_missing_observer_merge_status: bool = False,
 ) -> dict[str, Any]:
     """Resolve one completed line's server-written acceptance revision/time."""
 
@@ -65228,20 +65273,35 @@ def _contract_runtime_completed_line_acceptance(
         if isinstance(canonical_line.get("payload"), Mapping)
         else {}
     )
-    if (
-        not _contract_runtime_line_status_passes(canonical_line)
-        or _contract_runtime_line_reports_disqualifying_failed_qa(
+    canonical_no_pass_exception = (
+        _contract_runtime_candidate_scoped_no_pass_line(
             canonical_line,
             record=record,
         )
+        or (
+            allow_missing_observer_merge_status
+            and not str(canonical_line.get("status") or "").strip()
+            and _contract_runtime_server_derived_observer_merge_no_pass_line(
+                canonical_line,
+                allow_missing_top_level_status=True,
+            )
+        )
+    )
+    disqualifying_failed_qa = (
+        _contract_runtime_line_reports_disqualifying_failed_qa(
+            canonical_line,
+            record=record,
+        )
+        and not canonical_no_pass_exception
+    )
+    if (
+        not _contract_runtime_line_status_passes(canonical_line)
+        or disqualifying_failed_qa
         or str(canonical_line.get("status") or "").strip().lower()
         in {"waived", "bypassed"}
         or (
             payload.get("no_pass_claim") is True
-            and not _contract_runtime_candidate_scoped_no_pass_line(
-                canonical_line,
-                record=record,
-            )
+            and not canonical_no_pass_exception
         )
         or str(payload.get("disposition") or "").strip()
         == "proceeded_with_exception"
@@ -65373,10 +65433,20 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
 
     merged_commit = str(merge.get("merged_commit_sha") or "").strip().lower()
     reconcile = reconcile if isinstance(reconcile, Mapping) else {}
+    root = project_service.resolve_project_root(
+        project_id,
+        None,
+        fallback_self=True,
+    )
+    target_project_root = str(Path(root).resolve()) if root else ""
+    canonical_head_commit = (
+        _git_head_commit(Path(root)).strip().lower() if root else ""
+    )
     state = graph_snapshot_store.current_full_reconcile_state(
         conn,
         project_id,
         merged_commit,
+        current_canonical_commit_sha=canonical_head_commit,
         qa_event_id=int(merge.get("qa_event_id") or 0),
         qa_event_created_at=str(merge.get("qa_event_created_at") or ""),
         qa_source_ref=str(merge.get("qa_source_ref") or ""),
@@ -65411,28 +65481,29 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
             or merge.get("allow_taskless_reconcile")
         ),
     )
-    root = project_service.resolve_project_root(
-        project_id,
-        None,
-        fallback_self=True,
-    )
-    target_project_root = str(Path(root).resolve()) if root else ""
-    canonical_head_commit = _git_head_commit(Path(root)).strip().lower() if root else ""
     active_snapshot_commit = str(
         state.get("active_snapshot_commit") or ""
+    ).strip().lower()
+    reconciled_commit = str(
+        state.get("reconciled_commit_sha")
+        or state.get("current_canonical_commit_sha")
+        or ""
     ).strip().lower()
     canonical_head_equals_merged_commit = bool(
         merged_commit and canonical_head_commit == merged_commit
     )
+    canonical_head_equals_reconciled_commit = bool(
+        reconciled_commit and canonical_head_commit == reconciled_commit
+    )
     reconciled_commit_is_ancestor_of_canonical_head = bool(
-        canonical_head_equals_merged_commit
+        canonical_head_equals_reconciled_commit
         or (
             root
-            and merged_commit
+            and reconciled_commit
             and canonical_head_commit
             and _git_commit_is_ancestor(
                 Path(root),
-                merged_commit,
+                reconciled_commit,
                 canonical_head_commit,
             )
         )
@@ -65477,10 +65548,13 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
         "task_id": str(merge.get("task_id") or ""),
         "parent_task_id": str(merge.get("parent_task_id") or ""),
         "merged_commit_sha": merged_commit,
-        "reconciled_commit_sha": merged_commit,
+        "reconciled_commit_sha": reconciled_commit,
         "canonical_head_commit": canonical_head_commit,
         "canonical_head_equals_merged_commit": (
             canonical_head_equals_merged_commit
+        ),
+        "canonical_head_equals_reconciled_commit": (
+            canonical_head_equals_reconciled_commit
         ),
         "reconciled_commit_is_ancestor_of_canonical_head": (
             reconciled_commit_is_ancestor_of_canonical_head
