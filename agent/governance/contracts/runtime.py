@@ -3324,7 +3324,7 @@ def _qa_no_pass_failure_identities(value: Any) -> tuple[str, ...]:
         return ()
     if len(set(identities)) != len(identities):
         return ()
-    return identities
+    return tuple(sorted(identities))
 
 
 def _qa_no_pass_exact_positive_count(value: Any, expected: int) -> bool:
