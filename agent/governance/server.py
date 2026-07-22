@@ -27403,11 +27403,6 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             if isinstance(reopened_guide.get("next_legal_action"), Mapping)
             else {}
         )
-        reopened_failed_qa_blocker = (
-            reopened_next_line.get("failed_qa_blocker")
-            if isinstance(reopened_next_line.get("failed_qa_blocker"), Mapping)
-            else {}
-        )
         reopened_execution = (
             reopened_guide.get("execution")
             if isinstance(reopened_guide.get("execution"), Mapping)
@@ -27419,19 +27414,31 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         reopened_execution_revision = int(
             reopened_execution.get("execution_state_revision") or 0
         )
+        reopened_execution_hash = str(
+            reopened_execution.get("execution_state_hash") or ""
+        ).strip()
+        stored_execution_hash = str(
+            record.get("execution_state_hash") or ""
+        ).strip()
+        # The projected guide's execution identity and required writer line are
+        # the authorization contract.  Failed-QA semantic labels are advisory
+        # presentation fields and are not emitted by every canonical
+        # current/worker projection.  The authenticated failed-QA boundary and
+        # exact rejoin marker above already provide the server-derived rework
+        # authority, so requiring workers to echo those labels would turn an
+        # optional guide projection into client-synthesized authorization.
         canonical_reopened_worker_implementation = bool(
             reopened_execution_id == contract_execution_id
             and reopened_execution_revision
             == int(record.get("execution_state_revision") or 0)
+            and (
+                not stored_execution_hash
+                or reopened_execution_hash == stored_execution_hash
+            )
             and str(reopened_next_line.get("stage_id") or "").strip()
             == "worker_implementation"
             and str(reopened_next_line.get("line_id") or "").strip()
             == "worker_implementation"
-            and str(
-                reopened_next_line.get("semantic_next_action") or ""
-            ).strip()
-            == "revise_after_failed_independent_qa"
-            and reopened_next_line.get("blocked_by_failed_qa") is True
             and str(reopened_next_line.get("owner_role") or "").strip()
             == "mf_sub"
             and "mf_sub"
@@ -27441,16 +27448,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             }
             and str(reopened_next_line.get("evidence_kind") or "").strip()
             == "implementation"
-            and str(reopened_failed_qa_blocker.get("status") or "").strip()
-            == "blocked_by_failed_independent_qa"
-            and str(
-                reopened_failed_qa_blocker.get("next_required_line_id") or ""
-            ).strip()
-            == "worker_implementation"
-            and str(
-                reopened_failed_qa_blocker.get("required_submission") or ""
-            ).strip()
-            == "changed_files=cumulative_runtime_diff"
+            and reopened_next_line.get("required") is not False
         )
         if (
             str(next_line.get("line_id") or "").strip() != "observer_merge"
