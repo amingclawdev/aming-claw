@@ -1549,6 +1549,99 @@ def test_mf_parallel_repeated_failed_qa_payload_outcome_does_not_unlock_observer
     assert next_action["line_id"] != "observer_merge"
 
 
+@pytest.mark.parametrize(
+    "failed_evidence",
+    [
+        {"payload": {"verdict": "failed"}},
+        {"payload": {"outcome": "blocked"}},
+        {"payload": {"decision": "rejected"}},
+        {"test_results": {"tests_summary": {"failures": 1}}},
+        {"test_results": {"tests_summary": "Independent QA failed"}},
+        {"tests": [{"command": {"status": "failed"}}]},
+        {"verification": {"decision": "rejected"}},
+        {
+            "artifact_refs": {
+                "qa_report": {
+                    "command": {"status": "blocked"},
+                }
+            }
+        },
+    ],
+    ids=[
+        "payload-verdict",
+        "payload-outcome",
+        "payload-decision",
+        "tests-summary-count",
+        "tests-summary-text",
+        "command-status",
+        "verification",
+        "nested-artifact-refs",
+    ],
+)
+def test_mf_parallel_persisted_nested_failed_qa_evidence_blocks_observer_merge(
+    failed_evidence,
+):
+    service = ContractCrudService()
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        service.registry,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    execution_id = "cex-mf-parallel-nested-failed-qa-blocks-merge-test"
+    _start_mf_parallel_successor(
+        runtime,
+        project_id="aming-claw",
+        backlog_id="AC-MF-PARALLEL-NESTED-FAILED-QA-BLOCKS-MERGE-20260721",
+        contract_execution_id=execution_id,
+        route_token_ref="rtok-test",
+    )
+
+    for stage_id, line_id, actor_role in [
+        ("orchestration", "observer_prefill_child_contracts", "observer"),
+        ("dispatch", "observer_dispatch_bounded_workers", "observer"),
+        ("worker_read", "worker_read_runtime_guide", "mf_sub"),
+        ("worker_startup", "worker_startup", "mf_sub"),
+        ("worker_context", "worker_graph_context", "mf_sub"),
+        ("worker_implementation", "worker_implementation", "mf_sub"),
+        ("worker_attestation", "worker_finish_time_attestation", "mf_sub"),
+        ("worker_finish", "worker_finish_gate", "mf_sub"),
+        ("qa_handoff", "worker_review_ready_handoff", "mf_sub"),
+    ]:
+        runtime.current_guide(execution_id, actor_role=actor_role)
+        record = runtime.store.get(execution_id)
+        accepted = runtime.submit_line_write(
+            execution_id,
+            _runtime_write_from(
+                record,
+                actor_role=actor_role,
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )
+        assert accepted["ok"] is True
+
+    runtime.current_guide(execution_id, actor_role="qa")
+    record = runtime.store.get(execution_id)
+    failed_qa_write = _runtime_write_from(
+        record,
+        actor_role="qa",
+        stage_id="qa",
+        line_id="qa_independent_verification",
+    )
+    failed_qa_write["status"] = "accepted"
+    failed_qa_write.update(failed_evidence)
+    accepted_failed_qa = runtime.submit_line_write(execution_id, failed_qa_write)
+    assert accepted_failed_qa["ok"] is True
+
+    persisted = runtime.store.get(execution_id)
+    next_action = persisted["runtime_guide"]["next_legal_action"]
+    assert next_action["line_id"] == "worker_read_runtime_guide"
+    assert next_action["owner_role"] == "mf_sub"
+    assert next_action["line_id"] != "observer_merge"
+    assert next_action["semantic_next_action"] == "revise_after_failed_independent_qa"
+
+
 def test_mf_parallel_failed_qa_retry_ignores_malformed_worker_implementation_payload():
     service = ContractCrudService()
     runtime = ContractRuntime(service.registry)

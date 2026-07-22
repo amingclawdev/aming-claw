@@ -2720,12 +2720,16 @@ def _line_status_allows_contract_completion(
                 or qa_status not in _QA_COMPLETION_PASSING_STATUSES
             ):
                 return False
-        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
         if canonical_no_pass:
             return True
-        if _contains_contract_completion_blocker(payload):
+        # Ordinary independent-QA evidence is fail-closed across the entire
+        # persisted line. Command/test summaries and artifact references are
+        # first-class evidence containers that may contradict an otherwise
+        # passing top-level status. The authenticated canonical no-PASS ledger
+        # above remains the sole narrow exception.
+        if _contains_contract_completion_blocker(line):
             return False
-        if _qa_independent_verification_summary_reports_failure(payload):
+        if _qa_independent_verification_summary_reports_failure(line):
             return False
     return True
 
@@ -3393,6 +3397,7 @@ def _qa_no_pass_source_claims_pass(value: Mapping[str, Any]) -> bool:
 _QA_FAILURE_SUMMARY_FIELDS = frozenset(
     {
         "summary",
+        "tests_summary",
         "reason",
         "decision_summary",
         "qa_summary",

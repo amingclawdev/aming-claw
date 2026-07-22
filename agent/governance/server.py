@@ -71424,6 +71424,7 @@ _CONTRACT_RUNTIME_QA_FAILURE_COUNT_FIELDS = frozenset(
 _CONTRACT_RUNTIME_QA_FAILURE_SUMMARY_FIELDS = frozenset(
     {
         "summary",
+        "tests_summary",
         "reason",
         "decision_summary",
         "qa_summary",
