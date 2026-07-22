@@ -2417,6 +2417,9 @@ def current_full_reconcile_state(
     expected_contract_execution_id: str = "",
     expected_task_id: str = "",
     expected_runtime_context_id: str = "",
+    expected_parent_task_id: str = "",
+    expected_merge_queue_id: str = "",
+    trusted_contract_execution_lineage_verified: bool = False,
     reconcile_task_id: str = "",
     reconcile_runtime_context_id: str = "",
     allow_taskless: bool = False,
@@ -2798,6 +2801,8 @@ def current_full_reconcile_state(
     ).strip()
     expected_task_id = str(expected_task_id or "").strip()
     expected_runtime_context_id = str(expected_runtime_context_id or "").strip()
+    expected_parent_task_id = str(expected_parent_task_id or "").strip()
+    expected_merge_queue_id = str(expected_merge_queue_id or "").strip()
     route_task_id = str(route_scope.get("task_id") or "").strip()
     task_claims = {
         str(value or "").strip()
@@ -2826,6 +2831,11 @@ def current_full_reconcile_state(
         )
         if str(value or "").strip()
     }
+    trusted_historical_dispatch = bool(
+        trusted_contract_execution_lineage_verified
+        and expected_parent_task_id
+        and expected_parent_task_id != expected_contract_execution_id
+    )
     if expected_contract_execution_id:
         if route_task_id:
             if route_task_id == expected_task_id:
@@ -2842,6 +2852,19 @@ def current_full_reconcile_state(
                     and canonical_runtime_parent_claims
                     == {expected_contract_execution_id}
                 ):
+                    contract_execution_claims.add(
+                        expected_contract_execution_id
+                    )
+                elif (
+                    trusted_historical_dispatch
+                    and runtime_context_scope_link_verified
+                    and canonical_runtime_parent_claims
+                    in (set(), {expected_parent_task_id})
+                ):
+                    # Historical mf_parallel runtime contexts used backlog_id
+                    # as parent_task_id.  The caller cannot opt into this
+                    # bridge: the server must first prove the exact sealed
+                    # ContractRuntime dispatch lineage for the runtime/task.
                     contract_execution_claims.add(
                         expected_contract_execution_id
                     )
@@ -2873,6 +2896,14 @@ def current_full_reconcile_state(
         )
         if str(value or "").strip()
     }
+    merge_queue_claims = {
+        str(value or "").strip()
+        for value in (
+            marker_runtime_context_scope.get("merge_queue_id"),
+            route_runtime_context_scope.get("merge_queue_id"),
+        )
+        if str(value or "").strip()
+    }
 
     def scope_dimension_verified(
         expected: str,
@@ -2901,10 +2932,22 @@ def current_full_reconcile_state(
         runtime_context_claims,
         allow_missing=allow_taskless,
     )
+    parent_task_scope_verified = scope_dimension_verified(
+        expected_parent_task_id,
+        canonical_runtime_parent_claims,
+        allow_missing=trusted_historical_dispatch,
+    )
+    merge_queue_scope_verified = scope_dimension_verified(
+        expected_merge_queue_id,
+        merge_queue_claims,
+        allow_missing=trusted_historical_dispatch,
+    )
     provenance_scope_verified = bool(
         contract_execution_scope_verified
         and task_scope_verified
         and runtime_context_scope_verified
+        and parent_task_scope_verified
+        and merge_queue_scope_verified
     )
     reconcile_snapshot_verified = bool(
         reconcile_snapshot_id
@@ -2977,12 +3020,19 @@ def current_full_reconcile_state(
         ),
         "task_scope_verified": task_scope_verified,
         "runtime_context_scope_verified": runtime_context_scope_verified,
+        "parent_task_scope_verified": parent_task_scope_verified,
+        "merge_queue_scope_verified": merge_queue_scope_verified,
         "runtime_context_scope_link_verified": (
             runtime_context_scope_link_verified
         ),
         "expected_contract_execution_id": expected_contract_execution_id,
         "expected_task_id": expected_task_id,
         "expected_runtime_context_id": expected_runtime_context_id,
+        "expected_parent_task_id": expected_parent_task_id,
+        "expected_merge_queue_id": expected_merge_queue_id,
+        "trusted_contract_execution_lineage_verified": bool(
+            trusted_contract_execution_lineage_verified
+        ),
         "reconcile_task_id": str(reconcile_task_id or "").strip(),
         "reconcile_runtime_context_id": str(
             reconcile_runtime_context_id or ""
