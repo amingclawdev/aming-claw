@@ -23195,6 +23195,22 @@ def _runtime_context_finish_attestation_candidate(
     return {}
 
 
+def _runtime_context_contract_line_execution_matches(
+    value: Mapping[str, Any],
+    contract_execution_id: str,
+) -> bool:
+    """Require every claimed execution identity to bind to one execution."""
+
+    expected = str(contract_execution_id or "").strip()
+    claimed = {
+        str(candidate.get(key) or "").strip()
+        for candidate in _contract_runtime_mapping_candidates(value)
+        for key in ("contract_execution_id", "successor_contract_execution_id")
+        if str(candidate.get(key) or "").strip()
+    }
+    return bool(expected and claimed == {expected})
+
+
 def _runtime_context_contract_finish_attestation_projection(
     conn,
     *,
@@ -23224,7 +23240,7 @@ def _runtime_context_contract_finish_attestation_projection(
             {"contract_execution_id": contract_execution_id},
         ) from exc
     completed_lines = _contract_runtime_completed_lines(record)
-    matches = [
+    context_matches = [
         (index, line)
         for index, line in completed_lines
         if str(line.get("line_id") or "").strip()
@@ -23239,36 +23255,101 @@ def _runtime_context_contract_finish_attestation_projection(
     failed_qa_index = _active_failed_qa_line_index(
         [line for _, line in completed_lines]
     )
-    active_worker_commit_index = -1
-    if failed_qa_index >= 0:
-        retry_worker_commit_indexes = [
-            index
-            for index, line in completed_lines
-            if index > failed_qa_index
-            and str(line.get("line_id") or "").strip() == "worker_commit"
-            and _contract_runtime_mapping_matches_context(
-                line,
-                runtime_context_id=runtime_context_id,
-                task_id=task_id,
-                parent_task_id=parent_task_id,
-            )
-        ]
-        if retry_worker_commit_indexes:
-            active_worker_commit_index = max(retry_worker_commit_indexes)
-            matches = [
-                (index, line)
-                for index, line in matches
-                if index > active_worker_commit_index
-            ]
-        else:
-            matches = []
+    context_worker_commits = [
+        (index, line)
+        for index, line in completed_lines
+        if index > failed_qa_index
+        and str(line.get("line_id") or "").strip() == "worker_commit"
+        and _contract_runtime_mapping_matches_context(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+        )
+    ]
+    active_worker_commit_index = (
+        context_worker_commits[-1][0] if context_worker_commits else -1
+    )
+    requested_head = str(head_commit or "").strip()
+    round_mismatched_fields: list[str] = []
+    active_commit_session = ""
+    active_commit_filer = ""
+    if context_worker_commits:
+        _, active_worker_commit = context_worker_commits[-1]
+        active_commit_payload = (
+            active_worker_commit.get("payload")
+            if isinstance(active_worker_commit.get("payload"), Mapping)
+            else {}
+        )
+        active_commit_head = str(
+            active_worker_commit.get("commit_sha")
+            or active_commit_payload.get("worker_commit_sha")
+            or active_commit_payload.get("commit_sha")
+            or active_commit_payload.get("head_commit")
+            or ""
+        ).strip()
+        if not _runtime_context_contract_line_execution_matches(
+            active_worker_commit, contract_execution_id
+        ):
+            round_mismatched_fields.append("contract_execution_id")
+        if not active_commit_head or active_commit_head != requested_head:
+            round_mismatched_fields.append("head_commit")
+        active_commit_session = _runtime_context_finish_attestation_text(
+            active_worker_commit, "worker_session_id"
+        )
+        active_commit_filer = _runtime_context_finish_attestation_text(
+            active_worker_commit, "filer_principal"
+        )
+        if not active_commit_session:
+            round_mismatched_fields.append("worker_session_id")
+        if not active_commit_filer or active_commit_filer != active_commit_session:
+            round_mismatched_fields.append("filer_principal")
+        if (
+            supplied_worker_session_id
+            and active_commit_session
+            and active_commit_session != supplied_worker_session_id
+        ):
+            round_mismatched_fields.append("worker_session_id")
+        if (
+            supplied_filer_principal
+            and active_commit_filer
+            and active_commit_filer != supplied_filer_principal
+        ):
+            round_mismatched_fields.append("filer_principal")
+
+    matches = [
+        (index, line)
+        for index, line in context_matches
+        if index > active_worker_commit_index
+    ]
+    if active_worker_commit_index < 0 or not matches:
+        raise GovernanceError(
+            "contract_worker_finish_attestation_required",
+            "finish requires one exact accepted ContractRuntime finish attestation",
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "matching_completed_line_indexes": [index for index, _ in matches],
+                "active_failed_qa_line_index": failed_qa_index,
+                "active_worker_commit_line_index": active_worker_commit_index,
+            },
+        )
+    if round_mismatched_fields:
+        raise GovernanceError(
+            "contract_worker_finish_attestation_mismatch",
+            "canonical ContractRuntime worker round does not match finish gate",
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "mismatched_fields": list(dict.fromkeys(round_mismatched_fields)),
+                "matching_completed_line_indexes": [index for index, _ in matches],
+                "active_failed_qa_line_index": failed_qa_index,
+                "active_worker_commit_line_index": active_worker_commit_index,
+            },
+        )
     if len(matches) != 1:
         raise GovernanceError(
-            (
-                "contract_worker_finish_attestation_required"
-                if not matches
-                else "contract_worker_finish_attestation_ambiguous"
-            ),
+            "contract_worker_finish_attestation_ambiguous",
             "finish requires one exact accepted ContractRuntime finish attestation",
             422,
             {
@@ -23297,8 +23378,11 @@ def _runtime_context_contract_finish_attestation_projection(
     )
     canonical_read_hash = str(payload.get("read_receipt_hash") or "").strip()
     checks = {
+        "contract_execution_id": _runtime_context_contract_line_execution_matches(
+            line, contract_execution_id
+        ),
         "finish_time_worker_self_attestation": bool(gate.get("passed")),
-        "head_commit": canonical_head == str(head_commit or "").strip(),
+        "head_commit": canonical_head == requested_head,
         "changed_files": _runtime_context_same_string_set(
             canonical_files, changed_files
         ),
@@ -23307,12 +23391,14 @@ def _runtime_context_contract_finish_attestation_projection(
         )
         and _runtime_context_test_results_compatible(canonical_tests, test_results),
         "worker_session_id": bool(canonical_session)
+        and canonical_session == active_commit_session
         and (
             not supplied_worker_session_id
             or supplied_worker_session_id == canonical_session
         ),
         "filer_principal": bool(canonical_filer)
         and canonical_filer == canonical_session
+        and canonical_filer == active_commit_filer
         and (
             not supplied_filer_principal
             or supplied_filer_principal == canonical_filer

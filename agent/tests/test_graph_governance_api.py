@@ -61604,6 +61604,7 @@ def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage
             "blockers": [],
         }
         payload = {
+            "contract_execution_id": contract_execution_id,
             "runtime_context_id": runtime_context.runtime_context_id,
             "task_id": runtime_context.task_id,
             "parent_task_id": parent_task_id,
@@ -61621,6 +61622,7 @@ def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage
         return {
             "stage_id": "worker_attestation",
             "line_id": "worker_finish_time_attestation",
+            "contract_execution_id": contract_execution_id,
             "actor_role": "mf_sub",
             "evidence_kind": "record_finish_time_worker_attestation",
             "runtime_context_id": runtime_context.runtime_context_id,
@@ -61631,11 +61633,13 @@ def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage
         }
 
     context_line = {
+        "contract_execution_id": contract_execution_id,
         "runtime_context_id": runtime_context.runtime_context_id,
         "task_id": runtime_context.task_id,
         "parent_task_id": parent_task_id,
         "actor_role": "mf_sub",
         "payload": {
+            "contract_execution_id": contract_execution_id,
             "runtime_context_id": runtime_context.runtime_context_id,
             "task_id": runtime_context.task_id,
             "parent_task_id": parent_task_id,
@@ -61658,11 +61662,23 @@ def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage
         "line_id": "worker_commit",
         "evidence_kind": "worker_commit",
         "commit_sha": head_commit,
+        "payload": {
+            **context_line["payload"],
+            "worker_session_id": worker_session_id,
+            "filer_principal": worker_session_id,
+            "worker_commit_sha": head_commit,
+            "head_commit": head_commit,
+        },
+    }
+    initial_worker_commit = {
+        **retry_worker_commit,
+        "payload": dict(retry_worker_commit["payload"]),
     }
     active_attestation = attestation_line(label="post-qa")
     runtime = server._contract_runtime(conn)
     record = runtime.store.get(contract_execution_id)
     record["completed_lines"] = [
+        initial_worker_commit,
         old_attestation,
         failed_qa,
         retry_worker_commit,
@@ -61692,12 +61708,13 @@ def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage
             "finish_time_worker_self_attestation"
         ],
     )
-    assert projected["contract_runtime_source_ref"].endswith(":completed_lines:3")
-    assert projected["active_failed_qa_line_index"] == 1
-    assert projected["active_worker_commit_line_index"] == 2
+    assert projected["contract_runtime_source_ref"].endswith(":completed_lines:4")
+    assert projected["active_failed_qa_line_index"] == 2
+    assert projected["active_worker_commit_line_index"] == 3
 
     record_without_active = runtime.store.get(contract_execution_id)
     record_without_active["completed_lines"] = [
+        initial_worker_commit,
         old_attestation,
         failed_qa,
         retry_worker_commit,
@@ -61724,6 +61741,7 @@ def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage
 
     record_ambiguous = runtime.store.get(contract_execution_id)
     record_ambiguous["completed_lines"] = [
+        initial_worker_commit,
         old_attestation,
         failed_qa,
         retry_worker_commit,
@@ -61748,7 +61766,269 @@ def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage
             test_results=test_results,
         )
     assert ambiguous_active.value.code == "contract_worker_finish_attestation_ambiguous"
-    assert ambiguous_active.value.details["matching_completed_line_indexes"] == [3, 4]
+    assert ambiguous_active.value.details["matching_completed_line_indexes"] == [4, 5]
+
+
+def test_finish_gate_handler_binds_latest_canonical_attestation_round(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-CONTRACT-FINISH-LATEST-CANONICAL-ROUND"
+    target_root = tmp_path / "contract-finish-latest-canonical-round"
+    head_commit = _init_test_git_repo(target_root)
+    changed_files = ["agent/governance/server.py"]
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="contract-finish-latest-round-parent",
+        worker_task_id="contract-finish-latest-round-worker",
+        fence_token="fence-contract-finish-latest-round",
+        token="contract-finish-latest-round-token",
+        worktree_path=str(target_root),
+        base_commit=head_commit,
+        owned_files=tuple(changed_files),
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    parent_task_id = runtime_context.parent_task_id or backlog_id
+    worker_session_id = "worker-session-latest-round"
+    read_receipt_event_id = "4301"
+    read_receipt_hash = "sha256:latest-round-read"
+    test_results = {
+        "status": "accepted_with_known_baseline_failure",
+        "no_pass": True,
+        "candidate_new_failures": 0,
+        "full_failed": 17,
+        "inherited_failed": 17,
+        "baseline_failed": 17,
+        "focused_passed": 11,
+        "full_passed": 713,
+        "baseline_passed": 712,
+        "command": "pytest -q",
+        "overall_release_pass_claimed": False,
+    }
+    context_payload = {
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+    }
+
+    def worker_commit_line(round_number: int) -> dict[str, Any]:
+        return {
+            **context_payload,
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+            "evidence_kind": "worker_commit",
+            "commit_sha": head_commit,
+            "payload": {
+                **context_payload,
+                "worker_session_id": worker_session_id,
+                "filer_principal": worker_session_id,
+                "worker_commit_sha": head_commit,
+                "head_commit": head_commit,
+                "round_number": round_number,
+            },
+        }
+
+    def attestation_line(
+        label: str,
+        *,
+        session_id: str = worker_session_id,
+    ) -> dict[str, Any]:
+        attestation = {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "attestation_phase": "finish",
+            "status": "passed",
+            "ok": True,
+            "worker_self_attesting": True,
+            "self_attesting": True,
+            "finish_time_self_attesting": True,
+            "finish_time_blockers": [],
+            "worker_session_id": session_id,
+            "filer_principal": session_id,
+            "worker_transcript_ref": f"codex:{session_id}:{label}",
+            "harness_type": "codex",
+            "blockers": [],
+        }
+        payload = {
+            **context_payload,
+            "worker_session_id": session_id,
+            "filer_principal": session_id,
+            "head_commit": head_commit,
+            "changed_files": changed_files,
+            "test_results": test_results,
+            "read_receipt_event_id": read_receipt_event_id,
+            "read_receipt_hash": read_receipt_hash,
+            "graph_trace_ids": ["gqt-contract-finish-latest-round"],
+            "finish_time_worker_self_attestation": attestation,
+        }
+        return {
+            **context_payload,
+            "stage_id": "worker_attestation",
+            "line_id": "worker_finish_time_attestation",
+            "evidence_kind": "record_finish_time_worker_attestation",
+            "commit_sha": head_commit,
+            "payload": payload,
+        }
+
+    completed_lines: list[dict[str, Any]] = []
+    for round_number, commit_index in enumerate((6, 13, 20, 27), start=1):
+        while len(completed_lines) < commit_index:
+            completed_lines.append(
+                {
+                    **context_payload,
+                    "stage_id": "worker_context",
+                    "line_id": f"historical_round_marker_{len(completed_lines)}",
+                    "evidence_kind": "graph_trace",
+                    "payload": dict(context_payload),
+                }
+            )
+        completed_lines.append(worker_commit_line(round_number))
+        completed_lines.append(attestation_line(f"round-{round_number}"))
+    assert [
+        index
+        for index, line in enumerate(completed_lines)
+        if line.get("line_id") == "worker_finish_time_attestation"
+    ] == [7, 14, 21, 28]
+
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(contract_execution_id)
+    record["completed_lines"] = completed_lines
+    record["runtime_guide"] = {
+        **dict(record.get("runtime_guide") or {}),
+        "completed_lines": list(completed_lines),
+    }
+    record["execution_state_revision"] = len(completed_lines)
+    runtime.store.update(contract_execution_id, record)
+    conn.commit()
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_mf_sub_write_context",
+        lambda *_args, **_kwargs: (
+            runtime_context,
+            runtime_context.runtime_context_id,
+            {"status": "verified"},
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_contract_revision_payload",
+        lambda *_args, **_kwargs: {
+            "contract_execution_id": contract_execution_id,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_contract_worker_commit_projection",
+        lambda *_args, **_kwargs: {
+            "canonical_worker_commit_required": True,
+            "contract_execution_id": contract_execution_id,
+            "worker_commit_sha": head_commit,
+            "changed_files": changed_files,
+        },
+    )
+    forwarded_bodies: list[dict[str, Any]] = []
+
+    def fake_finish_gate(forwarded_ctx):
+        forwarded_bodies.append(dict(forwarded_ctx.body or {}))
+        return {"ok": True, "status": "review_ready", "gate": {"status": "passed"}}
+
+    monkeypatch.setattr(
+        server,
+        "handle_graph_governance_parallel_branch_finish_gate",
+        fake_finish_gate,
+    )
+    finish_request = _ctx_with_role(
+        {
+            "project_id": PID,
+            "runtime_context_id": runtime_context.runtime_context_id,
+        },
+        "mf_sub",
+        method="POST",
+        body={
+            "contract_execution_id": contract_execution_id,
+            "parent_task_id": parent_task_id,
+            "session_token": "contract-finish-latest-round-token",
+            "fence_token": "fence-contract-finish-latest-round",
+            "target_project_root": str(target_root),
+            "head_commit": head_commit,
+            "changed_files": changed_files,
+            "test_results": test_results,
+            "worker_session_id": worker_session_id,
+            "filer_principal": worker_session_id,
+            "read_receipt_event_id": read_receipt_event_id,
+            "read_receipt_hash": read_receipt_hash,
+        },
+    )
+    response = server.handle_graph_governance_runtime_context_finish_gate(
+        finish_request
+    )
+    assert response["ok"] is True
+    assert forwarded_bodies[-1]["finish_time_worker_self_attestation"][
+        "worker_transcript_ref"
+    ].endswith(":round-4")
+
+    identity_mismatch_record = runtime.store.get(contract_execution_id)
+    identity_mismatch_record["completed_lines"] = [
+        *completed_lines[:-1],
+        attestation_line("round-4-worker-b", session_id="worker-session-B"),
+    ]
+    identity_mismatch_record["runtime_guide"] = {
+        **dict(identity_mismatch_record.get("runtime_guide") or {}),
+        "completed_lines": list(identity_mismatch_record["completed_lines"]),
+    }
+    identity_mismatch_record["execution_state_revision"] += 1
+    runtime.store.update(contract_execution_id, identity_mismatch_record)
+    conn.commit()
+    omitted_identity_body = dict(finish_request.body or {})
+    omitted_identity_body.pop("worker_session_id")
+    omitted_identity_body.pop("filer_principal")
+    omitted_identity_request = _ctx_with_role(
+        {
+            "project_id": PID,
+            "runtime_context_id": runtime_context.runtime_context_id,
+        },
+        "mf_sub",
+        method="POST",
+        body=omitted_identity_body,
+    )
+    with pytest.raises(GovernanceError) as omitted_identity_mismatch:
+        server.handle_graph_governance_runtime_context_finish_gate(
+            omitted_identity_request
+        )
+    assert omitted_identity_mismatch.value.code == (
+        "contract_worker_finish_attestation_mismatch"
+    )
+    assert omitted_identity_mismatch.value.details["mismatched_fields"] == [
+        "worker_session_id",
+        "filer_principal",
+    ]
+
+    ambiguous_record = runtime.store.get(contract_execution_id)
+    ambiguous_record["completed_lines"] = [
+        *completed_lines,
+        attestation_line("round-4-duplicate"),
+    ]
+    ambiguous_record["runtime_guide"] = {
+        **dict(ambiguous_record.get("runtime_guide") or {}),
+        "completed_lines": list(ambiguous_record["completed_lines"]),
+    }
+    ambiguous_record["execution_state_revision"] += 1
+    runtime.store.update(contract_execution_id, ambiguous_record)
+    conn.commit()
+    with pytest.raises(GovernanceError) as ambiguous_round:
+        server.handle_graph_governance_runtime_context_finish_gate(finish_request)
+    assert ambiguous_round.value.code == (
+        "contract_worker_finish_attestation_ambiguous"
+    )
+    assert ambiguous_round.value.details["active_worker_commit_line_index"] == 27
+    assert ambiguous_round.value.details["matching_completed_line_indexes"] == [
+        28,
+        29,
+    ]
 
 
 @pytest.mark.parametrize(
