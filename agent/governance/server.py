@@ -78892,6 +78892,220 @@ def _contract_runtime_close_authority_explicit_commit(
     return ""
 
 
+def _contract_runtime_formal_no_pass_bypass_authorities(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Resolve narrow close-gate exceptions without turning a bypass into PASS.
+
+    ContractRuntime already proves that ``bypass_current_line`` targeted the
+    current line at write time.  Close authority additionally re-verifies the
+    immutable completed-line payload against both audit timeline events and the
+    still-OPEN linked diagnostic.  A caller-shaped waiver, a rewritten line,
+    or an unrelated diagnostic therefore cannot borrow this exception.
+    """
+
+    if conn is None:
+        return {}
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    if not project_id or not execution_id or not backlog_id:
+        return {}
+
+    allowed_line_ids = {"worker_finish_gate", "observer_close_ready"}
+    authorities: dict[str, dict[str, Any]] = {}
+    for line in _contract_runtime_completed_line_items(record):
+        line_id = str(line.get("line_id") or "").strip()
+        payload = _contract_runtime_close_authority_line_payload(line)
+        diagnostic_id = str(
+            payload.get("diagnostic_backlog_id") or ""
+        ).strip()
+        bypass_identity = str(payload.get("bypass_identity") or "").strip()
+        classification = str(payload.get("classification") or "").strip()
+        disposition = str(payload.get("disposition") or "").strip()
+        try:
+            bypass_revision = int(payload.get("execution_state_revision") or 0)
+        except (TypeError, ValueError):
+            bypass_revision = 0
+        if (
+            line_id not in allowed_line_ids
+            or str(line.get("actor_role") or "").strip() != "observer"
+            or str(line.get("evidence_kind") or "").strip()
+            != "contract_line_bypass"
+            or str(line.get("status") or "").strip().lower() != "waived"
+            or line.get("no_pass_claim") is not True
+            or payload.get("no_pass_claim") is not True
+            or str(payload.get("schema_version") or "").strip()
+            != "contract_line_bypass.v1"
+            or str(payload.get("source_backlog_id") or "").strip()
+            != backlog_id
+            or not diagnostic_id
+            or not bypass_identity
+            or not classification
+            or disposition != "proceeded_with_exception"
+            or bypass_revision <= 0
+        ):
+            continue
+
+        diagnostic = conn.execute(
+            "SELECT status, chain_trigger_json, bypass_policy_json "
+            "FROM backlog_bugs WHERE bug_id = ?",
+            (diagnostic_id,),
+        ).fetchone()
+        if (
+            not diagnostic
+            or str(diagnostic["status"] or "").strip().upper() != "OPEN"
+        ):
+            continue
+
+        # Backlog metadata can accumulate repair/resume annotations, so fields
+        # omitted by a later annotation remain timeline-verified below.  Any
+        # identity field that is still present must continue to match exactly.
+        metadata_matches = True
+        for raw_metadata in (
+            diagnostic["chain_trigger_json"],
+            diagnostic["bypass_policy_json"],
+        ):
+            metadata = backlog_runtime.parse_json_object(raw_metadata)
+            if not metadata:
+                continue
+            metadata_execution_id = str(
+                metadata.get("contract_execution_id")
+                or metadata.get("source_contract_execution_id")
+                or ""
+            ).strip()
+            provided_expectations = (
+                ("source_backlog_id", backlog_id),
+                ("line_id", line_id),
+                ("bypass_identity", bypass_identity),
+                ("classification", classification),
+            )
+            if metadata_execution_id and metadata_execution_id != execution_id:
+                metadata_matches = False
+                break
+            if any(
+                key in metadata
+                and str(metadata.get(key) or "").strip() != expected
+                for key, expected in provided_expectations
+            ):
+                metadata_matches = False
+                break
+            if "execution_state_revision" in metadata:
+                try:
+                    metadata_revision = int(
+                        metadata.get("execution_state_revision") or 0
+                    )
+                except (TypeError, ValueError):
+                    metadata_revision = 0
+                if metadata_revision != bypass_revision:
+                    metadata_matches = False
+                    break
+            if (
+                "no_pass_claim" in metadata
+                and metadata.get("no_pass_claim") is not True
+            ):
+                metadata_matches = False
+                break
+        if not metadata_matches:
+            continue
+
+        correlation_id = f"contract-line-bypass:{bypass_identity}"
+        audit_rows = conn.execute(
+            "SELECT id, backlog_id, event_type, actor, status, payload_json "
+            "FROM task_timeline_events "
+            "WHERE project_id = ? AND correlation_id = ? ORDER BY id",
+            (project_id, correlation_id),
+        ).fetchall()
+
+        def matching_audit_event(
+            *,
+            event_type: str,
+            event_backlog_id: str,
+            event_status: str,
+        ):
+            matches = []
+            for row in audit_rows:
+                event_payload = backlog_runtime.parse_json_object(
+                    row["payload_json"]
+                )
+                try:
+                    event_revision = int(
+                        event_payload.get("execution_state_revision") or 0
+                    )
+                except (TypeError, ValueError):
+                    event_revision = 0
+                if (
+                    str(row["event_type"] or "").strip() == event_type
+                    and str(row["backlog_id"] or "").strip()
+                    == event_backlog_id
+                    and str(row["actor"] or "").strip() == "observer"
+                    and str(row["status"] or "").strip().lower()
+                    == event_status
+                    and str(event_payload.get("source_backlog_id") or "").strip()
+                    == backlog_id
+                    and str(
+                        event_payload.get("contract_execution_id") or ""
+                    ).strip()
+                    == execution_id
+                    and str(event_payload.get("diagnostic_backlog_id") or "").strip()
+                    == diagnostic_id
+                    and str(event_payload.get("line_id") or "").strip()
+                    == line_id
+                    and event_revision == bypass_revision
+                    and str(event_payload.get("bypass_identity") or "").strip()
+                    == bypass_identity
+                    and str(event_payload.get("classification") or "").strip()
+                    == classification
+                    and event_payload.get("no_pass_claim") is True
+                ):
+                    matches.append(row)
+            return matches
+
+        source_events = matching_audit_event(
+            event_type="contract_line_bypass",
+            event_backlog_id=backlog_id,
+            event_status="proceeded_with_exception",
+        )
+        diagnostic_events = matching_audit_event(
+            event_type="contract_line_bypass_diagnostic_linked",
+            event_backlog_id=diagnostic_id,
+            event_status="open",
+        )
+        if len(source_events) != 1 or len(diagnostic_events) != 1:
+            continue
+
+        authorities[line_id] = {
+            "schema_version": (
+                "contract_runtime.formal_no_pass_close_bypass_authority.v1"
+            ),
+            "server_derived": True,
+            "db_verified": True,
+            "status": "verified_no_pass_exception",
+            "contract_execution_id": execution_id,
+            "source_backlog_id": backlog_id,
+            "diagnostic_backlog_id": diagnostic_id,
+            "diagnostic_status": "OPEN",
+            "line_id": line_id,
+            "execution_state_revision": bypass_revision,
+            "bypass_identity": bypass_identity,
+            "classification": classification,
+            "disposition": disposition,
+            "no_pass_claim": True,
+            "bypassed_business_line_passed": False,
+            "source_event_ref": f"timeline:{int(source_events[0]['id'])}",
+            "diagnostic_event_ref": (
+                f"timeline:{int(diagnostic_events[0]['id'])}"
+            ),
+            "bypass_line_index": _contract_runtime_close_authority_line_index(
+                line.get("_completed_line_index", -1)
+            ),
+            "_line": line,
+        }
+    return authorities
+
+
 _MF_PARALLEL_CLOSE_AUTHORITY_SEMANTIC_ORDER = {
     "worker_implementation": 10,
     "worker_commit": 20,
@@ -79525,6 +79739,8 @@ def _contract_runtime_mf_parallel_close_authority_gate(
     *,
     chain_projection: Mapping[str, Any],
     close_commit: str,
+    conn=None,
+    project_id: str = "",
 ) -> dict[str, Any]:
     if not _contract_runtime_server_derived_close_authority(chain_projection):
         return {}
@@ -79649,6 +79865,22 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         )
     )
     contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+    formal_bypass_authorities = (
+        _contract_runtime_formal_no_pass_bypass_authorities(
+            conn,
+            project_id=(
+                project_id or str(record.get("project_id") or "").strip()
+            ),
+            record=record,
+        )
+        if conn is not None
+        else {}
+    )
+    formal_bypass_lines = {
+        line_id: authority["_line"]
+        for line_id, authority in formal_bypass_authorities.items()
+        if isinstance(authority.get("_line"), Mapping)
+    }
     required_specs = {
         "worker_implementation": {
             "line_ids": {"worker_implementation"},
@@ -79710,6 +79942,15 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                 line_id not in spec["line_ids"]
                 and evidence_kind not in spec["evidence_kinds"]
             ):
+                continue
+            if evidence_kind == "contract_line_bypass":
+                rejected_by_requirement[requirement_id].append({
+                    "line_id": line_id,
+                    "evidence_kind": evidence_kind,
+                    "actor_role": actor_role,
+                    "reason": "formal_no_pass_bypass_not_business_pass",
+                    "source_ref": str(line.get("_source_ref") or ""),
+                })
                 continue
             expected_roles = set(spec["actor_roles"])
             if actor_role not in expected_roles:
@@ -79835,6 +80076,56 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         if not bool(ordering.get("passed")):
             missing.append(missing_id)
 
+    server_lineage_diagnostics: list[dict[str, Any]] = []
+    if all(
+        requirement in found
+        for requirement in (
+            "qa_independent_verification",
+            "observer_merge",
+            "observer_reconcile",
+        )
+    ):
+        for before, after, missing_id in (
+            (
+                "qa_independent_verification",
+                "observer_merge",
+                "contract_runtime.merge_after_qa",
+            ),
+            (
+                "observer_merge",
+                "observer_reconcile",
+                "contract_runtime.reconcile_after_merge",
+            ),
+        ):
+            server_lineage_diagnostics.append(
+                _contract_runtime_mf_parallel_server_temporal_ordering_diagnostic(
+                    before=before,
+                    after=after,
+                    missing_id=missing_id,
+                    before_line=found[before],
+                    after_line=found[after],
+                    qa_line=found["qa_independent_verification"],
+                    merge_line=found["observer_merge"],
+                    reconcile_line=found["observer_reconcile"],
+                )
+            )
+    bypass_reconcile_diagnostic = (
+        _contract_runtime_mf_parallel_reconcile_close_diagnostic(
+            record,
+            found["observer_reconcile"],
+        )
+        if "observer_reconcile" in found
+        else {}
+    )
+    server_post_qa_lineage_passed = bool(
+        len(server_lineage_diagnostics) == 2
+        and all(
+            diagnostic.get("passed") is True
+            for diagnostic in server_lineage_diagnostics
+        )
+        and bypass_reconcile_diagnostic.get("passed") is True
+    )
+
     commit_mismatches: list[dict[str, Any]] = []
     commit_bridge_diagnostics: list[dict[str, Any]] = []
     worker_commit_line = found.get("worker_commit")
@@ -79900,6 +80191,136 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                     "source_ref": str(line.get("_source_ref") or ""),
                 })
 
+    applied_no_pass_exceptions: list[dict[str, Any]] = []
+    worker_bypass = formal_bypass_authorities.get("worker_finish_gate", {})
+    worker_bypass_line = formal_bypass_lines.get("worker_finish_gate", {})
+    worker_commit_line = found.get("worker_commit", {})
+    qa_line = found.get("qa_independent_verification", {})
+    worker_commit = _contract_runtime_close_authority_explicit_commit(
+        worker_commit_line
+    )
+    qa_commit = _contract_runtime_close_authority_explicit_commit(qa_line)
+    worker_bypass_order_valid = bool(
+        worker_bypass_line
+        and worker_commit_line
+        and qa_line
+        and _contract_runtime_close_authority_line_index(
+            worker_commit_line.get("_completed_line_index", -1)
+        )
+        < _contract_runtime_close_authority_line_index(
+            worker_bypass_line.get("_completed_line_index", -1)
+        )
+        < _contract_runtime_close_authority_line_index(
+            qa_line.get("_completed_line_index", -1)
+        )
+    )
+    worker_finish_commit_exception = bool(
+        worker_bypass
+        and "worker_finish_gate" in found
+        and worker_commit
+        and _contract_runtime_authority_commit_matches(worker_commit, qa_commit)
+        and worker_bypass_order_valid
+        and server_post_qa_lineage_passed
+    )
+    if worker_finish_commit_exception:
+        missing = [
+            item
+            for item in missing
+            if item
+            not in {
+                "contract_runtime.worker_finish_exact_worker_commit",
+                "contract_runtime.worker_finish_after_worker_commit",
+                "contract_runtime.qa_after_worker_finish",
+            }
+        ]
+        commit_mismatches = [
+            item
+            for item in commit_mismatches
+            if item.get("reason") != "worker_finish_commit_mismatch"
+        ]
+        applied_no_pass_exceptions.append({
+            **{
+                key: value
+                for key, value in worker_bypass.items()
+                if key != "_line"
+            },
+            "exception_scope": "worker_finish_exact_worker_commit",
+            "latest_worker_commit": worker_commit,
+            "accepted_qa_commit": qa_commit,
+            "normal_business_line_present": True,
+            "bypass_used_as_business_line": False,
+        })
+
+    close_ready_bypass = formal_bypass_authorities.get(
+        "observer_close_ready", {}
+    )
+    close_ready_bypass_line = formal_bypass_lines.get(
+        "observer_close_ready", {}
+    )
+    reconcile_line = found.get("observer_reconcile", {})
+    reconcile_authority = _contract_runtime_close_authority_payload_mapping(
+        reconcile_line,
+        "reconcile_authority",
+    )
+    server_close_commit = str(
+        reconcile_authority.get("reconciled_commit_sha")
+        or reconcile_authority.get("canonical_head_commit")
+        or ""
+    ).strip()
+    close_ready_bypass_order_valid = bool(
+        close_ready_bypass_line
+        and reconcile_line
+        and _contract_runtime_close_authority_line_index(
+            reconcile_line.get("_completed_line_index", -1)
+        )
+        < _contract_runtime_close_authority_line_index(
+            close_ready_bypass_line.get("_completed_line_index", -1)
+        )
+    )
+    close_ready_commit_exception = bool(
+        close_ready_bypass
+        and "observer_close_ready" not in found
+        and close_ready_bypass_order_valid
+        and server_post_qa_lineage_passed
+        and server_close_commit
+        and _contract_runtime_authority_commit_matches(
+            close_commit,
+            server_close_commit,
+        )
+        and _contract_runtime_authority_commit_matches(
+            close_commit,
+            _contract_runtime_close_authority_explicit_commit(reconcile_line),
+        )
+    )
+    if close_ready_commit_exception:
+        missing = [
+            item
+            for item in missing
+            if item
+            not in {
+                "contract_runtime.observer_close_ready",
+                "contract_runtime.observer_close_ready_close_commit",
+                "contract_runtime.close_ready_after_reconcile",
+            }
+        ]
+        commit_mismatches = [
+            item
+            for item in commit_mismatches
+            if item.get("requirement_id") != "observer_close_ready"
+        ]
+        applied_no_pass_exceptions.append({
+            **{
+                key: value
+                for key, value in close_ready_bypass.items()
+                if key != "_line"
+            },
+            "exception_scope": "observer_close_ready_close_commit",
+            "server_derived_close_commit": server_close_commit,
+            "caller_bypass_commit_fields_ignored": True,
+            "normal_business_line_present": False,
+            "bypass_used_as_business_line": False,
+        })
+
     missing = list(dict.fromkeys(item for item in missing if item))
     passed = not missing
     source_refs = [
@@ -79935,6 +80356,8 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         "commit_mismatches": commit_mismatches,
         "commit_bridge_diagnostics": commit_bridge_diagnostics,
         "reconcile_close_diagnostic": reconcile_close_diagnostic,
+        "formal_no_pass_bypass_exceptions": applied_no_pass_exceptions,
+        "server_post_qa_lineage_diagnostics": server_lineage_diagnostics,
         "checks": {
             "has_worker_implementation": "worker_implementation" in found,
             "has_worker_commit": (
@@ -79945,6 +80368,19 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             "has_observer_merge": "observer_merge" in found,
             "has_observer_reconcile": "observer_reconcile" in found,
             "has_observer_close_ready": "observer_close_ready" in found,
+            "worker_finish_business_line_passed": (
+                "worker_finish_gate" in found
+            ),
+            "observer_close_ready_business_line_passed": (
+                "observer_close_ready" in found
+            ),
+            "formal_worker_finish_commit_bypass_verified": (
+                worker_finish_commit_exception
+            ),
+            "formal_observer_close_ready_bypass_verified": (
+                close_ready_commit_exception
+            ),
+            "formal_bypass_synthesized_pass": False,
             "observer_merge_close_commit_bridged_by_close_ready": bool(
                 commit_bridge_diagnostics
             ),
@@ -80006,6 +80442,8 @@ def _contract_runtime_mf_parallel_close_ready_precheck(
             "active_chain": {"execution_ids": [execution_id]},
         },
         close_commit=close_commit,
+        conn=conn,
+        project_id=project_id,
     )
 
 
@@ -82430,6 +82868,8 @@ def _contract_runtime_close_authority_projection(
         close_bound_chain_records,
         chain_projection=server_chain_projection,
         close_commit=close_commit,
+        conn=conn,
+        project_id=project_id,
     )
 
     projected_events = _contract_runtime_close_authority_seed_events(
