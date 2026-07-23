@@ -42359,6 +42359,9 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
     root = _graph_governance_project_root(project_id, body)
     from .state_reconcile import run_state_only_full_reconcile
     from . import graph_snapshot_store as store
+    from .parallel_branch_runtime import (
+        record_merge_queue_graph_epoch_after_reconcile,
+    )
 
     request_started_at = _utc_now()
     request_started_monotonic = time.monotonic()
@@ -42429,6 +42432,12 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             target_commit_sha=target_commit,
             candidate_only=not activate_requested,
         )
+        merge_queue_id = str(
+            runtime_context_scope.get("merge_queue_id")
+            or body.get("merge_queue_id")
+            or ""
+        ).strip()
+        queue_item_id = str(body.get("queue_item_id") or "").strip()
         run_id = str(body.get("run_id") or "").strip() or (
             f"current-full-{target_commit[:7]}"
         )
@@ -42477,12 +42486,42 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "next_legal_action": "file_or_resume_audited_system_repair",
             }
         if existing.get("status") == "complete":
-            return 200, _current_full_reconcile_idempotent_response(
+            response = _current_full_reconcile_idempotent_response(
                 existing,
                 project_id=project_id,
                 target_commit_sha=target_commit,
                 head_commit=head_commit,
             )
+            if activate_requested:
+                existing_snapshot_id = str(
+                    existing.get("snapshot_id") or ""
+                ).strip()
+                response["merge_queue_graph_epoch_auto_record"] = (
+                    record_merge_queue_graph_epoch_after_reconcile(
+                        conn,
+                        project_id=project_id,
+                        target_head_commit=target_commit,
+                        snapshot_id=existing_snapshot_id,
+                        projection_id=_current_full_reconcile_projection_id(
+                            conn,
+                            project_id=project_id,
+                            snapshot_id=existing_snapshot_id,
+                            result=(
+                                existing.get("snapshot")
+                                if isinstance(
+                                    existing.get("snapshot"),
+                                    Mapping,
+                                )
+                                else {}
+                            ),
+                        ),
+                        merge_queue_id=merge_queue_id,
+                        queue_item_id=queue_item_id,
+                        now_iso=_utc_now(),
+                    )
+                )
+                conn.commit()
+            return 200, response
         if existing.get("status") == "running":
             return 202, {
                 "ok": True,
@@ -42710,10 +42749,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         )
         conn.commit()
 
-        from .parallel_branch_runtime import record_merge_queue_graph_epoch_after_reconcile
-
-        merge_queue_id = str(body.get("merge_queue_id") or "").strip()
-        queue_item_id = str(body.get("queue_item_id") or "").strip()
         if not activate_requested:
             result["activated"] = False
             result.setdefault("candidate_only", True)

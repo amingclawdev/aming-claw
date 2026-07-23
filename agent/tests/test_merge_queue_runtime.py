@@ -1378,6 +1378,55 @@ def test_reconcile_without_queue_scope_refuses_ambiguous_matching_epochs_without
         assert epoch.updated_at == "2026-07-20T12:00:00Z"
 
 
+def test_reconcile_and_close_accept_unique_abbreviated_epoch_head() -> None:
+    conn = _runtime_conn()
+    epoch = upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PROJECT_ID,
+            batch_id="batch-abbreviated-final-head",
+            epoch_id="epoch-abbreviated-final-head",
+            coordination_backlog_id="AC-BATCH-ABBREVIATED-FINAL-HEAD",
+            target_ref=TARGET_REF,
+            base_head="base-head",
+            current_head=_SHORT_TARGET_HEAD,
+            merge_queue_id="mq-abbreviated-final-head",
+            status=pbr.INTEGRATION_EPOCH_RECONCILE_PENDING,
+            reconcile_state="pending",
+        ),
+        now_iso="2026-07-20T12:00:00Z",
+    )
+
+    reconciled = pbr.mark_integration_epoch_reconciled(
+        conn,
+        project_id=PROJECT_ID,
+        target_head_commit=_FULL_TARGET_HEAD,
+        snapshot_id="full-abbreviated-final-head",
+        projection_id="",
+        now_iso="2026-07-20T12:01:00Z",
+    )
+
+    assert reconciled is not None
+    assert reconciled.status == INTEGRATION_EPOCH_RECONCILED
+    assert reconciled.reconcile_state == "reconciled"
+    assert reconciled.snapshot_id == "full-abbreviated-final-head"
+    close_gate = validate_integration_epoch_backlog_close(
+        reconciled,
+        backlog_scope="coordination",
+        target_head_commit=_FULL_TARGET_HEAD,
+    )
+    assert close_gate["passed"] is True
+    assert close_gate["target_head_commit"] == _FULL_TARGET_HEAD
+    closed = close_integration_epoch(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=epoch.batch_id,
+        target_head_commit=_FULL_TARGET_HEAD,
+        now_iso="2026-07-20T12:02:00Z",
+    )
+    assert closed.status == pbr.INTEGRATION_EPOCH_CLOSED
+
+
 def test_open_integration_epoch_refuses_non_contiguous_merged_prefix_without_mutation() -> None:
     conn = _runtime_conn()
     batch_id = "batch-prefix-gap"

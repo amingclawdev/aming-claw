@@ -12075,6 +12075,10 @@ def record_merge_queue_graph_epoch_after_reconcile(
         integration_epoch_to_dict(epoch) if epoch is not None else None
     )
     if epoch is not None and epoch.status == INTEGRATION_EPOCH_RECONCILED:
+        if activation_completed:
+            result["status"] = "recorded"
+            result["epoch_projection_recorded"] = True
+            result.pop("skipped_reason", None)
         result["integration_epoch_barrier"] = "reconciled_frozen_until_atomic_close"
     return result
 
@@ -12677,7 +12681,7 @@ def validate_integration_epoch_backlog_close(
     if (
         epoch.status != INTEGRATION_EPOCH_RECONCILED
         or epoch.remaining_queue_item_ids
-        or epoch.current_head != target
+        or not _commit_ref_unambiguously_matches(epoch.current_head, target)
     ):
         raise IntegrationEpochFrozenError(
             "backlog close remains frozen until the final batch reconcile barrier",
@@ -13118,7 +13122,9 @@ def mark_integration_epoch_reconciled(
     else:
         # A project may have multiple live epochs on distinct target refs.  A
         # reconcile callback without explicit queue scope may bind only when
-        # the frozen target head identifies exactly one pending epoch.
+        # the frozen target head identifies exactly one pending epoch.  Live
+        # merge evidence may persist an unambiguous abbreviated object id while
+        # current-full reconcile always supplies the exact object id.
         if not target:
             return None
         ensure_branch_runtime_schema(conn)
@@ -13127,20 +13133,29 @@ def mark_integration_epoch_reconciled(
             SELECT * FROM parallel_branch_integration_epochs
             WHERE project_id = ?
               AND status = ?
-              AND current_head = ?
             ORDER BY created_at, batch_id
-            LIMIT 2
             """,
-            (project_id, INTEGRATION_EPOCH_RECONCILE_PENDING, target),
+            (project_id, INTEGRATION_EPOCH_RECONCILE_PENDING),
         ).fetchall()
-        if len(rows) != 1:
+        matching_epochs = [
+            _integration_epoch_from_row(row)
+            for row in rows
+            if _commit_ref_unambiguously_matches(
+                str(row["current_head"] or ""),
+                target,
+            )
+        ]
+        if len(matching_epochs) != 1:
             return None
-        epoch = _integration_epoch_from_row(rows[0])
+        epoch = matching_epochs[0]
     if epoch is None:
         return None
     if epoch.status != INTEGRATION_EPOCH_RECONCILE_PENDING:
         return epoch
-    if epoch.remaining_queue_item_ids or epoch.current_head != target:
+    if (
+        epoch.remaining_queue_item_ids
+        or not _commit_ref_unambiguously_matches(epoch.current_head, target)
+    ):
         return upsert_integration_epoch(
             conn,
             replace(
@@ -13181,7 +13196,13 @@ def close_integration_epoch(
         raise IntegrationEpochFrozenError(
             "integration epoch must be reconciled before atomic close", epoch
         )
-    if epoch.remaining_queue_item_ids or epoch.current_head != target_head_commit:
+    if (
+        epoch.remaining_queue_item_ids
+        or not _commit_ref_unambiguously_matches(
+            epoch.current_head,
+            target_head_commit,
+        )
+    ):
         raise IntegrationEpochFrozenError(
             "integration epoch close head/cursor does not match the frozen barrier",
             epoch,
