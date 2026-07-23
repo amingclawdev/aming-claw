@@ -92914,6 +92914,8 @@ def handle_backlog_list(ctx: RequestContext):
                         "query": search,
                         "status": _first_query_value(query, "status").strip(),
                         "priority": _first_query_value(query, "priority").strip(),
+                        "view": view,
+                        "include_closed": include_closed,
                         "authority": authority_generation,
                         "cursor": cursor_value,
                         "limit": page_limit,

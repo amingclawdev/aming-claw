@@ -6411,6 +6411,80 @@ def test_backlog_history_uses_stable_keyset_and_separate_cache(conn):
     )
 
 
+def test_backlog_history_cache_separates_compact_then_full_authority_view(conn):
+    server._backlog_read_cache_clear()
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, details_md, created_at, updated_at)
+           VALUES (?, ?, 'OPEN', 'P1', ?, ?, ?)""",
+        (
+            "AC-HISTORY-CACHE-VIEW-AUTHORITY",
+            "Historical cache view authority",
+            "Full-only details remain available",
+            "2026-07-23T01:00:00Z",
+            "2026-07-23T01:00:00Z",
+        ),
+    )
+    conn.commit()
+    query = {
+        "q": "Historical cache view authority",
+        "limit": "10",
+        "include_closed": "true",
+    }
+
+    compact = server.handle_backlog_list(
+        _ctx({"project_id": PID}, query={**query, "view": "compact"})
+    )
+    full = server.handle_backlog_list(
+        _ctx({"project_id": PID}, query={**query, "view": "full"})
+    )
+
+    assert compact["view"] == "compact"
+    assert compact["read_cache"]["miss"] is True
+    assert compact["bugs"][0]["compact"] is True
+    assert full["view"] == "full"
+    assert full["source"] == "sqlite_indexed_keyset"
+    assert full["read_cache"]["miss"] is True
+    assert "compact" not in full["bugs"][0]
+    assert full["bugs"][0]["details_md"] == "Full-only details remain available"
+
+
+def test_backlog_history_cache_separates_closed_visibility_true_then_false(conn):
+    server._backlog_read_cache_clear()
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, created_at, updated_at)
+           VALUES (?, ?, 'FIXED', 'P1', ?, ?)""",
+        (
+            "AC-HISTORY-CACHE-CLOSED-AUTHORITY",
+            "Historical cache closed visibility authority",
+            "2026-07-23T01:01:00Z",
+            "2026-07-23T01:01:00Z",
+        ),
+    )
+    conn.commit()
+    query = {
+        "view": "compact",
+        "q": "Historical cache closed visibility authority",
+        "limit": "10",
+    }
+
+    with_closed = server.handle_backlog_list(
+        _ctx({"project_id": PID}, query={**query, "include_closed": "true"})
+    )
+    without_closed = server.handle_backlog_list(
+        _ctx({"project_id": PID}, query={**query, "include_closed": "false"})
+    )
+
+    assert with_closed["count"] == 1
+    assert with_closed["bugs"][0]["status"] == "FIXED"
+    assert with_closed["read_cache"]["miss"] is True
+    assert without_closed["count"] == 0
+    assert without_closed["filtered_count"] == 0
+    assert without_closed["source"] == "sqlite_indexed_keyset"
+    assert without_closed["read_cache"]["miss"] is True
+
+
 def test_backlog_offset_pagination_fails_closed_with_cursor_hint(conn):
     server._backlog_read_cache_clear()
     with pytest.raises(GovernanceError) as exc_info:
