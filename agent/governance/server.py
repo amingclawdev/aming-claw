@@ -27022,6 +27022,401 @@ def _runtime_context_superseded_implementation_commit_authority(
     return authority
 
 
+def _runtime_context_revise_precommit_implementation_lineage(
+    *,
+    project_id: str,
+    context: Any,
+    runtime: ContractRuntime,
+    record: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    validate_only: bool = False,
+) -> dict[str, Any]:
+    """Append one clean canonical implementation correction before commit.
+
+    The runtime-context facade has already authenticated the worker and
+    resolved graph traces from the database.  This helper derives the git
+    boundary and owned-file scope again from the assigned runtime context,
+    then asks ContractRuntime to append the sole correction line.  It never
+    handles failed-QA rework and never reopens a recorded worker commit.
+    """
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    completed_lines = list(record.get("completed_lines") or [])
+    previous = _worker_commit_completed_implementation(
+        record,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    if previous is None or _active_failed_qa_line_index(
+        completed_lines,
+        source_record=record,
+    ) >= 0:
+        return {}
+
+    matching_worker_commit_exists = any(
+        isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "worker_commit"
+        and _runtime_context_contract_line_matches_worker(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        )
+        for line in completed_lines
+    )
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_line = (
+        guide.get("next_legal_action")
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if str(next_line.get("line_id") or "").strip() != "worker_commit":
+        return {}
+    if matching_worker_commit_exists:
+        raise GovernanceError(
+            "contract_runtime_precommit_correction_closed",
+            "precommit implementation correction is closed after worker_commit",
+            422,
+            {
+                "contract_execution_id": record.get("contract_execution_id"),
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "next_legal_action": dict(next_line),
+                "fail_closed": True,
+                "timeline_evidence_backfill_allowed": False,
+            },
+        )
+
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    runtime_base_commit = str(getattr(context, "base_commit", "") or "").strip()
+    if not worktree_path or not re.fullmatch(
+        r"[0-9a-f]{40,64}",
+        runtime_base_commit,
+    ):
+        raise GovernanceError(
+            "contract_runtime_precommit_correction_revision_boundary_invalid",
+            (
+                "precommit implementation correction requires the assigned "
+                "worktree and immutable runtime base"
+            ),
+            422,
+            {
+                "contract_execution_id": record.get("contract_execution_id"),
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "fail_closed": True,
+            },
+        )
+
+    from . import batch_jobs
+
+    actual_head = batch_jobs.git_commit(worktree_path)
+    dirty_files = _runtime_context_git_dirty_files(worktree_path)
+    if dirty_files:
+        raise GovernanceError(
+            "contract_runtime_precommit_correction_dirty_worktree",
+            (
+                "precommit implementation correction requires a clean "
+                "assigned worktree"
+            ),
+            422,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "dirty_files": dirty_files,
+                "next_legal_action": "commit_or_clean_worker_correction",
+                "fail_closed": True,
+            },
+        )
+    revision_diff = _runtime_context_worker_commit_revision_diff(
+        worktree_path,
+        actual_head,
+        base_commit=runtime_base_commit,
+    )
+    cumulative_files = sorted(set(revision_diff.get("changed_files") or []))
+    owned_files = sorted(
+        set(
+            getattr(context, "owned_files", ())
+            or getattr(context, "target_files", ())
+            or ()
+        )
+    )
+    out_of_fence = sorted(set(cumulative_files) - set(owned_files))
+    if not cumulative_files or out_of_fence:
+        raise GovernanceError(
+            "contract_runtime_precommit_correction_scope_invalid",
+            (
+                "precommit implementation correction must resolve a non-empty "
+                "cumulative diff entirely inside the active worker fence"
+            ),
+            422,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "cumulative_changed_files": cumulative_files,
+                "owned_files": owned_files,
+                "out_of_fence_files": out_of_fence,
+                "fail_closed": True,
+            },
+        )
+
+    graph_evidence = (
+        payload.get("graph_trace_db_evidence")
+        if isinstance(payload.get("graph_trace_db_evidence"), Mapping)
+        else {}
+    )
+    verified_trace_ids = sorted(
+        set(graph_evidence.get("verified_trace_ids") or [])
+    )
+    if graph_evidence.get("db_verified") is not True or not verified_trace_ids:
+        raise GovernanceError(
+            "contract_runtime_precommit_correction_graph_evidence_invalid",
+            (
+                "precommit implementation correction requires exact "
+                "DB-verified worker graph traces"
+            ),
+            422,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "fail_closed": True,
+                "caller_graph_authority_trusted": False,
+            },
+        )
+
+    claimed_files = sorted(
+        set(_runtime_context_service_query_values(payload, "changed_files"))
+    )
+    if claimed_files and claimed_files != cumulative_files:
+        raise GovernanceError(
+            "contract_runtime_precommit_correction_diff_claim_mismatch",
+            (
+                "claimed implementation files do not match the "
+                "server-derived cumulative runtime diff"
+            ),
+            422,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "claimed_changed_files": claimed_files,
+                "cumulative_changed_files": cumulative_files,
+                "source_of_authority": "runtime_context_clean_cumulative_git_diff",
+                "fail_closed": True,
+            },
+        )
+
+    from .parallel_branch_runtime import (
+        runtime_context_secret_hash,
+        runtime_context_session_token_ref,
+    )
+
+    expected_identity = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "worker_id": str(getattr(context, "worker_id", "") or "").strip(),
+        "worker_slot_id": str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ).strip(),
+        "target_project_root": _runtime_context_effective_target_project_root(
+            context
+        ),
+        "fence_token_hash": runtime_context_secret_hash(
+            str(getattr(context, "fence_token", "") or "")
+        ),
+        "session_token_ref": runtime_context_session_token_ref(context),
+    }
+    identity_errors = [
+        field
+        for field, expected in expected_identity.items()
+        if expected
+        and str(payload.get(field) or "").strip() != expected
+    ]
+    if identity_errors:
+        raise GovernanceError(
+            "contract_runtime_precommit_correction_identity_mismatch",
+            (
+                "precommit implementation correction must match the exact "
+                "active runtime, worker, session, and fence identity"
+            ),
+            422,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "mismatched_fields": identity_errors,
+                "fail_closed": True,
+            },
+        )
+
+    previous_files = sorted(
+        set(_runtime_context_service_query_values(previous, "changed_files"))
+    )
+    previous_trace_ids = sorted(
+        set(
+            _runtime_context_service_query_values(
+                previous,
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+                "verified_trace_ids",
+            )
+        )
+    )
+    previous_commit = str(previous.get("commit_sha") or "").strip()
+    previous_payload = (
+        previous.get("payload")
+        if isinstance(previous.get("payload"), Mapping)
+        else {}
+    )
+    previous_is_correction = isinstance(
+        previous_payload.get("canonical_precommit_lineage_revision"),
+        Mapping,
+    )
+    if (
+        not previous_is_correction
+        and previous_commit == actual_head
+        and previous_files == cumulative_files
+        and previous_trace_ids == verified_trace_ids
+    ):
+        return {}
+
+    canonical_payload = dict(payload)
+    canonical_payload.update(expected_identity)
+    canonical_payload["changed_files"] = cumulative_files
+    canonical_payload["graph_trace_ids"] = verified_trace_ids
+    canonical_payload["graph_trace_db_evidence"] = dict(graph_evidence)
+    canonical_payload["commit_sha"] = actual_head
+    canonical_payload["head_commit"] = actual_head
+    canonical_payload["immutable_head_commit"] = actual_head
+    canonical_payload["validated_head_commit"] = actual_head
+    canonical_payload["canonical_precommit_lineage_revision_authority"] = {
+        "schema_version": (
+            "runtime_context.clean_cumulative_git_precommit_correction_authority.v1"
+        ),
+        "source": (
+            "runtime_context_clean_cumulative_git_precommit_correction"
+        ),
+        "server_derived": True,
+        "actual_head_commit": actual_head,
+        "commit_parent_sha": revision_diff.get("parent_commit") or "",
+        "diff_base_commit": revision_diff.get("base_commit") or "",
+        "clean_worktree": True,
+        "cumulative_changed_files": cumulative_files,
+        "owned_files": owned_files,
+        "graph_trace_ids": verified_trace_ids,
+        "graph_trace_authority_source": "graph_query_traces",
+        "caller_authority_fields_trusted": False,
+        "raw_worker_tokens_persisted": False,
+    }
+    write = {
+        "project_id": project_id,
+        "backlog_id": record.get("backlog_id"),
+        "contract_execution_id": record.get("contract_execution_id"),
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "actor_role": "mf_sub",
+        "evidence_kind": "implementation",
+        "commit_sha": actual_head,
+        "changed_files": cumulative_files,
+        "graph_trace_ids": verified_trace_ids,
+        "payload": canonical_payload,
+    }
+    for key, value in canonical_payload.items():
+        if key not in write:
+            write[key] = value
+    if validate_only:
+        return {
+            "schema_version": (
+                "runtime_context.precommit_implementation_correction_validation.v1"
+            ),
+            "accepted": True,
+            "status": "validated_submission",
+            "canonical": False,
+            "contract_execution_id": str(
+                record.get("contract_execution_id") or ""
+            ),
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "evidence_kind": "implementation",
+            "commit_sha": actual_head,
+            "canonical_payload": canonical_payload,
+            "append_only_history_preserved": True,
+            "canonical_submit_required": True,
+            "timeline_projection_authoritative": False,
+        }
+    result = runtime.revise_precommit_worker_implementation(
+        str(record.get("contract_execution_id") or ""),
+        write,
+        actor_role="mf_sub",
+    )
+    if not result.get("ok"):
+        raise GovernanceError(
+            "contract_runtime_precommit_correction_rejected",
+            "ContractRuntime rejected the precommit implementation correction",
+            422,
+            {
+                "contract_execution_id": record.get("contract_execution_id"),
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "decision": result.get("decision") or {},
+                "fail_closed": True,
+            },
+        )
+
+    updated = (
+        result.get("record")
+        if isinstance(result.get("record"), Mapping)
+        else {}
+    )
+    latest = _worker_commit_completed_implementation(
+        updated,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    lineage = _worker_implementation_lineage(updated, latest or {})
+    current_state = _runtime_current_state_from_record(updated)
+    return {
+        "schema_version": "runtime_context.canonical_contract_line.v1",
+        "accepted": True,
+        "status": str(result.get("status") or "revised"),
+        "canonical": True,
+        "source_of_authority": "ContractRuntime.completed_lines",
+        "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        "line_instance_id": str((latest or {}).get("line_instance_id") or ""),
+        "commit_sha": actual_head,
+        "implementation_lineage_ref": lineage.get(
+            "implementation_lineage_ref"
+        )
+        or "",
+        "supersedes_implementation_lineage_ref": result.get(
+            "supersedes_implementation_lineage_ref"
+        )
+        or "",
+        "execution_state_revision": current_state.get(
+            "execution_state_revision", 0
+        ),
+        "execution_state_hash": current_state.get("execution_state_hash", ""),
+        "next_legal_action": current_state.get("next_legal_action") or {},
+        "append_only_history_preserved": True,
+        "single_correction_boundary": True,
+        "timeline_projection_authoritative": False,
+    }
+
+
 def _runtime_context_revise_failed_qa_implementation_lineage(
     conn,
     *,
@@ -28709,6 +29104,18 @@ def _runtime_context_submit_canonical_contract_line(
             or next_line_id != "worker_implementation"
         ):
             return revision
+        if not revision:
+            precommit_correction = (
+                _runtime_context_revise_precommit_implementation_lineage(
+                    project_id=project_id,
+                    context=context,
+                    runtime=runtime,
+                    record=stored_record,
+                    payload=canonical_payload,
+                )
+            )
+            if precommit_correction:
+                return precommit_correction
 
     for completed in record.get("completed_lines") or []:
         if not isinstance(completed, Mapping):
@@ -78365,6 +78772,44 @@ def _contract_runtime_close_gate(
                     prevalidation.get("canonical_payload")
                     or canonical_norm_payload
                 )
+            if not prevalidation:
+                precommit_validation = (
+                    _runtime_context_revise_precommit_implementation_lineage(
+                        project_id=project_id,
+                        context=runtime_context,
+                        runtime=runtime,
+                        record=stored_record,
+                        payload=canonical_norm_payload,
+                        validate_only=True,
+                    )
+                )
+                if precommit_validation.get("status") == (
+                    "validated_submission"
+                ):
+                    return {
+                        "schema_version": (
+                            _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
+                        ),
+                        "accepted": True,
+                        "status": "validated_submission",
+                        "primary_decision_source": True,
+                        "agent_facing_decision_source": (
+                            "contract_runtime_first_missing_line"
+                        ),
+                        "meta_contract_gate_decision_source": False,
+                        "contract_execution_id": contract_execution_id,
+                        "actor_role": actor_role,
+                        "requested_event_kind": event_kind,
+                        "stage_id": line.get("stage_id", ""),
+                        "line_id": line.get("line_id", ""),
+                        "evidence_kind": line.get("evidence_kind", ""),
+                        "decision": {"ok": True, "errors": []},
+                        "next_legal_action": dict(
+                            current_state.get("next_legal_action") or {}
+                        ),
+                        "canonical_submit_required": True,
+                        "precommit_implementation_correction": True,
+                    }
     write["payload"] = canonical_norm_payload
     if normalized_status:
         write["status"] = normalized_status
