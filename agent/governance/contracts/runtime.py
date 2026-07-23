@@ -5359,6 +5359,383 @@ class ContractRuntime:
             ],
         }
 
+    def revise_precommit_worker_implementation(
+        self,
+        contract_execution_id: str,
+        write: Mapping[str, Any],
+        *,
+        actor_role: str | None = None,
+    ) -> dict[str, Any]:
+        """Append one canonical implementation correction before worker commit.
+
+        This is not a duplicate-line or rewind facility.  It is a bounded
+        append-only correction for the narrow case where the authenticated
+        worker has already recorded ``worker_implementation``, the live
+        ContractRuntime line is ``worker_commit``, and no worker commit exists.
+        Server-derived immutable git and graph authority must accompany the
+        write.  Once a correction is recorded, only an exact idempotent replay
+        is accepted; a different HEAD must not recursively revise the lineage.
+        """
+
+        effective_write = dict(write)
+        effective_actor_role = _effective_actor_role(
+            effective_write,
+            actor_role=actor_role,
+        )
+        if effective_actor_role:
+            effective_write["actor_role"] = effective_actor_role
+        _enrich_line_instance_fields(effective_write)
+
+        record = self.store.get(contract_execution_id)
+        lines = list(record.get("completed_lines") or [])
+        payload = (
+            dict(effective_write.get("payload"))
+            if isinstance(effective_write.get("payload"), Mapping)
+            else {}
+        )
+        authority = (
+            dict(payload.get("canonical_precommit_lineage_revision_authority"))
+            if isinstance(
+                payload.get("canonical_precommit_lineage_revision_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        graph_evidence = (
+            dict(payload.get("graph_trace_db_evidence"))
+            if isinstance(payload.get("graph_trace_db_evidence"), Mapping)
+            else {}
+        )
+        guide = self._record_view(
+            record,
+            actor_role=effective_actor_role,
+            completed_lines=lines,
+        )["runtime_guide"]
+        next_action = (
+            guide.get("next_legal_action")
+            if isinstance(guide.get("next_legal_action"), Mapping)
+            else {}
+        )
+
+        runtime_context_id = _worker_commit_text(
+            effective_write,
+            "runtime_context_id",
+        )
+        task_id = _worker_commit_text(effective_write, "task_id")
+        prior_implementation: Mapping[str, Any] | None = None
+        prior_index = -1
+        for index in range(len(lines) - 1, -1, -1):
+            candidate = lines[index]
+            if not isinstance(candidate, Mapping):
+                continue
+            if str(candidate.get("line_id") or "").strip() != "worker_implementation":
+                continue
+            if runtime_context_id and _worker_commit_text(
+                candidate,
+                "runtime_context_id",
+            ) != runtime_context_id:
+                continue
+            if task_id and _worker_commit_text(candidate, "task_id") != task_id:
+                continue
+            prior_implementation = candidate
+            prior_index = index
+            break
+
+        matching_worker_commit_exists = any(
+            isinstance(candidate, Mapping)
+            and str(candidate.get("line_id") or "").strip() == "worker_commit"
+            and (
+                not runtime_context_id
+                or _worker_commit_text(candidate, "runtime_context_id")
+                == runtime_context_id
+            )
+            and (
+                not task_id
+                or _worker_commit_text(candidate, "task_id") == task_id
+            )
+            for candidate in lines
+        )
+        errors: list[str] = []
+        if _record_contract_id(record) not in {"mf_parallel", "mf_parallel.v2"}:
+            errors.append("precommit implementation correction requires mf_parallel.v2")
+        if effective_actor_role != "mf_sub":
+            errors.append(
+                "precommit implementation correction requires actor_role=mf_sub"
+            )
+        if str(effective_write.get("line_id") or "").strip() != (
+            "worker_implementation"
+        ):
+            errors.append(
+                "precommit implementation correction requires worker_implementation"
+            )
+        if str(effective_write.get("evidence_kind") or "").strip() != (
+            "implementation"
+        ):
+            errors.append(
+                "precommit implementation correction requires implementation evidence"
+            )
+        if _active_failed_qa_line_index(lines, source_record=record) >= 0:
+            errors.append(
+                "precommit implementation correction cannot replace failed-QA rework"
+            )
+        if str(next_action.get("line_id") or "").strip() != "worker_commit":
+            errors.append(
+                "precommit implementation correction is only legal before worker_commit"
+            )
+        if prior_implementation is None:
+            errors.append(
+                "precommit implementation correction requires a prior worker_implementation"
+            )
+        if matching_worker_commit_exists:
+            errors.append(
+                "precommit implementation correction is closed after worker_commit"
+            )
+
+        identity_fields = (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "target_project_root",
+            "fence_token_hash",
+            "session_token_ref",
+        )
+        if prior_implementation is not None:
+            for field in identity_fields:
+                prior_value = _worker_commit_text(prior_implementation, field)
+                revised_value = _worker_commit_text(effective_write, field)
+                if prior_value and revised_value != prior_value:
+                    errors.append(
+                        "precommit implementation correction "
+                        f"{field} must match prior implementation"
+                    )
+
+        commit_sha = str(effective_write.get("commit_sha") or "").strip()
+        changed_files = sorted(
+            set(_worker_commit_strings(effective_write, "changed_files"))
+        )
+        graph_trace_ids = sorted(
+            set(
+                _worker_commit_strings(
+                    effective_write,
+                    "graph_trace_ids",
+                    "graph_query_trace_ids",
+                    "verified_trace_ids",
+                )
+            )
+        )
+        if not _WORKER_COMMIT_SHA_RE.fullmatch(commit_sha):
+            errors.append(
+                "precommit implementation correction requires a full immutable commit_sha"
+            )
+        if not changed_files:
+            errors.append(
+                "precommit implementation correction requires cumulative changed_files"
+            )
+        if not graph_trace_ids:
+            errors.append(
+                "precommit implementation correction requires graph_trace_ids"
+            )
+        if authority.get("server_derived") is not True or str(
+            authority.get("source") or ""
+        ).strip() != "runtime_context_clean_cumulative_git_precommit_correction":
+            errors.append(
+                "precommit implementation correction requires server-derived git authority"
+            )
+        if (
+            authority.get("correction_intent_verified") is not True
+            or str(
+                authority.get("correction_intent_schema_version") or ""
+            ).strip()
+            != "runtime_context.precommit_implementation_correction_intent.v1"
+            or str(authority.get("correction_intent_action") or "").strip()
+            != "revise_precommit_worker_implementation"
+        ):
+            errors.append(
+                "precommit implementation correction requires server-verified correction intent"
+            )
+        if authority.get("clean_worktree") is not True:
+            errors.append(
+                "precommit implementation correction requires a clean worktree"
+            )
+        if str(authority.get("actual_head_commit") or "").strip() != commit_sha:
+            errors.append(
+                "precommit implementation correction commit must match actual worker HEAD"
+            )
+        if sorted(set(authority.get("cumulative_changed_files") or [])) != (
+            changed_files
+        ):
+            errors.append(
+                "precommit implementation correction files must match cumulative runtime diff"
+            )
+        owned_files = set(authority.get("owned_files") or [])
+        if not owned_files or set(changed_files) - owned_files:
+            errors.append(
+                "precommit implementation correction files must remain inside the worker fence"
+            )
+        if graph_evidence.get("db_verified") is not True or sorted(
+            set(graph_evidence.get("verified_trace_ids") or [])
+        ) != graph_trace_ids:
+            errors.append(
+                "precommit implementation correction requires exact DB-verified graph traces"
+            )
+
+        prior_payload = (
+            prior_implementation.get("payload")
+            if prior_implementation is not None
+            and isinstance(prior_implementation.get("payload"), Mapping)
+            else {}
+        )
+        prior_correction = (
+            prior_payload.get("canonical_precommit_lineage_revision")
+            if isinstance(
+                prior_payload.get("canonical_precommit_lineage_revision"),
+                Mapping,
+            )
+            else {}
+        )
+        prior_lineage = _worker_implementation_lineage(
+            record,
+            prior_implementation or {},
+        )
+        expected_intent_prior_lineage_ref = str(
+            prior_correction.get(
+                "supersedes_implementation_lineage_ref"
+            )
+            or prior_lineage.get("implementation_lineage_ref")
+            or ""
+        ).strip()
+        if str(
+            authority.get("prior_implementation_lineage_ref") or ""
+        ).strip() != expected_intent_prior_lineage_ref:
+            errors.append(
+                "precommit implementation correction intent must bind the prior implementation lineage"
+            )
+        if prior_correction and not matching_worker_commit_exists:
+            prior_authority = (
+                prior_payload.get(
+                    "canonical_precommit_lineage_revision_authority"
+                )
+                if isinstance(
+                    prior_payload.get(
+                        "canonical_precommit_lineage_revision_authority"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+            prior_files = sorted(
+                set(
+                    _worker_commit_strings(
+                        prior_implementation,
+                        "changed_files",
+                    )
+                )
+            )
+            prior_trace_ids = sorted(
+                set(
+                    _worker_commit_strings(
+                        prior_implementation,
+                        "graph_trace_ids",
+                        "graph_query_trace_ids",
+                        "verified_trace_ids",
+                    )
+                )
+            )
+            if (
+                not errors
+                and str(prior_authority.get("actual_head_commit") or "").strip()
+                == commit_sha
+                and prior_files == changed_files
+                and prior_trace_ids == graph_trace_ids
+            ):
+                return {
+                    "schema_version": "contract_runtime_write_result.v1",
+                    "ok": True,
+                    "status": "already_completed",
+                    "decision": WriteGateDecision(ok=True).to_dict(),
+                    "record": record,
+                    "supersedes_implementation_lineage_ref": str(
+                        prior_correction.get(
+                            "supersedes_implementation_lineage_ref"
+                        )
+                        or ""
+                    ),
+                }
+            errors.append(
+                "precommit implementation correction already recorded; "
+                "different-HEAD replay is forbidden"
+            )
+
+        if errors:
+            return {
+                "schema_version": "contract_runtime_write_result.v1",
+                "ok": False,
+                "decision": WriteGateDecision(
+                    ok=False,
+                    errors=tuple(dict.fromkeys(errors)),
+                ).to_dict(),
+                "record": record,
+            }
+
+        payload["canonical_precommit_lineage_revision"] = {
+            "schema_version": (
+                "contract_runtime.worker_implementation_precommit_revision.v1"
+            ),
+            "source": "server_verified_precommit_correction",
+            "superseded_completed_line_index": prior_index,
+            "supersedes_implementation_lineage_ref": prior_lineage[
+                "implementation_lineage_ref"
+            ],
+            "commit_sha": commit_sha,
+            "append_only_history_preserved": True,
+            "single_correction_boundary": True,
+            "raw_session_tokens_persisted": False,
+        }
+        effective_write["payload"] = payload
+        written_line = _line_evidence_from_write(
+            effective_write,
+            effective_actor_role,
+        )
+        expected_revision = int(record.get("execution_state_revision") or 1)
+        updated_record = dict(record)
+        updated_record["completed_lines"] = [*lines, written_line]
+        updated_record["execution_state_revision"] = expected_revision + 1
+        try:
+            self.store.update(
+                contract_execution_id,
+                updated_record,
+                expected_revision=expected_revision,
+            )
+        except ContractRuntimeError as exc:
+            return {
+                "schema_version": "contract_runtime_write_result.v1",
+                "ok": False,
+                "decision": WriteGateDecision(
+                    ok=False,
+                    errors=(str(exc),),
+                ).to_dict(),
+                "record": self.store.get(contract_execution_id),
+            }
+        next_guide = self.current_guide(
+            contract_execution_id,
+            actor_role=effective_actor_role,
+        )
+        persisted = self.store.get(contract_execution_id)
+        persisted["runtime_guide"] = next_guide
+        self.store.update(contract_execution_id, persisted)
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": True,
+            "status": "revised",
+            "decision": WriteGateDecision(ok=True).to_dict(),
+            "record": self.store.get(contract_execution_id),
+            "supersedes_implementation_lineage_ref": prior_lineage[
+                "implementation_lineage_ref"
+            ],
+        }
+
     def bypass_current_line(
         self,
         contract_execution_id: str,

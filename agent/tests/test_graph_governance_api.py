@@ -103,6 +103,300 @@ from agent.governance.parallel_branch_runtime import (
 PID = "graph-api-test"
 
 
+def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-PRECOMMIT-IMPLEMENTATION-FACADE-CORRECTION"
+    worker_task_id = "precommit-implementation-facade-worker"
+    fence_token = "fence-precommit-implementation-facade-worker"
+    session_token = "token-precommit-implementation-facade-worker"
+    graph_trace_id = "gqt-precommit-implementation-facade-worker"
+    target_root = tmp_path / worker_task_id
+    _init_test_git_repo(target_root)
+    changed_files = [
+        "agent/governance/contracts/runtime.py",
+        "agent/governance/server.py",
+    ]
+    for relative in changed_files:
+        path = target_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", *changed_files], cwd=target_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "precommit correction base"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    base_commit = batch_jobs.git_commit(target_root)
+
+    (target_root / "agent/governance/server.py").write_text(
+        "frozen candidate\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=target_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "frozen implementation candidate"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    frozen_head = batch_jobs.git_commit(target_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: target_root,
+    )
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="precommit-implementation-facade-parent",
+        worker_task_id=worker_task_id,
+        fence_token=fence_token,
+        token=session_token,
+        worktree_path=str(target_root),
+        target_project_root=str(target_root),
+        base_commit=base_commit,
+        owned_files=tuple(changed_files),
+    )
+    evidence_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token=fence_token,
+        graph_trace_id=graph_trace_id,
+        head_commit=frozen_head,
+        include_finish_evidence=False,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=frozen_head,
+        implementation_event_ref=f"timeline:{evidence_events['implementation']}",
+        include_worker_commit=False,
+    )
+    runtime = server._contract_runtime(conn)
+    frozen_record = runtime.store.get(successor["contract_execution_id"])
+    frozen_implementation = next(
+        line
+        for line in reversed(frozen_record["completed_lines"])
+        if line.get("line_id") == "worker_implementation"
+        and line.get("runtime_context_id")
+        == runtime_context.runtime_context_id
+        and line.get("task_id") == runtime_context.task_id
+    )
+    frozen_lineage = _worker_implementation_lineage(
+        frozen_record,
+        frozen_implementation,
+    )
+    correction_intent = {
+        "schema_version": (
+            "runtime_context.precommit_implementation_correction_intent.v1"
+        ),
+        "action": "revise_precommit_worker_implementation",
+        "contract_execution_id": successor["contract_execution_id"],
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "prior_implementation_lineage_ref": frozen_lineage[
+            "implementation_lineage_ref"
+        ],
+    }
+
+    (target_root / "agent/governance/contracts/runtime.py").write_text(
+        "precommit correction\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "agent/governance/contracts/runtime.py"],
+        cwd=target_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "correct frozen implementation candidate"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    corrected_head = batch_jobs.git_commit(target_root)
+
+    def submit_correction(*, intent=correction_intent):
+        request_body = {
+            "parent_task_id": backlog_id,
+            "fence_token": fence_token,
+            "session_token": session_token,
+            "target_project_root": str(target_root),
+            "commit_sha": corrected_head,
+            "changed_files": changed_files,
+            "graph_trace_ids": [graph_trace_id],
+            "tests": [{"command": "pytest -q", "status": "passed"}],
+        }
+        if intent is not None:
+            request_body[
+                "precommit_implementation_correction_intent"
+            ] = intent
+        return server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=request_body,
+            )
+        )
+
+    runtime_file = target_root / "agent/governance/contracts/runtime.py"
+    runtime_file.write_text("dirty precommit correction\n", encoding="utf-8")
+    ordinary_retry = submit_correction(intent=None)
+    assert ordinary_retry["contract_runtime_canonical_line"]["status"] == (
+        "already_completed"
+    )
+    with pytest.raises(GovernanceError) as malformed_intent:
+        submit_correction(
+            intent={
+                "schema_version": correction_intent["schema_version"],
+                "action": correction_intent["action"],
+            }
+        )
+    assert malformed_intent.value.code == (
+        "contract_runtime_precommit_correction_intent_invalid"
+    )
+    with pytest.raises(GovernanceError) as dirty_error:
+        submit_correction()
+    assert dirty_error.value.code == (
+        "contract_runtime_precommit_correction_dirty_worktree"
+    )
+    subprocess.run(
+        ["git", "restore", "agent/governance/contracts/runtime.py"],
+        cwd=target_root,
+        check=True,
+    )
+
+    outside_fence = "agent/governance/shared_cache.py"
+    outside_path = target_root / outside_fence
+    outside_path.write_text("outside worker fence\n", encoding="utf-8")
+    subprocess.run(["git", "add", outside_fence], cwd=target_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "outside worker fence"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    corrected_head = batch_jobs.git_commit(target_root)
+    with pytest.raises(GovernanceError) as scope_error:
+        submit_correction()
+    assert scope_error.value.code == (
+        "contract_runtime_precommit_correction_scope_invalid"
+    )
+    assert scope_error.value.details["out_of_fence_files"] == [outside_fence]
+    outside_path.unlink()
+    subprocess.run(["git", "add", "-u", outside_fence], cwd=target_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "remove outside worker fence"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    corrected_head = batch_jobs.git_commit(target_root)
+
+    corrected = submit_correction()
+    canonical = corrected["contract_runtime_canonical_line"]
+    assert canonical["accepted"] is True
+    assert canonical["status"] == "revised"
+    assert canonical["commit_sha"] == corrected_head
+    assert canonical["append_only_history_preserved"] is True
+    assert canonical["supersedes_implementation_lineage_ref"]
+
+    revised_record = runtime.store.get(successor["contract_execution_id"])
+    implementations = [
+        line
+        for line in revised_record["completed_lines"]
+        if line.get("line_id") == "worker_implementation"
+    ]
+    assert len(implementations) == 2
+    assert implementations[0]["commit_sha"] == frozen_head
+    assert implementations[0]["changed_files"] == ["agent/governance/server.py"]
+    assert implementations[-1]["commit_sha"] == corrected_head
+    assert implementations[-1]["changed_files"] == changed_files
+    correction = implementations[-1]["payload"][
+        "canonical_precommit_lineage_revision"
+    ]
+    assert correction["append_only_history_preserved"] is True
+    assert correction["commit_sha"] == corrected_head
+    assert correction["supersedes_implementation_lineage_ref"] == (
+        canonical["supersedes_implementation_lineage_ref"]
+    )
+    authority = implementations[-1]["payload"][
+        "canonical_precommit_lineage_revision_authority"
+    ]
+    assert authority["server_derived"] is True
+    assert authority["diff_base_commit"] == base_commit
+    assert authority["actual_head_commit"] == corrected_head
+    assert authority["cumulative_changed_files"] == changed_files
+
+    idempotent_correction = submit_correction()
+    assert idempotent_correction[
+        "contract_runtime_canonical_line"
+    ]["status"] == "already_completed"
+
+    latest_lineage = _worker_implementation_lineage(
+        revised_record,
+        implementations[-1],
+    )
+    worker_commit = server.handle_graph_governance_runtime_context_worker_commit(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "contract_execution_id": successor["contract_execution_id"],
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "fence_token": fence_token,
+                "session_token": session_token,
+                "target_project_root": str(target_root),
+                "worker_commit_sha": corrected_head,
+                "worker_session_id": runtime_context.worker_slot_id,
+                "filer_principal": runtime_context.worker_slot_id,
+                "implementation_lineage_ref": latest_lineage[
+                    "implementation_lineage_ref"
+                ],
+                "owned_files": changed_files,
+                "changed_files": changed_files,
+                "graph_trace_ids": latest_lineage["graph_trace_ids"],
+            },
+        )
+    )
+    assert worker_commit["ok"] is True
+    assert worker_commit["worker_commit"]["commit_sha"] == corrected_head
+    assert worker_commit["worker_commit"]["implementation_lineage_ref"] == (
+        latest_lineage["implementation_lineage_ref"]
+    )
+    assert worker_commit["contract_runtime_close_evidence_gate"]["accepted"] is True
+    assert worker_commit["next_legal_action"] == (
+        "record_finish_time_worker_attestation"
+    )
+
+
 def test_runtime_context_head_projection_prefers_assigned_worktree(
     tmp_path,
 ):
@@ -32891,10 +33185,12 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         )
     )
     assert revised_implementation["ok"] is True
-    assert revised_implementation["contract_runtime_canonical_line"]["status"] in {
-        "completed",
-        "already_completed",
-    }
+    revised_canonical = revised_implementation[
+        "contract_runtime_canonical_line"
+    ]
+    assert revised_canonical["status"] in {"completed", "already_completed"}
+    assert revised_canonical.get("projection_only") is not True
+    assert revised_canonical.get("precommit_implementation_correction") is not True
     revised_record = server._contract_runtime(conn).store.get(
         successor["contract_execution_id"]
     )
@@ -32907,6 +33203,25 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     assert revised_record["completed_lines"][-1]["commit_sha"] == hashlib.sha1(
         b"contract-failed-qa-revised-worker-head"
     ).hexdigest()
+    implementation_lines = [
+        line
+        for line in revised_record["completed_lines"]
+        if line.get("line_id") == "worker_implementation"
+        and line.get("runtime_context_id") == runtime_context.runtime_context_id
+    ]
+    assert len(implementation_lines) >= 2
+    prior_lineage = server._worker_implementation_lineage(
+        revised_record,
+        implementation_lines[-2],
+    )
+    revised_lineage = server._worker_implementation_lineage(
+        revised_record,
+        implementation_lines[-1],
+    )
+    assert revised_lineage["implementation_lineage_ref"]
+    assert revised_lineage["implementation_lineage_ref"] != (
+        prior_lineage["implementation_lineage_ref"]
+    )
 
     revised_head = hashlib.sha1(
         b"contract-failed-qa-revised-worker-head"
@@ -32919,7 +33234,7 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         "commit_sha": revised_head,
         "status": "passed",
     }
-    completed_retry_lines = [
+    completed_worker_retry_lines = [
         {
             **retry_common,
             "stage_id": stage_id,
@@ -32942,6 +33257,18 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
                 "mf_sub",
                 "mf_subagent_finish_gate",
             ),
+        )
+    ]
+    completed_qa_retry_lines = [
+        {
+            **retry_common,
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "actor_role": actor_role,
+            "evidence_kind": evidence_kind,
+            "payload": {**retry_common, "status": "passed"},
+        }
+        for stage_id, line_id, actor_role, evidence_kind in (
             ("qa_graph_context", "qa_graph_context", "qa", "graph_trace"),
             (
                 "qa",
@@ -32954,13 +33281,32 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     retry_record = dict(revised_record)
     retry_record["completed_lines"] = [
         *list(revised_record["completed_lines"]),
-        *completed_retry_lines,
+        *completed_worker_retry_lines,
     ]
     retry_record["execution_state_revision"] = int(
         revised_record["execution_state_revision"]
     ) + 1
     runtime = server._contract_runtime(conn)
     runtime.store.update(successor["contract_execution_id"], retry_record)
+    after_worker_retry = runtime.current_guide(
+        successor["contract_execution_id"], actor_role="qa"
+    )
+    assert after_worker_retry["next_legal_action"]["line_id"] == (
+        "qa_graph_context"
+    )
+
+    completed_retry_record = dict(retry_record)
+    completed_retry_record["completed_lines"] = [
+        *list(retry_record["completed_lines"]),
+        *completed_qa_retry_lines,
+    ]
+    completed_retry_record["execution_state_revision"] = int(
+        retry_record["execution_state_revision"]
+    ) + 1
+    runtime.store.update(
+        successor["contract_execution_id"],
+        completed_retry_record,
+    )
 
     rejoin_events = task_timeline.list_events(
         conn,

@@ -344,6 +344,368 @@ def test_projected_record_cannot_override_canonical_worker_commit_lineage(
     assert canonical_precheck["ok"] is True
 
 
+def test_precommit_worker_implementation_correction_is_append_only_and_bounded(
+    tmp_path,
+):
+    _write_contract_definition(
+        tmp_path,
+        contract_id="mf_parallel.v2",
+        stages=[
+            {
+                "stage_id": "worker_implementation",
+                "lines": [
+                    {
+                        "line_id": "worker_implementation",
+                        "owner_role": "mf_sub",
+                        "allowed_writer_roles": ["mf_sub"],
+                        "evidence_kind": "implementation",
+                    }
+                ],
+            },
+            {
+                "stage_id": "worker_commit",
+                "lines": [
+                    {
+                        "line_id": "worker_commit",
+                        "owner_role": "mf_sub",
+                        "allowed_writer_roles": ["mf_sub"],
+                        "evidence_kind": "worker_commit",
+                        "requires": ["worker_implementation"],
+                    }
+                ],
+            },
+        ],
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    execution = runtime.start_execution(
+        "mf_parallel.v2",
+        project_id="aming-claw",
+        backlog_id="AC-PRECOMMIT-CORRECTION",
+        contract_execution_id="cex-precommit-correction",
+        actor_role="observer",
+    )
+    runtime.current_guide(
+        execution["contract_execution_id"],
+        actor_role="mf_sub",
+    )
+    changed_files = [
+        "agent/governance/contracts/runtime.py",
+        "agent/governance/server.py",
+    ]
+    identity = {
+        "runtime_context_id": "mfrctx-precommit-correction",
+        "task_id": "task-precommit-correction",
+        "parent_task_id": "AC-PRECOMMIT-CORRECTION",
+        "worker_id": "worker-precommit-correction",
+        "worker_slot_id": "worker-precommit-correction",
+        "target_project_root": str(tmp_path),
+        "session_token_ref": "wstok-precommit-correction",
+        "fence_token_hash": "sha256:precommit-fence",
+    }
+    initial_record = runtime.store.get(execution["contract_execution_id"])
+    initial_write = {
+        **_write_from(
+            initial_record,
+            actor_role="mf_sub",
+            stage_id="worker_implementation",
+            line_id="worker_implementation",
+            evidence_kind="implementation",
+        ),
+        **identity,
+        "commit_sha": "a" * 40,
+        "changed_files": [changed_files[0]],
+        "graph_trace_ids": ["gqt-precommit-initial"],
+        "payload": {
+            **identity,
+            "changed_files": [changed_files[0]],
+            "graph_trace_ids": ["gqt-precommit-initial"],
+        },
+    }
+    initial_result = runtime.submit_line_write(
+        execution["contract_execution_id"],
+        initial_write,
+        actor_role="mf_sub",
+    )
+    assert initial_result["ok"], json.dumps(
+        initial_result["decision"],
+        indent=2,
+    )
+    before_correction = runtime.store.get(execution["contract_execution_id"])
+    immutable_initial = json.loads(
+        json.dumps(before_correction["completed_lines"][0])
+    )
+    initial_lineage = _worker_implementation_lineage(
+        before_correction,
+        before_correction["completed_lines"][0],
+    )
+
+    corrected_head = "b" * 40
+    correction_payload = {
+        **identity,
+        "changed_files": changed_files,
+        "graph_trace_ids": ["gqt-precommit-corrected"],
+        "precommit_implementation_correction_intent": {
+            "schema_version": (
+                "runtime_context.precommit_implementation_correction_intent.v1"
+            ),
+            "action": "revise_precommit_worker_implementation",
+            "contract_execution_id": execution["contract_execution_id"],
+            "runtime_context_id": identity["runtime_context_id"],
+            "task_id": identity["task_id"],
+            "prior_implementation_lineage_ref": initial_lineage[
+                "implementation_lineage_ref"
+            ],
+            "verified_by_server": True,
+            "caller_authority_fields_trusted": False,
+        },
+        "graph_trace_db_evidence": {
+            "db_verified": True,
+            "verified_trace_ids": ["gqt-precommit-corrected"],
+        },
+        "canonical_precommit_lineage_revision_authority": {
+            "schema_version": (
+                "runtime_context.clean_cumulative_git_precommit_correction_authority.v1"
+            ),
+            "source": (
+                "runtime_context_clean_cumulative_git_precommit_correction"
+            ),
+            "server_derived": True,
+            "actual_head_commit": corrected_head,
+            "diff_base_commit": "0" * 40,
+            "clean_worktree": True,
+            "cumulative_changed_files": changed_files,
+            "owned_files": changed_files,
+            "graph_trace_ids": ["gqt-precommit-corrected"],
+            "correction_intent_verified": True,
+            "correction_intent_schema_version": (
+                "runtime_context.precommit_implementation_correction_intent.v1"
+            ),
+            "correction_intent_action": (
+                "revise_precommit_worker_implementation"
+            ),
+            "prior_implementation_lineage_ref": initial_lineage[
+                "implementation_lineage_ref"
+            ],
+            "caller_authority_fields_trusted": False,
+        },
+    }
+    correction_write = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "actor_role": "mf_sub",
+        "evidence_kind": "implementation",
+        "commit_sha": corrected_head,
+        "changed_files": changed_files,
+        "graph_trace_ids": ["gqt-precommit-corrected"],
+        "payload": correction_payload,
+    }
+    corrected = runtime.revise_precommit_worker_implementation(
+        execution["contract_execution_id"],
+        correction_write,
+        actor_role="mf_sub",
+    )
+    assert corrected["ok"] is True
+    assert corrected["status"] == "revised"
+    assert corrected["supersedes_implementation_lineage_ref"] == (
+        initial_lineage["implementation_lineage_ref"]
+    )
+
+    corrected_record = runtime.store.get(execution["contract_execution_id"])
+    implementations = [
+        line
+        for line in corrected_record["completed_lines"]
+        if line.get("line_id") == "worker_implementation"
+    ]
+    assert len(implementations) == 2
+    assert implementations[0] == immutable_initial
+    assert implementations[-1]["commit_sha"] == corrected_head
+    assert implementations[-1]["changed_files"] == changed_files
+    correction_audit = implementations[-1]["payload"][
+        "canonical_precommit_lineage_revision"
+    ]
+    assert correction_audit["source"] == (
+        "server_verified_precommit_correction"
+    )
+    assert correction_audit["append_only_history_preserved"] is True
+    assert correction_audit["single_correction_boundary"] is True
+    assert correction_audit["supersedes_implementation_lineage_ref"] == (
+        initial_lineage["implementation_lineage_ref"]
+    )
+    latest_lineage = _worker_implementation_lineage(
+        corrected_record,
+        implementations[-1],
+    )
+    assert latest_lineage["changed_files"] == changed_files
+    assert latest_lineage["graph_trace_ids"] == [
+        "gqt-precommit-corrected"
+    ]
+
+    corrected_revision = corrected_record["execution_state_revision"]
+    idempotent = runtime.revise_precommit_worker_implementation(
+        execution["contract_execution_id"],
+        correction_write,
+        actor_role="mf_sub",
+    )
+    assert idempotent["ok"] is True
+    assert idempotent["status"] == "already_completed"
+    assert runtime.store.get(execution["contract_execution_id"])[
+        "execution_state_revision"
+    ] == corrected_revision
+
+    wrong_idempotent_lineage = {
+        **correction_write,
+        "payload": {
+            **correction_payload,
+            "precommit_implementation_correction_intent": {
+                **correction_payload[
+                    "precommit_implementation_correction_intent"
+                ],
+                "prior_implementation_lineage_ref": (
+                    "contract-runtime:worker-implementation:sha256:"
+                    + "f" * 64
+                ),
+            },
+            "canonical_precommit_lineage_revision_authority": {
+                **correction_payload[
+                    "canonical_precommit_lineage_revision_authority"
+                ],
+                "prior_implementation_lineage_ref": (
+                    "contract-runtime:worker-implementation:sha256:"
+                    + "f" * 64
+                ),
+            },
+        },
+    }
+    rejected_idempotent = runtime.revise_precommit_worker_implementation(
+        execution["contract_execution_id"],
+        wrong_idempotent_lineage,
+        actor_role="mf_sub",
+    )
+    assert rejected_idempotent["ok"] is False
+    assert any(
+        "intent must bind the prior implementation lineage" in error
+        for error in rejected_idempotent["decision"]["errors"]
+    )
+    assert runtime.store.get(execution["contract_execution_id"])[
+        "execution_state_revision"
+    ] == corrected_revision
+
+    negative_cases = {
+        "different_head": {
+            **correction_write,
+            "commit_sha": "c" * 40,
+            "payload": {
+                **correction_payload,
+                "commit_sha": "c" * 40,
+                "canonical_precommit_lineage_revision_authority": {
+                    **correction_payload[
+                        "canonical_precommit_lineage_revision_authority"
+                    ],
+                    "actual_head_commit": "c" * 40,
+                },
+            },
+        },
+        "different_worker": {
+            **correction_write,
+            "worker_id": "different-worker",
+            "payload": {
+                **correction_payload,
+                "worker_id": "different-worker",
+            },
+        },
+        "different_session": {
+            **correction_write,
+            "session_token_ref": "wstok-different-session",
+            "payload": {
+                **correction_payload,
+                "session_token_ref": "wstok-different-session",
+            },
+        },
+        "different_fence": {
+            **correction_write,
+            "fence_token_hash": "sha256:different-fence",
+            "payload": {
+                **correction_payload,
+                "fence_token_hash": "sha256:different-fence",
+            },
+        },
+        "caller_graph_authority": {
+            **correction_write,
+            "payload": {
+                **correction_payload,
+                "graph_trace_db_evidence": {
+                    "db_verified": False,
+                    "verified_trace_ids": ["gqt-precommit-corrected"],
+                },
+            },
+        },
+    }
+    for case_name, candidate in negative_cases.items():
+        rejected = runtime.revise_precommit_worker_implementation(
+            execution["contract_execution_id"],
+            candidate,
+            actor_role="mf_sub",
+        )
+        assert rejected["ok"] is False, case_name
+        assert runtime.store.get(execution["contract_execution_id"])[
+            "execution_state_revision"
+        ] == corrected_revision, case_name
+
+    after_correction = runtime.store.get(execution["contract_execution_id"])
+    worker_commit = {
+        "stage_id": "worker_commit",
+        "line_id": "worker_commit",
+        "actor_role": "mf_sub",
+        "evidence_kind": "worker_commit",
+        **identity,
+        "implementation_lineage_ref": latest_lineage[
+            "implementation_lineage_ref"
+        ],
+        "commit_sha": corrected_head,
+        "payload": {
+            **identity,
+            "implementation_lineage_ref": latest_lineage[
+                "implementation_lineage_ref"
+            ],
+            "commit_sha": corrected_head,
+        },
+    }
+    after_correction["completed_lines"].append(worker_commit)
+    expected_revision = int(after_correction["execution_state_revision"])
+    after_correction["execution_state_revision"] = expected_revision + 1
+    runtime.store.update(
+        execution["contract_execution_id"],
+        after_correction,
+        expected_revision=expected_revision,
+    )
+    runtime.current_guide(
+        execution["contract_execution_id"],
+        actor_role="mf_sub",
+    )
+    after_commit_revision = runtime.store.get(
+        execution["contract_execution_id"]
+    )["execution_state_revision"]
+    closed = runtime.revise_precommit_worker_implementation(
+        execution["contract_execution_id"],
+        correction_write,
+        actor_role="mf_sub",
+    )
+    assert closed["ok"] is False
+    assert any(
+        "closed after worker_commit" in error
+        for error in closed["decision"]["errors"]
+    )
+    assert runtime.store.get(execution["contract_execution_id"])[
+        "execution_state_revision"
+    ] == after_commit_revision
+
+
 def _write_minimal_contract(tmp_path, *, status: str = "active"):
     prompts = tmp_path / "prompts"
     prompts.mkdir(exist_ok=True)
