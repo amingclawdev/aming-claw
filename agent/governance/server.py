@@ -78908,6 +78908,13 @@ def _contract_runtime_close_gate(
                     task_id = str(
                         getattr(runtime_context, "task_id", "") or ""
                     ).strip()
+                    active_failed_qa_revision = (
+                        _active_failed_qa_line_index(
+                            list(stored_record.get("completed_lines") or []),
+                            source_record=stored_record,
+                        )
+                        >= 0
+                    )
                     completed_implementation = (
                         _worker_commit_completed_implementation(
                             stored_record,
@@ -78915,7 +78922,10 @@ def _contract_runtime_close_gate(
                             task_id=task_id,
                         )
                     )
-                    if completed_implementation is not None:
+                    if (
+                        completed_implementation is not None
+                        and not active_failed_qa_revision
+                    ):
                         return {
                             "schema_version": (
                                 _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION

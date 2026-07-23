@@ -33185,10 +33185,12 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         )
     )
     assert revised_implementation["ok"] is True
-    assert revised_implementation["contract_runtime_canonical_line"]["status"] in {
-        "completed",
-        "already_completed",
-    }
+    revised_canonical = revised_implementation[
+        "contract_runtime_canonical_line"
+    ]
+    assert revised_canonical["status"] in {"completed", "already_completed"}
+    assert revised_canonical.get("projection_only") is not True
+    assert revised_canonical.get("precommit_implementation_correction") is not True
     revised_record = server._contract_runtime(conn).store.get(
         successor["contract_execution_id"]
     )
@@ -33201,6 +33203,25 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     assert revised_record["completed_lines"][-1]["commit_sha"] == hashlib.sha1(
         b"contract-failed-qa-revised-worker-head"
     ).hexdigest()
+    implementation_lines = [
+        line
+        for line in revised_record["completed_lines"]
+        if line.get("line_id") == "worker_implementation"
+        and line.get("runtime_context_id") == runtime_context.runtime_context_id
+    ]
+    assert len(implementation_lines) >= 2
+    prior_lineage = server._worker_implementation_lineage(
+        revised_record,
+        implementation_lines[-2],
+    )
+    revised_lineage = server._worker_implementation_lineage(
+        revised_record,
+        implementation_lines[-1],
+    )
+    assert revised_lineage["implementation_lineage_ref"]
+    assert revised_lineage["implementation_lineage_ref"] != (
+        prior_lineage["implementation_lineage_ref"]
+    )
 
     revised_head = hashlib.sha1(
         b"contract-failed-qa-revised-worker-head"
@@ -33213,7 +33234,7 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         "commit_sha": revised_head,
         "status": "passed",
     }
-    completed_retry_lines = [
+    completed_worker_retry_lines = [
         {
             **retry_common,
             "stage_id": stage_id,
@@ -33236,6 +33257,18 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
                 "mf_sub",
                 "mf_subagent_finish_gate",
             ),
+        )
+    ]
+    completed_qa_retry_lines = [
+        {
+            **retry_common,
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "actor_role": actor_role,
+            "evidence_kind": evidence_kind,
+            "payload": {**retry_common, "status": "passed"},
+        }
+        for stage_id, line_id, actor_role, evidence_kind in (
             ("qa_graph_context", "qa_graph_context", "qa", "graph_trace"),
             (
                 "qa",
@@ -33248,13 +33281,32 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     retry_record = dict(revised_record)
     retry_record["completed_lines"] = [
         *list(revised_record["completed_lines"]),
-        *completed_retry_lines,
+        *completed_worker_retry_lines,
     ]
     retry_record["execution_state_revision"] = int(
         revised_record["execution_state_revision"]
     ) + 1
     runtime = server._contract_runtime(conn)
     runtime.store.update(successor["contract_execution_id"], retry_record)
+    after_worker_retry = runtime.current_guide(
+        successor["contract_execution_id"], actor_role="qa"
+    )
+    assert after_worker_retry["next_legal_action"]["line_id"] == (
+        "qa_graph_context"
+    )
+
+    completed_retry_record = dict(retry_record)
+    completed_retry_record["completed_lines"] = [
+        *list(retry_record["completed_lines"]),
+        *completed_qa_retry_lines,
+    ]
+    completed_retry_record["execution_state_revision"] = int(
+        retry_record["execution_state_revision"]
+    ) + 1
+    runtime.store.update(
+        successor["contract_execution_id"],
+        completed_retry_record,
+    )
 
     rejoin_events = task_timeline.list_events(
         conn,
