@@ -64691,9 +64691,17 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         "line_id": "observer_merge",
         "actor_role": "observer",
         "evidence_kind": "merge",
+        "runtime_context_id": "caller-runtime-context",
+        "task_id": "caller-task",
+        "parent_task_id": contract_execution_id,
         "commit_sha": merged_commit,
         "payload": {
             "merge_commit": merged_commit,
+            "runtime_context_id": "caller-runtime-context",
+            "task_id": "caller-task",
+            "worker_task_id": "caller-worker-task",
+            "parent_task_id": contract_execution_id,
+            "root_task_id": contract_execution_id,
             "durable_merge_authority": {
                 "server_derived": True,
                 "db_verified": True,
@@ -64764,6 +64772,43 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     assert durable_merge["worker_commit_completed_line_index"] == 6
     assert durable_merge["qa_graph_completed_line_index"] == 9
     assert durable_merge["qa_completed_line_index"] == 10
+    assert bound_merge_write["runtime_context_id"] == runtime_context_id
+    assert bound_merge_write["task_id"] == task_id
+    assert bound_merge_write["parent_task_id"] == context.parent_task_id
+    assert bound_merge_write["payload"]["runtime_context_id"] == (
+        runtime_context_id
+    )
+    assert bound_merge_write["payload"]["task_id"] == task_id
+    assert bound_merge_write["payload"]["worker_task_id"] == task_id
+    assert bound_merge_write["payload"]["parent_task_id"] == (
+        context.parent_task_id
+    )
+    assert bound_merge_write["payload"]["root_task_id"] == (
+        context.parent_task_id
+    )
+    forged_write = json.loads(json.dumps(r6_like_merge_write))
+    forged_write["payload"]["durable_merge_authority"][
+        "parent_task_id"
+    ] = contract_execution_id
+    with pytest.raises(GovernanceError) as forged_write_rejection:
+        server._contract_runtime_bind_server_line_authority(
+            _ctx({"project_id": project_id}),
+            conn,
+            project_id=project_id,
+            record=late_read_record,
+            write=forged_write,
+            body=forged_write,
+        )
+    assert forged_write_rejection.value.code == (
+        "contract_runtime_observer_merge_authority_mismatch"
+    )
+    assert forged_write_rejection.value.details["mismatches"] == [
+        {
+            "field": "durable_merge_authority.parent_task_id",
+            "expected": context.parent_task_id,
+            "actual": contract_execution_id,
+        }
+    ]
 
     cross_runtime_round = json.loads(json.dumps(late_read_record))
     cross_runtime_round["completed_lines"][6]["runtime_context_id"] = (
@@ -64812,6 +64857,53 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         contract_execution_id,
         record,
         expected_revision=int(record["execution_state_revision"]),
+    )
+
+    # Historical accepted lines are immutable raw audit.  A caller-shaped
+    # duplicate parent inside payload must stay visible, while runtime
+    # projection derives the worker identity exclusively from the durable
+    # server authority and can therefore proceed to reconcile.
+    historical_conflict = json.loads(json.dumps(record))
+    historical_merge = historical_conflict["completed_lines"][-1]
+    historical_merge["payload"]["parent_task_id"] = contract_execution_id
+    assert historical_merge["payload"]["parent_task_id"] == (
+        contract_execution_id
+    )
+    historical_identity = server._contract_runtime_server_line_identity(
+        historical_conflict
+    )
+    assert historical_identity == {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": context.parent_task_id,
+        "identity_status": "resolved",
+        "identity_source_line_id": "observer_merge",
+    }
+    historical_projection = server._contract_runtime_trusted_merge_projection(
+        conn,
+        project_id=project_id,
+        record=historical_conflict,
+    )
+    assert historical_projection["timeline_verified"] is True
+    assert historical_projection["runtime_context_id"] == runtime_context_id
+    assert historical_projection["task_id"] == task_id
+    assert historical_projection["parent_task_id"] == context.parent_task_id
+
+    forged_durable_identity = json.loads(json.dumps(historical_conflict))
+    forged_durable_identity["completed_lines"][-1]["payload"][
+        "durable_merge_authority"
+    ]["parent_task_id"] = contract_execution_id
+    assert server._contract_runtime_server_line_identity(
+        forged_durable_identity
+    )["identity_status"] == "ambiguous"
+    forged_projection = server._contract_runtime_trusted_merge_projection(
+        conn,
+        project_id=project_id,
+        record=forged_durable_identity,
+    )
+    assert forged_projection["timeline_verified"] is False
+    assert forged_projection["identity_mismatches"][0]["field"] == (
+        "server_line_identity"
     )
 
     route_bound_scope = server._current_full_reconcile_runtime_context_scope(

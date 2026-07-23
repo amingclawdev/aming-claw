@@ -62154,6 +62154,79 @@ def _contract_runtime_server_line_identity(
         ],
     ]
     for source_line_id, source in sources:
+        if source_line_id == "observer_merge":
+            payload = (
+                source.get("payload")
+                if isinstance(source.get("payload"), Mapping)
+                else {}
+            )
+            durable = (
+                payload.get("durable_merge_authority")
+                if isinstance(payload.get("durable_merge_authority"), Mapping)
+                else {}
+            )
+            if durable:
+                durable_identity = {
+                    "runtime_context_id": _contract_runtime_mapping_value(
+                        durable,
+                        "runtime_context_id",
+                    ),
+                    "task_id": _contract_runtime_mapping_value(
+                        durable,
+                        "task_id",
+                    ),
+                    "parent_task_id": _contract_runtime_mapping_value(
+                        durable,
+                        "parent_task_id",
+                    ),
+                }
+                top_level_identity = {
+                    "runtime_context_id": _contract_runtime_mapping_value(
+                        source,
+                        "runtime_context_id",
+                    ),
+                    "task_id": _contract_runtime_mapping_value(
+                        source,
+                        "task_id",
+                        "worker_task_id",
+                    ),
+                    "parent_task_id": _contract_runtime_mapping_value(
+                        source,
+                        "parent_task_id",
+                        "root_task_id",
+                    ),
+                }
+                durable_is_server_authority = bool(
+                    str(durable.get("schema_version") or "")
+                    == _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
+                    and durable.get("server_derived") is True
+                    and durable.get("db_verified") is True
+                    and durable_identity["runtime_context_id"]
+                    and durable_identity["task_id"]
+                    and durable_identity["parent_task_id"]
+                )
+                top_level_mismatches = [
+                    field
+                    for field, value in top_level_identity.items()
+                    if value and value != durable_identity[field]
+                ]
+                if not durable_is_server_authority or top_level_mismatches:
+                    return {
+                        **empty,
+                        "identity_status": "ambiguous",
+                        "identity_source_line_id": source_line_id,
+                    }
+                # Accepted observer_merge lines retain their immutable raw
+                # caller payload for audit/playback.  Identity projection,
+                # however, is owned by the durable server authority.  Ignore
+                # conflicting caller-shaped duplicate fields inside payload;
+                # the canonical top level and durable authority still have to
+                # agree, and all later queue/timeline joins remain mandatory.
+                return {
+                    **durable_identity,
+                    "identity_status": "resolved",
+                    "identity_source_line_id": source_line_id,
+                }
         identities: dict[tuple[str, str, str], dict[str, str]] = {}
         for candidate in _contract_runtime_mapping_candidates(source):
             runtime_context_id = _contract_runtime_mapping_value(
@@ -64666,6 +64739,11 @@ def _contract_runtime_bind_observer_merge_authority(
         if isinstance(write.get("payload"), Mapping)
         else {}
     )
+    supplied_durable = (
+        payload.get("durable_merge_authority")
+        if isinstance(payload.get("durable_merge_authority"), Mapping)
+        else {}
+    )
     expected_values = {
         "branch_head": authority["branch_head"],
         "merge_commit": authority["merge_commit"],
@@ -64698,6 +64776,17 @@ def _contract_runtime_bind_observer_merge_authority(
                 "actual": "false",
             }
         )
+    for field in ("runtime_context_id", "task_id", "parent_task_id"):
+        supplied = str(supplied_durable.get(field) or "").strip()
+        expected = str(authority[field]).strip()
+        if supplied and supplied != expected:
+            mismatches.append(
+                {
+                    "field": f"durable_merge_authority.{field}",
+                    "expected": expected,
+                    "actual": supplied,
+                }
+            )
     if mismatches:
         raise GovernanceError(
             "contract_runtime_observer_merge_authority_mismatch",
@@ -64754,6 +64843,12 @@ def _contract_runtime_bind_observer_merge_authority(
     effective = dict(write)
     effective["payload"] = payload
     effective["commit_sha"] = authority["merge_commit"]
+    for field in ("runtime_context_id", "task_id", "parent_task_id"):
+        payload[field] = authority[field]
+    if "worker_task_id" in payload:
+        payload["worker_task_id"] = authority["task_id"]
+    if "root_task_id" in payload:
+        payload["root_task_id"] = authority["parent_task_id"]
     for field, value in expected_values.items():
         effective[field] = value
     for field in ("runtime_context_id", "task_id", "parent_task_id"):
