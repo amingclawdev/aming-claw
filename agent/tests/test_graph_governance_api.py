@@ -1402,6 +1402,36 @@ def test_runtime_context_finish_resolves_recorded_commit_and_rejects_later_drift
     assert projection["worker_commit_sha"] == worker_commit
     assert projection["contract_execution_id"] == "cex-drift"
     assert projection["contract_runtime_execution_resolution"] == resolution
+    assert projection["owned_files"] == ["owned.py"]
+    assert projection["fence_authority_source"] == (
+        "contract_runtime_worker_commit_recorded_fence"
+    )
+
+    context.owned_files = ("owned.py",)
+    allocated_projection = (
+        server._runtime_context_contract_worker_commit_projection(
+            None,
+            **kwargs,
+        )
+    )
+    assert allocated_projection["fence_authority_source"] == (
+        "runtime_context_allocated_fence"
+    )
+
+    context.owned_files = ("different.py",)
+    with pytest.raises(GovernanceError) as allocated_drift:
+        server._runtime_context_contract_worker_commit_projection(None, **kwargs)
+    assert allocated_drift.value.code == "contract_worker_commit_drift"
+    assert "owned fence drifted" in str(allocated_drift.value)
+    assert "out-of-fence files" in str(allocated_drift.value)
+    assert allocated_drift.value.details["recorded_owned_files"] == ["owned.py"]
+    assert allocated_drift.value.details["allocated_owned_files"] == [
+        "different.py"
+    ]
+    assert allocated_drift.value.details["fence_authority_source"] == (
+        "runtime_context_allocated_fence"
+    )
+    del context.owned_files
 
     owned.write_text("dirty after commit\n", encoding="utf-8")
     with pytest.raises(GovernanceError) as dirty:

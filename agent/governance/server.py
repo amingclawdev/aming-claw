@@ -29750,9 +29750,19 @@ def _runtime_context_contract_worker_commit_projection(
             or ()
         )
     )
+    projection_owned_files = (
+        allocated_owned_files
+        if allocated_owned_files
+        else sorted(set(recorded_owned_files))
+    )
+    fence_authority_source = (
+        "runtime_context_allocated_fence"
+        if allocated_owned_files
+        else "contract_runtime_worker_commit_recorded_fence"
+    )
     fence_containment = _worker_fence_containment(
         committed_files,
-        allocated_owned_files,
+        projection_owned_files,
         repository_root=worktree_path,
     )
     errors: list[str] = []
@@ -29770,7 +29780,10 @@ def _runtime_context_contract_worker_commit_projection(
         errors.append("ContractRuntime worker_commit revision parent drifted")
     if recorded_diff_base != diff_base_commit:
         errors.append("ContractRuntime worker_commit runtime diff base drifted")
-    if sorted(set(recorded_owned_files)) != allocated_owned_files:
+    if (
+        allocated_owned_files
+        and sorted(set(recorded_owned_files)) != allocated_owned_files
+    ):
         errors.append("ContractRuntime worker_commit owned fence drifted")
     if not fence_containment["ok"]:
         errors.append("ContractRuntime worker_commit contains out-of-fence files")
@@ -29793,6 +29806,8 @@ def _runtime_context_contract_worker_commit_projection(
                 "actual_diff_base_commit": diff_base_commit,
                 "recorded_owned_files": recorded_owned_files,
                 "allocated_owned_files": allocated_owned_files,
+                "projection_owned_files": projection_owned_files,
+                "fence_authority_source": fence_authority_source,
                 "fence_containment": fence_containment,
                 "dirty_files": dirty_files,
                 "source_of_authority": "ContractRuntime.completed_lines.worker_commit",
@@ -29832,6 +29847,7 @@ def _runtime_context_contract_worker_commit_projection(
         "changed_files": recorded_files,
         "commit_diff_files": recorded_diff_files,
         "owned_files": recorded_owned_files,
+        "fence_authority_source": fence_authority_source,
         "graph_trace_ids": _runtime_context_service_query_values(
             payload,
             "graph_trace_ids",
