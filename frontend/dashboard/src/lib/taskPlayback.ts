@@ -712,10 +712,24 @@ export function taskPlaybackNextLegalActionPresentations(
       ? actionId && actionId !== actionValue ? `${actionValue} (${actionId})` : actionValue
       : actionId || description;
     if (!actionText) return;
+    const blockerIds = stringsFromUnknown(action.blocker_ids)
+      .map((value) => sanitizeTaskPlaybackEvidenceText(safeText(String(value)), `${source}.next_legal_action.blocker_ids`))
+      .filter(Boolean);
+    const blockerId = sanitizeTaskPlaybackEvidenceText(
+      safeText(String(action.blocker_id ?? action.block_id ?? "")),
+      `${source}.next_legal_action.blocker_id`,
+    );
+    const repairTargetId = sanitizeTaskPlaybackEvidenceText(
+      safeText(String(action.repair_target_id ?? action.diagnostic_backlog_id ?? action.governed_action ?? "")),
+      `${source}.next_legal_action.repair_target_id`,
+    );
     const detail = [
       safeText(String(action.stage_id ?? "")) ? `stage ${safeText(String(action.stage_id ?? ""))}` : "",
       safeText(String(action.line_id ?? "")) ? `line ${safeText(String(action.line_id ?? ""))}` : "",
       safeText(String(action.owner_role ?? "")) ? `owner ${safeText(String(action.owner_role ?? ""))}` : "",
+      blockerId ? `blocker ${blockerId}` : "",
+      blockerIds.length > 0 ? `blockers ${blockerIds.join(", ")}` : "",
+      repairTargetId ? `repair target ${repairTargetId}` : "",
       description && description !== actionText ? description : "",
       safeText(String(action.block_reason ?? "")),
     ].filter(Boolean).map((value) => sanitizeTaskPlaybackEvidenceText(value, `${source}.next_legal_action.detail`)).join(" · ");
@@ -726,7 +740,7 @@ export function taskPlaybackNextLegalActionPresentations(
         ? "WAIVED"
         : statusText.includes("bypass")
           ? "BYPASSED"
-          : safeText(String(action.block_reason ?? "")) || /block|fail|reject|missing|error/.test(statusText)
+          : booleanFrom(action.blocked) || blockerId || blockerIds.length > 0 || safeText(String(action.block_reason ?? "")) || /block|fail|reject|missing|error/.test(statusText)
             ? "BLOCKED"
             : "AUTHORITATIVE";
     const key = [source, actionId, actionValue, description].join(":");
@@ -1484,6 +1498,255 @@ export function projectRecentTimelineEvents(
     ...(Array.isArray(record.contract_runtime_projection_events) ? record.contract_runtime_projection_events : []),
   ].filter(isCurrentStreamProjectionEvent);
   return mergeRecentTimelineEvents([...currentEvents, ...sourceEvents]);
+}
+
+export const TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT = 50;
+export const TASK_PLAYBACK_BACKLOG_HOT_WINDOW_LIMIT = 250;
+export const TASK_PLAYBACK_MEMORY_PROJECT_LIMIT = 32;
+export const TASK_PLAYBACK_MEMORY_PLAYBACK_LIMIT = 128;
+export type TaskPlaybackSurfaceMode = "activity" | "history";
+
+export interface TaskPlaybackMemoryWindow<T> {
+  key: string;
+  project_id: string;
+  backlog_id: string;
+  values: T[];
+  updated_at: string;
+}
+
+const currentTimelineHotWindows = new Map<string, TaskPlaybackMemoryWindow<TaskTimelineEvent>>();
+const playbackTraceHotWindows = new Map<string, TaskPlaybackMemoryWindow<TaskPlaybackTrace>>();
+const backlogHotWindows = new Map<string, TaskPlaybackMemoryWindow<BacklogBug>>();
+
+export function shouldRunPlaybackColdFullLoader(
+  mode: TaskPlaybackSurfaceMode,
+  state: { loaded?: boolean; loading?: boolean; inFlight?: boolean } | null | undefined,
+): boolean {
+  return mode === "history"
+    && !state?.loaded
+    && !state?.loading
+    && !state?.inFlight;
+}
+
+function retainedPlaybackEventId(frame: TaskPlaybackFrame): string {
+  return safeText(frame.source_event_id).replace(/^#/, "") || safeText(frame.id);
+}
+
+function projectGateMatrixToRetainedFrames(
+  matrix: GateMatrixProjection,
+  frames: TaskPlaybackFrame[],
+): GateMatrixProjection {
+  const retainedEventIds = new Set(frames.flatMap((frame) => [
+    retainedPlaybackEventId(frame),
+    safeText(frame.source_event_id),
+    safeText(frame.id),
+  ]).filter(Boolean));
+  return {
+    ...matrix,
+    rows: matrix.rows.map((row) => {
+      const retainedIndexes = row.evidenceEventIds
+        .map((eventId, index) => ({ eventId, index }))
+        .filter(({ eventId }) => (
+          retainedEventIds.has(safeText(eventId))
+          || retainedEventIds.has(safeText(eventId).replace(/^#/, ""))
+        ));
+      return {
+        ...row,
+        evidenceEventIds: retainedIndexes.map(({ eventId }) => eventId),
+        evidenceLabels: retainedIndexes.map(({ index }) => row.evidenceLabels[index] || ""),
+      };
+    }),
+  };
+}
+
+function projectPlaybackHotWindowTrace(trace: TaskPlaybackTrace): TaskPlaybackTrace {
+  const frames = trace.frames.slice(-TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT);
+  const retainedEventIds = new Set(frames.map(retainedPlaybackEventId));
+  const retainedEvents: TaskTimelineEvent[] = frames.map((frame) => ({
+    event_id: retainedPlaybackEventId(frame),
+    project_id: trace.project_id,
+    backlog_id: trace.backlog_id,
+    event_type: frame.event_type || "task_timeline.event",
+    event_kind: frame.event_kind,
+    phase: frame.phase,
+    actor: frame.actor,
+    status: frame.status,
+    created_at: frame.at,
+  }));
+  const closeGateSummary = {
+    ...trace.close_gate_summary,
+    event_count: frames.filter((frame) => frame.lane_id === "gate").length,
+  };
+  const backlog: BacklogBug = {
+    bug_id: trace.backlog_id,
+    title: trace.backlog_title,
+    status: trace.current_snapshot.row?.status || "UNKNOWN",
+    priority: (trace.current_snapshot.row?.priority || "P3") as BacklogBug["priority"],
+  };
+  const evidenceRefs = stableEvidence(frames.flatMap((frame) => frame.evidence_refs));
+  const artifactRefs = stableArtifacts(frames.flatMap((frame) => frame.artifact_refs));
+  const authorityView = trace.authority_view
+    ? {
+      ...trace.authority_view,
+      historical_diagnostics: {
+        ...trace.authority_view.historical_diagnostics,
+        timeline_events: trace.authority_view.historical_diagnostics.timeline_events.filter((event, index) => (
+          retainedEventIds.has(eventIdentity(event, index))
+          || retainedEventIds.has(eventDisplayId(event).replace(/^#/, ""))
+        )),
+        truncated: trace.authority_view.historical_diagnostics.truncated
+          || trace.authority_view.historical_diagnostics.timeline_events.length > retainedEventIds.size,
+      },
+    }
+    : null;
+  return {
+    ...trace,
+    frames,
+    lanes: lanesFromFrames(frames, backlog, closeGateSummary),
+    statuses: summarizeFrames(frames, closeGateSummary, trace.source),
+    evidence_refs: evidenceRefs,
+    artifact_refs: artifactRefs,
+    authority_view: authorityView,
+    dag: normalizeTaskPlaybackDag({
+      projectId: trace.project_id,
+      backlog,
+      events: retainedEvents,
+      visualization: null,
+    }),
+    close_gate_summary: closeGateSummary,
+    close_gate_matrix: projectGateMatrixToRetainedFrames(trace.close_gate_matrix, frames),
+    computation_cache: {
+      ...trace.computation_cache,
+      status: "miss",
+      hit: false,
+      age_ms: 0,
+      identity: JSON.stringify({
+        project_id: trace.project_id,
+        backlog_id: trace.backlog_id,
+        retained_frame_ids: frames.map((frame) => frame.id),
+      }),
+    },
+  };
+}
+
+function rememberBoundedMemoryWindow<T>(
+  store: Map<string, TaskPlaybackMemoryWindow<T>>,
+  key: string,
+  entry: TaskPlaybackMemoryWindow<T>,
+  maxEntries: number,
+): TaskPlaybackMemoryWindow<T> {
+  store.delete(key);
+  store.set(key, entry);
+  while (store.size > maxEntries) {
+    const oldest = store.keys().next().value as string | undefined;
+    if (!oldest) break;
+    store.delete(oldest);
+  }
+  return entry;
+}
+
+function readBoundedMemoryWindow<T>(
+  store: Map<string, TaskPlaybackMemoryWindow<T>>,
+  key: string,
+): TaskPlaybackMemoryWindow<T> | null {
+  const entry = store.get(key);
+  if (!entry) return null;
+  store.delete(key);
+  store.set(key, entry);
+  return { ...entry, values: [...entry.values] };
+}
+
+export function rememberProjectCurrentTimelineHotWindow(
+  projectId: string,
+  events: TaskTimelineEvent[],
+): TaskPlaybackMemoryWindow<TaskTimelineEvent> {
+  const key = projectId.trim();
+  const entry = {
+    key,
+    project_id: key,
+    backlog_id: "",
+    values: mergeRecentTimelineEvents(events, TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT),
+    updated_at: new Date().toISOString(),
+  };
+  return rememberBoundedMemoryWindow(
+    currentTimelineHotWindows,
+    key,
+    entry,
+    TASK_PLAYBACK_MEMORY_PROJECT_LIMIT,
+  );
+}
+
+export function projectCurrentTimelineHotWindow(
+  projectId: string,
+): TaskPlaybackMemoryWindow<TaskTimelineEvent> | null {
+  return readBoundedMemoryWindow(currentTimelineHotWindows, projectId.trim());
+}
+
+export function rememberProjectPlaybackHotWindow(
+  projectId: string,
+  backlogId: string,
+  trace: TaskPlaybackTrace,
+): TaskPlaybackMemoryWindow<TaskPlaybackTrace> {
+  const project = projectId.trim();
+  const backlog = backlogId.trim();
+  const key = `${project}:${backlog}`;
+  const hotTrace = projectPlaybackHotWindowTrace(trace);
+  const entry = {
+    key,
+    project_id: project,
+    backlog_id: backlog,
+    values: [hotTrace],
+    updated_at: new Date().toISOString(),
+  };
+  return rememberBoundedMemoryWindow(
+    playbackTraceHotWindows,
+    key,
+    entry,
+    TASK_PLAYBACK_MEMORY_PLAYBACK_LIMIT,
+  );
+}
+
+export function projectPlaybackHotWindow(
+  projectId: string,
+  backlogId: string,
+): TaskPlaybackMemoryWindow<TaskPlaybackTrace> | null {
+  return readBoundedMemoryWindow(playbackTraceHotWindows, `${projectId.trim()}:${backlogId.trim()}`);
+}
+
+export function projectPlaybackHotWindows(
+  projectId: string,
+): Array<TaskPlaybackMemoryWindow<TaskPlaybackTrace>> {
+  const project = projectId.trim();
+  return [...playbackTraceHotWindows.values()]
+    .filter((entry) => entry.project_id === project)
+    .map((entry) => ({ ...entry, values: [...entry.values] }));
+}
+
+export function rememberProjectBacklogHotWindow(
+  projectId: string,
+  bugs: BacklogBug[],
+): TaskPlaybackMemoryWindow<BacklogBug> {
+  const key = projectId.trim();
+  const entry = {
+    key,
+    project_id: key,
+    backlog_id: "",
+    values: bugs.slice(0, TASK_PLAYBACK_BACKLOG_HOT_WINDOW_LIMIT),
+    updated_at: new Date().toISOString(),
+  };
+  return rememberBoundedMemoryWindow(backlogHotWindows, key, entry, TASK_PLAYBACK_MEMORY_PROJECT_LIMIT);
+}
+
+export function projectBacklogHotWindow(
+  projectId: string,
+): TaskPlaybackMemoryWindow<BacklogBug> | null {
+  return readBoundedMemoryWindow(backlogHotWindows, projectId.trim());
+}
+
+export function resetTaskPlaybackMemoryHotWindowsForTests(): void {
+  currentTimelineHotWindows.clear();
+  playbackTraceHotWindows.clear();
+  backlogHotWindows.clear();
 }
 
 function isCurrentStreamProjectionEvent(event: TaskTimelineEvent): boolean {
