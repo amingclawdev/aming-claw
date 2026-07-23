@@ -450,6 +450,20 @@ def test_precommit_worker_implementation_correction_is_append_only_and_bounded(
         **identity,
         "changed_files": changed_files,
         "graph_trace_ids": ["gqt-precommit-corrected"],
+        "precommit_implementation_correction_intent": {
+            "schema_version": (
+                "runtime_context.precommit_implementation_correction_intent.v1"
+            ),
+            "action": "revise_precommit_worker_implementation",
+            "contract_execution_id": execution["contract_execution_id"],
+            "runtime_context_id": identity["runtime_context_id"],
+            "task_id": identity["task_id"],
+            "prior_implementation_lineage_ref": initial_lineage[
+                "implementation_lineage_ref"
+            ],
+            "verified_by_server": True,
+            "caller_authority_fields_trusted": False,
+        },
         "graph_trace_db_evidence": {
             "db_verified": True,
             "verified_trace_ids": ["gqt-precommit-corrected"],
@@ -468,6 +482,16 @@ def test_precommit_worker_implementation_correction_is_append_only_and_bounded(
             "cumulative_changed_files": changed_files,
             "owned_files": changed_files,
             "graph_trace_ids": ["gqt-precommit-corrected"],
+            "correction_intent_verified": True,
+            "correction_intent_schema_version": (
+                "runtime_context.precommit_implementation_correction_intent.v1"
+            ),
+            "correction_intent_action": (
+                "revise_precommit_worker_implementation"
+            ),
+            "prior_implementation_lineage_ref": initial_lineage[
+                "implementation_lineage_ref"
+            ],
             "caller_authority_fields_trusted": False,
         },
     }
@@ -530,6 +554,44 @@ def test_precommit_worker_implementation_correction_is_append_only_and_bounded(
     )
     assert idempotent["ok"] is True
     assert idempotent["status"] == "already_completed"
+    assert runtime.store.get(execution["contract_execution_id"])[
+        "execution_state_revision"
+    ] == corrected_revision
+
+    wrong_idempotent_lineage = {
+        **correction_write,
+        "payload": {
+            **correction_payload,
+            "precommit_implementation_correction_intent": {
+                **correction_payload[
+                    "precommit_implementation_correction_intent"
+                ],
+                "prior_implementation_lineage_ref": (
+                    "contract-runtime:worker-implementation:sha256:"
+                    + "f" * 64
+                ),
+            },
+            "canonical_precommit_lineage_revision_authority": {
+                **correction_payload[
+                    "canonical_precommit_lineage_revision_authority"
+                ],
+                "prior_implementation_lineage_ref": (
+                    "contract-runtime:worker-implementation:sha256:"
+                    + "f" * 64
+                ),
+            },
+        },
+    }
+    rejected_idempotent = runtime.revise_precommit_worker_implementation(
+        execution["contract_execution_id"],
+        wrong_idempotent_lineage,
+        actor_role="mf_sub",
+    )
+    assert rejected_idempotent["ok"] is False
+    assert any(
+        "intent must bind the prior implementation lineage" in error
+        for error in rejected_idempotent["decision"]["errors"]
+    )
     assert runtime.store.get(execution["contract_execution_id"])[
         "execution_state_revision"
     ] == corrected_revision

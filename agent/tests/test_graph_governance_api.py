@@ -186,6 +186,32 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
         implementation_event_ref=f"timeline:{evidence_events['implementation']}",
         include_worker_commit=False,
     )
+    runtime = server._contract_runtime(conn)
+    frozen_record = runtime.store.get(successor["contract_execution_id"])
+    frozen_implementation = next(
+        line
+        for line in reversed(frozen_record["completed_lines"])
+        if line.get("line_id") == "worker_implementation"
+        and line.get("runtime_context_id")
+        == runtime_context.runtime_context_id
+        and line.get("task_id") == runtime_context.task_id
+    )
+    frozen_lineage = _worker_implementation_lineage(
+        frozen_record,
+        frozen_implementation,
+    )
+    correction_intent = {
+        "schema_version": (
+            "runtime_context.precommit_implementation_correction_intent.v1"
+        ),
+        "action": "revise_precommit_worker_implementation",
+        "contract_execution_id": successor["contract_execution_id"],
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "prior_implementation_lineage_ref": frozen_lineage[
+            "implementation_lineage_ref"
+        ],
+    }
 
     (target_root / "agent/governance/contracts/runtime.py").write_text(
         "precommit correction\n",
@@ -205,7 +231,21 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
     )
     corrected_head = batch_jobs.git_commit(target_root)
 
-    def submit_correction():
+    def submit_correction(*, intent=correction_intent):
+        request_body = {
+            "parent_task_id": backlog_id,
+            "fence_token": fence_token,
+            "session_token": session_token,
+            "target_project_root": str(target_root),
+            "commit_sha": corrected_head,
+            "changed_files": changed_files,
+            "graph_trace_ids": [graph_trace_id],
+            "tests": [{"command": "pytest -q", "status": "passed"}],
+        }
+        if intent is not None:
+            request_body[
+                "precommit_implementation_correction_intent"
+            ] = intent
         return server.handle_graph_governance_runtime_context_implementation_evidence(
             _ctx_with_role(
                 {
@@ -214,21 +254,26 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
                 },
                 "mf_sub",
                 method="POST",
-                body={
-                    "parent_task_id": backlog_id,
-                    "fence_token": fence_token,
-                    "session_token": session_token,
-                    "target_project_root": str(target_root),
-                    "commit_sha": corrected_head,
-                    "changed_files": changed_files,
-                    "graph_trace_ids": [graph_trace_id],
-                    "tests": [{"command": "pytest -q", "status": "passed"}],
-                },
+                body=request_body,
             )
         )
 
     runtime_file = target_root / "agent/governance/contracts/runtime.py"
     runtime_file.write_text("dirty precommit correction\n", encoding="utf-8")
+    ordinary_retry = submit_correction(intent=None)
+    assert ordinary_retry["contract_runtime_canonical_line"]["status"] == (
+        "already_completed"
+    )
+    with pytest.raises(GovernanceError) as malformed_intent:
+        submit_correction(
+            intent={
+                "schema_version": correction_intent["schema_version"],
+                "action": correction_intent["action"],
+            }
+        )
+    assert malformed_intent.value.code == (
+        "contract_runtime_precommit_correction_intent_invalid"
+    )
     with pytest.raises(GovernanceError) as dirty_error:
         submit_correction()
     assert dirty_error.value.code == (
@@ -277,7 +322,6 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
     assert canonical["append_only_history_preserved"] is True
     assert canonical["supersedes_implementation_lineage_ref"]
 
-    runtime = server._contract_runtime(conn)
     revised_record = runtime.store.get(successor["contract_execution_id"])
     implementations = [
         line
@@ -304,6 +348,11 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
     assert authority["diff_base_commit"] == base_commit
     assert authority["actual_head_commit"] == corrected_head
     assert authority["cumulative_changed_files"] == changed_files
+
+    idempotent_correction = submit_correction()
+    assert idempotent_correction[
+        "contract_runtime_canonical_line"
+    ]["status"] == "already_completed"
 
     latest_lineage = _worker_implementation_lineage(
         revised_record,

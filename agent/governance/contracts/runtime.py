@@ -5543,6 +5543,18 @@ class ContractRuntime:
             errors.append(
                 "precommit implementation correction requires server-derived git authority"
             )
+        if (
+            authority.get("correction_intent_verified") is not True
+            or str(
+                authority.get("correction_intent_schema_version") or ""
+            ).strip()
+            != "runtime_context.precommit_implementation_correction_intent.v1"
+            or str(authority.get("correction_intent_action") or "").strip()
+            != "revise_precommit_worker_implementation"
+        ):
+            errors.append(
+                "precommit implementation correction requires server-verified correction intent"
+            )
         if authority.get("clean_worktree") is not True:
             errors.append(
                 "precommit implementation correction requires a clean worktree"
@@ -5583,6 +5595,23 @@ class ContractRuntime:
             )
             else {}
         )
+        prior_lineage = _worker_implementation_lineage(
+            record,
+            prior_implementation or {},
+        )
+        expected_intent_prior_lineage_ref = str(
+            prior_correction.get(
+                "supersedes_implementation_lineage_ref"
+            )
+            or prior_lineage.get("implementation_lineage_ref")
+            or ""
+        ).strip()
+        if str(
+            authority.get("prior_implementation_lineage_ref") or ""
+        ).strip() != expected_intent_prior_lineage_ref:
+            errors.append(
+                "precommit implementation correction intent must bind the prior implementation lineage"
+            )
         if prior_correction and not matching_worker_commit_exists:
             prior_authority = (
                 prior_payload.get(
@@ -5650,10 +5679,6 @@ class ContractRuntime:
                 "record": record,
             }
 
-        prior_lineage = _worker_implementation_lineage(
-            record,
-            prior_implementation or {},
-        )
         payload["canonical_precommit_lineage_revision"] = {
             "schema_version": (
                 "contract_runtime.worker_implementation_precommit_revision.v1"

@@ -27093,6 +27093,78 @@ def _runtime_context_revise_precommit_implementation_lineage(
             },
         )
 
+    correction_intent_present = (
+        "precommit_implementation_correction_intent" in payload
+    )
+    if not correction_intent_present:
+        return {}
+    correction_intent = payload.get(
+        "precommit_implementation_correction_intent"
+    )
+    prior_lineage = _worker_implementation_lineage(record, previous)
+    current_prior_lineage_ref = str(
+        prior_lineage.get("implementation_lineage_ref") or ""
+    ).strip()
+    previous_payload = (
+        previous.get("payload")
+        if isinstance(previous.get("payload"), Mapping)
+        else {}
+    )
+    previous_correction = (
+        previous_payload.get("canonical_precommit_lineage_revision")
+        if isinstance(
+            previous_payload.get("canonical_precommit_lineage_revision"),
+            Mapping,
+        )
+        else {}
+    )
+    prior_lineage_ref = str(
+        previous_correction.get(
+            "supersedes_implementation_lineage_ref"
+        )
+        or current_prior_lineage_ref
+    ).strip()
+    expected_intent = {
+        "schema_version": (
+            "runtime_context.precommit_implementation_correction_intent.v1"
+        ),
+        "action": "revise_precommit_worker_implementation",
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "prior_implementation_lineage_ref": prior_lineage_ref,
+    }
+    intent_errors = []
+    if not isinstance(correction_intent, Mapping):
+        intent_errors.append("intent must be an object")
+    else:
+        intent_errors.extend(
+            f"{field} must match server-derived correction context"
+            for field, expected in expected_intent.items()
+            if str(correction_intent.get(field) or "").strip() != expected
+        )
+    if intent_errors:
+        raise GovernanceError(
+            "contract_runtime_precommit_correction_intent_invalid",
+            (
+                "precommit implementation correction requires an explicit "
+                "server-verifiable intent bound to the prior implementation"
+            ),
+            422,
+            {
+                "contract_execution_id": record.get("contract_execution_id"),
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "errors": intent_errors,
+                "required_schema_version": expected_intent["schema_version"],
+                "required_action": expected_intent["action"],
+                "fail_closed": True,
+                "caller_authority_fields_trusted": False,
+            },
+        )
+
     worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
     runtime_base_commit = str(getattr(context, "base_commit", "") or "").strip()
     if not worktree_path or not re.fullmatch(
@@ -27270,11 +27342,6 @@ def _runtime_context_revise_precommit_implementation_lineage(
         )
     )
     previous_commit = str(previous.get("commit_sha") or "").strip()
-    previous_payload = (
-        previous.get("payload")
-        if isinstance(previous.get("payload"), Mapping)
-        else {}
-    )
     previous_is_correction = isinstance(
         previous_payload.get("canonical_precommit_lineage_revision"),
         Mapping,
@@ -27296,6 +27363,11 @@ def _runtime_context_revise_precommit_implementation_lineage(
     canonical_payload["head_commit"] = actual_head
     canonical_payload["immutable_head_commit"] = actual_head
     canonical_payload["validated_head_commit"] = actual_head
+    canonical_payload["precommit_implementation_correction_intent"] = {
+        **expected_intent,
+        "verified_by_server": True,
+        "caller_authority_fields_trusted": False,
+    }
     canonical_payload["canonical_precommit_lineage_revision_authority"] = {
         "schema_version": (
             "runtime_context.clean_cumulative_git_precommit_correction_authority.v1"
@@ -27312,6 +27384,12 @@ def _runtime_context_revise_precommit_implementation_lineage(
         "owned_files": owned_files,
         "graph_trace_ids": verified_trace_ids,
         "graph_trace_authority_source": "graph_query_traces",
+        "correction_intent_verified": True,
+        "correction_intent_schema_version": expected_intent[
+            "schema_version"
+        ],
+        "correction_intent_action": expected_intent["action"],
+        "prior_implementation_lineage_ref": prior_lineage_ref,
         "caller_authority_fields_trusted": False,
         "raw_worker_tokens_persisted": False,
     }
@@ -31141,6 +31219,10 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     for key in ("changed_files", "tests", "test_results", "risk", "summary"):
         if key in body:
             payload[key] = body.get(key)
+    if "precommit_implementation_correction_intent" in body:
+        payload["precommit_implementation_correction_intent"] = body.get(
+            "precommit_implementation_correction_intent"
+        )
     if isinstance(body.get("route_token_gate"), Mapping):
         payload["route_token_gate"] = body.get("route_token_gate")
 
@@ -78773,6 +78855,10 @@ def _contract_runtime_close_gate(
                     or canonical_norm_payload
                 )
             if not prevalidation:
+                correction_intent_present = (
+                    "precommit_implementation_correction_intent"
+                    in canonical_norm_payload
+                )
                 precommit_validation = (
                     _runtime_context_revise_precommit_implementation_lineage(
                         project_id=project_id,
@@ -78810,6 +78896,54 @@ def _contract_runtime_close_gate(
                         "canonical_submit_required": True,
                         "precommit_implementation_correction": True,
                     }
+                if not correction_intent_present:
+                    runtime_context_id = str(
+                        getattr(
+                            runtime_context,
+                            "runtime_context_id",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+                    task_id = str(
+                        getattr(runtime_context, "task_id", "") or ""
+                    ).strip()
+                    completed_implementation = (
+                        _worker_commit_completed_implementation(
+                            stored_record,
+                            runtime_context_id=runtime_context_id,
+                            task_id=task_id,
+                        )
+                    )
+                    if completed_implementation is not None:
+                        return {
+                            "schema_version": (
+                                _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
+                            ),
+                            "accepted": True,
+                            "status": "already_completed",
+                            "projection_only": True,
+                            "primary_decision_source": True,
+                            "agent_facing_decision_source": (
+                                "contract_runtime_completed_line"
+                            ),
+                            "meta_contract_gate_decision_source": False,
+                            "contract_execution_id": contract_execution_id,
+                            "actor_role": actor_role,
+                            "requested_event_kind": event_kind,
+                            "stage_id": line.get("stage_id", ""),
+                            "line_id": line.get("line_id", ""),
+                            "evidence_kind": line.get(
+                                "evidence_kind",
+                                "",
+                            ),
+                            "decision": {"ok": True, "errors": []},
+                            "next_legal_action": dict(
+                                current_state.get("next_legal_action") or {}
+                            ),
+                            "canonical_submit_required": False,
+                            "precommit_implementation_correction": False,
+                        }
     write["payload"] = canonical_norm_payload
     if normalized_status:
         write["status"] = normalized_status
