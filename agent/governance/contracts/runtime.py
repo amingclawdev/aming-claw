@@ -2110,6 +2110,7 @@ _FAILED_QA_RETRY_RESET_LINE_IDS = frozenset(
         "worker_finish_time_attestation",
         "worker_finish_gate",
         "worker_review_ready_handoff",
+        "qa_graph_context",
         "qa_independent_verification",
         "observer_merge",
         "observer_reconcile",

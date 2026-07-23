@@ -15512,6 +15512,136 @@ def test_runtime_context_failed_qa_without_revision_keeps_rework_action():
     )
 
 
+def test_failed_qa_retry_resets_formal_qa_graph_bypass_until_fresh_qa_graph():
+    runtime_context_id = "mfrctx-failed-qa-graph-bypass-reset"
+    task_id = "worker-failed-qa-graph-bypass-reset"
+    parent_task_id = "cex-failed-qa-graph-bypass-reset"
+    old_commit = "a" * 40
+    revised_commit = "b" * 40
+
+    def worker_line(
+        line_id: str,
+        *,
+        commit_sha: str = "",
+    ) -> dict[str, Any]:
+        line = {
+            "stage_id": line_id,
+            "line_id": line_id,
+            "actor_role": "mf_sub",
+            "evidence_kind": line_id,
+            "status": "passed",
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "line_instance_id": f"runtime_context:{runtime_context_id}",
+        }
+        if commit_sha:
+            line["commit_sha"] = commit_sha
+        return line
+
+    pre_retry_lines = [
+        worker_line("worker_read_runtime_guide"),
+        worker_line("worker_startup"),
+        worker_line("worker_graph_context"),
+        worker_line("worker_implementation", commit_sha=old_commit),
+        worker_line("worker_commit", commit_sha=old_commit),
+        worker_line("worker_finish_time_attestation", commit_sha=old_commit),
+        worker_line("worker_finish_gate", commit_sha=old_commit),
+        {
+            "stage_id": "qa_graph_context",
+            "line_id": "qa_graph_context",
+            "actor_role": "observer",
+            "evidence_kind": "contract_line_bypass",
+            "status": "waived",
+            "disposition": "proceeded_with_exception",
+            "no_pass_claim": True,
+            "payload": {
+                "schema_version": "contract_line_bypass.v1",
+                "bypass_identity": (
+                    "bypass:cex-failed-qa-graph-bypass-reset:"
+                    "revision-8:qa_graph_context:qa_graph_context"
+                ),
+                "diagnostic_backlog_id": (
+                    "AC-CONTRACT-LINE-BYPASS-QA-GRAPH-RESET"
+                ),
+                "disposition": "proceeded_with_exception",
+                "no_pass_claim": True,
+            },
+        },
+        {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "actor_role": "qa",
+            "evidence_kind": "independent_verification",
+            "status": "failed",
+            "commit_sha": old_commit,
+            "verification": {"verdict": "FAIL"},
+        },
+    ]
+    retry_lines = [
+        worker_line("worker_implementation", commit_sha=revised_commit),
+        worker_line("worker_commit", commit_sha=revised_commit),
+        worker_line("worker_finish_time_attestation", commit_sha=revised_commit),
+        worker_line("worker_finish_gate", commit_sha=revised_commit),
+    ]
+
+    awaiting_fresh_qa_graph = _contract_completion_satisfying_lines(
+        [*pre_retry_lines, *retry_lines]
+    )
+
+    assert not any(
+        line["line_id"] == "qa_graph_context"
+        for line in awaiting_fresh_qa_graph
+    )
+    assert any(
+        line["line_id"] == "worker_commit"
+        and line.get("commit_sha") == revised_commit
+        for line in awaiting_fresh_qa_graph
+    )
+
+    fresh_qa_graph = {
+        "stage_id": "qa_graph_context",
+        "line_id": "qa_graph_context",
+        "actor_role": "qa",
+        "evidence_kind": "graph_trace",
+        "status": "passed",
+        "commit_sha": revised_commit,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+    }
+    fresh_qa = {
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "status": "passed",
+        "commit_sha": revised_commit,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+    }
+    completed_retry = _contract_completion_satisfying_lines(
+        [
+            *pre_retry_lines,
+            *retry_lines,
+            fresh_qa_graph,
+            fresh_qa,
+        ]
+    )
+
+    assert [
+        line for line in completed_retry if line["line_id"] == "qa_graph_context"
+    ] == [fresh_qa_graph]
+    assert [
+        line
+        for line in completed_retry
+        if line["line_id"] == "qa_independent_verification"
+    ] == [fresh_qa]
+
+
 def test_runtime_context_failed_qa_revision_finish_projects_fresh_qa_rerun():
     current_values = _runtime_context_qa_handoff_current_values(
         "failed-qa-revised",
