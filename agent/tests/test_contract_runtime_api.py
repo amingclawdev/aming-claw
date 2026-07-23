@@ -282,6 +282,162 @@ def test_completed_merge_recovers_missing_status_only_after_canonical_acceptance
     ) == {}
 
 
+def test_trusted_merge_uses_one_coherent_worker_identity_after_close_ready(
+    monkeypatch,
+):
+    project_id = "contract-runtime-api-test"
+    contract_execution_id = "cex-f711"
+    runtime_context_id = "mfrctx-f711"
+    task_id = "worker-f711"
+    context = SimpleNamespace(
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=contract_execution_id,
+        backlog_id="AC-F711",
+    )
+    record = {
+        "project_id": project_id,
+        "backlog_id": context.backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "runtime_guide": {
+            # A contract-scoped close action is intentionally incomplete as a
+            # worker identity and must not seed fields from completed lines.
+            "next_legal_action": {
+                "line_id": "observer_close_ready",
+                "task_id": contract_execution_id,
+            }
+        },
+        "completed_lines": [
+            {
+                "line_id": "observer_dispatch_bounded_workers",
+                "payload": {"worker_count": 1},
+            },
+            {
+                "line_id": "observer_merge",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": contract_execution_id,
+            },
+            {
+                "line_id": "observer_reconcile",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "parent_task_id": contract_execution_id,
+                },
+            },
+            {
+                "line_id": "observer_close_ready",
+                "task_id": contract_execution_id,
+                "payload": {"status": "passed"},
+            },
+        ],
+    }
+
+    identity = server._contract_runtime_server_line_identity(record)
+    assert identity == {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": contract_execution_id,
+        "identity_status": "resolved",
+        "identity_source_line_id": "observer_merge",
+    }
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [context],
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_timeline_events",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_merge_authority",
+        lambda *_args, **_kwargs: {
+            "timeline_verified": True,
+            "authority_verified": True,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": contract_execution_id,
+            "merged_commit_sha": "b" * 40,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_merge_reconcile_authority",
+        lambda *_args, merge, **_kwargs: dict(merge),
+    )
+
+    projection = server._contract_runtime_trusted_merge_projection(
+        object(),
+        project_id=project_id,
+        record=record,
+    )
+    assert projection["timeline_verified"] is True
+    assert projection["authority_verified"] is True
+    assert projection["runtime_context_id"] == runtime_context_id
+    assert projection["task_id"] == task_id
+
+
+def test_server_line_identity_rejects_ambiguous_single_line_scope(
+    monkeypatch,
+):
+    record = {
+        "project_id": "contract-runtime-api-test",
+        "backlog_id": "AC-AMBIGUOUS-IDENTITY",
+        "contract_execution_id": "cex-ambiguous",
+        "completed_lines": [
+            {
+                "line_id": "observer_dispatch_bounded_workers",
+                "payload": {"worker_count": 2},
+            },
+            {
+                "line_id": "observer_merge",
+                "payload": {
+                    "primary": {
+                        "runtime_context_id": "mfrctx-primary",
+                        "task_id": "worker-primary",
+                        "parent_task_id": "cex-ambiguous",
+                    },
+                    "conflicting": {
+                        "runtime_context_id": "mfrctx-conflict",
+                        "task_id": "worker-conflict",
+                        "parent_task_id": "cex-ambiguous",
+                    },
+                },
+            },
+        ],
+    }
+
+    identity = server._contract_runtime_server_line_identity(record)
+    assert identity["identity_status"] == "ambiguous"
+    assert identity["runtime_context_id"] == ""
+    assert identity["task_id"] == ""
+    assert identity["identity_source_line_id"] == "observer_merge"
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [],
+    )
+    projection = server._contract_runtime_trusted_merge_projection(
+        object(),
+        project_id=record["project_id"],
+        record=record,
+    )
+    assert projection["timeline_verified"] is False
+    assert projection["identity_mismatches"] == [
+        {
+            "field": "server_line_identity",
+            "expected": "one coherent runtime_context_id/task_id tuple",
+            "actual": "ambiguous",
+            "source_line_id": "observer_merge",
+        }
+    ]
+
+
 def test_current_full_authority_uses_current_canonical_reconcile_target(
     monkeypatch,
 ):

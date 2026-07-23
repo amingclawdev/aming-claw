@@ -62023,30 +62023,84 @@ def _contract_runtime_requested_trace_ids(
 def _contract_runtime_server_line_identity(
     record: Mapping[str, Any],
 ) -> dict[str, str]:
-    next_line = _contract_runtime_next_line(record)
-    identity = {
-        "runtime_context_id": str(next_line.get("runtime_context_id") or "").strip(),
-        "task_id": str(next_line.get("task_id") or "").strip(),
-        "parent_task_id": str(next_line.get("parent_task_id") or "").strip(),
+    empty = {
+        "runtime_context_id": "",
+        "task_id": "",
+        "parent_task_id": "",
+        "identity_status": "missing",
+        "identity_source_line_id": "",
     }
-    if all(identity.values()):
-        return identity
-    for line in reversed(
-        [item for item in record.get("completed_lines") or [] if isinstance(item, Mapping)]
-    ):
-        for candidate in _contract_runtime_mapping_candidates(line):
-            identity["runtime_context_id"] = identity["runtime_context_id"] or (
-                _contract_runtime_mapping_value(candidate, "runtime_context_id")
+    sources = [
+        ("next_legal_action", _contract_runtime_next_line(record)),
+        *[
+            (str(line.get("line_id") or "").strip(), line)
+            for line in reversed(
+                [
+                    item
+                    for item in record.get("completed_lines") or []
+                    if isinstance(item, Mapping)
+                ]
             )
-            identity["task_id"] = identity["task_id"] or (
-                _contract_runtime_mapping_value(candidate, "task_id", "worker_task_id")
+        ],
+    ]
+    for source_line_id, source in sources:
+        identities: dict[tuple[str, str, str], dict[str, str]] = {}
+        for candidate in _contract_runtime_mapping_candidates(source):
+            runtime_context_id = _contract_runtime_mapping_value(
+                candidate,
+                "runtime_context_id",
             )
-            identity["parent_task_id"] = identity["parent_task_id"] or (
-                _contract_runtime_mapping_value(candidate, "parent_task_id", "root_task_id")
+            task_id = _contract_runtime_mapping_value(
+                candidate,
+                "task_id",
+                "worker_task_id",
             )
-        if identity["runtime_context_id"] and identity["task_id"]:
-            break
-    return identity
+            if not runtime_context_id or not task_id:
+                continue
+            parent_task_id = _contract_runtime_mapping_value(
+                candidate,
+                "parent_task_id",
+                "root_task_id",
+            )
+            identity = {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+            }
+            identities[
+                (runtime_context_id, task_id, parent_task_id)
+            ] = identity
+        if not identities:
+            continue
+
+        worker_scopes = {
+            (identity["runtime_context_id"], identity["task_id"])
+            for identity in identities.values()
+        }
+        parent_scopes = {
+            identity["parent_task_id"]
+            for identity in identities.values()
+            if identity["parent_task_id"]
+        }
+        if len(worker_scopes) != 1 or len(parent_scopes) > 1:
+            return {
+                **empty,
+                "identity_status": "ambiguous",
+                "identity_source_line_id": source_line_id,
+            }
+
+        # Prefer the candidate that carries the parent scope, but never fill
+        # missing identity fields from a different mapping or completed line.
+        coherent = max(
+            identities.values(),
+            key=lambda identity: bool(identity["parent_task_id"]),
+        )
+        return {
+            **coherent,
+            "identity_status": "resolved",
+            "identity_source_line_id": source_line_id,
+        }
+    return empty
 
 
 def _contract_runtime_assigned_target_project_root(
@@ -62056,6 +62110,12 @@ def _contract_runtime_assigned_target_project_root(
     record: Mapping[str, Any],
     identity: Mapping[str, str],
 ) -> dict[str, Any]:
+    if identity.get("identity_status") == "ambiguous":
+        return {
+            "status": "ambiguous_identity",
+            "target_project_root": "",
+            "candidate_roots": [],
+        }
     roots: set[str] = set()
     dispatch_line_ids = {
         "observer_dispatch_bounded_workers",
@@ -63257,6 +63317,21 @@ def _contract_runtime_trusted_merge_projection(
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
     expected_identity = _contract_runtime_server_line_identity(record)
+    if expected_identity.get("identity_status") == "ambiguous":
+        return {
+            "timeline_verified": False,
+            "identity_mismatches": [
+                {
+                    "field": "server_line_identity",
+                    "expected": "one coherent runtime_context_id/task_id tuple",
+                    "actual": "ambiguous",
+                    "source_line_id": expected_identity.get(
+                        "identity_source_line_id"
+                    )
+                    or "",
+                }
+            ],
+        }
     candidates: list[dict[str, Any]] = []
     dispatch_lines = [
         line
