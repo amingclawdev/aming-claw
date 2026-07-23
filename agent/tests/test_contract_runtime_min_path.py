@@ -8,9 +8,11 @@ from pathlib import Path
 import pytest
 
 from agent.governance.contracts import ContractDefinitionRegistry, ContractRuntime
-from agent.governance.contracts.hash import file_sha256
+from agent.governance.contracts.hash import file_sha256, stable_sha256
 from agent.governance.contracts.runtime import (
+    _audited_bypass_terminal_disposition,
     _contract_completion_satisfying_lines,
+    _project_record_state,
     _worker_implementation_lineage,
     ContractRuntimeError,
     read_backlog_contract_chain_current,
@@ -1390,6 +1392,116 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
     assert result["record"]["runtime_guide"]["next_legal_action"]["line_id"] == (
         "qa_verdict"
     )
+    assert "terminal_disposition" not in result["record"]["runtime_guide"]
+
+    merged_commit = "a" * 40
+    durable_merge_authority = {
+        "schema_version": "contract_runtime.observer_merge_durable_authority.v1",
+        "server_derived": True,
+        "db_verified": True,
+        "merge_gate_passed": True,
+        "merge_event_ref": "timeline:42",
+        "merge_commit": merged_commit,
+        "qa_contract_runtime_verified": True,
+        "qa_acceptance_ref": "contract-runtime-acceptance:qa:1",
+    }
+    reconcile_authority = {
+        "schema_version": "contract_runtime.observer_reconcile_record_authority.v1",
+        "server_derived": True,
+        "record_verified": True,
+        "merge_projection_verified": True,
+        "dispatch_lineage_verified": True,
+        "reconcile_event_recorded": True,
+        "merge_source_ref": "timeline:42",
+        "merged_commit_sha": merged_commit,
+        "reconcile_source_ref": "timeline:43",
+    }
+    reconcile_authority["authority_hash"] = stable_sha256(reconcile_authority)
+    terminal_lines = [
+        result["written_line"],
+        {
+            "line_id": "qa_independent_verification",
+            "actor_role": "qa",
+            "evidence_kind": "independent_verification",
+            "status": "passed",
+        },
+        {
+            "line_id": "observer_merge",
+            "actor_role": "observer",
+            "evidence_kind": "merge",
+            "status": "accepted",
+            "payload": {
+                "durable_merge_authority": durable_merge_authority,
+            },
+        },
+        {
+            "line_id": "observer_reconcile",
+            "actor_role": "observer",
+            "evidence_kind": "reconcile",
+            "status": "accepted",
+            "payload": {"reconcile_authority": reconcile_authority},
+        },
+    ]
+    terminal = _audited_bypass_terminal_disposition(
+        {"completed_lines": terminal_lines}
+    )
+    assert terminal["row_status"] == "WAIVED"
+    assert terminal["readiness_state"] == "completed_with_exception"
+    assert terminal["scheduler_eligible"] is False
+    assert terminal["current_eligible"] is False
+    assert terminal["close_eligible"] is False
+    assert terminal["resume_eligible"] is False
+    assert terminal["source_backlog_mutated"] is False
+    assert terminal["terminal_barrier"]["reconcile_source_ref"] == "timeline:43"
+    projected_terminal = _project_record_state(
+        {
+            "contract_execution_id": record["contract_execution_id"],
+            "contract_id": "bypass_min_path",
+            "execution_state_revision": 4,
+            "completed_lines": terminal_lines,
+            "runtime_guide": {"next_legal_action": None},
+        }
+    )
+    serialized_terminal = json.dumps(projected_terminal, sort_keys=True)
+    assert "parent_to_resume" not in serialized_terminal
+    assert projected_terminal["next_legal_action"] == {}
+    from agent.governance import server
+
+    server_terminal = server._runtime_current_state_from_record(
+        {
+            "contract_execution_id": record["contract_execution_id"],
+            "contract_id": "bypass_min_path",
+            "execution_state_revision": 4,
+            "runtime_guide": {
+                "next_legal_action": None,
+                "readiness_state": "completed_with_exception",
+                "terminal_disposition": terminal,
+            },
+        }
+    )
+    assert server_terminal["readiness_state"] == "completed_with_exception"
+    assert server_terminal["row_status"] == "WAIVED"
+    assert server_terminal["source_row_status"] == "WAIVED"
+    assert server_terminal["disposition"] == "completed_with_exception"
+    assert server_terminal["terminal"] is True
+    assert server_terminal["scheduler_eligible"] is False
+    assert server_terminal["current_eligible"] is False
+    assert server_terminal["close_eligible"] is False
+    assert server_terminal["resume_eligible"] is False
+    assert server_terminal["next_legal_action"] == {}
+    assert server_terminal["terminal_disposition"] == terminal
+    forged_lines = json.loads(json.dumps(terminal_lines))
+    forged_lines[-1]["payload"]["reconcile_authority"]["record_verified"] = False
+    assert _audited_bypass_terminal_disposition(
+        {"completed_lines": forged_lines}
+    ) == {}
+    noncanonical_bypass_lines = json.loads(json.dumps(terminal_lines))
+    noncanonical_bypass_lines[0]["payload"]["schema_version"] = (
+        "contract_line_bypass.forged"
+    )
+    assert _audited_bypass_terminal_disposition(
+        {"completed_lines": noncanonical_bypass_lines}
+    ) == {}
 
     retry = runtime.bypass_current_line(
         record["contract_execution_id"], request, actor_role="observer"
@@ -1489,6 +1601,14 @@ def test_runtime_current_guide_exposes_strict_line_bypass_row_binding(tmp_path):
     assert generic["allowed_as"] == "evidence_ref_only"
     assert generic["allowed_as_diagnostic_backlog_id"] is False
     assert bypass["invariants"]["no_pass_claim"] is True
+    assert bypass["invariants"]["source_generation_terminal_after_barrier"] is True
+    assert bypass["invariants"]["pre_barrier_forward_integration_required"] is True
+    assert bypass["invariants"]["post_barrier_scheduler_eligible"] is False
+    assert bypass["invariants"]["post_barrier_current_eligible"] is False
+    assert bypass["invariants"]["post_barrier_close_eligible"] is False
+    assert bypass["invariants"]["post_barrier_resume_eligible"] is False
+    assert bypass["invariants"]["source_backlog_mutated_by_bypass"] is False
+    assert bypass["invariants"]["repair_requires_separate_backlog_row"] is True
     assert bypass["invariants"]["strict_line_validation_unchanged"] is True
     assert bypass["invariants"]["bypass_acceptance_logic_unchanged"] is True
 

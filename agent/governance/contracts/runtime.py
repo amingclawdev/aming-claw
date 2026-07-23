@@ -697,9 +697,9 @@ def rebuild_backlog_contract_chain_projection(
         "root_contract_execution_id": active_chain["root_contract_execution_id"],
         "current_contract_execution_id": current["current_contract_execution_id"],
         "current_contract_id": current["current_contract_id"],
-        "parent_to_resume_contract_execution_id": current[
-            "parent_to_resume_contract_execution_id"
-        ],
+        "parent_to_resume_contract_execution_id": str(
+            current.get("parent_to_resume_contract_execution_id") or ""
+        ),
         "active_child_contract_execution_id": current[
             "active_child_contract_execution_id"
         ],
@@ -1215,6 +1215,28 @@ def _recovery_superseded_execution_ids(
 def _project_record_state(record: Mapping[str, Any]) -> dict[str, Any]:
     current_id = str(record.get("contract_execution_id") or "")
     current_contract_id = _record_contract_id(record)
+    terminal = _audited_bypass_terminal_disposition(record)
+    if terminal:
+        return {
+            "current_contract_execution_id": "",
+            "current_contract_id": "",
+            "active_child_contract_execution_id": "",
+            "readiness_state": "completed_with_exception",
+            "disposition": "completed_with_exception",
+            "row_status": "WAIVED",
+            "source_row_status": "WAIVED",
+            "terminal": True,
+            "scheduler_eligible": False,
+            "schedulable": False,
+            "current_eligible": False,
+            "close_eligible": False,
+            "closeable": False,
+            "resume_eligible": False,
+            "resumable": False,
+            "generation": int(record.get("execution_state_revision") or 0),
+            "next_legal_action": {},
+            "terminal_disposition": terminal,
+        }
     next_action = _next_action_from_record(record)
     readiness = "contract_complete" if _record_is_complete(record) else "contract_active"
     return {
@@ -1500,6 +1522,188 @@ def _direct_fix_worker_graph_context_compat_decision(
         ),
         runtime_guide_hash=str(getattr(gate_decision, "runtime_guide_hash", "") or ""),
     )
+
+
+def _audited_bypass_terminal_disposition(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, Sequence):
+        return {}
+    bypass_index = -1
+    bypass_line: Mapping[str, Any] = {}
+    qa_barrier_index = -1
+    merge_index = -1
+    merge_authority: Mapping[str, Any] = {}
+    for index, line in enumerate(completed_lines):
+        if not isinstance(line, Mapping):
+            continue
+        line_payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        if (
+            str(line.get("evidence_kind") or "") == "contract_line_bypass"
+            and str(line.get("status") or "").lower() == "waived"
+            and line.get("no_pass_claim") is True
+            and str(line_payload.get("schema_version") or "")
+            == "contract_line_bypass.v1"
+            and line_payload.get("no_pass_claim") is True
+            and str(line_payload.get("disposition") or "")
+            == "proceeded_with_exception"
+        ):
+            bypass_index = index
+            bypass_line = line
+            if (
+                str(line.get("line_id") or "") == "qa_independent_verification"
+            ):
+                qa_barrier_index = index
+            continue
+        if (
+            bypass_index >= 0
+            and index > bypass_index
+            and str(line.get("line_id") or "") == "qa_independent_verification"
+            and str(line.get("actor_role") or "") == "qa"
+            and str(line.get("evidence_kind") or "")
+            == "independent_verification"
+            and str(line.get("status") or "").lower()
+            in {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+        ):
+            qa_barrier_index = index
+            continue
+        durable_merge = (
+            line_payload.get("durable_merge_authority")
+            if isinstance(line_payload.get("durable_merge_authority"), Mapping)
+            else {}
+        )
+        audit_only_qa = (
+            durable_merge.get("qa_audit_only_no_pass_authority")
+            if isinstance(
+                durable_merge.get("qa_audit_only_no_pass_authority"), Mapping
+            )
+            else {}
+        )
+        ordinary_qa_bound = bool(
+            qa_barrier_index > bypass_index
+            and durable_merge.get("qa_contract_runtime_verified") is True
+            and str(durable_merge.get("qa_acceptance_ref") or "")
+        )
+        audited_no_pass_bound = bool(
+            qa_barrier_index == bypass_index
+            and str(audit_only_qa.get("schema_version") or "")
+            == "contract_runtime.audit_only_no_pass_bypass_round_authority.v1"
+            and audit_only_qa.get("server_derived") is True
+            and audit_only_qa.get("db_verified") is True
+            and audit_only_qa.get("no_pass_claim") is True
+            and audit_only_qa.get("authoritative_pass_synthesized") is False
+            and str(audit_only_qa.get("authority_hash") or "")
+            == str(durable_merge.get("qa_acceptance_ref") or "")
+        )
+        if (
+            qa_barrier_index >= bypass_index >= 0
+            and index > qa_barrier_index
+            and str(line.get("line_id") or "") == "observer_merge"
+            and str(line.get("actor_role") or "") == "observer"
+            and str(line.get("evidence_kind") or "") == "merge"
+            and str(line.get("status") or "").lower() in {"accepted", "passed"}
+            and str(durable_merge.get("schema_version") or "")
+            == "contract_runtime.observer_merge_durable_authority.v1"
+            and durable_merge.get("server_derived") is True
+            and durable_merge.get("db_verified") is True
+            and durable_merge.get("merge_gate_passed") is True
+            and str(durable_merge.get("merge_event_ref") or "").startswith(
+                "timeline:"
+            )
+            and (ordinary_qa_bound or audited_no_pass_bound)
+        ):
+            merge_index = index
+            merge_authority = durable_merge
+            continue
+        if not (
+            merge_index > qa_barrier_index >= bypass_index >= 0
+            and index > merge_index
+            and str(line.get("line_id") or "") == "observer_reconcile"
+            and str(line.get("actor_role") or "") == "observer"
+            and str(line.get("evidence_kind") or "") == "reconcile"
+            and str(line.get("status") or "").lower() in {"accepted", "passed"}
+        ):
+            continue
+        reconcile_payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        reconcile_authority = (
+            reconcile_payload.get("reconcile_authority")
+            if isinstance(reconcile_payload.get("reconcile_authority"), Mapping)
+            else {}
+        )
+        if not (
+            reconcile_authority.get("server_derived") is True
+            and reconcile_authority.get("record_verified") is True
+            and reconcile_authority.get("merge_projection_verified") is True
+            and reconcile_authority.get("dispatch_lineage_verified") is True
+            and reconcile_authority.get("reconcile_event_recorded") is True
+            and str(reconcile_authority.get("schema_version") or "")
+            == "contract_runtime.observer_reconcile_record_authority.v1"
+            and str(reconcile_authority.get("merge_source_ref") or "")
+            == str(merge_authority.get("merge_event_ref") or "")
+            and str(reconcile_authority.get("merged_commit_sha") or "")
+            == str(merge_authority.get("merge_commit") or "")
+            and str(reconcile_authority.get("reconcile_source_ref") or "").startswith(
+                "timeline:"
+            )
+            and str(reconcile_authority.get("authority_hash") or "")
+            == stable_sha256(
+                {
+                    key: value
+                    for key, value in reconcile_authority.items()
+                    if key != "authority_hash"
+                }
+            )
+        ):
+            continue
+        bypass_payload = (
+            bypass_line.get("payload")
+            if isinstance(bypass_line.get("payload"), Mapping)
+            else {}
+        )
+        return {
+            "schema_version": "contract_runtime.audited_bypass_terminal.v1",
+            "status": "WAIVED",
+            "row_status": "WAIVED",
+            "source_row_status": "WAIVED",
+            "readiness_state": "completed_with_exception",
+            "disposition": "completed_with_exception",
+            "terminal": True,
+            "scheduler_eligible": False,
+            "schedulable": False,
+            "current_eligible": False,
+            "close_eligible": False,
+            "closeable": False,
+            "resume_eligible": False,
+            "resumable": False,
+            "source_backlog_mutated": False,
+            "diagnostic_backlog_id": str(
+                bypass_payload.get("diagnostic_backlog_id") or ""
+            ),
+            "bypass_identity": str(bypass_payload.get("bypass_identity") or ""),
+            "line_id": str(bypass_line.get("line_id") or ""),
+            "stage_id": str(bypass_line.get("stage_id") or ""),
+            "no_pass_claim": True,
+            "terminal_barrier": {
+                "qa_line_index": qa_barrier_index,
+                "merge_line_index": merge_index,
+                "reconcile_line_index": index,
+                "reconcile_source_ref": str(
+                    reconcile_authority.get("reconcile_source_ref") or ""
+                ),
+            },
+            "repair_requires_separate_backlog_row": True,
+            "fresh_generation_requires_accepted_repair_merge_and_current_head_reconcile": True,
+        }
+    return {}
 
 
 def _record_is_complete(record: Mapping[str, Any]) -> bool:
@@ -3808,7 +4012,7 @@ def _current_projection_from_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str
     next_legal_action = _json_field(data.get("next_legal_action_json"), {})
     active_chain = _json_field(data.get("active_chain_json"), {})
     source_refs = _json_field(data.get("source_refs_json"), [])
-    return {
+    projection = {
         "schema_version": "backlog_contract_chain_current.v1",
         "project_id": str(data.get("project_id") or ""),
         "backlog_id": str(data.get("backlog_id") or ""),
@@ -3841,6 +4045,33 @@ def _current_projection_from_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str
         "projection_source": "backlog_contract_chain_current",
         "source_of_proof": "contract_runtime_executions.completed_lines",
     }
+    if projection["readiness_state"] == "completed_with_exception":
+        projection.update(
+            {
+                "row_status": "WAIVED",
+                "source_row_status": "WAIVED",
+                "disposition": "completed_with_exception",
+                "terminal": True,
+                "scheduler_eligible": False,
+                "schedulable": False,
+                "current_eligible": False,
+                "close_eligible": False,
+                "closeable": False,
+                "resume_eligible": False,
+                "resumable": False,
+                "terminal_disposition": {
+                    "schema_version": (
+                        "contract_runtime.audited_bypass_terminal.v1"
+                    ),
+                    "status": "WAIVED",
+                    "readiness_state": "completed_with_exception",
+                    "source": "backlog_contract_chain_current",
+                    "no_pass_claim": True,
+                },
+            }
+        )
+        projection.pop("parent_to_resume_contract_execution_id", None)
+    return projection
 
 
 def _json_field(raw: Any, fallback: Any) -> Any:
@@ -4311,6 +4542,21 @@ class ContractRuntime:
             instruction_bundle=instruction_bundle,
             judgment_hints=_record_judgment_hints(record),
         )
+        terminal_disposition = _audited_bypass_terminal_disposition(
+            {**dict(record), "completed_lines": line_items}
+        )
+        if terminal_disposition:
+            guide["next_legal_action"] = None
+            guide["terminal_disposition"] = terminal_disposition
+            guide["readiness_state"] = "completed_with_exception"
+            guide["disposition"] = "completed_with_exception"
+            state["readiness_state"] = "completed_with_exception"
+            state["disposition"] = "completed_with_exception"
+            state["terminal"] = True
+            state["scheduler_eligible"] = False
+            state["current_eligible"] = False
+            state["close_eligible"] = False
+            state["resume_eligible"] = False
         _attach_failed_qa_rework_guidance(
             guide,
             line_items=line_items,
@@ -5753,8 +5999,22 @@ def _attach_line_bypass_guidance(
             "no_pass_claim": True,
             "written_status": "waived",
             "disposition": "proceeded_with_exception",
-            "source_row_remains_open": True,
+            "source_generation_terminal_after_barrier": True,
+            "terminal_barrier": [
+                "independent_qa",
+                "ordered_merge",
+                "current_head_full_reconcile_activation",
+            ],
+            "pre_barrier_forward_integration_required": True,
+            "post_barrier_readiness_state": "completed_with_exception",
+            "post_barrier_scheduler_eligible": False,
+            "post_barrier_current_eligible": False,
+            "post_barrier_close_eligible": False,
+            "post_barrier_resume_eligible": False,
+            "source_backlog_mutated_by_bypass": False,
             "diagnostic_row_remains_open": True,
+            "repair_requires_separate_backlog_row": True,
+            "fresh_generation_requires_accepted_repair_merge_and_current_head_reconcile": True,
             "strict_line_validation_unchanged": True,
             "strict_revision_and_runtime_guide_hash_validation_unchanged": True,
             "bypass_acceptance_logic_unchanged": True,
