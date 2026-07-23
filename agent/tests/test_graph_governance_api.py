@@ -47,6 +47,7 @@ from agent.governance.contracts.runtime import (
     _line_status_allows_contract_completion,
     _mf_parallel_worker_commit_errors,
     _next_action_from_record,
+    _worker_fence_containment,
     _worker_implementation_lineage,
 )
 from agent.governance.contract_runtime_visualization import (
@@ -103,7 +104,7 @@ from agent.governance.parallel_branch_runtime import (
 PID = "graph-api-test"
 
 
-def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit(
+def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commit(
     conn,
     monkeypatch,
     tmp_path,
@@ -115,15 +116,27 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
     graph_trace_id = "gqt-precommit-implementation-facade-worker"
     target_root = tmp_path / worker_task_id
     _init_test_git_repo(target_root)
-    changed_files = [
-        "agent/governance/contracts/runtime.py",
-        "agent/governance/server.py",
+    frozen_asset_files = [
+        "agent/governance/dashboard_dist/assets/index-BGxFKhRa.css",
+        "agent/governance/dashboard_dist/assets/index-BttN1OBl.js",
+        "agent/governance/dashboard_dist/assets/index-CxdqAXM1.js",
+        "agent/governance/dashboard_dist/assets/index-DTkNP_Kn.css",
+        "agent/governance/dashboard_dist/index.html",
+        "frontend/dashboard/package.json",
     ]
-    for relative in changed_files:
+    owned_files = [
+        "agent/governance/dashboard_dist/",
+        "frontend/dashboard/package.json",
+    ]
+    for relative in frozen_asset_files:
         path = target_root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("base\n", encoding="utf-8")
-    subprocess.run(["git", "add", *changed_files], cwd=target_root, check=True)
+    subprocess.run(
+        ["git", "add", *frozen_asset_files],
+        cwd=target_root,
+        check=True,
+    )
     subprocess.run(
         ["git", "commit", "-m", "precommit correction base"],
         cwd=target_root,
@@ -133,12 +146,13 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
     )
     base_commit = batch_jobs.git_commit(target_root)
 
-    (target_root / "agent/governance/server.py").write_text(
+    frozen_first_file = "agent/governance/dashboard_dist/index.html"
+    (target_root / frozen_first_file).write_text(
         "frozen candidate\n",
         encoding="utf-8",
     )
     subprocess.run(
-        ["git", "add", "agent/governance/server.py"],
+        ["git", "add", frozen_first_file],
         cwd=target_root,
         check=True,
     )
@@ -165,7 +179,7 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
         worktree_path=str(target_root),
         target_project_root=str(target_root),
         base_commit=base_commit,
-        owned_files=tuple(changed_files),
+        owned_files=tuple(owned_files),
     )
     evidence_events = _record_mf_parallel_runtime_context_worker_evidence(
         conn,
@@ -185,6 +199,8 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
         head_commit=frozen_head,
         implementation_event_ref=f"timeline:{evidence_events['implementation']}",
         include_worker_commit=False,
+        changed_files=[frozen_first_file],
+        owned_files=owned_files,
     )
     runtime = server._contract_runtime(conn)
     frozen_record = runtime.store.get(successor["contract_execution_id"])
@@ -213,12 +229,15 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
         ],
     }
 
-    (target_root / "agent/governance/contracts/runtime.py").write_text(
-        "precommit correction\n",
-        encoding="utf-8",
-    )
+    for relative in frozen_asset_files:
+        if relative == frozen_first_file:
+            continue
+        (target_root / relative).write_text(
+            f"precommit correction for {relative}\n",
+            encoding="utf-8",
+        )
     subprocess.run(
-        ["git", "add", "agent/governance/contracts/runtime.py"],
+        ["git", "add", *frozen_asset_files],
         cwd=target_root,
         check=True,
     )
@@ -238,7 +257,7 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
             "session_token": session_token,
             "target_project_root": str(target_root),
             "commit_sha": corrected_head,
-            "changed_files": changed_files,
+            "changed_files": frozen_asset_files,
             "graph_trace_ids": [graph_trace_id],
             "tests": [{"command": "pytest -q", "status": "passed"}],
         }
@@ -258,8 +277,8 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
             )
         )
 
-    runtime_file = target_root / "agent/governance/contracts/runtime.py"
-    runtime_file.write_text("dirty precommit correction\n", encoding="utf-8")
+    package_file = target_root / "frontend/dashboard/package.json"
+    package_file.write_text("dirty precommit correction\n", encoding="utf-8")
     ordinary_retry = submit_correction(intent=None)
     assert ordinary_retry["contract_runtime_canonical_line"]["status"] == (
         "already_completed"
@@ -280,13 +299,14 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
         "contract_runtime_precommit_correction_dirty_worktree"
     )
     subprocess.run(
-        ["git", "restore", "agent/governance/contracts/runtime.py"],
+        ["git", "restore", "frontend/dashboard/package.json"],
         cwd=target_root,
         check=True,
     )
 
-    outside_fence = "agent/governance/shared_cache.py"
+    outside_fence = "agent/governance/dashboard_dist-escape/index.js"
     outside_path = target_root / outside_fence
+    outside_path.parent.mkdir(parents=True, exist_ok=True)
     outside_path.write_text("outside worker fence\n", encoding="utf-8")
     subprocess.run(["git", "add", outside_fence], cwd=target_root, check=True)
     subprocess.run(
@@ -330,9 +350,9 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
     ]
     assert len(implementations) == 2
     assert implementations[0]["commit_sha"] == frozen_head
-    assert implementations[0]["changed_files"] == ["agent/governance/server.py"]
+    assert implementations[0]["changed_files"] == [frozen_first_file]
     assert implementations[-1]["commit_sha"] == corrected_head
-    assert implementations[-1]["changed_files"] == changed_files
+    assert implementations[-1]["changed_files"] == sorted(frozen_asset_files)
     correction = implementations[-1]["payload"][
         "canonical_precommit_lineage_revision"
     ]
@@ -347,7 +367,8 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
     assert authority["server_derived"] is True
     assert authority["diff_base_commit"] == base_commit
     assert authority["actual_head_commit"] == corrected_head
-    assert authority["cumulative_changed_files"] == changed_files
+    assert authority["cumulative_changed_files"] == sorted(frozen_asset_files)
+    assert authority["owned_files"] == sorted(owned_files)
 
     idempotent_correction = submit_correction()
     assert idempotent_correction[
@@ -380,8 +401,8 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
                 "implementation_lineage_ref": latest_lineage[
                     "implementation_lineage_ref"
                 ],
-                "owned_files": changed_files,
-                "changed_files": changed_files,
+                "owned_files": owned_files,
+                "changed_files": frozen_asset_files,
                 "graph_trace_ids": latest_lineage["graph_trace_ids"],
             },
         )
@@ -395,6 +416,33 @@ def test_precommit_implementation_facade_corrects_frozen_candidate_before_commit
     assert worker_commit["next_legal_action"] == (
         "record_finish_time_worker_attestation"
     )
+    revision_payload = server._runtime_context_latest_contract_revision_payload(
+        conn,
+        runtime_context,
+    )
+    for source in (
+        "runtime_context.finish_time_worker_attestation",
+        "runtime_context.finish_gate",
+    ):
+        finish_projection = (
+            server._runtime_context_contract_worker_commit_projection(
+                conn,
+                project_id=PID,
+                context=runtime_context,
+                runtime_context_id=runtime_context.runtime_context_id,
+                revision_payload=revision_payload,
+                body={
+                    "contract_execution_id": successor[
+                        "contract_execution_id"
+                    ],
+                },
+                source=source,
+            )
+        )
+        assert finish_projection["canonical_worker_commit_required"] is True
+        assert finish_projection["worker_commit_sha"] == corrected_head
+        assert finish_projection["changed_files"] == sorted(frozen_asset_files)
+        assert finish_projection["owned_files"] == sorted(owned_files)
 
 
 def test_runtime_context_head_projection_prefers_assigned_worktree(
@@ -641,6 +689,117 @@ def _worker_commit_contract_proof():
         "payload": identity,
     }
     return record, write
+
+
+def test_worker_fence_containment_accepts_directory_descendants_and_exact_file(
+    tmp_path,
+):
+    changed_files = [
+        "agent/governance/dashboard_dist/assets/index-BGxFKhRa.css",
+        "agent/governance/dashboard_dist/assets/index-BttN1OBl.js",
+        "agent/governance/dashboard_dist/assets/index-CxdqAXM1.js",
+        "agent/governance/dashboard_dist/assets/index-DTkNP_Kn.css",
+        "agent/governance/dashboard_dist/index.html",
+        "frontend/dashboard/package.json",
+    ]
+
+    result = _worker_fence_containment(
+        changed_files,
+        [
+            "agent/governance/dashboard_dist/",
+            "frontend/dashboard/package.json",
+        ],
+        repository_root=str(tmp_path),
+    )
+
+    assert result["ok"] is True
+    assert result["out_of_fence_files"] == []
+    assert result["normalized_changed_files"] == changed_files
+    assert result["normalized_owned_files"] == [
+        "agent/governance/dashboard_dist/",
+        "frontend/dashboard/package.json",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("changed_files", "owned_files"),
+    [
+        (
+            ["agent/governance/dashboard_dist-escape/index.js"],
+            ["agent/governance/dashboard_dist/"],
+        ),
+        (
+            ["agent/governance/dashboard_dist/../server.py"],
+            ["agent/governance/dashboard_dist/"],
+        ),
+        (
+            ["/agent/governance/dashboard_dist/index.html"],
+            ["agent/governance/dashboard_dist/"],
+        ),
+        (
+            [r"agent\\governance\\dashboard_dist\\index.html"],
+            ["agent/governance/dashboard_dist/"],
+        ),
+        (
+            ["agent/governance/dashboard_dist/index.html"],
+            ["agent/governance/dashboard_dist"],
+        ),
+        (
+            ["agent/governance/dashboard_dist/index.html"],
+            ["agent/governance/dashboard_dist/../dashboard_dist/"],
+        ),
+        (
+            ["agent/governance/dashboard_dist/index.html"],
+            ["/agent/governance/dashboard_dist/"],
+        ),
+        (
+            ["agent/governance/dashboard_dist/index.html"],
+            [r"agent\\governance\\dashboard_dist\\"],
+        ),
+        (
+            ["agent/governance/dashboard_dist/index.html"],
+            ["."],
+        ),
+        (
+            ["agent/governance/dashboard_dist/index.html"],
+            [""],
+        ),
+    ],
+)
+def test_worker_fence_containment_rejects_escape_and_alias_shapes(
+    tmp_path,
+    changed_files,
+    owned_files,
+):
+    result = _worker_fence_containment(
+        changed_files,
+        owned_files,
+        repository_root=str(tmp_path),
+    )
+
+    assert result["ok"] is False
+    assert result["out_of_fence_files"]
+
+
+def test_worker_fence_containment_rejects_symlink_escape(tmp_path):
+    repository_root = tmp_path / "repo"
+    repository_root.mkdir()
+    outside_root = tmp_path / "outside"
+    outside_root.mkdir()
+    (repository_root / "dashboard_link").symlink_to(
+        outside_root,
+        target_is_directory=True,
+    )
+
+    result = _worker_fence_containment(
+        ["dashboard_link/index.html"],
+        ["dashboard_link/"],
+        repository_root=str(repository_root),
+    )
+
+    assert result["ok"] is False
+    assert result["canonical_escape_roots"] == ["dashboard_link/"]
+    assert result["canonical_escape_files"] == ["dashboard_link/index.html"]
 
 
 def test_contract_runtime_worker_commit_proof_accepts_exact_active_worker_commit():
@@ -1243,6 +1402,36 @@ def test_runtime_context_finish_resolves_recorded_commit_and_rejects_later_drift
     assert projection["worker_commit_sha"] == worker_commit
     assert projection["contract_execution_id"] == "cex-drift"
     assert projection["contract_runtime_execution_resolution"] == resolution
+    assert projection["owned_files"] == ["owned.py"]
+    assert projection["fence_authority_source"] == (
+        "contract_runtime_worker_commit_recorded_fence"
+    )
+
+    context.owned_files = ("owned.py",)
+    allocated_projection = (
+        server._runtime_context_contract_worker_commit_projection(
+            None,
+            **kwargs,
+        )
+    )
+    assert allocated_projection["fence_authority_source"] == (
+        "runtime_context_allocated_fence"
+    )
+
+    context.owned_files = ("different.py",)
+    with pytest.raises(GovernanceError) as allocated_drift:
+        server._runtime_context_contract_worker_commit_projection(None, **kwargs)
+    assert allocated_drift.value.code == "contract_worker_commit_drift"
+    assert "owned fence drifted" in str(allocated_drift.value)
+    assert "out-of-fence files" in str(allocated_drift.value)
+    assert allocated_drift.value.details["recorded_owned_files"] == ["owned.py"]
+    assert allocated_drift.value.details["allocated_owned_files"] == [
+        "different.py"
+    ]
+    assert allocated_drift.value.details["fence_authority_source"] == (
+        "runtime_context_allocated_fence"
+    )
+    del context.owned_files
 
     owned.write_text("dirty after commit\n", encoding="utf-8")
     with pytest.raises(GovernanceError) as dirty:
@@ -60434,11 +60623,14 @@ def _mf_parallel_worker_proof_payloads(
     graph_trace_id: str,
     head_commit: str,
     implementation_event_ref: str,
+    changed_files: list[str] | None = None,
+    owned_files: list[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     worker_id = runtime_context.worker_id
     worker_slot_id = runtime_context.worker_slot_id or worker_id
     worker_session_id = f"session-{runtime_context.task_id}"
-    changed_files = ["agent/governance/server.py"]
+    changed_files = list(changed_files or ["agent/governance/server.py"])
+    owned_files = list(owned_files or changed_files)
     common = {
         "runtime_context_id": runtime_context.runtime_context_id,
         "task_id": runtime_context.task_id,
@@ -60447,7 +60639,7 @@ def _mf_parallel_worker_proof_payloads(
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
         "target_project_root": runtime_context.target_project_root,
-        "owned_files": changed_files,
+        "owned_files": owned_files,
         "changed_files": changed_files,
         "graph_trace_ids": [graph_trace_id],
     }
@@ -60486,6 +60678,8 @@ def _record_mf_parallel_contract_runtime_worker_prefix(
     implementation_event_ref: str,
     include_worker_commit: bool = True,
     route_token_ref: str = "",
+    changed_files: list[str] | None = None,
+    owned_files: list[str] | None = None,
 ) -> None:
     implementation, worker_commit = _mf_parallel_worker_proof_payloads(
         runtime_context,
@@ -60493,6 +60687,8 @@ def _record_mf_parallel_contract_runtime_worker_prefix(
         graph_trace_id=graph_trace_id,
         head_commit=head_commit,
         implementation_event_ref=implementation_event_ref,
+        changed_files=changed_files,
+        owned_files=owned_files,
     )
     common = dict(implementation)
     if route_token_ref:

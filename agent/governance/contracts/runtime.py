@@ -2903,6 +2903,152 @@ def _worker_commit_strings(value: Any, *keys: str) -> list[str]:
     return values
 
 
+def _worker_fence_containment(
+    changed_files: Sequence[Any],
+    owned_files: Sequence[Any],
+    *,
+    repository_root: str = "",
+) -> dict[str, Any]:
+    """Validate file changes against exact-file and recursive-directory roots.
+
+    A trailing slash is the only directory-root marker. All other owned paths
+    are exact files. Both sides are repository-relative canonical POSIX paths;
+    aliases and escape-shaped paths fail closed instead of being normalized
+    into authority.
+    """
+
+    def _normalized_path(value: Any, *, allow_directory: bool) -> tuple[str, bool]:
+        raw = str(value or "").strip()
+        if (
+            not raw
+            or "\x00" in raw
+            or "\\" in raw
+            or raw.startswith("/")
+            or re.match(r"^[A-Za-z]:", raw)
+        ):
+            return "", False
+        is_directory = raw.endswith("/")
+        if is_directory and not allow_directory:
+            return "", False
+        candidate = raw[:-1] if is_directory else raw
+        parts = candidate.split("/")
+        if (
+            not candidate
+            or candidate in {".", ".."}
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            return "", False
+        normalized = "/".join(parts)
+        if normalized != candidate:
+            return "", False
+        return normalized, is_directory
+
+    raw_changed = sorted(
+        {
+            str(value or "").strip()
+            for value in changed_files
+            if str(value or "").strip()
+        }
+    )
+    raw_owned = sorted(
+        {
+            str(value or "").strip()
+            for value in owned_files
+            if str(value or "").strip()
+        }
+    )
+    root_path: Path | None = None
+    repository_root_valid = True
+    if repository_root:
+        candidate_root = Path(repository_root).expanduser()
+        repository_root_valid = candidate_root.is_absolute()
+        if repository_root_valid:
+            root_path = candidate_root.resolve(strict=False)
+
+    def _escapes_repository(normalized: str) -> bool:
+        if root_path is None:
+            return False
+        resolved = (root_path / normalized).resolve(strict=False)
+        try:
+            resolved.relative_to(root_path)
+        except ValueError:
+            return True
+        return False
+
+    normalized_roots: list[tuple[str, bool]] = []
+    invalid_owned: list[str] = []
+    canonical_escape_roots: list[str] = []
+    for raw in raw_owned:
+        normalized, is_directory = _normalized_path(
+            raw,
+            allow_directory=True,
+        )
+        if not normalized:
+            invalid_owned.append(raw)
+            continue
+        if _escapes_repository(normalized):
+            invalid_owned.append(raw)
+            canonical_escape_roots.append(raw)
+            continue
+        normalized_roots.append((normalized, is_directory))
+
+    normalized_changed: list[str] = []
+    invalid_changed: list[str] = []
+    canonical_escape_files: list[str] = []
+    for raw in raw_changed:
+        normalized, is_directory = _normalized_path(
+            raw,
+            allow_directory=False,
+        )
+        if not normalized or is_directory:
+            invalid_changed.append(raw)
+            continue
+        if _escapes_repository(normalized):
+            invalid_changed.append(raw)
+            canonical_escape_files.append(raw)
+            continue
+        normalized_changed.append(normalized)
+
+    out_of_fence = [
+        changed
+        for changed in normalized_changed
+        if not any(
+            changed == root
+            if not is_directory
+            else changed.startswith(root + "/")
+            for root, is_directory in normalized_roots
+        )
+    ]
+    if invalid_owned or not repository_root_valid:
+        out_of_fence = sorted(set(out_of_fence) | set(normalized_changed))
+    out_of_fence = sorted(set(out_of_fence) | set(invalid_changed))
+    return {
+        "schema_version": "contract_runtime.worker_fence_containment.v1",
+        "ok": bool(
+            raw_changed
+            and raw_owned
+            and repository_root_valid
+            and not invalid_owned
+            and not invalid_changed
+            and not out_of_fence
+        ),
+        "repository_root": str(root_path or ""),
+        "repository_root_valid": repository_root_valid,
+        "normalized_changed_files": sorted(set(normalized_changed)),
+        "normalized_owned_files": sorted(
+            {
+                root + ("/" if is_directory else "")
+                for root, is_directory in normalized_roots
+            }
+        ),
+        "invalid_changed_files": sorted(set(invalid_changed)),
+        "invalid_owned_files": sorted(set(invalid_owned)),
+        "canonical_escape_files": sorted(set(canonical_escape_files)),
+        "canonical_escape_roots": sorted(set(canonical_escape_roots)),
+        "out_of_fence_files": out_of_fence,
+    }
+
+
 def _worker_commit_flag(value: Any, *keys: str) -> bool:
     for candidate in _worker_commit_mapping_candidates(value):
         for key in keys:
@@ -3060,8 +3206,13 @@ def _mf_parallel_worker_commit_errors(
         errors.append("worker_commit changed_files must exactly match commit_diff_files")
     if not owned_files:
         errors.append("worker_commit requires owned_files")
-    out_of_fence = sorted(changed_files - owned_files)
-    if out_of_fence:
+    fence_containment = _worker_fence_containment(
+        sorted(changed_files),
+        sorted(owned_files),
+        repository_root=resolved.get("target_project_root", ""),
+    )
+    out_of_fence = list(fence_containment["out_of_fence_files"])
+    if not fence_containment["ok"]:
         errors.append(f"worker_commit contains out-of-fence files: {out_of_fence!r}")
 
     graph_trace_ids = set(
@@ -5264,7 +5415,17 @@ class ContractRuntime:
         if sorted(set(authority.get("cumulative_changed_files") or [])) != changed_files:
             errors.append("implementation revision files must match cumulative runtime diff")
         owned_files = set(authority.get("owned_files") or [])
-        if not owned_files or set(changed_files) - owned_files:
+        fence_containment = _worker_fence_containment(
+            changed_files,
+            sorted(owned_files),
+            repository_root=str(
+                authority.get("fence_repository_root")
+                or effective_write.get("target_project_root")
+                or payload.get("target_project_root")
+                or ""
+            ).strip(),
+        )
+        if not fence_containment["ok"]:
             errors.append("implementation revision files must remain inside the worker fence")
         revision_event_ref = str(rejoin_marker.get("revision_event_ref") or "").strip()
         if not revision_event_ref or str(
@@ -5570,7 +5731,17 @@ class ContractRuntime:
                 "precommit implementation correction files must match cumulative runtime diff"
             )
         owned_files = set(authority.get("owned_files") or [])
-        if not owned_files or set(changed_files) - owned_files:
+        fence_containment = _worker_fence_containment(
+            changed_files,
+            sorted(owned_files),
+            repository_root=str(
+                authority.get("fence_repository_root")
+                or effective_write.get("target_project_root")
+                or payload.get("target_project_root")
+                or ""
+            ).strip(),
+        )
+        if not fence_containment["ok"]:
             errors.append(
                 "precommit implementation correction files must remain inside the worker fence"
             )

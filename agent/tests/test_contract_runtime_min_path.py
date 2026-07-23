@@ -395,8 +395,16 @@ def test_precommit_worker_implementation_correction_is_append_only_and_bounded(
         actor_role="mf_sub",
     )
     changed_files = [
-        "agent/governance/contracts/runtime.py",
-        "agent/governance/server.py",
+        "agent/governance/dashboard_dist/assets/index-BGxFKhRa.css",
+        "agent/governance/dashboard_dist/assets/index-BttN1OBl.js",
+        "agent/governance/dashboard_dist/assets/index-CxdqAXM1.js",
+        "agent/governance/dashboard_dist/assets/index-DTkNP_Kn.css",
+        "agent/governance/dashboard_dist/index.html",
+        "frontend/dashboard/package.json",
+    ]
+    owned_files = [
+        "agent/governance/dashboard_dist/",
+        "frontend/dashboard/package.json",
     ]
     identity = {
         "runtime_context_id": "mfrctx-precommit-correction",
@@ -480,7 +488,7 @@ def test_precommit_worker_implementation_correction_is_append_only_and_bounded(
             "diff_base_commit": "0" * 40,
             "clean_worktree": True,
             "cumulative_changed_files": changed_files,
-            "owned_files": changed_files,
+            "owned_files": owned_files,
             "graph_trace_ids": ["gqt-precommit-corrected"],
             "correction_intent_verified": True,
             "correction_intent_schema_version": (

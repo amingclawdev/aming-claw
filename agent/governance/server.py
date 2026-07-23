@@ -63,6 +63,7 @@ from .contracts.runtime import (
     _line_evidence_from_write,
     _worker_commit_completed_implementation,
     _worker_commit_text,
+    _worker_fence_containment,
     _worker_implementation_lineage,
     is_legacy_primary_contract_route,
     read_backlog_contract_chain_current,
@@ -26618,7 +26619,12 @@ def _runtime_context_same_lane_worker_commit_recovery(
         revision_diff.get("base_commit") or ""
     ).strip():
         errors.append("worker_commit runtime diff base drifted")
-    if set(actual_files) - set(owned_files):
+    fence_containment = _worker_fence_containment(
+        actual_files,
+        owned_files,
+        repository_root=worktree_path,
+    )
+    if not fence_containment["ok"]:
         errors.append("current cumulative diff contains files outside the owned fence")
     if errors:
         return result
@@ -27219,8 +27225,13 @@ def _runtime_context_revise_precommit_implementation_lineage(
             or ()
         )
     )
-    out_of_fence = sorted(set(cumulative_files) - set(owned_files))
-    if not cumulative_files or out_of_fence:
+    fence_containment = _worker_fence_containment(
+        cumulative_files,
+        owned_files,
+        repository_root=worktree_path,
+    )
+    out_of_fence = list(fence_containment["out_of_fence_files"])
+    if not cumulative_files or not fence_containment["ok"]:
         raise GovernanceError(
             "contract_runtime_precommit_correction_scope_invalid",
             (
@@ -27234,6 +27245,7 @@ def _runtime_context_revise_precommit_implementation_lineage(
                 "cumulative_changed_files": cumulative_files,
                 "owned_files": owned_files,
                 "out_of_fence_files": out_of_fence,
+                "fence_containment": fence_containment,
                 "fail_closed": True,
             },
         )
@@ -27382,6 +27394,7 @@ def _runtime_context_revise_precommit_implementation_lineage(
         "clean_worktree": True,
         "cumulative_changed_files": cumulative_files,
         "owned_files": owned_files,
+        "fence_repository_root": worktree_path,
         "graph_trace_ids": verified_trace_ids,
         "graph_trace_authority_source": "graph_query_traces",
         "correction_intent_verified": True,
@@ -27740,7 +27753,12 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             or ()
         )
     )
-    out_of_fence = sorted(set(cumulative_files) - set(owned_files))
+    fence_containment = _worker_fence_containment(
+        cumulative_files,
+        owned_files,
+        repository_root=worktree_path,
+    )
+    out_of_fence = list(fence_containment["out_of_fence_files"])
     graph_evidence = (
         payload.get("graph_trace_db_evidence")
         if isinstance(payload.get("graph_trace_db_evidence"), Mapping)
@@ -27754,7 +27772,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         errors.append(
             "implementation revision changed_files must equal the cumulative runtime diff"
         )
-    if out_of_fence:
+    if not fence_containment["ok"]:
         errors.append(f"implementation revision contains out-of-fence files: {out_of_fence!r}")
     if (
         graph_evidence.get("db_verified") is not True
@@ -28103,6 +28121,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         "clean_worktree": True,
         "cumulative_changed_files": cumulative_files,
         "owned_files": owned_files,
+        "fence_repository_root": worktree_path,
         "revision_event_ref": revision_event_ref,
         "failed_qa_source_ref": expected_failed_qa_source_ref,
         "superseded_implementation_commit_authority": dict(
@@ -29720,6 +29739,32 @@ def _runtime_context_contract_worker_commit_projection(
     )
     recorded_commit_parent = str(payload.get("commit_parent_sha") or "").strip()
     recorded_diff_base = str(payload.get("diff_base_commit") or "").strip()
+    recorded_owned_files = _runtime_context_service_query_values(
+        payload,
+        "owned_files",
+    )
+    allocated_owned_files = sorted(
+        set(
+            getattr(context, "owned_files", ())
+            or getattr(context, "target_files", ())
+            or ()
+        )
+    )
+    projection_owned_files = (
+        allocated_owned_files
+        if allocated_owned_files
+        else sorted(set(recorded_owned_files))
+    )
+    fence_authority_source = (
+        "runtime_context_allocated_fence"
+        if allocated_owned_files
+        else "contract_runtime_worker_commit_recorded_fence"
+    )
+    fence_containment = _worker_fence_containment(
+        committed_files,
+        projection_owned_files,
+        repository_root=worktree_path,
+    )
     errors: list[str] = []
     if not re.fullmatch(r"[0-9a-f]{40,64}", commit_sha):
         errors.append("ContractRuntime worker_commit is missing a full commit SHA")
@@ -29735,6 +29780,13 @@ def _runtime_context_contract_worker_commit_projection(
         errors.append("ContractRuntime worker_commit revision parent drifted")
     if recorded_diff_base != diff_base_commit:
         errors.append("ContractRuntime worker_commit runtime diff base drifted")
+    if (
+        allocated_owned_files
+        and sorted(set(recorded_owned_files)) != allocated_owned_files
+    ):
+        errors.append("ContractRuntime worker_commit owned fence drifted")
+    if not fence_containment["ok"]:
+        errors.append("ContractRuntime worker_commit contains out-of-fence files")
     if errors:
         raise GovernanceError(
             "contract_worker_commit_drift",
@@ -29752,6 +29804,11 @@ def _runtime_context_contract_worker_commit_projection(
                 "actual_commit_parent": commit_parent,
                 "recorded_diff_base_commit": recorded_diff_base,
                 "actual_diff_base_commit": diff_base_commit,
+                "recorded_owned_files": recorded_owned_files,
+                "allocated_owned_files": allocated_owned_files,
+                "projection_owned_files": projection_owned_files,
+                "fence_authority_source": fence_authority_source,
+                "fence_containment": fence_containment,
                 "dirty_files": dirty_files,
                 "source_of_authority": "ContractRuntime.completed_lines.worker_commit",
                 "next_legal_action": "stop_and_report_worker_commit_drift",
@@ -29789,7 +29846,8 @@ def _runtime_context_contract_worker_commit_projection(
         "worker_session_id": str(payload.get("worker_session_id") or ""),
         "changed_files": recorded_files,
         "commit_diff_files": recorded_diff_files,
-        "owned_files": _runtime_context_service_query_values(payload, "owned_files"),
+        "owned_files": recorded_owned_files,
+        "fence_authority_source": fence_authority_source,
         "graph_trace_ids": _runtime_context_service_query_values(
             payload,
             "graph_trace_ids",
@@ -30014,13 +30072,22 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             raise ValidationError(
                 "worker_commit diff must exactly match worker_implementation changed_files"
             )
-        out_of_fence = sorted(set(commit_diff_files) - set(owned_files))
-        if out_of_fence:
+        fence_containment = _worker_fence_containment(
+            commit_diff_files,
+            owned_files,
+            repository_root=worktree_path,
+        )
+        out_of_fence = list(fence_containment["out_of_fence_files"])
+        if not fence_containment["ok"]:
             raise GovernanceError(
                 "worker_commit_out_of_fence",
                 "worker_commit contains files outside the allocated fence",
                 422,
-                {"out_of_fence_files": out_of_fence, "owned_files": owned_files},
+                {
+                    "out_of_fence_files": out_of_fence,
+                    "owned_files": owned_files,
+                    "fence_containment": fence_containment,
+                },
             )
 
         session_token_ref = runtime_context_session_token_ref(context)
@@ -30058,6 +30125,7 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             "clean_worktree": True,
             "dirty_files": [],
             "owned_files": owned_files,
+            "fence_repository_root": worktree_path,
             "changed_files": sorted(commit_diff_files),
             "commit_diff_files": sorted(commit_diff_files),
             "graph_trace_ids": verified_trace_ids,
