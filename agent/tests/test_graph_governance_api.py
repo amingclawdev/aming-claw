@@ -76349,6 +76349,188 @@ def test_active_integration_epoch_precedes_onboard_and_rejects_new_allocation(
     assert resolved_parent is not None and parent_scope == "coordination"
 
 
+def _seed_open_epoch_planned_successor(
+    conn,
+    *,
+    batch_id="batch-canonical-successor",
+    queue_id="mq-canonical-successor",
+    queue_item_id="item-canonical-successor",
+    task_id="task-canonical-successor",
+    backlog_id="AC-CANONICAL-SUCCESSOR",
+    current_head="a" * 40,
+):
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id=queue_item_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+                branch_ref="",
+                queue_index=2,
+                status="planned",
+                target_ref="refs/heads/main",
+            )
+        ],
+    )
+    return upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id=batch_id,
+            epoch_id="integration-epoch-canonical-successor",
+            coordination_backlog_id="AC-BATCH-PARENT",
+            target_ref="refs/heads/main",
+            base_head="0" * 40,
+            current_head=current_head,
+            merge_queue_id=queue_id,
+            merge_cursor=1,
+            merged_prefix=("item-row1",),
+            remaining_queue_item_ids=(queue_item_id,),
+            status="open",
+            active_queue_item_id=queue_item_id,
+            active_task_id=task_id,
+            active_backlog_id=backlog_id,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [
+        ("task_id", "task-unrelated"),
+        ("backlog_id", "AC-UNRELATED"),
+        ("batch_id", "batch-unrelated"),
+        ("merge_queue_id", "mq-unrelated"),
+        ("target_ref", "refs/heads/release"),
+        ("requested_head_commit", "b" * 40),
+        ("queue_item_id", "item-unrelated"),
+    ],
+)
+def test_active_epoch_canonical_successor_dispatch_rejects_identity_drift(
+    conn,
+    field,
+    replacement,
+):
+    epoch = _seed_open_epoch_planned_successor(conn)
+    request = {
+        "active_epoch": epoch,
+        "project_id": PID,
+        "task_id": "task-canonical-successor",
+        "backlog_id": "AC-CANONICAL-SUCCESSOR",
+        "batch_id": "batch-canonical-successor",
+        "merge_queue_id": "mq-canonical-successor",
+        "target_ref": "refs/heads/main",
+        "requested_head_commit": "a" * 40,
+        "queue_item_id": "item-canonical-successor",
+    }
+    request[field] = replacement
+
+    assert (
+        server._active_epoch_canonical_successor_dispatch_allowed(
+            conn,
+            **request,
+        )
+        is False
+    )
+
+
+def test_active_epoch_allows_only_canonical_planned_successor_allocation(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    current_head = "a" * 40
+    _seed_open_epoch_planned_successor(conn, current_head=current_head)
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args: {"role": "observer", "principal_id": "observer"},
+    )
+
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "task-canonical-successor",
+                "batch_id": "batch-canonical-successor",
+                "backlog_id": "AC-CANONICAL-SUCCESSOR",
+                "workspace_root": str(tmp_path),
+                "base_commit": current_head,
+                "target_head_commit": current_head,
+                "target_ref": "refs/heads/main",
+                "merge_queue_id": "mq-canonical-successor",
+                "owned_files": ["agent/canonical.py"],
+                "agent_id": "observer",
+                "worker_id": "canonical-worker",
+                "create_worktree": False,
+            },
+        )
+    )
+
+    assert status == 201
+    assert allocated["ok"] is True
+    assert allocated["context"]["task_id"] == "task-canonical-successor"
+    assert allocated["context"]["target_head_commit"] == current_head
+
+
+def test_mf_parallel_enter_allows_open_epoch_canonical_planned_successor(conn):
+    backlog_id = "AC-CANONICAL-SUCCESSOR"
+    task_id = "task-canonical-successor"
+    current_head = "a" * 40
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-canonical-onboard",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    _seed_open_epoch_planned_successor(
+        conn,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        current_head=current_head,
+    )
+    conn.commit()
+
+    entered = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "reason": "Continue the canonical serialized batch successor.",
+                "route_token_ref": "rtok-canonical-successor",
+                "owned_files": ["agent/canonical.py"],
+                "metadata": {
+                    "active_integration_epoch_successor": {
+                        "batch_id": "batch-canonical-successor",
+                        "merge_queue_id": "mq-canonical-successor",
+                        "queue_item_id": "item-canonical-successor",
+                        "target_ref": "refs/heads/main",
+                        "current_head": current_head,
+                    }
+                },
+            },
+        )
+    )
+
+    assert entered["ok"] is True
+    assert entered["event"]["backlog_id"] == backlog_id
+    assert entered["next_legal_action"]["id"] == "observer_prefill_child_contracts"
+
+
 @pytest.mark.parametrize(
     "invalid_child_commit,invalid_child_fixed_at,expected_detail_key",
     [

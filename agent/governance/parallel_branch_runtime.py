@@ -16915,10 +16915,13 @@ def _merge_dependency_blockers(
             if dep_item is None or dep_item.status not in MERGE_DONE_STATES:
                 add(dep, blocker_type)
                 continue
-            if blocker_type == "requires_graph_epoch" and not (
-                dep_item.snapshot_id and dep_item.projection_id
-            ):
-                add(dep, blocker_type)
+            # One merge queue is one integration unit. A durably merged earlier
+            # item satisfies ordering for its canonical successor; requiring a
+            # graph epoch here would force an intermediate full reconcile
+            # between candidates. The integration epoch still enforces one
+            # activated current-HEAD full reconcile after the final merge.
+            if blocker_type == "requires_graph_epoch":
+                continue
 
     for blocker_type, deps in (
         ("conflicts_with", item.conflicts_with),

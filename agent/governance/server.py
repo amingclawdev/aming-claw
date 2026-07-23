@@ -11621,6 +11621,63 @@ def _parallel_branch_allocate_effective_route_body(
     return effective
 
 
+def _active_epoch_canonical_successor_dispatch_allowed(
+    conn,
+    *,
+    active_epoch: Any,
+    project_id: str,
+    task_id: str,
+    backlog_id: str,
+    batch_id: str,
+    merge_queue_id: str,
+    target_ref: str,
+    requested_head_commit: str,
+    queue_item_id: str = "",
+) -> bool:
+    """Admit only the active epoch's unmaterialized canonical successor."""
+
+    if active_epoch is None or str(active_epoch.status or "") != "open":
+        return False
+    if str(active_epoch.project_id or "") != str(project_id or ""):
+        return False
+    if str(active_epoch.active_task_id or "") != str(task_id or ""):
+        return False
+    if str(active_epoch.active_backlog_id or "") != str(backlog_id or ""):
+        return False
+    if str(active_epoch.batch_id or "") != str(batch_id or ""):
+        return False
+    if str(active_epoch.merge_queue_id or "") != str(merge_queue_id or ""):
+        return False
+    if str(active_epoch.target_ref or "") != str(target_ref or ""):
+        return False
+    if queue_item_id and str(active_epoch.active_queue_item_id or "") != str(
+        queue_item_id
+    ):
+        return False
+    if not _contract_runtime_authority_commit_matches(
+        str(active_epoch.current_head or ""),
+        str(requested_head_commit or ""),
+    ):
+        return False
+
+    from .parallel_branch_runtime import get_merge_queue_item
+
+    item = get_merge_queue_item(
+        conn,
+        project_id,
+        str(active_epoch.merge_queue_id or ""),
+        str(active_epoch.active_queue_item_id or ""),
+    )
+    if item is None or str(item.status or "") != "planned":
+        return False
+    return bool(
+        str(item.task_id or "") == str(task_id or "")
+        and str(item.backlog_id or "") == str(backlog_id or "")
+        and str(item.merge_queue_id or "") == str(merge_queue_id or "")
+        and str(item.target_ref or "") == str(target_ref or "")
+    )
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/allocate")
 def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     """Allocate and optionally materialize one parallel branch runtime context."""
@@ -11815,7 +11872,25 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         continuing_materialized_worker = (
             not create_worktree and is_materialized_branch_context(preexisting_context)
         )
-        if active_epoch is not None and not continuing_materialized_worker:
+        canonical_epoch_successor = (
+            active_epoch is not None
+            and _active_epoch_canonical_successor_dispatch_allowed(
+                conn,
+                active_epoch=active_epoch,
+                project_id=project_id,
+                task_id=task_id,
+                backlog_id=str(ctx.body.get("backlog_id") or ""),
+                batch_id=str(ctx.body.get("batch_id") or ""),
+                merge_queue_id=normalized_merge_queue_id,
+                target_ref=allocation_target_ref,
+                requested_head_commit=target_head_commit or base_commit,
+            )
+        )
+        if (
+            active_epoch is not None
+            and not continuing_materialized_worker
+            and not canonical_epoch_successor
+        ):
             return 409, {
                 "ok": False,
                 "error": "integration_epoch_dispatch_base_frozen",
@@ -95572,13 +95647,26 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             integration_epoch_to_dict,
         )
 
+        epoch_successor_proof = (
+            metadata.get("active_integration_epoch_successor")
+            if isinstance(
+                metadata.get("active_integration_epoch_successor"), Mapping
+            )
+            else {}
+        )
+        merge_queue_item = (
+            body.get("merge_queue_item")
+            if isinstance(body.get("merge_queue_item"), Mapping)
+            else (
+                metadata.get("merge_queue_item")
+                if isinstance(metadata.get("merge_queue_item"), Mapping)
+                else {}
+            )
+        )
         enter_target_ref = str(
             body.get("target_ref")
-            or (
-                body.get("merge_queue_item", {}).get("target_ref")
-                if isinstance(body.get("merge_queue_item"), Mapping)
-                else ""
-            )
+            or merge_queue_item.get("target_ref")
+            or epoch_successor_proof.get("target_ref")
             or "refs/heads/main"
         ).strip()
         active_epoch = get_active_integration_epoch(
@@ -95586,7 +95674,47 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             project_id,
             target_ref=enter_target_ref,
         )
-        if active_epoch is not None:
+        canonical_epoch_successor = (
+            active_epoch is not None
+            and _active_epoch_canonical_successor_dispatch_allowed(
+                conn,
+                active_epoch=active_epoch,
+                project_id=project_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+                batch_id=str(
+                    body.get("parent_batch_id")
+                    or body.get("batch_id")
+                    or metadata.get("parent_batch_id")
+                    or metadata.get("batch_id")
+                    or epoch_successor_proof.get("batch_id")
+                    or ""
+                ).strip(),
+                merge_queue_id=str(
+                    body.get("merge_queue_id")
+                    or merge_queue_item.get("merge_queue_id")
+                    or metadata.get("merge_queue_id")
+                    or epoch_successor_proof.get("merge_queue_id")
+                    or ""
+                ).strip(),
+                target_ref=enter_target_ref,
+                requested_head_commit=str(
+                    body.get("target_head_commit")
+                    or body.get("head_commit")
+                    or metadata.get("target_head_commit")
+                    or epoch_successor_proof.get("current_head")
+                    or merge_queue_item.get("current_target_head")
+                    or merge_queue_item.get("target_head_commit")
+                    or ""
+                ).strip(),
+                queue_item_id=str(
+                    merge_queue_item.get("queue_item_id")
+                    or epoch_successor_proof.get("queue_item_id")
+                    or ""
+                ).strip(),
+            )
+        )
+        if active_epoch is not None and not canonical_epoch_successor:
             return 409, {
                 "ok": False,
                 "error": "integration_epoch_dispatch_base_frozen",
@@ -95692,6 +95820,9 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             "target_files": list(target_files),
             "test_files": list(row_test_files),
             "worker_fence": dict(worker_fence),
+            "active_integration_epoch_canonical_successor": (
+                canonical_epoch_successor
+            ),
         }
         if onboard_service_waiver:
             metadata = {
