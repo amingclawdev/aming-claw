@@ -40571,6 +40571,8 @@ def _complete_source_backed_mf_parallel_successor(
     worker_commit: str,
     route_identity: dict,
     worktree_path: str,
+    fixture_suffix: str = "",
+    target_head_before_merge: str = "",
 ) -> dict:
     runtime = server._contract_runtime(conn)
     runtime_context = _insert_mf_parallel_source_backed_runtime_context(
@@ -40598,7 +40600,7 @@ def _complete_source_backed_mf_parallel_successor(
         "changed_files": ["agent/governance/server.py"],
         **route_identity,
     }
-    worker_graph_trace_id = "gqt-20260628-feed1234"
+    worker_graph_trace_id = f"gqt-20260628-feed1234{fixture_suffix}"
     worker_payload.update(
         {
             "worker_session_id": runtime_context.worker_slot_id,
@@ -40613,27 +40615,31 @@ def _complete_source_backed_mf_parallel_successor(
         conn,
         trace_id=worker_graph_trace_id,
         parent_task_id=runtime_context.parent_task_id or backlog_id,
-        snapshot_id="scope-mf-parallel-source-backed-complete",
+        snapshot_id=(
+            f"scope-mf-parallel-source-backed-complete{fixture_suffix}"
+        ),
         runtime_context_id=runtime_context.runtime_context_id,
         task_id=runtime_context.task_id,
         worker_role="mf_sub",
         fence_token=runtime_context.fence_token,
         run_id=_mf_sub_run_id(runtime_context.task_id, runtime_context.fence_token),
     )
-    qa_graph_trace_id = "gqt-20260628-aabb5678"
+    qa_graph_trace_id = f"gqt-20260628-aabb5678{fixture_suffix}"
     qa_graph_evidence = _insert_exact_qa_graph_query_trace(
         conn,
         trace_id=qa_graph_trace_id,
-        snapshot_id="scope-mf-parallel-source-backed-qa",
+        snapshot_id=f"scope-mf-parallel-source-backed-qa{fixture_suffix}",
         candidate_commit_sha=worker_commit,
         backlog_id=backlog_id,
         task_id=runtime_context.task_id,
         target_project_root=runtime_context.target_project_root,
         actor="qa",
-        qa_session_id="ses-qa-source-backed-complete",
+        qa_session_id=f"ses-qa-source-backed-complete{fixture_suffix}",
         query_purpose="qa_gate_validation",
     )
-    current_full_snapshot_id = "full-mf-parallel-source-backed-close"
+    current_full_snapshot_id = (
+        f"full-mf-parallel-source-backed-close{fixture_suffix}"
+    )
     _activate_basic_graph(
         conn,
         current_full_snapshot_id,
@@ -40667,7 +40673,9 @@ def _complete_source_backed_mf_parallel_successor(
                 target_ref="refs/heads/main",
                 branch_head=worker_commit,
                 merge_commit=close_commit,
-                target_head_before_merge="c" * 40,
+                target_head_before_merge=(
+                    target_head_before_merge or "c" * 40
+                ),
                 target_head_after_merge=close_commit,
             )
         ],
@@ -41509,7 +41517,9 @@ def test_mf_parallel_close_authority_honors_missing_finish_and_reconcile_bypasse
     record["runtime_guide"]["completed_lines"] = lines
 
     # 相关修复可以把 canonical HEAD 推进到已 reconcile commit 的后代；
-    # 父 row 的精确 reconcile provenance 仍须按原 event/commit 复用。
+    # 但后代关系本身不够，必须存在 parent bypass 精确指向的 OPEN
+    # diagnostic，并由该 diagnostic 的 child ContractRuntime 完成 durable
+    # merge + task-scoped current-full reconcile。
     (worktree / "related-repair.txt").write_text(
         "related close-authority repair\n",
         encoding="utf-8",
@@ -41528,10 +41538,79 @@ def test_mf_parallel_close_authority_honors_missing_finish_and_reconcile_bypasse
     )
     repair_commit = batch_jobs.git_commit(worktree)
     assert repair_commit != close_commit
-    _activate_basic_graph(
+    repair_diagnostic_id = "AC-CONTRACT-LINE-BYPASS-MISSING-RECONCILE"
+    conn.execute(
+        "UPDATE backlog_bugs SET mf_type = 'chain_rescue', \"commit\" = ?, "
+        "chain_stage = 'fixed', runtime_state = 'fixed' WHERE bug_id = ?",
+        (repair_commit, repair_diagnostic_id),
+    )
+    conn.commit()
+    repair_route_identity = {
+        "route_id": "route-missing-reconcile-related-repair",
+        "route_context_hash": _fake_sha(
+            "route-missing-reconcile-related-repair"
+        ),
+        "prompt_contract_id": (
+            "rprompt-missing-reconcile-related-repair"
+        ),
+        "prompt_contract_hash": _fake_sha(
+            "prompt-missing-reconcile-related-repair"
+        ),
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-missing-reconcile-related-repair"
+        ),
+        "route_token_ref": "rtok-missing-reconcile-related-repair",
+    }
+    repair_started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": repair_diagnostic_id,
+                "route_token_ref": repair_route_identity[
+                    "route_token_ref"
+                ],
+            },
+        )
+    )
+    _complete_source_backed_onboarding(
         conn,
-        "full-missing-finish-reconcile-repair",
-        commit_sha=repair_commit,
+        repair_started["contract_execution_id"],
+    )
+    repair_successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": (
+                    "Repair the exact parent no-PASS reconcile blocker."
+                ),
+                "backlog_id": repair_diagnostic_id,
+                "task_id": "missing-reconcile-related-repair-parent",
+                "route_token_ref": repair_route_identity[
+                    "route_token_ref"
+                ],
+                "worker_fence": {
+                    "fence_token": "fence-missing-reconcile-related-repair",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    _complete_source_backed_mf_parallel_successor(
+        conn,
+        repair_successor["contract_execution_id"],
+        backlog_id=repair_diagnostic_id,
+        close_commit=repair_commit,
+        worker_commit=repair_commit,
+        route_identity=repair_route_identity,
+        worktree_path=str(worktree),
+        fixture_suffix="-related-repair",
+        target_head_before_merge=close_commit,
     )
 
     authority_record = server._contract_runtime_bind_close_reconcile_authority(
@@ -41546,7 +41625,20 @@ def test_mf_parallel_close_authority_honors_missing_finish_and_reconcile_bypasse
         if line["line_id"] == "observer_reconcile"
     )["payload"]["reconcile_authority"]
     assert rebound_reconcile["merged_commit_sha"] == close_commit
-    assert rebound_reconcile["reconciled_commit_sha"] == close_commit
+    assert rebound_reconcile["reconciled_commit_sha"] == close_commit, {
+        key: rebound_reconcile.get(key)
+        for key in (
+            "merged_commit_sha",
+            "reconciled_commit_sha",
+            "canonical_head_commit",
+            "active_snapshot_commit",
+            "reconcile_snapshot_commit",
+            "reconcile_event_id",
+            "reconcile_source_ref",
+            "provenance_id",
+            "provenance_verified",
+        )
+    }
     assert rebound_reconcile["canonical_head_commit"] == repair_commit
     assert rebound_reconcile[
         "reconciled_commit_is_ancestor_of_canonical_head"
@@ -41621,6 +41713,24 @@ def test_mf_parallel_close_authority_honors_missing_finish_and_reconcile_bypasse
     assert gate["checks"][
         "formal_observer_reconcile_historical_descendant_verified"
     ] is True
+    reconcile_exception = next(
+        item
+        for item in gate["formal_no_pass_bypass_exceptions"]
+        if item["line_id"] == "observer_reconcile"
+    )
+    repair_authority = reconcile_exception[
+        "reconcile_head_relationship"
+    ]["descendant_repair_authority"]
+    assert repair_authority["diagnostic_backlog_id"] == repair_diagnostic_id
+    assert repair_authority["diagnostic_status"] == "OPEN"
+    assert repair_authority["child_contract_execution_id"] == (
+        repair_successor["contract_execution_id"]
+    )
+    assert repair_authority["source_close_commit"] == close_commit
+    assert repair_authority["repair_merge_commit"] == repair_commit
+    assert repair_authority["repair_reconciled_commit"] == repair_commit
+    assert repair_authority["no_pass_claim"] is True
+    assert repair_authority["authoritative_pass_synthesized"] is False
     assert "worker_finish_gate" not in gate["line_sources"]
     assert "observer_reconcile" not in gate["line_sources"]
     assert {
@@ -41683,6 +41793,46 @@ def test_mf_parallel_close_authority_honors_missing_finish_and_reconcile_bypasse
         assert rejected_gate["checks"][
             "formal_observer_reconcile_bypass_verified"
         ] is False
+
+    # 即使是 Git 后代，只要不是 exact diagnostic child 的 durable merge /
+    # reconcile HEAD，就不能借用 parent 历史 reconcile authority。
+    (worktree / "unrelated-descendant.txt").write_text(
+        "unrelated descendant\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "unrelated-descendant.txt"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "unrelated descendant"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    unrelated_commit = batch_jobs.git_commit(worktree)
+    _activate_basic_graph(
+        conn,
+        "full-missing-finish-reconcile-unrelated",
+        commit_sha=unrelated_commit,
+    )
+    unrelated_authority = (
+        server._contract_runtime_bind_close_reconcile_authority(
+            conn,
+            project_id=PID,
+            record=record,
+        )
+    )
+    unrelated_gate = close_gate(unrelated_authority)
+    assert unrelated_gate["passed"] is False
+    assert unrelated_gate["checks"][
+        "formal_observer_reconcile_bypass_verified"
+    ] is False
+    assert unrelated_gate["checks"][
+        "formal_observer_reconcile_historical_descendant_verified"
+    ] is False
 
     conn.execute(
         "UPDATE backlog_bugs SET status = 'FIXED' WHERE bug_id = ?",

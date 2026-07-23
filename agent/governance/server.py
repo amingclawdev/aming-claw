@@ -65586,11 +65586,41 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
     canonical_head_commit = (
         _git_head_commit(Path(root)).strip().lower() if root else ""
     )
+    requested_reconcile_event_id = int(
+        reconcile.get("reconcile_event_id") or 0
+    )
+    reconcile_target_commit = canonical_head_commit
+    if requested_reconcile_event_id > 0:
+        try:
+            provenance_rows = conn.execute(
+                """
+                SELECT target_commit_sha
+                FROM graph_current_full_reconcile_provenance
+                WHERE project_id = ? AND reconcile_event_id = ?
+                ORDER BY created_at DESC, provenance_id DESC
+                LIMIT 2
+                """,
+                (project_id, requested_reconcile_event_id),
+            ).fetchall()
+        except sqlite3.Error:
+            provenance_rows = []
+        if len(provenance_rows) == 1:
+            exact_target = str(
+                provenance_rows[0]["target_commit_sha"] or ""
+            ).strip().lower()
+            if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", exact_target):
+                # Resolve the immutable provenance selected by the trusted
+                # reconcile timeline event.  current_full_reconcile_state
+                # still returns the live active snapshot independently, so
+                # the checks below bind both the historical reconcile target
+                # and today's canonical HEAD without borrowing the latest
+                # active marker for an older ContractRuntime.
+                reconcile_target_commit = exact_target
     state = graph_snapshot_store.current_full_reconcile_state(
         conn,
         project_id,
         merged_commit,
-        current_canonical_commit_sha=canonical_head_commit,
+        current_canonical_commit_sha=reconcile_target_commit,
         qa_event_id=int(merge.get("qa_event_id") or 0),
         qa_event_created_at=str(merge.get("qa_event_created_at") or ""),
         qa_source_ref=str(merge.get("qa_source_ref") or ""),
@@ -65605,7 +65635,7 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
         ),
         merge_event_id=int(merge.get("merge_event_id") or 0),
         merge_event_created_at=str(merge.get("merge_event_created_at") or ""),
-        reconcile_event_id=int(reconcile.get("reconcile_event_id") or 0),
+        reconcile_event_id=requested_reconcile_event_id,
         reconcile_event_created_at=str(
             reconcile.get("reconcile_event_created_at") or ""
         ),
@@ -65704,6 +65734,8 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
         "merge_queue_id": str(merge.get("merge_queue_id") or ""),
         "merged_commit_sha": merged_commit,
         "reconciled_commit_sha": reconciled_commit,
+        "reconcile_provenance_target_commit": reconcile_target_commit,
+        "current_canonical_commit_sha": canonical_head_commit,
         "canonical_head_commit": canonical_head_commit,
         "canonical_head_equals_merged_commit": (
             canonical_head_equals_merged_commit
@@ -79322,8 +79354,15 @@ def _contract_runtime_mf_parallel_reconcile_head_relationship(
     authority: Mapping[str, Any],
     *,
     close_commit: str,
+    descendant_repair_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """验证历史 reconcile commit 与当前 descendant HEAD 的双重边界。"""
+
+    descendant_repair_authority = (
+        descendant_repair_authority
+        if isinstance(descendant_repair_authority, Mapping)
+        else {}
+    )
 
     merged_commit = str(authority.get("merged_commit_sha") or "").strip()
     reconciled_commit = str(
@@ -79385,6 +79424,29 @@ def _contract_runtime_mf_parallel_reconcile_head_relationship(
             reconciled_commit,
             reconcile_snapshot_commit,
         )
+        and descendant_repair_authority.get("passed") is True
+        and descendant_repair_authority.get("db_verified") is True
+        and descendant_repair_authority.get("no_pass_claim") is True
+        and descendant_repair_authority.get(
+            "authoritative_pass_synthesized"
+        )
+        is False
+        and _contract_runtime_authority_commit_matches(
+            canonical_head,
+            str(
+                descendant_repair_authority.get("repair_merge_commit")
+                or ""
+            ),
+        )
+        and _contract_runtime_authority_commit_matches(
+            canonical_head,
+            str(
+                descendant_repair_authority.get(
+                    "repair_reconciled_commit"
+                )
+                or ""
+            ),
+        )
     )
     passed = bool(exact_current_head or historical_descendant)
     return {
@@ -79408,8 +79470,367 @@ def _contract_runtime_mf_parallel_reconcile_head_relationship(
         "reconcile_snapshot_commit": reconcile_snapshot_commit,
         "close_matches_historical_reconcile": close_matches_historical,
         "historical_reconcile_descendant_verified": historical_descendant,
+        "descendant_repair_authority": dict(descendant_repair_authority),
         "caller_commit_relationship_accepted": False,
     }
+
+
+def _contract_runtime_mf_parallel_historical_descendant_repair_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    bypass_authority: Mapping[str, Any],
+    reconcile_authority: Mapping[str, Any],
+    close_commit: str,
+) -> dict[str, Any]:
+    """绑定把历史 parent HEAD 推进到当前 HEAD 的唯一正式修复 child。
+
+    后代关系本身不构成 close authority。只有 parent 的精确 OPEN no-PASS
+    diagnostic 启动的 child ContractRuntime，经过 durable merge queue 和
+    task-scoped current-full reconcile，才允许复用历史 parent reconcile。
+    """
+
+    if conn is None:
+        return {}
+    parent_backlog_id = str(record.get("backlog_id") or "").strip()
+    parent_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    diagnostic_id = str(
+        bypass_authority.get("diagnostic_backlog_id") or ""
+    ).strip()
+    bypass_identity = str(
+        bypass_authority.get("bypass_identity") or ""
+    ).strip()
+    canonical_head = str(
+        reconcile_authority.get("canonical_head_commit") or ""
+    ).strip().lower()
+    if not (
+        project_id
+        and parent_backlog_id
+        and parent_execution_id
+        and diagnostic_id
+        and bypass_identity
+        and str(bypass_authority.get("source_backlog_id") or "").strip()
+        == parent_backlog_id
+        and str(bypass_authority.get("contract_execution_id") or "").strip()
+        == parent_execution_id
+        and str(bypass_authority.get("line_id") or "").strip()
+        == "observer_reconcile"
+        and bypass_authority.get("db_verified") is True
+        and bypass_authority.get("no_pass_claim") is True
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", canonical_head)
+        and not _contract_runtime_authority_commit_matches(
+            close_commit,
+            canonical_head,
+        )
+    ):
+        return {}
+
+    diagnostic = conn.execute(
+        """
+        SELECT bug_id, status, mf_type, "commit", chain_stage, runtime_state,
+               chain_trigger_json, bypass_policy_json
+        FROM backlog_bugs WHERE bug_id = ?
+        """,
+        (diagnostic_id,),
+    ).fetchone()
+    if not diagnostic:
+        return {}
+    chain = backlog_runtime.parse_json_object(
+        diagnostic["chain_trigger_json"]
+    )
+    policy = backlog_runtime.parse_json_object(
+        diagnostic["bypass_policy_json"]
+    )
+    try:
+        bypass_revision = int(
+            bypass_authority.get("execution_state_revision") or 0
+        )
+    except (TypeError, ValueError):
+        return {}
+    exact_binding = {
+        "source_backlog_id": parent_backlog_id,
+        "contract_execution_id": parent_execution_id,
+        "line_id": "observer_reconcile",
+        "execution_state_revision": bypass_revision,
+        "bypass_identity": bypass_identity,
+        "classification": "system_logic",
+        "disposition": "proceeded_with_exception",
+        "no_pass_claim": True,
+    }
+
+    def metadata_matches(metadata: Mapping[str, Any]) -> bool:
+        metadata_execution_id = str(
+            metadata.get("contract_execution_id")
+            or metadata.get("source_contract_execution_id")
+            or ""
+        ).strip()
+        if metadata_execution_id != parent_execution_id:
+            return False
+        for field, expected in exact_binding.items():
+            if field == "contract_execution_id":
+                continue
+            actual = metadata.get(field)
+            if field == "execution_state_revision":
+                try:
+                    actual = int(actual or 0)
+                except (TypeError, ValueError):
+                    return False
+            if actual != expected:
+                return False
+        return True
+
+    diagnostic_commit = str(diagnostic["commit"] or "").strip().lower()
+    if not (
+        str(diagnostic["status"] or "").strip().upper() == "OPEN"
+        and str(diagnostic["mf_type"] or "").strip() == "chain_rescue"
+        and metadata_matches(chain)
+        and metadata_matches(policy)
+        and policy.get("keep_open") is True
+        and diagnostic_commit == canonical_head
+    ):
+        return {}
+
+    diagnostic_event_ref = str(
+        bypass_authority.get("diagnostic_event_ref") or ""
+    ).strip()
+    diagnostic_event_match = re.fullmatch(
+        r"timeline:(\d+)", diagnostic_event_ref
+    )
+    if not diagnostic_event_match:
+        return {}
+    diagnostic_event_id = int(diagnostic_event_match.group(1))
+    rows = conn.execute(
+        """
+        SELECT id, event_type, event_kind, status, task_id, commit_sha,
+               payload_json, created_at
+        FROM task_timeline_events
+        WHERE project_id = ? AND backlog_id = ?
+        ORDER BY id
+        """,
+        (project_id, diagnostic_id),
+    ).fetchall()
+    entered_candidates: list[tuple[int, str]] = []
+    events_by_id: dict[int, tuple[Any, Mapping[str, Any]]] = {}
+    for row in rows:
+        event_id = int(row["id"] or 0)
+        payload = backlog_runtime.parse_json_object(row["payload_json"])
+        events_by_id[event_id] = (row, payload)
+        if (
+            event_id > diagnostic_event_id
+            and str(row["event_type"] or "").strip()
+            == "mf_parallel.entered"
+            and str(row["status"] or "").strip().lower()
+            == "accepted"
+        ):
+            execution_id = _timeline_first_deep_text(
+                payload,
+                "successor_contract_execution_id",
+            )
+            if execution_id.startswith("cex-"):
+                entered_candidates.append((event_id, execution_id))
+
+    try:
+        from .parallel_branch_runtime import (
+            get_merge_queue_item_for_branch_context,
+        )
+    except ImportError:
+        return {}
+
+    candidates: list[dict[str, Any]] = []
+    for entered_event_id, child_execution_id in entered_candidates:
+        try:
+            child_record = _contract_runtime_store(conn).get(
+                child_execution_id
+            )
+        except (ContractRuntimeError, sqlite3.Error):
+            continue
+        if not (
+            str(child_record.get("project_id") or "").strip() == project_id
+            and str(child_record.get("backlog_id") or "").strip()
+            == diagnostic_id
+            and str(
+                child_record.get("contract_execution_id") or ""
+            ).strip()
+            == child_execution_id
+            and _is_mf_parallel_record_contract_id(
+                str(child_record.get("contract_id") or "")
+            )
+        ):
+            continue
+        repair_reconcile = _contract_runtime_current_full_reconcile_authority(
+            conn,
+            project_id=project_id,
+            record=child_record,
+        )
+        runtime_context_id = str(
+            repair_reconcile.get("runtime_context_id") or ""
+        ).strip()
+        task_id = str(repair_reconcile.get("task_id") or "").strip()
+        parent_task_id = str(
+            repair_reconcile.get("parent_task_id") or ""
+        ).strip()
+        merge_queue_id = str(
+            repair_reconcile.get("merge_queue_id") or ""
+        ).strip()
+        if not all(
+            (runtime_context_id, task_id, parent_task_id, merge_queue_id)
+        ):
+            continue
+        queue_item = get_merge_queue_item_for_branch_context(
+            conn,
+            project_id,
+            task_id,
+            merge_queue_id=merge_queue_id,
+        )
+        if queue_item is None:
+            continue
+        repair_merge_commit = str(
+            repair_reconcile.get("merged_commit_sha") or ""
+        ).strip().lower()
+        repair_reconciled_commit = str(
+            repair_reconcile.get("reconciled_commit_sha") or ""
+        ).strip().lower()
+        merge_event_id = int(
+            repair_reconcile.get("merge_event_id") or 0
+        )
+        reconcile_event_id = int(
+            repair_reconcile.get("reconcile_event_id") or 0
+        )
+        merge_event = events_by_id.get(merge_event_id)
+        reconcile_event = events_by_id.get(reconcile_event_id)
+        if not merge_event or not reconcile_event:
+            continue
+        merge_row, merge_payload = merge_event
+        reconcile_row, reconcile_payload = reconcile_event
+        merge_event_commit = str(
+            merge_row["commit_sha"]
+            or merge_payload.get("merge_commit")
+            or merge_payload.get("target_head_after_merge")
+            or ""
+        ).strip().lower()
+        reconcile_event_commit = str(
+            reconcile_row["commit_sha"]
+            or reconcile_payload.get("reconciled_commit_sha")
+            or ""
+        ).strip().lower()
+        active_snapshot_id = str(
+            repair_reconcile.get("active_snapshot_id")
+            or repair_reconcile.get("snapshot_id")
+            or ""
+        ).strip()
+        if not (
+            repair_reconcile.get("db_verified") is True
+            and repair_reconcile.get("live_verified") is True
+            and repair_reconcile.get("active_snapshot_verified") is True
+            and repair_reconcile.get("graph_reconciled") is True
+            and repair_reconcile.get("dispatch_lineage_verified") is True
+            and str(
+                repair_reconcile.get("contract_execution_id") or ""
+            ).strip()
+            == child_execution_id
+            and str(repair_reconcile.get("backlog_id") or "").strip()
+            == diagnostic_id
+            and repair_merge_commit == canonical_head
+            and repair_reconciled_commit == canonical_head
+            and str(
+                repair_reconcile.get("canonical_head_commit") or ""
+            ).strip().lower()
+            == canonical_head
+            and str(
+                repair_reconcile.get("active_snapshot_commit") or ""
+            ).strip().lower()
+            == canonical_head
+            and active_snapshot_id
+            and str(getattr(queue_item, "status", "") or "") == "merged"
+            and str(
+                getattr(queue_item, "backlog_id", "") or ""
+            ).strip()
+            == diagnostic_id
+            and str(getattr(queue_item, "task_id", "") or "").strip()
+            == task_id
+            and str(
+                getattr(queue_item, "merge_queue_id", "") or ""
+            ).strip()
+            == merge_queue_id
+            and str(
+                getattr(queue_item, "target_head_before_merge", "") or ""
+            ).strip().lower()
+            == str(close_commit or "").strip().lower()
+            and str(
+                getattr(queue_item, "merge_commit", "") or ""
+            ).strip().lower()
+            == canonical_head
+            and str(
+                getattr(queue_item, "target_head_after_merge", "") or ""
+            ).strip().lower()
+            == canonical_head
+            and diagnostic_event_id
+            < entered_event_id
+            < merge_event_id
+            < reconcile_event_id
+            and str(merge_row["event_type"] or "").strip()
+            in {"parallel.live_merge", "merge.live"}
+            and str(merge_row["status"] or "").strip().lower()
+            == "passed"
+            and merge_event_commit == canonical_head
+            and str(reconcile_row["event_type"] or "").strip()
+            == "graph.reconcile"
+            and str(reconcile_row["status"] or "").strip().lower()
+            == "passed"
+            and reconcile_event_commit == canonical_head
+        ):
+            continue
+        candidates.append(
+            {
+                "schema_version": (
+                    "contract_runtime.historical_descendant_repair_authority.v1"
+                ),
+                "passed": True,
+                "server_derived": True,
+                "db_verified": True,
+                "source": (
+                    "formal_no_pass_diagnostic+child_contract_runtime+"
+                    "parallel_merge_queue+current_full_reconcile"
+                ),
+                "project_id": project_id,
+                "source_backlog_id": parent_backlog_id,
+                "source_contract_execution_id": parent_execution_id,
+                "source_close_commit": str(close_commit or "").lower(),
+                "diagnostic_backlog_id": diagnostic_id,
+                "diagnostic_status": "OPEN",
+                "diagnostic_event_ref": diagnostic_event_ref,
+                "diagnostic_event_id": diagnostic_event_id,
+                "bypass_identity": bypass_identity,
+                "child_contract_execution_id": child_execution_id,
+                "child_entered_event_ref": f"timeline:{entered_event_id}",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "merge_queue_id": merge_queue_id,
+                "queue_item_id": str(
+                    getattr(queue_item, "queue_item_id", "") or ""
+                ),
+                "repair_merge_commit": repair_merge_commit,
+                "repair_merge_event_ref": f"timeline:{merge_event_id}",
+                "repair_reconciled_commit": repair_reconciled_commit,
+                "repair_reconcile_event_ref": (
+                    f"timeline:{reconcile_event_id}"
+                ),
+                "repair_snapshot_id": active_snapshot_id,
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+                "authoritative_pass_synthesized": False,
+            }
+        )
+    unique = {stable_sha256(item): item for item in candidates}
+    if len(unique) != 1:
+        return {}
+    result = next(iter(unique.values()))
+    result["authority_hash"] = stable_sha256(result)
+    return result
 
 
 def _contract_runtime_mf_parallel_server_temporal_ordering_diagnostic(
@@ -80471,10 +80892,25 @@ def _contract_runtime_mf_parallel_close_authority_gate(
     reconciled_merged_commit = str(
         reconcile_authority.get("merged_commit_sha") or ""
     ).strip()
+    descendant_repair_authority = (
+        _contract_runtime_mf_parallel_historical_descendant_repair_authority(
+            conn,
+            project_id=(
+                project_id or str(record.get("project_id") or "").strip()
+            ),
+            record=record,
+            bypass_authority=reconcile_bypass,
+            reconcile_authority=reconcile_authority,
+            close_commit=close_commit,
+        )
+        if conn is not None and reconcile_bypass
+        else {}
+    )
     reconcile_head_relationship = (
         _contract_runtime_mf_parallel_reconcile_head_relationship(
             reconcile_authority,
             close_commit=close_commit,
+            descendant_repair_authority=descendant_repair_authority,
         )
     )
     reconcile_boundary_line = found.get("observer_close_ready", {}) or (
