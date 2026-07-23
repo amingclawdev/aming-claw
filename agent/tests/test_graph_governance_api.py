@@ -41249,6 +41249,356 @@ def _mf_parallel_close_authority_v2_record(
     return record
 
 
+def _record_formal_no_pass_close_bypass(
+    conn,
+    *,
+    record: dict,
+    line_id: str,
+    diagnostic_id: str,
+    revision: int,
+) -> dict:
+    backlog_id = record["backlog_id"]
+    execution_id = record["contract_execution_id"]
+    bypass_identity = (
+        f"bypass:{execution_id}:revision-{revision}:close:{line_id}"
+    )
+    payload = {
+        "schema_version": "contract_line_bypass.v1",
+        "source_backlog_id": backlog_id,
+        "diagnostic_backlog_id": diagnostic_id,
+        "bypass_identity": bypass_identity,
+        "classification": "system_logic",
+        "execution_state_revision": revision,
+        "disposition": "proceeded_with_exception",
+        "no_pass_claim": True,
+    }
+    line = {
+        "stage_id": (
+            "worker_finish"
+            if line_id == "worker_finish_gate"
+            else "observer_integration"
+        ),
+        "line_id": line_id,
+        "actor_role": "observer",
+        "evidence_kind": "contract_line_bypass",
+        "status": "waived",
+        "no_pass_claim": True,
+        "payload": payload,
+    }
+    link = {
+        "source_backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "line_id": line_id,
+        "execution_state_revision": revision,
+        "bypass_identity": bypass_identity,
+        "classification": "system_logic",
+        "disposition": "proceeded_with_exception",
+        "no_pass_claim": True,
+    }
+    conn.execute(
+        """
+        INSERT INTO backlog_bugs (
+          bug_id, title, status, chain_trigger_json, bypass_policy_json,
+          created_at, updated_at
+        ) VALUES (?, ?, 'OPEN', ?, ?, ?, ?)
+        """,
+        (
+            diagnostic_id,
+            f"Formal no-PASS diagnostic for {line_id}",
+            json.dumps(link),
+            json.dumps({**link, "keep_open": True}),
+            "2026-07-22T12:30:00Z",
+            "2026-07-22T12:30:00Z",
+        ),
+    )
+    event_payload = {**link, "diagnostic_backlog_id": diagnostic_id}
+    correlation_id = f"contract-line-bypass:{bypass_identity}"
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=f"{backlog_id.lower()}-worker",
+        event_type="contract_line_bypass",
+        event_kind="record_blocker",
+        phase="contract_runtime_bypass",
+        actor="observer",
+        status="proceeded_with_exception",
+        decision="linked_open_diagnostic_no_pass",
+        correlation_id=correlation_id,
+        payload=event_payload,
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=diagnostic_id,
+        task_id=f"{backlog_id.lower()}-worker",
+        event_type="contract_line_bypass_diagnostic_linked",
+        event_kind="record_blocker",
+        phase="contract_runtime_bypass",
+        actor="observer",
+        status="open",
+        decision="keep_open_until_block_repaired",
+        correlation_id=correlation_id,
+        payload=event_payload,
+    )
+    conn.commit()
+    return line
+
+
+def test_mf_parallel_close_authority_honors_exact_formal_no_pass_bypasses(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-MF-PARALLEL-FORMAL-NO-PASS-CLOSE-AUTHORITY"
+    worktree = tmp_path / "formal-no-pass-close-authority"
+    worker_commit = _init_test_git_repo(worktree)
+    close_commit = worker_commit
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: worktree,
+    )
+    fixture = _start_completed_source_backed_mf_parallel_close_authority_chain(
+        conn,
+        backlog_id=backlog_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        route_label="formal-no-pass-close-authority",
+        worktree_path=str(worktree),
+    )
+    record = json.loads(json.dumps(fixture["completed"]))
+    lines = record["completed_lines"]
+    worker_finish = next(
+        line for line in lines if line["line_id"] == "worker_finish_gate"
+    )
+    stale_finish_commit = "f" * 40
+    worker_finish["commit_sha"] = stale_finish_commit
+    worker_finish["payload"]["mf_subagent_finish_gate"]["head_commit"] = (
+        stale_finish_commit
+    )
+
+    # Preserve the immutable QA/merge/reconcile completed-line indexes: use the
+    # prior attestation slot as the formal finish exception marker.
+    attestation_index = next(
+        index
+        for index, line in enumerate(lines)
+        if line["line_id"] == "worker_finish_time_attestation"
+    )
+    lines[attestation_index] = _record_formal_no_pass_close_bypass(
+        conn,
+        record=record,
+        line_id="worker_finish_gate",
+        diagnostic_id="AC-CONTRACT-LINE-BYPASS-TEST-WORKER-FINISH",
+        revision=24,
+    )
+    close_ready_index = next(
+        index
+        for index, line in enumerate(lines)
+        if line["line_id"] == "observer_close_ready"
+    )
+    lines[close_ready_index] = _record_formal_no_pass_close_bypass(
+        conn,
+        record=record,
+        line_id="observer_close_ready",
+        diagnostic_id="AC-CONTRACT-LINE-BYPASS-TEST-CLOSE-READY",
+        revision=29,
+    )
+    record["runtime_guide"]["completed_lines"] = lines
+    authority_record = server._contract_runtime_bind_close_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+
+    gate = server._contract_runtime_mf_parallel_close_authority_gate(
+        [authority_record],
+        chain_projection=_mf_parallel_close_authority_chain_projection(
+            record["contract_execution_id"]
+        ),
+        close_commit=close_commit,
+        conn=conn,
+        project_id=PID,
+    )
+
+    assert gate["passed"] is True, {
+        "missing": gate["missing_requirement_ids"],
+        "checks": gate["checks"],
+        "exceptions": gate["formal_no_pass_bypass_exceptions"],
+        "lineage": gate["server_post_qa_lineage_diagnostics"],
+        "reconcile": gate["reconcile_close_diagnostic"],
+        "rejected": gate["rejected_evidence_by_requirement"],
+        "mismatches": gate["commit_mismatches"],
+    }
+    assert gate["missing_requirement_ids"] == []
+    assert gate["checks"]["worker_finish_business_line_passed"] is True
+    assert gate["checks"]["observer_close_ready_business_line_passed"] is False
+    assert gate["checks"]["formal_worker_finish_commit_bypass_verified"] is True
+    assert gate["checks"]["formal_observer_close_ready_bypass_verified"] is True
+    assert gate["checks"]["formal_bypass_synthesized_pass"] is False
+    assert "observer_close_ready" not in gate["line_sources"]
+    assert {
+        item["exception_scope"]
+        for item in gate["formal_no_pass_bypass_exceptions"]
+    } == {
+        "worker_finish_exact_worker_commit",
+        "observer_close_ready_close_commit",
+    }
+    assert all(
+        item["no_pass_claim"] is True
+        and item["bypassed_business_line_passed"] is False
+        for item in gate["formal_no_pass_bypass_exceptions"]
+    )
+    close_exception = next(
+        item
+        for item in gate["formal_no_pass_bypass_exceptions"]
+        if item["line_id"] == "observer_close_ready"
+    )
+    assert close_exception["server_derived_close_commit"] == close_commit
+    assert close_exception["caller_bypass_commit_fields_ignored"] is True
+
+
+def test_formal_no_pass_close_bypass_rejects_caller_commit_without_server_lineage(
+    conn,
+):
+    backlog_id = "AC-FORMAL-NO-PASS-FORGED-CLOSE-COMMIT"
+    execution_id = "cex-formal-no-pass-forged-close-commit"
+    close_commit = "a" * 40
+    worker_commit = "b" * 40
+    record = _mf_parallel_close_authority_v2_record(
+        execution_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=True,
+        backlog_id=backlog_id,
+    )
+    lines = record["completed_lines"]
+    close_ready_index = next(
+        index
+        for index, line in enumerate(lines)
+        if line["line_id"] == "observer_close_ready"
+    )
+    forged = _record_formal_no_pass_close_bypass(
+        conn,
+        record=record,
+        line_id="observer_close_ready",
+        diagnostic_id="AC-CONTRACT-LINE-BYPASS-FORGED-CLOSE-COMMIT",
+        revision=17,
+    )
+    forged["commit_sha"] = close_commit
+    forged["payload"]["merge_commit"] = close_commit
+    forged["payload"]["close_commit"] = close_commit
+    lines[close_ready_index] = forged
+    record["runtime_guide"]["completed_lines"] = lines
+
+    gate = server._contract_runtime_mf_parallel_close_authority_gate(
+        [record],
+        chain_projection=_mf_parallel_close_authority_chain_projection(
+            execution_id
+        ),
+        close_commit=close_commit,
+        conn=conn,
+        project_id=PID,
+    )
+
+    assert gate["passed"] is False
+    assert gate["checks"]["formal_observer_close_ready_bypass_verified"] is False
+    assert "contract_runtime.observer_close_ready" in gate[
+        "missing_requirement_ids"
+    ]
+    assert gate["formal_no_pass_bypass_exceptions"] == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "malformed",
+        "cross_execution",
+        "stale_revision",
+        "forged_missing_audit_half",
+        "generic_waiver",
+        "closed_diagnostic",
+        "mismatched_backlog",
+    ],
+)
+def test_formal_no_pass_close_bypass_rejects_non_exact_authority(conn, case):
+    backlog_id = f"AC-FORMAL-NO-PASS-REJECT-{case.upper()}"
+    execution_id = f"cex-formal-no-pass-reject-{case}"
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [],
+        "runtime_guide": {"completed_lines": [], "next_legal_action": None},
+    }
+    diagnostic_id = f"AC-CONTRACT-LINE-BYPASS-REJECT-{case.upper()}"
+    line = _record_formal_no_pass_close_bypass(
+        conn,
+        record=record,
+        line_id="observer_close_ready",
+        diagnostic_id=diagnostic_id,
+        revision=17,
+    )
+    record["completed_lines"] = [line]
+    record["runtime_guide"]["completed_lines"] = record["completed_lines"]
+    correlation_id = (
+        "contract-line-bypass:" + line["payload"]["bypass_identity"]
+    )
+
+    if case == "malformed":
+        line["payload"]["schema_version"] = "caller.contract_line_bypass.v0"
+    elif case == "cross_execution":
+        rows = conn.execute(
+            "SELECT id, payload_json FROM task_timeline_events "
+            "WHERE correlation_id = ?",
+            (correlation_id,),
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            payload["contract_execution_id"] = "cex-unrelated"
+            conn.execute(
+                "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+                (json.dumps(payload), int(row["id"])),
+            )
+    elif case == "stale_revision":
+        metadata = json.loads(
+            conn.execute(
+                "SELECT chain_trigger_json FROM backlog_bugs WHERE bug_id = ?",
+                (diagnostic_id,),
+            ).fetchone()[0]
+        )
+        metadata["execution_state_revision"] = 16
+        conn.execute(
+            "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+            (json.dumps(metadata), diagnostic_id),
+        )
+    elif case == "forged_missing_audit_half":
+        conn.execute(
+            "DELETE FROM task_timeline_events "
+            "WHERE correlation_id = ? AND event_type = ?",
+            (correlation_id, "contract_line_bypass_diagnostic_linked"),
+        )
+    elif case == "generic_waiver":
+        line["evidence_kind"] = "close_ready"
+    elif case == "closed_diagnostic":
+        conn.execute(
+            "UPDATE backlog_bugs SET status = 'FIXED' WHERE bug_id = ?",
+            (diagnostic_id,),
+        )
+    elif case == "mismatched_backlog":
+        line["payload"]["source_backlog_id"] = "AC-UNRELATED"
+    conn.commit()
+
+    authority = server._contract_runtime_formal_no_pass_bypass_authorities(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+
+    assert authority == {}
+
+
 def test_mf_parallel_close_authority_still_requires_reconcile_evidence():
     close_commit = "9" * 40
     worker_commit = "8" * 40
