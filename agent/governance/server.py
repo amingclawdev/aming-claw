@@ -46,6 +46,7 @@ from . import backlog_runtime
 from . import raw_requirement
 from . import observer_session
 from . import context_registry
+from .dashboard_read_cache import BACKLOG_READ_CACHE
 from .idempotency import check_idempotency, store_idempotency
 from .redis_client import get_redis
 from .models import Evidence, MemoryEntry, NodeDef
@@ -92057,8 +92058,9 @@ _BACKLOG_CLOSED_STATUSES = {
     # successor) and CANCELLED/VOID (abandoned).
     "WAIVED",
 }
-_BACKLOG_DEFAULT_LIST_LIMIT = 100
-_BACKLOG_HARD_LIST_LIMIT = 200
+_BACKLOG_DEFAULT_LIST_LIMIT = 250
+_BACKLOG_HARD_LIST_LIMIT = 250
+_BACKLOG_HOT_WINDOW_LIMIT = 250
 _BACKLOG_COMPACT_PREVIEW_CHARS = 280
 _BACKLOG_AUDIT_ARCHIVE_SCHEMA_VERSION = "backlog_audit_archive.v1"
 
@@ -92532,13 +92534,214 @@ def _append_backlog_filters(sql: str, params: list[Any], ctx: RequestContext) ->
     return sql, params
 
 
+def _ensure_backlog_read_schema(conn: sqlite3.Connection) -> None:
+    """Install the indexed keyset and exact mutation-generation triggers."""
+
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_backlog_bugs_dashboard_keyset
+            ON backlog_bugs(updated_at DESC, created_at DESC, bug_id DESC);
+        CREATE TABLE IF NOT EXISTS dashboard_backlog_cache_generation (
+            resource TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        INSERT OR IGNORE INTO dashboard_backlog_cache_generation
+            (resource, generation, updated_at)
+        VALUES ('backlog', 1, CURRENT_TIMESTAMP);
+        CREATE TRIGGER IF NOT EXISTS trg_dashboard_backlog_cache_insert
+        AFTER INSERT ON backlog_bugs
+        BEGIN
+            UPDATE dashboard_backlog_cache_generation
+               SET generation = generation + 1,
+                   updated_at = CURRENT_TIMESTAMP
+             WHERE resource = 'backlog';
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_dashboard_backlog_cache_update
+        AFTER UPDATE ON backlog_bugs
+        BEGIN
+            UPDATE dashboard_backlog_cache_generation
+               SET generation = generation + 1,
+                   updated_at = CURRENT_TIMESTAMP
+             WHERE resource = 'backlog';
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_dashboard_backlog_cache_delete
+        AFTER DELETE ON backlog_bugs
+        BEGIN
+            UPDATE dashboard_backlog_cache_generation
+               SET generation = generation + 1,
+                   updated_at = CURRENT_TIMESTAMP
+             WHERE resource = 'backlog';
+        END;
+        """
+    )
+    conn.commit()
+
+
+def _backlog_read_authority(
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> tuple[int, str]:
+    """Return project-local mutation generation plus dynamic authority digest."""
+
+    row = conn.execute(
+        """
+        SELECT generation, updated_at
+          FROM dashboard_backlog_cache_generation
+         WHERE resource = 'backlog'
+        """
+    ).fetchone()
+    generation = int(_row_get(row, "generation", 1) or 1)
+    generation_updated_at = str(_row_get(row, "updated_at", "") or "")
+    try:
+        database_rows = conn.execute("PRAGMA database_list").fetchall()
+        database_path = next(
+            (
+                str(row[2] or "")
+                for row in database_rows
+                if len(row) > 2 and str(row[1] or "") == "main"
+            ),
+            "",
+        )
+    except (sqlite3.Error, TypeError, IndexError):
+        database_path = ""
+    if database_path and database_path != ":memory:":
+        db_scope = str(Path(database_path).expanduser().resolve(strict=False))
+    else:
+        marker_prefix = "__aming_backlog_read_scope_"
+        marker = conn.execute(
+            """
+            SELECT name
+              FROM sqlite_temp_master
+             WHERE type = 'view' AND name LIKE ?
+             ORDER BY name
+             LIMIT 1
+            """,
+            (f"{marker_prefix}%",),
+        ).fetchone()
+        marker_name = str(_row_get(marker, "name", "") if marker else "")
+        if not marker_name:
+            marker_name = f"{marker_prefix}{uuid.uuid4().hex}"
+            conn.execute(
+                f'CREATE TEMP VIEW "{marker_name}" AS SELECT 1 AS scope'
+            )
+        db_scope = marker_name
+    authority_parts = [
+        project_id,
+        db_scope,
+        str(generation),
+        generation_updated_at,
+    ]
+    for sql in (
+        """
+        SELECT COUNT(*) AS row_count,
+               COALESCE(MAX(COALESCE(completed_at, claimed_at, notified_at, created_at)), '') AS watermark
+          FROM observer_command_queue
+         WHERE project_id = ?
+        """,
+        """
+        SELECT COUNT(*) AS row_count,
+               COALESCE(MAX(execution_state_revision), 0) AS watermark
+          FROM contract_runtime_executions
+         WHERE project_id = ?
+        """,
+        """
+        SELECT COUNT(*) AS row_count,
+               COALESCE(MAX(generation), 0) AS watermark
+          FROM backlog_contract_chain_current
+         WHERE project_id = ?
+        """,
+    ):
+        try:
+            dynamic = conn.execute(sql, (project_id,)).fetchone()
+        except sqlite3.OperationalError:
+            dynamic = None
+        authority_parts.extend(
+            [
+                str(_row_get(dynamic, "row_count", 0) if dynamic else 0),
+                str(_row_get(dynamic, "watermark", "") if dynamic else ""),
+            ]
+        )
+    authority_generation = "sha256:" + hashlib.sha256(
+        "\x1f".join(authority_parts).encode("utf-8")
+    ).hexdigest()
+    return generation, authority_generation
+
+
+def _backlog_stable_cursor(row: Mapping[str, Any] | sqlite3.Row | None) -> str:
+    if row is None:
+        return ""
+    values = [
+        str(_row_get(row, "updated_at", "") or ""),
+        str(_row_get(row, "created_at", "") or ""),
+        str(_row_get(row, "bug_id", "") or ""),
+    ]
+    return "bk1." + json.dumps(
+        values,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8").hex()
+
+
+def _decode_backlog_stable_cursor(value: str) -> tuple[str, str, str] | None:
+    cursor = str(value or "").strip()
+    if not cursor:
+        return None
+    if not cursor.startswith("bk1."):
+        raise GovernanceError(
+            "invalid_backlog_cursor",
+            "backlog cursor must use the stable bk1 keyset format",
+            400,
+        )
+    try:
+        decoded = json.loads(bytes.fromhex(cursor[4:]).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GovernanceError(
+            "invalid_backlog_cursor",
+            "backlog cursor is malformed",
+            400,
+        ) from exc
+    if not isinstance(decoded, list) or len(decoded) != 3:
+        raise GovernanceError(
+            "invalid_backlog_cursor",
+            "backlog cursor must contain updated_at, created_at, and bug_id",
+            400,
+        )
+    return tuple(str(item or "") for item in decoded)  # type: ignore[return-value]
+
+
+def _backlog_keyset_clause(
+    sql: str,
+    params: list[Any],
+    cursor: tuple[str, str, str] | None,
+) -> tuple[str, list[Any]]:
+    if cursor is None:
+        return sql, params
+    updated_at, created_at, bug_id = cursor
+    sql += (
+        " AND (updated_at < ?"
+        " OR (updated_at = ? AND created_at < ?)"
+        " OR (updated_at = ? AND created_at = ? AND bug_id < ?))"
+    )
+    params.extend(
+        [updated_at, updated_at, created_at, updated_at, created_at, bug_id]
+    )
+    return sql, params
+
+
+def _backlog_read_cache_clear() -> None:
+    """Test/control hook; never changes durable backlog authority."""
+
+    BACKLOG_READ_CACHE.clear()
+
+
 @route("GET", "/api/backlog/{project_id}")
 def handle_backlog_list(ctx: RequestContext):
     """List backlog bugs.
 
-    Legacy no-query calls still return all full rows. Supplying view, limit,
-    offset, q, or include_closed enables the optimized list path with compact
-    rows and pagination metadata.
+    Compact no-search calls return one per-project newest-first hot window.
+    Search and history pages use an indexed stable keyset and a separate
+    bounded TTL/LRU cache.  Legacy no-query calls retain the full-row shape.
     """
     pid = ctx.path_params["project_id"]
     query = ctx.query or {}
@@ -92552,59 +92755,185 @@ def handle_backlog_list(ctx: RequestContext):
     raw_limit = _query_int(query, "limit", _BACKLOG_DEFAULT_LIST_LIMIT)
     limit = max(1, min(raw_limit, _BACKLOG_HARD_LIST_LIMIT)) if optimized else None
     offset = max(0, _query_int(query, "offset", 0)) if optimized else 0
+    cursor_value = _first_query_value(query, "cursor").strip()
+    search = _first_query_value(query, "q").strip()
+    include_closed = _query_bool(query, "include_closed", True)
+    canonical_hot_window = bool(
+        optimized
+        and view == "compact"
+        and not search
+        and not cursor_value
+        and offset == 0
+        and include_closed
+        and not _first_query_value(query, "status").strip()
+        and not _first_query_value(query, "priority").strip()
+    )
+    if offset > 0 and not cursor_value:
+        raise GovernanceError(
+            "backlog_cursor_required",
+            "historical backlog pages require next_cursor; offset pagination is not supported",
+            400,
+        )
     conn = get_connection(pid)
     try:
-        sql = "SELECT * FROM backlog_bugs WHERE 1=1"
-        params: list[Any] = []
-        sql, params = _append_backlog_filters(sql, params, ctx)
-        count_sql = sql.replace("SELECT *", "SELECT COUNT(*) AS count", 1)
-        filtered_count = int(conn.execute(count_sql, params).fetchone()["count"] or 0)
-        sql += " ORDER BY created_at DESC"
-        page_params = list(params)
-        if limit is not None:
-            sql += " LIMIT ? OFFSET ?"
-            page_params.extend([limit, offset])
-        rows = conn.execute(sql, page_params).fetchall()
-        bugs = [
-            _backlog_compact_bug(r) if view == "compact" else _backlog_full_bug(r)
-            for r in rows
-        ]
-        for bug in bugs:
-            bug_id = str(bug.get("bug_id") or "")
-            bug["deep_link"] = "/dashboard?" + urlencode(
-                {
-                    "project_id": pid,
-                    "view": "backlog",
-                    "backlog": bug_id,
-                }
+        if optimized:
+            _ensure_backlog_read_schema(conn)
+        generation, authority_generation = (
+            _backlog_read_authority(conn, pid)
+            if optimized
+            else (0, "legacy-full")
+        )
+        page_limit = (
+            _BACKLOG_HOT_WINDOW_LIMIT
+            if canonical_hot_window
+            else int(limit or _BACKLOG_DEFAULT_LIST_LIMIT)
+        )
+        decoded_cursor = _decode_backlog_stable_cursor(cursor_value)
+
+        def load_page() -> dict[str, Any]:
+            sql = "SELECT * FROM backlog_bugs WHERE 1=1"
+            params: list[Any] = []
+            if not canonical_hot_window:
+                sql, params = _append_backlog_filters(sql, params, ctx)
+                sql, params = _backlog_keyset_clause(
+                    sql,
+                    params,
+                    decoded_cursor,
+                )
+            count_sql = sql.replace("SELECT *", "SELECT COUNT(*) AS count", 1)
+            filtered_count = int(
+                conn.execute(count_sql, params).fetchone()["count"] or 0
             )
-        _attach_observer_command_projections(conn, pid, bugs)
-        total_count = int(conn.execute("SELECT COUNT(*) AS count FROM backlog_bugs").fetchone()["count"] or 0)
-        next_offset = offset + len(bugs)
-        has_more = limit is not None and next_offset < filtered_count
-        result = {
-            "bugs": bugs,
-            "count": len(bugs),
-            "total_count": total_count,
-            "filtered_count": filtered_count,
-            "view": view,
-            "limit": limit,
-            "offset": offset,
-            "has_more": has_more,
-            "next_offset": next_offset if has_more else None,
-            "truncated": has_more,
-            "q": _first_query_value(query, "q").strip(),
-            "scope": {
-                "schema_version": "backlog.public_search_scope.v1",
-                "project_id": pid,
-                "status": _first_query_value(query, "status").strip(),
-                "priority": _first_query_value(query, "priority").strip(),
+            sql += " ORDER BY updated_at DESC, created_at DESC, bug_id DESC"
+            page_params = list(params)
+            if limit is not None:
+                sql += " LIMIT ?"
+                page_params.append(page_limit + 1)
+            fetched_rows = conn.execute(sql, page_params).fetchall()
+            has_more = limit is not None and len(fetched_rows) > page_limit
+            page_rows = fetched_rows[:page_limit]
+            bugs = [
+                _backlog_compact_bug(row)
+                if view == "compact"
+                else _backlog_full_bug(row)
+                for row in page_rows
+            ]
+            for bug in bugs:
+                bug_id = str(bug.get("bug_id") or "")
+                bug["deep_link"] = "/dashboard?" + urlencode(
+                    {
+                        "project_id": pid,
+                        "view": "backlog",
+                        "backlog": bug_id,
+                    }
+                )
+            _attach_observer_command_projections(conn, pid, bugs)
+            total_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM backlog_bugs"
+                ).fetchone()["count"]
+                or 0
+            )
+            oldest_cursor = _backlog_stable_cursor(
+                page_rows[-1] if page_rows else None
+            )
+            return {
+                "bugs": bugs,
+                "count": len(bugs),
+                "total_count": total_count,
+                "filtered_count": filtered_count,
                 "view": view,
-                "public_safe": True,
-                "bounded": limit is not None,
-            },
-            "summary": _backlog_summary(conn),
-        }
+                "limit": page_limit if limit is not None else None,
+                "offset": 0,
+                "cursor": cursor_value,
+                "has_more": has_more,
+                "next_cursor": oldest_cursor if has_more else None,
+                "next_offset": len(bugs) if has_more else None,
+                "truncated": has_more,
+                "q": search,
+                "hot_limit": _BACKLOG_HOT_WINDOW_LIMIT,
+                "hot_count": len(bugs) if canonical_hot_window else 0,
+                "newest_cursor": _backlog_stable_cursor(
+                    page_rows[0] if page_rows else None
+                ),
+                "oldest_cursor": oldest_cursor,
+                "history_available": has_more,
+                "generation": generation,
+                "authority_generation": authority_generation,
+                "scope": {
+                    "schema_version": (
+                        "backlog.hot_window_scope.v1"
+                        if canonical_hot_window
+                        else "backlog.indexed_history_scope.v1"
+                    ),
+                    "project_id": pid,
+                    "status": _first_query_value(query, "status").strip(),
+                    "priority": _first_query_value(query, "priority").strip(),
+                    "view": view,
+                    "public_safe": True,
+                    "bounded": limit is not None,
+                    "facets": (
+                        ["status", "priority"]
+                        if canonical_hot_window
+                        else []
+                    ),
+                    "recent_scope": (
+                        f"newest {_BACKLOG_HOT_WINDOW_LIMIT}"
+                        if canonical_hot_window
+                        else ""
+                    ),
+                    "pagination": (
+                        "hot_window"
+                        if canonical_hot_window
+                        else "sqlite_indexed_keyset"
+                    ),
+                },
+                "summary": _backlog_summary(conn),
+            }
+
+        if not optimized:
+            result = load_page()
+            result["source"] = "sqlite_legacy_full"
+            return result
+        if canonical_hot_window:
+            result, read_cache = BACKLOG_READ_CACHE.load_hot(
+                project_id=pid,
+                authority_generation=authority_generation,
+                loader=load_page,
+            )
+            result["source"] = (
+                "memory_hot_window"
+                if read_cache["hit"]
+                else "sqlite_hot_window"
+            )
+        else:
+            cache_identity = hashlib.sha256(
+                json.dumps(
+                    {
+                        "project": pid,
+                        "query": search,
+                        "status": _first_query_value(query, "status").strip(),
+                        "priority": _first_query_value(query, "priority").strip(),
+                        "authority": authority_generation,
+                        "cursor": cursor_value,
+                        "limit": page_limit,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            result, read_cache = BACKLOG_READ_CACHE.load_historical(
+                key=cache_identity,
+                project_id=pid,
+                authority_generation=authority_generation,
+                loader=load_page,
+            )
+            result["source"] = (
+                "memory_historical_cache"
+                if read_cache["hit"]
+                else "sqlite_indexed_keyset"
+            )
+        result["read_cache"] = read_cache
         return result
     finally:
         conn.close()

@@ -60,8 +60,37 @@ export interface BacklogSearchOptions {
   priority?: string;
   limit?: number;
   offset?: number;
+  cursor?: string;
   include_closed?: boolean;
 }
+
+export type BacklogHotWindowResponse = BacklogResponse & {
+  cursor?: string;
+  next_cursor?: string | null;
+  hot_limit?: number;
+  hot_count?: number;
+  newest_cursor?: string;
+  oldest_cursor?: string;
+  history_available?: boolean;
+  source?: string;
+  generation?: number;
+  authority_generation?: string;
+  read_cache?: {
+    pool?: string;
+    storage?: string;
+    hit?: boolean;
+    miss?: boolean;
+    age_ms?: number;
+    eviction_count?: number;
+    single_flight?: string;
+    historical_ttl_seconds?: number;
+  };
+  scope?: BacklogResponse["scope"] & {
+    facets?: string[];
+    recent_scope?: string;
+    pagination?: string;
+  };
+};
 
 export interface TaskTimelineSearchOptions {
   q: string;
@@ -82,10 +111,10 @@ export interface TaskTimelineSearchOptions {
 function backlogListQuery(options: BacklogSearchOptions = {}): string {
   const query = new URLSearchParams({
     view: "compact",
-    limit: String(options.limit ?? 200),
-    offset: String(options.offset ?? 0),
+    limit: String(options.limit ?? BACKLOG_HOT_WINDOW_LIMIT),
     include_closed: String(options.include_closed ?? true),
   });
+  if (options.cursor?.trim()) query.set("cursor", options.cursor.trim());
   if (options.q?.trim()) query.set("q", options.q.trim());
   if (options.status?.trim() && options.status.toUpperCase() !== "ALL") query.set("status", options.status.trim());
   if (options.priority?.trim() && options.priority.toUpperCase() !== "ALL") query.set("priority", options.priority.trim());
@@ -187,7 +216,63 @@ async function getJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
 
 const PUBLIC_READ_SINGLE_FLIGHT_MAX_ENTRIES = 128;
 const TASK_PLAYBACK_HOT_WINDOW_LIMIT = 50;
+export const BACKLOG_HOT_WINDOW_LIMIT = 250;
 const publicReadSingleFlights = new Map<string, Promise<unknown>>();
+const projectBacklogHotWindows = new Map<string, BacklogHotWindowResponse>();
+const projectBacklogHotWindowListeners = new Map<string, Set<(response: BacklogHotWindowResponse) => void>>();
+const backlogKeysetCursors = new Map<string, string>();
+
+function backlogSearchIdentity(projectId: string, options: BacklogSearchOptions): string {
+  return JSON.stringify({
+    projectId: projectId.trim(),
+    q: options.q?.trim() ?? "",
+    status: options.status?.trim().toUpperCase() ?? "",
+    priority: options.priority?.trim().toUpperCase() ?? "",
+    limit: options.limit ?? BACKLOG_HOT_WINDOW_LIMIT,
+    includeClosed: options.include_closed ?? true,
+  });
+}
+
+function rememberBacklogHotWindow(projectId: string, response: BacklogHotWindowResponse): BacklogHotWindowResponse {
+  const key = projectId.trim() || DEFAULT_PROJECT_ID;
+  if (response.scope?.pagination === "hot_window" || response.hot_limit === BACKLOG_HOT_WINDOW_LIMIT) {
+    projectBacklogHotWindows.set(key, response);
+    for (const listener of projectBacklogHotWindowListeners.get(key) ?? []) listener(response);
+  }
+  return response;
+}
+
+function backlogSearchCursorFor(projectId: string, options: BacklogSearchOptions): string {
+  if (options.cursor?.trim()) return options.cursor.trim();
+  const offset = Math.max(0, options.offset ?? 0);
+  if (offset === 0) return "";
+  return backlogKeysetCursors.get(`${backlogSearchIdentity(projectId, options)}:${offset}`) ?? "";
+}
+
+function rememberBacklogSearchCursor(
+  projectId: string,
+  options: BacklogSearchOptions,
+  response: BacklogHotWindowResponse,
+): BacklogHotWindowResponse {
+  const offset = Math.max(0, options.offset ?? 0);
+  if (response.next_cursor) {
+    backlogKeysetCursors.set(
+      `${backlogSearchIdentity(projectId, options)}:${offset + response.count}`,
+      response.next_cursor,
+    );
+  }
+  return response;
+}
+
+function loadBacklogHotWindow(projectId: string, signal?: AbortSignal): Promise<BacklogHotWindowResponse> {
+  return getPublicJSONSingleFlight<BacklogHotWindowResponse>(
+    `/api/backlog/${pidFor(projectId)}?${backlogListQuery({
+      limit: BACKLOG_HOT_WINDOW_LIMIT,
+      include_closed: true,
+    })}`,
+    signal,
+  ).then((response) => rememberBacklogHotWindow(projectId, response));
+}
 
 function taskPlaybackHotWindowLimit(limit: number): number {
   return Math.max(1, Math.min(limit, TASK_PLAYBACK_HOT_WINDOW_LIMIT));
@@ -598,16 +683,47 @@ export const api = {
     );
   },
   backlog(signal?: AbortSignal) {
-    return getJSON<BacklogResponse>(`/api/backlog/${pid()}?${backlogListQuery()}`, signal);
+    return api.backlogFor(getProjectId(), signal);
   },
   backlogFor(projectId: string, signal?: AbortSignal) {
-    return getJSON<BacklogResponse>(`/api/backlog/${pidFor(projectId)}?${backlogListQuery()}`, signal);
+    const key = projectId.trim() || DEFAULT_PROJECT_ID;
+    const memory = projectBacklogHotWindows.get(key);
+    if (memory) {
+      void loadBacklogHotWindow(key).catch(() => undefined);
+      return awaitPublicRead(Promise.resolve(memory), signal);
+    }
+    return loadBacklogHotWindow(key, signal);
+  },
+  backlogRevalidateFor(projectId: string, signal?: AbortSignal) {
+    return loadBacklogHotWindow(projectId, signal);
+  },
+  backlogMemoryFor(projectId: string) {
+    return projectBacklogHotWindows.get(projectId.trim() || DEFAULT_PROJECT_ID);
+  },
+  subscribeBacklogHotWindow(projectId: string, listener: (response: BacklogHotWindowResponse) => void) {
+    const key = projectId.trim() || DEFAULT_PROJECT_ID;
+    const listeners = projectBacklogHotWindowListeners.get(key) ?? new Set();
+    listeners.add(listener);
+    projectBacklogHotWindowListeners.set(key, listeners);
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) projectBacklogHotWindowListeners.delete(key);
+    };
   },
   backlogSearchFor(projectId: string, options: BacklogSearchOptions, signal?: AbortSignal) {
-    return getJSON<BacklogResponse>(
-      `/api/backlog/${pidFor(projectId)}?${backlogListQuery(options)}`,
+    const cursor = backlogSearchCursorFor(projectId, options);
+    if ((options.offset ?? 0) > 0 && !cursor) {
+      return Promise.reject(new ApiError(
+        400,
+        "Backlog history cursor is unavailable; restart from the first keyset page",
+        "",
+      ));
+    }
+    const keysetOptions = { ...options, cursor, offset: undefined };
+    return getPublicJSONSingleFlight<BacklogHotWindowResponse>(
+      `/api/backlog/${pidFor(projectId)}?${backlogListQuery(keysetOptions)}`,
       signal,
-    );
+    ).then((response) => rememberBacklogSearchCursor(projectId, options, response));
   },
   backlogBugFor(projectId: string, backlogId: string, signal?: AbortSignal) {
     return getJSON<BacklogBug>(
