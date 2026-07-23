@@ -64089,6 +64089,307 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
     ]["worker_session_id"] == native_worker_session_id
 
 
+def test_completed_line_projection_uses_latest_failed_qa_rework_round():
+    old_commit = "a" * 40
+    fresh_commit = "b" * 40
+    runtime_context_id = "mfrctx-latest-failed-qa-round"
+    task_id = "worker-latest-failed-qa-round"
+    parent_task_id = "AC-LATEST-FAILED-QA-ROUND"
+    requested = {
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "evidence_kind": "independent_verification",
+    }
+    completed_lines = [
+        {
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+            "actor_role": "mf_sub",
+            "evidence_kind": "worker_commit",
+            "commit_sha": old_commit,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+        },
+        {
+            **requested,
+            "actor_role": "qa",
+            "status": "failed",
+            "commit_sha": old_commit,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "payload": {"verdict": "fail"},
+        },
+        {
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "actor_role": "mf_sub",
+            "evidence_kind": "implementation",
+            "status": "passed",
+            "commit_sha": fresh_commit,
+        },
+        {
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+            "actor_role": "mf_sub",
+            "evidence_kind": "worker_commit",
+            "commit_sha": fresh_commit,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+        },
+        {
+            **requested,
+            "actor_role": "qa",
+            "status": "passed",
+            "commit_sha": fresh_commit,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "payload": {"verdict": "pass"},
+        },
+    ]
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-LATEST-FAILED-QA-ROUND",
+        "contract_execution_id": "cex-latest-failed-qa-round",
+        "contract_id": "mf_parallel.v2",
+        "execution_state_revision": 7,
+        "completed_lines": completed_lines,
+        "runtime_guide": {
+            "completed_lines": completed_lines,
+            "next_legal_action": {
+                "stage_id": "observer_integration",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge",
+            },
+        },
+    }
+
+    matched = server._contract_runtime_matching_completed_line(
+        record,
+        requested,
+        body={"commit_sha": fresh_commit},
+    )
+    assert matched is completed_lines[4]
+    assert (
+        server._contract_runtime_matching_completed_line(
+            record,
+            requested,
+            body={},
+        )
+        is completed_lines[4]
+    )
+    assert (
+        server._contract_runtime_matching_completed_line(
+            record,
+            requested,
+            body={"commit_sha": old_commit},
+        )
+        is None
+    )
+
+    gate = server._contract_runtime_completed_line_projection_gate(
+        record,
+        body={"commit_sha": fresh_commit},
+        event_kind="qa_verification",
+        actor_role="qa",
+        line=requested,
+        allow_in_progress_completed_line=True,
+    )
+    assert gate["accepted"] is True
+    assert gate["completed_line_ref"]["commit_sha"] == fresh_commit
+
+    cross_runtime_duplicate = json.loads(json.dumps(record))
+    cross_runtime_line = json.loads(json.dumps(completed_lines[4]))
+    cross_runtime_line["runtime_context_id"] = "mfrctx-unrelated-round"
+    cross_runtime_duplicate["completed_lines"].append(cross_runtime_line)
+    cross_runtime_duplicate["runtime_guide"]["completed_lines"] = (
+        cross_runtime_duplicate["completed_lines"]
+    )
+    assert (
+        server._contract_runtime_matching_completed_line(
+            cross_runtime_duplicate,
+            requested,
+            body={"commit_sha": fresh_commit},
+        )["runtime_context_id"]
+        == runtime_context_id
+    )
+
+    duplicate_current_round = json.loads(json.dumps(record))
+    duplicate_current_round["completed_lines"].append(
+        json.loads(json.dumps(completed_lines[4]))
+    )
+    duplicate_current_round["runtime_guide"]["completed_lines"] = (
+        duplicate_current_round["completed_lines"]
+    )
+    assert (
+        server._contract_runtime_matching_completed_line(
+            duplicate_current_round,
+            requested,
+            body={"commit_sha": fresh_commit},
+        )
+        is None
+    )
+
+
+def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-LATEST-AUTHENTICATED-QA-ROUND"
+    task_id = "worker-latest-authenticated-qa-round"
+    runtime_context_id = "mfrctx-latest-authenticated-qa-round"
+    old_commit = "c" * 40
+    fresh_commit = "d" * 40
+    context = BranchTaskRuntimeContext(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        parent_task_id=backlog_id,
+        runtime_context_id=runtime_context_id,
+        branch_ref="refs/heads/codex/latest-authenticated-qa-round",
+        status=STATE_VALIDATED,
+    )
+    authenticated_qa = {
+        "schema_version": "qa_evidence_provenance.v1",
+        "server_derived": True,
+        "authorization_source": "qa_session_token_ref",
+        "evidence_owner_role": "qa",
+        "observer_impersonation": False,
+        "parent_materialization_authorized": False,
+        "authenticated_qa_binding": {
+            "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+            "server_derived": True,
+            "independent_verification_session_matched": True,
+            "qa_principal": "qa:latest-round",
+            "qa_session_id": "ses-latest-round",
+        },
+    }
+
+    def worker_commit(commit_sha):
+        return {
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+            "actor_role": "mf_sub",
+            "evidence_kind": "worker_commit",
+            "commit_sha": commit_sha,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": backlog_id,
+            "worker_role": "mf_sub",
+        }
+
+    def qa_graph(commit_sha):
+        return {
+            "stage_id": "qa_graph_context",
+            "line_id": "qa_graph_context",
+            "actor_role": "qa",
+            "evidence_kind": "graph_trace",
+            "commit_sha": commit_sha,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": backlog_id,
+            "authorization_source": "qa_session_token_ref",
+            "observer_impersonation": False,
+            "qa_evidence_provenance": authenticated_qa,
+            "payload": {
+                "graph_trace_evidence": {
+                    "db_verified": True,
+                    "verified_trace_ids": [f"gqt-{commit_sha[:8]}"],
+                    "candidate_commit_sha": commit_sha,
+                }
+            },
+        }
+
+    def qa_verification(commit_sha, status, parent_task_id):
+        return {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "actor_role": "qa",
+            "evidence_kind": "independent_verification",
+            "status": status,
+            "commit_sha": commit_sha,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "authorization_source": "qa_session_token_ref",
+            "observer_impersonation": False,
+            "qa_evidence_provenance": authenticated_qa,
+            "payload": {"verdict": status},
+        }
+
+    completed_lines = [
+        worker_commit(old_commit),
+        qa_graph(old_commit),
+        qa_verification(old_commit, "failed", backlog_id),
+        {
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "actor_role": "mf_sub",
+            "evidence_kind": "implementation",
+            "status": "passed",
+            "commit_sha": fresh_commit,
+        },
+        worker_commit(fresh_commit),
+        qa_graph(fresh_commit),
+        # The authenticated QA host adapter may repeat the worker task as the
+        # direct parent. Runtime/task/commit/provenance still bind this line to
+        # the one current rework generation.
+        qa_verification(fresh_commit, "passed", task_id),
+    ]
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": "cex-latest-authenticated-qa-round",
+        "completed_lines": completed_lines,
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_line_acceptance",
+        lambda *_args, **kwargs: (
+            {
+                "db_verified": True,
+                "acceptance_ref": (
+                    "contract_runtime:cex-latest-authenticated-qa-round:"
+                    "revision:current"
+                ),
+            }
+            if kwargs["completed_line_index"] == 6
+            else {}
+        ),
+    )
+
+    resolved = server._contract_runtime_observer_merge_completed_round(
+        conn,
+        project_id=PID,
+        record=record,
+        context=context,
+        branch_head=fresh_commit,
+    )
+    assert resolved["worker_commit_completed_line_index"] == 4
+    assert resolved["qa_graph_completed_line_index"] == 5
+    assert resolved["qa_completed_line_index"] == 6
+    assert resolved["qa_contract_runtime_verified"] is True
+
+    unrelated_parent = json.loads(json.dumps(record))
+    unrelated_parent["completed_lines"][6]["parent_task_id"] = (
+        "worker-unrelated-generation"
+    )
+    assert (
+        server._contract_runtime_observer_merge_completed_round(
+            conn,
+            project_id=PID,
+            record=unrelated_parent,
+            context=context,
+            branch_head=fresh_commit,
+        )
+        == {}
+    )
+
+
 def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timeline(
     conn,
     tmp_path,

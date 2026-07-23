@@ -64283,14 +64283,25 @@ def _contract_runtime_observer_merge_completed_round(
             if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value)
         }
 
-    def has_no_identity_conflict(line: Mapping[str, Any]) -> bool:
-        return all(
-            not supplied or supplied == {expected}
-            for supplied, expected in (
-                (values(line, "runtime_context_id"), runtime_context_id),
-                (values(line, "task_id", "worker_task_id"), task_id),
-                (values(line, "parent_task_id"), parent_task_id),
-            )
+    def has_no_identity_conflict(
+        line: Mapping[str, Any],
+        *,
+        allow_authenticated_qa_task_parent_alias: bool = False,
+    ) -> bool:
+        runtime_values = values(line, "runtime_context_id")
+        task_values = values(line, "task_id", "worker_task_id")
+        parent_values = values(line, "parent_task_id")
+        if (
+            (runtime_values and runtime_values != {runtime_context_id})
+            or (task_values and task_values != {task_id})
+        ):
+            return False
+        if not parent_values or parent_values == {parent_task_id}:
+            return True
+        return bool(
+            allow_authenticated_qa_task_parent_alias
+            and parent_values == {task_id}
+            and _contract_runtime_authenticated_qa_provenance(line)
         )
 
     worker_commit_indexes = [
@@ -64363,7 +64374,10 @@ def _contract_runtime_observer_merge_completed_round(
                 record=record,
             )
             and commit_values(line) == {branch_head}
-            and has_no_identity_conflict(line)
+            and has_no_identity_conflict(
+                line,
+                allow_authenticated_qa_task_parent_alias=True,
+            )
         ):
             continue
         acceptance = _contract_runtime_completed_line_acceptance(
@@ -77386,7 +77400,19 @@ def _contract_runtime_completed_line_request_for_event(
 def _contract_runtime_matching_completed_line(
     record: Mapping[str, Any],
     requested: Mapping[str, Any],
+    *,
+    body: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any] | None:
+    """Resolve one completed line from the current worker/QA generation.
+
+    Failed-QA rework deliberately keeps the prior QA attempt in
+    ``completed_lines`` as immutable audit history.  Matching the first line
+    with the same stage/line/evidence tuple can therefore select the stale
+    failed attempt.  Bind a projection to the worker-commit round that owns
+    the requested commit (or the latest worker-commit round when the request
+    carries no commit) and reject failed/waived historical lines.
+    """
+
     line_ref = {
         "stage_id": str(requested.get("stage_id") or "").strip(),
         "line_id": str(requested.get("line_id") or "").strip(),
@@ -77404,16 +77430,171 @@ def _contract_runtime_matching_completed_line(
         completed_lines = record.get("completed_lines")
     if not isinstance(completed_lines, list):
         return None
-    for item in completed_lines:
-        if not isinstance(item, Mapping):
-            continue
+
+    completed = [
+        item for item in completed_lines if isinstance(item, Mapping)
+    ]
+    singleton_authority_lines = {
+        "qa_graph_context",
+        "qa_independent_verification",
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
+    }
+
+    def commit_values(value: Mapping[str, Any]) -> set[str]:
+        return {
+            str(candidate.get(key) or "").strip().lower()
+            for candidate in _contract_runtime_mapping_candidates(value)
+            for key in (
+                "commit_sha",
+                "worker_commit_sha",
+                "candidate_commit_sha",
+                "head_commit",
+                "validated_head_commit",
+                "immutable_head_commit",
+            )
+            if re.fullmatch(
+                r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}",
+                str(candidate.get(key) or "").strip(),
+            )
+        }
+
+    def scope_values(
+        value: Mapping[str, Any],
+        *keys: str,
+    ) -> set[str]:
+        return {
+            text
+            for candidate in _contract_runtime_mapping_candidates(value)
+            for key in keys
+            if (
+                text := _runtime_context_non_placeholder_text(
+                    candidate.get(key)
+                )
+            )
+        }
+
+    def matches_round_identity(
+        item: Mapping[str, Any],
+        anchor: Mapping[str, Any],
+    ) -> bool:
+        anchor_runtime = scope_values(anchor, "runtime_context_id")
+        anchor_task = scope_values(anchor, "task_id", "worker_task_id")
+        anchor_parent = scope_values(anchor, "parent_task_id")
+        item_runtime = scope_values(item, "runtime_context_id")
+        item_task = scope_values(item, "task_id", "worker_task_id")
+        item_parent = scope_values(item, "parent_task_id")
+        if (
+            (anchor_runtime and item_runtime and item_runtime != anchor_runtime)
+            or (anchor_task and item_task and item_task != anchor_task)
+        ):
+            return False
+        if not anchor_parent or not item_parent or item_parent == anchor_parent:
+            return True
+        return bool(
+            str(item.get("actor_role") or "").strip() == "qa"
+            and len(anchor_task) == 1
+            and item_parent == anchor_task
+            and _contract_runtime_authenticated_qa_provenance(item)
+        )
+
+    requested_body = body if isinstance(body, Mapping) else {}
+    requested_commit = str(
+        requested_body.get("commit_sha")
+        or _route_request_identity_value(requested_body, "commit_sha")
+        or _contract_runtime_close_authority_explicit_commit(requested_body)
+        or ""
+    ).strip().lower()
+
+    matching = [
+        (index, item)
+        for index, item in enumerate(completed)
         if (
             str(item.get("stage_id") or "").strip() == line_ref["stage_id"]
             and str(item.get("line_id") or "").strip() == line_ref["line_id"]
             and str(item.get("evidence_kind") or "").strip()
             == line_ref["evidence_kind"]
-        ):
-            return item
+            and _contract_runtime_line_status_passes(item)
+            and not _contract_runtime_line_reports_disqualifying_failed_qa(
+                item,
+                record=record,
+            )
+            and str(item.get("status") or "").strip().lower()
+            not in {"waived", "bypassed"}
+            and (
+                not requested_commit
+                or any(
+                    _contract_runtime_authority_commit_matches(
+                        requested_commit,
+                        candidate_commit,
+                    )
+                    for candidate_commit in commit_values(item)
+                )
+            )
+        )
+    ]
+    if not matching:
+        return None
+
+    worker_commit_rounds = [
+        (index, commit_values(item))
+        for index, item in enumerate(completed)
+        if (
+            str(item.get("line_id") or "").strip() == "worker_commit"
+            and str(item.get("actor_role") or "").strip() == "mf_sub"
+            and str(item.get("evidence_kind") or "").strip()
+            == "worker_commit"
+            and _contract_runtime_line_status_passes(item)
+            and str(item.get("status") or "").strip().lower()
+            not in {"waived", "bypassed"}
+            and commit_values(item)
+        )
+    ]
+    if worker_commit_rounds:
+        eligible_rounds = [
+            (index, commits)
+            for index, commits in worker_commit_rounds
+            if (
+                not requested_commit
+                or any(
+                    _contract_runtime_authority_commit_matches(
+                        requested_commit,
+                        candidate_commit,
+                    )
+                    for candidate_commit in commits
+                )
+            )
+        ]
+        if eligible_rounds:
+            round_start = max(index for index, _commits in eligible_rounds)
+            round_end = next(
+                (
+                    index
+                    for index, _commits in worker_commit_rounds
+                    if index > round_start
+                ),
+                len(completed),
+            )
+            round_matching = [
+                (index, item)
+                for index, item in matching
+                if round_start <= index < round_end
+                and matches_round_identity(item, completed[round_start])
+            ]
+            if (
+                round_matching
+                or line_ref["line_id"] in singleton_authority_lines
+            ):
+                matching = round_matching
+
+    # QA/integration authority is single-instance within one worker generation.
+    # Worker implementation is intentionally append-only across a failed-QA
+    # revision, so retain its legacy first-match projection semantics.
+    if len(matching) == 1:
+        return matching[0][1]
+    if line_ref["line_id"] not in singleton_authority_lines:
+        return matching[0][1]
     return None
 
 
@@ -77532,7 +77713,11 @@ def _contract_runtime_completed_line_projection_gate(
     }
     if not all(requested.values()):
         return {}
-    matched_line = _contract_runtime_matching_completed_line(record, requested)
+    matched_line = _contract_runtime_matching_completed_line(
+        record,
+        requested,
+        body=body,
+    )
     if matched_line is None:
         return {}
 
@@ -77739,7 +77924,11 @@ def _contract_runtime_completed_line_projection_preflight_gate(
         )
     )
     matched_completed_line = (
-        _contract_runtime_matching_completed_line(record, completed_line)
+        _contract_runtime_matching_completed_line(
+            record,
+            completed_line,
+            body=body,
+        )
         if completed_line and not current_line_is_requested
         else None
     )
