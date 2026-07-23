@@ -22,6 +22,13 @@ import {
   resolveSelectedFrameIdForEventParam,
   contractRuntimeCompatibilityRepairValues,
   taskPlaybackNextLegalActionPresentations,
+  projectBacklogHotWindow,
+  projectCurrentTimelineHotWindow,
+  projectPlaybackHotWindows,
+  rememberProjectBacklogHotWindow,
+  rememberProjectCurrentTimelineHotWindow,
+  rememberProjectPlaybackHotWindow,
+  TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT,
   PLAYBACK_URL_PARAMS,
   type TaskPlaybackTrace,
   type ActivityEventCard,
@@ -45,7 +52,7 @@ const PLAYBACK_TIMELINE_LIMIT = 250;
 const ACTIVITY_TIMELINE_LIMIT = 250;
 const CURRENT_TASK_REFRESH_MS = 5000;
 /** Initial + max limit for the project-wide recent events stream in the Current tab. */
-const RECENT_EVENTS_LIMIT = 100;
+const RECENT_EVENTS_LIMIT = TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT;
 const PLAYBACK_SEARCH_DEBOUNCE_MS = 300;
 const PLAYBACK_SEARCH_PAGE_SIZE = 50;
 /** Cards per page for the Current tab event card list (IA item A). */
@@ -63,6 +70,7 @@ interface PlaybackLoadState {
   taskTimeline?: TaskTimelineResponse | null;
   gate?: BacklogTimelineGateResponse | null;
   authorityCacheKey?: string;
+  cacheSource?: "cold" | "memory" | "network";
 }
 
 interface BacklogDetailLoadState {
@@ -100,6 +108,22 @@ interface ActivityLoadState extends PlaybackLoadState {
   refreshedAt?: string;
 }
 
+function playbackStatesFromMemory(projectId: string): Record<string, PlaybackLoadState> {
+  return Object.fromEntries(projectPlaybackHotWindows(projectId).flatMap((entry) => {
+    const trace = entry.values[0];
+    return trace
+      ? [[entry.backlog_id, {
+        loading: false,
+        loaded: true,
+        error: "",
+        trace,
+        authorityCacheKey: trace.authority_view?.cache_identity.key,
+        cacheSource: "memory" as const,
+      }]]
+      : [];
+  }));
+}
+
 export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const bugs = backlog.bugs ?? [];
   const [mode, setMode] = useState<ActivityMode>(() => readActivityMode());
@@ -108,19 +132,28 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const [priorityFilter, setPriorityFilter] = useState<PriorityFilter>("all");
   const [gateFilter, setGateFilter] = useState<GateFilter>("all");
   const [searchOffset, setSearchOffset] = useState(0);
-  const [serverBacklog, setServerBacklog] = useState<BacklogResponse>(backlog);
+  const [serverBacklog, setServerBacklog] = useState<BacklogResponse>(() => {
+    const hot = projectBacklogHotWindow(projectId);
+    return hot ? { ...backlog, bugs: hot.values } : backlog;
+  });
   const [timelineSearch, setTimelineSearch] = useState<TaskTimelineResponse | null>(null);
   const [serverSearchLoading, setServerSearchLoading] = useState(false);
   const [serverSearchError, setServerSearchError] = useState("");
   const [selectedBugId, setSelectedBugId] = useState(() => readSelectedBacklogId());
   const [selectedBacklogDetailById, setSelectedBacklogDetailById] = useState<Record<string, BacklogDetailLoadState>>({});
-  const [playbackByBug, setPlaybackByBug] = useState<Record<string, PlaybackLoadState>>({});
+  const [playbackByBug, setPlaybackByBug] = useState<Record<string, PlaybackLoadState>>(
+    () => playbackStatesFromMemory(projectId),
+  );
   const [activityByBug, setActivityByBug] = useState<Record<string, ActivityLoadState>>({});
   const [currentTaskHint, setCurrentTaskHint] = useState<CurrentTaskHint | null>(null);
   // Project-wide recent events for the Current tab event list (newest-first, cross-row).
   // These are plain TaskTimelineEvents; each carries its own backlog_id/task_id.
-  const [recentEvents, setRecentEvents] = useState<TaskTimelineEvent[]>([]);
-  const [recentEventsLoaded, setRecentEventsLoaded] = useState(false);
+  const initialRecentHotWindow = useMemo(() => projectCurrentTimelineHotWindow(projectId), []);
+  const [recentEvents, setRecentEvents] = useState<TaskTimelineEvent[]>(() => initialRecentHotWindow?.values ?? []);
+  const [recentEventsLoaded, setRecentEventsLoaded] = useState(() => Boolean(initialRecentHotWindow));
+  const [recentEventsCacheSource, setRecentEventsCacheSource] = useState<"cold" | "memory" | "refreshing" | "revalidated">(
+    () => initialRecentHotWindow ? "memory" : "cold",
+  );
   const recentEventIdsRef = useRef<Set<string>>(new Set());
   // Frontend-local override: when multiple candidates compete and the user
   // clicks a competing-candidates selector entry, we rebind the activity view
@@ -157,6 +190,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const mountedRef = useRef(true);
   const activeProjectIdRef = useRef(projectId);
   const inFlightPlaybackKeysRef = useRef<Set<string>>(new Set());
+  const playbackColdLoadCountRef = useRef<Record<string, number>>({});
   const playbackControllersRef = useRef<Map<string, AbortController>>(new Map());
   // Stable ref so refreshActivityTimeline can call recordPoll without a
   // forward-reference issue (useEventStreamWithFreshness is declared later).
@@ -198,19 +232,23 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   }, [selectedBacklogDetailById]);
 
   useEffect(() => {
+    const restoredPlayback = playbackStatesFromMemory(projectId);
+    const restoredCurrent = projectCurrentTimelineHotWindow(projectId);
+    const restoredBacklog = projectBacklogHotWindow(projectId)
+      ?? rememberProjectBacklogHotWindow(projectId, backlog.bugs ?? []);
     activeProjectIdRef.current = projectId;
     playbackControllersRef.current.forEach((controller) => controller.abort());
     playbackControllersRef.current.clear();
     inFlightPlaybackKeysRef.current.clear();
-    playbackByBugRef.current = {};
+    playbackByBugRef.current = restoredPlayback;
     authorityTraceCacheRef.current = {};
     activityByBugRef.current = {};
     selectedBacklogDetailByIdRef.current = {};
-    setPlaybackByBug({});
+    setPlaybackByBug(restoredPlayback);
     setActivityByBug({});
     setSelectedBacklogDetailById({});
     setCurrentTaskHint(null);
-    setServerBacklog(backlog);
+    setServerBacklog({ ...backlog, bugs: restoredBacklog.values });
     setTimelineSearch(null);
     setServerSearchLoading(false);
     setServerSearchError("");
@@ -223,9 +261,12 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     setSelectedActivityFrameId("");
     setEventsPage(0);
     setPlaying(false);
-    setRecentEvents([]);
-    setRecentEventsLoaded(false);
-    recentEventIdsRef.current = new Set();
+    setRecentEvents(restoredCurrent?.values ?? []);
+    setRecentEventsLoaded(Boolean(restoredCurrent));
+    setRecentEventsCacheSource(restoredCurrent ? "memory" : "cold");
+    recentEventIdsRef.current = new Set(
+      (restoredCurrent?.values ?? []).map((event, index) => recentTimelineEventKey(event, index)),
+    );
   }, [projectId]);
 
   useEffect(() => {
@@ -484,6 +525,22 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       });
       const authorityCacheKey = trace.authority_view?.cache_identity.key;
       if (authorityCacheKey) authorityTraceCacheRef.current[authorityCacheKey] = trace;
+      const hotTrace = rememberProjectPlaybackHotWindow(projectId, bugId, trace).values[0] ?? trace;
+      setPlaybackByBug((states) => states[bugId]?.loaded
+        ? states
+        : {
+          ...states,
+          [bugId]: {
+            loading: false,
+            loaded: true,
+            error: errors.join(" | "),
+            trace: hotTrace,
+            taskTimeline,
+            gate,
+            authorityCacheKey,
+            cacheSource: "memory",
+          },
+        });
       // Merge new events without duplicating (deduplication by event id is
       // handled inside normalizeTaskPlaybackTrace via mergeTimelineEvents).
       setActivityByBug((states) => {
@@ -522,6 +579,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
    * (deduplicate by event id so the list stays append-only from the top).
    */
   const refreshRecentEvents = useCallback((signal: AbortSignal) => {
+    setRecentEventsCacheSource((source) => source === "cold" ? "cold" : "refreshing");
     return api.recentTimelineFor(projectId, RECENT_EVENTS_LIMIT, signal)
       .then((response) => {
         if (signal.aborted || activeProjectIdRef.current !== projectId) return;
@@ -529,18 +587,21 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         setRecentEvents((prev) => {
           const merged = mergeRecentTimelineEvents(
             [...incoming, ...prev],
-            RECENT_EVENTS_LIMIT * 2,
+            RECENT_EVENTS_LIMIT,
           );
+          rememberProjectCurrentTimelineHotWindow(projectId, merged);
           recentEventIdsRef.current = new Set(
             merged.map((event, index) => recentTimelineEventKey(event, index)),
           );
           return merged;
         });
         setRecentEventsLoaded(true);
+        setRecentEventsCacheSource("revalidated");
       })
       .catch(() => {
         if (!signal.aborted && activeProjectIdRef.current === projectId) {
           setRecentEventsLoaded(true); // mark loaded even on error so we don't spin
+          setRecentEventsCacheSource((source) => source === "refreshing" ? "memory" : source);
         }
       });
   }, [projectId]);
@@ -654,6 +715,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     const controller = new AbortController();
     inFlightPlaybackKeysRef.current.add(requestKey);
     playbackControllersRef.current.set(requestKey, controller);
+    playbackColdLoadCountRef.current[requestKey] = (playbackColdLoadCountRef.current[requestKey] ?? 0) + 1;
     setPlaybackByBug((states) => ({
       ...states,
       [bugId]: {
@@ -661,6 +723,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         loaded: false,
         error: "",
         trace: emptyTaskPlaybackTrace(projectId, bug),
+        cacheSource: "cold",
       },
     }));
 
@@ -685,16 +748,18 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         });
         const authorityCacheKey = trace.authority_view?.cache_identity.key;
         if (authorityCacheKey) authorityTraceCacheRef.current[authorityCacheKey] = trace;
+        const hotTrace = rememberProjectPlaybackHotWindow(projectId, bugId, trace).values[0] ?? trace;
         setPlaybackByBug((states) => ({
           ...states,
           [bugId]: {
             loading: false,
             loaded: true,
             error: errors.join(" | "),
-            trace,
+            trace: hotTrace,
             taskTimeline,
             gate,
             authorityCacheKey,
+            cacheSource: "network",
           },
         }));
         if (selectedBugRef.current?.bug_id === bugId) {
@@ -866,8 +931,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
               freshness={freshness}
               onReconnect={() => {
                 recentEventIdsRef.current = new Set();
-                setRecentEvents([]);
-                setRecentEventsLoaded(false);
+                setRecentEventsCacheSource("refreshing");
                 setActivityRefreshSeq((seq) => seq + 1);
               }}
             />
@@ -887,8 +951,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                 title="Force a fresh fetch of project-wide recent events"
                 onClick={() => {
                   recentEventIdsRef.current = new Set();
-                  setRecentEvents([]);
-                  setRecentEventsLoaded(false);
+                  setRecentEventsCacheSource("refreshing");
                   setActivityRefreshSeq((seq) => seq + 1);
                 }}
               >
@@ -897,7 +960,14 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
               <button type="button" className="action-btn" onClick={openActivityPlaybackHistory}>
                 Open playback history
               </button>
-              <span className="mono">{recentEventsLoaded ? `${recentEvents.length} event${recentEvents.length === 1 ? "" : "s"}` : "loading…"}</span>
+              <span
+                className="mono"
+                data-current-hot-window-count={recentEvents.length}
+                data-current-cache-source={recentEventsCacheSource}
+                data-current-memory-first={recentEvents.length > 0 ? "true" : "false"}
+              >
+                {recentEventsLoaded ? `${recentEvents.length} / ${RECENT_EVENTS_LIMIT} hot events · ${recentEventsCacheSource}` : "loading…"}
+              </span>
             </div>
           </div>
 
@@ -943,7 +1013,12 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         </div>
       ) : (
         <div className="task-playback-layout">
-          <aside className="task-playback-selector" aria-label="Backlog playback selector">
+          <aside
+            className="task-playback-selector"
+            aria-label="Backlog playback selector"
+            data-backlog-hot-window-count={serverBacklog.bugs?.length ?? 0}
+            data-backlog-hot-window-project={projectId}
+          >
             <div className="task-playback-selector-head">
               <strong>Backlog selector</strong>
               <span className="mono">{rows.length} local facet / {serverBacklog.filtered_count ?? selectorBugs.length} server</span>
@@ -954,7 +1029,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
               onChange={(event) => setQuery(event.target.value)}
               placeholder="Search backlog, status, files..."
             />
-            <div className="task-playback-filters">
+            <div className="task-playback-filters" data-backlog-local-facets="status,priority,timeline-state">
               <SegmentedButton<StatusFilter>
                 value={statusFilter}
                 options={[
@@ -983,7 +1058,13 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                 <option value="no_timeline">No timeline loaded</option>
               </select>
             </div>
-            <div data-server-search-results="playback" aria-live="polite">
+            <div
+              data-server-search-results="playback"
+              data-server-search-offset={searchOffset}
+              data-server-search-next-offset={Math.max(serverBacklog.next_offset ?? 0, timelineSearch?.next_offset ?? 0)}
+              data-server-search-project={projectId}
+              aria-live="polite"
+            >
               <strong>Server result set</strong>
               <p>
                 {serverSearchLoading
@@ -1073,7 +1154,14 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
             )}
           </aside>
 
-          <div className="task-playback-main">
+          <div
+            className="task-playback-main"
+            data-playback-cache-source={selectedState?.cacheSource ?? "cold"}
+            data-playback-memory-first={selectedState?.loaded ? "true" : "false"}
+            data-playback-cold-load-count={
+              selectedBugId ? playbackColdLoadCountRef.current[`${projectId}:${selectedBugId}`] ?? 0 : 0
+            }
+          >
             <div className="task-playback-controls">
               <button type="button" className="action-btn" onClick={() => setPlaying((value) => !value)} disabled={activeTrace.frames.length <= 1}>
                 {playing ? "Pause" : "Play"}
@@ -1187,6 +1275,8 @@ function NextLegalActionCallout({
               key={item.key}
               data-next-legal-action-authority={item.advisory_only ? "advisory" : "authoritative"}
               data-next-legal-action-disposition={item.disposition}
+              data-next-legal-action-blocked={blocked ? "true" : "false"}
+              data-next-legal-action-source={item.source}
               style={{ background, border: `1px solid ${accent}`, borderLeft: `4px solid ${accent}`, borderRadius: 8, padding: "11px 12px" }}
             >
               <div style={{ alignItems: "baseline", display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "space-between" }}>

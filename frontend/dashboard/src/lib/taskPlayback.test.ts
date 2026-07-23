@@ -13,6 +13,15 @@ import {
   taskPlaybackCompactLedgerBlockingLabel,
   taskPlaybackCompactLedgerDisplayState,
   taskPlaybackNextLegalActionPresentations,
+  projectBacklogHotWindow,
+  projectCurrentTimelineHotWindow,
+  projectPlaybackHotWindow,
+  rememberProjectBacklogHotWindow,
+  rememberProjectCurrentTimelineHotWindow,
+  rememberProjectPlaybackHotWindow,
+  resetTaskPlaybackMemoryHotWindowsForTests,
+  TASK_PLAYBACK_BACKLOG_HOT_WINDOW_LIMIT,
+  TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT,
   typedDagRawSecretPath,
   displayPlaybackFrames,
   latestPlaybackFrameId,
@@ -1698,6 +1707,33 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
     gateResponse: null,
     source: "governed",
   });
+  const blockedAuthorityResponse = structuredClone(response) as ContractRuntimeVisualizationResponse;
+  blockedAuthorityResponse.contract_execution_progress.next_legal_action = {
+    ...blockedAuthorityResponse.contract_execution_progress.next_legal_action,
+    blocked: true,
+    blocker_id: "blocker-runtime-17",
+    repair_target_id: "AC-REPAIR-RUNTIME-17",
+  } as typeof blockedAuthorityResponse.contract_execution_progress.next_legal_action;
+  const blockedAuthorityTrace = normalizeTaskPlaybackTrace({
+    projectId: response.project_id,
+    backlog: { bug_id: response.backlog_id, title: response.backlog.title, status: "OPEN", priority: "P1" },
+    taskTimeline: {
+      project_id: response.project_id,
+      backlog_id: response.backlog_id,
+      events: [selectedActionEvent],
+      count: 1,
+      contract_runtime_visualization: blockedAuthorityResponse,
+    },
+    gateResponse: null,
+    source: "governed",
+  });
+  const blockedAuthorityAction = taskPlaybackNextLegalActionPresentations(blockedAuthorityTrace)[0];
+  assertFixture(
+    blockedAuthorityAction?.disposition === "BLOCKED"
+      && blockedAuthorityAction.detail.includes("blocker blocker-runtime-17")
+      && blockedAuthorityAction.detail.includes("repair target AC-REPAIR-RUNTIME-17"),
+    "blocked ContractRuntime actions should expose their blocker and repair target ids",
+  );
   assertFixture(
     nextActionTrace.computation_cache.status === "miss"
       && nextActionTraceWarm.computation_cache.status === "hit"
@@ -5231,3 +5267,81 @@ function ueBlockerUrlAssertions(): string[] {
 }
 
 export const taskPlaybackUeBlockerUrlSummary: string[] = ueBlockerUrlAssertions();
+
+function taskPlaybackMemoryHotWindowAssertions(): string[] {
+  resetTaskPlaybackMemoryHotWindowsForTests();
+  const events = Array.from({ length: 60 }, (_, index) => ({
+    event_id: String(index + 1),
+    id: index + 1,
+    event_type: "task_timeline_append",
+    event_kind: "implementation",
+    status: "accepted",
+    backlog_id: "AC-HOT-WINDOW-A",
+    task_id: "task-hot-window-a",
+    created_at: new Date(Date.UTC(2026, 6, 23, 0, 0, index)).toISOString(),
+    payload: {},
+  } as TaskTimelineEvent));
+  rememberProjectCurrentTimelineHotWindow("project-a", events);
+  rememberProjectCurrentTimelineHotWindow("project-b", events.slice(0, 3));
+  const currentA = projectCurrentTimelineHotWindow("project-a");
+  const currentB = projectCurrentTimelineHotWindow("project-b");
+  assertFixture(currentA?.values.length === TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT, "Current hot window should retain exactly the newest 50 events");
+  assertFixture(String(currentA?.values[0]?.event_id) === "60", "Current hot window should be newest-first");
+  assertFixture(currentB?.values.length === 3, "Current hot windows must remain project-isolated");
+
+  const backlogRows = Array.from({ length: 300 }, (_, index) => ({
+    bug_id: `AC-HOT-BACKLOG-${index}`,
+    title: `Hot backlog ${index}`,
+    status: index % 2 ? "OPEN" : "FIXED",
+    priority: (`P${index % 3}`) as BacklogBug["priority"],
+  }));
+  rememberProjectBacklogHotWindow("project-a", backlogRows);
+  assertFixture(
+    projectBacklogHotWindow("project-a")?.values.length === TASK_PLAYBACK_BACKLOG_HOT_WINDOW_LIMIT,
+    "Backlog hot window should retain one bounded 250-row project window for local facets",
+  );
+  assertFixture(projectBacklogHotWindow("project-b") === null, "Backlog hot windows must not leak across projects");
+
+  const trace = normalizeTaskPlaybackTrace({
+    projectId: "project-a",
+    backlog: backlogRows[0],
+    taskTimeline: {
+      project_id: "project-a",
+      backlog_id: backlogRows[0].bug_id,
+      events,
+      count: events.length,
+    },
+    gateResponse: null,
+    source: "governed",
+  });
+  rememberProjectPlaybackHotWindow("project-a", backlogRows[0].bug_id, trace);
+  assertFixture(
+    projectPlaybackHotWindow("project-a", backlogRows[0].bug_id)?.values[0]?.frames.length === TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT,
+    "Playback hot window should retain the newest 50 frames per project and backlog",
+  );
+  assertFixture(
+    projectPlaybackHotWindow("project-b", backlogRows[0].bug_id) === null,
+    "Playback hot windows must include project identity in their cache key",
+  );
+
+  const viewSource = readFileSync(new URL("../views/TaskPlaybackView.tsx", import.meta.url), "utf8");
+  assertFixture(
+    viewSource.includes("data-current-cache-source")
+      && viewSource.includes("data-current-memory-first")
+      && viewSource.includes("data-playback-cache-source")
+      && viewSource.includes("data-playback-cold-load-count"),
+    "Current and Playback should expose memory-first/SWR telemetry for real E2E assertions",
+  );
+  assertFixture(
+    !/onReconnect=\{\(\) => \{[\s\S]*?setRecentEvents\(\[\]\)/.test(viewSource),
+    "Current reconnect should preserve useful memory content while revalidating",
+  );
+  return [
+    "Current: project-isolated newest-first 50-event memory window",
+    "Playback: project+backlog-isolated newest 50-frame memory window",
+    "Backlog: project-isolated 250-row local-facet window",
+    "Current/Playback: observable memory-first and cold-load telemetry",
+  ];
+}
+
+export const taskPlaybackMemoryHotWindowSummary: string[] = taskPlaybackMemoryHotWindowAssertions();

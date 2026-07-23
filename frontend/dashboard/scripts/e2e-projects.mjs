@@ -1177,7 +1177,9 @@ function verifyActivityPlaybackViewportWarmCacheContract() {
   const serverSource = readFileSync(path.join(REPO_ROOT, "agent/governance/server.py"), "utf8");
   const timelineTestSource = readFileSync(path.join(REPO_ROOT, "agent/tests/test_task_timeline.py"), "utf8");
   const packagedIndexSource = readFileSync(path.join(REPO_ROOT, "agent/governance/dashboard_dist/index.html"), "utf8");
-  const packagedCssSource = readFileSync(path.join(REPO_ROOT, "agent/governance/dashboard_dist/assets/index-DTkNP_Kn.css"), "utf8");
+  const packagedCssName = packagedIndexSource.match(/\/dashboard\/assets\/(index-[^"?]+\.css)(?:\?v=[^"]+)?/)?.[1] || "";
+  assert(packagedCssName, "Packaged dashboard index should reference one fingerprinted CSS asset");
+  const packagedCssSource = readFileSync(path.join(REPO_ROOT, "agent/governance/dashboard_dist/assets", packagedCssName), "utf8");
 
   assert(
     playbackSource.includes("next_legal_action_disposition")
@@ -1204,13 +1206,41 @@ function verifyActivityPlaybackViewportWarmCacheContract() {
     "Desktop Playback panel must expand the outer scroll range while reserving nonzero independently scrollable frame and inspector columns",
   );
   assert(
-    packagedIndexSource.includes("/dashboard/assets/index-CxdqAXM1.js?v=JMCch3sD")
-      && packagedIndexSource.includes("/dashboard/assets/index-DTkNP_Kn.css?v=Lagx07Hp")
-      && !packagedIndexSource.includes("/dashboard/assets/index-JMCch3sD.js")
-      && !packagedIndexSource.includes("/dashboard/assets/index-Lagx07Hp.css")
+    /\/dashboard\/assets\/index-[^"?]+\.js\?v=[^"]+/.test(packagedIndexSource)
+      && /\/dashboard\/assets\/index-[^"?]+\.css\?v=[^"]+/.test(packagedIndexSource)
       && packagedCssSource.includes("min-height:max-content")
       && packagedCssSource.includes("flex:0 0 clamp(300px,42vh,520px)"),
-    "Compatibility packaging should cache-bust authorized asset paths while serving the non-collapsing viewport CSS bytes",
+    "Compatibility packaging should cache-bust fingerprinted asset paths while serving the non-collapsing viewport CSS bytes",
+  );
+  assert(
+    playbackSource.includes("TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT = 50")
+      && playbackSource.includes("TASK_PLAYBACK_BACKLOG_HOT_WINDOW_LIMIT = 250")
+      && playbackSource.includes("projectPlaybackHotWindows")
+      && playbackSource.includes("rememberBoundedMemoryWindow"),
+    "Frontend hot windows should be bounded and independently keyed for Current, Playback, and Backlog",
+  );
+  assert(
+    playbackViewSource.includes("data-current-hot-window-count")
+      && playbackViewSource.includes("data-current-cache-source")
+      && playbackViewSource.includes("data-current-memory-first")
+      && playbackViewSource.includes("data-playback-cache-source")
+      && playbackViewSource.includes("data-playback-cold-load-count"),
+    "Browser E2E should have observable Current/Playback second-entry memory-hit and cold-load-count assertions",
+  );
+  assert(
+    playbackViewSource.includes('data-backlog-local-facets="status,priority,timeline-state"')
+      && playbackViewSource.includes("data-backlog-hot-window-count")
+      && playbackViewSource.includes("data-server-search-next-offset")
+      && playbackViewSource.includes('data-server-search-results="playback"')
+      && playbackViewSource.includes("api.backlogSearchFor(projectId")
+      && playbackViewSource.includes("api.taskTimelineSearchFor(projectId"),
+    "Browser E2E should have real entrypoints for local facets, >250 pagination, and database-backed history search",
+  );
+  assert(
+    playbackTestSource.includes("Current hot windows must remain project-isolated")
+      && playbackTestSource.includes("Playback hot windows must include project identity in their cache key")
+      && playbackTestSource.includes("Current reconnect should preserve useful memory content while revalidating"),
+    "Focused fixtures should prove multi-project isolation and stale-while-revalidate memory preservation",
   );
   assert(
     serverSource.includes('endpoint="timeline_list"')
