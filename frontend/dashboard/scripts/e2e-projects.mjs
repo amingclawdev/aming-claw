@@ -902,7 +902,7 @@ function verifyBacklogEvidenceContract() {
   assert(playbackViewSource.includes("<h2>Activity</h2>"), "Activity view should own the task/runtime stream heading");
   assert(playbackViewSource.includes("Current task/runtime event stream with task playback history as a reachable detail."), "Activity view should describe current events as the primary surface");
   assert(playbackViewSource.includes("Current activity") && playbackViewSource.includes("Playback history"), "Activity view should expose current stream and playback history tabs");
-  assert(viewSource.includes("api.backlogSearchFor(projectId") && viewSource.includes('data-server-search-results="backlog"') && viewSource.includes("local facet of the labeled server result set"), "Backlog lookup should use a labeled debounced server result set with only explicit local facets");
+  assert(viewSource.includes("api.backlogSearchFor(projectId") && viewSource.includes('data-server-search-results="backlog"') && viewSource.includes('data-backlog-local-facets="status,priority"') && viewSource.includes("Recent ${BACKLOG_HOT_WINDOW_LIMIT} scope.") && viewSource.includes("SQLite indexed history."), "Backlog lookup should use local facets over recent-250 and a separately labeled database history path");
   assert(playbackViewSource.includes("api.taskTimelineSearchFor(projectId") && playbackViewSource.includes('data-timeline-search-results="public-safe"') && playbackViewSource.includes("event.deep_link || buildPlaybackUrl(projectId, backlogId, eventId)"), "Playback lookup should search bounded public-safe timeline history and preserve exact event deep links");
   assert(taskTimelineSource.includes("task_timeline.public_search.v1") && taskTimelineSource.includes("PUBLIC_TIMELINE_SEARCH_MAX_SCAN_LIMIT") && taskTimelineSource.includes("raw_evidence_omitted"), "Timeline search should be bounded and expose only sanitized public-safe evidence");
   assert(taskTimelineSource.includes("task_timeline.public_blocker_semantics.v1") && taskTimelineSource.includes("blocker ids:"), "Historical blocked results should name concrete blocker ids and governed repair targets");
@@ -1175,6 +1175,7 @@ function verifyActivityPlaybackViewportWarmCacheContract() {
   const playbackViewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/TaskPlaybackView.tsx"), "utf8");
   const cssSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/styles.css"), "utf8");
   const serverSource = readFileSync(path.join(REPO_ROOT, "agent/governance/server.py"), "utf8");
+  const backlogCacheSource = readFileSync(path.join(REPO_ROOT, "agent/governance/dashboard_read_cache.py"), "utf8");
   const timelineTestSource = readFileSync(path.join(REPO_ROOT, "agent/tests/test_task_timeline.py"), "utf8");
   const packagedIndexSource = readFileSync(path.join(REPO_ROOT, "agent/governance/dashboard_dist/index.html"), "utf8");
   const packagedCssName = packagedIndexSource.match(/\/dashboard\/assets\/(index-[^"?]+\.css)(?:\?v=[^"]+)?/)?.[1] || "";
@@ -1271,6 +1272,17 @@ function verifyActivityPlaybackViewportWarmCacheContract() {
       && serverSource.includes('"freshness_watermark"')
       && serverSource.includes('"age_ms"'),
     "Warm cache should be bounded, expiring, freshness-aware, and observable",
+  );
+  assert(
+    serverSource.includes("_BACKLOG_HOT_WINDOW_LIMIT = 250")
+      && serverSource.includes("idx_backlog_bugs_dashboard_keyset")
+      && serverSource.includes("backlog.indexed_history_scope.v1")
+      && serverSource.includes("next_cursor")
+      && backlogCacheSource.includes("DashboardBacklogReadCache")
+      && backlogCacheSource.includes("historical_ttl_seconds: float = 180.0")
+      && backlogCacheSource.includes("single_flight")
+      && backlogCacheSource.includes("observe_generation"),
+    "Backlog reads should use one project hot-250 window plus isolated indexed history with bounded TTL/LRU, single-flight, and exact generation invalidation",
   );
   assert(
     playbackTestSource.includes("bypassed, waived, and blocked dispositions never render PASS")

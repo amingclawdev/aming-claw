@@ -4,6 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { ContractRuntimeAuthorityPanel } from "../components/TaskPlaybackPanel";
 import type { ContractRuntimeAuthorityViewModel } from "../lib/taskPlayback";
 import type { BacklogBug } from "../types";
+import { filterBacklogHotWindowRows } from "./BacklogView";
 
 const projectedCommandBug: BacklogBug = {
   bug_id: "AC-OBSERVER-COMMAND-TERMINAL-PROJECTION-FROM-CONTRACT-20260604",
@@ -77,17 +78,35 @@ assertBacklogAuthority(
 assertBacklogAuthority(
   backlogViewSource.includes("BACKLOG_SEARCH_DEBOUNCE_MS = 300")
     && backlogViewSource.includes("api.backlogSearchFor(projectId")
-    && backlogViewSource.includes("status: statusFilter")
-    && backlogViewSource.includes("priority: priorityFilter")
-    && backlogViewSource.includes("offset: searchOffset"),
-  "backlog lookup must debounce a status/priority/paginated server query",
+    && backlogViewSource.includes("cursor: historyCursor")
+    && !backlogViewSource.includes("offset: searchOffset")
+    && !backlogViewSource.includes("status: statusFilter")
+    && !backlogViewSource.includes("priority: priorityFilter"),
+  "database lookup must debounce search/keyset history without refetching local facets",
 );
 assertBacklogAuthority(
   backlogViewSource.includes('data-server-search-results="backlog"')
-    && backlogViewSource.includes("Server result set.")
-    && backlogViewSource.includes("local facet of the labeled server result set")
-    && backlogViewSource.includes("Next server page"),
-  "backlog lookup must label the server result scope and local facet pagination",
+    && backlogViewSource.includes('data-backlog-local-facets="status,priority"')
+    && backlogViewSource.includes("Recent ${BACKLOG_HOT_WINDOW_LIMIT} scope.")
+    && backlogViewSource.includes("SQLite indexed history.")
+    && backlogViewSource.includes("Next indexed page"),
+  "backlog must label the recent local-facet window separately from indexed history",
+);
+
+const localFacetRows: BacklogBug[] = Array.from({ length: 250 }, (_, index) => ({
+  bug_id: `AC-LOCAL-FACET-${index}`,
+  title: `Local facet ${index}`,
+  status: index % 2 ? "OPEN" : "FIXED",
+  priority: `P${index % 4}`,
+  created_at: `2026-07-23T00:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}Z`,
+  updated_at: `2026-07-23T00:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}Z`,
+}));
+const localOpenP1 = filterBacklogHotWindowRows(localFacetRows, "OPEN", "P1");
+assertBacklogAuthority(
+  localOpenP1.length > 0
+    && localOpenP1.every((row) => row.status === "OPEN" && row.priority === "P1")
+    && localFacetRows.length === 250,
+  "open/closed and P0-P3 facets must operate locally over the retained recent-250 window",
 );
 assertBacklogAuthority(
   playbackPanelSource.includes("Backlog row close authority")

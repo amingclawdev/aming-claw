@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import hashlib
 import io
 import json
 import sqlite3
 import subprocess
+from threading import Event
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -35,6 +37,8 @@ from agent.governance import reconcile_semantic_enrichment as semantic_enrichmen
 from agent.governance import server
 from agent.governance import state_reconcile
 from agent.governance import task_timeline
+from agent.governance import dashboard_read_cache
+from agent.governance.dashboard_read_cache import DashboardBacklogReadCache
 from agent.governance.contracts.instructions import resolve_instruction_bundle
 from agent.governance.contracts import write_gate as contract_write_gate
 from agent.governance.contracts.runtime import (
@@ -6215,6 +6219,7 @@ def test_audit_recovery_backlog_close_uses_archive_and_qa_without_mf_worker_gate
 
 
 def test_backlog_list_server_search_supports_status_priority_and_pagination(conn):
+    server._backlog_read_cache_clear()
     rows = (
         ("AC-HISTORICAL-LOOKUP-OPEN", "Historical governance lookup open", "OPEN", "P1", "2026-07-01T00:00:00Z"),
         ("AC-HISTORICAL-LOOKUP-WIP", "Historical governance lookup active", "IN_PROGRESS", "P1", "2026-07-02T00:00:00Z"),
@@ -6238,7 +6243,6 @@ def test_backlog_list_server_search_supports_status_priority_and_pagination(conn
                 "status": "OPEN",
                 "priority": "P1",
                 "limit": "1",
-                "offset": "0",
                 "include_closed": "true",
             },
         )
@@ -6252,7 +6256,7 @@ def test_backlog_list_server_search_supports_status_priority_and_pagination(conn
                 "status": "OPEN",
                 "priority": "P1",
                 "limit": "1",
-                "offset": "1",
+                "cursor": first["next_cursor"],
                 "include_closed": "true",
             },
         )
@@ -6260,16 +6264,20 @@ def test_backlog_list_server_search_supports_status_priority_and_pagination(conn
 
     assert first["filtered_count"] == 2
     assert first["has_more"] is True
-    assert first["next_offset"] == 1
+    assert first["next_cursor"].startswith("bk1.")
     assert first["scope"] == {
-        "schema_version": "backlog.public_search_scope.v1",
+        "schema_version": "backlog.indexed_history_scope.v1",
         "project_id": PID,
         "status": "OPEN",
         "priority": "P1",
         "view": "compact",
         "public_safe": True,
         "bounded": True,
+        "facets": [],
+        "recent_scope": "",
+        "pagination": "sqlite_indexed_keyset",
     }
+    assert first["source"] == "sqlite_indexed_keyset"
     assert first["bugs"][0]["bug_id"] == "AC-HISTORICAL-LOOKUP-WIP"
     assert second["bugs"][0]["bug_id"] == "AC-HISTORICAL-LOOKUP-OPEN"
     assert second["has_more"] is False
@@ -6279,7 +6287,347 @@ def test_backlog_list_server_search_supports_status_priority_and_pagination(conn
     )
 
 
+def test_backlog_hot_window_is_newest_first_bounded_and_generation_invalidated(conn):
+    server._backlog_read_cache_clear()
+    conn.executemany(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                f"AC-HOT-{index:03d}",
+                f"Hot row {index}",
+                "OPEN" if index % 2 else "FIXED",
+                f"P{index % 4}",
+                f"2026-07-23T00:{index // 60:02d}:{index % 60:02d}Z",
+                f"2026-07-23T00:{index // 60:02d}:{index % 60:02d}Z",
+            )
+            for index in range(260)
+        ],
+    )
+    conn.commit()
+    query = {
+        "view": "compact",
+        "limit": "250",
+        "include_closed": "true",
+    }
+
+    first = server.handle_backlog_list(_ctx({"project_id": PID}, query=query))
+    second = server.handle_backlog_list(_ctx({"project_id": PID}, query=query))
+
+    assert first["hot_limit"] == 250
+    assert first["hot_count"] == 250
+    assert first["bugs"][0]["bug_id"] == "AC-HOT-259"
+    assert first["bugs"][-1]["bug_id"] == "AC-HOT-010"
+    assert first["history_available"] is True
+    assert first["truncated"] is True
+    assert first["next_cursor"] == first["oldest_cursor"]
+    assert first["scope"]["facets"] == ["status", "priority"]
+    assert first["scope"]["recent_scope"] == "newest 250"
+    assert first["source"] == "sqlite_hot_window"
+    assert first["read_cache"]["miss"] is True
+    assert second["source"] == "memory_hot_window"
+    assert second["read_cache"]["hit"] is True
+    assert second["generation"] == first["generation"]
+
+    conn.execute(
+        """UPDATE backlog_bugs
+              SET title = ?, updated_at = ?
+            WHERE bug_id = ?""",
+        ("Hot row promoted", "2026-07-24T00:00:00Z", "AC-HOT-010"),
+    )
+    conn.commit()
+    refreshed = server.handle_backlog_list(_ctx({"project_id": PID}, query=query))
+
+    assert refreshed["source"] == "sqlite_hot_window"
+    assert refreshed["read_cache"]["miss"] is True
+    assert refreshed["generation"] == first["generation"] + 1
+    assert refreshed["bugs"][0]["bug_id"] == "AC-HOT-010"
+
+
+def test_backlog_history_uses_stable_keyset_and_separate_cache(conn):
+    server._backlog_read_cache_clear()
+    conn.executemany(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, created_at, updated_at)
+           VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
+        [
+            (
+                f"AC-KEYSET-{index}",
+                "Needle history row",
+                f"2026-07-23T00:00:0{index}Z",
+                f"2026-07-23T00:00:0{index}Z",
+            )
+            for index in range(3)
+        ],
+    )
+    conn.commit()
+    query = {
+        "view": "compact",
+        "q": "Needle history",
+        "limit": "2",
+        "include_closed": "true",
+    }
+
+    first = server.handle_backlog_list(_ctx({"project_id": PID}, query=query))
+    cached = server.handle_backlog_list(_ctx({"project_id": PID}, query=query))
+    page = server.handle_backlog_list(
+        _ctx(
+            {"project_id": PID},
+            query={**query, "cursor": first["next_cursor"]},
+        )
+    )
+
+    assert first["source"] == "sqlite_indexed_keyset"
+    assert first["read_cache"]["pool"] == "historical_ttl_lru"
+    assert cached["source"] == "memory_historical_cache"
+    assert cached["read_cache"]["hit"] is True
+    assert page["bugs"][0]["bug_id"] == "AC-KEYSET-0"
+    assert page["cursor"] == first["next_cursor"]
+    assert page["has_more"] is False
+    assert page["hot_count"] == 0
+
+    plan = conn.execute(
+        """EXPLAIN QUERY PLAN
+           SELECT bug_id FROM backlog_bugs
+            WHERE (updated_at < ?
+               OR (updated_at = ? AND created_at < ?)
+               OR (updated_at = ? AND created_at = ? AND bug_id < ?))
+            ORDER BY updated_at DESC, created_at DESC, bug_id DESC
+            LIMIT 2""",
+        (
+            "2026-07-23T00:00:02Z",
+            "2026-07-23T00:00:02Z",
+            "2026-07-23T00:00:02Z",
+            "2026-07-23T00:00:02Z",
+            "2026-07-23T00:00:02Z",
+            "AC-KEYSET-2",
+        ),
+    ).fetchall()
+    assert any(
+        "idx_backlog_bugs_dashboard_keyset"
+        in " ".join(str(value) for value in row)
+        for row in plan
+    )
+
+
+def test_backlog_history_cache_separates_compact_then_full_authority_view(conn):
+    server._backlog_read_cache_clear()
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, details_md, created_at, updated_at)
+           VALUES (?, ?, 'OPEN', 'P1', ?, ?, ?)""",
+        (
+            "AC-HISTORY-CACHE-VIEW-AUTHORITY",
+            "Historical cache view authority",
+            "Full-only details remain available",
+            "2026-07-23T01:00:00Z",
+            "2026-07-23T01:00:00Z",
+        ),
+    )
+    conn.commit()
+    query = {
+        "q": "Historical cache view authority",
+        "limit": "10",
+        "include_closed": "true",
+    }
+
+    compact = server.handle_backlog_list(
+        _ctx({"project_id": PID}, query={**query, "view": "compact"})
+    )
+    full = server.handle_backlog_list(
+        _ctx({"project_id": PID}, query={**query, "view": "full"})
+    )
+
+    assert compact["view"] == "compact"
+    assert compact["read_cache"]["miss"] is True
+    assert compact["bugs"][0]["compact"] is True
+    assert full["view"] == "full"
+    assert full["source"] == "sqlite_indexed_keyset"
+    assert full["read_cache"]["miss"] is True
+    assert "compact" not in full["bugs"][0]
+    assert full["bugs"][0]["details_md"] == "Full-only details remain available"
+
+
+def test_backlog_history_cache_separates_closed_visibility_true_then_false(conn):
+    server._backlog_read_cache_clear()
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, created_at, updated_at)
+           VALUES (?, ?, 'FIXED', 'P1', ?, ?)""",
+        (
+            "AC-HISTORY-CACHE-CLOSED-AUTHORITY",
+            "Historical cache closed visibility authority",
+            "2026-07-23T01:01:00Z",
+            "2026-07-23T01:01:00Z",
+        ),
+    )
+    conn.commit()
+    query = {
+        "view": "compact",
+        "q": "Historical cache closed visibility authority",
+        "limit": "10",
+    }
+
+    with_closed = server.handle_backlog_list(
+        _ctx({"project_id": PID}, query={**query, "include_closed": "true"})
+    )
+    without_closed = server.handle_backlog_list(
+        _ctx({"project_id": PID}, query={**query, "include_closed": "false"})
+    )
+
+    assert with_closed["count"] == 1
+    assert with_closed["bugs"][0]["status"] == "FIXED"
+    assert with_closed["read_cache"]["miss"] is True
+    assert without_closed["count"] == 0
+    assert without_closed["filtered_count"] == 0
+    assert without_closed["source"] == "sqlite_indexed_keyset"
+    assert without_closed["read_cache"]["miss"] is True
+
+
+def test_backlog_offset_pagination_fails_closed_with_cursor_hint(conn):
+    server._backlog_read_cache_clear()
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_backlog_list(
+            _ctx(
+                {"project_id": PID},
+                query={
+                    "view": "compact",
+                    "q": "history",
+                    "limit": "10",
+                    "offset": "10",
+                },
+            )
+        )
+    assert exc_info.value.code == "backlog_cursor_required"
+
+
+def test_dashboard_backlog_cache_ttl_lru_isolation_and_single_flight(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(
+        dashboard_read_cache.time,
+        "monotonic",
+        lambda: clock[0],
+    )
+    cache = DashboardBacklogReadCache(
+        hot_project_limit=2,
+        historical_project_limit=1,
+        historical_global_limit=2,
+        historical_ttl_seconds=1,
+    )
+    calls: list[str] = []
+
+    def load(label: str):
+        calls.append(label)
+        return {"label": label}
+
+    first, first_metrics = cache.load_hot(
+        project_id="project-a",
+        authority_generation="gen-a1",
+        loader=lambda: load("a1"),
+    )
+    cache.load_hot(
+        project_id="project-b",
+        authority_generation="gen-b1",
+        loader=lambda: load("b1"),
+    )
+    cached, cached_metrics = cache.load_hot(
+        project_id="project-a",
+        authority_generation="gen-a1",
+        loader=lambda: load("unexpected"),
+    )
+    refreshed, refreshed_metrics = cache.load_hot(
+        project_id="project-a",
+        authority_generation="gen-a2",
+        loader=lambda: load("a2"),
+    )
+
+    assert first == cached == {"label": "a1"}
+    assert first_metrics["miss"] is True
+    assert cached_metrics["hit"] is True
+    assert refreshed == {"label": "a2"}
+    assert refreshed_metrics["miss"] is True
+    assert calls == ["a1", "b1", "a2"]
+
+    cache.load_historical(
+        key="project-a-page-1",
+        project_id="project-a",
+        authority_generation="gen-a2",
+        loader=lambda: load("history-a1"),
+    )
+    cache.load_historical(
+        key="project-a-page-2",
+        project_id="project-a",
+        authority_generation="gen-a2",
+        loader=lambda: load("history-a2"),
+    )
+    assert len(
+        [
+            entry
+            for entry in cache._historical.values()
+            if entry.project_id == "project-a"
+        ]
+    ) == 1
+    cache.load_historical(
+        key="project-b-page-1",
+        project_id="project-b",
+        authority_generation="gen-b1",
+        loader=lambda: load("history-b1"),
+    )
+    assert {entry.project_id for entry in cache._historical.values()} == {
+        "project-a",
+        "project-b",
+    }
+
+    clock[0] += 2
+    _, expired_metrics = cache.load_historical(
+        key="project-b-page-1",
+        project_id="project-b",
+        authority_generation="gen-b1",
+        loader=lambda: load("history-b1-refreshed"),
+    )
+    assert expired_metrics["miss"] is True
+
+    leader_entered = Event()
+    release_leader = Event()
+    single_flight_calls: list[str] = []
+
+    def slow_loader():
+        single_flight_calls.append("load")
+        leader_entered.set()
+        release_leader.wait(timeout=2)
+        return {"value": "shared"}
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        leader = executor.submit(
+            cache.load_historical,
+            key="single-flight",
+            project_id="project-b",
+            authority_generation="gen-b1",
+            loader=slow_loader,
+        )
+        assert leader_entered.wait(timeout=1)
+        follower = executor.submit(
+            cache.load_historical,
+            key="single-flight",
+            project_id="project-b",
+            authority_generation="gen-b1",
+            loader=slow_loader,
+        )
+        release_leader.set()
+        leader_result = leader.result(timeout=2)
+        follower_result = follower.result(timeout=2)
+
+    assert single_flight_calls == ["load"]
+    assert leader_result[0] == follower_result[0] == {"value": "shared"}
+    assert {leader_result[1]["single_flight"], follower_result[1]["single_flight"]} == {
+        "leader",
+        "joined",
+    }
+
+
 def test_backlog_list_compact_includes_observer_command_terminal_projection(conn):
+    server._backlog_read_cache_clear()
     observer_session.ensure_schema(conn)
     backlog_id = "AC-OBSERVER-COMMAND-TERMINAL-PROJECTION-FROM-CONTRACT-20260604"
     conn.execute(
@@ -6348,6 +6696,7 @@ def test_backlog_list_compact_includes_observer_command_terminal_projection(conn
 
 
 def test_backlog_list_compact_hides_completed_command_with_stale_projection_for_fixed_row(conn):
+    server._backlog_read_cache_clear()
     observer_session.ensure_schema(conn)
     backlog_id = "AC-OBSERVER-COMMAND-STALE-PROJECTION-FIXED-ROW"
     conn.execute(

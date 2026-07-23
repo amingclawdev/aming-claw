@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError } from "../lib/api";
+import { api, ApiError, BACKLOG_HOT_WINDOW_LIMIT, type BacklogHotWindowResponse } from "../lib/api";
 import {
   buildPlaybackUrl,
   contractRuntimeCompatibilityRepairValues,
@@ -73,7 +73,7 @@ const AUDIT_ARCHIVED_RUNTIME_STATES = new Set(["audit_archived"]);
 const BACKLOG_URL_PARAM = "backlog";
 const BACKLOG_DETAIL_TIMELINE_LIMIT = 250;
 const BACKLOG_SEARCH_DEBOUNCE_MS = 300;
-const BACKLOG_SEARCH_PAGE_SIZE = 100;
+const BACKLOG_SEARCH_PAGE_SIZE = 250;
 const CONTENT_SYS_DEMO_VISUALIZATION_SCHEMA = "content_sys.demo_visualization_evidence.v1";
 const ROUTE_GUIDANCE_TEMPLATE_ID = "mf_workflow_runtime.v1";
 const ROUTE_GUIDANCE_ALLOWED_STAGES = ["dispatch", "startup_gate", "implementation_wait", "handoff_gate"];
@@ -82,6 +82,22 @@ const ROUTE_LEGACY_ADVISORY_REQUIREMENTS = ["route_action_precheck", "mf_timelin
 const ROUTE_WORKER_REQUIREMENTS = ["bounded_implementation_worker_dispatch", "mf_subagent_startup"];
 const ROUTE_QA_REQUIREMENTS = ["independent_verification_lane"];
 const ROUTE_IDENTITY_REQUIREMENTS = ["route_identity_mismatch", "same_route_identity", "route_identity_cleanup"];
+
+export function filterBacklogHotWindowRows(
+  bugs: BacklogBug[],
+  statusFilter: StatusFilter,
+  priorityFilter: PriorityFilter,
+): BacklogBug[] {
+  return bugs
+    .filter((bug) => {
+      if (statusFilter === "OPEN" && !isOpenBug(bug)) return false;
+      if (statusFilter === "CLOSED" && !isClosedBug(bug)) return false;
+      if (priorityFilter !== "ALL" && normalizePriority(bug.priority) !== priorityFilter) return false;
+      return true;
+    })
+    .slice()
+    .sort(compareBugs);
+}
 
 function playbackHref(projectId: string): string {
   return `?project_id=${encodeURIComponent(projectId)}&view=activity&activity_tab=history`;
@@ -275,8 +291,11 @@ export default function BacklogView({ backlog, projectId }: Props) {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("OPEN");
   const [priorityFilter, setPriorityFilter] = useState<PriorityFilter>("ALL");
   const [query, setQuery] = useState("");
-  const [searchOffset, setSearchOffset] = useState(0);
-  const [serverBacklog, setServerBacklog] = useState<BacklogResponse>(backlog);
+  const [historyCursor, setHistoryCursor] = useState("");
+  const [historyCursorTrail, setHistoryCursorTrail] = useState<string[]>([]);
+  const [serverBacklog, setServerBacklog] = useState<BacklogHotWindowResponse>(
+    () => api.backlogMemoryFor(projectId) ?? backlog,
+  );
   const [serverSearchLoading, setServerSearchLoading] = useState(false);
   const [serverSearchError, setServerSearchError] = useState("");
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
@@ -323,19 +342,12 @@ export default function BacklogView({ backlog, projectId }: Props) {
 
   const serverBugs = serverBacklog.bugs ?? bugs;
   const rows = useMemo(() => {
-    return serverBugs
-      .filter((bug) => {
-        if (statusFilter === "OPEN" && !isOpenBug(bug)) return false;
-        if (statusFilter === "CLOSED" && !isClosedBug(bug)) return false;
-        if (priorityFilter !== "ALL" && normalizePriority(bug.priority) !== priorityFilter) return false;
-        return true;
-      })
-      .slice()
-      .sort(compareBugs);
+    return filterBacklogHotWindowRows(serverBugs, statusFilter, priorityFilter);
   }, [priorityFilter, serverBugs, statusFilter]);
 
   const filteredCount = serverBacklog.filtered_count ?? stats.total;
-  const pageNote = serverBacklog.has_more ? ` · next offset ${serverBacklog.next_offset ?? rows.length}` : "";
+  const pageNote = serverBacklog.has_more ? " · more in indexed history" : "";
+  const browsingDatabase = Boolean(query.trim() || historyCursor);
   const syncCommands = [
     `aming-claw backlog export --project-id ${projectId} --output backlog.json`,
     `aming-claw backlog import --project-id ${projectId} --input backlog.json --dry-run`,
@@ -343,8 +355,9 @@ export default function BacklogView({ backlog, projectId }: Props) {
   ].join("\n");
 
   useEffect(() => {
-    setServerBacklog(backlog);
-    setSearchOffset(0);
+    setServerBacklog(api.backlogMemoryFor(projectId) ?? backlog);
+    setHistoryCursor("");
+    setHistoryCursorTrail([]);
     setServerSearchLoading(false);
     setServerSearchError("");
     setTimelineByBug({});
@@ -355,20 +368,38 @@ export default function BacklogView({ backlog, projectId }: Props) {
   }, [projectId]);
 
   useEffect(() => {
-    setSearchOffset(0);
-  }, [priorityFilter, query, statusFilter]);
+    setHistoryCursor("");
+    setHistoryCursorTrail([]);
+  }, [query]);
 
   useEffect(() => {
+    const controller = new AbortController();
+    const unsubscribe = api.subscribeBacklogHotWindow(projectId, (response) => {
+      if (!controller.signal.aborted && !query.trim() && !historyCursor) setServerBacklog(response);
+    });
+    const memory = api.backlogMemoryFor(projectId);
+    if (memory && !query.trim() && !historyCursor) setServerBacklog(memory);
+    api.backlogRevalidateFor(projectId, controller.signal)
+      .then((response) => {
+        if (!controller.signal.aborted && !query.trim() && !historyCursor) setServerBacklog(response);
+      })
+      .catch(() => undefined);
+    return () => {
+      unsubscribe();
+      controller.abort();
+    };
+  }, [historyCursor, projectId, query]);
+
+  useEffect(() => {
+    if (!query.trim() && !historyCursor) return;
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
       setServerSearchLoading(true);
       setServerSearchError("");
       api.backlogSearchFor(projectId, {
         q: query,
-        status: statusFilter,
-        priority: priorityFilter,
         limit: BACKLOG_SEARCH_PAGE_SIZE,
-        offset: searchOffset,
+        cursor: historyCursor,
         include_closed: true,
       }, controller.signal)
         .then((response) => {
@@ -385,7 +416,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [priorityFilter, projectId, query, searchOffset, statusFilter]);
+  }, [historyCursor, projectId, query]);
 
   useEffect(() => {
     const handlePopState = () => {
@@ -558,7 +589,14 @@ export default function BacklogView({ backlog, projectId }: Props) {
   const selectedTimeline = selectedBugId ? timelineByBug[selectedBugId] : undefined;
 
   return (
-    <div className="view">
+    <div
+      className="view"
+      data-backlog-local-facets="status,priority"
+      data-backlog-hot-window-count={serverBacklog.hot_count ?? (browsingDatabase ? 0 : serverBugs.length)}
+      data-backlog-cache-source={serverBacklog.source ?? "bootstrap"}
+      data-backlog-cache-hit={serverBacklog.read_cache?.hit ? "true" : "false"}
+      data-backlog-generation={serverBacklog.generation ?? 0}
+    >
       <div className="view-head">
         <h2 className="view-title">Backlog</h2>
         <span className="view-subtitle">
@@ -620,37 +658,63 @@ export default function BacklogView({ backlog, projectId }: Props) {
         />
       </div>
 
-      <div className="backlog-guidance" data-server-search-results="backlog" aria-live="polite">
+      <div
+        className="backlog-guidance backlog-hot-window-meta"
+        data-server-search-results="backlog"
+        data-server-search-next-cursor={serverBacklog.next_cursor ?? ""}
+        aria-live="polite"
+      >
         <div>
-          <strong>Server result set.</strong>{" "}
+          <strong>{browsingDatabase ? "SQLite indexed history." : `Recent ${BACKLOG_HOT_WINDOW_LIMIT} scope.`}</strong>{" "}
           {serverSearchLoading
             ? "Searching the governance database…"
-            : `${rows.length} local facet rows from ${filteredCount} server matches at offset ${serverBacklog.offset ?? searchOffset}.`}
+            : browsingDatabase
+              ? `${rows.length} local facet rows from this stable-keyset database page.`
+              : `${rows.length} rows after local status/priority facets; facet changes do not refetch the server.`}
           {serverSearchError ? ` Search error: ${serverSearchError}` : ""}
+          {!browsingDatabase && serverBacklog.history_available
+            ? " Older rows remain available through indexed history."
+            : ""}
+          <span className="backlog-cache-observability">
+            {" "}cache {serverBacklog.read_cache?.hit ? "hit" : "miss"} · age {serverBacklog.read_cache?.age_ms ?? 0}ms
+            {" "}· evictions {serverBacklog.read_cache?.eviction_count ?? 0}
+          </span>
         </div>
         <div className="backlog-guidance-actions">
           <button
             type="button"
             className="action-btn"
-            disabled={searchOffset <= 0 || serverSearchLoading}
-            onClick={() => setSearchOffset((offset) => Math.max(0, offset - BACKLOG_SEARCH_PAGE_SIZE))}
+            disabled={historyCursorTrail.length === 0 || serverSearchLoading}
+            onClick={() => {
+              const previousCursor = historyCursorTrail[historyCursorTrail.length - 1] ?? "";
+              setHistoryCursorTrail((trail) => trail.slice(0, -1));
+              setHistoryCursor(previousCursor);
+            }}
           >
-            Previous server page
+            Previous keyset page
           </button>
           <button
             type="button"
             className="action-btn"
-            disabled={!serverBacklog.has_more || serverSearchLoading}
-            onClick={() => setSearchOffset(serverBacklog.next_offset ?? searchOffset + BACKLOG_SEARCH_PAGE_SIZE)}
+            disabled={!serverBacklog.next_cursor || serverSearchLoading}
+            onClick={() => {
+              if (!serverBacklog.next_cursor) return;
+              setHistoryCursorTrail((trail) => [...trail, historyCursor]);
+              setHistoryCursor(serverBacklog.next_cursor ?? "");
+            }}
           >
-            Next server page
+            Next indexed page
           </button>
         </div>
       </div>
 
       <div className="section">
         <div className="section-head">
-          Rows <span className="head-hint">read-only local facet of the labeled server result set, sorted by priority and updated time</span>
+          Rows <span className="head-hint">
+            {browsingDatabase
+              ? "database-backed search/history page with local status and priority facets"
+              : "read-only local facets over the unified newest-first recent-250 window"}
+          </span>
         </div>
         {rows.length === 0 ? (
           <div className="empty">
