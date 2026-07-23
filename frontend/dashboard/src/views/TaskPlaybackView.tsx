@@ -28,13 +28,14 @@ import {
   rememberProjectBacklogHotWindow,
   rememberProjectCurrentTimelineHotWindow,
   rememberProjectPlaybackHotWindow,
+  shouldRunPlaybackColdFullLoader,
   TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT,
   PLAYBACK_URL_PARAMS,
   type TaskPlaybackTrace,
   type ActivityEventCard,
 } from "../lib/taskPlayback";
 import TaskPlaybackPanel from "../components/TaskPlaybackPanel";
-import type { BacklogBug, BacklogResponse, BacklogTimelineGateResponse, TaskTimelineEvent, TaskTimelineResponse } from "../types";
+import type { BacklogBug, BacklogResponse, TaskTimelineEvent, TaskTimelineResponse } from "../types";
 
 interface Props {
   backlog: BacklogResponse;
@@ -49,8 +50,6 @@ type ActivityMode = "activity" | "history";
 const PLAYBACK_BACKLOG_PARAM = PLAYBACK_URL_PARAMS.playback_backlog;
 const ACTIVITY_TAB_PARAM = PLAYBACK_URL_PARAMS.activity_tab;
 const PLAYBACK_TIMELINE_LIMIT = 250;
-const ACTIVITY_TIMELINE_LIMIT = 250;
-const CURRENT_TASK_REFRESH_MS = 5000;
 /** Initial + max limit for the project-wide recent events stream in the Current tab. */
 const RECENT_EVENTS_LIMIT = TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT;
 const PLAYBACK_SEARCH_DEBOUNCE_MS = 300;
@@ -67,8 +66,6 @@ interface PlaybackLoadState {
   loaded: boolean;
   error: string;
   trace: TaskPlaybackTrace;
-  taskTimeline?: TaskTimelineResponse | null;
-  gate?: BacklogTimelineGateResponse | null;
   authorityCacheKey?: string;
   cacheSource?: "cold" | "memory" | "network";
 }
@@ -182,7 +179,6 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const playbackByBugRef = useRef<Record<string, PlaybackLoadState>>({});
-  const authorityTraceCacheRef = useRef<Record<string, TaskPlaybackTrace>>({});
   const activityByBugRef = useRef<Record<string, ActivityLoadState>>({});
   const selectedBacklogDetailByIdRef = useRef<Record<string, BacklogDetailLoadState>>({});
   const selectedBugRef = useRef<BacklogBug | null>(null);
@@ -192,9 +188,6 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const inFlightPlaybackKeysRef = useRef<Set<string>>(new Set());
   const playbackColdLoadCountRef = useRef<Record<string, number>>({});
   const playbackControllersRef = useRef<Map<string, AbortController>>(new Map());
-  // Stable ref so refreshActivityTimeline can call recordPoll without a
-  // forward-reference issue (useEventStreamWithFreshness is declared later).
-  const recordPollRef = useRef<(at: string) => void>(() => undefined);
 
   const timelineSearchBugs = useMemo<BacklogBug[]>(() => (
     (timelineSearch?.events ?? [])
@@ -241,7 +234,6 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     playbackControllersRef.current.clear();
     inFlightPlaybackKeysRef.current.clear();
     playbackByBugRef.current = restoredPlayback;
-    authorityTraceCacheRef.current = {};
     activityByBugRef.current = {};
     selectedBacklogDetailByIdRef.current = {};
     setPlaybackByBug(restoredPlayback);
@@ -483,95 +475,6 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       });
   }, [projectId]);
 
-  const refreshActivityTimeline = useCallback((bug: BacklogBug, showLoading: boolean, signal: AbortSignal, isFallbackPoll = false) => {
-    const bugId = bug.bug_id;
-    if (showLoading) {
-      setActivityByBug((states) => ({
-        ...states,
-        [bugId]: {
-          loading: true,
-          loaded: states[bugId]?.loaded ?? false,
-          error: "",
-          trace: states[bugId]?.trace ?? emptyTaskPlaybackTrace(projectId, bug),
-          bug: states[bugId]?.bug ?? bug,
-          taskTimeline: states[bugId]?.taskTimeline,
-          gate: states[bugId]?.gate,
-          authorityCacheKey: states[bugId]?.authorityCacheKey,
-          refreshedAt: states[bugId]?.refreshedAt,
-        },
-      }));
-    }
-
-    return Promise.allSettled([
-      api.backlogBugFor(projectId, bugId, signal),
-      api.taskTimelineFor(projectId, bugId, ACTIVITY_TIMELINE_LIMIT, signal),
-      api.backlogTimelineGateFor(projectId, bugId, ACTIVITY_TIMELINE_LIMIT, signal),
-    ]).then(([detailResult, timelineResult, gateResult]) => {
-      if (signal.aborted || !activityMountedRef.current || activeProjectIdRef.current !== projectId) return;
-      const detailBug = detailResult.status === "fulfilled" ? detailResult.value : bug;
-      const taskTimeline = timelineResult.status === "fulfilled" ? timelineResult.value : null;
-      const gate = gateResult.status === "fulfilled" ? gateResult.value : null;
-      const errors = [
-        detailResult.status === "rejected" ? errorMessage(detailResult.reason) : "",
-        timelineResult.status === "rejected" ? errorMessage(timelineResult.reason) : "",
-        gateResult.status === "rejected" ? errorMessage(gateResult.reason) : "",
-      ].filter(Boolean);
-      const trace = normalizeTaskPlaybackTrace({
-        projectId,
-        backlog: detailBug,
-        taskTimeline,
-        gateResponse: gate,
-        source: taskTimeline && gate ? "governed" : "governed_partial",
-      });
-      const authorityCacheKey = trace.authority_view?.cache_identity.key;
-      if (authorityCacheKey) authorityTraceCacheRef.current[authorityCacheKey] = trace;
-      const hotTrace = rememberProjectPlaybackHotWindow(projectId, bugId, trace).values[0] ?? trace;
-      setPlaybackByBug((states) => states[bugId]?.loaded
-        ? states
-        : {
-          ...states,
-          [bugId]: {
-            loading: false,
-            loaded: true,
-            error: errors.join(" | "),
-            trace: hotTrace,
-            taskTimeline,
-            gate,
-            authorityCacheKey,
-            cacheSource: "memory",
-          },
-        });
-      // Merge new events without duplicating (deduplication by event id is
-      // handled inside normalizeTaskPlaybackTrace via mergeTimelineEvents).
-      setActivityByBug((states) => {
-        const prev = states[bugId];
-        // Preserve frame selection: if the previous trace had frames the user
-        // selected, keep them unless the new trace is genuinely larger.
-        return {
-          ...states,
-          [bugId]: {
-            loading: false,
-            loaded: true,
-            error: errors.join(" | "),
-            trace,
-            bug: detailBug,
-            taskTimeline,
-            gate,
-            authorityCacheKey,
-            refreshedAt: new Date().toISOString(),
-            // Preserve existing frame selection when merging poll results
-            ...(prev?.loaded && isFallbackPoll ? { _preserveFrameId: true } : {}),
-          },
-        };
-      });
-      if (isFallbackPoll) {
-        recordPollRef.current(new Date().toISOString());
-      }
-      // Current tab is newest-first: default to the newest (last) frame.
-      setSelectedActivityFrameId((current) => current || trace.frames[trace.frames.length - 1]?.id || "");
-    });
-  }, [projectId]);
-
   /**
    * Refresh the project-wide recent events list.
    * Initial load fetches RECENT_EVENTS_LIMIT newest events from the /recent endpoint.
@@ -608,8 +511,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
 
   // SSE with freshness metadata. onStale triggers fallback-polling mode.
   const [sseStaleTrigger, setSseStaleTrigger] = useState(0);
-  const { freshness, recordPoll } = useEventStreamWithFreshness(projectId, {
-    enabled: Boolean(projectId),
+  const { freshness } = useEventStreamWithFreshness(projectId, {
+    enabled: Boolean(projectId) && mode === "activity",
     onEvent: ({ name }) => {
       if (isActivityLiveEvent(name)) setActivityRefreshSeq((seq) => seq + 1);
     },
@@ -617,23 +520,21 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       // When SSE goes stale, trigger an immediate fallback poll
       setSseStaleTrigger((n) => n + 1);
     },
-  }) as { liveStatus: string; freshness: SseFreshnessMeta; recordPoll: (at: string) => void };
-  // Keep the stable ref in sync so refreshActivityTimeline can call it without
-  // a forward-reference hoisting issue (recordPollRef is declared above the callback).
-  recordPollRef.current = recordPoll;
-
+  }) as { freshness: SseFreshnessMeta };
   useEffect(() => {
+    if (mode !== "activity") return undefined;
     const controller = new AbortController();
     refreshCurrentTaskHint(controller.signal);
     return () => controller.abort();
-  }, [activityRefreshSeq, refreshCurrentTaskHint]);
+  }, [activityRefreshSeq, mode, refreshCurrentTaskHint]);
 
   // Load/refresh project-wide recent events whenever SSE fires or initial mount.
   useEffect(() => {
+    if (mode !== "activity") return undefined;
     const controller = new AbortController();
     void refreshRecentEvents(controller.signal);
     return () => controller.abort();
-  }, [activityRefreshSeq, sseStaleTrigger, refreshRecentEvents]);
+  }, [activityRefreshSeq, mode, sseStaleTrigger, refreshRecentEvents]);
 
   // F6: Track new events arriving while the user is browsing page>0.
   // When recentEvents grows and eventsPage>0, accumulate the delta count.
@@ -653,46 +554,60 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   }, [recentEvents.length, eventsPage]);
 
   useEffect(() => {
-    if (!activityBug) return undefined;
-    const bug = activityBug;
-    const controller = new AbortController();
-    let refreshing = false;
-    const refresh = (showLoading = false) => {
-      if (refreshing || controller.signal.aborted) return;
-      refreshing = true;
-      refreshActivityTimeline(bug, showLoading, controller.signal)
-        .catch((error: unknown) => {
-          if (controller.signal.aborted || !activityMountedRef.current || activeProjectIdRef.current !== projectId) return;
-          const bugId = bug.bug_id;
-          setActivityByBug((states) => ({
-            ...states,
-            [bugId]: {
-              loading: false,
-              loaded: true,
-              error: errorMessage(error),
-              trace: states[bugId]?.trace ?? emptyTaskPlaybackTrace(projectId, bug),
-              bug: states[bugId]?.bug ?? bug,
-              taskTimeline: states[bugId]?.taskTimeline ?? null,
-              gate: states[bugId]?.gate ?? null,
-              refreshedAt: states[bugId]?.refreshedAt,
-            },
-          }));
-        })
-        .finally(() => {
-          refreshing = false;
-        });
-    };
+    if (mode !== "activity" || recentEvents.length === 0) return;
+    const eventsByBacklog = new Map<string, TaskTimelineEvent[]>();
+    for (const event of recentEvents) {
+      const backlogId = event.backlog_id || event.backlog?.bug_id || "";
+      if (!backlogId) continue;
+      eventsByBacklog.set(backlogId, [...(eventsByBacklog.get(backlogId) ?? []), event]);
+    }
+    if (eventsByBacklog.size === 0) return;
 
-    refresh(!activityByBugRef.current[bug.bug_id]?.loaded);
-    const timer = window.setInterval(() => refresh(false), CURRENT_TASK_REFRESH_MS);
-    return () => {
-      window.clearInterval(timer);
-      controller.abort();
-    };
-    // sseStaleTrigger fires when SSE has been silent > SSE_STALE_THRESHOLD_MS,
-    // causing an immediate fallback poll to keep the activity view current.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activityBug?.bug_id, activityRefreshSeq, sseStaleTrigger, projectId, refreshActivityTimeline]);
+    const nextPlayback = { ...playbackByBugRef.current };
+    const nextActivity = { ...activityByBugRef.current };
+    for (const [backlogId, events] of eventsByBacklog) {
+      const eventBacklog = events.find((event) => event.backlog?.bug_id === backlogId)?.backlog;
+      const bug = publicBugs.find((candidate) => candidate.bug_id === backlogId) ?? {
+        bug_id: backlogId,
+        title: eventBacklog?.title || backlogId,
+        status: eventBacklog?.status || "UNKNOWN",
+        priority: eventBacklog?.priority || "P3",
+      };
+      const trace = normalizeTaskPlaybackTrace({
+        projectId,
+        backlog: bug,
+        taskTimeline: {
+          project_id: projectId,
+          backlog_id: backlogId,
+          events,
+          count: events.length,
+        },
+        gateResponse: null,
+        source: "governed_partial",
+      });
+      const hotTrace = rememberProjectPlaybackHotWindow(projectId, backlogId, trace).values[0] ?? trace;
+      const memoryState: PlaybackLoadState = {
+        loading: false,
+        loaded: true,
+        error: "",
+        trace: hotTrace,
+        authorityCacheKey: hotTrace.authority_view?.cache_identity.key,
+        cacheSource: "memory",
+      };
+      if (!nextPlayback[backlogId] || nextPlayback[backlogId].cacheSource === "memory") {
+        nextPlayback[backlogId] = memoryState;
+      }
+      nextActivity[backlogId] = {
+        ...memoryState,
+        bug,
+        refreshedAt: new Date().toISOString(),
+      };
+    }
+    playbackByBugRef.current = nextPlayback;
+    activityByBugRef.current = nextActivity;
+    setPlaybackByBug(nextPlayback);
+    setActivityByBug(nextActivity);
+  }, [mode, projectId, publicBugs, recentEvents]);
 
   useEffect(() => {
     if (!activityBug) return;
@@ -710,7 +625,11 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     const bugId = selectedLoadBugId;
     const requestKey = `${projectId}:${bugId}`;
     const currentState = playbackByBugRef.current[bugId];
-    if (currentState?.loaded || currentState?.loading || inFlightPlaybackKeysRef.current.has(requestKey)) return;
+    if (!shouldRunPlaybackColdFullLoader(mode, {
+      loaded: currentState?.loaded,
+      loading: currentState?.loading,
+      inFlight: inFlightPlaybackKeysRef.current.has(requestKey),
+    })) return;
 
     const controller = new AbortController();
     inFlightPlaybackKeysRef.current.add(requestKey);
@@ -747,7 +666,6 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
           source: taskTimeline && gate ? "governed" : "governed_partial",
         });
         const authorityCacheKey = trace.authority_view?.cache_identity.key;
-        if (authorityCacheKey) authorityTraceCacheRef.current[authorityCacheKey] = trace;
         const hotTrace = rememberProjectPlaybackHotWindow(projectId, bugId, trace).values[0] ?? trace;
         setPlaybackByBug((states) => ({
           ...states,
@@ -756,8 +674,6 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
             loaded: true,
             error: errors.join(" | "),
             trace: hotTrace,
-            taskTimeline,
-            gate,
             authorityCacheKey,
             cacheSource: "network",
           },
@@ -765,7 +681,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         if (selectedBugRef.current?.bug_id === bugId) {
           setSelectedFrameId((current) => (
             resolveInitialPlaybackFrameId(
-              trace.frames,
+              hotTrace.frames,
               selectedEventParamRef.current || readPlaybackEventParam(),
               current,
             )
@@ -782,8 +698,6 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
             loaded: true,
             error: errorMessage(error),
             trace,
-            taskTimeline: null,
-            gate: null,
           },
         }));
       })
@@ -791,7 +705,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         inFlightPlaybackKeysRef.current.delete(requestKey);
         playbackControllersRef.current.delete(requestKey);
       });
-  }, [projectId, selectedLoadBugId]);
+  }, [mode, projectId, selectedLoadBugId]);
 
   useEffect(() => {
     if (mode !== "activity") return;

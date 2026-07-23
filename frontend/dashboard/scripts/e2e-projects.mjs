@@ -1216,7 +1216,12 @@ function verifyActivityPlaybackViewportWarmCacheContract() {
     playbackSource.includes("TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT = 50")
       && playbackSource.includes("TASK_PLAYBACK_BACKLOG_HOT_WINDOW_LIMIT = 250")
       && playbackSource.includes("projectPlaybackHotWindows")
-      && playbackSource.includes("rememberBoundedMemoryWindow"),
+      && playbackSource.includes("rememberBoundedMemoryWindow")
+      && playbackSource.includes("projectPlaybackHotWindowTrace")
+      && playbackSource.includes("retainedPlaybackEventId")
+      && playbackSource.includes("lanesFromFrames(frames")
+      && playbackSource.includes("summarizeFrames(frames")
+      && playbackSource.includes("events: retainedEvents"),
     "Frontend hot windows should be bounded and independently keyed for Current, Playback, and Backlog",
   );
   assert(
@@ -1239,8 +1244,18 @@ function verifyActivityPlaybackViewportWarmCacheContract() {
   assert(
     playbackTestSource.includes("Current hot windows must remain project-isolated")
       && playbackTestSource.includes("Playback hot windows must include project identity in their cache key")
-      && playbackTestSource.includes("Current reconnect should preserve useful memory content while revalidating"),
-    "Focused fixtures should prove multi-project isolation and stale-while-revalidate memory preservation",
+      && playbackTestSource.includes("Current reconnect should preserve useful memory content while revalidating")
+      && playbackTestSource.includes("status totals must be rebuilt from the retained 50 frames")
+      && playbackTestSource.includes("DAG must be bounded and reference-closed")
+      && playbackTestSource.includes("Current second entry and warm Playback entry must not call the full timeline/gate loaders"),
+    "Focused fixtures should prove multi-project isolation, reference-closed playback windows, and memory-first loader exclusion",
+  );
+  assert(
+    !playbackViewSource.includes("refreshActivityTimeline")
+      && !playbackViewSource.includes("ACTIVITY_TIMELINE_LIMIT")
+      && playbackViewSource.includes("shouldRunPlaybackColdFullLoader(mode")
+      && playbackViewSource.includes('if (mode !== "activity") return undefined;'),
+    "Current SWR must use bounded resource refreshes while full timeline/gate loading remains Playback-only",
   );
   assert(
     serverSource.includes('endpoint="timeline_list"')
