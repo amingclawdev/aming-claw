@@ -51634,29 +51634,27 @@ def test_onboard_route_guide_service_continues_blocked_candidate_with_audited_by
         )
     )
 
-    next_action = result["next_legal_action"]
-    assert next_action["id"] == "continue_blocked_contract_with_audited_bypass"
-    assert next_action["action"] == "continue_with_audited_bypass"
-    assert next_action["status"] == "proceeded_with_exception"
-    assert next_action["mode"] == "resume_original_contract"
-    assert next_action["mutation_required"] is False
-    assert next_action["diagnostic_required"] is True
-    assert next_action["no_pass_claim"] is True
-    assert next_action["source_row_must_remain_open"] is True
-    assert next_action["direct_fix_required"] is False
-    assert next_action["parent_contract_execution_id"] == (
+    assert result["next_legal_action"] == {}
+    runtime_resume = result["runtime_resume"]
+    assert runtime_resume["status"] == "blocked"
+    assert runtime_resume["terminal"] is False
+    assert runtime_resume["scheduler_eligible"] is False
+    assert runtime_resume["current_eligible"] is False
+    assert runtime_resume["close_eligible"] is False
+    assert runtime_resume["resume_eligible"] is False
+    assert runtime_resume["next_legal_action"] == {}
+    audit = runtime_resume["historical_blocker_audit"]
+    assert audit["id"] == "blocked_contract_audit_only"
+    assert audit["live_next_legal_action"] is False
+    assert audit["legacy_raw_audit"]["parent_contract_execution_id"] == (
         "cex-mf-parallel-blocked-parent"
     )
-    assert "endpoint" not in next_action
-    assert "successor_contract_id" not in next_action
-    assert "successor_contract_template_id" not in next_action
-    assert result["runtime_resume"]["status"] == "proceeded_with_exception"
-    assert result["runtime_resume"]["mode"] == "resume_original_contract"
-    assert result["runtime_resume"]["source"] == "task_timeline_compact_ledger"
+    assert "action" not in audit
+    assert runtime_resume["source"] == "task_timeline_compact_ledger"
     route_guide = result["onboard_route_guide"]
     assert route_guide["backlog_chain_binding"]["runtime_resume"][
         "next_legal_action"
-    ] == next_action
+    ] == {}
     direct_fix_successor = route_guide["backlog_chain_binding"]["create_successor"][
         "direct_fix"
     ]
@@ -52683,34 +52681,96 @@ def test_contract_update_blocked_precheck_continues_with_audited_bypass(conn):
         )
     )
     next_action = current["next_legal_action"]
+    forward_projection = current["runtime_guide"]["next_legal_action"]
     assert next_action["id"] == "worker_revision_source_proof"
-    assert next_action["action"] == "continue_with_audited_bypass"
-    assert next_action["mode"] == "resume_original_contract"
-    assert next_action["status"] == "proceeded_with_exception"
+    assert next_action["action"] == "record_contract_revision_source_proof"
+    assert next_action["mode"] == "forward_integration_after_audited_bypass"
+    assert next_action["source"] == "completed_blocked_line_audited_bypass"
+    assert next_action["status"] == "forward_integration_required"
     assert next_action["line_id"] == "worker_revision_source_proof"
-    assert next_action["original_contract_action"] == (
-        "record_contract_revision_source_proof"
-    )
     assert next_action["blocked_by_line"]["line_id"] == "worker_revision_precheck"
-    assert next_action["blocked_by_line"]["payload"]["status"] == "blocked"
+    assert forward_projection["forward_integration_after_audited_bypass"] is True
+    assert forward_projection["precedence"] == (
+        "audited_bypass_forward_integration"
+    )
+    assert forward_projection["terminal"] is False
+    assert forward_projection["scheduler_eligible"] is True
+    assert forward_projection["schedulable"] is True
+    assert forward_projection["current_eligible"] is True
+    assert forward_projection["close_eligible"] is False
+    assert forward_projection["closeable"] is False
+    assert forward_projection["resume_eligible"] is False
+    assert forward_projection["resumable"] is False
+    assert forward_projection["live_next_legal_action"] is True
+    assert forward_projection["terminal_barrier_required"] == [
+        "independent_qa",
+        "durable_merge",
+        "current_head_full_reconcile_activation",
+    ]
     assert next_action["diagnostic_required"] is True
     assert next_action["no_pass_claim"] is True
-    assert next_action["source_row_must_remain_open"] is True
+    assert forward_projection["source_backlog_mutated"] is False
+    assert forward_projection["repair_requires_separate_backlog_row"] is True
     assert next_action["direct_fix_required"] is False
-    assert next_action["current_line_blocker_policy"]["action"] == (
-        "contract_runtime_bypass_line"
-    )
-    assert next_action["endpoint"].endswith(f"/{execution_id}/line-writes")
-    assert next_action["body"]["stage_id"] == "worker_source"
-    assert next_action["body"]["line_id"] == "worker_revision_source_proof"
-    assert next_action["body"]["evidence_kind"] == (
+    copy_payload = next_action["writer_role_safe_copy_payload"]["copy_payload"]
+    assert copy_payload["stage_id"] == "worker_source"
+    assert copy_payload["line_id"] == "worker_revision_source_proof"
+    assert copy_payload["evidence_kind"] == (
         "contract_revision_source_proof"
     )
-    assert next_action["body"]["runtime_guide_hash"] == next_action[
-        "writer_role_safe_copy_payload"
-    ]["copy_payload"]["runtime_guide_hash"]
-    assert "recommended_successor_contract_id" not in next_action
-    assert "successor_contract_template_id" not in next_action
+    assert copy_payload["runtime_guide_hash"]
+    assert next_action["block_reason"] == (
+        "continue at the ContractRuntime first missing line in this generation; "
+        "repair/backedge, parent-return, and historical close-retry routes are "
+        "disabled"
+    )
+    for forbidden_key in (
+        "parent_contract_execution_id",
+        "parent_to_resume_contract_execution_id",
+        "return_to_parent",
+        "audited_bypass_continuation",
+        "current_line_blocker_policy",
+        "recommended_successor_contract_id",
+        "recommended_successor_contract_template_id",
+        "successor_contract_id",
+        "successor_contract_execution_id",
+        "successor_contract_template_id",
+    ):
+        assert forbidden_key not in forward_projection
+    assert "terminal_disposition" not in current["runtime_guide"]
+    runtime_state = current["contract_runtime_current_state"]
+    assert runtime_state["next_legal_action"]["line_id"] == (
+        "worker_revision_source_proof"
+    )
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone()
+    assert row["status"] == "MF_IN_PROGRESS"
+    serialized_live_projection = json.dumps(
+        {
+            "next_legal_action": next_action,
+            "runtime_next_legal_action": forward_projection,
+            "blocked_contract_runtime": current["runtime_guide"].get(
+                "blocked_contract_runtime"
+            )
+            or {},
+        },
+        sort_keys=True,
+    )
+    for forbidden in (
+        "continue_with_audited_bypass",
+        "resume_original_contract",
+        "retry_source_backlog_close_after_repair",
+        "retry_backlog_close_after_repair",
+        "return_to_parent_required",
+        "parent_to_resume",
+        "enter_direct_fix_successor",
+        "direct_fix_successor",
+        "completed_with_exception",
+        '"WAIVED"',
+    ):
+        assert forbidden not in serialized_live_projection
 
     continued = server.handle_project_contract_update_line_write(
         _ctx_with_role(
@@ -58804,43 +58864,38 @@ def test_source_backed_backlog_close_blocker_projects_audited_bypass_from_comple
         f"timeline:{prechecks[0]['id']}"
     )
     blocked_action = blocked_payload["next_legal_action"]
-    assert blocked_action["id"] == "backlog_close_audited_bypass"
-    assert blocked_action["action"] == "continue_with_audited_bypass"
-    assert blocked_action["status"] == "proceeded_with_exception"
-    assert blocked_action["mode"] == "complete_with_exception"
+    assert blocked_action["id"] == "backlog_close_blocker_audit"
+    assert blocked_action["status"] == "blocked"
+    assert blocked_action["readiness_state"] == "close_blocked"
+    assert blocked_action["terminal"] is False
+    assert blocked_action["scheduler_eligible"] is False
+    assert blocked_action["current_eligible"] is False
+    assert blocked_action["close_eligible"] is False
+    assert blocked_action["resume_eligible"] is False
     assert blocked_action["mutation_required"] is False
     assert blocked_action["diagnostic_required"] is True
     assert blocked_action["no_pass_claim"] is True
-    assert blocked_action["source_row_must_remain_open"] is True
-    assert blocked_action["direct_fix_required"] is False
-    assert blocked_action["body"]["blocked_gate"] == expected_blocked_gate
-    assert blocked_action["audited_bypass_continuation"]["blocked_gate"] == (
-        expected_blocked_gate
-    )
-    assert blocked_action["body"]["blocker_event_ref"] == (
+    assert blocked_action["source_backlog_mutated"] is False
+    assert blocked_action["repair_requires_separate_backlog_row"] is True
+    assert blocked_action["live_next_legal_action"] is False
+    raw_audit = blocked_action["legacy_raw_audit"]
+    assert raw_audit["blocked_gate"] == expected_blocked_gate
+    assert raw_audit["blocker_event_ref"] == (
         f"timeline:{blocked[0]['id']}"
     )
-    assert blocked_action["body"]["close_commit"] == close_commit
-    assert blocked_action["body"]["route_token_ref"] == close_ref
-    assert blocked_action["audited_bypass_continuation"]["blocker_event_ref"] == (
-        f"timeline:{blocked[0]['id']}"
-    )
-    assert blocked_action["audited_bypass_continuation"]["close_commit"] == (
-        close_commit
-    )
-    assert blocked_action["audited_bypass_continuation"]["route_token_ref"] == (
-        close_ref
-    )
+    assert raw_audit["close_commit"] == close_commit
+    assert raw_audit["route_token_ref"] == close_ref
+    assert "action" not in blocked_action
     assert "endpoint" not in blocked_action
     assert "successor_contract_id" not in blocked_action
     assert "successor_contract_template_id" not in blocked_action
+    serialized_blocked_action = json.dumps(blocked_action, sort_keys=True)
+    assert "completed_with_exception" not in serialized_blocked_action
+    assert '"WAIVED"' not in serialized_blocked_action
 
     stale_payload = json.loads(json.dumps(blocked_payload))
     stale_action = stale_payload["next_legal_action"]
-    stale_action["body"]["blocked_gate"] = (
-        "missing_contract_runtime_close_authority"
-    )
-    stale_action["audited_bypass_continuation"]["blocked_gate"] = (
+    stale_action["legacy_raw_audit"]["blocked_gate"] = (
         "missing_contract_runtime_close_authority"
     )
     conn.execute(
@@ -58855,33 +58910,38 @@ def test_source_backed_backlog_close_blocker_projects_audited_bypass_from_comple
     current = server.handle_project_contract_chain_current(
         _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
     )["contract_chain_current"]
-    assert current["readiness_state"] == "completed_with_exception"
+    assert current["readiness_state"] == "close_blocked"
+    assert current["terminal"] is False
+    assert current["scheduler_eligible"] is False
+    assert current["current_eligible"] is False
+    assert current["close_eligible"] is False
+    assert current["resume_eligible"] is False
     assert current["source_of_proof"] == "task_timeline.backlog_close_blocked"
     assert current["blocked_parent_state"]["event_ref"] == f"timeline:{blocked[0]['id']}"
-    assert current["next_legal_action"]["action"] == (
-        "continue_with_audited_bypass"
-    )
-    assert current["next_legal_action"]["parent_contract_execution_id"] == (
+    assert current["next_legal_action"] == {}
+    assert "parent_to_resume_contract_execution_id" not in current
+    blocker_audit = current["backlog_close_blocker_audit"]
+    assert blocker_audit["legacy_raw_audit"]["parent_contract_execution_id"] == (
         parent_execution_id
     )
-    assert current["next_legal_action"]["body"]["blocked_gate"] == (
-        expected_blocked_gate
-    )
-    assert current["next_legal_action"]["audited_bypass_continuation"][
-        "blocked_gate"
-    ] == expected_blocked_gate
-    assert current["next_legal_action"]["audited_bypass_continuation"][
-        "close_commit"
-    ] == close_commit
-    assert current["next_legal_action"]["audited_bypass_continuation"][
-        "route_token_ref"
-    ] == close_ref
-    assert current["authority_projection"]["next_legal_action"][
-        "audited_bypass_continuation"
-    ]["blocked_gate"] == expected_blocked_gate
+    assert blocker_audit["legacy_raw_audit"]["blocked_gate"] == expected_blocked_gate
+    assert blocker_audit["legacy_raw_audit"]["close_commit"] == close_commit
+    assert blocker_audit["legacy_raw_audit"]["route_token_ref"] == close_ref
     assert current["blocked_parent_state"]["no_pass_claim"] is True
-    assert current["blocked_parent_state"]["source_row_must_remain_open"] is True
+    assert current["blocked_parent_state"]["terminal"] is False
+    assert current["blocked_parent_state"]["resumable"] is False
     assert current["blocked_parent_state"]["direct_fix_required"] is False
+    serialized_current = json.dumps(current, sort_keys=True)
+    for forbidden in (
+        "resume_original_contract",
+        "retry_source_backlog_close_after_repair",
+        "retry_backlog_close_after_repair",
+        "return_to_parent_required",
+        "parent_to_resume",
+        "completed_with_exception",
+        '"WAIVED"',
+    ):
+        assert forbidden not in serialized_current
 
 
 def test_backlog_close_blocker_projection_requires_source_backed_route_token_ref(

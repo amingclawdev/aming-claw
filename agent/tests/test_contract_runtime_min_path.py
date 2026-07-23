@@ -8,9 +8,11 @@ from pathlib import Path
 import pytest
 
 from agent.governance.contracts import ContractDefinitionRegistry, ContractRuntime
-from agent.governance.contracts.hash import file_sha256
+from agent.governance.contracts.hash import file_sha256, stable_sha256
 from agent.governance.contracts.runtime import (
+    _audited_bypass_terminal_disposition,
     _contract_completion_satisfying_lines,
+    _project_record_state,
     _worker_implementation_lineage,
     ContractRuntimeError,
     read_backlog_contract_chain_current,
@@ -1390,6 +1392,358 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
     assert result["record"]["runtime_guide"]["next_legal_action"]["line_id"] == (
         "qa_verdict"
     )
+    assert "terminal_disposition" not in result["record"]["runtime_guide"]
+
+    merged_commit = "a" * 40
+    durable_merge_authority = {
+        "schema_version": "contract_runtime.observer_merge_durable_authority.v1",
+        "server_derived": True,
+        "db_verified": True,
+        "merge_gate_passed": True,
+        "merge_event_ref": "timeline:42",
+        "merge_commit": merged_commit,
+        "qa_contract_runtime_verified": True,
+        "qa_acceptance_ref": "contract-runtime-acceptance:qa:1",
+    }
+    reconcile_authority = {
+        "schema_version": "contract_runtime.observer_reconcile_record_authority.v1",
+        "server_derived": True,
+        "record_verified": True,
+        "merge_projection_verified": True,
+        "dispatch_lineage_verified": True,
+        "reconcile_event_recorded": True,
+        "merge_source_ref": "timeline:42",
+        "merged_commit_sha": merged_commit,
+        "reconcile_source_ref": "timeline:43",
+    }
+    reconcile_authority["authority_hash"] = stable_sha256(reconcile_authority)
+    terminal_lines = [
+        result["written_line"],
+        {
+            "line_id": "qa_independent_verification",
+            "actor_role": "qa",
+            "evidence_kind": "independent_verification",
+            "status": "passed",
+        },
+        {
+            "line_id": "observer_merge",
+            "actor_role": "observer",
+            "evidence_kind": "merge",
+            "status": "accepted",
+            "payload": {
+                "durable_merge_authority": durable_merge_authority,
+            },
+        },
+        {
+            "line_id": "observer_reconcile",
+            "actor_role": "observer",
+            "evidence_kind": "reconcile",
+            "status": "accepted",
+            "payload": {"reconcile_authority": reconcile_authority},
+        },
+    ]
+    terminal = _audited_bypass_terminal_disposition(
+        {"completed_lines": terminal_lines}
+    )
+    assert terminal["row_status"] == "WAIVED"
+    assert terminal["readiness_state"] == "completed_with_exception"
+    assert terminal["scheduler_eligible"] is False
+    assert terminal["current_eligible"] is False
+    assert terminal["close_eligible"] is False
+    assert terminal["resume_eligible"] is False
+    assert terminal["source_backlog_mutated"] is False
+    assert terminal["terminal_barrier"]["bypass_line_index"] == 0
+    assert terminal["terminal_barrier"]["reconcile_source_ref"] == "timeline:43"
+    projected_terminal = _project_record_state(
+        {
+            "contract_execution_id": record["contract_execution_id"],
+            "contract_id": "bypass_min_path",
+            "execution_state_revision": 4,
+            "completed_lines": terminal_lines,
+            "runtime_guide": {"next_legal_action": None},
+        }
+    )
+    serialized_terminal = json.dumps(projected_terminal, sort_keys=True)
+    assert "parent_to_resume" not in serialized_terminal
+    assert projected_terminal["next_legal_action"] == {}
+    from agent.governance import server
+
+    server_terminal = server._runtime_current_state_from_record(
+        {
+            "contract_execution_id": record["contract_execution_id"],
+            "contract_id": "bypass_min_path",
+            "execution_state_revision": 4,
+            "runtime_guide": {
+                "next_legal_action": None,
+                "readiness_state": "completed_with_exception",
+                "terminal_disposition": terminal,
+            },
+        }
+    )
+    assert server_terminal["readiness_state"] == "completed_with_exception"
+    assert server_terminal["row_status"] == "WAIVED"
+    assert server_terminal["source_row_status"] == "WAIVED"
+    assert server_terminal["disposition"] == "completed_with_exception"
+    assert server_terminal["terminal"] is True
+    assert server_terminal["scheduler_eligible"] is False
+    assert server_terminal["current_eligible"] is False
+    assert server_terminal["close_eligible"] is False
+    assert server_terminal["resume_eligible"] is False
+    assert server_terminal["next_legal_action"] == {}
+    assert server_terminal["terminal_disposition"] == terminal
+    forged_lines = json.loads(json.dumps(terminal_lines))
+    forged_lines[-1]["payload"]["reconcile_authority"]["record_verified"] = False
+    assert _audited_bypass_terminal_disposition(
+        {"completed_lines": forged_lines}
+    ) == {}
+    noncanonical_bypass_lines = json.loads(json.dumps(terminal_lines))
+    noncanonical_bypass_lines[0]["payload"]["schema_version"] = (
+        "contract_line_bypass.forged"
+    )
+    assert _audited_bypass_terminal_disposition(
+        {"completed_lines": noncanonical_bypass_lines}
+    ) == {}
+
+    candidate_commit = "3ee34c35d611c7bde658b1faf7e8d41fb31526fd"
+    qa_acceptance_ref = (
+        "contract-runtime:cex-mf-parallel-ff19447376e89875a7f1:"
+        "completed_lines:10"
+    )
+    live_qa_line = {
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "status": "passed",
+        "commit_sha": candidate_commit,
+    }
+    live_merge_authority = {
+        **durable_merge_authority,
+        "branch_head": candidate_commit,
+        "qa_completed_line_index": 0,
+        "qa_acceptance_ref": qa_acceptance_ref,
+    }
+    live_merge_line = {
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "evidence_kind": "merge",
+        "status": "accepted",
+        "payload": {
+            "durable_merge_authority": live_merge_authority,
+        },
+    }
+
+    def bind_bypass_request_hash(line):
+        payload = line["payload"]
+        payload["request_hash"] = stable_sha256(
+            {
+                "bypass_identity": payload["bypass_identity"],
+                "line_id": line["line_id"],
+                "stage_id": line["stage_id"],
+                "execution_state_revision": payload[
+                    "execution_state_revision"
+                ],
+                "diagnostic_backlog_id": payload[
+                    "diagnostic_backlog_id"
+                ],
+                "classification": payload["classification"],
+                "reason": payload["reason"],
+                "decision": payload["decision"],
+                "actor_role": line["actor_role"],
+                "evidence_refs": payload["evidence_refs"],
+                "continuation_authority": {},
+            }
+        )
+
+    late_merge_bypass = json.loads(json.dumps(result["written_line"]))
+    late_merge_bypass["stage_id"] = "observer_integration"
+    late_merge_bypass["line_id"] = "observer_merge"
+    late_merge_bypass["payload"].update(
+        {
+            "bypass_identity": (
+                "bypass:cex-mf-parallel-ff19447376e89875a7f1:"
+                "revision-11:observer_integration:observer_merge"
+            ),
+            "source_backlog_id": (
+                "AC-CONTRACT-RUNTIME-BYPASS-TERMINAL-"
+                "NO-SOURCE-RESUME-R1-20260723"
+            ),
+            "blocked_owner_role": "observer",
+            "blocked_evidence_kind": "merge",
+            "execution_state_revision": 11,
+        }
+    )
+    bind_bypass_request_hash(late_merge_bypass)
+    terminal_after_late_merge_bypass = _audited_bypass_terminal_disposition(
+        {
+            "completed_lines": [
+                live_qa_line,
+                late_merge_bypass,
+                live_merge_line,
+                terminal_lines[-1],
+            ]
+        }
+    )
+    assert terminal_after_late_merge_bypass["terminal"] is True
+    assert terminal_after_late_merge_bypass["terminal_barrier"] == {
+        "bypass_line_index": 1,
+        "qa_line_index": 0,
+        "merge_line_index": 2,
+        "reconcile_line_index": 3,
+        "reconcile_source_ref": "timeline:43",
+        "ordering_policy": "stage_aware_forward_only",
+    }
+
+    late_reconcile_bypass = json.loads(json.dumps(result["written_line"]))
+    late_reconcile_bypass["stage_id"] = "observer_integration"
+    late_reconcile_bypass["line_id"] = "observer_reconcile"
+    late_reconcile_bypass["payload"].update(
+        {
+            "bypass_identity": (
+                "bypass:cex-mf-parallel-ff19447376e89875a7f1:"
+                "revision-12:observer_integration:observer_reconcile"
+            ),
+            "source_backlog_id": (
+                "AC-CONTRACT-RUNTIME-BYPASS-TERMINAL-"
+                "NO-SOURCE-RESUME-R1-20260723"
+            ),
+            "blocked_owner_role": "observer",
+            "blocked_evidence_kind": "reconcile",
+            "execution_state_revision": 12,
+        }
+    )
+    bind_bypass_request_hash(late_reconcile_bypass)
+    terminal_after_late_reconcile_bypass = (
+        _audited_bypass_terminal_disposition(
+            {
+                "completed_lines": [
+                    live_qa_line,
+                    live_merge_line,
+                    late_reconcile_bypass,
+                    terminal_lines[-1],
+                ]
+            }
+        )
+    )
+    assert terminal_after_late_reconcile_bypass["terminal"] is True
+    assert terminal_after_late_reconcile_bypass["terminal_barrier"] == {
+        "bypass_line_index": 2,
+        "qa_line_index": 0,
+        "merge_line_index": 1,
+        "reconcile_line_index": 3,
+        "reconcile_source_ref": "timeline:43",
+        "ordering_policy": "stage_aware_forward_only",
+    }
+    assert _audited_bypass_terminal_disposition(
+        {
+            "completed_lines": [
+                live_qa_line,
+                live_merge_line,
+                late_reconcile_bypass,
+                live_merge_line,
+                terminal_lines[-1],
+            ]
+        }
+    ) == {}
+
+    late_close_ready_bypass = json.loads(json.dumps(result["written_line"]))
+    late_close_ready_bypass["stage_id"] = "observer_integration"
+    late_close_ready_bypass["line_id"] = "observer_close_ready"
+    late_close_ready_bypass["payload"].update(
+        {
+            "bypass_identity": (
+                "bypass:cex-mf-parallel-ff19447376e89875a7f1:"
+                "revision-13:observer_integration:observer_close_ready"
+            ),
+            "source_backlog_id": (
+                "AC-CONTRACT-RUNTIME-BYPASS-TERMINAL-"
+                "NO-SOURCE-RESUME-R1-20260723"
+            ),
+            "blocked_owner_role": "observer",
+            "blocked_evidence_kind": "close_ready",
+            "execution_state_revision": 13,
+        }
+    )
+    bind_bypass_request_hash(late_close_ready_bypass)
+    assert _audited_bypass_terminal_disposition(
+        {
+            "completed_lines": [
+                live_qa_line,
+                live_merge_line,
+                late_close_ready_bypass,
+            ]
+        }
+    ) == {}
+    terminal_after_late_close_ready_bypass = (
+        _audited_bypass_terminal_disposition(
+            {
+                "completed_lines": [
+                    live_qa_line,
+                    live_merge_line,
+                    terminal_lines[-1],
+                    late_close_ready_bypass,
+                ]
+            }
+        )
+    )
+    assert terminal_after_late_close_ready_bypass["terminal_barrier"] == {
+        "bypass_line_index": 3,
+        "qa_line_index": 0,
+        "merge_line_index": 1,
+        "reconcile_line_index": 2,
+        "reconcile_source_ref": "timeline:43",
+        "ordering_policy": "stage_aware_forward_only",
+    }
+    terminal_after_multiple_late_bypasses = (
+        _audited_bypass_terminal_disposition(
+            {
+                "completed_lines": [
+                    live_qa_line,
+                    late_merge_bypass,
+                    live_merge_line,
+                    late_reconcile_bypass,
+                    terminal_lines[-1],
+                    late_close_ready_bypass,
+                ]
+            }
+        )
+    )
+    assert terminal_after_multiple_late_bypasses["terminal_barrier"] == {
+        "bypass_line_index": 5,
+        "qa_line_index": 0,
+        "merge_line_index": 2,
+        "reconcile_line_index": 4,
+        "reconcile_source_ref": "timeline:43",
+        "ordering_policy": "stage_aware_forward_only",
+    }
+
+    cross_candidate_merge = json.loads(json.dumps(live_merge_line))
+    cross_candidate_merge["payload"]["durable_merge_authority"][
+        "branch_head"
+    ] = "c" * 40
+    assert _audited_bypass_terminal_disposition(
+        {
+            "completed_lines": [
+                live_qa_line,
+                late_merge_bypass,
+                cross_candidate_merge,
+                terminal_lines[-1],
+            ]
+        }
+    ) == {}
+    stale_round_merge = json.loads(json.dumps(live_merge_line))
+    stale_round_merge["payload"]["durable_merge_authority"][
+        "qa_completed_line_index"
+    ] = 99
+    assert _audited_bypass_terminal_disposition(
+        {
+            "completed_lines": [
+                live_qa_line,
+                late_merge_bypass,
+                stale_round_merge,
+                terminal_lines[-1],
+            ]
+        }
+    ) == {}
 
     retry = runtime.bypass_current_line(
         record["contract_execution_id"], request, actor_role="observer"
@@ -1414,6 +1768,205 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
     )
     assert stale["ok"] is False
     assert stale["decision"]["errors"] == ["execution_state_revision mismatch"]
+
+
+@pytest.mark.parametrize(
+    (
+        "diagnostic_backlog_id",
+        "source_backlog_id",
+        "contract_execution_id",
+        "stage_id",
+        "bypass_identity_stage_id",
+        "line_id",
+        "execution_state_revision",
+    ),
+    [
+        (
+            "AC-CONTRACT-LINE-BYPASS-E0A8A5698E8A27D6",
+            (
+                "AC-ACTIVITY-PLAYBACK-PER-RESOURCE-CACHE-"
+                "SINGLE-FLIGHT-R2-20260722"
+            ),
+            "cex-mf-parallel-05dca57d0f222edea88d",
+            "observer_integration",
+            "observer_integration",
+            "observer_close_ready",
+            29,
+        ),
+        (
+            "AC-CONTRACT-LINE-BYPASS-0FAA24E164C04608",
+            "AC-CONTRACT-LINE-BYPASS-E0A8A5698E8A27D6",
+            "cex-mf-parallel-950f36cb45ff712a44d6",
+            "observer_integration",
+            "observer_integration",
+            "observer_reconcile",
+            13,
+        ),
+        (
+            "AC-CONTRACT-LINE-BYPASS-2CFC4B81B519B820",
+            "AC-CONTRACT-LINE-BYPASS-E0A8A5698E8A27D6",
+            "cex-mf-parallel-950f36cb45ff712a44d6",
+            "observer_integration",
+            "observer_integration",
+            "observer_close_ready",
+            14,
+        ),
+        (
+            "AC-CONTRACT-LINE-BYPASS-F711E000035BF613",
+            "AC-CONTRACT-LINE-BYPASS-2CFC4B81B519B820",
+            "cex-mf-parallel-1e5fbd813bda945d383d",
+            "observer_integration",
+            "observer_merge",
+            "observer_merge",
+            18,
+        ),
+        (
+            "AC-CONTRACT-LINE-BYPASS-3C0FD2ED41F3AC87",
+            "AC-CONTRACT-LINE-BYPASS-2CFC4B81B519B820",
+            "cex-mf-parallel-1e5fbd813bda945d383d",
+            "qa_graph_context",
+            "qa_graph_context",
+            "qa_graph_context",
+            10,
+        ),
+        (
+            "AC-CONTRACT-LINE-BYPASS-7D856ECDAB165BE2",
+            "AC-CONTRACT-LINE-BYPASS-2CFC4B81B519B820",
+            "cex-mf-parallel-1e5fbd813bda945d383d",
+            "observer_integration",
+            "observer_integration",
+            "observer_reconcile",
+            19,
+        ),
+    ],
+)
+def test_historical_operator_supersession_is_exact_and_no_pass(
+    diagnostic_backlog_id,
+    source_backlog_id,
+    contract_execution_id,
+    stage_id,
+    bypass_identity_stage_id,
+    line_id,
+    execution_state_revision,
+):
+    bypass_identity = (
+        f"bypass:{contract_execution_id}:revision-{execution_state_revision}:"
+        f"{bypass_identity_stage_id}:{line_id}"
+    )
+    completed_lines = [
+        {
+            "actor_role": "observer",
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "evidence_kind": "contract_line_bypass",
+            "status": "waived",
+            "no_pass_claim": True,
+            "payload": {
+                "schema_version": "contract_line_bypass.v1",
+                "source_backlog_id": source_backlog_id,
+                "diagnostic_backlog_id": diagnostic_backlog_id,
+                "bypass_identity": bypass_identity,
+                "execution_state_revision": execution_state_revision,
+                "disposition": "proceeded_with_exception",
+                "no_pass_claim": True,
+            },
+        }
+    ]
+    immutable_evidence = json.loads(json.dumps(completed_lines))
+    record = {
+        "backlog_id": source_backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "contract_id": "mf_parallel.v2",
+        "execution_state_revision": execution_state_revision,
+        "completed_lines": completed_lines,
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": stage_id,
+                "line_id": line_id,
+            }
+        },
+    }
+
+    terminal = _audited_bypass_terminal_disposition(record)
+
+    assert completed_lines == immutable_evidence
+    assert terminal["schema_version"] == (
+        "contract_runtime.historical_audited_bypass_supersession.v1"
+    )
+    assert terminal["status"] == "WAIVED"
+    assert terminal["readiness_state"] == "completed_with_exception"
+    assert terminal["terminal_basis"] == "historical_operator_supersession"
+    assert terminal["no_pass_claim"] is True
+    for field in (
+        "scheduler_eligible",
+        "current_eligible",
+        "close_eligible",
+        "resume_eligible",
+    ):
+        assert terminal[field] is False
+    provenance = terminal["historical_operator_supersession"]
+    assert provenance["operator_authorized"] is True
+    assert provenance["immutable_source_evidence"] is True
+    assert provenance["source_evidence_mutated"] is False
+    assert provenance["current_generation_barrier_satisfied"] is False
+    assert provenance["authoritative_pass_synthesized"] is False
+    assert provenance["qa_pass_claimed"] is False
+    assert provenance["merge_pass_claimed"] is False
+    assert provenance["reconcile_pass_claimed"] is False
+    assert provenance["matched_bindings"] == [
+        {
+            "diagnostic_backlog_id": diagnostic_backlog_id,
+            "source_backlog_id": source_backlog_id,
+            "source_contract_execution_id": contract_execution_id,
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "completed_line_index": 0,
+            "bypass_identity": bypass_identity,
+        }
+    ]
+    projected = _project_record_state(record)
+    assert projected["current_contract_execution_id"] == ""
+    assert projected["readiness_state"] == "completed_with_exception"
+    assert projected["next_legal_action"] == {}
+    assert projected["terminal_disposition"] == terminal
+
+
+def test_historical_operator_supersession_rejects_unrelated_execution():
+    source_backlog_id = (
+        "AC-META-CONTRACT-PRINCIPAL-QA-TOKEN-FALSE-ROLE-R1-20260722"
+    )
+    contract_execution_id = "cex-mf-parallel-e08d916b06ecab610295"
+    line = {
+        "actor_role": "observer",
+        "stage_id": "observer_integration",
+        "line_id": "observer_reconcile",
+        "evidence_kind": "contract_line_bypass",
+        "status": "waived",
+        "no_pass_claim": True,
+        "payload": {
+            "schema_version": "contract_line_bypass.v1",
+            "source_backlog_id": source_backlog_id,
+            "diagnostic_backlog_id": "AC-CONTRACT-LINE-BYPASS-1DBCE496EE79FCC7",
+            "bypass_identity": (
+                "bypass:cex-mf-parallel-e08d916b06ecab610295:"
+                "revision-13:observer_integration:observer_reconcile"
+            ),
+            "execution_state_revision": 13,
+            "disposition": "proceeded_with_exception",
+            "no_pass_claim": True,
+        },
+    }
+    record = {
+        "backlog_id": source_backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "completed_lines": [line],
+    }
+
+    assert _audited_bypass_terminal_disposition(record) == {}
+    line["payload"]["diagnostic_backlog_id"] = (
+        "AC-CONTRACT-LINE-BYPASS-7D856ECDAB165BE2"
+    )
+    assert _audited_bypass_terminal_disposition(record) == {}
 
 
 def test_runtime_current_guide_exposes_strict_line_bypass_row_binding(tmp_path):
@@ -1489,6 +2042,14 @@ def test_runtime_current_guide_exposes_strict_line_bypass_row_binding(tmp_path):
     assert generic["allowed_as"] == "evidence_ref_only"
     assert generic["allowed_as_diagnostic_backlog_id"] is False
     assert bypass["invariants"]["no_pass_claim"] is True
+    assert bypass["invariants"]["source_generation_terminal_after_barrier"] is True
+    assert bypass["invariants"]["pre_barrier_forward_integration_required"] is True
+    assert bypass["invariants"]["post_barrier_scheduler_eligible"] is False
+    assert bypass["invariants"]["post_barrier_current_eligible"] is False
+    assert bypass["invariants"]["post_barrier_close_eligible"] is False
+    assert bypass["invariants"]["post_barrier_resume_eligible"] is False
+    assert bypass["invariants"]["source_backlog_mutated_by_bypass"] is False
+    assert bypass["invariants"]["repair_requires_separate_backlog_row"] is True
     assert bypass["invariants"]["strict_line_validation_unchanged"] is True
     assert bypass["invariants"]["bypass_acceptance_logic_unchanged"] is True
 
