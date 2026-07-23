@@ -41458,6 +41458,149 @@ def test_mf_parallel_close_authority_honors_exact_formal_no_pass_bypasses(
     assert close_exception["caller_bypass_commit_fields_ignored"] is True
 
 
+def test_mf_parallel_close_authority_honors_missing_finish_and_reconcile_bypasses(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-MF-PARALLEL-MISSING-FINISH-RECONCILE-BYPASS"
+    worktree = tmp_path / "missing-finish-reconcile-bypass"
+    worker_commit = _init_test_git_repo(worktree)
+    close_commit = worker_commit
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: worktree,
+    )
+    fixture = _start_completed_source_backed_mf_parallel_close_authority_chain(
+        conn,
+        backlog_id=backlog_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        route_label="missing-finish-reconcile-bypass",
+        worktree_path=str(worktree),
+    )
+    record = json.loads(json.dumps(fixture["completed"]))
+    lines = record["completed_lines"]
+    finish_index = next(
+        index
+        for index, line in enumerate(lines)
+        if line["line_id"] == "worker_finish_gate"
+    )
+    lines[finish_index] = _record_formal_no_pass_close_bypass(
+        conn,
+        record=record,
+        line_id="worker_finish_gate",
+        diagnostic_id="AC-CONTRACT-LINE-BYPASS-MISSING-WORKER-FINISH",
+        revision=24,
+    )
+    reconcile_index = next(
+        index
+        for index, line in enumerate(lines)
+        if line["line_id"] == "observer_reconcile"
+    )
+    lines[reconcile_index] = _record_formal_no_pass_close_bypass(
+        conn,
+        record=record,
+        line_id="observer_reconcile",
+        diagnostic_id="AC-CONTRACT-LINE-BYPASS-MISSING-RECONCILE",
+        revision=28,
+    )
+    record["runtime_guide"]["completed_lines"] = lines
+    authority_record = server._contract_runtime_bind_close_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+
+    def close_gate(candidate: dict) -> dict:
+        return server._contract_runtime_mf_parallel_close_authority_gate(
+            [candidate],
+            chain_projection=_mf_parallel_close_authority_chain_projection(
+                record["contract_execution_id"]
+            ),
+            close_commit=close_commit,
+            conn=conn,
+            project_id=PID,
+        )
+
+    gate = close_gate(authority_record)
+    assert gate["passed"] is True, {
+        "missing": gate["missing_requirement_ids"],
+        "checks": gate["checks"],
+        "exceptions": gate["formal_no_pass_bypass_exceptions"],
+        "lineage": gate["server_post_qa_lineage_diagnostics"],
+        "reconcile": gate["reconcile_close_diagnostic"],
+        "rejected": gate["rejected_evidence_by_requirement"],
+    }
+    assert gate["checks"]["worker_finish_business_line_passed"] is False
+    assert gate["checks"]["observer_reconcile_business_line_passed"] is False
+    assert gate["checks"]["observer_close_ready_business_line_passed"] is True
+    assert gate["checks"]["formal_worker_finish_commit_bypass_verified"] is True
+    assert gate["checks"]["formal_observer_reconcile_bypass_verified"] is True
+    assert gate["checks"]["formal_bypass_synthesized_pass"] is False
+    assert "worker_finish_gate" not in gate["line_sources"]
+    assert "observer_reconcile" not in gate["line_sources"]
+    assert {
+        item["exception_scope"]
+        for item in gate["formal_no_pass_bypass_exceptions"]
+    } == {
+        "worker_finish_exact_worker_commit",
+        "observer_reconcile_current_full_commit",
+    }
+    assert all(
+        item["no_pass_claim"] is True
+        and item["bypassed_business_line_passed"] is False
+        and item["bypass_used_as_business_line"] is False
+        for item in gate["formal_no_pass_bypass_exceptions"]
+    )
+    diagnostic_statuses = {
+        row["bug_id"]: row["status"]
+        for row in conn.execute(
+            "SELECT bug_id, status FROM backlog_bugs "
+            "WHERE bug_id IN (?, ?)",
+            (
+                "AC-CONTRACT-LINE-BYPASS-MISSING-WORKER-FINISH",
+                "AC-CONTRACT-LINE-BYPASS-MISSING-RECONCILE",
+            ),
+        ).fetchall()
+    }
+    assert set(diagnostic_statuses.values()) == {"OPEN"}
+
+    for field, value in (
+        ("task_id", "worker-cross-scope"),
+        ("merged_commit_sha", "f" * 40),
+        ("canonical_head_commit", "e" * 40),
+        ("reconciled_commit_sha", "d" * 40),
+    ):
+        rejected = json.loads(json.dumps(authority_record))
+        for rejected_lines in (
+            rejected["completed_lines"],
+            rejected["runtime_guide"]["completed_lines"],
+        ):
+            rejected_reconcile = next(
+                line
+                for line in rejected_lines
+                if line["line_id"] == "observer_reconcile"
+            )
+            rejected_authority = rejected_reconcile["payload"][
+                "reconcile_authority"
+            ]
+            rejected_authority[field] = value
+            rejected_authority["authority_hash"] = server.stable_sha256(
+                {
+                    key: item
+                    for key, item in rejected_authority.items()
+                    if key != "authority_hash"
+                }
+            )
+        rejected_gate = close_gate(rejected)
+        assert rejected_gate["passed"] is False, field
+        assert rejected_gate["checks"][
+            "formal_observer_reconcile_bypass_verified"
+        ] is False
+
+
 def test_formal_no_pass_close_bypass_rejects_caller_commit_without_server_lineage(
     conn,
 ):
@@ -64302,6 +64445,105 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     assert trusted_no_pass_projection["authority_verified"] is True
     assert trusted_no_pass_projection["no_pass_claim"] is True
     assert trusted_no_pass_projection["queue_item_id"] == queue_item_id
+    overlay_compat_record = json.loads(json.dumps(record))
+    overlay_compat_graph = overlay_compat_record["completed_lines"][9]
+    overlay_compat_graph["payload"].pop("exact_candidate")
+    overlay_compat_graph["payload"].pop("candidate_new_graph_failures")
+    overlay_graph_evidence = overlay_compat_graph["payload"][
+        "graph_trace_evidence"
+    ]
+    overlay_graph_evidence["graph_basis"] = (
+        "canonical_base_plus_candidate_diff"
+    )
+    overlay_graph_evidence["base_commit_sha"] = (
+        overlay_compat_record["completed_lines"][10]["artifact_refs"][
+            "external_no_pass_baseline_ledger"
+        ]["base_commit_sha"]
+    )
+    for compatibility_only_field in (
+        "comparison_base_commit_sha",
+        "comparison_base_commit_source",
+        "graph_snapshot_base_commit_sha",
+    ):
+        overlay_graph_evidence.pop(compatibility_only_field, None)
+    overlay_compat_record.setdefault("runtime_guide", {})[
+        "completed_lines"
+    ] = json.loads(
+        json.dumps(overlay_compat_record["completed_lines"])
+    )
+    assert not server._contract_runtime_candidate_scoped_no_pass_line(
+        overlay_compat_graph
+    )
+    assert overlay_graph_evidence["graph_basis"] == (
+        "canonical_base_plus_candidate_diff"
+    )
+    assert server._contract_runtime_authenticated_qa_provenance(
+        overlay_compat_graph
+    ) is True
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        overlay_compat_record["completed_lines"][10],
+        record=overlay_compat_record,
+    ) is True
+    assert server._contract_runtime_server_derived_observer_merge_no_pass_line(
+        overlay_compat_record["completed_lines"][11]
+    ) is True
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        overlay_compat_graph,
+        record=overlay_compat_record,
+    ) is True
+
+    overlay_candidate_new = json.loads(json.dumps(overlay_compat_record))
+    overlay_candidate_new["completed_lines"][9]["payload"][
+        "candidate_new_graph_failures"
+    ] = 1
+    overlay_candidate_new.setdefault("runtime_guide", {})[
+        "completed_lines"
+    ] = json.loads(
+        json.dumps(overlay_candidate_new["completed_lines"])
+    )
+    assert not server._contract_runtime_candidate_scoped_no_pass_line(
+        overlay_candidate_new["completed_lines"][9],
+        record=overlay_candidate_new,
+    )
+    overlay_cross_commit = json.loads(json.dumps(overlay_compat_record))
+    overlay_cross_commit["completed_lines"][9]["payload"][
+        "graph_trace_evidence"
+    ]["candidate_commit_sha"] = "f" * 40
+    overlay_cross_commit.setdefault("runtime_guide", {})[
+        "completed_lines"
+    ] = json.loads(
+        json.dumps(overlay_cross_commit["completed_lines"])
+    )
+    assert not server._contract_runtime_candidate_scoped_no_pass_line(
+        overlay_cross_commit["completed_lines"][9],
+        record=overlay_cross_commit,
+    )
+    overlay_without_ledger = json.loads(json.dumps(overlay_compat_record))
+    overlay_without_ledger["completed_lines"][10]["artifact_refs"].pop(
+        "external_no_pass_baseline_ledger"
+    )
+    overlay_without_ledger.setdefault("runtime_guide", {})[
+        "completed_lines"
+    ] = json.loads(
+        json.dumps(overlay_without_ledger["completed_lines"])
+    )
+    assert not server._contract_runtime_candidate_scoped_no_pass_line(
+        overlay_without_ledger["completed_lines"][9],
+        record=overlay_without_ledger,
+    )
+    overlay_without_durable_merge = json.loads(json.dumps(overlay_compat_record))
+    overlay_without_durable_merge["completed_lines"][11]["payload"].pop(
+        "durable_merge_authority"
+    )
+    overlay_without_durable_merge.setdefault("runtime_guide", {})[
+        "completed_lines"
+    ] = json.loads(
+        json.dumps(overlay_without_durable_merge["completed_lines"])
+    )
+    assert not server._contract_runtime_candidate_scoped_no_pass_line(
+        overlay_without_durable_merge["completed_lines"][9],
+        record=overlay_without_durable_merge,
+    )
     legacy_qa_graph = json.loads(
         json.dumps(record["completed_lines"][9])
     )
