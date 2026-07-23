@@ -4968,18 +4968,28 @@ def test_current_full_reconcile_idempotent_replay_repairs_epoch_projection(
         replay["merge_queue_graph_epoch_auto_record"]["integration_epoch"][
             "status"
         ]
-        == parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILED
+        == parallel_branch_runtime.INTEGRATION_EPOCH_CLOSED
     )
-    reconciled = parallel_branch_runtime.get_active_integration_epoch(
+    assert (
+        replay["merge_queue_graph_epoch_auto_record"][
+            "integration_epoch_barrier"
+        ]
+        == "satisfied_and_closed"
+    )
+    active_epoch = parallel_branch_runtime.get_active_integration_epoch(
         conn,
         PID,
         merge_queue_id=merge_queue_id,
     )
-    assert reconciled is not None
-    assert reconciled.status == (
-        parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILED
+    assert active_epoch is None
+    closed_epoch = parallel_branch_runtime.get_integration_epoch(
+        conn,
+        PID,
+        "batch-current-full-epoch-idempotent-replay",
     )
-    assert reconciled.snapshot_id == "full-current"
+    assert closed_epoch is not None
+    assert closed_epoch.status == parallel_branch_runtime.INTEGRATION_EPOCH_CLOSED
+    assert closed_epoch.snapshot_id == "full-current"
     assert len(calls) == 1
     assert conn.execute(
         """
@@ -5137,16 +5147,20 @@ def test_current_full_reconcile_terminal_replay_repairs_epoch_after_head_advance
         ]
         is True
     )
-    reconciled = parallel_branch_runtime.get_active_integration_epoch(
+    active_epoch = parallel_branch_runtime.get_active_integration_epoch(
         conn,
         PID,
         merge_queue_id=merge_queue_id,
     )
-    assert reconciled is not None
-    assert reconciled.status == (
-        parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILED
+    assert active_epoch is None
+    closed_epoch = parallel_branch_runtime.get_integration_epoch(
+        conn,
+        PID,
+        "batch-current-full-epoch-advanced-head-replay",
     )
-    assert reconciled.snapshot_id == first["snapshot_id"]
+    assert closed_epoch is not None
+    assert closed_epoch.status == parallel_branch_runtime.INTEGRATION_EPOCH_CLOSED
+    assert closed_epoch.snapshot_id == first["snapshot_id"]
     assert len(calls) == 1
     assert conn.execute(
         """
@@ -50976,9 +50990,9 @@ def test_release_operator_head_queue_preserves_reconciled_epoch_member_positions
         "active_integration_epoch_position_non_skippable"
     )
     assert skip_refusal["next_legal_action"]["id"] == (
-        "close_reconciled_child_rows"
+        "finalize_reconciled_batch_epoch"
     )
-    assert skip_refusal["next_legal_action"]["backlog_id"] == child_a
+    assert skip_refusal["next_legal_action"]["backlog_id"] == coordination
     assert set(skip_refusal["protected_backlog_ids"]) == {
         child_a,
         child_b,
@@ -77229,7 +77243,7 @@ def test_mf_parallel_enter_allows_open_epoch_canonical_planned_successor(conn):
         ),
     ],
 )
-def test_coordination_close_rejects_child_fixed_before_canonical_epoch_barrier(
+def test_coordination_close_does_not_use_child_status_to_release_epoch(
     conn,
     monkeypatch,
     invalid_child_commit,
@@ -77347,25 +77361,24 @@ def test_coordination_close_rejects_child_fixed_before_canonical_epoch_barrier(
         ),
     )
 
-    with pytest.raises(GovernanceError) as exc:
-        server.handle_backlog_close(
-            _ctx(
-                {"project_id": PID, "bug_id": coordination},
-                method="POST",
-                body={"actor": "observer", "commit": "epoch-final-head"},
-            )
+    closed = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": coordination},
+            method="POST",
+            body={"actor": "observer", "commit": "epoch-final-head"},
         )
+    )
 
-    assert exc.value.code == "integration_epoch_atomic_child_close_not_ready"
-    assert exc.value.status == 409
-    assert exc.value.details[expected_detail_key] == [child_a]
-    assert exc.value.details["required_child_commit"] == epoch.current_head
-    assert exc.value.details["reconcile_barrier_at"] == epoch.updated_at
-    assert exc.value.details["epoch_remains_active"] is True
+    assert closed["ok"] is True
+    assert closed["integration_epoch_close_gate"][
+        "backlog_close_independent_of_epoch_release"
+    ] is True
+    assert closed["integration_epoch_close_gate"]["release_epoch"] is False
+    assert closed["child_close_preserved_epoch_freeze"] is True
     parent_row = conn.execute(
         "SELECT status FROM backlog_bugs WHERE bug_id = ?", (coordination,)
     ).fetchone()
-    assert parent_row["status"] == "MF_IN_PROGRESS"
+    assert parent_row["status"] == "FIXED"
     active_epoch = parallel_branch_runtime.get_active_integration_epoch(
         conn, PID, merge_queue_id=queue_id
     )

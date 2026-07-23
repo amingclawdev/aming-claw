@@ -33,6 +33,7 @@ from agent.governance.parallel_branch_runtime import (
     MergeQueueItem,
     IntegrationEpoch,
     IntegrationEpochFrozenError,
+    INTEGRATION_EPOCH_CLOSED,
     INTEGRATION_EPOCH_MERGE_IN_DOUBT,
     INTEGRATION_EPOCH_RECONCILED,
     advance_integration_epoch_after_merge,
@@ -45,6 +46,7 @@ from agent.governance.parallel_branch_runtime import (
     decide_persisted_merge_queue,
     execute_merge_queue_item,
     get_active_integration_epoch,
+    get_integration_epoch,
     get_branch_context,
     git_merge_preview_evidence,
     integration_epoch_resume_payload,
@@ -1730,6 +1732,13 @@ def test_final_reconcile_accepts_active_snapshot_when_semantic_projection_is_ski
         merge_commit="final-head",
     )
     assert epoch.status == pbr.INTEGRATION_EPOCH_RECONCILE_PENDING
+    conn.execute(
+        "CREATE TABLE backlog_bugs (bug_id TEXT PRIMARY KEY, status TEXT NOT NULL)"
+    )
+    conn.executemany(
+        "INSERT INTO backlog_bugs (bug_id, status) VALUES (?, 'OPEN')",
+        [("AC-BATCH-PARENT",), ("AC-BATCH-ONLY",)],
+    )
 
     candidate_only = record_merge_queue_graph_epoch_after_reconcile(
         conn,
@@ -1762,26 +1771,24 @@ def test_final_reconcile_accepts_active_snapshot_when_semantic_projection_is_ski
     )
     assert recorded["semantic_projection_optional"] is True
     assert recorded["projection_status"] == "skipped"
-    assert recorded["integration_epoch"]["status"] == INTEGRATION_EPOCH_RECONCILED
+    assert recorded["integration_epoch"]["status"] == INTEGRATION_EPOCH_CLOSED
+    assert recorded["integration_epoch_barrier"] == "satisfied_and_closed"
+    assert recorded["batch_closed_atomically"] is True
     reconciled = get_active_integration_epoch(
         conn, PROJECT_ID, merge_queue_id=queue_id
     )
-    assert reconciled is not None
-    assert reconciled.snapshot_id == "full-final-head"
-    assert reconciled.projection_id == ""
-    assert integration_epoch_resume_payload(conn, reconciled)["id"] == (
-        "close_reconciled_child_rows"
+    assert reconciled is None
+    persisted = get_integration_epoch(conn, PROJECT_ID, batch_id)
+    assert persisted is not None
+    assert persisted.snapshot_id == "full-final-head"
+    assert persisted.projection_id == ""
+    statuses = dict(
+        conn.execute("SELECT bug_id, status FROM backlog_bugs").fetchall()
     )
-    conn.execute(
-        "CREATE TABLE backlog_bugs (bug_id TEXT PRIMARY KEY, status TEXT NOT NULL)"
-    )
-    conn.execute(
-        "INSERT INTO backlog_bugs (bug_id, status) VALUES (?, ?)",
-        ("AC-BATCH-ONLY", "FIXED"),
-    )
-    assert integration_epoch_resume_payload(conn, reconciled)["id"] == (
-        "close_batch_atomically"
-    )
+    assert statuses == {
+        "AC-BATCH-PARENT": "OPEN",
+        "AC-BATCH-ONLY": "OPEN",
+    }
 
 
 def test_child_close_waits_for_final_barrier_and_never_releases_epoch() -> None:
@@ -1842,9 +1849,11 @@ def test_child_close_waits_for_final_barrier_and_never_releases_epoch() -> None:
         backlog_scope="coordination",
         target_head_commit="final-head",
     )
-    assert parent_gate["release_epoch"] is True
-    # A failed parent close after validation is still read-only and cannot
-    # release the epoch; only the atomic close write below does so.
+    assert parent_gate["release_epoch"] is False
+    assert parent_gate["preserve_epoch_freeze"] is True
+    assert parent_gate["backlog_close_independent_of_epoch_release"] is True
+    # Backlog close validation is read-only and cannot release the epoch; only
+    # the activated terminal full-reconcile projection owns atomic release.
     assert get_active_integration_epoch(
         conn, PROJECT_ID, target_ref=TARGET_REF
     ) is not None

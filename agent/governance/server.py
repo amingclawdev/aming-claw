@@ -99048,7 +99048,6 @@ def handle_backlog_close(ctx: RequestContext):
         from .parallel_branch_runtime import (
             INTEGRATION_EPOCH_RECONCILED,
             IntegrationEpochFrozenError,
-            integration_epoch_child_backlog_ids,
             integration_epoch_to_dict,
             resolve_active_integration_epoch_for_backlog,
             validate_integration_epoch_backlog_close,
@@ -99056,11 +99055,6 @@ def handle_backlog_close(ctx: RequestContext):
 
         resolved_integration_epoch, integration_backlog_scope = (
             resolve_active_integration_epoch_for_backlog(conn, pid, bug_id)
-        )
-        integration_batch_id = (
-            resolved_integration_epoch.batch_id
-            if resolved_integration_epoch is not None
-            else ""
         )
         integration_epoch_close_gate: dict[str, Any] = {}
         if resolved_integration_epoch is not None:
@@ -99082,117 +99076,6 @@ def handle_backlog_close(ctx: RequestContext):
                         "backlog_scope": integration_backlog_scope,
                     },
                 ) from exc
-        integration_epoch_close = (
-            resolved_integration_epoch
-            if integration_backlog_scope == "coordination"
-            else None
-        )
-        integration_child_backlog_ids: tuple[str, ...] = ()
-        if integration_epoch_close is not None:
-            integration_child_backlog_ids = integration_epoch_child_backlog_ids(
-                conn, integration_epoch_close
-            )
-            if integration_child_backlog_ids:
-                placeholders = ",".join("?" for _ in integration_child_backlog_ids)
-                child_rows = conn.execute(
-                    f"""
-                    SELECT bug_id, status, "commit", fixed_at
-                    FROM backlog_bugs
-                    WHERE bug_id IN ({placeholders})
-                    """,
-                    integration_child_backlog_ids,
-                ).fetchall()
-                child_states = {
-                    str(child_row["bug_id"] or ""): {
-                        "status": str(child_row["status"] or ""),
-                        "commit": str(child_row["commit"] or ""),
-                        "fixed_at": str(child_row["fixed_at"] or ""),
-                    }
-                    for child_row in child_rows
-                }
-                child_statuses = {
-                    child_id: state["status"]
-                    for child_id, state in child_states.items()
-                }
-                missing_children = [
-                    child_id
-                    for child_id in integration_child_backlog_ids
-                    if child_id not in child_states
-                ]
-                invalid_status_children = [
-                    child_id
-                    for child_id in integration_child_backlog_ids
-                    if (child_states.get(child_id) or {}).get("status") != "FIXED"
-                ]
-                stale_commit_children = [
-                    child_id
-                    for child_id in integration_child_backlog_ids
-                    if (child_states.get(child_id) or {}).get("commit")
-                    != integration_epoch_close.current_head
-                ]
-                reconcile_barrier_at = integration_epoch_close.updated_at
-                reconcile_barrier_order = (
-                    _contract_runtime_close_authority_time_order_value(
-                        reconcile_barrier_at
-                    )
-                )
-                stale_fixed_at_children = []
-                for child_id in integration_child_backlog_ids:
-                    fixed_at = (child_states.get(child_id) or {}).get(
-                        "fixed_at", ""
-                    )
-                    fixed_at_order = (
-                        _contract_runtime_close_authority_time_order_value(
-                            fixed_at
-                        )
-                    )
-                    if (
-                        reconcile_barrier_order is None
-                        or fixed_at_order is None
-                        or fixed_at_order < reconcile_barrier_order
-                    ):
-                        stale_fixed_at_children.append(child_id)
-                invalid_children = list(
-                    dict.fromkeys(
-                        [
-                            *invalid_status_children,
-                            *stale_commit_children,
-                            *stale_fixed_at_children,
-                        ]
-                    )
-                )
-                if invalid_children or missing_children:
-                    raise GovernanceError(
-                        "integration_epoch_atomic_child_close_not_ready",
-                        (
-                            "coordination close requires every child to have passed "
-                            "its own protected close route at the canonical epoch "
-                            "head after the final reconcile barrier"
-                        ),
-                        409,
-                        {
-                            "invalid_child_backlog_ids": invalid_children,
-                            "missing_child_backlog_ids": missing_children,
-                            "child_statuses": child_statuses,
-                            "child_states": child_states,
-                            "invalid_status_child_backlog_ids": (
-                                invalid_status_children
-                            ),
-                            "stale_commit_child_backlog_ids": (
-                                stale_commit_children
-                            ),
-                            "stale_fixed_at_child_backlog_ids": (
-                                stale_fixed_at_children
-                            ),
-                            "required_child_commit": (
-                                integration_epoch_close.current_head
-                            ),
-                            "reconcile_barrier_at": reconcile_barrier_at,
-                            "bulk_child_status_mutation_forbidden": True,
-                            "epoch_remains_active": True,
-                        },
-                    )
-
         # Determine chain_stage based on prior status
         chain_stage = "manual-fix" if prior_status == "MF_IN_PROGRESS" else None
 
@@ -99229,19 +99112,6 @@ def handle_backlog_close(ctx: RequestContext):
             },
             runtime_state="fixed",
         )
-        if (
-            integration_epoch_close is not None
-            and integration_backlog_scope == "coordination"
-        ):
-            from .parallel_branch_runtime import close_integration_epoch
-
-            integration_epoch_close = close_integration_epoch(
-                conn,
-                project_id=pid,
-                batch_id=integration_batch_id,
-                target_head_commit=commit_sha,
-                now_iso=now,
-            )
         _publish_current_task_changed(
             pid,
             backlog_id=bug_id,
@@ -99277,7 +99147,7 @@ def handle_backlog_close(ctx: RequestContext):
             result["hotfix_audit_event"] = hotfix_audit_event
         if close_impact_check:
             result["close_impact_check"] = close_impact_check
-        response_epoch = integration_epoch_close or resolved_integration_epoch
+        response_epoch = resolved_integration_epoch
         if response_epoch is not None:
             from .parallel_branch_runtime import integration_epoch_to_dict
 
@@ -99287,7 +99157,7 @@ def handle_backlog_close(ctx: RequestContext):
             result["integration_backlog_scope"] = integration_backlog_scope
             result["integration_epoch_close_gate"] = integration_epoch_close_gate
             result["child_close_preserved_epoch_freeze"] = (
-                integration_backlog_scope == "child"
+                bool(integration_epoch_close_gate.get("preserve_epoch_freeze"))
             )
         return result
     finally:

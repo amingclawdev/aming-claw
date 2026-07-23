@@ -325,12 +325,7 @@ def integration_epoch_resume_projection(
     elif status == "reconcile_pending":
         action_id = "final_batch_reconcile"
     else:
-        pending_children = epoch.get("pending_child_backlog_ids")
-        action_id = (
-            "close_reconciled_child_rows"
-            if isinstance(pending_children, (list, tuple)) and pending_children
-            else "close_batch_atomically"
-        )
+        action_id = "finalize_reconciled_batch_epoch"
     return {
         "schema_version": INTEGRATION_EPOCH_RESUME_SCHEMA_VERSION,
         "next_legal_action": {
@@ -346,6 +341,13 @@ def integration_epoch_resume_projection(
             "task_id": str(epoch.get("active_task_id") or ""),
             "backlog_id": str(epoch.get("active_backlog_id") or ""),
             "checkpoint_id": str(epoch.get("active_checkpoint_id") or ""),
+            "required_tool": (
+                "graph_current_full_reconcile"
+                if status == "reconciled"
+                else ""
+            ),
+            "idempotent_replay_required": status == "reconciled",
+            "backlog_close_required_for_epoch_release": False,
             "position_skippable": False,
             "target_ref_frozen": True,
         },

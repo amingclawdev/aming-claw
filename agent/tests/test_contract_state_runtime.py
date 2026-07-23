@@ -5170,9 +5170,18 @@ def test_active_integration_epoch_projects_non_skippable_resume_before_contract_
         }
     )
     assert child_close["next_legal_action"]["id"] == (
-        "close_reconciled_child_rows"
+        "finalize_reconciled_batch_epoch"
+    )
+    assert child_close["next_legal_action"]["idempotent_replay_required"] is True
+    assert (
+        child_close["next_legal_action"][
+            "backlog_close_required_for_epoch_release"
+        ]
+        is False
     )
     atomic_close = contract_state_runtime.integration_epoch_resume_projection(
         {"status": "reconciled", "pending_child_backlog_ids": []}
     )
-    assert atomic_close["next_legal_action"]["id"] == "close_batch_atomically"
+    assert atomic_close["next_legal_action"]["id"] == (
+        "finalize_reconciled_batch_epoch"
+    )

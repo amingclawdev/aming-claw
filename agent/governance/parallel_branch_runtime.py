@@ -10253,7 +10253,7 @@ def integration_epoch_to_dict(epoch: IntegrationEpoch) -> dict[str, Any]:
             "final_batch_reconcile"
             if epoch.status == INTEGRATION_EPOCH_RECONCILE_PENDING
             else (
-                "close_batch_atomically"
+                "finalize_reconciled_batch_epoch"
                 if epoch.status == INTEGRATION_EPOCH_RECONCILED
                 else "none"
             )
@@ -12061,6 +12061,14 @@ def record_merge_queue_graph_epoch_after_reconcile(
             merge_queue_id=queue_id,
             now_iso=now,
         )
+        if epoch is not None and epoch.status == INTEGRATION_EPOCH_RECONCILED:
+            epoch = close_integration_epoch(
+                conn,
+                project_id=project,
+                batch_id=epoch.batch_id,
+                target_head_commit=target,
+                now_iso=now,
+            )
         result["integration_epoch_reconcile_recording"] = "completed"
     else:
         epoch = get_active_integration_epoch(
@@ -12074,12 +12082,21 @@ def record_merge_queue_graph_epoch_after_reconcile(
     result["integration_epoch"] = (
         integration_epoch_to_dict(epoch) if epoch is not None else None
     )
-    if epoch is not None and epoch.status == INTEGRATION_EPOCH_RECONCILED:
+    if epoch is not None and epoch.status in {
+        INTEGRATION_EPOCH_RECONCILED,
+        INTEGRATION_EPOCH_CLOSED,
+    }:
         if activation_completed:
             result["status"] = "recorded"
             result["epoch_projection_recorded"] = True
             result.pop("skipped_reason", None)
-        result["integration_epoch_barrier"] = "reconciled_frozen_until_atomic_close"
+        if epoch.status == INTEGRATION_EPOCH_CLOSED:
+            result["integration_epoch_barrier"] = "satisfied_and_closed"
+            result["batch_closed_atomically"] = True
+        else:
+            result["integration_epoch_barrier"] = (
+                "reconciled_frozen_until_atomic_close"
+            )
     return result
 
 
@@ -12672,7 +12689,7 @@ def validate_integration_epoch_backlog_close(
     backlog_scope: str,
     target_head_commit: str,
 ) -> dict[str, Any]:
-    """Validate child/coordination close without releasing the epoch."""
+    """Validate backlog close without using it to release the batch epoch."""
 
     scope = str(backlog_scope or "").strip()
     target = str(target_head_commit or "").strip()
@@ -12694,9 +12711,11 @@ def validate_integration_epoch_backlog_close(
         "batch_id": epoch.batch_id,
         "epoch_id": epoch.epoch_id,
         "target_head_commit": target,
-        "release_epoch": scope == "coordination",
-        "preserve_epoch_freeze": scope == "child",
+        "release_epoch": False,
+        "preserve_epoch_freeze": True,
         "child_protected_close_required": scope == "child",
+        "backlog_close_independent_of_epoch_release": True,
+        "epoch_release_source": "activated_terminal_full_reconcile_projection",
     }
 
 
@@ -12744,12 +12763,12 @@ def integration_epoch_resume_payload(
             for backlog_id in child_backlog_ids
             if child_statuses.get(backlog_id) != "FIXED"
         )
-        if pending_child_backlog_ids:
-            action_id = "close_reconciled_child_rows"
-            action_backlog_id = pending_child_backlog_ids[0]
-        else:
-            action_id = "close_batch_atomically"
-            action_backlog_id = epoch.coordination_backlog_id
+        # ``reconciled`` is a legacy/transient state. The activated terminal
+        # full-reconcile projection owns atomic epoch release; backlog status
+        # is observational and must never be mutated merely to unfreeze the
+        # integration unit.
+        action_id = "finalize_reconciled_batch_epoch"
+        action_backlog_id = epoch.coordination_backlog_id
     return {
         "schema_version": "mf_batch_parallel.integration_epoch_resume.v1",
         "id": action_id,
@@ -12770,6 +12789,17 @@ def integration_epoch_resume_payload(
         "reconcile_state": epoch.reconcile_state,
         "child_backlog_ids": list(child_backlog_ids),
         "pending_child_backlog_ids": list(pending_child_backlog_ids),
+        "pending_child_backlog_ids_observational_only": True,
+        "backlog_close_required_for_epoch_release": False,
+        "backlog_close_independent": True,
+        "required_tool": (
+            "graph_current_full_reconcile"
+            if epoch.status == INTEGRATION_EPOCH_RECONCILED
+            else ""
+        ),
+        "idempotent_replay_required": (
+            epoch.status == INTEGRATION_EPOCH_RECONCILED
+        ),
         "canonical_queue_item": merge_queue_item_to_dict(item) if item else None,
         "position_skippable": False,
         "target_ref_frozen": True,
