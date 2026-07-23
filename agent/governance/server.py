@@ -79318,6 +79318,100 @@ def _contract_runtime_close_authority_time_order_value(value: str) -> float | No
     return parsed.timestamp()
 
 
+def _contract_runtime_mf_parallel_reconcile_head_relationship(
+    authority: Mapping[str, Any],
+    *,
+    close_commit: str,
+) -> dict[str, Any]:
+    """验证历史 reconcile commit 与当前 descendant HEAD 的双重边界。"""
+
+    merged_commit = str(authority.get("merged_commit_sha") or "").strip()
+    reconciled_commit = str(
+        authority.get("reconciled_commit_sha") or ""
+    ).strip()
+    canonical_head = str(
+        authority.get("canonical_head_commit") or ""
+    ).strip()
+    current_canonical = str(
+        authority.get("current_canonical_commit_sha") or ""
+    ).strip()
+    active_snapshot_commit = str(
+        authority.get("active_snapshot_commit") or ""
+    ).strip()
+    reconcile_snapshot_commit = str(
+        authority.get("reconcile_snapshot_commit") or ""
+    ).strip()
+    close_matches_historical = bool(
+        _contract_runtime_authority_commit_matches(
+            close_commit,
+            merged_commit,
+        )
+        and _contract_runtime_authority_commit_matches(
+            close_commit,
+            reconciled_commit,
+        )
+    )
+    exact_current_head = bool(
+        close_matches_historical
+        and _contract_runtime_authority_commit_matches(
+            close_commit,
+            canonical_head,
+        )
+    )
+    historical_descendant = bool(
+        close_matches_historical
+        and canonical_head
+        and not _contract_runtime_authority_commit_matches(
+            close_commit,
+            canonical_head,
+        )
+        and authority.get("canonical_head_verified") is True
+        and authority.get(
+            "reconciled_commit_is_ancestor_of_canonical_head"
+        )
+        is True
+        and authority.get("active_snapshot_matches_canonical_head") is True
+        and authority.get("active_snapshot_verified") is True
+        and authority.get("reconcile_snapshot_verified") is True
+        and _contract_runtime_authority_commit_matches(
+            canonical_head,
+            current_canonical,
+        )
+        and _contract_runtime_authority_commit_matches(
+            canonical_head,
+            active_snapshot_commit,
+        )
+        and _contract_runtime_authority_commit_matches(
+            reconciled_commit,
+            reconcile_snapshot_commit,
+        )
+    )
+    passed = bool(exact_current_head or historical_descendant)
+    return {
+        "schema_version": (
+            "contract_runtime.mf_parallel_reconcile_head_relationship.v1"
+        ),
+        "passed": passed,
+        "mode": (
+            "exact_current_head"
+            if exact_current_head
+            else "historical_reconcile_descendant_current_head"
+            if historical_descendant
+            else "rejected"
+        ),
+        "close_commit": close_commit,
+        "merged_commit_sha": merged_commit,
+        "reconciled_commit_sha": reconciled_commit,
+        "canonical_head_commit": canonical_head,
+        "current_canonical_commit_sha": current_canonical,
+        "active_snapshot_commit": active_snapshot_commit,
+        "reconcile_snapshot_commit": reconcile_snapshot_commit,
+        "close_matches_historical_reconcile": close_matches_historical,
+        "historical_reconcile_descendant_verified": historical_descendant,
+        "caller_commit_relationship_accepted": False,
+    }
+
+
 def _contract_runtime_mf_parallel_server_temporal_ordering_diagnostic(
     *,
     before: str,
@@ -80377,6 +80471,12 @@ def _contract_runtime_mf_parallel_close_authority_gate(
     reconciled_merged_commit = str(
         reconcile_authority.get("merged_commit_sha") or ""
     ).strip()
+    reconcile_head_relationship = (
+        _contract_runtime_mf_parallel_reconcile_head_relationship(
+            reconcile_authority,
+            close_commit=close_commit,
+        )
+    )
     reconcile_boundary_line = found.get("observer_close_ready", {}) or (
         formal_bypass_lines.get("observer_close_ready", {})
     )
@@ -80403,18 +80503,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         and reconciled_commit
         and canonical_reconcile_head
         and reconciled_merged_commit
-        and _contract_runtime_authority_commit_matches(
-            close_commit,
-            reconciled_commit,
-        )
-        and _contract_runtime_authority_commit_matches(
-            close_commit,
-            canonical_reconcile_head,
-        )
-        and _contract_runtime_authority_commit_matches(
-            close_commit,
-            reconciled_merged_commit,
-        )
+        and reconcile_head_relationship.get("passed") is True
     )
     if observer_reconcile_exception:
         missing = [
@@ -80440,7 +80529,9 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                 if key != "_line"
             },
             "exception_scope": "observer_reconcile_current_full_commit",
-            "server_derived_close_commit": canonical_reconcile_head,
+            "server_derived_close_commit": reconciled_commit,
+            "current_canonical_head_commit": canonical_reconcile_head,
+            "reconcile_head_relationship": reconcile_head_relationship,
             "normal_business_line_present": False,
             "bypass_used_as_business_line": False,
         })
@@ -80571,6 +80662,13 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             ),
             "formal_observer_reconcile_bypass_verified": (
                 observer_reconcile_exception
+            ),
+            "formal_observer_reconcile_historical_descendant_verified": bool(
+                observer_reconcile_exception
+                and reconcile_head_relationship.get(
+                    "historical_reconcile_descendant_verified"
+                )
+                is True
             ),
             "formal_observer_close_ready_bypass_verified": (
                 close_ready_commit_exception

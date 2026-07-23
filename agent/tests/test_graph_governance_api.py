@@ -41507,10 +41507,89 @@ def test_mf_parallel_close_authority_honors_missing_finish_and_reconcile_bypasse
         revision=28,
     )
     record["runtime_guide"]["completed_lines"] = lines
+
+    # 相关修复可以把 canonical HEAD 推进到已 reconcile commit 的后代；
+    # 父 row 的精确 reconcile provenance 仍须按原 event/commit 复用。
+    (worktree / "related-repair.txt").write_text(
+        "related close-authority repair\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "related-repair.txt"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "related close authority repair"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    repair_commit = batch_jobs.git_commit(worktree)
+    assert repair_commit != close_commit
+    _activate_basic_graph(
+        conn,
+        "full-missing-finish-reconcile-repair",
+        commit_sha=repair_commit,
+    )
+
     authority_record = server._contract_runtime_bind_close_reconcile_authority(
         conn,
         project_id=PID,
         record=record,
+    )
+
+    rebound_reconcile = next(
+        line
+        for line in authority_record["completed_lines"]
+        if line["line_id"] == "observer_reconcile"
+    )["payload"]["reconcile_authority"]
+    assert rebound_reconcile["merged_commit_sha"] == close_commit
+    assert rebound_reconcile["reconciled_commit_sha"] == close_commit
+    assert rebound_reconcile["canonical_head_commit"] == repair_commit
+    assert rebound_reconcile[
+        "reconciled_commit_is_ancestor_of_canonical_head"
+    ] is True
+    assert rebound_reconcile["active_snapshot_commit"] == repair_commit
+    assert rebound_reconcile[
+        "active_snapshot_matches_canonical_head"
+    ] is True
+
+    # close-ready precheck 只在内存加入 prospective line，不能预写 completed_lines。
+    prospective_record = json.loads(json.dumps(record))
+    prospective_lines = prospective_record["completed_lines"]
+    prospective_close_ready = next(
+        line
+        for line in prospective_lines
+        if line["line_id"] == "observer_close_ready"
+    )
+    prospective_record["completed_lines"] = [
+        line
+        for line in prospective_lines
+        if line["line_id"] != "observer_close_ready"
+    ]
+    prospective_record["runtime_guide"]["completed_lines"] = json.loads(
+        json.dumps(prospective_record["completed_lines"])
+    )
+    prospective_before = server.stable_sha256(prospective_record)
+    prospective_gate = server._contract_runtime_mf_parallel_close_ready_precheck(
+        prospective_record,
+        prospective_close_ready,
+        conn=conn,
+        project_id=PID,
+    )
+    assert prospective_gate["passed"] is True, {
+        "missing": prospective_gate["missing_requirement_ids"],
+        "checks": prospective_gate["checks"],
+        "exceptions": prospective_gate["formal_no_pass_bypass_exceptions"],
+        "reconcile": prospective_gate["reconcile_close_diagnostic"],
+        "lineage": prospective_gate["server_post_qa_lineage_diagnostics"],
+    }
+    assert server.stable_sha256(prospective_record) == prospective_before
+    assert not any(
+        line["line_id"] == "observer_close_ready"
+        for line in prospective_record["completed_lines"]
     )
 
     def close_gate(candidate: dict) -> dict:
@@ -41539,6 +41618,9 @@ def test_mf_parallel_close_authority_honors_missing_finish_and_reconcile_bypasse
     assert gate["checks"]["formal_worker_finish_commit_bypass_verified"] is True
     assert gate["checks"]["formal_observer_reconcile_bypass_verified"] is True
     assert gate["checks"]["formal_bypass_synthesized_pass"] is False
+    assert gate["checks"][
+        "formal_observer_reconcile_historical_descendant_verified"
+    ] is True
     assert "worker_finish_gate" not in gate["line_sources"]
     assert "observer_reconcile" not in gate["line_sources"]
     assert {
@@ -41572,6 +41654,8 @@ def test_mf_parallel_close_authority_honors_missing_finish_and_reconcile_bypasse
         ("merged_commit_sha", "f" * 40),
         ("canonical_head_commit", "e" * 40),
         ("reconciled_commit_sha", "d" * 40),
+        ("reconciled_commit_is_ancestor_of_canonical_head", False),
+        ("active_snapshot_matches_canonical_head", False),
     ):
         rejected = json.loads(json.dumps(authority_record))
         for rejected_lines in (
@@ -41599,6 +41683,20 @@ def test_mf_parallel_close_authority_honors_missing_finish_and_reconcile_bypasse
         assert rejected_gate["checks"][
             "formal_observer_reconcile_bypass_verified"
         ] is False
+
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'FIXED' WHERE bug_id = ?",
+        ("AC-CONTRACT-LINE-BYPASS-MISSING-RECONCILE",),
+    )
+    conn.commit()
+    closed_diagnostic_gate = close_gate(authority_record)
+    assert closed_diagnostic_gate["passed"] is False
+    assert closed_diagnostic_gate["checks"][
+        "formal_observer_reconcile_bypass_verified"
+    ] is False
+    assert closed_diagnostic_gate["checks"][
+        "formal_bypass_synthesized_pass"
+    ] is False
 
 
 def test_formal_no_pass_close_bypass_rejects_caller_commit_without_server_lineage(
