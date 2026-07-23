@@ -60669,9 +60669,13 @@ def _mf_parallel_worker_proof_payloads(
     worker_id = runtime_context.worker_id
     worker_slot_id = runtime_context.worker_slot_id or worker_id
     worker_session_id = f"session-{runtime_context.task_id}"
+    session_token_hash = str(
+        getattr(runtime_context, "session_token_hash", "") or ""
+    ).strip()
     session_token_ref = (
         runtime_context_session_token_ref(runtime_context)
-        or f"wstok-{runtime_context.task_id}"
+        if session_token_hash
+        else f"wstok-{runtime_context.task_id}"
     )
     fence_token_hash = _fake_sha(runtime_context.fence_token)
     changed_files = list(changed_files or ["agent/governance/server.py"])
