@@ -64620,6 +64620,95 @@ def _contract_runtime_candidate_scoped_no_pass_line(
             or graph_evidence.get("candidate_commit")
             or ""
         ).strip().lower()
+        explicit_candidate_scope = bool(
+            payload.get("candidate_new_graph_failures") == 0
+            and payload.get("exact_candidate") is True
+        )
+        canonical_overlay_round_verified = False
+        if (
+            not explicit_candidate_scope
+            and isinstance(record, Mapping)
+            and str(graph_evidence.get("graph_basis") or "").strip()
+            == "canonical_base_plus_candidate_diff"
+            and (
+                payload.get("candidate_new_graph_failures") is None
+                or payload.get("candidate_new_graph_failures") == 0
+            )
+            and _contract_runtime_authenticated_qa_provenance(line)
+        ):
+            completed = _contract_runtime_completed_line_items(record)
+            expected_graph_hash = stable_sha256(
+                {
+                    key: value
+                    for key, value in line.items()
+                    if not str(key).startswith("_")
+                }
+            )
+            matching_graph_indexes = [
+                index
+                for index, candidate in enumerate(completed)
+                if str(candidate.get("line_id") or "").strip()
+                == "qa_graph_context"
+                and stable_sha256(
+                    {
+                        key: value
+                        for key, value in candidate.items()
+                        if not str(key).startswith("_")
+                    }
+                )
+                == expected_graph_hash
+            ]
+            qa_candidates: list[tuple[int, Mapping[str, Any]]] = []
+            merge_candidates: list[tuple[int, Mapping[str, Any]]] = []
+            if len(matching_graph_indexes) == 1:
+                graph_index = matching_graph_indexes[0]
+                qa_candidates = [
+                    (index, candidate)
+                    for index, candidate in enumerate(completed)
+                    if index > graph_index
+                    and str(candidate.get("line_id") or "").strip()
+                    == "qa_independent_verification"
+                    and _contract_runtime_candidate_scoped_no_pass_line(
+                        candidate,
+                        record=record,
+                    )
+                    and _contract_runtime_authority_commit_matches(
+                        graph_commit,
+                        _contract_runtime_close_authority_explicit_commit(
+                            candidate
+                        ),
+                    )
+                ]
+                if len(qa_candidates) == 1:
+                    qa_index = qa_candidates[0][0]
+                    merge_candidates = [
+                        (index, candidate)
+                        for index, candidate in enumerate(completed)
+                        if index > qa_index
+                        and str(candidate.get("line_id") or "").strip()
+                        == "observer_merge"
+                        and (
+                            _contract_runtime_server_derived_observer_merge_no_pass_line(
+                                candidate,
+                                allow_missing_top_level_status=True,
+                            )
+                        )
+                        and _contract_runtime_authority_commit_matches(
+                            graph_commit,
+                            str(
+                                _contract_runtime_close_authority_payload_mapping(
+                                    candidate,
+                                    "durable_merge_authority",
+                                ).get("branch_head")
+                                or ""
+                            ),
+                        )
+                    ]
+            canonical_overlay_round_verified = bool(
+                len(matching_graph_indexes) == 1
+                and len(qa_candidates) == 1
+                and len(merge_candidates) == 1
+            )
         return bool(
             str(line.get("actor_role") or "").strip() == "qa"
             and str(line.get("evidence_kind") or "").strip() == "graph_trace"
@@ -64631,8 +64720,7 @@ def _contract_runtime_candidate_scoped_no_pass_line(
                 "qa_graph_context.v1",
             }
             and str(payload.get("acceptance_scope") or "") == candidate_scope
-            and payload.get("candidate_new_graph_failures") == 0
-            and payload.get("exact_candidate") is True
+            and (explicit_candidate_scope or canonical_overlay_round_verified)
             and qa_provenance_verified
             and graph_evidence.get("db_verified") is True
             and not list(graph_evidence.get("identity_mismatches") or [])
@@ -78914,7 +79002,11 @@ def _contract_runtime_formal_no_pass_bypass_authorities(
     if not project_id or not execution_id or not backlog_id:
         return {}
 
-    allowed_line_ids = {"worker_finish_gate", "observer_close_ready"}
+    allowed_line_ids = {
+        "worker_finish_gate",
+        "observer_reconcile",
+        "observer_close_ready",
+    }
     authorities: dict[str, dict[str, Any]] = {}
     for line in _contract_runtime_completed_line_items(record):
         line_id = str(line.get("line_id") or "").strip()
@@ -79979,12 +80071,22 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         if requirement_id not in found:
             missing.append(str(spec["missing_id"]))
 
+    reconcile_bypass = formal_bypass_authorities.get(
+        "observer_reconcile", {}
+    )
+    reconcile_bypass_line = formal_bypass_lines.get(
+        "observer_reconcile", {}
+    )
+    reconcile_authority_line = found.get("observer_reconcile", {})
+    if not reconcile_authority_line and reconcile_bypass:
+        reconcile_authority_line = reconcile_bypass_line
+
     reconcile_close_diagnostic: dict[str, Any] = {}
-    if strict_temporal_order and "observer_reconcile" in found:
+    if strict_temporal_order and reconcile_authority_line:
         reconcile_close_diagnostic = (
             _contract_runtime_mf_parallel_reconcile_close_diagnostic(
                 record,
-                found["observer_reconcile"],
+                reconcile_authority_line,
             )
         )
         missing.extend(
@@ -80061,7 +80163,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                     after_line=after_line,
                     qa_line=found.get("qa_independent_verification", {}),
                     merge_line=found.get("observer_merge", {}),
-                    reconcile_line=found.get("observer_reconcile", {}),
+                    reconcile_line=reconcile_authority_line,
                 )
             )
         else:
@@ -80077,13 +80179,10 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             missing.append(missing_id)
 
     server_lineage_diagnostics: list[dict[str, Any]] = []
-    if all(
-        requirement in found
-        for requirement in (
-            "qa_independent_verification",
-            "observer_merge",
-            "observer_reconcile",
-        )
+    if (
+        "qa_independent_verification" in found
+        and "observer_merge" in found
+        and reconcile_authority_line
     ):
         for before, after, missing_id in (
             (
@@ -80103,18 +80202,22 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                     after=after,
                     missing_id=missing_id,
                     before_line=found[before],
-                    after_line=found[after],
+                    after_line=(
+                        reconcile_authority_line
+                        if after == "observer_reconcile"
+                        else found[after]
+                    ),
                     qa_line=found["qa_independent_verification"],
                     merge_line=found["observer_merge"],
-                    reconcile_line=found["observer_reconcile"],
+                    reconcile_line=reconcile_authority_line,
                 )
             )
     bypass_reconcile_diagnostic = (
         _contract_runtime_mf_parallel_reconcile_close_diagnostic(
             record,
-            found["observer_reconcile"],
+            reconcile_authority_line,
         )
-        if "observer_reconcile" in found
+        if reconcile_authority_line
         else {}
     )
     server_post_qa_lineage_passed = bool(
@@ -80214,9 +80317,15 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             qa_line.get("_completed_line_index", -1)
         )
     )
+    worker_finish_exception_needed = bool(
+        "contract_runtime.worker_finish_gate" in missing
+        or "contract_runtime.worker_finish_exact_worker_commit" in missing
+        or "contract_runtime.worker_finish_after_worker_commit" in missing
+        or "contract_runtime.qa_after_worker_finish" in missing
+    )
     worker_finish_commit_exception = bool(
         worker_bypass
-        and "worker_finish_gate" in found
+        and worker_finish_exception_needed
         and worker_commit
         and _contract_runtime_authority_commit_matches(worker_commit, qa_commit)
         and worker_bypass_order_valid
@@ -80228,6 +80337,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             for item in missing
             if item
             not in {
+                "contract_runtime.worker_finish_gate",
                 "contract_runtime.worker_finish_exact_worker_commit",
                 "contract_runtime.worker_finish_after_worker_commit",
                 "contract_runtime.qa_after_worker_finish",
@@ -80247,7 +80357,91 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             "exception_scope": "worker_finish_exact_worker_commit",
             "latest_worker_commit": worker_commit,
             "accepted_qa_commit": qa_commit,
-            "normal_business_line_present": True,
+            "normal_business_line_present": (
+                "worker_finish_gate" in found
+            ),
+            "bypass_used_as_business_line": False,
+        })
+
+    reconcile_line = reconcile_authority_line
+    reconcile_authority = _contract_runtime_close_authority_payload_mapping(
+        reconcile_line,
+        "reconcile_authority",
+    )
+    reconciled_commit = str(
+        reconcile_authority.get("reconciled_commit_sha") or ""
+    ).strip()
+    canonical_reconcile_head = str(
+        reconcile_authority.get("canonical_head_commit") or ""
+    ).strip()
+    reconciled_merged_commit = str(
+        reconcile_authority.get("merged_commit_sha") or ""
+    ).strip()
+    reconcile_boundary_line = found.get("observer_close_ready", {}) or (
+        formal_bypass_lines.get("observer_close_ready", {})
+    )
+    reconcile_bypass_order_valid = bool(
+        reconcile_bypass_line
+        and found.get("observer_merge")
+        and reconcile_boundary_line
+        and _contract_runtime_close_authority_line_index(
+            found["observer_merge"].get("_completed_line_index", -1)
+        )
+        < _contract_runtime_close_authority_line_index(
+            reconcile_bypass_line.get("_completed_line_index", -1)
+        )
+        < _contract_runtime_close_authority_line_index(
+            reconcile_boundary_line.get("_completed_line_index", -1)
+        )
+    )
+    observer_reconcile_exception = bool(
+        reconcile_bypass
+        and "observer_reconcile" not in found
+        and reconcile_bypass_order_valid
+        and server_post_qa_lineage_passed
+        and bypass_reconcile_diagnostic.get("passed") is True
+        and reconciled_commit
+        and canonical_reconcile_head
+        and reconciled_merged_commit
+        and _contract_runtime_authority_commit_matches(
+            close_commit,
+            reconciled_commit,
+        )
+        and _contract_runtime_authority_commit_matches(
+            close_commit,
+            canonical_reconcile_head,
+        )
+        and _contract_runtime_authority_commit_matches(
+            close_commit,
+            reconciled_merged_commit,
+        )
+    )
+    if observer_reconcile_exception:
+        missing = [
+            item
+            for item in missing
+            if item
+            not in {
+                "contract_runtime.observer_reconcile",
+                "contract_runtime.observer_reconcile_close_commit",
+                "contract_runtime.reconcile_after_merge",
+                "contract_runtime.close_ready_after_reconcile",
+            }
+        ]
+        commit_mismatches = [
+            item
+            for item in commit_mismatches
+            if item.get("requirement_id") != "observer_reconcile"
+        ]
+        applied_no_pass_exceptions.append({
+            **{
+                key: value
+                for key, value in reconcile_bypass.items()
+                if key != "_line"
+            },
+            "exception_scope": "observer_reconcile_current_full_commit",
+            "server_derived_close_commit": canonical_reconcile_head,
+            "normal_business_line_present": False,
             "bypass_used_as_business_line": False,
         })
 
@@ -80256,11 +80450,6 @@ def _contract_runtime_mf_parallel_close_authority_gate(
     )
     close_ready_bypass_line = formal_bypass_lines.get(
         "observer_close_ready", {}
-    )
-    reconcile_line = found.get("observer_reconcile", {})
-    reconcile_authority = _contract_runtime_close_authority_payload_mapping(
-        reconcile_line,
-        "reconcile_authority",
     )
     server_close_commit = str(
         reconcile_authority.get("reconciled_commit_sha")
@@ -80374,8 +80563,14 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             "observer_close_ready_business_line_passed": (
                 "observer_close_ready" in found
             ),
+            "observer_reconcile_business_line_passed": (
+                "observer_reconcile" in found
+            ),
             "formal_worker_finish_commit_bypass_verified": (
                 worker_finish_commit_exception
+            ),
+            "formal_observer_reconcile_bypass_verified": (
+                observer_reconcile_exception
             ),
             "formal_observer_close_ready_bypass_verified": (
                 close_ready_commit_exception
