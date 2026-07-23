@@ -25042,6 +25042,197 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
     return {}
 
 
+def _runtime_context_precommit_correction_rejoin_marker(
+    *,
+    context: Any,
+    runtime_context_id: str,
+    contract_execution_id: str,
+    prior_implementation: Mapping[str, Any],
+    timeline_events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Project an audited same-worker token rotation for precommit correction."""
+
+    from .parallel_branch_runtime import (
+        runtime_context_secret_hash,
+        runtime_context_session_token_ref,
+    )
+
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    prior_session_token_ref = _worker_commit_text(
+        prior_implementation,
+        "session_token_ref",
+    )
+    active_session_token_ref = runtime_context_session_token_ref(context)
+    expected_worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    expected_worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    expected_target_project_root = _runtime_context_effective_target_project_root(
+        context
+    )
+    expected_fence_token_hash = runtime_context_secret_hash(
+        str(getattr(context, "fence_token", "") or "")
+    )
+    if (
+        not runtime_context_id
+        or not task_id
+        or not contract_execution_id
+        or not prior_session_token_ref
+        or not active_session_token_ref
+        or prior_session_token_ref == active_session_token_ref
+    ):
+        return {}
+
+    for event in reversed(list(timeline_events)):
+        if not isinstance(event, Mapping):
+            continue
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        event_type = str(event.get("event_type") or "").strip().lower()
+        event_kind = str(event.get("event_kind") or "").strip().lower()
+        if str(event.get("status") or "").strip().lower() not in {
+            "accepted",
+            "passed",
+            "succeeded",
+        }:
+            continue
+        if not (
+            event_type == "observer.runtime_context_session_token_rejoin"
+            or (
+                event_kind == "observer_command"
+                and str(payload.get("action") or "").strip()
+                == "runtime_context_session_token_rejoin"
+            )
+        ):
+            continue
+        if str(payload.get("runtime_context_id") or "").strip() != (
+            runtime_context_id
+        ):
+            continue
+        if str(payload.get("task_id") or "").strip() != task_id:
+            continue
+        if (
+            parent_task_id
+            and str(payload.get("parent_task_id") or "").strip()
+            != parent_task_id
+        ):
+            continue
+        event_backlog_id = str(
+            event.get("backlog_id") or payload.get("backlog_id") or ""
+        ).strip()
+        if backlog_id and event_backlog_id != backlog_id:
+            continue
+        if str(payload.get("session_token_ref") or "").strip() != (
+            active_session_token_ref
+        ):
+            continue
+        if str(payload.get("worker_id") or "").strip() != expected_worker_id:
+            continue
+        if str(
+            payload.get("worker_slot_id") or payload.get("worker_id") or ""
+        ).strip() != expected_worker_slot_id:
+            continue
+        if str(payload.get("fence_token_hash") or "").strip() != (
+            expected_fence_token_hash
+        ):
+            continue
+        if str(payload.get("current_status") or "").strip() not in {
+            "running",
+            "worktree_ready",
+        }:
+            continue
+        worker_sequence = (
+            payload.get("contract_runtime_worker_sequence")
+            if isinstance(
+                payload.get("contract_runtime_worker_sequence"),
+                Mapping,
+            )
+            else {}
+        )
+        if (
+            str(worker_sequence.get("source") or "").strip()
+            != "contract_runtime_completed_lines"
+            or str(worker_sequence.get("source_of_authority") or "").strip()
+            != "contract_runtime"
+            or worker_sequence.get("ordered") is not True
+            or str(
+                worker_sequence.get("contract_execution_id") or ""
+            ).strip()
+            != contract_execution_id
+            or str(worker_sequence.get("runtime_context_id") or "").strip()
+            != runtime_context_id
+            or str(worker_sequence.get("task_id") or "").strip() != task_id
+            or (
+                parent_task_id
+                and str(
+                    worker_sequence.get("parent_task_id") or ""
+                ).strip()
+                != parent_task_id
+            )
+        ):
+            continue
+        event_id = int(event.get("id") or 0)
+        if event_id <= 0:
+            continue
+        route_identity = (
+            payload.get("route_identity")
+            if isinstance(payload.get("route_identity"), Mapping)
+            else {}
+        )
+        rejoin_event_ref = f"timeline:{event_id}"
+        return {
+            "schema_version": (
+                "contract_runtime.precommit_correction_rejoin_marker.v1"
+            ),
+            "source": "accepted_runtime_context_rejoin_event",
+            "server_derived": True,
+            "rejoin_event_id": event_id,
+            "rejoin_event_ref": rejoin_event_ref,
+            "contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "backlog_id": backlog_id,
+            "worker_id": expected_worker_id,
+            "worker_slot_id": expected_worker_slot_id,
+            "target_project_root": expected_target_project_root,
+            "fence_token_hash": expected_fence_token_hash,
+            "prior_session_token_ref": prior_session_token_ref,
+            "active_session_token_ref": active_session_token_ref,
+            "route_token_ref": str(
+                route_identity.get("route_token_ref") or ""
+            ).strip(),
+            "raw_session_tokens_persisted": False,
+            "session_token_ref_rotation": {
+                "schema_version": (
+                    "contract_runtime.precommit_rejoin_session_ref_rotation.v1"
+                ),
+                "source": "accepted_runtime_context_rejoin_event",
+                "server_derived": True,
+                "rejoin_event_ref": rejoin_event_ref,
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "worker_id": expected_worker_id,
+                "worker_slot_id": expected_worker_slot_id,
+                "target_project_root": expected_target_project_root,
+                "fence_token_hash": expected_fence_token_hash,
+                "prior_session_token_ref": prior_session_token_ref,
+                "active_session_token_ref": active_session_token_ref,
+                "raw_session_tokens_persisted": False,
+            },
+        }
+    return {}
+
+
 def _runtime_context_contract_runtime_qa_verification_evidence(
     conn,
     *,
@@ -27029,6 +27220,7 @@ def _runtime_context_superseded_implementation_commit_authority(
 
 
 def _runtime_context_revise_precommit_implementation_lineage(
+    conn,
     *,
     project_id: str,
     context: Any,
@@ -27366,8 +27558,34 @@ def _runtime_context_revise_precommit_implementation_lineage(
     ):
         return {}
 
+    from . import task_timeline
+
+    timeline_events = task_timeline.list_events(
+        conn,
+        project_id,
+        task_id=task_id,
+        backlog_id=str(getattr(context, "backlog_id", "") or ""),
+        limit=1000,
+    )
+    precommit_rejoin_marker = (
+        _runtime_context_precommit_correction_rejoin_marker(
+            context=context,
+            runtime_context_id=runtime_context_id,
+            contract_execution_id=str(
+                record.get("contract_execution_id") or ""
+            ).strip(),
+            prior_implementation=previous,
+            timeline_events=timeline_events,
+        )
+    )
+
     canonical_payload = dict(payload)
+    canonical_payload.pop("precommit_correction_rejoin_marker", None)
     canonical_payload.update(expected_identity)
+    if precommit_rejoin_marker:
+        canonical_payload["precommit_correction_rejoin_marker"] = dict(
+            precommit_rejoin_marker
+        )
     canonical_payload["changed_files"] = cumulative_files
     canonical_payload["graph_trace_ids"] = verified_trace_ids
     canonical_payload["graph_trace_db_evidence"] = dict(graph_evidence)
@@ -27403,6 +27621,9 @@ def _runtime_context_revise_precommit_implementation_lineage(
         ],
         "correction_intent_action": expected_intent["action"],
         "prior_implementation_lineage_ref": prior_lineage_ref,
+        "session_token_ref_rotation": dict(
+            precommit_rejoin_marker.get("session_token_ref_rotation") or {}
+        ),
         "caller_authority_fields_trusted": False,
         "raw_worker_tokens_persisted": False,
     }
@@ -29204,6 +29425,7 @@ def _runtime_context_submit_canonical_contract_line(
         if not revision:
             precommit_correction = (
                 _runtime_context_revise_precommit_implementation_lineage(
+                    conn,
                     project_id=project_id,
                     context=context,
                     runtime=runtime,
@@ -78929,6 +79151,7 @@ def _contract_runtime_close_gate(
                 )
                 precommit_validation = (
                     _runtime_context_revise_precommit_implementation_lineage(
+                        conn,
                         project_id=project_id,
                         context=runtime_context,
                         runtime=runtime,

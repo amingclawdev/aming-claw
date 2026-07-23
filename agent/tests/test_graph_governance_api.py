@@ -249,12 +249,38 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
         text=True,
     )
     corrected_head = batch_jobs.git_commit(target_root)
+    prior_session_token_ref = runtime_context_session_token_ref(runtime_context)
+    rejoin = (
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "target_project_root": str(target_root),
+                    "reason": (
+                        "same frozen worker resumes precommit correction "
+                        "after a runtime redeploy"
+                    ),
+                    "now_iso": "2999-01-01T00:00:00Z",
+                },
+            )
+        )
+    )
+    assert rejoin["session_token_ref"] != prior_session_token_ref
+    active_fence_token = rejoin["fence_token"]
+    active_session_token = rejoin["session_token"]
 
     def submit_correction(*, intent=correction_intent):
         request_body = {
             "parent_task_id": backlog_id,
-            "fence_token": fence_token,
-            "session_token": session_token,
+            "fence_token": active_fence_token,
+            "session_token": active_session_token,
             "target_project_root": str(target_root),
             "commit_sha": corrected_head,
             "changed_files": frozen_asset_files,
@@ -351,8 +377,12 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
     assert len(implementations) == 2
     assert implementations[0]["commit_sha"] == frozen_head
     assert implementations[0]["changed_files"] == [frozen_first_file]
+    assert implementations[0]["session_token_ref"] == prior_session_token_ref
     assert implementations[-1]["commit_sha"] == corrected_head
     assert implementations[-1]["changed_files"] == sorted(frozen_asset_files)
+    assert implementations[-1]["session_token_ref"] == (
+        rejoin["session_token_ref"]
+    )
     correction = implementations[-1]["payload"][
         "canonical_precommit_lineage_revision"
     ]
@@ -361,6 +391,16 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
     assert correction["supersedes_implementation_lineage_ref"] == (
         canonical["supersedes_implementation_lineage_ref"]
     )
+    assert correction["session_token_ref_rotation"]["applied"] is True
+    assert correction["session_token_ref_rotation"]["source"] == (
+        "accepted_runtime_context_rejoin_event"
+    )
+    assert correction["session_token_ref_rotation"][
+        "rejoin_event_ref"
+    ].startswith("timeline:")
+    assert correction["session_token_ref_rotation"][
+        "raw_session_tokens_persisted"
+    ] is False
     authority = implementations[-1]["payload"][
         "canonical_precommit_lineage_revision_authority"
     ]
@@ -392,8 +432,8 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
                 "runtime_context_id": runtime_context.runtime_context_id,
                 "task_id": runtime_context.task_id,
                 "parent_task_id": backlog_id,
-                "fence_token": fence_token,
-                "session_token": session_token,
+                "fence_token": active_fence_token,
+                "session_token": active_session_token,
                 "target_project_root": str(target_root),
                 "worker_commit_sha": corrected_head,
                 "worker_session_id": runtime_context.worker_slot_id,
@@ -60629,6 +60669,11 @@ def _mf_parallel_worker_proof_payloads(
     worker_id = runtime_context.worker_id
     worker_slot_id = runtime_context.worker_slot_id or worker_id
     worker_session_id = f"session-{runtime_context.task_id}"
+    session_token_ref = (
+        runtime_context_session_token_ref(runtime_context)
+        or f"wstok-{runtime_context.task_id}"
+    )
+    fence_token_hash = _fake_sha(runtime_context.fence_token)
     changed_files = list(changed_files or ["agent/governance/server.py"])
     owned_files = list(owned_files or changed_files)
     common = {
@@ -60643,7 +60688,13 @@ def _mf_parallel_worker_proof_payloads(
         "changed_files": changed_files,
         "graph_trace_ids": [graph_trace_id],
     }
-    implementation = dict(common)
+    implementation = {
+        **common,
+        "worker_session_id": worker_session_id,
+        "actor_session_principal": worker_session_id,
+        "session_token_ref": session_token_ref,
+        "fence_token_hash": fence_token_hash,
+    }
     worker_commit = {
         **common,
         "evidence_owner_role": "mf_sub",
@@ -60651,8 +60702,8 @@ def _mf_parallel_worker_proof_payloads(
         "actor_session_principal": worker_session_id,
         "filer_principal": worker_session_id,
         "implementation_event_ref": implementation_event_ref,
-        "session_token_ref": f"wstok-{runtime_context.task_id}",
-        "fence_token_hash": _fake_sha(runtime_context.fence_token),
+        "session_token_ref": session_token_ref,
+        "fence_token_hash": fence_token_hash,
         "worker_commit_sha": head_commit,
         "commit_sha": head_commit,
         "head_commit": head_commit,

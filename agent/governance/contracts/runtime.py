@@ -5567,6 +5567,14 @@ class ContractRuntime:
             if isinstance(payload.get("graph_trace_db_evidence"), Mapping)
             else {}
         )
+        rejoin_marker = (
+            dict(payload.get("precommit_correction_rejoin_marker"))
+            if isinstance(
+                payload.get("precommit_correction_rejoin_marker"),
+                Mapping,
+            )
+            else {}
+        )
         guide = self._record_view(
             record,
             actor_role=effective_actor_role,
@@ -5660,7 +5668,6 @@ class ContractRuntime:
             "worker_slot_id",
             "target_project_root",
             "fence_token_hash",
-            "session_token_ref",
         )
         if prior_implementation is not None:
             for field in identity_fields:
@@ -5671,6 +5678,93 @@ class ContractRuntime:
                         "precommit implementation correction "
                         f"{field} must match prior implementation"
                     )
+
+        prior_session_token_ref = (
+            _worker_commit_text(prior_implementation, "session_token_ref")
+            if prior_implementation is not None
+            else ""
+        )
+        revised_session_token_ref = _worker_commit_text(
+            effective_write,
+            "session_token_ref",
+        )
+        session_token_ref_rotation = (
+            dict(rejoin_marker.get("session_token_ref_rotation"))
+            if isinstance(
+                rejoin_marker.get("session_token_ref_rotation"),
+                Mapping,
+            )
+            else {}
+        )
+        session_token_ref_rotated = bool(
+            prior_session_token_ref
+            and revised_session_token_ref != prior_session_token_ref
+        )
+        if session_token_ref_rotated:
+            rotation_errors: list[str] = []
+            if not revised_session_token_ref:
+                rotation_errors.append("active session_token_ref is required")
+            if (
+                rejoin_marker.get("server_derived") is not True
+                or str(rejoin_marker.get("source") or "").strip()
+                != "accepted_runtime_context_rejoin_event"
+            ):
+                rotation_errors.append(
+                    "server-derived same-worker rejoin authority is required"
+                )
+            rejoin_event_ref = str(
+                rejoin_marker.get("rejoin_event_ref") or ""
+            ).strip()
+            if not rejoin_event_ref.startswith("timeline:"):
+                rotation_errors.append("audited rejoin event ref is required")
+            if (
+                session_token_ref_rotation.get("server_derived") is not True
+                or str(
+                    session_token_ref_rotation.get("source") or ""
+                ).strip()
+                != "accepted_runtime_context_rejoin_event"
+            ):
+                rotation_errors.append(
+                    "server-derived session rotation is required"
+                )
+            if str(
+                session_token_ref_rotation.get("rejoin_event_ref") or ""
+            ).strip() != rejoin_event_ref:
+                rotation_errors.append("session rotation rejoin event must match")
+            if str(
+                session_token_ref_rotation.get("prior_session_token_ref") or ""
+            ).strip() != prior_session_token_ref:
+                rotation_errors.append("prior session_token_ref must match")
+            if str(
+                session_token_ref_rotation.get("active_session_token_ref") or ""
+            ).strip() != revised_session_token_ref:
+                rotation_errors.append("active session_token_ref must match")
+            for field in (
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_id",
+                "worker_slot_id",
+                "target_project_root",
+                "fence_token_hash",
+            ):
+                expected_value = _worker_commit_text(effective_write, field)
+                marker_value = str(
+                    session_token_ref_rotation.get(field) or ""
+                ).strip()
+                if expected_value and marker_value != expected_value:
+                    rotation_errors.append(f"rejoin {field} must match")
+            if str(
+                session_token_ref_rotation.get("contract_execution_id") or ""
+            ).strip() != contract_execution_id:
+                rotation_errors.append("rejoin contract_execution_id must match")
+            if rotation_errors:
+                errors.append(
+                    "precommit implementation correction session_token_ref "
+                    "must match prior implementation or an audited same-worker "
+                    "rejoin: "
+                    + "; ".join(rotation_errors)
+                )
 
         commit_sha = str(effective_write.get("commit_sha") or "").strip()
         changed_files = sorted(
@@ -5863,6 +5957,20 @@ class ContractRuntime:
             "append_only_history_preserved": True,
             "single_correction_boundary": True,
             "raw_session_tokens_persisted": False,
+            "session_token_ref_rotation": {
+                "applied": session_token_ref_rotated,
+                "source": (
+                    "accepted_runtime_context_rejoin_event"
+                    if session_token_ref_rotated
+                    else "same_session_token_ref"
+                ),
+                "rejoin_event_ref": (
+                    str(rejoin_marker.get("rejoin_event_ref") or "").strip()
+                    if session_token_ref_rotated
+                    else ""
+                ),
+                "raw_session_tokens_persisted": False,
+            },
         }
         effective_write["payload"] = payload
         written_line = _line_evidence_from_write(
