@@ -4998,6 +4998,173 @@ def test_current_full_reconcile_idempotent_replay_repairs_epoch_projection(
     ).fetchone()[0] == provenance_count
 
 
+def test_current_full_reconcile_terminal_replay_repairs_epoch_after_head_advances(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    old_snapshot_id = "full-current-epoch-advanced-head-old"
+    _activate_basic_graph(conn, old_snapshot_id, commit_sha="b" * 40)
+    reconciled_head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-EPOCH-ADVANCED-HEAD-REPLAY"
+    task_id = "current-full-epoch-advanced-head-replay-worker"
+    runtime_context_id = "mfrctx-current-full-epoch-advanced-head-replay"
+    merge_queue_id = "mq-current-full-epoch-advanced-head-replay"
+    route_token_ref = "rtok-current-full-epoch-advanced-head-replay"
+    observer_session_id = (
+        _current_full_parallel_route_without_merge_authority_fixture(
+            conn,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            merge_queue_id=merge_queue_id,
+            head_commit=reconciled_head,
+            observer_session_id="obs-current-full-epoch-advanced-head-replay",
+            route_token_ref=route_token_ref,
+        )
+    )
+    short_reconciled_head = reconciled_head[:8]
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=merge_queue_id,
+            queue_item_id="mqitem-current-full-epoch-advanced-head-replay",
+            task_id=task_id,
+            backlog_id=backlog_id,
+            branch_ref=f"refs/heads/codex/{task_id}",
+            queue_index=1,
+            status=STATE_MERGED,
+            target_ref="refs/heads/main",
+            current_target_head=short_reconciled_head,
+            merge_commit=short_reconciled_head,
+            target_head_after_merge=short_reconciled_head,
+        ),
+    )
+    upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id="batch-current-full-epoch-advanced-head-replay",
+            epoch_id="epoch-current-full-epoch-advanced-head-replay",
+            coordination_backlog_id="AC-CURRENT-FULL-EPOCH-PARENT",
+            target_ref="refs/heads/main",
+            base_head="b" * 40,
+            current_head=short_reconciled_head,
+            merge_queue_id=merge_queue_id,
+            status=parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILE_PENDING,
+            reconcile_state="pending",
+        ),
+    )
+    conn.commit()
+
+    real_auto_record = (
+        parallel_branch_runtime.record_merge_queue_graph_epoch_after_reconcile
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "record_merge_queue_graph_epoch_after_reconcile",
+        lambda *_args, **_kwargs: {
+            "status": "skipped",
+            "skipped_reason": "simulated_post_activation_projection_gap",
+        },
+    )
+    run_id = "current-full-epoch-before-repair-commit"
+    body = {
+        "target_commit_sha": reconciled_head,
+        "activate": True,
+        "semantic_enrich": False,
+        "run_id": run_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": route_token_ref,
+    }
+    first_status, first = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    assert first_status == 201
+    assert first["activated"] is True
+
+    reconcile_event_count = conn.execute(
+        """
+        SELECT COUNT(*) FROM task_timeline_events
+        WHERE project_id = ? AND backlog_id = ? AND task_id = ?
+          AND event_type = 'graph.reconcile'
+        """,
+        (PID, backlog_id, task_id),
+    ).fetchone()[0]
+    provenance_count = conn.execute(
+        """
+        SELECT COUNT(*) FROM graph_current_full_reconcile_provenance
+        WHERE project_id = ? AND target_commit_sha = ?
+        """,
+        (PID, reconciled_head),
+    ).fetchone()[0]
+
+    repair_head = "c" * 40
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: repair_head)
+    monkeypatch.setattr(
+        server,
+        "_git_dirty_paths",
+        lambda _root: ["agent/governance/server.py"],
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "record_merge_queue_graph_epoch_after_reconcile",
+        real_auto_record,
+    )
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                **body,
+                "snapshot_id": first["snapshot_id"],
+            },
+        )
+    )
+
+    assert replay_status == 200
+    assert replay["idempotent_replay"] is True
+    assert replay["rebuild_skipped"] is True
+    assert replay["historical_terminal_projection_replay"] is True
+    assert replay["target_commit_sha"] == reconciled_head
+    assert replay["head_commit"] == repair_head
+    assert (
+        replay["merge_queue_graph_epoch_auto_record"][
+            "epoch_projection_recorded"
+        ]
+        is True
+    )
+    reconciled = parallel_branch_runtime.get_active_integration_epoch(
+        conn,
+        PID,
+        merge_queue_id=merge_queue_id,
+    )
+    assert reconciled is not None
+    assert reconciled.status == (
+        parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILED
+    )
+    assert reconciled.snapshot_id == first["snapshot_id"]
+    assert len(calls) == 1
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM task_timeline_events
+        WHERE project_id = ? AND backlog_id = ? AND task_id = ?
+          AND event_type = 'graph.reconcile'
+        """,
+        (PID, backlog_id, task_id),
+    ).fetchone()[0] == reconcile_event_count
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM graph_current_full_reconcile_provenance
+        WHERE project_id = ? AND target_commit_sha = ?
+        """,
+        (PID, reconciled_head),
+    ).fetchone()[0] == provenance_count
+
+
 def test_current_full_reconcile_ignores_demo_environment_marker_dirty_state(
     conn,
     monkeypatch,

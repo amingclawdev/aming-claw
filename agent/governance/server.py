@@ -42388,15 +42388,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "head_commit": head_commit,
                 "target_commit_sha": target_commit,
             }
-        if target_commit != head_commit:
-            return 400, {
-                "ok": False,
-                "project_id": project_id,
-                "error": "target_not_head",
-                "message": "current-full reconcile rebuilds the current worktree; target_commit_sha must equal HEAD",
-                "target_commit_sha": target_commit,
-                "head_commit": head_commit,
-            }
         activate_requested = bool(body.get("activate", True))
         requested_identity = store.normalize_pending_scope_identity(
             ref_name=str(body.get("ref_name") or ""),
@@ -42411,18 +42402,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         # remains resumable after QA or a failed CAS.
         identity = store.normalize_pending_scope_identity(ref_name="active")
         require_clean = True if not activate_requested else bool(body.get("require_clean", True))
-        dirty_paths = filter_dirty_files(_git_dirty_paths(root)) if require_clean else []
-        if dirty_paths:
-            return 409, {
-                "ok": False,
-                "project_id": project_id,
-                "error": "dirty_worktree",
-                "message": "current-full reconcile requires a clean worktree by default",
-                "dirty_files": dirty_paths,
-                "dirty_file_count": len(dirty_paths),
-                "target_commit_sha": target_commit,
-                "head_commit": head_commit,
-            }
 
         runtime_context_scope = _current_full_reconcile_runtime_context_scope(
             conn,
@@ -42521,6 +42500,9 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     )
                 )
                 conn.commit()
+            response["historical_terminal_projection_replay"] = bool(
+                target_commit != head_commit
+            )
             return 200, response
         if existing.get("status") == "running":
             return 202, {
@@ -42537,6 +42519,32 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     "run_id": run_id,
                     "retry_allowed": False,
                 },
+            }
+        # Only a terminal idempotent replay may target a commit that is no
+        # longer the worktree HEAD.  That replay consumes the already-active
+        # exact full snapshot plus its durable terminal provenance above; it
+        # does not rebuild, reactivate, or synthesize timeline/provenance.
+        if target_commit != head_commit:
+            return 400, {
+                "ok": False,
+                "project_id": project_id,
+                "error": "target_not_head",
+                "message": "current-full reconcile rebuilds the current worktree; target_commit_sha must equal HEAD",
+                "target_commit_sha": target_commit,
+                "head_commit": head_commit,
+                "terminal_idempotent_replay_checked": True,
+            }
+        dirty_paths = filter_dirty_files(_git_dirty_paths(root)) if require_clean else []
+        if dirty_paths:
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": "dirty_worktree",
+                "message": "current-full reconcile requires a clean worktree by default",
+                "dirty_files": dirty_paths,
+                "dirty_file_count": len(dirty_paths),
+                "target_commit_sha": target_commit,
+                "head_commit": head_commit,
             }
 
         semantic_use_ai = _semantic_use_ai_from_body(body)
