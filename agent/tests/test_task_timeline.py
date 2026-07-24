@@ -119,6 +119,39 @@ def test_recent_timeline_compact_view_omits_raw_payload(tmp_path):
     assert full["events"][0]["payload"]["large_evidence"] == "x" * 100_000
 
 
+def test_recent_runtime_fresh_ledger_tolerates_missing_runtime_table():
+    from agent.governance import server, task_timeline
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        ledger = {
+            "schema_version": "task_timeline.compact_multi_backlog_ledger.v1",
+            "project_id": "proj",
+            "row_count": 1,
+            "rows": [
+                {
+                    "backlog_id": "AC-NO-RUNTIME-TABLE",
+                    "current_contract_execution_id": "cex-not-materialized",
+                    "projection_updated_at": "2026-07-24T00:00:00Z",
+                }
+            ],
+        }
+
+        result = server._task_timeline_runtime_fresh_compact_ledger(
+            conn,
+            project_id="proj",
+            ledger=ledger,
+            task_timeline_module=task_timeline,
+        )
+    finally:
+        conn.close()
+
+    assert result["row_count"] == 1
+    assert result["rows"][0]["contract_execution_id"] == "cex-not-materialized"
+    assert result["rows"][0]["projection_updated_at"] == "2026-07-24T00:00:00Z"
+    assert "projection_freshness_source" not in result["rows"][0]
+
+
 def _route_context_consumption_events(identity=None):
     route_identity = dict(identity or ROUTE_IDENTITY)
     return [

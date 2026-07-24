@@ -88489,7 +88489,15 @@ def _task_timeline_runtime_fresh_compact_ledger(
         - {""}
     )
     runtime_updated_at_by_execution: dict[str, str] = {}
-    if execution_ids:
+    has_runtime_executions = bool(
+        conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'contract_runtime_executions'
+            """
+        ).fetchone()
+    )
+    if execution_ids and has_runtime_executions:
         placeholders = ", ".join("?" for _ in execution_ids)
         runtime_rows = conn.execute(
             f"""

@@ -22,6 +22,7 @@ from urllib.parse import urlencode
 from .contracts.runtime import (
     _current_projection_from_row,
     ensure_contract_chain_mapping_schema,
+    read_backlog_contract_chain_current,
 )
 
 log = logging.getLogger(__name__)
