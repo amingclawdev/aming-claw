@@ -1253,6 +1253,45 @@ class DependencyRevalidationQaCandidateAuthority:
 
 
 @dataclass(frozen=True)
+class PostQaMergeConflictRejoinAuthority:
+    """Server-derived authority for reopening a QA-passed conflicted lane.
+
+    The caller cannot construct this authority from request booleans.  The
+    governance server issues it only after binding the exact worker/runtime
+    fence to source-backed ContractRuntime worker and QA lines, the durable
+    merge-ready queue item, and a fresh current-target conflict preview.
+    """
+
+    project_id: str
+    backlog_id: str
+    task_id: str
+    parent_task_id: str
+    runtime_context_id: str
+    merge_queue_id: str
+    queue_item_id: str
+    branch_ref: str
+    target_project_root: str
+    worktree_path: str
+    owned_files: tuple[str, ...]
+    candidate_commit: str
+    current_target_head: str
+    dispatch_source_ref: str
+    worker_commit_source_ref: str
+    qa_source_ref: str
+    merge_preview_id: str
+    route_identity_hash: str
+    authority_hash: str
+    schema_version: str = (
+        "parallel_branch.post_qa_merge_conflict_rejoin_authority.v1"
+    )
+    server_derived: bool = True
+    caller_claims_trusted: bool = False
+    independent_qa_passed: bool = True
+    merge_conflict_verified: bool = True
+    historical_bypass_context: bool = False
+
+
+@dataclass(frozen=True)
 class MergeQueueItem:
     project_id: str
     merge_queue_id: str
@@ -10658,6 +10697,9 @@ def rejoin_mf_subagent_runtime_session_token(
     reason: str = "",
     now_iso: str = "",
     reopen_for_revision: bool = False,
+    post_qa_merge_conflict_rejoin_authority: (
+        PostQaMergeConflictRejoinAuthority | None
+    ) = None,
 ) -> dict[str, Any]:
     """Issue a new host envelope for an existing worker context.
 
@@ -10677,9 +10719,69 @@ def rejoin_mf_subagent_runtime_session_token(
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if context.task_id != task:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
-    revision_rejoin = bool(
+    failed_qa_revision_rejoin = bool(
         reopen_for_revision and context.status in FAILED_QA_REVISION_REJOIN_STATES
     )
+    post_qa_conflict_rejoin = False
+    authority = post_qa_merge_conflict_rejoin_authority
+    if authority is not None:
+        if not isinstance(authority, PostQaMergeConflictRejoinAuthority):
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        expected_scope = (
+            ("project_id", context.project_id),
+            ("backlog_id", context.backlog_id),
+            ("task_id", context.task_id),
+            ("parent_task_id", _parent_task_id_for_context(context)),
+            ("runtime_context_id", runtime_id),
+            ("merge_queue_id", context.merge_queue_id),
+            ("branch_ref", context.branch_ref),
+            (
+                "target_project_root",
+                runtime_context_effective_target_project_root(context),
+            ),
+            ("worktree_path", context.worktree_path),
+        )
+        if any(
+            str(getattr(authority, field_name, "") or "").strip()
+            != str(expected_value or "").strip()
+            for field_name, expected_value in expected_scope
+        ):
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        authority_payload = asdict(authority)
+        authority_hash = str(authority_payload.pop("authority_hash") or "")
+        if (
+            context.status not in FAILED_QA_REVISION_REJOIN_STATES
+            or tuple(authority.owned_files)
+            != tuple(context.owned_files or context.target_files or ())
+            or authority.schema_version
+            != "parallel_branch.post_qa_merge_conflict_rejoin_authority.v1"
+            or authority.server_derived is not True
+            or authority.caller_claims_trusted is not False
+            or authority.independent_qa_passed is not True
+            or authority.merge_conflict_verified is not True
+            or authority.historical_bypass_context is not False
+            or not re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                str(authority.candidate_commit or ""),
+            )
+            or not re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                str(authority.current_target_head or ""),
+            )
+            or not str(authority.dispatch_source_ref).startswith(
+                "contract_runtime:"
+            )
+            or not str(authority.worker_commit_source_ref).startswith(
+                "contract_runtime:"
+            )
+            or not str(authority.qa_source_ref).startswith("contract_runtime:")
+            or not str(authority.merge_preview_id).startswith("merge-preview:")
+            or not str(authority.route_identity_hash).startswith("sha256:")
+            or authority_hash != _stable_authority_hash(authority_payload)
+        ):
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        post_qa_conflict_rejoin = True
+    revision_rejoin = failed_qa_revision_rejoin or post_qa_conflict_rejoin
     if (
         context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
         and not revision_rejoin
@@ -10716,6 +10818,12 @@ def rejoin_mf_subagent_runtime_session_token(
     new_token = secrets.token_urlsafe(32)
     new_hash = mf_subagent_session_token_hash(new_token)
     lease_id = "mfrlease-" + uuid.uuid4().hex[:16]
+    if post_qa_conflict_rejoin:
+        recovery_action = "mf_subagent_post_qa_merge_conflict_rejoin_issued"
+    elif failed_qa_revision_rejoin:
+        recovery_action = "mf_subagent_failed_qa_revision_rejoin_issued"
+    else:
+        recovery_action = "mf_subagent_session_token_rejoin_issued"
     saved = upsert_branch_context(
         conn,
         replace(
@@ -10726,11 +10834,7 @@ def rejoin_mf_subagent_runtime_session_token(
             status=STATE_WORKTREE_READY if revision_rejoin else context.status,
             retry_round=context.retry_round + (1 if revision_rejoin else 0),
             attempt=context.attempt + (1 if revision_rejoin else 0),
-            last_recovery_action=(
-                "mf_subagent_failed_qa_revision_rejoin_issued"
-                if revision_rejoin
-                else "mf_subagent_session_token_rejoin_issued"
-            ),
+            last_recovery_action=recovery_action,
         ),
         now_iso=_runtime_context_iso(now_dt),
     )
@@ -10753,6 +10857,11 @@ def rejoin_mf_subagent_runtime_session_token(
         "worker_slot_id": saved.worker_slot_id or saved.worker_id,
         "principal_id": saved.worker_slot_id or saved.worker_id or saved.agent_id,
         "reopen_for_revision": revision_rejoin,
+        "reopen_for_failed_qa_revision": failed_qa_revision_rejoin,
+        "reopen_for_post_qa_merge_conflict": post_qa_conflict_rejoin,
+        "post_qa_merge_conflict_rejoin_authority": (
+            asdict(authority) if post_qa_conflict_rejoin else {}
+        ),
         "previous_status": context.status,
         "current_status": saved.status,
         "attempt": saved.attempt,

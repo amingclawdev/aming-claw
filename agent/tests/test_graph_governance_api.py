@@ -36528,6 +36528,8 @@ def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_with
                     "parent_task_id": context.root_task_id,
                     "target_project_root": str(target_root),
                     "reason": "host worker session lost raw auth env after resume",
+                    "reopen_for_revision": True,
+                    "reopen_for_post_qa_merge_conflict": True,
                 },
             )
         )
@@ -58808,6 +58810,11 @@ def test_contract_runtime_qa_bridge_preserves_precheck_submit_and_failure_fields
     passing_status_gate = persisted_qa["qa_evidence_provenance"][
         "completion_status_gate"
     ]
+    assert persisted_qa["observer_impersonation"] is False
+    assert persisted_qa["payload"]["observer_impersonation"] is False
+    assert persisted_qa["qa_evidence_provenance"][
+        "payload_observer_impersonation_explicit"
+    ] is True
     assert passing_status_gate == {
         "schema_version": "contract_runtime.qa_completion_status_gate.v1",
         "source": "contract_runtime_line_write_normalization",
@@ -61903,6 +61910,7 @@ def _mf_parallel_worker_proof_payloads(
     }
     worker_commit = {
         **common,
+        "status": "accepted",
         "evidence_owner_role": "mf_sub",
         "worker_session_id": worker_session_id,
         "actor_session_principal": worker_session_id,
@@ -64009,6 +64017,33 @@ def test_same_lane_worker_commit_revision_is_append_only_and_advances_to_attesta
             "diff_base_commit": base_commit,
         }
     )
+    statusless_payload = copy.deepcopy(initial_commit_payload)
+    statusless_payload.pop("status", None)
+    canonicalized_worker_commit = server._contract_runtime_line_write_body(
+        record,
+        {
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+            "evidence_kind": "worker_commit",
+            "payload": statusless_payload,
+        },
+        actor_role="mf_sub",
+        worker_proof={
+            field: initial_commit_payload[field]
+            for field in (
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_id",
+                "worker_slot_id",
+                "target_project_root",
+                "session_token_ref",
+                "fence_token_hash",
+            )
+        },
+    )
+    assert canonicalized_worker_commit["status"] == "accepted"
+    assert canonicalized_worker_commit["payload"]["status"] == "accepted"
     initial_write = server._contract_runtime_write_from_record(
         record,
         actor_role="mf_sub",
@@ -64351,11 +64386,14 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
             "task_id": runtime_context.task_id,
             "parent_task_id": backlog_id,
             "commit_sha": candidate_commit,
+            "status": "passed",
+            "observer_impersonation": False,
             "payload": {
                 "runtime_context_id": runtime_context.runtime_context_id,
                 "task_id": runtime_context.task_id,
                 "parent_task_id": backlog_id,
                 "status": "passed",
+                "observer_impersonation": False,
             },
         }
         for stage_id, line_id, evidence_kind, actor_role in downstream_specs
@@ -64376,6 +64414,43 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     assert post_qa_record["runtime_guide"]["next_legal_action"]["line_id"] == (
         "observer_merge"
     )
+    canonical_dispatch = next(
+        line
+        for line in post_qa_record["completed_lines"]
+        if line.get("line_id") == "observer_dispatch_bounded_workers"
+    )
+    assert canonical_dispatch["observer_impersonation"] is False
+    assert canonical_dispatch["payload"]["observer_impersonation"] is False
+    assert canonical_dispatch["payload"]["dispatch_ticket_authority"][
+        "observer_impersonation_explicit"
+    ] is True
+    canonical_worker_commit = next(
+        line
+        for line in reversed(post_qa_record["completed_lines"])
+        if line.get("line_id") == "worker_commit"
+    )
+    assert canonical_worker_commit["status"] == "accepted"
+    assert canonical_worker_commit["payload"]["status"] == "accepted"
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(
+            runtime_context,
+            status=STATE_VALIDATED,
+            attempt=1,
+            retry_round=0,
+        ),
+        now_iso="2026-07-24T10:00:00Z",
+    )
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": (
+            f"sha256:visible-{worker_task_id}"
+        ),
+    }
 
     queue_item = MergeQueueItem(
         project_id=PID,
@@ -64395,6 +64470,19 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     upsert_merge_queue_item(conn, queue_item)
     conn.commit()
 
+    authority, diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=post_qa_record,
+            route_identity=route_identity,
+        )
+    )
+    assert authority is None
+    assert "not QA-passed merge_ready" in " ".join(
+        diagnostics["merge_conflict_authority"]["errors"]
+    )
     assert server._runtime_context_same_lane_worker_commit_recovery(
         post_qa_record,
         runtime_context,
@@ -64425,12 +64513,470 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     assert "did not reproduce a merge conflict" in " ".join(
         stale_target["errors"]
     )
+    stale_authority, stale_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=post_qa_record,
+            route_identity=route_identity,
+        )
+    )
+    assert stale_authority is None
+    assert "did not reproduce a merge conflict" in " ".join(
+        stale_diagnostics["merge_conflict_authority"]["errors"]
+    )
 
     subprocess.run(
         ["git", "branch", "-f", "target", target_commit],
         cwd=worktree,
         check=True,
     )
+    conflict_authority, conflict_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=post_qa_record,
+            route_identity=route_identity,
+        )
+    )
+    assert conflict_authority is not None
+    assert conflict_diagnostics["status"] == "eligible"
+    assert conflict_authority.independent_qa_passed is True
+    assert conflict_authority.merge_conflict_verified is True
+
+    historical_startup_without_ref = copy.deepcopy(post_qa_record)
+    historical_startup_line = next(
+        line
+        for line in historical_startup_without_ref["completed_lines"]
+        if line.get("line_id") == "worker_startup"
+    )
+    historical_startup_line.pop("session_token_ref", None)
+    historical_startup_line["payload"].pop("session_token_ref", None)
+    historical_authority, historical_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=historical_startup_without_ref,
+            route_identity=route_identity,
+        )
+    )
+    assert historical_authority is not None
+    assert historical_diagnostics["status"] == "eligible"
+    historical_lineage = (
+        server._runtime_context_post_qa_worker_startup_lineage(
+            historical_startup_without_ref,
+            context=runtime_context,
+        )
+    )
+    assert historical_lineage["session_token_ref_source"] == (
+        "runtime_context_stored_hash_lineage"
+    )
+
+    def assert_exact_identity_rejected(
+        mutated_record: dict[str, Any],
+        expected_error: str,
+    ) -> None:
+        rejected_authority, rejected_diagnostics = (
+            server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+                conn,
+                project_id=PID,
+                context=runtime_context,
+                record=mutated_record,
+                route_identity=route_identity,
+            )
+        )
+        assert rejected_authority is None
+        assert expected_error in " ".join(rejected_diagnostics["errors"])
+
+    observer_worker_commit = copy.deepcopy(post_qa_record)
+    observer_worker_commit_line = next(
+        line
+        for line in reversed(observer_worker_commit["completed_lines"])
+        if line.get("line_id") == "worker_commit"
+    )
+    observer_worker_commit_line["actor_role"] = "observer"
+    assert_exact_identity_rejected(
+        observer_worker_commit,
+        "exact source-backed worker_commit is missing",
+    )
+
+    for worker_identity_field in ("worker_id", "worker_slot_id"):
+        wrong_worker_identity = copy.deepcopy(post_qa_record)
+        wrong_worker_commit_line = next(
+            line
+            for line in reversed(wrong_worker_identity["completed_lines"])
+            if line.get("line_id") == "worker_commit"
+        )
+        wrong_worker_commit_line[worker_identity_field] = "worker-wrong"
+        wrong_worker_commit_line["payload"][
+            worker_identity_field
+        ] = "worker-wrong"
+        assert_exact_identity_rejected(
+            wrong_worker_identity,
+            "exact source-backed worker_commit is missing",
+        )
+
+    wrong_worker_session = copy.deepcopy(post_qa_record)
+    wrong_worker_session_line = next(
+        line
+        for line in reversed(wrong_worker_session["completed_lines"])
+        if line.get("line_id") == "worker_commit"
+    )
+    wrong_worker_session_line["worker_session_id"] = "session-wrong"
+    wrong_worker_session_line["payload"]["worker_session_id"] = "session-wrong"
+    assert_exact_identity_rejected(
+        wrong_worker_session,
+        "exact source-backed worker_commit is missing",
+    )
+
+    wrong_session_token_ref = copy.deepcopy(post_qa_record)
+    wrong_session_token_ref_line = next(
+        line
+        for line in reversed(wrong_session_token_ref["completed_lines"])
+        if line.get("line_id") == "worker_commit"
+    )
+    wrong_session_token_ref_line["session_token_ref"] = "wstok-wrong"
+    wrong_session_token_ref_line["payload"][
+        "session_token_ref"
+    ] = "wstok-wrong"
+    assert_exact_identity_rejected(
+        wrong_session_token_ref,
+        "exact source-backed worker_commit is missing",
+    )
+
+    wrong_worker_fence = copy.deepcopy(post_qa_record)
+    wrong_worker_fence_line = next(
+        line
+        for line in reversed(wrong_worker_fence["completed_lines"])
+        if line.get("line_id") == "worker_commit"
+    )
+    wrong_worker_fence_line["fence_token_hash"] = _fake_sha("fence-wrong")
+    wrong_worker_fence_line["payload"]["fence_token_hash"] = _fake_sha(
+        "fence-wrong"
+    )
+    assert_exact_identity_rejected(
+        wrong_worker_fence,
+        "exact source-backed worker_commit is missing",
+    )
+
+    for lineage_field in (
+        "worker_session_id",
+        "session_token_ref",
+        "fence_token_hash",
+    ):
+        missing_lineage = copy.deepcopy(post_qa_record)
+        missing_lineage_commit = next(
+            line
+            for line in reversed(missing_lineage["completed_lines"])
+            if line.get("line_id") == "worker_commit"
+        )
+        missing_lineage_commit.pop(lineage_field, None)
+        missing_lineage_commit["payload"].pop(lineage_field, None)
+        assert_exact_identity_rejected(
+            missing_lineage,
+            "exact source-backed worker_commit is missing",
+        )
+
+    for status_source in ("line", "payload"):
+        for status_mutation in ("failed", "missing"):
+            invalid_worker_commit_status = copy.deepcopy(post_qa_record)
+            invalid_status_line = next(
+                line
+                for line in reversed(
+                    invalid_worker_commit_status["completed_lines"]
+                )
+                if line.get("line_id") == "worker_commit"
+            )
+            status_container = (
+                invalid_status_line
+                if status_source == "line"
+                else invalid_status_line["payload"]
+            )
+            if status_mutation == "failed":
+                status_container["status"] = "failed"
+            else:
+                status_container.pop("status", None)
+            assert_exact_identity_rejected(
+                invalid_worker_commit_status,
+                "exact source-backed worker_commit is missing",
+            )
+
+    wrong_dispatch = copy.deepcopy(post_qa_record)
+    wrong_dispatch_line = next(
+        line
+        for line in wrong_dispatch["completed_lines"]
+        if line.get("line_id") == "observer_dispatch_bounded_workers"
+    )
+    wrong_dispatch_line["payload"]["merge_queue_id"] = "mq-wrong"
+    assert_exact_identity_rejected(
+        wrong_dispatch,
+        "source-backed bounded worker dispatch identity is missing",
+    )
+
+    for impersonation_source in ("line", "payload"):
+        for impersonation_mutation in ("true", "missing"):
+            invalid_dispatch_impersonation = copy.deepcopy(post_qa_record)
+            invalid_dispatch_line = next(
+                line
+                for line in invalid_dispatch_impersonation["completed_lines"]
+                if line.get("line_id")
+                == "observer_dispatch_bounded_workers"
+            )
+            impersonation_container = (
+                invalid_dispatch_line
+                if impersonation_source == "line"
+                else invalid_dispatch_line["payload"]
+            )
+            if impersonation_mutation == "true":
+                impersonation_container["observer_impersonation"] = True
+            else:
+                impersonation_container.pop("observer_impersonation", None)
+            assert_exact_identity_rejected(
+                invalid_dispatch_impersonation,
+                "source-backed bounded worker dispatch identity is missing",
+            )
+
+    wrong_fence_authority, wrong_fence_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=replace(
+                runtime_context,
+                owned_files=("different.py",),
+                target_files=("different.py",),
+            ),
+            record=post_qa_record,
+            route_identity=route_identity,
+        )
+    )
+    assert wrong_fence_authority is None
+    assert "owned-file fence mismatch" in " ".join(
+        wrong_fence_diagnostics["errors"]
+    )
+    wrong_root_authority, wrong_root_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=replace(
+                runtime_context,
+                target_project_root=str(tmp_path / "wrong-root"),
+            ),
+            record=post_qa_record,
+            route_identity=route_identity,
+        )
+    )
+    assert wrong_root_authority is None
+    assert "root/worktree identity mismatch" in " ".join(
+        wrong_root_diagnostics["errors"]
+    )
+    wrong_route_authority, wrong_route_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=post_qa_record,
+            route_identity={**route_identity, "route_id": "route-wrong"},
+        )
+    )
+    assert wrong_route_authority is None
+    assert "route_id identity mismatch" in " ".join(
+        wrong_route_diagnostics["errors"]
+    )
+    failed_qa_record = copy.deepcopy(post_qa_record)
+    failed_qa_line = next(
+        line
+        for line in reversed(failed_qa_record["completed_lines"])
+        if line.get("line_id") == "qa_independent_verification"
+    )
+    failed_qa_line["status"] = "failed"
+    failed_qa_line["payload"]["status"] = "failed"
+    failed_qa_authority, failed_qa_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=failed_qa_record,
+            route_identity=route_identity,
+        )
+    )
+    assert failed_qa_authority is None
+    assert "independent QA-passed line is missing" in " ".join(
+        failed_qa_diagnostics["errors"]
+    )
+
+    for impersonation_source in ("line", "payload"):
+        for impersonation_mutation in ("true", "missing"):
+            invalid_qa_impersonation = copy.deepcopy(post_qa_record)
+            invalid_qa_line = next(
+                line
+                for line in reversed(
+                    invalid_qa_impersonation["completed_lines"]
+                )
+                if line.get("line_id") == "qa_independent_verification"
+            )
+            impersonation_container = (
+                invalid_qa_line
+                if impersonation_source == "line"
+                else invalid_qa_line["payload"]
+            )
+            if impersonation_mutation == "true":
+                impersonation_container["observer_impersonation"] = True
+            else:
+                impersonation_container.pop("observer_impersonation", None)
+            assert_exact_identity_rejected(
+                invalid_qa_impersonation,
+                "independent QA-passed line is missing",
+            )
+
+    known_baseline_record = copy.deepcopy(post_qa_record)
+    known_baseline_template = _known_baseline_accepted_qa_record()
+    known_baseline_graph_line = copy.deepcopy(
+        known_baseline_template["completed_lines"][1]
+    )
+    known_baseline_graph_line["commit_sha"] = candidate_commit
+    known_baseline_graph_evidence = known_baseline_graph_line["payload"][
+        "graph_trace_evidence"
+    ]
+    known_baseline_graph_evidence["base_commit_sha"] = base_commit
+    known_baseline_graph_evidence["candidate_commit_sha"] = candidate_commit
+    known_baseline_qa_line = copy.deepcopy(
+        known_baseline_template["completed_lines"][2]
+    )
+    known_baseline_qa_line.update(
+        {
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": backlog_id,
+            "commit_sha": candidate_commit,
+        }
+    )
+    known_baseline_qa_line["payload"].update(
+        {
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": backlog_id,
+        }
+    )
+    baseline_failures = [
+        "test_post_qa_known_baseline_one",
+        "test_post_qa_known_baseline_two",
+    ]
+    known_baseline_ledger = known_baseline_qa_line["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]
+    known_baseline_ledger.update(
+        {
+            "base_commit_sha": base_commit,
+            "candidate_commit_sha": candidate_commit,
+            "base_failure_identities": baseline_failures,
+            "candidate_failure_identities": baseline_failures,
+            "base_reproduction": {
+                "reproduced": len(baseline_failures),
+                "total": len(baseline_failures),
+                "failure_identities": baseline_failures,
+            },
+            "candidate_suite_counts": {
+                "baseline_known_non_green": len(baseline_failures),
+                "failed": len(baseline_failures),
+                "passed": 741,
+            },
+        }
+    )
+    for results in (
+        known_baseline_qa_line["test_results"],
+        known_baseline_qa_line["payload"]["test_results"],
+    ):
+        results["baseline"] = {"failed": len(baseline_failures)}
+        results["candidate"] = {
+            "failed": len(baseline_failures),
+            "passed": 741,
+        }
+    known_baseline_record["completed_lines"].extend(
+        [known_baseline_graph_line, known_baseline_qa_line]
+    )
+    assert server._contract_runtime_value_reports_failed_qa(
+        known_baseline_qa_line
+    ) is True
+    assert server._contract_runtime_known_baseline_qa_acceptance(
+        known_baseline_qa_line,
+        record=known_baseline_record,
+    ) is True
+    known_baseline_authority, known_baseline_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=known_baseline_record,
+            route_identity=route_identity,
+        )
+    )
+    assert known_baseline_authority is not None
+    assert known_baseline_diagnostics["status"] == "eligible"
+
+    bypass_record = copy.deepcopy(post_qa_record)
+    bypass_record["completed_lines"].append(
+        {
+            "stage_id": "qa",
+            "line_id": "qa_graph_context",
+            "evidence_kind": "contract_line_bypass",
+            "status": "waived",
+            "no_pass_claim": True,
+        }
+    )
+    bypass_authority, bypass_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=bypass_record,
+            route_identity=route_identity,
+        )
+    )
+    assert bypass_authority is None
+    assert "historical/bypass" in " ".join(bypass_diagnostics["errors"])
+
+    rejoin = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "contract_execution_id": successor["contract_execution_id"],
+                "target_project_root": str(worktree),
+                "reason": (
+                    "server-verified QA-passed candidate conflicts with "
+                    "the current target"
+                ),
+                "now_iso": "2999-07-24T10:01:00Z",
+                **route_identity,
+            },
+        )
+    )
+    assert rejoin["reopen_for_revision"] is True
+    assert rejoin["reopen_for_failed_qa_revision"] is False
+    assert rejoin["reopen_for_post_qa_merge_conflict"] is True
+    assert rejoin["post_qa_merge_conflict_rejoin_diagnostics"]["status"] == (
+        "eligible"
+    )
+    runtime_context = get_branch_context(
+        conn,
+        PID,
+        runtime_context.task_id,
+    )
+    assert runtime_context is not None
+    assert runtime_context.status == STATE_WORKTREE_READY
+    assert runtime_context.last_recovery_action == (
+        "mf_subagent_post_qa_merge_conflict_rejoin_issued"
+    )
+
     missing_target_parent = (
         server._runtime_context_same_lane_worker_commit_recovery(
             post_qa_record,
