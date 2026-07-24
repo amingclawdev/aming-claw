@@ -59,6 +59,7 @@ from .contracts.runtime import (
     ContractRuntimeError,
     LINE_EVIDENCE_OPTIONAL_FIELDS,
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
+    _active_failed_qa_line,
     _active_failed_qa_line_index,
     _line_evidence_from_write,
     _worker_commit_completed_implementation,
@@ -25477,10 +25478,10 @@ def _runtime_context_failed_qa_line_matches_context(
     *,
     context: Any,
 ) -> bool:
-    runtime_context_id, task_id, _parent_task_id = _contract_runtime_context_identity(
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
         context
     )
-    if not runtime_context_id or not task_id:
+    if not runtime_context_id or not task_id or not parent_task_id:
         return False
 
     for candidate in _contract_runtime_mapping_candidates(failed_line):
@@ -25497,13 +25498,156 @@ def _runtime_context_failed_qa_line_matches_context(
         )
         if task_id not in task_values:
             continue
-        # The active runtime-context/task tuple is the durable worker identity.
-        # Older QA rows can carry a stale parent alias from a parent execution
-        # or backlog-shaped caller payload.  That alias must not erase an
-        # otherwise exact worker identity, and it is never sufficient by
-        # itself to authorize a rejoin.
+        if (
+            _contract_runtime_mapping_value(candidate, "parent_task_id")
+            != parent_task_id
+        ):
+            continue
         return True
     return False
+
+
+def _runtime_context_failed_qa_accepted_line_binding(
+    record: Mapping[str, Any],
+    failed_line: Mapping[str, Any],
+    *,
+    context: Any,
+    dispatch_match: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind an accepted-but-noncompleting QA line to the active worker.
+
+    Explicit failed/rejected QA already carries a blocking status.  Accepted
+    no-PASS evidence is subtler: before it can reopen a validated worker, the
+    immutable line must match the exact current runtime/task/parent and the
+    canonical worker commit must match the current worker, fence, and
+    candidate HEAD.  Only the subsequent session-token ref may rotate.
+    """
+
+    status = str(failed_line.get("status") or "").strip().lower()
+    if status not in {"accepted", "passed", "pass", "ok", "succeeded"}:
+        return {
+            "schema_version": (
+                "runtime_context.failed_qa_revision_identity_binding.v1"
+            ),
+            "source": "explicit_failed_qa_status",
+            "server_derived": True,
+            "accepted_no_pass_completion_failure": False,
+        }
+    if not _runtime_context_failed_qa_line_matches_context(
+        failed_line,
+        context=context,
+    ):
+        return {}
+
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    expected_worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    expected_worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    expected_candidate_commit = str(
+        getattr(context, "head_commit", "") or ""
+    ).strip().lower()
+    raw_fence_token = str(getattr(context, "fence_token", "") or "").strip()
+    if not (
+        expected_worker_id
+        and expected_worker_slot_id
+        and raw_fence_token
+        and re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            expected_candidate_commit,
+        )
+    ):
+        return {}
+
+    from .parallel_branch_runtime import runtime_context_secret_hash
+
+    expected_fence_token_hash = runtime_context_secret_hash(raw_fence_token)
+    canonical_worker_commit: Mapping[str, Any] = {}
+    canonical_candidate_commit = ""
+    for line in reversed(list(record.get("completed_lines") or [])):
+        if (
+            not isinstance(line, Mapping)
+            or str(line.get("line_id") or "").strip() != "worker_commit"
+        ):
+            continue
+        if not _contract_runtime_mapping_matches_context(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+        ):
+            continue
+        line_worker_id = _timeline_first_deep_text(line, "worker_id")
+        line_worker_slot_id = _timeline_first_deep_text(
+            line,
+            "worker_slot_id",
+        )
+        line_fence_token_hash = _timeline_first_deep_text(
+            line,
+            "fence_token_hash",
+        )
+        if (
+            line_worker_id != expected_worker_id
+            or line_worker_slot_id != expected_worker_slot_id
+            or line_fence_token_hash != expected_fence_token_hash
+        ):
+            continue
+        commit_values = {
+            str(value or "").strip().lower()
+            for value in (
+                line.get("commit_sha"),
+                _timeline_first_deep_text(line, "worker_commit_sha"),
+                _timeline_first_deep_text(line, "head_commit"),
+                _timeline_first_deep_text(line, "immutable_head_commit"),
+                _timeline_first_deep_text(line, "validated_head_commit"),
+            )
+            if str(value or "").strip()
+        }
+        if commit_values != {expected_candidate_commit}:
+            continue
+        canonical_worker_commit = line
+        canonical_candidate_commit = expected_candidate_commit
+        break
+    if not canonical_worker_commit:
+        return {}
+
+    failed_commit = str(
+        failed_line.get("commit_sha")
+        or _timeline_first_deep_text(failed_line, "candidate_commit_sha")
+        or _timeline_first_deep_text(failed_line, "candidate_commit")
+        or ""
+    ).strip().lower()
+    if failed_commit != canonical_candidate_commit:
+        return {}
+
+    binding = {
+        "schema_version": (
+            "runtime_context.failed_qa_revision_identity_binding.v1"
+        ),
+        "source": (
+            "contract_runtime_active_failed_qa+canonical_worker_commit+"
+            "branch_runtime_context"
+        ),
+        "server_derived": True,
+        "accepted_no_pass_completion_failure": True,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": expected_worker_id,
+        "worker_slot_id": expected_worker_slot_id,
+        "fence_token_hash": expected_fence_token_hash,
+        "candidate_commit_sha": canonical_candidate_commit,
+        "dispatch_source_ref": str(dispatch_match.get("source_ref") or ""),
+        "worker_commit_source": "ContractRuntime.completed_lines.worker_commit",
+        "raw_fence_token_exposed": False,
+        "raw_session_token_exposed": False,
+    }
+    binding["binding_hash"] = stable_sha256(binding)
+    return binding
 
 
 def _runtime_context_failed_qa_revision_contract_runtime_evidence(
@@ -25561,6 +25705,14 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
             context=context,
         ):
             continue
+        identity_binding = _runtime_context_failed_qa_accepted_line_binding(
+            record,
+            failed_line,
+            context=context,
+            dispatch_match=dispatch_match,
+        )
+        if not identity_binding:
+            continue
         contract_execution_id = str(record.get("contract_execution_id") or "")
         line_index = failed_line.get("_completed_line_index")
         source_ref = (
@@ -25589,6 +25741,7 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
             ),
             "failed_qa_source_ref": source_ref,
             "dispatch_source_ref": str(dispatch_match.get("source_ref") or ""),
+            "identity_binding": identity_binding,
             "runtime_context_id": _contract_runtime_context_identity(context)[0],
             "task_id": str(getattr(context, "task_id", "") or ""),
             "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
@@ -27882,7 +28035,10 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         task_id=task_id,
     )
     completed_lines = list(record.get("completed_lines") or [])
-    failed_qa_index = _active_failed_qa_line_index(completed_lines)
+    failed_qa_index = _active_failed_qa_line_index(
+        completed_lines,
+        source_record=record,
+    )
     from . import task_timeline
 
     timeline_events = task_timeline.list_events(
@@ -75183,22 +75339,18 @@ def _contract_runtime_latest_failed_qa_line(
     completed_lines = record.get("completed_lines")
     if not isinstance(completed_lines, list):
         return {}
-    for index, line in reversed(list(enumerate(completed_lines))):
-        if not isinstance(line, Mapping):
-            continue
-        if str(line.get("line_id") or "").strip() != "qa_independent_verification":
-            continue
-        if _contract_runtime_known_baseline_qa_acceptance(
-            line,
-            record=record,
-        ):
-            return {}
-        if not _contract_runtime_value_reports_failed_qa(line):
-            return {}
-        enriched = dict(line)
-        enriched["_completed_line_index"] = index
-        return enriched
-    return {}
+    index, line = _active_failed_qa_line(
+        completed_lines,
+        source_record=record,
+    )
+    if index < 0 or not line:
+        return {}
+    enriched = dict(line)
+    enriched["_completed_line_index"] = index
+    enriched["_failure_selection_source"] = (
+        "ContractRuntime.active_failed_qa_completion_state"
+    )
+    return enriched
 
 
 def _contract_runtime_last_blocked_line(

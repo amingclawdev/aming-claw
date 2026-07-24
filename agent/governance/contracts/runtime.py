@@ -2526,6 +2526,31 @@ def _active_failed_qa_line_index(
     return failed_index
 
 
+def _active_failed_qa_line(
+    lines: Sequence[Mapping[str, Any]],
+    *,
+    source_record: Mapping[str, Any] | None = None,
+) -> tuple[int, Mapping[str, Any]]:
+    """Return the QA line selected by the canonical completion state machine.
+
+    Runtime Context recovery must not maintain a second, looser definition of
+    failed independent QA.  In particular, an accepted no-PASS line whose
+    redundant result counts disagree with its immutable baseline ledger is an
+    active failed-QA boundary even when candidate-new failures are zero.
+    """
+
+    failed_index = _active_failed_qa_line_index(
+        lines,
+        source_record=source_record,
+    )
+    if failed_index < 0 or failed_index >= len(lines):
+        return -1, {}
+    failed_line = lines[failed_index]
+    if not isinstance(failed_line, Mapping):
+        return -1, {}
+    return failed_index, failed_line
+
+
 def _attach_failed_qa_rework_guidance(
     guide: dict[str, Any],
     *,
