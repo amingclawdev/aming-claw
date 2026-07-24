@@ -29977,6 +29977,47 @@ def _runtime_context_finish_attestation_git_scope(
     }
 
 
+def _runtime_context_finish_attestation_verifier_scope(
+    payload: Mapping[str, Any],
+    *,
+    worktree_path: str,
+    changed_files: Sequence[str],
+    owned_files: Sequence[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Adapt a strictly contained worker fence for the legacy exact-list verifier."""
+
+    fence_containment = _worker_fence_containment(
+        changed_files,
+        owned_files,
+        repository_root=worktree_path,
+    )
+    if not fence_containment["ok"]:
+        raise GovernanceError(
+            "finish_attestation_owned_scope_invalid",
+            "finish-time worker attestation changed files fall outside the "
+            "allocated owned-file fence",
+            422,
+            {
+                "changed_files": list(changed_files),
+                "owned_files": list(owned_files),
+                "fence_containment": fence_containment,
+                "fail_closed": True,
+                "next_legal_action": (
+                    "stop_and_report_finish_attestation_owned_scope"
+                ),
+            },
+        )
+
+    verifier_payload = dict(payload)
+    # worker_transcript_verify retains an exact-file compatibility check. The
+    # authoritative recursive-directory decision above runs first, so its
+    # verifier-only view can safely use the already-proven concrete diff.
+    verifier_payload["owned_files"] = list(
+        fence_containment["normalized_changed_files"]
+    )
+    return verifier_payload, fence_containment
+
+
 def _runtime_context_contract_worker_commit_projection(
     conn,
     *,
@@ -30942,7 +30983,16 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         for key, value in route_lineage_payload.items():
             if value:
                 attestation_payload[key] = value
-        attestation = verify_worker_transcript(attestation_payload)
+        (
+            transcript_verifier_payload,
+            owned_fence_containment,
+        ) = _runtime_context_finish_attestation_verifier_scope(
+            attestation_payload,
+            worktree_path=worktree_path,
+            changed_files=changed_files,
+            owned_files=attestation_git_scope["owned_files"],
+        )
+        attestation = verify_worker_transcript(transcript_verifier_payload)
         if not attestation.get("ok"):
             raise ValidationError(
                 "finish-time worker attestation blocked: "
@@ -30978,6 +31028,8 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "contract_worker_commit_evidence": finish_order_projection,
             "finish_order_projection": finish_order_projection,
             "changed_files": changed_files,
+            "owned_files": list(attestation_git_scope["owned_files"]),
+            "owned_fence_containment": owned_fence_containment,
             "graph_trace_ids": verified_graph_trace_ids,
             "read_receipt_hash": read_receipt_hash,
             "read_receipt_event_id": read_receipt_event_id,
@@ -31046,6 +31098,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         response["no_pass"] = True
         response["overall_release_pass_claimed"] = False
     response["finish_order_projection"] = finish_order_projection
+    response["owned_fence_containment"] = owned_fence_containment
     response["contract_runtime_canonical_line"] = canonical_contract_line
     response["next_legal_action"] = "record_finish_gate"
     response["next_action"] = {

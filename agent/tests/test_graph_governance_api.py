@@ -842,6 +842,135 @@ def test_worker_fence_containment_rejects_symlink_escape(tmp_path):
     assert result["canonical_escape_files"] == ["dashboard_link/index.html"]
 
 
+def test_finish_attestation_verifier_scope_accepts_owned_directory_descendants(
+    tmp_path,
+):
+    from agent.governance.worker_transcript_verify import verify_worker_transcript
+
+    worktree = tmp_path / "finish-attestation-directory-scope"
+    worktree.mkdir()
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "worker@example.test"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Worker Scope Test"],
+        cwd=worktree,
+        check=True,
+    )
+    (worktree / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True)
+    base_commit = batch_jobs.git_commit(worktree)
+
+    changed_files = [
+        "agent/governance/dashboard_dist/assets/index-test.js",
+        "agent/governance/dashboard_dist/index.html",
+    ]
+    for changed_file in changed_files:
+        path = worktree / changed_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{changed_file}\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/dashboard_dist"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "dashboard assets"],
+        cwd=worktree,
+        check=True,
+    )
+    head_commit = batch_jobs.git_commit(worktree)
+    payload = {
+        "attestation_phase": "finish",
+        "worker_session_id": "worker-directory-scope",
+        "filer_principal": "worker-directory-scope",
+        "worker_transcript_ref": "multi_agent:worker-directory-scope",
+        "harness_type": "codex",
+        "task_id": "task-directory-scope",
+        "runtime_context_id": "mfrctx-directory-scope",
+        "fence_token": "fence-directory-scope",
+        "worktree_path": str(worktree),
+        "branch_ref": "refs/heads/worker-directory-scope",
+        "base_commit": base_commit,
+        "head_commit": head_commit,
+        "changed_files": changed_files,
+        "owned_files": ["agent/governance/dashboard_dist/"],
+        "graph_trace_ids": ["gqt-directory-scope"],
+        "graph_trace_db_evidence": {
+            "db_verified": True,
+            "verified_trace_ids": ["gqt-directory-scope"],
+        },
+        "observer_command_id": "cmd-directory-scope",
+        "read_receipt_hash": "sha256:read-directory-scope",
+        "read_receipt_event_id": "17254",
+        "route_token_ref": "rtok-directory-scope",
+    }
+
+    verifier_payload, containment = (
+        server._runtime_context_finish_attestation_verifier_scope(
+            payload,
+            worktree_path=str(worktree),
+            changed_files=changed_files,
+            owned_files=["agent/governance/dashboard_dist/"],
+        )
+    )
+
+    assert payload["owned_files"] == ["agent/governance/dashboard_dist/"]
+    assert containment["ok"] is True
+    assert containment["normalized_owned_files"] == [
+        "agent/governance/dashboard_dist/"
+    ]
+    assert verifier_payload["owned_files"] == changed_files
+    assert verify_worker_transcript(verifier_payload)["ok"] is True
+
+
+@pytest.mark.parametrize(
+    ("changed_files", "owned_files"),
+    [
+        (
+            ["agent/governance/dashboard_dist-escape/index.html"],
+            ["agent/governance/dashboard_dist/"],
+        ),
+        (
+            ["agent/governance/dashboard_dist/index.html"],
+            ["agent/governance/dashboard_dist"],
+        ),
+        (
+            ["agent/governance/dashboard_dist/../server.py"],
+            ["agent/governance/dashboard_dist/"],
+        ),
+        (
+            [r"agent\governance\dashboard_dist\index.html"],
+            ["agent/governance/dashboard_dist/"],
+        ),
+        (
+            ["/agent/governance/dashboard_dist/index.html"],
+            ["agent/governance/dashboard_dist/"],
+        ),
+    ],
+)
+def test_finish_attestation_verifier_scope_rejects_unowned_or_alias_paths(
+    tmp_path,
+    changed_files,
+    owned_files,
+):
+    with pytest.raises(GovernanceError) as exc:
+        server._runtime_context_finish_attestation_verifier_scope(
+            {"owned_files": list(owned_files)},
+            worktree_path=str(tmp_path),
+            changed_files=changed_files,
+            owned_files=owned_files,
+        )
+
+    assert exc.value.code == "finish_attestation_owned_scope_invalid"
+    assert exc.value.details["fail_closed"] is True
+    assert exc.value.details["fence_containment"]["ok"] is False
+
+
 def test_contract_runtime_worker_commit_proof_accepts_exact_active_worker_commit():
     record, write = _worker_commit_contract_proof()
 
