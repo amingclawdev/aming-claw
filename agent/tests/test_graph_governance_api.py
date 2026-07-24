@@ -64772,6 +64772,151 @@ def test_dependency_revalidation_recovers_only_source_backed_qa_candidate(
             target_ref="target",
         )
 
+    baseline_record = copy.deepcopy(_known_baseline_accepted_qa_record())
+    baseline_record.update(
+        {
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+        }
+    )
+    baseline_record["completed_lines"][0] = copy.deepcopy(
+        record["completed_lines"][0]
+    )
+    graph_line = baseline_record["completed_lines"][1]
+    graph_line["commit_sha"] = candidate_commit
+    graph_evidence = graph_line["payload"]["graph_trace_evidence"]
+    graph_evidence["base_commit_sha"] = base_commit
+    graph_evidence["candidate_commit_sha"] = candidate_commit
+    qa_line = baseline_record["completed_lines"][2]
+    qa_line.update(
+        {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": execution_id,
+            "commit_sha": candidate_commit,
+        }
+    )
+    qa_line["payload"].update(
+        {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": execution_id,
+        }
+    )
+    failures = [f"test_live_baseline_{index:02d}" for index in range(17)]
+    for results in (
+        qa_line["test_results"],
+        qa_line["payload"]["test_results"],
+    ):
+        results["baseline"] = {"failed": 17}
+        results["candidate"] = {"failed": 17, "passed": 741}
+    ledger = qa_line["artifact_refs"]["external_no_pass_baseline_ledger"]
+    ledger.update(
+        {
+            "base_commit_sha": base_commit,
+            "candidate_commit_sha": candidate_commit,
+            "base_failure_identities": failures,
+            "candidate_failure_identities": failures,
+            "base_reproduction": {
+                "reproduced": 17,
+                "total": 17,
+                "failure_identities": failures,
+            },
+            "candidate_suite_counts": {
+                "baseline_known_non_green": 17,
+                "failed": 17,
+                "passed": 741,
+            },
+        }
+    )
+    fake_store.get = lambda requested: baseline_record
+    assert server._contract_runtime_value_reports_failed_qa(qa_line) is True
+    assert server._contract_runtime_known_baseline_qa_acceptance(
+        qa_line,
+        record=baseline_record,
+    ) is True
+    baseline_authority = (
+        server._dependency_revalidation_qa_candidate_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            queue_item=queue_item,
+            current_target_head=target_commit,
+            target_ref="target",
+        )
+    )
+    assert baseline_authority is not None
+    assert baseline_authority.candidate_commit == candidate_commit
+    assert baseline_authority.qa_source_ref.endswith(":completed_lines:2")
+
+    def assert_baseline_mutation_fails_closed(mutate) -> None:
+        mutated = copy.deepcopy(baseline_record)
+        mutate(mutated["completed_lines"][2])
+        fake_store.get = lambda requested: mutated
+        with pytest.raises(
+            GovernanceError,
+            match="later independent QA-passed line",
+        ):
+            server._dependency_revalidation_qa_candidate_authority(
+                conn,
+                project_id=PID,
+                context=runtime_context,
+                queue_item=queue_item,
+                current_target_head=target_commit,
+                target_ref="target",
+            )
+
+    assert_baseline_mutation_fails_closed(
+        lambda line: line.update({"status": "failed"})
+    )
+    assert_baseline_mutation_fails_closed(
+        lambda line: line.update({"status": "blocked"})
+    )
+    assert_baseline_mutation_fails_closed(
+        lambda line: line.update({"verdict": "rejected"})
+    )
+    assert_baseline_mutation_fails_closed(
+        lambda line: line["payload"].update({"candidate_new_failures": 1})
+    )
+    assert_baseline_mutation_fails_closed(
+        lambda line: line["artifact_refs"][
+            "external_no_pass_baseline_ledger"
+        ]["candidate_failure_identities"].append("test_candidate_only")
+    )
+    assert_baseline_mutation_fails_closed(
+        lambda line: line["artifact_refs"][
+            "external_no_pass_baseline_ledger"
+        ].update({"schema_version": "forged"})
+    )
+    assert_baseline_mutation_fails_closed(
+        lambda line: line["artifact_refs"].pop(
+            "external_no_pass_baseline_ledger"
+        )
+    )
+    assert_baseline_mutation_fails_closed(
+        lambda line: line.pop("qa_evidence_provenance")
+    )
+    assert_baseline_mutation_fails_closed(
+        lambda line: line["qa_evidence_provenance"].update(
+            {"authorization_source": "forged"}
+        )
+    )
+    assert_baseline_mutation_fails_closed(
+        lambda line: line.update({"observer_impersonation": True})
+    )
+    assert_baseline_mutation_fails_closed(
+        lambda line: line.update({"commit_sha": "f" * 40})
+    )
+    assert_baseline_mutation_fails_closed(
+        lambda line: line.update(
+            {"runtime_context_id": "mfrctx-forged-candidate"}
+        )
+    )
+    assert_baseline_mutation_fails_closed(
+        lambda line: line.update({"task_id": "forged-task"})
+    )
+
 
 def test_runtime_context_worker_guide_ambiguous_resolution_does_not_override(
     conn,
