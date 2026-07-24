@@ -10964,12 +10964,6 @@ def retarget_post_qa_rejoin_runtime_authority(
     authority_hash = str(authority_payload.pop("authority_hash") or "")
     if (
         context.status != STATE_WORKTREE_READY
-        or context.last_recovery_action
-        not in {
-            "mf_subagent_post_qa_merge_conflict_rejoin_issued",
-            "mf_subagent_post_qa_rejoin_retarget_issued",
-            "mf_subagent_session_token_rejoin_issued",
-        }
         or any(
             str(getattr(authority, field_name, "") or "").strip()
             != str(expected_value or "").strip()

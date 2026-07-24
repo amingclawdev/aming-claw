@@ -26815,6 +26815,9 @@ def _runtime_context_post_qa_rejoin_retarget_authority(
     worker_slot_id = str(
         getattr(context, "worker_slot_id", "") or worker_id
     ).strip()
+    last_recovery_action = str(
+        getattr(context, "last_recovery_action", "") or ""
+    ).strip()
     diagnostics: dict[str, Any] = {
         "schema_version": (
             "runtime_context.post_qa_rejoin_retarget_diagnostics.v1"
@@ -26832,6 +26835,8 @@ def _runtime_context_post_qa_rejoin_retarget_authority(
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "merge_queue_id": merge_queue_id,
+        "last_recovery_action": last_recovery_action,
+        "last_recovery_action_authoritative": False,
         "errors": [],
     }
     errors: list[str] = diagnostics["errors"]
@@ -26839,11 +26844,6 @@ def _runtime_context_post_qa_rejoin_retarget_authority(
         STATE_WORKTREE_READY
     ):
         errors.append("runtime context is not an active worktree_ready rejoin")
-    if str(getattr(context, "last_recovery_action", "") or "").strip() not in {
-        "mf_subagent_post_qa_merge_conflict_rejoin_issued",
-        "mf_subagent_post_qa_rejoin_retarget_issued",
-    }:
-        errors.append("runtime context lacks typed post-QA rejoin lineage")
     if not all(
         (
             project_id,
@@ -26910,6 +26910,12 @@ def _runtime_context_post_qa_rejoin_retarget_authority(
     if not prior_event:
         errors.append("accepted prior post-QA rejoin authority is missing")
         return None, diagnostics
+    diagnostics.update(
+        {
+            "lineage_source": "latest_accepted_typed_timeline_event",
+            "lineage_event_ref": _runtime_context_event_ref(prior_event),
+        }
+    )
 
     prior_authority_payload = dict(prior_authority)
     prior_authority_hash = str(
