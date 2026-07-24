@@ -18197,6 +18197,11 @@ def _runtime_context_row_scoped_finish_head_projection(
         elif recovery.get("status") == "eligible":
             status = "worker_commit_repair_ready"
             next_legal_action = "record_worker_commit"
+        elif recovery.get("status") == "retarget_required":
+            status = "post_qa_current_target_sync_required"
+            next_legal_action = (
+                "merge_current_target_and_record_worker_commit"
+            )
         elif recovery.get("status") == "blocked":
             status = "worker_commit_drift_blocked"
             next_legal_action = "stop_and_report_worker_commit_drift"
@@ -18246,14 +18251,22 @@ def _runtime_context_row_scoped_finish_head_projection(
                     "repair of the canonical worker_commit."
                     if recovery.get("status") == "blocked"
                     else (
-                        "The branch HEAD moved after implementation evidence. Record that "
-                        "exact clean immutable HEAD through runtime_context.worker_commit "
-                        "before any finish-time attestation."
-                        if mismatch
+                        (
+                            "The post-QA lane was retargeted after reopen. Merge the "
+                            "server-derived current target into this same clean worker "
+                            "lane, then record the exact replacement HEAD."
+                        )
+                        if recovery.get("status") == "retarget_required"
                         else (
-                            "Create the bounded implementation commit, then record its exact "
-                            "clean HEAD through runtime_context.worker_commit before finish-time "
-                            "attestation and finish gate."
+                            "The branch HEAD moved after implementation evidence. Record that "
+                            "exact clean immutable HEAD through runtime_context.worker_commit "
+                            "before any finish-time attestation."
+                            if mismatch
+                            else (
+                                "Create the bounded implementation commit, then record its exact "
+                                "clean HEAD through runtime_context.worker_commit before finish-time "
+                                "attestation and finish gate."
+                            )
                         )
                     )
                 )
@@ -26676,6 +26689,461 @@ def _runtime_context_post_qa_merge_conflict_rejoin_authority(
     return authority, diagnostics
 
 
+def _runtime_context_latest_post_qa_rejoin_authority_event(
+    timeline_events: Sequence[Mapping[str, Any]],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    retarget_only: bool = False,
+) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    """Return the newest accepted typed rejoin authority for one worker lane."""
+
+    def event_order(event: Mapping[str, Any]) -> int:
+        raw = str(event.get("id") or event.get("event_id") or "0").strip()
+        return int(raw) if raw.isdigit() else 0
+
+    for event in sorted(timeline_events, key=event_order, reverse=True):
+        if not isinstance(event, Mapping):
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        retarget = payload.get("post_qa_rejoin_retarget_authority")
+        conflict = payload.get("post_qa_merge_conflict_rejoin_authority")
+        authority = (
+            retarget
+            if isinstance(retarget, Mapping) and retarget
+            else {}
+            if retarget_only
+            else conflict
+            if isinstance(conflict, Mapping) and conflict
+            else {}
+        )
+        if (
+            str(event.get("event_type") or "").strip()
+            == "observer.runtime_context_session_token_rejoin"
+            and str(event.get("status") or "").strip() == "accepted"
+            and str(payload.get("runtime_context_id") or "").strip()
+            == runtime_context_id
+            and str(payload.get("task_id") or "").strip() == task_id
+            and (
+                not retarget_only
+                or payload.get("reopen_for_post_qa_target_retarget") is True
+            )
+            and authority
+        ):
+            return event, payload, authority
+    return {}, {}, {}
+
+
+def _runtime_context_current_target_preview(
+    *,
+    worktree_path: str,
+    target_ref: str,
+    expected_target_head: str,
+) -> dict[str, Any]:
+    """Read one clean worker HEAD and a stable server-side target preview."""
+
+    from . import batch_jobs
+    from .parallel_branch_runtime import git_merge_preview_evidence
+
+    try:
+        actual_head = batch_jobs.git_commit(worktree_path)
+        dirty_files = _runtime_context_git_dirty_files(worktree_path)
+        target_before = batch_jobs.git_commit(worktree_path, ref=target_ref)
+        preview = git_merge_preview_evidence(
+            repo_root_path=worktree_path,
+            target_ref=target_ref,
+            branch_ref=actual_head,
+            expected_target_head=expected_target_head or target_before,
+        )
+        target_after = batch_jobs.git_commit(worktree_path, ref=target_ref)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return {"error": str(exc)}
+    return {
+        "actual_head": actual_head,
+        "dirty_files": dirty_files,
+        "target_before": target_before,
+        "target_after": target_after,
+        "preview": preview,
+    }
+
+
+def _runtime_context_post_qa_rejoin_retarget_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    record: Mapping[str, Any],
+    route_identity: Mapping[str, Any],
+    timeline_events: Sequence[Mapping[str, Any]],
+) -> tuple[Any | None, dict[str, Any]]:
+    """Refresh target authority after a typed post-QA rejoin is already open."""
+
+    from .parallel_branch_runtime import (
+        PostQaRejoinRetargetAuthority,
+        STATE_MERGE_READY,
+        STATE_QUEUED_FOR_MERGE,
+        STATE_WORKTREE_READY,
+        list_merge_queue_items,
+    )
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    merge_queue_id = str(
+        getattr(context, "merge_queue_id", "") or ""
+    ).strip()
+    branch_ref = str(getattr(context, "branch_ref", "") or "").strip()
+    target_project_root = _runtime_context_effective_target_project_root(
+        context
+    )
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    owned_files = tuple(
+        str(value or "").strip()
+        for value in (
+            getattr(context, "owned_files", ())
+            or getattr(context, "target_files", ())
+            or ()
+        )
+        if str(value or "").strip()
+    )
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    diagnostics: dict[str, Any] = {
+        "schema_version": (
+            "runtime_context.post_qa_rejoin_retarget_diagnostics.v1"
+        ),
+        "status": "blocked",
+        "eligible": False,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": backlog_id,
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "merge_queue_id": merge_queue_id,
+        "errors": [],
+    }
+    errors: list[str] = diagnostics["errors"]
+    if str(getattr(context, "status", "") or "").strip() != (
+        STATE_WORKTREE_READY
+    ):
+        errors.append("runtime context is not an active worktree_ready rejoin")
+    if str(getattr(context, "last_recovery_action", "") or "").strip() not in {
+        "mf_subagent_post_qa_merge_conflict_rejoin_issued",
+        "mf_subagent_post_qa_rejoin_retarget_issued",
+    }:
+        errors.append("runtime context lacks typed post-QA rejoin lineage")
+    if not all(
+        (
+            project_id,
+            backlog_id,
+            runtime_context_id,
+            task_id,
+            parent_task_id,
+            merge_queue_id,
+            branch_ref,
+            target_project_root,
+            worktree_path,
+            owned_files,
+            worker_id,
+            worker_slot_id,
+        )
+    ):
+        errors.append("runtime/worker/file-fence identity is incomplete")
+    if (
+        str(record.get("project_id") or "").strip()
+        != str(project_id or "").strip()
+        or str(record.get("backlog_id") or "").strip() != backlog_id
+        or not _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+    ):
+        errors.append("ContractRuntime project/backlog/contract identity mismatch")
+    next_action = (
+        record.get("runtime_guide", {}).get("next_legal_action", {})
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    if str(next_action.get("line_id") or "").strip() != "observer_merge":
+        errors.append("ContractRuntime is not at the post-QA observer_merge line")
+    if any(
+        isinstance(line, Mapping)
+        and (
+            str(line.get("evidence_kind") or "").strip()
+            == "contract_line_bypass"
+            or str(line.get("line_id") or "").strip()
+            == "contract_line_bypass"
+        )
+        for line in record.get("completed_lines") or []
+    ):
+        errors.append("historical/bypass ContractRuntime contexts cannot retarget")
+    if errors:
+        return None, diagnostics
+
+    safe_route_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if not all(safe_route_identity.values()):
+        errors.append("active route identity is incomplete")
+        return None, diagnostics
+    route_identity_hash = stable_sha256(safe_route_identity)
+
+    prior_event, prior_payload, prior_authority = (
+        _runtime_context_latest_post_qa_rejoin_authority_event(
+            timeline_events,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        )
+    )
+    if not prior_event:
+        errors.append("accepted prior post-QA rejoin authority is missing")
+        return None, diagnostics
+
+    prior_authority_payload = dict(prior_authority)
+    prior_authority_hash = str(
+        prior_authority_payload.pop("authority_hash", "") or ""
+    ).strip()
+    prior_schema = str(prior_authority.get("schema_version") or "").strip()
+    if (
+        prior_schema
+        not in {
+            "parallel_branch.post_qa_merge_conflict_rejoin_authority.v1",
+            "parallel_branch.post_qa_rejoin_retarget_authority.v1",
+        }
+        or prior_authority.get("server_derived") is not True
+        or prior_authority.get("caller_claims_trusted") is not False
+        or prior_authority.get("historical_bypass_context") is not False
+        or not prior_authority_hash.startswith("sha256:")
+        or prior_authority_hash != stable_sha256(prior_authority_payload)
+    ):
+        errors.append("prior post-QA rejoin authority is invalid")
+    for field, expected in (
+        ("project_id", str(project_id or "").strip()),
+        ("backlog_id", backlog_id),
+        ("task_id", task_id),
+        ("parent_task_id", parent_task_id),
+        ("runtime_context_id", runtime_context_id),
+        ("merge_queue_id", merge_queue_id),
+        ("branch_ref", branch_ref),
+        ("target_project_root", target_project_root),
+        ("worktree_path", worktree_path),
+    ):
+        if str(prior_authority.get(field) or "").strip() != expected:
+            errors.append(f"prior post-QA rejoin {field} identity mismatch")
+    if tuple(prior_authority.get("owned_files") or ()) != owned_files:
+        errors.append("prior post-QA rejoin owned-file fence mismatch")
+    if (
+        str(prior_payload.get("worker_id") or "").strip() != worker_id
+        or str(
+            prior_payload.get("worker_slot_id")
+            or prior_payload.get("worker_id")
+            or ""
+        ).strip()
+        != worker_slot_id
+    ):
+        errors.append("prior post-QA rejoin worker identity mismatch")
+    if str(prior_authority.get("route_identity_hash") or "").strip() != (
+        route_identity_hash
+    ):
+        errors.append("prior post-QA rejoin route identity mismatch")
+
+    candidate_commit = str(
+        prior_authority.get("candidate_commit") or ""
+    ).strip()
+    prior_target_head = str(
+        prior_authority.get("current_target_head") or ""
+    ).strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", candidate_commit):
+        errors.append("prior candidate commit is not a full SHA")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", prior_target_head):
+        errors.append("prior target head is not a full SHA")
+
+    completed_worker_commit = next(
+        (
+            line
+            for line in reversed(record.get("completed_lines") or [])
+            if isinstance(line, Mapping)
+            and str(line.get("line_id") or "").strip() == "worker_commit"
+            and _runtime_context_contract_line_matches_worker(
+                line,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+            )
+            and str(
+                line.get("commit_sha")
+                or (
+                    line.get("payload", {}).get("worker_commit_sha")
+                    if isinstance(line.get("payload"), Mapping)
+                    else ""
+                )
+                or ""
+            ).strip()
+            == candidate_commit
+        ),
+        None,
+    )
+    if completed_worker_commit is None:
+        errors.append("prior candidate lacks exact source-backed worker_commit")
+
+    items = list_merge_queue_items(conn, project_id, merge_queue_id)
+    matches = [item for item in items if item.task_id == task_id]
+    if len(matches) != 1:
+        errors.append("durable merge queue task identity is missing or ambiguous")
+        return None, diagnostics
+    item = matches[0]
+    queue_previous_target = str(
+        item.current_target_head or item.validated_target_head or ""
+    ).strip()
+    if str(item.backlog_id or "").strip() != backlog_id:
+        errors.append("durable merge queue backlog identity mismatch")
+    if str(item.branch_ref or "").strip() != branch_ref:
+        errors.append("durable merge queue branch identity mismatch")
+    if str(item.branch_head or "").strip() != candidate_commit:
+        errors.append("durable merge queue candidate differs from prior worker_commit")
+    if str(item.status or "").strip() not in {
+        STATE_MERGE_READY,
+        STATE_QUEUED_FOR_MERGE,
+    }:
+        errors.append("durable merge queue is not retargetable")
+    target_ref = str(item.target_ref or "").strip()
+    if not target_ref:
+        errors.append("durable merge queue target ref is missing")
+    if queue_previous_target != prior_target_head:
+        errors.append("durable merge queue prior target identity drifted")
+    if errors:
+        return None, diagnostics
+
+    target_state = _runtime_context_current_target_preview(
+        worktree_path=worktree_path,
+        target_ref=target_ref,
+        expected_target_head="",
+    )
+    if target_state.get("error"):
+        errors.append(
+            f"post-QA rejoin retarget preview failed: {target_state['error']}"
+        )
+        return None, diagnostics
+    actual_worker_head = str(target_state["actual_head"])
+    dirty_files = list(target_state["dirty_files"])
+    current_target_head = str(target_state["target_before"])
+    preview = target_state["preview"]
+    diagnostics.update(
+        {
+            "queue_item_id": str(item.queue_item_id or "").strip(),
+            "candidate_commit": candidate_commit,
+            "actual_worker_head": actual_worker_head,
+            "previous_target_head": queue_previous_target,
+            "current_target_head": current_target_head,
+            "dirty_files": dirty_files,
+        }
+    )
+    if dirty_files:
+        errors.append("assigned worktree is dirty")
+    if not _git_commit_is_ancestor(
+        Path(worktree_path),
+        candidate_commit,
+        actual_worker_head,
+    ):
+        errors.append("current worker HEAD is not a descendant of prior candidate")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", current_target_head):
+        errors.append("current durable target ref is not a full SHA")
+    if current_target_head == queue_previous_target:
+        diagnostics.update(
+            {
+                "status": "not_needed",
+                "eligible": False,
+                "errors": [],
+            }
+        )
+        return None, diagnostics
+    if errors:
+        return None, diagnostics
+
+    diagnostics["preview_evidence_id"] = str(
+        preview.get("evidence_id") or ""
+    ).strip()
+    diagnostics["preview_status"] = str(preview.get("status") or "").strip()
+    diagnostics["preview_reason"] = str(preview.get("reason") or "").strip()
+    if str(preview.get("branch_commit") or "").strip() != actual_worker_head:
+        errors.append("post-QA retarget preview worker identity mismatch")
+    if str(preview.get("target_commit") or "").strip() != current_target_head:
+        errors.append("post-QA retarget preview target identity mismatch")
+    if str(target_state["target_after"]) != current_target_head:
+        errors.append("durable merge target moved after retarget preview")
+    if (
+        preview.get("passed") is not True
+        or str(preview.get("status") or "").strip() != "pass"
+    ):
+        errors.append("post-QA retarget requires a current clean preview")
+    if errors:
+        return None, diagnostics
+
+    core = {
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": str(item.queue_item_id or "").strip(),
+        "branch_ref": branch_ref,
+        "target_ref": target_ref,
+        "target_project_root": target_project_root,
+        "worktree_path": worktree_path,
+        "owned_files": owned_files,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "candidate_commit": candidate_commit,
+        "actual_worker_head": actual_worker_head,
+        "previous_target_head": queue_previous_target,
+        "current_target_head": current_target_head,
+        "prior_rejoin_event_ref": _runtime_context_event_ref(prior_event),
+        "prior_rejoin_authority_hash": prior_authority_hash,
+        "merge_preview_id": str(preview.get("evidence_id") or "").strip(),
+        "route_identity_hash": route_identity_hash,
+        "schema_version": (
+            "parallel_branch.post_qa_rejoin_retarget_authority.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "current_preview_passed": True,
+        "historical_bypass_context": False,
+    }
+    authority = PostQaRejoinRetargetAuthority(
+        **{
+            key: value
+            for key, value in core.items()
+            if key != "schema_version"
+        },
+        authority_hash=stable_sha256(core),
+    )
+    diagnostics.update(
+        {
+            "status": "eligible",
+            "eligible": True,
+            "errors": [],
+            "authority_hash": authority.authority_hash,
+            "prior_rejoin_event_ref": authority.prior_rejoin_event_ref,
+            "prior_rejoin_authority_hash": (
+                authority.prior_rejoin_authority_hash
+            ),
+        }
+    )
+    return authority, diagnostics
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/rejoin")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/session-token/rejoin")
 def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestContext):
@@ -26699,6 +27167,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             BranchRuntimeFenceError,
             get_branch_context_by_runtime_context_id,
             rejoin_mf_subagent_runtime_session_token,
+            retarget_post_qa_rejoin_runtime_authority,
             runtime_context_id_for_branch_context,
         )
         from .permissions import require_operator_capability, session_role
@@ -26904,6 +27373,8 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         )
         post_qa_merge_conflict_rejoin_authority = None
         post_qa_merge_conflict_rejoin_diagnostics: dict[str, Any] = {}
+        post_qa_rejoin_retarget_authority = None
+        post_qa_rejoin_retarget_diagnostics: dict[str, Any] = {}
         if (
             not failed_qa_reopen_for_revision
             and resolved_contract_execution_id
@@ -26925,6 +27396,18 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     record=post_qa_record,
                     route_identity=selected_route_identity,
                 )
+                if post_qa_merge_conflict_rejoin_authority is None:
+                    (
+                        post_qa_rejoin_retarget_authority,
+                        post_qa_rejoin_retarget_diagnostics,
+                    ) = _runtime_context_post_qa_rejoin_retarget_authority(
+                        conn,
+                        project_id=project_id,
+                        context=context,
+                        record=post_qa_record,
+                        route_identity=selected_route_identity,
+                        timeline_events=timeline_events,
+                    )
         reopen_for_revision = bool(
             failed_qa_reopen_for_revision
             or post_qa_merge_conflict_rejoin_authority is not None
@@ -26968,10 +27451,63 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     "post_qa_merge_conflict_rejoin_diagnostics": (
                         post_qa_merge_conflict_rejoin_diagnostics
                     ),
+                    "post_qa_rejoin_retarget_diagnostics": (
+                        post_qa_rejoin_retarget_diagnostics
+                    ),
                     "reason": str(exc) or "fence_invalidated_or_unknown",
                     "fail_closed": True,
                 },
             ) from exc
+
+        post_qa_rejoin_retarget_result: dict[str, Any] = {}
+        if post_qa_rejoin_retarget_authority is not None:
+            try:
+                post_qa_rejoin_retarget_result = (
+                    retarget_post_qa_rejoin_runtime_authority(
+                        conn,
+                        project_id=project_id,
+                        runtime_context_id=runtime_context_id,
+                        task_id=task_id,
+                        authority=post_qa_rejoin_retarget_authority,
+                        now_iso=str(body.get("now_iso") or ""),
+                    )
+                )
+            except BranchRuntimeFenceError as exc:
+                raise GovernanceError(
+                    "runtime_context_post_qa_retarget_rejected",
+                    (
+                        "runtime-context post-QA rejoin retarget failed "
+                        "durable scope validation"
+                    ),
+                    409,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": task_id,
+                        "post_qa_rejoin_retarget_diagnostics": (
+                            post_qa_rejoin_retarget_diagnostics
+                        ),
+                        "reason": str(exc) or "fence_invalidated_or_unknown",
+                        "next_legal_action": (
+                            "stop_and_report_post_qa_retarget_drift"
+                        ),
+                        "fail_closed": True,
+                    },
+                ) from exc
+            context = get_branch_context_by_runtime_context_id(
+                conn,
+                project_id,
+                runtime_context_id,
+            )
+            if context is None:
+                raise GovernanceError(
+                    "runtime_context_not_found",
+                    "runtime context disappeared after post-QA retarget",
+                    409,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "fail_closed": True,
+                    },
+                )
 
         # The branch-runtime primitive changes revision counters only when it
         # moves a validated/merge-ready context back to worktree-ready under a
@@ -26984,10 +27520,24 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         result["reopen_for_post_qa_merge_conflict"] = bool(
             post_qa_merge_conflict_rejoin_authority is not None
         )
+        result["reopen_for_post_qa_target_retarget"] = bool(
+            post_qa_rejoin_retarget_authority is not None
+        )
         result["timeline_reopen_for_revision"] = timeline_reopen_for_revision
         if post_qa_merge_conflict_rejoin_diagnostics:
             result["post_qa_merge_conflict_rejoin_diagnostics"] = dict(
                 post_qa_merge_conflict_rejoin_diagnostics
+            )
+        if post_qa_rejoin_retarget_diagnostics:
+            result["post_qa_rejoin_retarget_diagnostics"] = dict(
+                post_qa_rejoin_retarget_diagnostics
+            )
+        if post_qa_rejoin_retarget_authority is not None:
+            result["post_qa_rejoin_retarget_authority"] = asdict(
+                post_qa_rejoin_retarget_authority
+            )
+            result["post_qa_rejoin_retarget_result"] = dict(
+                post_qa_rejoin_retarget_result
             )
 
         safe_route_identity = {
@@ -27106,6 +27656,17 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 ),
                 "post_qa_merge_conflict_rejoin_diagnostics": (
                     post_qa_merge_conflict_rejoin_diagnostics
+                ),
+                "post_qa_rejoin_retarget_diagnostics": (
+                    post_qa_rejoin_retarget_diagnostics
+                ),
+                "post_qa_rejoin_retarget_authority": (
+                    asdict(post_qa_rejoin_retarget_authority)
+                    if post_qa_rejoin_retarget_authority is not None
+                    else {}
+                ),
+                "post_qa_rejoin_retarget_result": (
+                    post_qa_rejoin_retarget_result
                 ),
                 "runtime_context_id": runtime_context_id_for_branch_context(context),
                 "route_identity_source": safe_route_source,
@@ -27876,6 +28437,276 @@ _POST_QA_MERGE_CONFLICT_RESET_LINE_IDS = frozenset(
 )
 
 
+def _runtime_context_server_revalidated_post_qa_retarget_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    recorded_commit: str,
+) -> dict[str, Any]:
+    """Revalidate a durable retarget issued after the original lane reopen."""
+
+    from .parallel_branch_runtime import (
+        STATE_QUEUED_FOR_MERGE,
+        STATE_WORKTREE_READY,
+        list_merge_queue_items,
+    )
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    merge_queue_id = str(
+        getattr(context, "merge_queue_id", "") or ""
+    ).strip()
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    owned_files = tuple(
+        getattr(context, "owned_files", ())
+        or getattr(context, "target_files", ())
+        or ()
+    )
+    authority: dict[str, Any] = {
+        "schema_version": (
+            "runtime_context.server_revalidated_post_qa_retarget_authority.v1"
+        ),
+        "status": "blocked",
+        "verified": False,
+        "server_revalidated": False,
+        "server_derived": True,
+        "retarget_after_open": True,
+        "source": "durable_post_qa_retarget+server_git_merge_preview",
+        "source_of_authority": (
+            "task_timeline.post_qa_retarget+parallel_branch_merge_queue_items"
+        ),
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": backlog_id,
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": "",
+        "recorded_candidate_commit": str(recorded_commit or "").strip(),
+        "target_ref": "",
+        "current_target_parent_commit": "",
+        "current_target_after_preview_commit": "",
+        "retarget_authority_hash": "",
+        "retarget_event_ref": "",
+        "retarget_preview_evidence_id": "",
+        "preview_evidence_id": "",
+        "preview_status": "",
+        "preview_reason": "",
+        "errors": [],
+        "raw_preview_output_persisted": False,
+    }
+    errors: list[str] = authority["errors"]
+    if conn is None:
+        errors.append("durable merge queue connection is required")
+        return authority
+    if (
+        str(getattr(context, "status", "") or "").strip()
+        != STATE_WORKTREE_READY
+        or str(
+            getattr(context, "last_recovery_action", "") or ""
+        ).strip()
+        not in {
+            "mf_subagent_post_qa_rejoin_retarget_issued",
+            "mf_subagent_post_qa_replacement_worker_commit_recorded",
+        }
+    ):
+        errors.append("runtime context lacks active post-QA retarget state")
+        return authority
+
+    timeline_events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
+
+    retarget_event, retarget_payload, persisted_authority = (
+        _runtime_context_latest_post_qa_rejoin_authority_event(
+            timeline_events,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            retarget_only=True,
+        )
+    )
+    if not retarget_event:
+        errors.append("accepted post-QA retarget event is missing")
+        return authority
+
+    persisted_payload = dict(persisted_authority)
+    persisted_hash = str(
+        persisted_payload.pop("authority_hash", "") or ""
+    ).strip()
+    authority["retarget_authority_hash"] = persisted_hash
+    authority["retarget_event_ref"] = _runtime_context_event_ref(
+        retarget_event
+    )
+    authority["retarget_preview_evidence_id"] = str(
+        persisted_authority.get("merge_preview_id") or ""
+    ).strip()
+    if (
+        str(persisted_authority.get("schema_version") or "").strip()
+        != "parallel_branch.post_qa_rejoin_retarget_authority.v1"
+        or persisted_authority.get("server_derived") is not True
+        or persisted_authority.get("caller_claims_trusted") is not False
+        or persisted_authority.get("current_preview_passed") is not True
+        or persisted_authority.get("historical_bypass_context") is not False
+        or not persisted_hash.startswith("sha256:")
+        or persisted_hash != stable_sha256(persisted_payload)
+    ):
+        errors.append("persisted post-QA retarget authority is invalid")
+    for field, expected in (
+        ("project_id", str(project_id or "").strip()),
+        ("backlog_id", backlog_id),
+        ("task_id", task_id),
+        ("runtime_context_id", runtime_context_id),
+        ("merge_queue_id", merge_queue_id),
+        ("candidate_commit", str(recorded_commit or "").strip()),
+        ("worker_id", worker_id),
+        ("worker_slot_id", worker_slot_id),
+    ):
+        if str(persisted_authority.get(field) or "").strip() != expected:
+            errors.append(f"persisted post-QA retarget {field} mismatch")
+    if tuple(persisted_authority.get("owned_files") or ()) != owned_files:
+        errors.append("persisted post-QA retarget owned-file fence mismatch")
+    if (
+        str(retarget_payload.get("worker_id") or "").strip() != worker_id
+        or str(
+            retarget_payload.get("worker_slot_id")
+            or retarget_payload.get("worker_id")
+            or ""
+        ).strip()
+        != worker_slot_id
+    ):
+        errors.append("persisted post-QA retarget worker identity mismatch")
+    if errors:
+        return authority
+
+    items = list_merge_queue_items(conn, project_id, merge_queue_id)
+    matches = [item for item in items if item.task_id == task_id]
+    if len(matches) != 1:
+        errors.append("durable merge queue task identity is missing or ambiguous")
+        return authority
+    item = matches[0]
+    target_ref = str(item.target_ref or "").strip()
+    current_target = str(item.current_target_head or "").strip()
+    authority.update(
+        {
+            "queue_item_id": str(item.queue_item_id or "").strip(),
+            "target_ref": target_ref,
+            "current_target_parent_commit": current_target,
+        }
+    )
+    if item.status != STATE_QUEUED_FOR_MERGE:
+        errors.append("post-QA retarget queue item is not queued_for_merge")
+    if str(item.branch_head or "").strip() != str(recorded_commit or "").strip():
+        errors.append("post-QA retarget queue candidate drifted")
+    if str(item.queue_item_id or "").strip() != str(
+        persisted_authority.get("queue_item_id") or ""
+    ).strip():
+        errors.append("post-QA retarget queue item identity drifted")
+    if target_ref != str(
+        persisted_authority.get("target_ref") or ""
+    ).strip():
+        errors.append("post-QA retarget target ref drifted")
+    if current_target != str(
+        persisted_authority.get("current_target_head") or ""
+    ).strip():
+        errors.append("post-QA retarget current target drifted")
+    if str(getattr(context, "target_head_commit", "") or "").strip() != (
+        current_target
+    ):
+        errors.append("runtime context target differs from durable retarget")
+    if str(getattr(context, "merge_preview_id", "") or "").strip() != str(
+        item.merge_preview_id or ""
+    ).strip():
+        errors.append("runtime context preview differs from durable retarget")
+    if errors:
+        return authority
+
+    target_state = _runtime_context_current_target_preview(
+        worktree_path=worktree_path,
+        target_ref=target_ref,
+        expected_target_head=current_target,
+    )
+    if target_state.get("error"):
+        errors.append(
+            f"post-QA retarget server preview failed: {target_state['error']}"
+        )
+        return authority
+    actual_head = str(target_state["actual_head"])
+    dirty_files = list(target_state["dirty_files"])
+    preview = target_state["preview"]
+    authority["actual_worktree_head_commit"] = actual_head
+    authority["dirty_files"] = dirty_files
+    if dirty_files:
+        errors.append("assigned worktree is dirty")
+    if not _git_commit_is_ancestor(
+        Path(worktree_path),
+        str(recorded_commit or "").strip(),
+        actual_head,
+    ):
+        errors.append("current HEAD is not a descendant of recorded worker_commit")
+    if str(target_state["target_before"]) != current_target:
+        errors.append("durable current target moved after retarget")
+    if errors:
+        return authority
+
+    authority.update(
+        {
+            "current_target_after_preview_commit": str(
+                target_state["target_after"]
+            ),
+            "preview_evidence_id": str(
+                preview.get("evidence_id") or ""
+            ).strip(),
+            "preview_status": str(preview.get("status") or "").strip(),
+            "preview_reason": str(preview.get("reason") or "").strip(),
+            "preview_merge_base": str(
+                preview.get("merge_base") or ""
+            ).strip(),
+        }
+    )
+    if str(preview.get("branch_commit") or "").strip() != actual_head:
+        errors.append("post-QA retarget preview worker identity mismatch")
+    if str(preview.get("target_commit") or "").strip() != current_target:
+        errors.append("post-QA retarget preview target identity mismatch")
+    if str(target_state["target_after"]) != current_target:
+        errors.append("durable current target moved during retarget validation")
+    if (
+        preview.get("passed") is not True
+        or str(preview.get("status") or "").strip() != "pass"
+    ):
+        errors.append("post-QA retarget current preview is stale or conflicting")
+    if errors:
+        return authority
+    authority.update(
+        {
+            "status": "verified_retarget",
+            "verified": True,
+            "server_revalidated": True,
+        }
+    )
+    authority["authority_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in authority.items()
+            if key not in {"authority_hash", "errors"}
+        }
+    )
+    return authority
+
+
 def _runtime_context_server_revalidated_merge_conflict_authority(
     conn,
     *,
@@ -27885,6 +28716,20 @@ def _runtime_context_server_revalidated_merge_conflict_authority(
     recorded_commit: str,
 ) -> dict[str, Any]:
     """Re-run merge preview from durable queue identity, never caller claims."""
+
+    if str(
+        getattr(context, "last_recovery_action", "") or ""
+    ).strip() in {
+        "mf_subagent_post_qa_rejoin_retarget_issued",
+        "mf_subagent_post_qa_replacement_worker_commit_recorded",
+    }:
+        return _runtime_context_server_revalidated_post_qa_retarget_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+            context=context,
+            recorded_commit=recorded_commit,
+        )
 
     runtime_context_id = str(
         getattr(context, "runtime_context_id", "") or ""
@@ -28112,12 +28957,23 @@ def _runtime_context_persisted_post_qa_conflict_reset_indices(
             )
             else {}
         )
-        if (
-            str(marker.get("schema_version") or "").strip()
-            != "runtime_context.canonical_same_lane_repair_head_revision.v2"
-            or str(marker.get("source") or "").strip()
-            != "server_revalidated_post_qa_merge_conflict"
-            or marker.get("server_revalidated_merge_conflict") is not True
+        marker_schema = str(marker.get("schema_version") or "").strip()
+        marker_source = str(marker.get("source") or "").strip()
+        if not (
+            (
+                marker_schema
+                == "runtime_context.canonical_same_lane_repair_head_revision.v2"
+                and marker_source
+                == "server_revalidated_post_qa_merge_conflict"
+                and marker.get("server_revalidated_merge_conflict") is True
+            )
+            or (
+                marker_schema
+                == "runtime_context.canonical_same_lane_repair_head_revision.v3"
+                and marker_source
+                == "server_revalidated_post_qa_retarget_after_open"
+                and marker.get("server_revalidated_current_target") is True
+            )
         ):
             continue
         if not _runtime_context_contract_line_matches_worker(
@@ -28299,6 +29155,29 @@ def _runtime_context_same_lane_worker_commit_recovery(
         )
     )
     if post_qa_merge_conflict_recovery and not target_parent_is_ancestor:
+        if merge_conflict_authority.get("retarget_after_open") is True:
+            result.update(
+                {
+                    "status": "retarget_required",
+                    "blocked": False,
+                    "current_target_baseline_commit": target_parent,
+                    "target_ref": str(
+                        merge_conflict_authority.get("target_ref") or ""
+                    ).strip(),
+                    "next_legal_action": (
+                        "merge_current_target_and_record_worker_commit"
+                    ),
+                    "fresh_evidence_required": [
+                        "worker_finish_time_attestation",
+                        "worker_finish_gate",
+                        "qa_graph_context",
+                        "qa_independent_verification",
+                        "observer_merge",
+                    ],
+                    "target_baseline_changes_worker_authored": False,
+                }
+            )
+            return result
         errors.append(
             "replacement HEAD is not a descendant of current target parent"
         )
@@ -28567,6 +29446,23 @@ def _runtime_context_append_same_lane_worker_commit_revision(
     )
     if recovery.get("status") != "eligible":
         return {}
+    recovery_target_authority = (
+        recovery.get("final_merge_conflict_recovery_authority")
+        if isinstance(
+            recovery.get("final_merge_conflict_recovery_authority"),
+            Mapping,
+        )
+        else recovery.get("merge_conflict_recovery_authority")
+        if isinstance(
+            recovery.get("merge_conflict_recovery_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    post_qa_retarget_after_open = bool(
+        post_qa_merge_conflict_recovery
+        and recovery_target_authority.get("retarget_after_open") is True
+    )
     runtime_context_id = str(
         getattr(context, "runtime_context_id", "") or ""
     ).strip()
@@ -28638,19 +29534,6 @@ def _runtime_context_append_same_lane_worker_commit_revision(
                 ),
             )
         )
-        recovery_target_authority = (
-            recovery.get("final_merge_conflict_recovery_authority")
-            if isinstance(
-                recovery.get("final_merge_conflict_recovery_authority"),
-                Mapping,
-            )
-            else recovery.get("merge_conflict_recovery_authority")
-            if isinstance(
-                recovery.get("merge_conflict_recovery_authority"),
-                Mapping,
-            )
-            else {}
-        )
         if (
             write_target_authority.get("verified") is not True
             or str(
@@ -28702,7 +29585,9 @@ def _runtime_context_append_same_lane_worker_commit_revision(
         if index not in invalidated_indices
     ]
     projection_source = (
-        "server_revalidated_post_qa_merge_conflict"
+        "server_revalidated_post_qa_retarget_after_open"
+        if post_qa_retarget_after_open
+        else "server_revalidated_post_qa_merge_conflict"
         if post_qa_merge_conflict_recovery
         else "server_verified_same_lane_clean_git_descendant"
     )
@@ -28743,7 +29628,9 @@ def _runtime_context_append_same_lane_worker_commit_revision(
     canonical_payload = dict(payload)
     canonical_payload["canonical_same_lane_repair_head_revision"] = {
         "schema_version": (
-            "runtime_context.canonical_same_lane_repair_head_revision.v2"
+            "runtime_context.canonical_same_lane_repair_head_revision.v3"
+            if post_qa_retarget_after_open
+            else "runtime_context.canonical_same_lane_repair_head_revision.v2"
             if post_qa_merge_conflict_recovery
             else "runtime_context.canonical_same_lane_repair_head_revision.v1"
         ),
@@ -28775,6 +29662,10 @@ def _runtime_context_append_same_lane_worker_commit_revision(
         "invalidated_completed_line_indices": sorted(invalidated_indices),
         "server_revalidated_merge_conflict": (
             post_qa_merge_conflict_recovery
+            and not post_qa_retarget_after_open
+        ),
+        "server_revalidated_current_target": (
+            post_qa_retarget_after_open
         ),
         "merge_conflict_recovery_authority": (
             dict(recovery.get("merge_conflict_recovery_authority") or {})
@@ -28870,6 +29761,90 @@ def _runtime_context_append_same_lane_worker_commit_revision(
                 "fail_closed": True,
             },
         ) from exc
+    if post_qa_merge_conflict_recovery:
+        from .parallel_branch_runtime import (
+            STATE_QUEUED_FOR_MERGE,
+            STATE_WORKTREE_READY,
+            list_merge_queue_items,
+            upsert_branch_context,
+            upsert_merge_queue_item,
+        )
+
+        queue_items = list_merge_queue_items(
+            conn,
+            str(project_id or record.get("project_id") or ""),
+            str(getattr(context, "merge_queue_id", "") or ""),
+        )
+        matching_items = [
+            item
+            for item in queue_items
+            if str(item.task_id or "").strip() == task_id
+        ]
+        if len(matching_items) != 1:
+            raise GovernanceError(
+                "contract_worker_commit_recovery_queue_drift",
+                "replacement worker_commit durable queue identity drifted",
+                409,
+                {
+                    "contract_execution_id": execution_id,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "fail_closed": True,
+                },
+            )
+        queue_item = matching_items[0]
+        if (
+            str(queue_item.branch_head or "").strip()
+            != str(recovery.get("recorded_commit_sha") or "").strip()
+            or str(queue_item.current_target_head or "").strip()
+            != str(
+                recovery.get("current_target_baseline_commit") or ""
+            ).strip()
+        ):
+            raise GovernanceError(
+                "contract_worker_commit_recovery_queue_drift",
+                "replacement worker_commit durable queue target drifted",
+                409,
+                {
+                    "contract_execution_id": execution_id,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "fail_closed": True,
+                },
+            )
+        persisted_queue_item = upsert_merge_queue_item(
+            conn,
+            replace(
+                queue_item,
+                status=STATE_QUEUED_FOR_MERGE,
+                branch_head=candidate_commit,
+                validated_target_head="",
+                current_target_head=str(
+                    recovery.get("current_target_baseline_commit") or ""
+                ).strip(),
+                merge_preview_id=str(
+                    recovery_target_authority.get(
+                        "preview_evidence_id"
+                    )
+                    or queue_item.merge_preview_id
+                    or ""
+                ).strip(),
+                failure_reason="",
+            ),
+        )
+        upsert_branch_context(
+            conn,
+            replace(
+                context,
+                status=STATE_WORKTREE_READY,
+                head_commit=candidate_commit,
+                target_head_commit=persisted_queue_item.current_target_head,
+                merge_preview_id=persisted_queue_item.merge_preview_id,
+                last_recovery_action=(
+                    "mf_subagent_post_qa_replacement_worker_commit_recorded"
+                ),
+            ),
+        )
     persisted = runtime.store.get(execution_id)
     persisted_projection_lines = [
         line
@@ -31900,10 +32875,13 @@ def _runtime_context_contract_worker_commit_projection(
         )
         else {}
     )
-    post_qa_target_baseline_revision = bool(
-        str(same_lane_revision.get("schema_version") or "").strip()
-        == "runtime_context.canonical_same_lane_repair_head_revision.v2"
-    )
+    post_qa_revision_schema = str(
+        same_lane_revision.get("schema_version") or ""
+    ).strip()
+    post_qa_target_baseline_revision = post_qa_revision_schema in {
+        "runtime_context.canonical_same_lane_repair_head_revision.v2",
+        "runtime_context.canonical_same_lane_repair_head_revision.v3",
+    }
     allocated_owned_files = sorted(
         set(
             getattr(context, "owned_files", ())
@@ -31950,10 +32928,31 @@ def _runtime_context_contract_worker_commit_projection(
             )
             else {}
         )
+        valid_revision_source = bool(
+            (
+                post_qa_revision_schema
+                == "runtime_context.canonical_same_lane_repair_head_revision.v2"
+                and str(same_lane_revision.get("source") or "").strip()
+                == "server_revalidated_post_qa_merge_conflict"
+                and same_lane_revision.get(
+                    "server_revalidated_merge_conflict"
+                )
+                is True
+            )
+            or (
+                post_qa_revision_schema
+                == "runtime_context.canonical_same_lane_repair_head_revision.v3"
+                and str(same_lane_revision.get("source") or "").strip()
+                == "server_revalidated_post_qa_retarget_after_open"
+                and same_lane_revision.get(
+                    "server_revalidated_current_target"
+                )
+                is True
+            )
+        )
         if (
             same_lane_revision.get("server_derived") is not True
-            or str(same_lane_revision.get("source") or "").strip()
-            != "server_revalidated_post_qa_merge_conflict"
+            or not valid_revision_source
             or str(
                 same_lane_revision.get("current_target_baseline_commit") or ""
             ).strip()
@@ -61566,7 +62565,11 @@ def _contract_runtime_mf_parallel_context_projection(
                     str(actor_role or "").strip() == "mf_sub"
                 ),
             )
-            if recovery and recovery.get("status") in {"eligible", "blocked"}:
+            if recovery and recovery.get("status") in {
+                "eligible",
+                "blocked",
+                "retarget_required",
+            }:
                 same_lane_recoveries.append(dict(recovery))
             for line in context_projection.get("projected_lines", []):
                 if not isinstance(line, Mapping):
