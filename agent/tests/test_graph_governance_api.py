@@ -64194,6 +64194,7 @@ def test_same_lane_worker_commit_revision_is_append_only_and_advances_to_attesta
 def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fresh_qa(
     conn,
     tmp_path,
+    monkeypatch,
 ):
     backlog_id = "AC-POST-QA-MERGE-CONFLICT-SAME-LANE-REVISION"
     worker_task_id = "post-qa-merge-conflict-same-lane-worker"
@@ -64210,11 +64211,27 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         cwd=worktree,
         check=True,
     )
-    owned = worktree / "agent" / "governance" / "server.py"
-    owned.parent.mkdir(parents=True)
-    owned.write_text("base\n", encoding="utf-8")
+    candidate_relative_paths = [
+        "agent/governance/server.py",
+        "agent/governance/contracts/runtime.py",
+        "agent/governance/parallel_branch_runtime.py",
+        "agent/tests/test_contract_runtime.py",
+    ]
+    target_baseline_relative_paths = [
+        *candidate_relative_paths,
+        "agent/tests/test_graph_governance_api.py",
+        "agent/tests/test_parallel_branch_runtime.py",
+    ]
+    target_baseline_files = [
+        worktree / relative_path
+        for relative_path in target_baseline_relative_paths
+    ]
+    for baseline_file in target_baseline_files:
+        baseline_file.parent.mkdir(parents=True, exist_ok=True)
+        baseline_file.write_text("base\n", encoding="utf-8")
+    owned = target_baseline_files[0]
     subprocess.run(
-        ["git", "add", "agent/governance/server.py"],
+        ["git", "add", "--", *target_baseline_relative_paths],
         cwd=worktree,
         check=True,
     )
@@ -64226,9 +64243,13 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         check=True,
         capture_output=True,
     )
-    owned.write_text("candidate\n", encoding="utf-8")
+    for relative_path in candidate_relative_paths:
+        (worktree / relative_path).write_text(
+            f"candidate:{relative_path}\n",
+            encoding="utf-8",
+        )
     subprocess.run(
-        ["git", "add", "agent/governance/server.py"],
+        ["git", "add", "--", *candidate_relative_paths],
         cwd=worktree,
         check=True,
     )
@@ -64244,9 +64265,13 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         check=True,
         capture_output=True,
     )
-    owned.write_text("target\n", encoding="utf-8")
+    for relative_path in target_baseline_relative_paths:
+        (worktree / relative_path).write_text(
+            f"target:{relative_path}\n",
+            encoding="utf-8",
+        )
     subprocess.run(
-        ["git", "add", "agent/governance/server.py"],
+        ["git", "add", "--", *target_baseline_relative_paths],
         cwd=worktree,
         check=True,
     )
@@ -64267,6 +64292,7 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         cwd=worktree,
         check=True,
     )
+    advanced_target_commit = batch_jobs.git_commit(worktree)
     subprocess.run(
         ["git", "switch", "candidate"],
         cwd=worktree,
@@ -64295,8 +64321,25 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         worktree_path=str(worktree),
         target_project_root=str(worktree),
         base_commit=base_commit,
+        owned_files=tuple(target_baseline_relative_paths),
     )
     graph_trace_id = "gqt-post-qa-merge-conflict-same-lane"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        parent_task_id=backlog_id,
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        worker_role="mf_sub",
+        fence_token=(
+            "fence-post-qa-merge-conflict-same-lane"
+        ),
+        run_id=_mf_sub_run_id(
+            runtime_context.task_id,
+            "fence-post-qa-merge-conflict-same-lane",
+        ),
+    )
+    conn.commit()
     _record_mf_parallel_contract_runtime_worker_prefix(
         conn,
         contract_execution_id=successor["contract_execution_id"],
@@ -64306,6 +64349,8 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         head_commit=candidate_commit,
         implementation_event_ref="timeline:post-qa-merge-conflict-implementation",
         include_worker_commit=False,
+        changed_files=candidate_relative_paths,
+        owned_files=target_baseline_relative_paths,
     )
     runtime = server._contract_runtime(conn)
     runtime.current_guide(successor["contract_execution_id"], actor_role="mf_sub")
@@ -64325,6 +64370,8 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
             implementation_event_ref=(
                 "timeline:post-qa-merge-conflict-implementation"
             ),
+            changed_files=candidate_relative_paths,
+            owned_files=target_baseline_relative_paths,
         )
     )
     initial_commit_payload.update(
@@ -64545,6 +64592,56 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     assert conflict_diagnostics["status"] == "eligible"
     assert conflict_authority.independent_qa_passed is True
     assert conflict_authority.merge_conflict_verified is True
+
+    original_preview = (
+        parallel_branch_runtime.git_merge_preview_evidence
+    )
+    moved_after_preview = False
+
+    def move_target_after_preview(**kwargs):
+        nonlocal moved_after_preview
+        preview = original_preview(**kwargs)
+        if not moved_after_preview:
+            moved_after_preview = True
+            subprocess.run(
+                [
+                    "git",
+                    "branch",
+                    "-f",
+                    "target",
+                    advanced_target_commit,
+                ],
+                cwd=worktree,
+                check=True,
+            )
+        return preview
+
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "git_merge_preview_evidence",
+        move_target_after_preview,
+    )
+    moved_target = server._runtime_context_same_lane_worker_commit_recovery(
+        post_qa_record,
+        runtime_context,
+        conn=conn,
+        project_id=PID,
+        allow_post_qa_merge_conflict_recovery=True,
+    )
+    assert moved_target["status"] == "blocked"
+    assert "target moved after server preview" in " ".join(
+        moved_target["errors"]
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "git_merge_preview_evidence",
+        original_preview,
+    )
+    subprocess.run(
+        ["git", "branch", "-f", "target", target_commit],
+        cwd=worktree,
+        check=True,
+    )
 
     historical_startup_without_ref = copy.deepcopy(post_qa_record)
     historical_startup_line = next(
@@ -64999,9 +65096,13 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         text=True,
     )
     assert merge.returncode != 0
-    owned.write_text("resolved candidate and target\n", encoding="utf-8")
+    for relative_path in candidate_relative_paths:
+        (worktree / relative_path).write_text(
+            f"resolved candidate and target:{relative_path}\n",
+            encoding="utf-8",
+        )
     subprocess.run(
-        ["git", "add", "agent/governance/server.py"],
+        ["git", "add", "--", *candidate_relative_paths],
         cwd=worktree,
         check=True,
     )
@@ -65025,14 +65126,78 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     assert recovery["merge_conflict_recovery_authority"][
         "current_target_parent_commit"
     ] == target_commit
+    assert recovery["current_target_baseline_commit"] == target_commit
+    assert recovery["current_target_baseline_changed_files"] == sorted(
+        target_baseline_relative_paths
+    )
+    assert recovery["recorded_candidate_changed_files"] == sorted(
+        candidate_relative_paths
+    )
+    assert recovery["worker_authored_candidate_delta_files"] == sorted(
+        candidate_relative_paths
+    )
+    assert recovery["cumulative_runtime_changed_files"] == sorted(
+        target_baseline_relative_paths
+    )
+    assert recovery["target_baseline_changes_worker_authored"] is False
     assert recovery["invalidated_completed_line_indices"]
     assert recovery["fresh_evidence_required"][-1] == "observer_merge"
 
-    replacement_diff = server._runtime_context_worker_commit_revision_diff(
-        str(worktree),
-        replacement_commit,
-        base_commit=base_commit,
+    owned.write_text("dirty target-relative worker change\n", encoding="utf-8")
+    dirty_recovery = (
+        server._runtime_context_same_lane_worker_commit_recovery(
+            post_qa_record,
+            runtime_context,
+            conn=conn,
+            project_id=PID,
+            allow_post_qa_merge_conflict_recovery=True,
+        )
     )
+    assert dirty_recovery["status"] == "blocked"
+    assert "assigned worktree is dirty" in " ".join(
+        dirty_recovery["errors"]
+    )
+    subprocess.run(
+        ["git", "restore", "--", candidate_relative_paths[0]],
+        cwd=worktree,
+        check=True,
+    )
+
+    target_only_path = target_baseline_relative_paths[-1]
+    (worktree / target_only_path).write_text(
+        "worker-authored extra target-relative change\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "--", target_only_path],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "extra candidate file"],
+        cwd=worktree,
+        check=True,
+    )
+    widened_recovery = (
+        server._runtime_context_same_lane_worker_commit_recovery(
+            post_qa_record,
+            runtime_context,
+            conn=conn,
+            project_id=PID,
+            allow_post_qa_merge_conflict_recovery=True,
+        )
+    )
+    assert widened_recovery["status"] == "blocked"
+    assert "target-relative candidate delta widened" in " ".join(
+        widened_recovery["errors"]
+    )
+    subprocess.run(
+        ["git", "switch", "--detach", replacement_commit],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+    )
+
     replacement_payload = {
         **initial_commit_payload,
         "worker_commit_sha": replacement_commit,
@@ -65040,18 +65205,69 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         "head_commit": replacement_commit,
         "immutable_head_commit": replacement_commit,
         "validated_head_commit": replacement_commit,
-        "commit_parent_sha": replacement_diff["parent_commit"],
-        "diff_base_commit": replacement_diff["base_commit"],
+        "changed_files": recovery["changed_files"],
+        "commit_diff_files": recovery["changed_files"],
+        "commit_parent_sha": recovery["commit_parent_sha"],
+        "diff_base_commit": recovery["diff_base_commit"],
     }
     old_completed_lines = copy.deepcopy(post_qa_record["completed_lines"])
-    gate = server._runtime_context_append_same_lane_worker_commit_revision(
-        runtime=runtime,
-        record=post_qa_record,
-        context=runtime_context,
-        payload=replacement_payload,
-        conn=conn,
-        project_id=PID,
+    forged_baseline_payload = {
+        **replacement_payload,
+        "diff_base_commit": base_commit,
+    }
+    with pytest.raises(
+        GovernanceError,
+        match="diff baseline drifted",
+    ):
+        server._runtime_context_append_same_lane_worker_commit_revision(
+            runtime=runtime,
+            record=post_qa_record,
+            context=runtime_context,
+            payload=forged_baseline_payload,
+            conn=conn,
+            project_id=PID,
+        )
+    worker_commit_response = (
+        server.handle_graph_governance_runtime_context_worker_commit(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "contract_execution_id": successor[
+                        "contract_execution_id"
+                    ],
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "fence_token": rejoin["fence_token"],
+                    "session_token": rejoin["session_token"],
+                    "session_token_ref": rejoin["session_token_ref"],
+                    "target_project_root": str(worktree),
+                    "worker_commit_sha": replacement_commit,
+                    "worker_session_id": initial_commit_payload[
+                        "worker_session_id"
+                    ],
+                    "filer_principal": initial_commit_payload[
+                        "worker_session_id"
+                    ],
+                    "implementation_lineage_ref": replacement_payload[
+                        "implementation_lineage_ref"
+                    ],
+                    "owned_files": target_baseline_relative_paths,
+                    "changed_files": recovery["changed_files"],
+                    "graph_trace_ids": [graph_trace_id],
+                },
+            )
+        )
     )
+    assert worker_commit_response["ok"] is True
+    gate = worker_commit_response[
+        "contract_runtime_close_evidence_gate"
+    ]
     assert gate["accepted"] is True
     after = runtime.store.get(successor["contract_execution_id"])
     assert after["completed_lines"][:-1] == old_completed_lines
@@ -65059,6 +65275,18 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         "canonical_same_lane_repair_head_revision"
     ]
     assert revision["server_revalidated_merge_conflict"] is True
+    assert revision["current_target_baseline_commit"] == target_commit
+    assert revision["current_target_baseline_changed_files"] == sorted(
+        target_baseline_relative_paths
+    )
+    assert revision["worker_authored_candidate_delta_files"] == sorted(
+        candidate_relative_paths
+    )
+    assert revision["cumulative_runtime_changed_files"] == sorted(
+        target_baseline_relative_paths
+    )
+    assert revision["target_baseline_changes_worker_authored"] is False
+    assert revision["write_target_revalidation"]["verified"] is True
     assert revision["invalidated_completed_line_indices"] == recovery[
         "invalidated_completed_line_indices"
     ]

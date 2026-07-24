@@ -27917,7 +27917,9 @@ def _runtime_context_server_revalidated_merge_conflict_authority(
         "merge_queue_id": merge_queue_id,
         "queue_item_id": "",
         "recorded_candidate_commit": str(recorded_commit or "").strip(),
+        "target_ref": "",
         "current_target_parent_commit": "",
+        "current_target_after_preview_commit": "",
         "preview_evidence_id": "",
         "preview_status": "",
         "preview_reason": "",
@@ -27949,6 +27951,7 @@ def _runtime_context_server_revalidated_merge_conflict_authority(
     if errors:
         return authority
 
+    from . import batch_jobs
     from .parallel_branch_runtime import (
         STATE_MERGE_READY,
         git_merge_preview_evidence,
@@ -27971,6 +27974,7 @@ def _runtime_context_server_revalidated_merge_conflict_authority(
     if str(item.merge_queue_id or "").strip() != merge_queue_id:
         errors.append("durable merge queue id mismatch")
     target_ref = str(item.target_ref or "").strip()
+    authority["target_ref"] = target_ref
     if not target_ref:
         errors.append("durable merge queue target ref is missing")
     context_branch_ref = str(getattr(context, "branch_ref", "") or "").strip()
@@ -27999,9 +28003,14 @@ def _runtime_context_server_revalidated_merge_conflict_authority(
             branch_ref=str(recorded_commit).strip(),
             expected_target_head=target_commit,
         )
+        target_after_preview = batch_jobs.git_commit(
+            worktree_path,
+            ref=target_ref,
+        )
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         errors.append(f"server merge preview failed: {exc}")
         return authority
+    authority["current_target_after_preview_commit"] = target_after_preview
     authority.update(
         {
             "preview_evidence_id": str(
@@ -28020,6 +28029,8 @@ def _runtime_context_server_revalidated_merge_conflict_authority(
         errors.append("server merge preview candidate identity mismatch")
     if str(preview.get("target_commit") or "").strip() != target_commit:
         errors.append("server merge preview target identity mismatch")
+    if target_after_preview != target_commit:
+        errors.append("durable merge target moved after server preview")
     if (
         preview.get("passed") is not False
         or str(preview.get("status") or "").strip() != "fail"
@@ -28139,9 +28150,11 @@ def _runtime_context_same_lane_worker_commit_recovery(
 ) -> dict[str, Any]:
     """Resolve a bounded append-only refresh of a stale same-lane commit.
 
-    A later clean descendant may replace the current worker-commit authority
-    only when the cumulative runtime diff, implementation lineage, graph
-    traces, and owned-file fence remain exactly unchanged.  The old line is
+    A later clean descendant may replace the current worker-commit authority.
+    Ordinary pre-attestation recovery retains the cumulative runtime-base
+    boundary.  Post-QA merge-conflict recovery instead measures worker-authored
+    replacement scope from the immutable server-derived current target, while
+    retaining the runtime-base diff only as audit evidence.  The old line is
     retained as history and is ignored only by the non-mutating projection
     that reopens ``worker_commit``.
     """
@@ -28244,7 +28257,7 @@ def _runtime_context_same_lane_worker_commit_recovery(
         # remain compatible and let the stored ContractRuntime line decide.
         return {}
     result["actual_worktree_head_commit"] = actual_head
-    if actual_head == recorded_commit:
+    if actual_head == recorded_commit and not post_qa_merge_conflict_recovery:
         result.update(
             {
                 "status": "not_needed",
@@ -28273,16 +28286,70 @@ def _runtime_context_same_lane_worker_commit_recovery(
                     "server merge conflict revalidation failed"
                 ]
             )
+    target_parent = str(
+        merge_conflict_authority.get("current_target_parent_commit") or ""
+    ).strip()
+    target_parent_is_ancestor = bool(
+        post_qa_merge_conflict_recovery
+        and target_parent
+        and _git_commit_is_ancestor(
+            Path(worktree_path),
+            target_parent,
+            actual_head,
+        )
+    )
+    if post_qa_merge_conflict_recovery and not target_parent_is_ancestor:
+        errors.append(
+            "replacement HEAD is not a descendant of current target parent"
+        )
     try:
         dirty_files = _runtime_context_git_dirty_files(worktree_path)
-        revision_diff = _runtime_context_worker_commit_revision_diff(
+        cumulative_revision_diff = _runtime_context_worker_commit_revision_diff(
             worktree_path,
             actual_head,
             base_commit=runtime_base,
         )
-    except (GovernanceError, ValidationError, OSError, subprocess.SubprocessError):
-        return {}
+        recorded_candidate_revision_diff = (
+            _runtime_context_worker_commit_revision_diff(
+                worktree_path,
+                recorded_commit,
+                base_commit=runtime_base,
+            )
+        )
+        if post_qa_merge_conflict_recovery and target_parent_is_ancestor:
+            target_baseline_revision_diff = (
+                _runtime_context_worker_commit_revision_diff(
+                    worktree_path,
+                    target_parent,
+                    base_commit=runtime_base,
+                )
+            )
+            revision_diff = _runtime_context_worker_commit_revision_diff(
+                worktree_path,
+                actual_head,
+                base_commit=target_parent,
+            )
+        else:
+            target_baseline_revision_diff = {}
+            revision_diff = cumulative_revision_diff
+    except (
+        GovernanceError,
+        ValidationError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as exc:
+        errors.append(f"worker commit revision boundary failed closed: {exc}")
+        return result
     actual_files = sorted(set(revision_diff.get("changed_files") or []))
+    cumulative_files = sorted(
+        set(cumulative_revision_diff.get("changed_files") or [])
+    )
+    recorded_candidate_files = sorted(
+        set(recorded_candidate_revision_diff.get("changed_files") or [])
+    )
+    target_baseline_files = sorted(
+        set(target_baseline_revision_diff.get("changed_files") or [])
+    )
     recorded_files = sorted(
         set(_runtime_context_service_query_values(payload, "changed_files"))
     )
@@ -28299,11 +28366,23 @@ def _runtime_context_same_lane_worker_commit_recovery(
     result.update(
         {
             "changed_files": actual_files,
+            "worker_authored_candidate_delta_files": actual_files,
+            "cumulative_runtime_changed_files": cumulative_files,
+            "recorded_candidate_changed_files": recorded_candidate_files,
+            "current_target_baseline_commit": (
+                target_parent if post_qa_merge_conflict_recovery else ""
+            ),
+            "current_target_baseline_changed_files": target_baseline_files,
+            "target_baseline_changes_worker_authored": False,
             "recorded_changed_files": recorded_files,
             "owned_files": owned_files,
             "dirty_files": dirty_files,
             "commit_parent_sha": str(revision_diff.get("parent_commit") or ""),
             "diff_base_commit": str(revision_diff.get("base_commit") or ""),
+            "runtime_base_commit": runtime_base,
+            "cumulative_runtime_diff_base_commit": str(
+                cumulative_revision_diff.get("base_commit") or ""
+            ),
         }
     )
     implementation = _worker_commit_completed_implementation(
@@ -28347,20 +28426,14 @@ def _runtime_context_same_lane_worker_commit_recovery(
         actual_head,
     ):
         errors.append("current HEAD is not a descendant of recorded worker_commit")
-    target_parent = str(
-        merge_conflict_authority.get("current_target_parent_commit") or ""
-    ).strip()
-    if post_qa_merge_conflict_recovery and (
-        not target_parent
-        or not _git_commit_is_ancestor(
-            Path(worktree_path),
-            target_parent,
-            actual_head,
+    if recorded_candidate_files != recorded_files:
+        errors.append(
+            "recorded worker_commit files do not match the immutable candidate diff"
         )
-    ):
-        errors.append("replacement HEAD is not a descendant of current target parent")
-    if not actual_files or actual_files != recorded_files:
-        errors.append("current cumulative diff widened or changed worker_commit scope")
+    if not actual_files or not set(actual_files).issubset(recorded_files):
+        errors.append(
+            "current target-relative candidate delta widened worker_commit scope"
+        )
     if recorded_diff_files != recorded_files:
         errors.append("recorded worker_commit diff proof is internally inconsistent")
     if implementation_files != recorded_files:
@@ -28370,7 +28443,7 @@ def _runtime_context_same_lane_worker_commit_recovery(
     if not expected_lineage_ref or recorded_lineage_ref != expected_lineage_ref:
         errors.append("worker_commit implementation lineage is stale")
     if str(payload.get("diff_base_commit") or "").strip() != str(
-        revision_diff.get("base_commit") or ""
+        recorded_candidate_revision_diff.get("base_commit") or ""
     ).strip():
         errors.append("worker_commit runtime diff base drifted")
     fence_containment = _worker_fence_containment(
@@ -28378,8 +28451,56 @@ def _runtime_context_same_lane_worker_commit_recovery(
         owned_files,
         repository_root=worktree_path,
     )
+    recorded_fence_containment = _worker_fence_containment(
+        recorded_candidate_files,
+        owned_files,
+        repository_root=worktree_path,
+    )
     if not fence_containment["ok"]:
-        errors.append("current cumulative diff contains files outside the owned fence")
+        errors.append(
+            "current target-relative candidate delta contains files outside "
+            "the owned fence"
+        )
+    if not recorded_fence_containment["ok"]:
+        errors.append(
+            "recorded candidate diff contains files outside the owned fence"
+        )
+    result["candidate_delta_fence_containment"] = fence_containment
+    result["recorded_candidate_fence_containment"] = (
+        recorded_fence_containment
+    )
+    if post_qa_merge_conflict_recovery and not errors:
+        final_merge_conflict_authority = (
+            _runtime_context_server_revalidated_merge_conflict_authority(
+                conn,
+                project_id=str(
+                    project_id or record.get("project_id") or ""
+                ),
+                record=record,
+                context=context,
+                recorded_commit=recorded_commit,
+            )
+        )
+        result["final_merge_conflict_recovery_authority"] = dict(
+            final_merge_conflict_authority
+        )
+        if (
+            final_merge_conflict_authority.get("verified") is not True
+            or str(
+                final_merge_conflict_authority.get(
+                    "current_target_parent_commit"
+                )
+                or ""
+            ).strip()
+            != target_parent
+            or str(
+                final_merge_conflict_authority.get("authority_hash") or ""
+            ).strip()
+            != str(merge_conflict_authority.get("authority_hash") or "").strip()
+        ):
+            errors.append(
+                "durable current target changed during recovery validation"
+            )
     if errors:
         return result
     invalidated_indices: list[int] = []
@@ -28460,6 +28581,27 @@ def _runtime_context_append_same_lane_worker_commit_revision(
         set(recovery.get("changed_files") or [])
     ):
         errors.append("replacement worker_commit changed_files drifted")
+    if sorted(set(payload.get("commit_diff_files") or [])) != sorted(
+        set(recovery.get("changed_files") or [])
+    ):
+        errors.append("replacement worker_commit diff proof drifted")
+    if str(payload.get("commit_parent_sha") or "").strip() != str(
+        recovery.get("commit_parent_sha") or ""
+    ).strip():
+        errors.append("replacement worker_commit parent drifted")
+    if str(payload.get("diff_base_commit") or "").strip() != str(
+        recovery.get("diff_base_commit") or ""
+    ).strip():
+        errors.append("replacement worker_commit diff baseline drifted")
+    allocated_owned_files = sorted(
+        set(
+            getattr(context, "owned_files", ())
+            or getattr(context, "target_files", ())
+            or ()
+        )
+    )
+    if sorted(set(payload.get("owned_files") or [])) != allocated_owned_files:
+        errors.append("replacement worker_commit owned fence drifted")
     if str(payload.get("implementation_lineage_ref") or "").strip() != str(
         recovery.get("implementation_lineage_ref") or ""
     ).strip():
@@ -28480,6 +28622,68 @@ def _runtime_context_append_same_lane_worker_commit_revision(
                 "same_lane_worker_commit_recovery": recovery,
                 "next_legal_action": "stop_and_report_worker_commit_drift",
             },
+        )
+
+    if post_qa_merge_conflict_recovery:
+        write_target_authority = (
+            _runtime_context_server_revalidated_merge_conflict_authority(
+                conn,
+                project_id=str(
+                    project_id or record.get("project_id") or ""
+                ),
+                record=record,
+                context=context,
+                recorded_commit=str(
+                    recovery.get("recorded_commit_sha") or ""
+                ),
+            )
+        )
+        recovery_target_authority = (
+            recovery.get("final_merge_conflict_recovery_authority")
+            if isinstance(
+                recovery.get("final_merge_conflict_recovery_authority"),
+                Mapping,
+            )
+            else recovery.get("merge_conflict_recovery_authority")
+            if isinstance(
+                recovery.get("merge_conflict_recovery_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        if (
+            write_target_authority.get("verified") is not True
+            or str(
+                write_target_authority.get("current_target_parent_commit")
+                or ""
+            ).strip()
+            != str(recovery.get("current_target_baseline_commit") or "").strip()
+            or str(write_target_authority.get("authority_hash") or "").strip()
+            != str(recovery_target_authority.get("authority_hash") or "").strip()
+        ):
+            raise GovernanceError(
+                "contract_worker_commit_recovery_target_moved",
+                (
+                    "durable current target changed before replacement "
+                    "worker_commit write"
+                ),
+                409,
+                {
+                    "contract_execution_id": record.get(
+                        "contract_execution_id"
+                    ),
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "same_lane_worker_commit_recovery": recovery,
+                    "write_target_authority": write_target_authority,
+                    "next_legal_action": (
+                        "repreview_current_target_before_worker_commit"
+                    ),
+                    "fail_closed": True,
+                },
+            )
+        recovery["write_target_revalidation"] = dict(
+            write_target_authority
         )
 
     completed_lines = list(record.get("completed_lines") or [])
@@ -28550,6 +28754,22 @@ def _runtime_context_append_same_lane_worker_commit_revision(
         "replacement_worker_commit_sha": candidate_commit,
         "diff_base_commit": recovery.get("diff_base_commit"),
         "cumulative_changed_files": list(recovery.get("changed_files") or []),
+        "worker_authored_candidate_delta_files": list(
+            recovery.get("worker_authored_candidate_delta_files") or []
+        ),
+        "recorded_candidate_changed_files": list(
+            recovery.get("recorded_candidate_changed_files") or []
+        ),
+        "current_target_baseline_commit": recovery.get(
+            "current_target_baseline_commit"
+        ),
+        "current_target_baseline_changed_files": list(
+            recovery.get("current_target_baseline_changed_files") or []
+        ),
+        "cumulative_runtime_changed_files": list(
+            recovery.get("cumulative_runtime_changed_files") or []
+        ),
+        "target_baseline_changes_worker_authored": False,
         "clean_worktree": True,
         "append_only_history_preserved": True,
         "invalidated_completed_line_indices": sorted(invalidated_indices),
@@ -28558,6 +28778,11 @@ def _runtime_context_append_same_lane_worker_commit_revision(
         ),
         "merge_conflict_recovery_authority": (
             dict(recovery.get("merge_conflict_recovery_authority") or {})
+            if post_qa_merge_conflict_recovery
+            else {}
+        ),
+        "write_target_revalidation": (
+            dict(recovery.get("write_target_revalidation") or {})
             if post_qa_merge_conflict_recovery
             else {}
         ),
@@ -31386,7 +31611,12 @@ def _runtime_context_worker_commit_revision_diff(
     *,
     base_commit: str,
 ) -> dict[str, Any]:
-    """Return the immutable cumulative worker diff from its runtime base."""
+    """Return an immutable diff from a server-selected ancestor boundary.
+
+    The ordinary boundary is the runtime base.  Post-QA conflict recovery may
+    pass the server-revalidated current target so target baseline changes are
+    not mislabeled as worker-authored candidate scope.
+    """
 
     from . import batch_jobs
 
@@ -31633,11 +31863,15 @@ def _runtime_context_contract_worker_commit_projection(
     dirty_files = (
         _runtime_context_git_dirty_files(worktree_path) if worktree_path else []
     )
+    recorded_diff_base = str(payload.get("diff_base_commit") or "").strip()
+    validation_diff_base = recorded_diff_base or str(
+        getattr(context, "base_commit", "") or ""
+    ).strip()
     revision_diff = (
         _runtime_context_worker_commit_revision_diff(
             worktree_path,
             actual_head,
-            base_commit=str(getattr(context, "base_commit", "") or ""),
+            base_commit=validation_diff_base,
         )
         if worktree_path and actual_head
         else {}
@@ -31654,10 +31888,21 @@ def _runtime_context_contract_worker_commit_projection(
         "commit_diff_files",
     )
     recorded_commit_parent = str(payload.get("commit_parent_sha") or "").strip()
-    recorded_diff_base = str(payload.get("diff_base_commit") or "").strip()
     recorded_owned_files = _runtime_context_service_query_values(
         payload,
         "owned_files",
+    )
+    same_lane_revision = (
+        payload.get("canonical_same_lane_repair_head_revision")
+        if isinstance(
+            payload.get("canonical_same_lane_repair_head_revision"),
+            Mapping,
+        )
+        else {}
+    )
+    post_qa_target_baseline_revision = bool(
+        str(same_lane_revision.get("schema_version") or "").strip()
+        == "runtime_context.canonical_same_lane_repair_head_revision.v2"
     )
     allocated_owned_files = sorted(
         set(
@@ -31696,6 +31941,48 @@ def _runtime_context_contract_worker_commit_projection(
         errors.append("ContractRuntime worker_commit revision parent drifted")
     if recorded_diff_base != diff_base_commit:
         errors.append("ContractRuntime worker_commit runtime diff base drifted")
+    if post_qa_target_baseline_revision:
+        write_target_revalidation = (
+            same_lane_revision.get("write_target_revalidation")
+            if isinstance(
+                same_lane_revision.get("write_target_revalidation"),
+                Mapping,
+            )
+            else {}
+        )
+        if (
+            same_lane_revision.get("server_derived") is not True
+            or str(same_lane_revision.get("source") or "").strip()
+            != "server_revalidated_post_qa_merge_conflict"
+            or str(
+                same_lane_revision.get("current_target_baseline_commit") or ""
+            ).strip()
+            != recorded_diff_base
+            or sorted(
+                set(
+                    same_lane_revision.get(
+                        "worker_authored_candidate_delta_files"
+                    )
+                    or []
+                )
+            )
+            != sorted(set(recorded_files))
+            or same_lane_revision.get(
+                "target_baseline_changes_worker_authored"
+            )
+            is not False
+            or write_target_revalidation.get("verified") is not True
+            or str(
+                write_target_revalidation.get(
+                    "current_target_parent_commit"
+                )
+                or ""
+            ).strip()
+            != recorded_diff_base
+        ):
+            errors.append(
+                "ContractRuntime post-QA target-baseline authority drifted"
+            )
     if (
         allocated_owned_files
         and sorted(set(recorded_owned_files)) != allocated_owned_files
@@ -31963,10 +32250,58 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
                 422,
                 {"dirty_files": dirty_files, "next_legal_action": "clean_worktree"},
             )
-        revision_diff = _runtime_context_worker_commit_revision_diff(
-            worktree_path,
-            actual_head,
-            base_commit=str(context.base_commit or ""),
+        runtime = _contract_runtime(conn)
+        stored_record = runtime.store.get(contract_execution_id)
+        same_lane_recovery = (
+            _runtime_context_same_lane_worker_commit_recovery(
+                stored_record,
+                context,
+                conn=conn,
+                project_id=project_id,
+                allow_post_qa_merge_conflict_recovery=True,
+            )
+        )
+        post_qa_target_baseline_recovery = bool(
+            same_lane_recovery.get("recovery_reason")
+            == "post_qa_merge_conflict"
+        )
+        if (
+            post_qa_target_baseline_recovery
+            and same_lane_recovery.get("status") != "eligible"
+        ):
+            raise GovernanceError(
+                "contract_worker_commit_recovery_blocked",
+                (
+                    "post-QA replacement worker_commit failed current-target "
+                    "baseline validation"
+                ),
+                422,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "same_lane_worker_commit_recovery": same_lane_recovery,
+                    "next_legal_action": (
+                        "stop_and_report_worker_commit_drift"
+                    ),
+                    "fail_closed": True,
+                },
+            )
+        revision_diff = (
+            {
+                "head_commit": actual_head,
+                "parent_commit": same_lane_recovery.get(
+                    "commit_parent_sha"
+                ),
+                "base_commit": same_lane_recovery.get("diff_base_commit"),
+                "changed_files": same_lane_recovery.get("changed_files") or [],
+            }
+            if post_qa_target_baseline_recovery
+            else _runtime_context_worker_commit_revision_diff(
+                worktree_path,
+                actual_head,
+                base_commit=str(context.base_commit or ""),
+            )
         )
         commit_parent_sha = str(revision_diff["parent_commit"])
         diff_base_commit = str(revision_diff["base_commit"])
@@ -31980,13 +32315,28 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
         )
         if supplied_owned_files != owned_files:
             raise ValidationError("worker_commit owned_files must equal the allocated fence")
-        if not _runtime_context_worker_commit_diff_matches(
-            commit_diff_files,
-            implementation_files,
-            supplied_changed_files,
+        post_qa_scope_matches = bool(
+            post_qa_target_baseline_recovery
+            and commit_diff_files
+            and set(commit_diff_files).issubset(set(implementation_files))
+            and sorted(set(commit_diff_files))
+            == sorted(set(supplied_changed_files))
+        )
+        if not post_qa_scope_matches and not (
+            not post_qa_target_baseline_recovery
+            and _runtime_context_worker_commit_diff_matches(
+                commit_diff_files,
+                implementation_files,
+                supplied_changed_files,
+            )
         ):
             raise ValidationError(
-                "worker_commit diff must exactly match worker_implementation changed_files"
+                (
+                    "worker_commit diff must exactly match "
+                    "worker_implementation changed_files, or be a non-empty "
+                    "server-derived current-target-relative subset during "
+                    "post-QA merge-conflict recovery"
+                )
             )
         fence_containment = _worker_fence_containment(
             commit_diff_files,
@@ -32060,15 +32410,62 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             )
         second_head = batch_jobs.git_commit(worktree_path)
         second_dirty_files = _runtime_context_git_dirty_files(worktree_path)
-        second_revision_diff = _runtime_context_worker_commit_revision_diff(
-            worktree_path,
-            second_head,
-            base_commit=str(context.base_commit or ""),
-        )
+        if post_qa_target_baseline_recovery:
+            second_recovery = (
+                _runtime_context_same_lane_worker_commit_recovery(
+                    stored_record,
+                    context,
+                    conn=conn,
+                    project_id=project_id,
+                    allow_post_qa_merge_conflict_recovery=True,
+                )
+            )
+            second_revision_diff = {
+                "parent_commit": second_recovery.get("commit_parent_sha"),
+                "base_commit": second_recovery.get("diff_base_commit"),
+                "changed_files": second_recovery.get("changed_files") or [],
+            }
+            recovery_state_changed = bool(
+                second_recovery.get("status") != "eligible"
+                or str(
+                    second_recovery.get("current_target_baseline_commit")
+                    or ""
+                )
+                != str(
+                    same_lane_recovery.get("current_target_baseline_commit")
+                    or ""
+                )
+                or str(
+                    (
+                        second_recovery.get(
+                            "final_merge_conflict_recovery_authority"
+                        )
+                        or {}
+                    ).get("authority_hash")
+                    or ""
+                )
+                != str(
+                    (
+                        same_lane_recovery.get(
+                            "final_merge_conflict_recovery_authority"
+                        )
+                        or {}
+                    ).get("authority_hash")
+                    or ""
+                )
+            )
+        else:
+            second_revision_diff = _runtime_context_worker_commit_revision_diff(
+                worktree_path,
+                second_head,
+                base_commit=str(context.base_commit or ""),
+            )
+            recovery_state_changed = False
         second_diff_files = list(second_revision_diff["changed_files"])
         if (
             second_head != actual_head
             or second_dirty_files
+            or recovery_state_changed
             or str(second_revision_diff["parent_commit"]) != commit_parent_sha
             or str(second_revision_diff["base_commit"]) != diff_base_commit
             or sorted(second_diff_files) != sorted(commit_diff_files)
@@ -32090,8 +32487,6 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
                 "evidence_kind": "worker_commit",
             },
         }
-        runtime = _contract_runtime(conn)
-        stored_record = runtime.store.get(contract_execution_id)
         contract_gate = _runtime_context_append_same_lane_worker_commit_revision(
             runtime=runtime,
             record=stored_record,
