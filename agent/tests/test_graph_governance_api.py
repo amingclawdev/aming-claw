@@ -16027,6 +16027,118 @@ def test_runtime_context_service_refs_accept_legacy_implementation_evidence_kind
     assert not close_event.get("event_id")
 
 
+def test_runtime_context_service_refs_keep_changed_files_separate_from_owned_scope(
+    conn,
+):
+    changed_files = [
+        "agent/governance/dashboard_dist/index.html",
+        "frontend/dashboard/dist/index.html",
+    ]
+    owned_files = [
+        "agent/governance/dashboard_dist/",
+        "frontend/dashboard/dist/",
+        "frontend/dashboard/scripts/e2e-projects.mjs",
+    ]
+    event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="runtime-service-changed-owned-task",
+        backlog_id="AC-RUNTIME-SERVICE-CHANGED-OWNED",
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="worker-runtime-service-changed-owned",
+        status="passed",
+        payload={
+            "runtime_context_id": "mfrctx-runtime-service-changed-owned",
+            "task_id": "runtime-service-changed-owned-task",
+            "parent_task_id": "runtime-service-changed-owned-parent",
+            "worker_role": "mf_sub",
+            "changed_files": changed_files,
+            "owned_files": owned_files,
+            "graph_trace_ids": ["gqt-runtime-service-changed-owned"],
+        },
+    )
+
+    refs, _, _, _ = server._runtime_context_service_timeline_refs(
+        conn,
+        project_id=PID,
+        task_id="runtime-service-changed-owned-task",
+        backlog_id="AC-RUNTIME-SERVICE-CHANGED-OWNED",
+    )
+
+    assert refs["latest_implementation_event_ref"] == f"timeline:{event['id']}"
+    assert refs["changed_files"] == changed_files
+    assert refs["finish_time_worker_attestation_hint"]["changed_files"] == (
+        changed_files
+    )
+    assert not set(owned_files) & set(refs["changed_files"])
+
+
+def test_runtime_context_worker_guide_separates_attestation_diff_from_owned_scope():
+    changed_files = ["frontend/dashboard/dist/index.html"]
+    owned_files = [
+        "frontend/dashboard/dist/",
+        "frontend/dashboard/scripts/e2e-projects.mjs",
+    ]
+    current_state = {
+        "runtime_context_id": "mfrctx-guide-changed-owned",
+        "project_id": PID,
+        "task_id": "worker-guide-changed-owned",
+        "target_project_root": "/tmp/worker-guide-changed-owned",
+        "contract_worker_commit_required": True,
+        "source_refs": {
+            "timeline": {
+                "finish_time_worker_attestation_hint": {
+                    "changed_files": changed_files,
+                    "test_results": {"status": "passed", "passed": True},
+                    "graph_trace_ids": ["gqt-guide-changed-owned"],
+                    "head_commit": "a" * 40,
+                }
+            }
+        },
+        "runtime_context_service": {
+            "views": {
+                "worker_view": {
+                    "task": {
+                        "task_id": "worker-guide-changed-owned",
+                        "parent_task_id": "parent-guide-changed-owned",
+                        "target_project_root": "/tmp/worker-guide-changed-owned",
+                        "owned_files": owned_files,
+                        "target_files": owned_files,
+                        "worker_id": "worker-guide-changed-owned",
+                        "worker_slot_id": "worker-guide-changed-owned",
+                    },
+                    "branch": {
+                        "worktree_path": "/tmp/worker-guide-changed-owned"
+                    },
+                    "graph_query_identity": {
+                        "target_project_root": (
+                            "/tmp/worker-guide-changed-owned"
+                        ),
+                        "parent_task_id": "parent-guide-changed-owned",
+                        "worker_id": "worker-guide-changed-owned",
+                        "worker_slot_id": "worker-guide-changed-owned",
+                        "owned_files": owned_files,
+                    },
+                    "action_plan": {},
+                    "control_plane": {},
+                    "capability_boundary": {},
+                    "route_identity": {},
+                }
+            }
+        },
+    }
+
+    response = server._runtime_context_worker_guide_response(current_state)
+    body = response["worker_guide"]["write_guides"][
+        "finish_time_worker_attestation"
+    ]["finish_time_worker_attestation_submission"]["copy_safe_body"]
+
+    assert body["changed_files"] == changed_files
+    assert body["owned_files"] == owned_files
+
+
 def test_runtime_context_service_refs_use_canonical_finish_time_attestation_event(
     conn,
 ):

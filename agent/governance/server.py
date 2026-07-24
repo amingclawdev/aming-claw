@@ -12626,9 +12626,17 @@ def _runtime_context_service_timeline_refs(
             changed_files = _runtime_context_service_query_values(
                 implementation_payload,
                 "changed_files",
-                "owned_files",
-                "worker_changed_files",
             )
+            if not changed_files:
+                changed_files = _runtime_context_service_query_values(
+                    implementation_payload,
+                    "worker_changed_files",
+                )
+            if not changed_files:
+                changed_files = _runtime_context_service_query_values(
+                    implementation_payload,
+                    "owned_files",
+                )
             if changed_files:
                 refs["changed_files"] = changed_files
         if is_worker_commit:
@@ -16603,7 +16611,8 @@ def _runtime_context_worker_guide_response(
         for item in finish_attestation_hint.get("changed_files") or []
         if str(item or "").strip()
     ]
-    attestation_owned_files = hinted_changed_files or list(worker_scope_files)
+    attestation_changed_files = hinted_changed_files or list(worker_scope_files)
+    attestation_owned_files = list(worker_scope_files) or attestation_changed_files
     hinted_worker_session_id = str(
         finish_attestation_hint.get("worker_session_id") or ""
     ).strip()
@@ -16741,7 +16750,7 @@ def _runtime_context_worker_guide_response(
         ),
         "current_branch_head_commit": current_branch_head_commit,
         "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
-        "changed_files": attestation_owned_files or ["<owned-file>"],
+        "changed_files": attestation_changed_files or ["<owned-file>"],
         "owned_files": attestation_owned_files or ["<owned-file>"],
         "actual_cwd": str(
             finish_attestation_hint.get("actual_cwd") or target_project_root
