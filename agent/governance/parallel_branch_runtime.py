@@ -1218,6 +1218,41 @@ class AuditedPostmergeRecoveryAuthority:
 
 
 @dataclass(frozen=True)
+class DependencyRevalidationQaCandidateAuthority:
+    """Server-derived authority for restoring an overwritten QA candidate.
+
+    A dependency-only target refresh must preserve the immutable candidate
+    already materialized for independent QA.  When a legacy materialization
+    overwrote that candidate with the live worker branch, only the governance
+    server may reconstruct it from source-backed ContractRuntime, QA, and
+    materialization evidence and bind it to a current-target merge preview.
+    """
+
+    project_id: str
+    backlog_id: str
+    task_id: str
+    parent_task_id: str
+    runtime_context_id: str
+    merge_queue_id: str
+    queue_item_id: str
+    overwritten_candidate_commit: str
+    candidate_commit: str
+    current_target_head: str
+    worker_commit_source_ref: str
+    qa_source_ref: str
+    materialize_source_ref: str
+    merge_preview_id: str
+    authority_hash: str
+    schema_version: str = (
+        "parallel_branch.dependency_revalidation_qa_candidate_authority.v1"
+    )
+    merge_preview_status: str = "fail"
+    merge_conflict_verified: bool = True
+    server_derived: bool = True
+    caller_candidate_trusted: bool = False
+
+
+@dataclass(frozen=True)
 class MergeQueueItem:
     project_id: str
     merge_queue_id: str
@@ -16684,21 +16719,29 @@ def _refresh_merge_queue_heads_for_materialization(
     *,
     target_ref: str,
     current_target_head: str = "",
+    immutable_candidate_head: str = "",
 ) -> tuple[str, str]:
     git_root = _materialization_git_root(context)
-    branch_head = str(context.head_commit or "").strip()
+    branch_head = str(
+        immutable_candidate_head or context.head_commit or ""
+    ).strip()
     target_head = str(current_target_head or context.target_head_commit or "").strip()
     if git_root is None:
         return branch_head, target_head
 
-    branch_ref = str(context.branch_ref or "").strip()
-    resolved_branch_head, _ = _git_preview_commit(
-        git_root,
-        branch_ref,
-        timeout_seconds=10,
-    )
-    if resolved_branch_head:
-        branch_head = resolved_branch_head
+    # The worker branch is mutable after QA (for example while resolving a
+    # target conflict in the same lane).  It is authoritative only for the
+    # first materialization.  Revalidation of an existing durable item keeps
+    # its immutable candidate, or a typed server-recovered candidate.
+    if not str(immutable_candidate_head or "").strip():
+        branch_ref = str(context.branch_ref or "").strip()
+        resolved_branch_head, _ = _git_preview_commit(
+            git_root,
+            branch_ref,
+            timeout_seconds=10,
+        )
+        if resolved_branch_head:
+            branch_head = resolved_branch_head
 
     resolved_target_head, _ = _git_preview_commit(
         git_root,
@@ -16756,6 +16799,9 @@ def queue_merge_item_for_branch_context(
     require_finish_gate: bool = False,
     allow_finish_checkpoint_without_fence: bool = False,
     audited_postmerge_recovery_authority: AuditedPostmergeRecoveryAuthority | None = None,
+    dependency_revalidation_candidate_authority: (
+        DependencyRevalidationQaCandidateAuthority | None
+    ) = None,
     now_iso: str = "",
 ) -> dict[str, Any]:
     """Persist a fenced merge queue request for one branch runtime context."""
@@ -16769,6 +16815,101 @@ def queue_merge_item_for_branch_context(
         raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
     postmerge_recovery = audited_postmerge_recovery_authority
     resolved_queue_item_id = queue_item_id or f"{queue_id}:{task_id}"
+    existing_candidate_rows = conn.execute(
+        """
+        SELECT queue_item_id
+        FROM parallel_branch_merge_queue_items
+        WHERE project_id = ? AND merge_queue_id = ? AND task_id = ?
+        ORDER BY queue_item_id
+        """,
+        (project_id, queue_id, task_id),
+    ).fetchall()
+    if len(existing_candidate_rows) > 1:
+        raise ValueError("durable merge queue task identity is ambiguous")
+    if (
+        existing_candidate_rows
+        and str(existing_candidate_rows[0]["queue_item_id"] or "")
+        != resolved_queue_item_id
+    ):
+        raise ValueError("durable merge queue item identity changed")
+    existing_item = (
+        get_merge_queue_item(
+            conn,
+            project_id,
+            queue_id,
+            resolved_queue_item_id,
+        )
+        if existing_candidate_rows
+        else None
+    )
+    candidate_recovery = dependency_revalidation_candidate_authority
+    if candidate_recovery is not None:
+        if not isinstance(
+            candidate_recovery,
+            DependencyRevalidationQaCandidateAuthority,
+        ):
+            raise ValueError(
+                "dependency revalidation candidate recovery requires "
+                "server-derived authority"
+            )
+        if existing_item is None:
+            raise ValueError(
+                "dependency revalidation candidate recovery requires an "
+                "existing durable queue item"
+            )
+        expected_recovery_scope = (
+            ("project_id", project_id),
+            ("backlog_id", str(context.backlog_id or "")),
+            ("task_id", task_id),
+            ("parent_task_id", str(context.parent_task_id or "")),
+            ("runtime_context_id", str(context.runtime_context_id or "")),
+            ("merge_queue_id", queue_id),
+            ("queue_item_id", resolved_queue_item_id),
+            (
+                "overwritten_candidate_commit",
+                str(existing_item.branch_head or ""),
+            ),
+        )
+        for field_name, expected_value in expected_recovery_scope:
+            if str(getattr(candidate_recovery, field_name, "") or "") != str(
+                expected_value or ""
+            ):
+                raise ValueError(
+                    "dependency revalidation candidate recovery "
+                    f"{field_name} does not match durable runtime scope"
+                )
+        if (
+            candidate_recovery.schema_version
+            != "parallel_branch.dependency_revalidation_qa_candidate_authority.v1"
+            or candidate_recovery.server_derived is not True
+            or candidate_recovery.caller_candidate_trusted is not False
+            or candidate_recovery.merge_conflict_verified is not True
+            or candidate_recovery.merge_preview_status != "fail"
+            or not re.fullmatch(
+                r"[0-9a-f]{40,64}",
+                str(candidate_recovery.candidate_commit or ""),
+            )
+            or not re.fullmatch(
+                r"[0-9a-f]{40,64}",
+                str(candidate_recovery.current_target_head or ""),
+            )
+            or not str(candidate_recovery.worker_commit_source_ref).startswith(
+                "contract_runtime:"
+            )
+            or not str(candidate_recovery.qa_source_ref).startswith(
+                "contract_runtime:"
+            )
+            or not str(candidate_recovery.materialize_source_ref).startswith(
+                "timeline:"
+            )
+            or not str(candidate_recovery.merge_preview_id).startswith(
+                "merge-preview:"
+            )
+            or not str(candidate_recovery.authority_hash).startswith("sha256:")
+        ):
+            raise ValueError(
+                "dependency revalidation candidate recovery authority is invalid"
+            )
     existing_recovery_rows = conn.execute(
         """
         SELECT queue_item_id, recovery_mode, recovery_authority_hash
@@ -16866,7 +17007,24 @@ def queue_merge_item_for_branch_context(
         context,
         target_ref=target_ref,
         current_target_head=current_target_head,
+        immutable_candidate_head=(
+            str(candidate_recovery.candidate_commit or "")
+            if candidate_recovery is not None
+            else (
+                str(existing_item.branch_head or "")
+                if existing_item is not None
+                else ""
+            )
+        ),
     )
+    if (
+        candidate_recovery is not None
+        and refreshed_target_head
+        != str(candidate_recovery.current_target_head or "")
+    ):
+        raise ValueError(
+            "dependency revalidation current target changed after server preview"
+        )
     item = MergeQueueItem(
         project_id=project_id,
         merge_queue_id=queue_id,
@@ -16923,6 +17081,10 @@ def queue_merge_item_for_branch_context(
     }
     if postmerge_recovery is not None:
         result["audited_postmerge_recovery_authority"] = asdict(postmerge_recovery)
+    if candidate_recovery is not None:
+        result["dependency_revalidation_candidate_authority"] = asdict(
+            candidate_recovery
+        )
     return result
 
 

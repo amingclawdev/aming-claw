@@ -35123,6 +35123,371 @@ def _record_parallel_branch_merge_queue_materialize_event(
     return event
 
 
+def _dependency_revalidation_qa_candidate_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    queue_item: Any,
+    current_target_head: str,
+    target_ref: str,
+):
+    """Recover an overwritten QA candidate from server-owned evidence only.
+
+    Re-materializing after a dependency merge is target-only.  The mutable
+    worker branch must never replace the candidate that independent QA
+    reviewed.  Legacy rows that already lost that candidate are recoverable
+    only when the latest exact worker commit, a later passing QA line, the
+    original durable materialization event, and a current-target conflict
+    preview all agree.
+    """
+
+    from . import task_timeline
+    from .parallel_branch_runtime import (
+        DependencyRevalidationQaCandidateAuthority,
+        git_merge_preview_evidence,
+    )
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = str(
+        getattr(context, "parent_task_id", "") or ""
+    ).strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    merge_queue_id = str(
+        getattr(queue_item, "merge_queue_id", "") or ""
+    ).strip()
+    queue_item_id = str(
+        getattr(queue_item, "queue_item_id", "") or ""
+    ).strip()
+    durable_candidate = str(
+        getattr(queue_item, "branch_head", "") or ""
+    ).strip().lower()
+    claimed_target_head = str(current_target_head or "").strip().lower()
+    if not all(
+        (
+            runtime_context_id,
+            task_id,
+            parent_task_id,
+            backlog_id,
+            merge_queue_id,
+            queue_item_id,
+        )
+    ):
+        return None
+
+    record: Mapping[str, Any] = {}
+    contract_execution_id = parent_task_id
+    try:
+        candidate_record = _contract_runtime_store(conn).get(
+            contract_execution_id
+        )
+    except (ContractRuntimeError, sqlite3.Error):
+        candidate_record = {}
+    if (
+        isinstance(candidate_record, Mapping)
+        and str(candidate_record.get("project_id") or "").strip() == project_id
+        and str(candidate_record.get("backlog_id") or "").strip() == backlog_id
+        and _is_mf_parallel_record_contract_id(
+            str(candidate_record.get("contract_id") or "")
+        )
+    ):
+        record = candidate_record
+    else:
+        identity, resolution = (
+            _runtime_context_source_backed_contract_identity(
+                conn,
+                project_id=project_id,
+                context=context,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+            )
+        )
+        contract_execution_id = str(
+            identity.get("contract_execution_id") or ""
+        ).strip()
+        if not contract_execution_id:
+            # Legacy non-ContractRuntime queues retain their durable candidate.
+            # A source-backed runtime that cannot resolve is instead ambiguous
+            # and must not be silently "recovered" from caller data.
+            if str(resolution.get("status") or "").startswith("ambiguous"):
+                raise GovernanceError(
+                    "dependency_revalidation_candidate_authority_ambiguous",
+                    "source-backed ContractRuntime candidate authority is ambiguous",
+                    409,
+                    {"fail_closed": True, "resolution": dict(resolution)},
+                )
+            return None
+        try:
+            record = _contract_runtime_store(conn).get(contract_execution_id)
+        except (ContractRuntimeError, sqlite3.Error) as exc:
+            raise GovernanceError(
+                "dependency_revalidation_candidate_authority_missing",
+                "source-backed ContractRuntime candidate authority is unavailable",
+                409,
+                {"fail_closed": True},
+            ) from exc
+
+    completed_lines = list(record.get("completed_lines") or [])
+    worker_commit_index = -1
+    worker_commit_line: Mapping[str, Any] = {}
+    worker_commit_payload: Mapping[str, Any] = {}
+    candidate_commit = ""
+    for index in range(len(completed_lines) - 1, -1, -1):
+        line = completed_lines[index]
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() != "worker_commit":
+            continue
+        if not _runtime_context_contract_line_matches_worker(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        ):
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        commit_values = {
+            str(value or "").strip().lower()
+            for value in (
+                line.get("commit_sha"),
+                payload.get("worker_commit_sha"),
+                payload.get("commit_sha"),
+                payload.get("immutable_head_commit"),
+                payload.get("validated_head_commit"),
+            )
+            if str(value or "").strip()
+        }
+        if (
+            len(commit_values) != 1
+            or not re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                next(iter(commit_values), ""),
+            )
+        ):
+            continue
+        worker_commit_index = index
+        worker_commit_line = line
+        worker_commit_payload = payload
+        candidate_commit = next(iter(commit_values))
+        break
+    if worker_commit_index < 0:
+        raise GovernanceError(
+            "dependency_revalidation_worker_commit_missing",
+            "candidate recovery requires the latest exact source-backed worker_commit",
+            409,
+            {"fail_closed": True},
+        )
+    if durable_candidate == candidate_commit:
+        return None
+
+    qa_index = -1
+    qa_line: Mapping[str, Any] = {}
+    for index in range(len(completed_lines) - 1, worker_commit_index, -1):
+        line = completed_lines[index]
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() != (
+            "qa_independent_verification"
+        ):
+            continue
+        if not _runtime_context_contract_line_matches_worker(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        ):
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        qa_commit = str(
+            line.get("commit_sha")
+            or payload.get("candidate_commit_sha")
+            or payload.get("candidate_commit")
+            or payload.get("commit_sha")
+            or ""
+        ).strip().lower()
+        actor_role = str(
+            line.get("actor_role")
+            or line.get("evidence_owner_role")
+            or payload.get("actor_role")
+            or ""
+        ).strip().lower()
+        if (
+            qa_commit == candidate_commit
+            and actor_role == "qa"
+            and not bool(line.get("observer_impersonation"))
+            and not _contract_runtime_value_reports_failed_qa(line)
+            and _contract_runtime_line_status_passes(line)
+        ):
+            qa_index = index
+            qa_line = line
+            break
+    if qa_index < 0:
+        raise GovernanceError(
+            "dependency_revalidation_qa_candidate_missing",
+            "candidate recovery requires a later independent QA-passed line",
+            409,
+            {"fail_closed": True, "candidate_commit": candidate_commit},
+        )
+
+    materialize_event: Mapping[str, Any] = {}
+    for event in reversed(
+        task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        )
+    ):
+        if not isinstance(event, Mapping):
+            continue
+        if str(event.get("event_type") or "").strip() != (
+            "parallel.merge_queue_item_materialize"
+        ):
+            continue
+        if str(event.get("status") or "").strip() != "accepted":
+            continue
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        queue_payload = (
+            payload.get("queue_item")
+            if isinstance(payload.get("queue_item"), Mapping)
+            else {}
+        )
+        if (
+            str(payload.get("merge_queue_id") or "").strip()
+            == merge_queue_id
+            and str(payload.get("queue_item_id") or "").strip()
+            == queue_item_id
+            and str(
+                payload.get("child_task_id")
+                or queue_payload.get("task_id")
+                or ""
+            ).strip()
+            == task_id
+            and str(queue_payload.get("branch_head") or "").strip().lower()
+            == candidate_commit
+        ):
+            materialize_event = event
+            break
+    materialize_event_id = int(materialize_event.get("id") or 0)
+    if materialize_event_id <= 0:
+        raise GovernanceError(
+            "dependency_revalidation_materialize_evidence_missing",
+            "candidate recovery requires immutable original materialization evidence",
+            409,
+            {"fail_closed": True, "candidate_commit": candidate_commit},
+        )
+
+    repo_root = str(
+        getattr(context, "target_project_root", "") or ""
+    ).strip()
+    try:
+        target_head = _git_output(
+            Path(repo_root),
+            ["rev-parse", "--verify", str(target_ref or "").strip()],
+        ).strip().lower()
+    except Exception as exc:
+        raise GovernanceError(
+            "dependency_revalidation_current_target_missing",
+            "candidate recovery requires a server-resolved current target commit",
+            409,
+            {"fail_closed": True},
+        ) from exc
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target_head)
+        or (claimed_target_head and claimed_target_head != target_head)
+    ):
+        raise GovernanceError(
+            "dependency_revalidation_current_target_missing",
+            "candidate recovery requires the exact server-resolved current target commit",
+            409,
+            {
+                "fail_closed": True,
+                "caller_target_matched": (
+                    not claimed_target_head or claimed_target_head == target_head
+                ),
+            },
+        )
+    preview = git_merge_preview_evidence(
+        repo_root_path=repo_root,
+        target_ref=str(target_ref or "").strip(),
+        branch_ref=candidate_commit,
+        expected_target_head=target_head,
+    )
+    if not (
+        str(preview.get("branch_commit") or "").strip().lower()
+        == candidate_commit
+        and str(preview.get("target_commit") or "").strip().lower()
+        == target_head
+        and preview.get("passed") is False
+        and str(preview.get("status") or "").strip() == "fail"
+        and "conflict" in str(preview.get("reason") or "").lower()
+    ):
+        raise GovernanceError(
+            "dependency_revalidation_merge_preview_invalid",
+            "server merge preview did not verify the recovered candidate against the exact current target conflict",
+            409,
+            {
+                "fail_closed": True,
+                "candidate_commit": candidate_commit,
+                "current_target_head": target_head,
+                "preview_status": str(preview.get("status") or ""),
+                "preview_reason": str(preview.get("reason") or ""),
+            },
+        )
+
+    worker_ref = (
+        f"contract_runtime:{contract_execution_id}:completed_lines:"
+        f"{worker_commit_index}"
+    )
+    qa_ref = (
+        f"contract_runtime:{contract_execution_id}:completed_lines:{qa_index}"
+    )
+    authority_payload = {
+        "schema_version": (
+            "parallel_branch.dependency_revalidation_qa_candidate_authority.v1"
+        ),
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": queue_item_id,
+        "overwritten_candidate_commit": durable_candidate,
+        "candidate_commit": candidate_commit,
+        "current_target_head": target_head,
+        "worker_commit_source_ref": worker_ref,
+        "qa_source_ref": qa_ref,
+        "materialize_source_ref": f"timeline:{materialize_event_id}",
+        "merge_preview_id": str(preview.get("evidence_id") or "").strip(),
+        "merge_preview_status": "fail",
+        "merge_conflict_verified": True,
+        "server_derived": True,
+        "caller_candidate_trusted": False,
+    }
+    return DependencyRevalidationQaCandidateAuthority(
+        **{
+            key: value
+            for key, value in authority_payload.items()
+            if key != "schema_version"
+        },
+        authority_hash=stable_sha256(authority_payload),
+    )
+
+
 def _independent_qa_toolchain_evidence_passed(
     verification: Mapping[str, Any],
 ) -> bool:
@@ -35688,6 +36053,7 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
         get_branch_context,
         integration_epoch_resume_payload,
         integration_epoch_to_dict,
+        list_merge_queue_items,
         queue_merge_item_for_branch_context,
     )
 
@@ -35742,6 +36108,43 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                     route_gate=route_gate,
                 )
             )
+            current_target_head = _parallel_branch_current_target_head(
+                project_id,
+                ctx.body,
+                target_ref=target_ref,
+            )
+            existing_task_items = [
+                item
+                for item in list_merge_queue_items(
+                    conn,
+                    project_id,
+                    merge_queue_id,
+                )
+                if str(item.task_id or "").strip() == task_id
+            ]
+            if len(existing_task_items) > 1:
+                raise GovernanceError(
+                    "dependency_revalidation_queue_identity_ambiguous",
+                    "durable merge queue task identity is ambiguous",
+                    409,
+                    {"fail_closed": True},
+                )
+            dependency_candidate_authority = None
+            if (
+                postmerge_recovery_authority is None
+                and runtime_context is not None
+                and existing_task_items
+            ):
+                dependency_candidate_authority = (
+                    _dependency_revalidation_qa_candidate_authority(
+                        conn,
+                        project_id=project_id,
+                        context=runtime_context,
+                        queue_item=existing_task_items[0],
+                        current_target_head=current_target_head,
+                        target_ref=target_ref,
+                    )
+                )
             queued = queue_merge_item_for_branch_context(
                 conn,
                 project_id=project_id,
@@ -35760,11 +36163,7 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                 ),
                 requires_graph_epoch=tuple(_query_statuses(ctx.body, "requires_graph_epoch")),
                 target_ref=target_ref,
-                current_target_head=_parallel_branch_current_target_head(
-                    project_id,
-                    ctx.body,
-                    target_ref=target_ref,
-                ),
+                current_target_head=current_target_head,
                 validated_target_head=str(ctx.body.get("validated_target_head") or ""),
                 validation_attempt=_query_int(ctx.body, "validation_attempt", 0),
                 merge_preview_id=str(ctx.body.get("merge_preview_id") or ""),
@@ -35777,6 +36176,9 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                 audited_postmerge_recovery_authority=(
                     postmerge_recovery_authority
                 ),
+                dependency_revalidation_candidate_authority=(
+                    dependency_candidate_authority
+                ),
                 now_iso=str(ctx.body.get("now_iso") or ""),
             )
             decision = decide_persisted_merge_queue(
@@ -35784,11 +36186,7 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                 project_id,
                 merge_queue_id,
                 target_ref=target_ref,
-                current_target_head=_parallel_branch_current_target_head(
-                    project_id,
-                    ctx.body,
-                    target_ref=target_ref,
-                ),
+                current_target_head=current_target_head,
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-002"),
             )
             _record_route_token_gate_event(

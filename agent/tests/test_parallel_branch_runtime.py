@@ -58,6 +58,7 @@ from agent.governance.parallel_branch_runtime import (
     BranchRuntimeFenceError,
     BranchRuntimeTask,
     BranchTaskRuntimeContext,
+    DependencyRevalidationQaCandidateAuthority,
     MergeQueueItem,
     append_branch_contract_revision,
     branch_context_from_chain_stage,
@@ -96,6 +97,7 @@ from agent.governance.parallel_branch_runtime import (
     runtime_context_secret_hash,
     runtime_tasks_from_contexts,
     upsert_branch_context,
+    upsert_merge_queue_item,
     validate_mf_subagent_graph_query_identity,
 )
 
@@ -7832,6 +7834,233 @@ def test_merge_queue_materialize_repairs_legacy_queued_finish_context() -> None:
     assert queued["queue_item"]["status"] == "queued_for_merge"
     assert repaired["context"]["status"] == STATE_VALIDATED
     assert repaired["queue_item"]["status"] == "queued_for_merge"
+
+
+def test_dependency_target_revalidation_preserves_immutable_candidate(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "dependency-revalidation"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "worker@example.test"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Worker"],
+        cwd=repo,
+        check=True,
+    )
+    owned = repo / "owned.txt"
+    owned.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "owned.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "switch", "-c", "candidate"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    owned.write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "add", "owned.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "candidate"], cwd=repo, check=True)
+    candidate = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "switch", "-c", "target", base],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    (repo / "target.txt").write_text("target one\n", encoding="utf-8")
+    subprocess.run(["git", "add", "target.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "target one"], cwd=repo, check=True)
+    target_one = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "switch", "candidate"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    conn = _runtime_conn()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id="T-dependency-revalidate",
+            batch_id="PB-dependency-revalidate",
+            branch_ref="candidate",
+            ref_name="target",
+            worktree_path=str(repo),
+            target_project_root=str(repo),
+            status=STATE_WORKTREE_READY,
+            base_commit=base,
+            head_commit=candidate,
+            target_head_commit=target_one,
+        ),
+        now_iso=NOW,
+    )
+    first = queue_merge_item_for_branch_context(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="T-dependency-revalidate",
+        merge_queue_id="mq-dependency-revalidate",
+        target_ref="target",
+        now_iso=NOW,
+    )
+    assert first["queue_item"]["branch_head"] == candidate
+    assert first["queue_item"]["current_target_head"] == target_one
+
+    owned.write_text("mutable same-lane replacement\n", encoding="utf-8")
+    subprocess.run(["git", "add", "owned.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "mutable replacement"],
+        cwd=repo,
+        check=True,
+    )
+    replacement = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert replacement != candidate
+    subprocess.run(
+        ["git", "switch", "target"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    (repo / "target.txt").write_text("target two\n", encoding="utf-8")
+    subprocess.run(["git", "add", "target.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "target two"], cwd=repo, check=True)
+    target_two = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    revalidated = queue_merge_item_for_branch_context(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="T-dependency-revalidate",
+        merge_queue_id="mq-dependency-revalidate",
+        target_ref="target",
+        now_iso=NOW,
+    )
+    assert revalidated["queue_item"]["branch_head"] == candidate
+    assert revalidated["context"]["head_commit"] == candidate
+    assert revalidated["queue_item"]["current_target_head"] == target_two
+
+
+def test_overwritten_candidate_recovery_requires_typed_server_authority() -> None:
+    conn = _runtime_conn()
+    candidate = "a" * 40
+    overwritten = "b" * 40
+    target = "c" * 40
+    queue_id = "mq-overwritten-candidate"
+    task_id = "T-overwritten-candidate"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            backlog_id="AC-OVERWRITTEN-CANDIDATE",
+            task_id=task_id,
+            parent_task_id="cex-overwritten-candidate",
+            runtime_context_id="mfrctx-overwritten-candidate",
+            merge_queue_id=queue_id,
+            branch_ref="refs/heads/codex/overwritten",
+            status=STATE_VALIDATED,
+            head_commit=overwritten,
+            target_head_commit=target,
+        ),
+        now_iso=NOW,
+    )
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=queue_id,
+            queue_item_id=f"{queue_id}:{task_id}",
+            backlog_id="AC-OVERWRITTEN-CANDIDATE",
+            task_id=task_id,
+            branch_ref="refs/heads/codex/overwritten",
+            queue_index=0,
+            status="merge_ready",
+            branch_head=overwritten,
+            current_target_head=target,
+        ),
+        now_iso=NOW,
+    )
+    with pytest.raises(ValueError, match="server-derived authority"):
+        queue_merge_item_for_branch_context(
+            conn,
+            project_id=PROJECT_ID,
+            task_id=task_id,
+            merge_queue_id=queue_id,
+            dependency_revalidation_candidate_authority={  # type: ignore[arg-type]
+                "candidate_commit": candidate,
+            },
+        )
+
+    authority = DependencyRevalidationQaCandidateAuthority(
+        project_id=PROJECT_ID,
+        backlog_id="AC-OVERWRITTEN-CANDIDATE",
+        task_id=task_id,
+        parent_task_id="cex-overwritten-candidate",
+        runtime_context_id="mfrctx-overwritten-candidate",
+        merge_queue_id=queue_id,
+        queue_item_id=f"{queue_id}:{task_id}",
+        overwritten_candidate_commit=overwritten,
+        candidate_commit=candidate,
+        current_target_head=target,
+        worker_commit_source_ref=(
+            "contract_runtime:cex-overwritten-candidate:completed_lines:6"
+        ),
+        qa_source_ref=(
+            "contract_runtime:cex-overwritten-candidate:completed_lines:10"
+        ),
+        materialize_source_ref="timeline:100",
+        merge_preview_id=f"merge-preview:{target[:12]}:{candidate[:12]}",
+        authority_hash="sha256:" + "d" * 64,
+    )
+    recovered = queue_merge_item_for_branch_context(
+        conn,
+        project_id=PROJECT_ID,
+        task_id=task_id,
+        merge_queue_id=queue_id,
+        current_target_head=target,
+        dependency_revalidation_candidate_authority=authority,
+        now_iso=NOW,
+    )
+    assert recovered["queue_item"]["branch_head"] == candidate
+    assert recovered["context"]["head_commit"] == candidate
+    assert recovered["dependency_revalidation_candidate_authority"][
+        "caller_candidate_trusted"
+    ] is False
 
 
 def _finished_qa_runtime_projection(
