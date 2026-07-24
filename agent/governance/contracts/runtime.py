@@ -2514,7 +2514,7 @@ def _active_failed_qa_line_index(
             continue
         if not _line_shape_allows_contract_completion(line):
             continue
-        if _line_status_allows_contract_completion(
+        if _qa_line_supersedes_active_failed_qa(
             line,
             source_record=source_record,
             source_line_index=_source_record_completed_line_index(
@@ -2603,7 +2603,7 @@ def _last_failed_qa_line_index(
             continue
         if str(line.get("line_id") or "").strip() != "qa_independent_verification":
             continue
-        if not _line_status_allows_contract_completion(
+        if not _qa_line_supersedes_active_failed_qa(
             line,
             source_record=source_record,
             source_line_index=_source_record_completed_line_index(
@@ -2613,6 +2613,74 @@ def _last_failed_qa_line_index(
         ):
             failed_index = index
     return failed_index
+
+
+def _qa_line_supersedes_active_failed_qa(
+    line: Mapping[str, Any],
+    *,
+    source_record: Mapping[str, Any] | None = None,
+    source_line_index: int = -1,
+) -> bool:
+    """Return whether a later QA line clears the active repair boundary.
+
+    Completion remains strictly server-normalized.  Failed-QA recovery also
+    has to understand one historical/synthetic projection: callers copied a
+    failed QA line, replaced its top-level and payload statuses with ``passed``,
+    but retained the earlier normalization gate that says no top-level status
+    was present.  That explicit later pass supersedes the older repair
+    authority without making the copied line close-satisfying.
+    """
+
+    if _line_status_allows_contract_completion(
+        line,
+        source_record=source_record,
+        source_line_index=source_line_index,
+    ):
+        return True
+    if str(line.get("line_id") or "").strip() != "qa_independent_verification":
+        return False
+    if str(line.get("actor_role") or "").strip().lower() != "qa":
+        return False
+    if bool(line.get("observer_impersonation")):
+        return False
+    payload = (
+        line.get("payload")
+        if isinstance(line.get("payload"), Mapping)
+        else {}
+    )
+    if (
+        str(line.get("status") or "").strip().lower()
+        not in _QA_COMPLETION_PASSING_STATUSES
+        or str(payload.get("status") or "").strip().lower()
+        not in _QA_COMPLETION_PASSING_STATUSES
+    ):
+        return False
+    provenance = (
+        line.get("qa_evidence_provenance")
+        if isinstance(line.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    status_gate = (
+        provenance.get("completion_status_gate")
+        if isinstance(provenance.get("completion_status_gate"), Mapping)
+        else {}
+    )
+    if not (
+        str(status_gate.get("schema_version") or "")
+        == _QA_COMPLETION_STATUS_GATE_SCHEMA_VERSION
+        and status_gate.get("server_derived") is True
+        and status_gate.get("top_level_status_present") is False
+        and status_gate.get("top_level_status_passing") is False
+        and not str(status_gate.get("normalized_status") or "").strip()
+    ):
+        return False
+    if (
+        _mapping_own_fields_contain_contract_completion_blocker(payload)
+        or _contains_contract_completion_blocker(payload)
+        or _qa_independent_verification_summary_reports_failure(payload)
+    ):
+        return False
+    return True
 
 
 _FAILED_QA_RETRY_RESET_LINE_IDS = frozenset(

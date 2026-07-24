@@ -147,3 +147,84 @@ def test_accepted_no_pass_count_mismatch_is_active_failed_qa():
     )
     assert failed_index == 0
     assert failed_line is line
+
+
+def _synthetic_later_qa_pass(*, summary: str) -> dict:
+    return {
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "status": "passed",
+        "observer_impersonation": False,
+        "payload": {
+            "status": "passed",
+            "summary": summary,
+        },
+        "qa_evidence_provenance": {
+            "schema_version": "qa_evidence_provenance.v1",
+            "server_derived": True,
+            "authorization_source": "qa_role_session",
+            "evidence_owner_role": "qa",
+            "observer_impersonation": False,
+            "completion_status_gate": {
+                "schema_version": (
+                    "contract_runtime.qa_completion_status_gate.v1"
+                ),
+                "source": "contract_runtime_line_write_normalization",
+                "server_derived": True,
+                "top_level_status_present": False,
+                "top_level_status_passing": False,
+                "normalized_status": "",
+                "nested_payload_decision_satisfies": False,
+            },
+        },
+    }
+
+
+def test_synthetic_later_pass_clears_repair_without_satisfying_close():
+    failed = {
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "status": "failed",
+        "payload": {"summary": "Independent QA failed the worker commit."},
+    }
+    passed = _synthetic_later_qa_pass(
+        summary="Independent QA passed the retry."
+    )
+    record = {
+        "contract_execution_id": "cex-synthetic-qa-pass",
+        "completed_lines": [failed, passed],
+    }
+
+    assert not _line_status_allows_contract_completion(
+        passed,
+        source_record=record,
+        source_line_index=1,
+    )
+    assert _active_failed_qa_line(
+        record["completed_lines"],
+        source_record=record,
+    ) == (-1, {})
+
+
+def test_synthetic_later_pass_with_failure_summary_keeps_repair_active():
+    failed = {
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "status": "failed",
+        "payload": {"summary": "Independent QA failed the worker commit."},
+    }
+    contradictory = _synthetic_later_qa_pass(
+        summary="Independent QA failed the worker commit again."
+    )
+    record = {
+        "contract_execution_id": "cex-synthetic-qa-contradiction",
+        "completed_lines": [failed, contradictory],
+    }
+
+    failed_index, failed_line = _active_failed_qa_line(
+        record["completed_lines"],
+        source_record=record,
+    )
+    assert failed_index == 1
+    assert failed_line is contradictory
