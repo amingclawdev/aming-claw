@@ -33803,7 +33803,7 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         "status": qa_status,
         "runtime_context_id": runtime_context.runtime_context_id,
         "task_id": runtime_context.task_id,
-        "parent_task_id": backlog_id,
+        "parent_task_id": "stale-parent-contract-alias",
         "summary": (
             "Independent QA failed in ContractRuntime without a "
             "failed timeline event."
@@ -33843,7 +33843,7 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
                 "status": qa_status,
                 "runtime_context_id": runtime_context.runtime_context_id,
                 "task_id": runtime_context.task_id,
-                "parent_task_id": backlog_id,
+                "parent_task_id": "stale-parent-contract-alias",
                 "worker_role": "mf_sub",
                 "payload": qa_payload,
                 "verification": qa_verification,
@@ -33854,6 +33854,17 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     assert qa_result["contract_runtime_current_state"]["next_legal_action"][
         "line_id"
     ] == "worker_read_runtime_guide"
+    failed_qa_line = server._contract_runtime(conn).store.get(
+        successor["contract_execution_id"]
+    )["completed_lines"][-1]
+    assert failed_qa_line["runtime_context_id"] == runtime_context.runtime_context_id
+    assert failed_qa_line["task_id"] == runtime_context.task_id
+    assert failed_qa_line["parent_task_id"] == backlog_id
+    assert failed_qa_line["payload"]["runtime_context_id"] == (
+        runtime_context.runtime_context_id
+    )
+    assert failed_qa_line["payload"]["task_id"] == runtime_context.task_id
+    assert failed_qa_line["payload"]["parent_task_id"] == backlog_id
     assert not task_timeline.list_events(
         conn,
         PID,
@@ -36549,6 +36560,111 @@ def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_with
     second_rotation_audit = json.loads(second_rotation_row["payload_json"])
     assert second_rotation_audit["reopen_for_revision"] is False
     assert second_rotation_audit["timeline_reopen_for_revision"] is False
+
+
+@pytest.mark.parametrize(
+    ("failed_line", "matches"),
+    [
+        (
+            {
+                "runtime_context_id": "mfrctx-canonical-rejoin",
+                "task_id": "worker-canonical-rejoin",
+                "parent_task_id": "stale-parent-alias",
+            },
+            True,
+        ),
+        (
+            {
+                "runtime_context_id": "mfrctx-wrong",
+                "task_id": "worker-canonical-rejoin",
+            },
+            False,
+        ),
+        (
+            {
+                "runtime_context_id": "mfrctx-canonical-rejoin",
+                "task_id": "worker-wrong",
+            },
+            False,
+        ),
+        ({"parent_task_id": "parent-canonical-rejoin"}, False),
+        ({}, False),
+    ],
+)
+def test_failed_qa_rejoin_requires_exact_runtime_and_task_identity(
+    failed_line,
+    matches,
+):
+    context = SimpleNamespace(
+        runtime_context_id="mfrctx-canonical-rejoin",
+        task_id="worker-canonical-rejoin",
+        parent_task_id="parent-canonical-rejoin",
+    )
+
+    assert server._runtime_context_failed_qa_line_matches_context(
+        failed_line,
+        context=context,
+    ) is matches
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("runtime_context_id", "mfrctx-wrong"),
+        ("task_id", "worker-wrong"),
+    ],
+)
+def test_qa_worker_identity_binding_rejects_wrong_runtime_or_task(
+    monkeypatch,
+    field,
+    wrong_value,
+):
+    context = SimpleNamespace(
+        runtime_context_id="mfrctx-canonical-qa",
+        task_id="worker-canonical-qa",
+        parent_task_id="parent-canonical-qa",
+    )
+    record = {
+        "contract_execution_id": "cex-canonical-qa",
+        "completed_lines": [
+            {"line_id": "observer_dispatch_bounded_workers"},
+        ],
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_line_identity",
+        lambda _record: {
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.parent_task_id,
+            "identity_status": "resolved",
+            "identity_source_line_id": "observer_dispatch_bounded_workers",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [context],
+    )
+    write = {
+        "line_id": "qa_independent_verification",
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": "stale-parent-alias",
+    }
+    write[field] = wrong_value
+
+    with pytest.raises(GovernanceError) as blocked:
+        server._contract_runtime_bind_qa_worker_identity_authority(
+            object(),
+            project_id=PID,
+            record=record,
+            write=write,
+        )
+
+    assert blocked.value.code == "contract_runtime_qa_worker_identity_mismatch"
+    assert blocked.value.details["identity_mismatches"][0]["field"] == field
+    assert blocked.value.details["fail_closed"] is True
 
 
 def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_context(
@@ -55149,6 +55265,9 @@ def _known_baseline_accepted_qa_record() -> dict:
         "line_id": "qa_independent_verification",
         "actor_role": "qa",
         "evidence_kind": "independent_verification",
+        "runtime_context_id": "mfrctx-known-baseline-qa-selection",
+        "task_id": "worker-known-baseline-qa-selection",
+        "parent_task_id": "cex-known-baseline-qa-selection",
         "authorization_source": "qa_session_token_ref",
         "observer_impersonation": False,
         "commit_sha": candidate_commit,
@@ -55157,6 +55276,9 @@ def _known_baseline_accepted_qa_record() -> dict:
         "qa_evidence_provenance": provenance(),
         "payload": {
             "schema_version": "mf_parallel.qa_independent_verification.v1",
+            "runtime_context_id": "mfrctx-known-baseline-qa-selection",
+            "task_id": "worker-known-baseline-qa-selection",
+            "parent_task_id": "cex-known-baseline-qa-selection",
             "acceptance_scope": "candidate_regression_and_acceptance_criteria",
             "verdict": "accepted",
             "full_suite_claim": "not_claimed",
