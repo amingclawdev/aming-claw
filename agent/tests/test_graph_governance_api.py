@@ -36528,6 +36528,8 @@ def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_with
                     "parent_task_id": context.root_task_id,
                     "target_project_root": str(target_root),
                     "reason": "host worker session lost raw auth env after resume",
+                    "reopen_for_revision": True,
+                    "reopen_for_post_qa_merge_conflict": True,
                 },
             )
         )
@@ -64376,6 +64378,26 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     assert post_qa_record["runtime_guide"]["next_legal_action"]["line_id"] == (
         "observer_merge"
     )
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(
+            runtime_context,
+            status=STATE_VALIDATED,
+            attempt=1,
+            retry_round=0,
+        ),
+        now_iso="2026-07-24T10:00:00Z",
+    )
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": (
+            f"sha256:visible-{worker_task_id}"
+        ),
+    }
 
     queue_item = MergeQueueItem(
         project_id=PID,
@@ -64395,6 +64417,19 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     upsert_merge_queue_item(conn, queue_item)
     conn.commit()
 
+    authority, diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=post_qa_record,
+            route_identity=route_identity,
+        )
+    )
+    assert authority is None
+    assert "not QA-passed merge_ready" in " ".join(
+        diagnostics["merge_conflict_authority"]["errors"]
+    )
     assert server._runtime_context_same_lane_worker_commit_recovery(
         post_qa_record,
         runtime_context,
@@ -64425,12 +64460,167 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     assert "did not reproduce a merge conflict" in " ".join(
         stale_target["errors"]
     )
+    stale_authority, stale_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=post_qa_record,
+            route_identity=route_identity,
+        )
+    )
+    assert stale_authority is None
+    assert "did not reproduce a merge conflict" in " ".join(
+        stale_diagnostics["merge_conflict_authority"]["errors"]
+    )
 
     subprocess.run(
         ["git", "branch", "-f", "target", target_commit],
         cwd=worktree,
         check=True,
     )
+    conflict_authority, conflict_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=post_qa_record,
+            route_identity=route_identity,
+        )
+    )
+    assert conflict_authority is not None
+    assert conflict_diagnostics["status"] == "eligible"
+    assert conflict_authority.independent_qa_passed is True
+    assert conflict_authority.merge_conflict_verified is True
+
+    wrong_fence_authority, wrong_fence_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=replace(
+                runtime_context,
+                owned_files=("different.py",),
+                target_files=("different.py",),
+            ),
+            record=post_qa_record,
+            route_identity=route_identity,
+        )
+    )
+    assert wrong_fence_authority is None
+    assert "owned-file fence mismatch" in " ".join(
+        wrong_fence_diagnostics["errors"]
+    )
+    wrong_root_authority, wrong_root_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=replace(
+                runtime_context,
+                target_project_root=str(tmp_path / "wrong-root"),
+            ),
+            record=post_qa_record,
+            route_identity=route_identity,
+        )
+    )
+    assert wrong_root_authority is None
+    assert "root/worktree identity mismatch" in " ".join(
+        wrong_root_diagnostics["errors"]
+    )
+    wrong_route_authority, wrong_route_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=post_qa_record,
+            route_identity={**route_identity, "route_id": "route-wrong"},
+        )
+    )
+    assert wrong_route_authority is None
+    assert "route_id identity mismatch" in " ".join(
+        wrong_route_diagnostics["errors"]
+    )
+    failed_qa_record = copy.deepcopy(post_qa_record)
+    failed_qa_line = next(
+        line
+        for line in reversed(failed_qa_record["completed_lines"])
+        if line.get("line_id") == "qa_independent_verification"
+    )
+    failed_qa_line["status"] = "failed"
+    failed_qa_line["payload"]["status"] = "failed"
+    failed_qa_authority, failed_qa_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=failed_qa_record,
+            route_identity=route_identity,
+        )
+    )
+    assert failed_qa_authority is None
+    assert "independent QA-passed line is missing" in " ".join(
+        failed_qa_diagnostics["errors"]
+    )
+    bypass_record = copy.deepcopy(post_qa_record)
+    bypass_record["completed_lines"].append(
+        {
+            "stage_id": "qa",
+            "line_id": "qa_graph_context",
+            "evidence_kind": "contract_line_bypass",
+            "status": "waived",
+            "no_pass_claim": True,
+        }
+    )
+    bypass_authority, bypass_diagnostics = (
+        server._runtime_context_post_qa_merge_conflict_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=bypass_record,
+            route_identity=route_identity,
+        )
+    )
+    assert bypass_authority is None
+    assert "historical/bypass" in " ".join(bypass_diagnostics["errors"])
+
+    rejoin = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "contract_execution_id": successor["contract_execution_id"],
+                "target_project_root": str(worktree),
+                "reason": (
+                    "server-verified QA-passed candidate conflicts with "
+                    "the current target"
+                ),
+                "now_iso": "2999-07-24T10:01:00Z",
+                **route_identity,
+            },
+        )
+    )
+    assert rejoin["reopen_for_revision"] is True
+    assert rejoin["reopen_for_failed_qa_revision"] is False
+    assert rejoin["reopen_for_post_qa_merge_conflict"] is True
+    assert rejoin["post_qa_merge_conflict_rejoin_diagnostics"]["status"] == (
+        "eligible"
+    )
+    runtime_context = get_branch_context(
+        conn,
+        PID,
+        runtime_context.task_id,
+    )
+    assert runtime_context is not None
+    assert runtime_context.status == STATE_WORKTREE_READY
+    assert runtime_context.last_recovery_action == (
+        "mf_subagent_post_qa_merge_conflict_rejoin_issued"
+    )
+
     missing_target_parent = (
         server._runtime_context_same_lane_worker_commit_recovery(
             post_qa_record,

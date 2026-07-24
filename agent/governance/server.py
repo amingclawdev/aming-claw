@@ -25753,6 +25753,376 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
     return {}
 
 
+def _runtime_context_post_qa_merge_conflict_rejoin_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    record: Mapping[str, Any],
+    route_identity: Mapping[str, Any],
+) -> tuple[Any | None, dict[str, Any]]:
+    """Derive the only non-failed-QA authority that may reopen a closed lane."""
+
+    from .parallel_branch_runtime import (
+        FAILED_QA_REVISION_REJOIN_STATES,
+        PostQaMergeConflictRejoinAuthority,
+    )
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    merge_queue_id = str(
+        getattr(context, "merge_queue_id", "") or ""
+    ).strip()
+    branch_ref = str(getattr(context, "branch_ref", "") or "").strip()
+    target_project_root = _runtime_context_effective_target_project_root(context)
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    owned_files = tuple(
+        str(value or "").strip()
+        for value in (
+            getattr(context, "owned_files", ())
+            or getattr(context, "target_files", ())
+            or ()
+        )
+        if str(value or "").strip()
+    )
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    diagnostics: dict[str, Any] = {
+        "schema_version": (
+            "runtime_context.post_qa_merge_conflict_rejoin_diagnostics.v1"
+        ),
+        "status": "blocked",
+        "eligible": False,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "merge_queue_id": merge_queue_id,
+        "errors": [],
+    }
+    errors: list[str] = diagnostics["errors"]
+    if str(getattr(context, "status", "") or "").strip() not in (
+        FAILED_QA_REVISION_REJOIN_STATES
+    ):
+        errors.append("runtime context is not closed at validated/merge_ready")
+    if not all(
+        (
+            project_id,
+            runtime_context_id,
+            task_id,
+            parent_task_id,
+            backlog_id,
+            merge_queue_id,
+            branch_ref,
+            target_project_root,
+            worktree_path,
+            owned_files,
+            execution_id,
+        )
+    ):
+        errors.append("runtime/contract/file-fence identity is incomplete")
+    if (
+        str(record.get("project_id") or "").strip()
+        != str(project_id or "").strip()
+        or str(record.get("backlog_id") or "").strip() != backlog_id
+        or not _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+    ):
+        errors.append("ContractRuntime project/backlog/contract identity mismatch")
+    next_action = (
+        record.get("runtime_guide", {}).get("next_legal_action", {})
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    if str(next_action.get("line_id") or "").strip() != "observer_merge":
+        errors.append("ContractRuntime is not at the post-QA observer_merge line")
+    if any(
+        isinstance(line, Mapping)
+        and (
+            str(line.get("evidence_kind") or "").strip()
+            == "contract_line_bypass"
+            or str(line.get("line_id") or "").strip() == "contract_line_bypass"
+        )
+        for line in record.get("completed_lines") or []
+    ):
+        errors.append("historical/bypass ContractRuntime contexts cannot rejoin")
+
+    dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+    if not dispatch_match:
+        errors.append("source-backed bounded worker dispatch identity is missing")
+    dispatch_payload = (
+        dispatch_match.get("payload")
+        if isinstance(dispatch_match.get("payload"), Mapping)
+        else {}
+    )
+    dispatch_root = _timeline_first_deep_text(
+        dispatch_payload,
+        "target_project_root",
+    )
+    dispatch_worktree = _timeline_first_deep_text(
+        dispatch_payload,
+        "worktree_path",
+    )
+    dispatch_branch = _timeline_first_deep_text(dispatch_payload, "branch_ref")
+    dispatch_queue = _timeline_first_deep_text(
+        dispatch_payload,
+        "merge_queue_id",
+    )
+    dispatch_owned_files = tuple(
+        sorted(
+            set(
+                _runtime_context_service_query_values(
+                    dispatch_payload,
+                    "owned_files",
+                )
+            )
+        )
+    )
+    try:
+        roots_match = bool(
+            dispatch_root
+            and Path(dispatch_root).resolve()
+            == Path(target_project_root).resolve()
+            and dispatch_worktree
+            and Path(dispatch_worktree).resolve()
+            == Path(worktree_path).resolve()
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        roots_match = False
+    if not roots_match:
+        errors.append("source-backed dispatch root/worktree identity mismatch")
+    if dispatch_branch != branch_ref or dispatch_queue != merge_queue_id:
+        errors.append("source-backed dispatch branch/merge-queue identity mismatch")
+    if dispatch_owned_files != tuple(sorted(set(owned_files))):
+        errors.append("source-backed dispatch owned-file fence mismatch")
+
+    safe_route_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if not all(safe_route_identity.values()):
+        errors.append("active route identity is incomplete")
+    for field, expected_value in safe_route_identity.items():
+        if (
+            _timeline_first_deep_text(dispatch_payload, field)
+            != expected_value
+        ):
+            errors.append(f"source-backed dispatch {field} identity mismatch")
+
+    completed_lines = list(record.get("completed_lines") or [])
+    worker_commit_index = -1
+    worker_commit_line: Mapping[str, Any] = {}
+    worker_commit_payload: Mapping[str, Any] = {}
+    candidate_commit = ""
+    for index in range(len(completed_lines) - 1, -1, -1):
+        line = completed_lines[index]
+        if (
+            not isinstance(line, Mapping)
+            or str(line.get("line_id") or "").strip() != "worker_commit"
+            or not _runtime_context_contract_line_matches_worker(
+                line,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+            )
+        ):
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        commits = {
+            str(value or "").strip().lower()
+            for value in (
+                line.get("commit_sha"),
+                payload.get("worker_commit_sha"),
+                payload.get("commit_sha"),
+                payload.get("immutable_head_commit"),
+                payload.get("validated_head_commit"),
+            )
+            if str(value or "").strip()
+        }
+        if len(commits) != 1:
+            continue
+        candidate_commit = next(iter(commits))
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_commit):
+            continue
+        worker_commit_index = index
+        worker_commit_line = line
+        worker_commit_payload = payload
+        break
+    if worker_commit_index < 0:
+        errors.append("exact source-backed worker_commit is missing")
+    candidate_owned_files = tuple(
+        sorted(
+            set(
+                _runtime_context_service_query_values(
+                    worker_commit_payload,
+                    "owned_files",
+                )
+            )
+        )
+    )
+    candidate_changed_files = tuple(
+        sorted(
+            set(
+                _runtime_context_service_query_values(
+                    worker_commit_payload,
+                    "changed_files",
+                )
+            )
+        )
+    )
+    if (
+        candidate_owned_files != tuple(sorted(set(owned_files)))
+        or not candidate_changed_files
+        or any(path not in set(owned_files) for path in candidate_changed_files)
+    ):
+        errors.append("worker_commit file-fence identity is missing or widened")
+    if (
+        _timeline_first_deep_text(
+            worker_commit_line,
+            "target_project_root",
+        )
+        != target_project_root
+    ):
+        errors.append("worker_commit target root identity mismatch")
+
+    qa_index = -1
+    for index in range(len(completed_lines) - 1, worker_commit_index, -1):
+        line = completed_lines[index]
+        if (
+            not isinstance(line, Mapping)
+            or str(line.get("line_id") or "").strip()
+            != "qa_independent_verification"
+            or not _runtime_context_contract_line_matches_worker(
+                line,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+            )
+        ):
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        qa_commit = str(
+            line.get("commit_sha")
+            or payload.get("candidate_commit_sha")
+            or payload.get("candidate_commit")
+            or payload.get("commit_sha")
+            or ""
+        ).strip().lower()
+        actor_role = str(
+            line.get("actor_role")
+            or line.get("evidence_owner_role")
+            or payload.get("actor_role")
+            or ""
+        ).strip().lower()
+        if (
+            qa_commit == candidate_commit
+            and actor_role == "qa"
+            and not bool(line.get("observer_impersonation"))
+            and not _contract_runtime_value_reports_failed_qa(line)
+            and _contract_runtime_line_status_passes(line)
+        ):
+            qa_index = index
+            break
+    if qa_index < 0:
+        errors.append("later exact independent QA-passed line is missing")
+    if errors:
+        return None, diagnostics
+
+    conflict = _runtime_context_server_revalidated_merge_conflict_authority(
+        conn,
+        project_id=str(project_id or "").strip(),
+        record=record,
+        context=context,
+        recorded_commit=candidate_commit,
+    )
+    diagnostics["merge_conflict_authority"] = dict(conflict)
+    if conflict.get("verified") is not True:
+        errors.extend(
+            conflict.get("errors") or [
+                "server did not reproduce the current-target merge conflict"
+            ]
+        )
+        return None, diagnostics
+
+    core = {
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": str(conflict.get("queue_item_id") or "").strip(),
+        "branch_ref": branch_ref,
+        "target_project_root": target_project_root,
+        "worktree_path": worktree_path,
+        "owned_files": tuple(owned_files),
+        "candidate_commit": candidate_commit,
+        "current_target_head": str(
+            conflict.get("current_target_parent_commit") or ""
+        ).strip(),
+        "dispatch_source_ref": str(
+            dispatch_match.get("source_ref") or ""
+        ).strip(),
+        "worker_commit_source_ref": (
+            f"contract_runtime:{execution_id}:completed_lines:"
+            f"{worker_commit_index}"
+        ),
+        "qa_source_ref": (
+            f"contract_runtime:{execution_id}:completed_lines:{qa_index}"
+        ),
+        "merge_preview_id": str(
+            conflict.get("preview_evidence_id") or ""
+        ).strip(),
+        "route_identity_hash": stable_sha256(safe_route_identity),
+        "schema_version": (
+            "parallel_branch.post_qa_merge_conflict_rejoin_authority.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "independent_qa_passed": True,
+        "merge_conflict_verified": True,
+        "historical_bypass_context": False,
+    }
+    authority = PostQaMergeConflictRejoinAuthority(
+        **{
+            key: value
+            for key, value in core.items()
+            if key != "schema_version"
+        },
+        authority_hash=stable_sha256(core),
+    )
+    diagnostics.update(
+        {
+            "status": "eligible",
+            "eligible": True,
+            "errors": [],
+            "authority_hash": authority.authority_hash,
+            "candidate_commit": candidate_commit,
+            "current_target_head": authority.current_target_head,
+            "dispatch_source_ref": authority.dispatch_source_ref,
+            "worker_commit_source_ref": authority.worker_commit_source_ref,
+            "qa_source_ref": authority.qa_source_ref,
+            "merge_preview_id": authority.merge_preview_id,
+            "route_identity_hash": authority.route_identity_hash,
+        }
+    )
+    return authority, diagnostics
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/rejoin")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/session-token/rejoin")
 def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestContext):
@@ -25976,8 +26346,35 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 context=context,
             )
         )
-        reopen_for_revision = bool(
+        failed_qa_reopen_for_revision = bool(
             timeline_reopen_for_revision or contract_runtime_failed_qa_revision
+        )
+        post_qa_merge_conflict_rejoin_authority = None
+        post_qa_merge_conflict_rejoin_diagnostics: dict[str, Any] = {}
+        if (
+            not failed_qa_reopen_for_revision
+            and resolved_contract_execution_id
+        ):
+            try:
+                post_qa_record = _contract_runtime_store(conn).get(
+                    resolved_contract_execution_id
+                )
+            except (ContractRuntimeError, sqlite3.Error):
+                post_qa_record = {}
+            if post_qa_record:
+                (
+                    post_qa_merge_conflict_rejoin_authority,
+                    post_qa_merge_conflict_rejoin_diagnostics,
+                ) = _runtime_context_post_qa_merge_conflict_rejoin_authority(
+                    conn,
+                    project_id=project_id,
+                    context=context,
+                    record=post_qa_record,
+                    route_identity=selected_route_identity,
+                )
+        reopen_for_revision = bool(
+            failed_qa_reopen_for_revision
+            or post_qa_merge_conflict_rejoin_authority is not None
         )
         try:
             result = rejoin_mf_subagent_runtime_session_token(
@@ -25995,7 +26392,10 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 ttl_seconds=body.get("ttl_seconds"),
                 reason=reason,
                 now_iso=str(body.get("now_iso") or ""),
-                reopen_for_revision=reopen_for_revision,
+                reopen_for_revision=failed_qa_reopen_for_revision,
+                post_qa_merge_conflict_rejoin_authority=(
+                    post_qa_merge_conflict_rejoin_authority
+                ),
             )
         except BranchRuntimeFenceError as exc:
             raise GovernanceError(
@@ -26012,18 +26412,30 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     "contract_runtime_failed_qa_revision": (
                         contract_runtime_failed_qa_revision
                     ),
+                    "post_qa_merge_conflict_rejoin_diagnostics": (
+                        post_qa_merge_conflict_rejoin_diagnostics
+                    ),
                     "reason": str(exc) or "fence_invalidated_or_unknown",
                     "fail_closed": True,
                 },
             ) from exc
 
-        # The branch-runtime primitive only changes revision counters when it
-        # moves a validated/merge-ready context back to worktree-ready.  A
-        # later same-context auth-only rejoin must keep those counters stable,
-        # while the facade preserves the active server-authenticated failed-QA
-        # revision authority in both its response and append-only audit event.
+        # The branch-runtime primitive changes revision counters only when it
+        # moves a validated/merge-ready context back to worktree-ready under a
+        # server-derived failed-QA or post-QA-conflict authority. A later
+        # same-context auth-only rejoin keeps those counters stable.
         result["reopen_for_revision"] = reopen_for_revision
+        result["reopen_for_failed_qa_revision"] = (
+            failed_qa_reopen_for_revision
+        )
+        result["reopen_for_post_qa_merge_conflict"] = bool(
+            post_qa_merge_conflict_rejoin_authority is not None
+        )
         result["timeline_reopen_for_revision"] = timeline_reopen_for_revision
+        if post_qa_merge_conflict_rejoin_diagnostics:
+            result["post_qa_merge_conflict_rejoin_diagnostics"] = dict(
+                post_qa_merge_conflict_rejoin_diagnostics
+            )
 
         safe_route_identity = {
             field: str(selected_route_identity.get(field) or "").strip()
@@ -26138,6 +26550,9 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "timeline_reopen_for_revision": timeline_reopen_for_revision,
                 "contract_runtime_failed_qa_revision": (
                     contract_runtime_failed_qa_revision
+                ),
+                "post_qa_merge_conflict_rejoin_diagnostics": (
+                    post_qa_merge_conflict_rejoin_diagnostics
                 ),
                 "runtime_context_id": runtime_context_id_for_branch_context(context),
                 "route_identity_source": safe_route_source,

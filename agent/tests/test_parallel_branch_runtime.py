@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -60,6 +61,7 @@ from agent.governance.parallel_branch_runtime import (
     BranchTaskRuntimeContext,
     DependencyRevalidationQaCandidateAuthority,
     MergeQueueItem,
+    PostQaMergeConflictRejoinAuthority,
     append_branch_contract_revision,
     branch_context_from_chain_stage,
     branch_context_to_dict,
@@ -82,6 +84,7 @@ from agent.governance.parallel_branch_runtime import (
     mf_subagent_session_token_hash,
     plan_branch_runtime_context,
     queue_merge_item_for_branch_context,
+    rejoin_mf_subagent_runtime_session_token,
     reissue_mf_subagent_runtime_session_token,
     record_runtime_context_access_audit,
     record_branch_finish_gate,
@@ -239,6 +242,120 @@ def _runtime_conn() -> sqlite3.Connection:
 def _canonical_test_hash(value: object) -> str:
     body = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def test_post_qa_merge_conflict_rejoin_requires_typed_exact_scope_authority(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    root = tmp_path / "post-qa-rejoin-authority"
+    root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            backlog_id="AC-POST-QA-REJOIN-AUTHORITY",
+            task_id="post-qa-rejoin-worker",
+            parent_task_id="post-qa-rejoin-parent",
+            root_task_id="post-qa-rejoin-parent",
+            worker_id="post-qa-rejoin-worker",
+            worker_slot_id="post-qa-rejoin-worker",
+            branch_ref="refs/heads/codex/post-qa-rejoin-worker",
+            target_project_root=str(root),
+            worktree_path=str(root),
+            owned_files=("agent/governance/server.py",),
+            target_files=("agent/governance/server.py",),
+            merge_queue_id="mq-post-qa-rejoin",
+            status=STATE_VALIDATED,
+            fence_token="fence-post-qa-rejoin",
+            session_token_hash=mf_subagent_session_token_hash(
+                "lost-post-qa-token"
+            ),
+            attempt=1,
+            retry_round=0,
+        ),
+        now_iso=NOW,
+    )
+    core = {
+        "project_id": PROJECT_ID,
+        "backlog_id": context.backlog_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "runtime_context_id": context.runtime_context_id,
+        "merge_queue_id": context.merge_queue_id,
+        "queue_item_id": "mq-post-qa-rejoin:item",
+        "branch_ref": context.branch_ref,
+        "target_project_root": str(root),
+        "worktree_path": str(root),
+        "owned_files": ("agent/governance/server.py",),
+        "candidate_commit": "a" * 40,
+        "current_target_head": "b" * 40,
+        "dispatch_source_ref": "contract_runtime:cex-post-qa:completed_lines:1",
+        "worker_commit_source_ref": (
+            "contract_runtime:cex-post-qa:completed_lines:6"
+        ),
+        "qa_source_ref": "contract_runtime:cex-post-qa:completed_lines:10",
+        "merge_preview_id": "merge-preview:post-qa-rejoin",
+        "route_identity_hash": "sha256:" + "c" * 64,
+        "schema_version": (
+            "parallel_branch.post_qa_merge_conflict_rejoin_authority.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "independent_qa_passed": True,
+        "merge_conflict_verified": True,
+        "historical_bypass_context": False,
+    }
+    authority = PostQaMergeConflictRejoinAuthority(
+        **{
+            key: value
+            for key, value in core.items()
+            if key != "schema_version"
+        },
+        authority_hash=_canonical_test_hash(core),
+    )
+
+    with pytest.raises(BranchRuntimeFenceError):
+        rejoin_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PROJECT_ID,
+            runtime_context_id=context.runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=context.parent_task_id,
+            target_project_root=str(root),
+            reason="reject caller-forged authority drift",
+            post_qa_merge_conflict_rejoin_authority=replace(
+                authority,
+                owned_files=("different.py",),
+            ),
+        )
+
+    result = rejoin_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        target_project_root=str(root),
+        reason="server verified post-QA current-target merge conflict",
+        post_qa_merge_conflict_rejoin_authority=authority,
+    )
+
+    assert result["reopen_for_revision"] is True
+    assert result["reopen_for_failed_qa_revision"] is False
+    assert result["reopen_for_post_qa_merge_conflict"] is True
+    assert result["previous_status"] == STATE_VALIDATED
+    assert result["current_status"] == STATE_WORKTREE_READY
+    assert result["attempt"] == 2
+    assert result["retry_round"] == 1
+    assert result["post_qa_merge_conflict_rejoin_authority"][
+        "authority_hash"
+    ] == authority.authority_hash
+    saved = get_branch_context(conn, PROJECT_ID, context.task_id)
+    assert saved is not None
+    assert saved.last_recovery_action == (
+        "mf_subagent_post_qa_merge_conflict_rejoin_issued"
+    )
 
 
 def _contract_revision_test_context(task_id: str = "T-revision") -> BranchTaskRuntimeContext:
