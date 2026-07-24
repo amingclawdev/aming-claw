@@ -64281,9 +64281,13 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         check=True,
     )
     target_commit = batch_jobs.git_commit(worktree)
-    owned.write_text("target advanced after durable snapshot\n", encoding="utf-8")
+    advanced_target_only = target_baseline_files[-1]
+    advanced_target_only.write_text(
+        "target advanced after durable snapshot\n",
+        encoding="utf-8",
+    )
     subprocess.run(
-        ["git", "add", "agent/governance/server.py"],
+        ["git", "add", target_baseline_relative_paths[-1]],
         cwd=worktree,
         check=True,
     )
@@ -64293,6 +64297,21 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         check=True,
     )
     advanced_target_commit = batch_jobs.git_commit(worktree)
+    advanced_target_only.write_text(
+        "target moved during retarget preview\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", target_baseline_relative_paths[-1]],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "move target during retarget preview"],
+        cwd=worktree,
+        check=True,
+    )
+    moved_retarget_commit = batch_jobs.git_commit(worktree)
     subprocess.run(
         ["git", "switch", "candidate"],
         cwd=worktree,
@@ -65143,6 +65162,146 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     assert recovery["invalidated_completed_line_indices"]
     assert recovery["fresh_evidence_required"][-1] == "observer_merge"
 
+    subprocess.run(
+        ["git", "branch", "-f", "target", advanced_target_commit],
+        cwd=worktree,
+        check=True,
+    )
+    moved_during_retarget_preview = False
+
+    def move_target_during_retarget_preview(**kwargs):
+        nonlocal moved_during_retarget_preview
+        preview = original_preview(**kwargs)
+        if not moved_during_retarget_preview:
+            moved_during_retarget_preview = True
+            subprocess.run(
+                ["git", "branch", "-f", "target", moved_retarget_commit],
+                cwd=worktree,
+                check=True,
+            )
+        return preview
+
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "git_merge_preview_evidence",
+        move_target_during_retarget_preview,
+    )
+    moved_retarget_authority, moved_retarget_diagnostics = (
+        server._runtime_context_post_qa_rejoin_retarget_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=post_qa_record,
+            route_identity=route_identity,
+            timeline_events=server._runtime_context_service_timeline_events(
+                conn,
+                project_id=PID,
+                task_id=runtime_context.task_id,
+                backlog_id=backlog_id,
+            ),
+        )
+    )
+    assert moved_retarget_authority is None
+    assert "target moved after retarget preview" in " ".join(
+        moved_retarget_diagnostics["errors"]
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "git_merge_preview_evidence",
+        original_preview,
+    )
+    subprocess.run(
+        ["git", "branch", "-f", "target", advanced_target_commit],
+        cwd=worktree,
+        check=True,
+    )
+    rejoin = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "contract_execution_id": successor["contract_execution_id"],
+                "target_project_root": str(worktree),
+                "reason": "retarget reopened lane to the current target",
+                "now_iso": "2999-07-24T10:02:00Z",
+                **route_identity,
+            },
+        )
+    )
+    assert rejoin["reopen_for_revision"] is False
+    assert rejoin["reopen_for_post_qa_merge_conflict"] is False
+    assert rejoin["post_qa_rejoin_retarget_diagnostics"]["errors"] == []
+    assert rejoin["post_qa_rejoin_retarget_diagnostics"]["status"] == (
+        "eligible"
+    )
+    assert rejoin["reopen_for_post_qa_target_retarget"] is True
+    runtime_context = get_branch_context(
+        conn,
+        PID,
+        runtime_context.task_id,
+    )
+    assert runtime_context is not None
+    assert runtime_context.status == STATE_WORKTREE_READY
+    assert runtime_context.target_head_commit == advanced_target_commit
+    assert runtime_context.last_recovery_action == (
+        "mf_subagent_post_qa_rejoin_retarget_issued"
+    )
+    retarget_queue_item = next(
+        item
+        for item in list_merge_queue_items(
+            conn,
+            PID,
+            runtime_context.merge_queue_id,
+        )
+        if item.task_id == runtime_context.task_id
+    )
+    assert retarget_queue_item.status == "queued_for_merge"
+    assert retarget_queue_item.branch_head == candidate_commit
+    assert retarget_queue_item.current_target_head == advanced_target_commit
+    assert retarget_queue_item.validated_target_head == ""
+
+    retarget_required = (
+        server._runtime_context_same_lane_worker_commit_recovery(
+            post_qa_record,
+            runtime_context,
+            conn=conn,
+            project_id=PID,
+            allow_post_qa_merge_conflict_recovery=True,
+        )
+    )
+    assert retarget_required["status"] == "retarget_required"
+    assert retarget_required["blocked"] is False
+    assert retarget_required["next_legal_action"] == (
+        "merge_current_target_and_record_worker_commit"
+    )
+    subprocess.run(
+        ["git", "merge", "--no-edit", advanced_target_commit],
+        cwd=worktree,
+        check=True,
+    )
+    replacement_commit = batch_jobs.git_commit(worktree)
+    recovery = server._runtime_context_same_lane_worker_commit_recovery(
+        post_qa_record,
+        runtime_context,
+        conn=conn,
+        project_id=PID,
+        allow_post_qa_merge_conflict_recovery=True,
+    )
+    assert recovery["status"] == "eligible"
+    assert recovery["merge_conflict_recovery_authority"][
+        "retarget_after_open"
+    ] is True
+    assert recovery["current_target_baseline_commit"] == (
+        advanced_target_commit
+    )
+    assert recovery["target_baseline_changes_worker_authored"] is False
+
     owned.write_text("dirty target-relative worker change\n", encoding="utf-8")
     dirty_recovery = (
         server._runtime_context_same_lane_worker_commit_recovery(
@@ -65274,8 +65433,14 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     revision = after["completed_lines"][-1]["payload"][
         "canonical_same_lane_repair_head_revision"
     ]
-    assert revision["server_revalidated_merge_conflict"] is True
-    assert revision["current_target_baseline_commit"] == target_commit
+    assert revision["schema_version"] == (
+        "runtime_context.canonical_same_lane_repair_head_revision.v3"
+    )
+    assert revision["server_revalidated_merge_conflict"] is False
+    assert revision["server_revalidated_current_target"] is True
+    assert revision["current_target_baseline_commit"] == (
+        advanced_target_commit
+    )
     assert revision["current_target_baseline_changed_files"] == sorted(
         target_baseline_relative_paths
     )

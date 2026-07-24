@@ -1292,6 +1292,47 @@ class PostQaMergeConflictRejoinAuthority:
 
 
 @dataclass(frozen=True)
+class PostQaRejoinRetargetAuthority:
+    """Server-derived authority for retargeting an already reopened QA lane.
+
+    The initial conflict authority remains immutable audit evidence.  This
+    authority is issued only after the same active worker/runtime/fence is
+    rebound to a later target ref with a clean, current server preview.
+    """
+
+    project_id: str
+    backlog_id: str
+    task_id: str
+    parent_task_id: str
+    runtime_context_id: str
+    merge_queue_id: str
+    queue_item_id: str
+    branch_ref: str
+    target_ref: str
+    target_project_root: str
+    worktree_path: str
+    owned_files: tuple[str, ...]
+    worker_id: str
+    worker_slot_id: str
+    candidate_commit: str
+    actual_worker_head: str
+    previous_target_head: str
+    current_target_head: str
+    prior_rejoin_event_ref: str
+    prior_rejoin_authority_hash: str
+    merge_preview_id: str
+    route_identity_hash: str
+    authority_hash: str
+    schema_version: str = (
+        "parallel_branch.post_qa_rejoin_retarget_authority.v1"
+    )
+    server_derived: bool = True
+    caller_claims_trusted: bool = False
+    current_preview_passed: bool = True
+    historical_bypass_context: bool = False
+
+
+@dataclass(frozen=True)
 class MergeQueueItem:
     project_id: str
     merge_queue_id: str
@@ -10879,6 +10920,151 @@ def rejoin_mf_subagent_runtime_session_token(
         "ttl_seconds": ttl,
         "expires_at": expires_at,
         "session_token_lease": lease,
+    }
+
+
+def retarget_post_qa_rejoin_runtime_authority(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    authority: PostQaRejoinRetargetAuthority,
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Persist one typed current-target refresh for an already reopened lane."""
+
+    ensure_branch_runtime_schema(conn)
+    context = get_branch_context_by_runtime_context_id(
+        conn,
+        project_id,
+        runtime_context_id,
+    )
+    if context is None or context.task_id != str(task_id or "").strip():
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if not isinstance(authority, PostQaRejoinRetargetAuthority):
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    expected_scope = (
+        ("project_id", context.project_id),
+        ("backlog_id", context.backlog_id),
+        ("task_id", context.task_id),
+        ("parent_task_id", _parent_task_id_for_context(context)),
+        ("runtime_context_id", runtime_context_id_for_branch_context(context)),
+        ("merge_queue_id", context.merge_queue_id),
+        ("branch_ref", context.branch_ref),
+        (
+            "target_project_root",
+            runtime_context_effective_target_project_root(context),
+        ),
+        ("worktree_path", context.worktree_path),
+        ("worker_id", context.worker_id),
+        ("worker_slot_id", context.worker_slot_id or context.worker_id),
+    )
+    authority_payload = asdict(authority)
+    authority_hash = str(authority_payload.pop("authority_hash") or "")
+    if (
+        context.status != STATE_WORKTREE_READY
+        or context.last_recovery_action
+        not in {
+            "mf_subagent_post_qa_merge_conflict_rejoin_issued",
+            "mf_subagent_post_qa_rejoin_retarget_issued",
+            "mf_subagent_session_token_rejoin_issued",
+        }
+        or any(
+            str(getattr(authority, field_name, "") or "").strip()
+            != str(expected_value or "").strip()
+            for field_name, expected_value in expected_scope
+        )
+        or tuple(authority.owned_files)
+        != tuple(context.owned_files or context.target_files or ())
+        or authority.schema_version
+        != "parallel_branch.post_qa_rejoin_retarget_authority.v1"
+        or authority.server_derived is not True
+        or authority.caller_claims_trusted is not False
+        or authority.current_preview_passed is not True
+        or authority.historical_bypass_context is not False
+        or not re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            str(authority.candidate_commit or ""),
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            str(authority.actual_worker_head or ""),
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            str(authority.previous_target_head or ""),
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            str(authority.current_target_head or ""),
+        )
+        or authority.previous_target_head == authority.current_target_head
+        or not str(authority.prior_rejoin_event_ref).startswith("timeline:")
+        or not str(authority.prior_rejoin_authority_hash).startswith("sha256:")
+        or not str(authority.merge_preview_id).startswith("merge-preview:")
+        or not str(authority.route_identity_hash).startswith("sha256:")
+        or authority_hash != _stable_authority_hash(authority_payload)
+    ):
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    items = list_merge_queue_items(
+        conn,
+        project_id,
+        context.merge_queue_id,
+    )
+    matches = [item for item in items if item.task_id == context.task_id]
+    if len(matches) != 1:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    item = matches[0]
+    durable_previous_target = str(
+        item.current_target_head or item.validated_target_head or ""
+    ).strip()
+    if (
+        item.queue_item_id != authority.queue_item_id
+        or item.target_ref != authority.target_ref
+        or item.branch_ref != context.branch_ref
+        or item.branch_head != authority.candidate_commit
+        or item.status not in {STATE_MERGE_READY, STATE_QUEUED_FOR_MERGE}
+        or durable_previous_target != authority.previous_target_head
+    ):
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    now = now_iso or utc_now()
+    saved_item = upsert_merge_queue_item(
+        conn,
+        replace(
+            item,
+            status=STATE_QUEUED_FOR_MERGE,
+            validated_target_head="",
+            current_target_head=authority.current_target_head,
+            merge_preview_id=authority.merge_preview_id,
+            failure_reason="",
+        ),
+        now_iso=now,
+    )
+    saved_context = upsert_branch_context(
+        conn,
+        replace(
+            context,
+            status=STATE_WORKTREE_READY,
+            head_commit=authority.actual_worker_head,
+            target_head_commit=authority.current_target_head,
+            merge_preview_id=authority.merge_preview_id,
+            last_recovery_action=(
+                "mf_subagent_post_qa_rejoin_retarget_issued"
+            ),
+        ),
+        now_iso=now,
+    )
+    return {
+        "schema_version": "parallel_branch.post_qa_rejoin_retarget_result.v1",
+        "status": "retargeted",
+        "context": public_branch_context_to_dict(saved_context),
+        "queue_item": merge_queue_item_to_dict(saved_item),
+        "post_qa_rejoin_retarget_authority": asdict(authority),
+        "stale_merge_ready_cleared": True,
+        "fresh_qa_required": True,
     }
 
 
