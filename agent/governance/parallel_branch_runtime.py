@@ -12868,6 +12868,36 @@ def _integration_epoch_coordination_backlog_id(
     return ""
 
 
+def _standalone_integration_epoch_coordination_backlog_id(
+    conn: sqlite3.Connection,
+    *,
+    item: MergeQueueItem,
+    batch_id: str,
+) -> str:
+    """Resolve explicit standalone batch-of-one authority from its durable row."""
+
+    batch = str(batch_id or "").strip()
+    if not batch.startswith("standalone-") or batch == "standalone-":
+        return ""
+    queue_items = list_merge_queue_items(
+        conn,
+        item.project_id,
+        item.merge_queue_id,
+    )
+    if len(queue_items) != 1:
+        return ""
+    durable_item = queue_items[0]
+    if (
+        durable_item.queue_item_id != item.queue_item_id
+        or durable_item.task_id != item.task_id
+        or durable_item.backlog_id != item.backlog_id
+        or durable_item.target_ref != item.target_ref
+        or not item.backlog_id
+    ):
+        return ""
+    return item.backlog_id
+
+
 def open_or_validate_integration_epoch(
     conn: sqlite3.Connection,
     *,
@@ -12984,13 +13014,27 @@ def open_or_validate_integration_epoch(
         item.merge_queue_id,
         target_head,
     )
-    coordination_backlog_id = _integration_epoch_coordination_backlog_id(
-        conn,
-        project_id=item.project_id,
-        batch_id=batch,
-        merge_queue_id=item.merge_queue_id,
+    standalone_batch = batch.startswith("standalone-")
+    coordination_backlog_id = (
+        _standalone_integration_epoch_coordination_backlog_id(
+            conn,
+            item=item,
+            batch_id=batch,
+        )
+        if standalone_batch
+        else _integration_epoch_coordination_backlog_id(
+            conn,
+            project_id=item.project_id,
+            batch_id=batch,
+            merge_queue_id=item.merge_queue_id,
+        )
     )
     if not coordination_backlog_id:
+        failure_reason = (
+            "standalone_batch_of_one_scope_invalid"
+            if standalone_batch
+            else "coordination_backlog_lineage_unresolved"
+        )
         provisional = IntegrationEpoch(
             project_id=item.project_id,
             batch_id=batch,
@@ -13007,8 +13051,17 @@ def open_or_validate_integration_epoch(
             active_task_id=item.task_id,
             active_backlog_id=item.backlog_id,
             active_checkpoint_id=checkpoint_id,
-            failure_reason="coordination_backlog_lineage_unresolved",
+            failure_reason=failure_reason,
         )
+        if standalone_batch:
+            raise IntegrationEpochFrozenError(
+                (
+                    "standalone integration epoch requires a reserved non-empty "
+                    "standalone- batch id and exactly one matching durable queue "
+                    "row with its own backlog authority"
+                ),
+                provisional,
+            )
         raise IntegrationEpochFrozenError(
             (
                 "coordination backlog lineage is required before opening an "

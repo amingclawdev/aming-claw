@@ -5660,6 +5660,184 @@ def test_current_full_reconcile_idempotent_replay_repairs_epoch_projection(
     ).fetchone()[0] == provenance_count
 
 
+def test_current_full_reconcile_idempotent_replay_attaches_preexisting_exact_snapshot_to_standalone_epoch(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    run_id = "current-full-before-standalone-durable-projection"
+    body = {
+        "target_commit_sha": head,
+        "run_id": run_id,
+        "activate": True,
+        "semantic_enrich": False,
+    }
+
+    first_status, first = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    assert first_status == 201
+    assert first["activated"] is True
+    assert first["snapshot_id"] == "full-current"
+    assert len(calls) == 1
+
+    merge_queue_id = "mq-standalone-preexisting-exact-reconcile"
+    queue_item_id = "mqitem-standalone-preexisting-exact-reconcile"
+    batch_id = "standalone-preexisting-exact-reconcile"
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=queue_item_id,
+            task_id="standalone-preexisting-exact-reconcile-worker",
+            backlog_id="AC-STANDALONE-PREEXISTING-EXACT-RECONCILE",
+            branch_ref=(
+                "refs/heads/codex/"
+                "standalone-preexisting-exact-reconcile-worker"
+            ),
+            queue_index=1,
+            status=STATE_MERGED,
+            target_ref="refs/heads/main",
+            current_target_head=head,
+            merge_commit=head,
+            target_head_after_merge=head,
+        ),
+    )
+    upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id=batch_id,
+            epoch_id="epoch-standalone-preexisting-exact-reconcile",
+            coordination_backlog_id=(
+                "AC-STANDALONE-PREEXISTING-EXACT-RECONCILE"
+            ),
+            target_ref="refs/heads/main",
+            base_head="b" * 40,
+            current_head=head,
+            merge_queue_id=merge_queue_id,
+            merge_cursor=1,
+            merged_prefix=(queue_item_id,),
+            remaining_queue_item_ids=(),
+            status=parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILE_PENDING,
+            reconcile_state="pending",
+            last_merge_commit=head,
+        ),
+    )
+    conn.commit()
+
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={**body, "merge_queue_id": merge_queue_id},
+        )
+    )
+
+    assert replay_status == 200
+    assert replay["idempotent_replay"] is True
+    assert replay["rebuild_skipped"] is True
+    assert replay["snapshot_id"] == first["snapshot_id"]
+    auto_record = replay["merge_queue_graph_epoch_auto_record"]
+    assert auto_record["status"] == "recorded"
+    assert auto_record["epoch_projection_recorded"] is True
+    assert auto_record["integration_epoch_barrier"] == "satisfied_and_closed"
+    assert auto_record["integration_epoch"]["status"] == (
+        parallel_branch_runtime.INTEGRATION_EPOCH_CLOSED
+    )
+    assert len(calls) == 1
+    persisted_item = get_merge_queue_item(
+        conn,
+        PID,
+        merge_queue_id,
+        queue_item_id,
+    )
+    assert persisted_item is not None
+    assert persisted_item.snapshot_id == first["snapshot_id"]
+    assert parallel_branch_runtime.get_active_integration_epoch(
+        conn,
+        PID,
+        merge_queue_id=merge_queue_id,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "snapshot_id,snapshot_kind,snapshot_commit,expected_error",
+    [
+        (
+            "full-stale-idempotent-attachment",
+            "full",
+            "b" * 40,
+            "reconcile_snapshot_id_target_commit_conflict",
+        ),
+        (
+            "scope-current-idempotent-attachment",
+            "scope",
+            "a" * 40,
+            "reconcile_snapshot_id_kind_conflict",
+        ),
+    ],
+)
+def test_current_full_reconcile_idempotent_attachment_rejects_stale_or_nonfull_snapshot(
+    conn,
+    monkeypatch,
+    tmp_path,
+    snapshot_id,
+    snapshot_kind,
+    snapshot_commit,
+    expected_error,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    body = {
+        "target_commit_sha": head,
+        "run_id": "current-full-idempotent-attachment-invalid-snapshot",
+        "activate": True,
+        "semantic_enrich": False,
+    }
+    first_status, first = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    assert first_status == 201
+    assert first["activated"] is True
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=snapshot_id,
+        commit_sha=snapshot_commit,
+        snapshot_kind=snapshot_kind,
+        graph_json=_graph("L7.invalid"),
+        notes=json.dumps({"run_id": body["run_id"]}),
+    )
+    conn.commit()
+
+    status, refusal = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={**body, "snapshot_id": snapshot_id},
+        )
+    )
+
+    assert status == 409
+    assert refusal["ok"] is False
+    assert refusal["error"] == expected_error
+    assert refusal["fail_closed"] is True
+    assert len(calls) == 1
+
+
 def test_current_full_reconcile_terminal_replay_repairs_epoch_after_head_advances(
     conn,
     monkeypatch,

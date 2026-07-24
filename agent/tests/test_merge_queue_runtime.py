@@ -1487,7 +1487,7 @@ def test_open_integration_epoch_refuses_non_contiguous_merged_prefix_without_mut
 
 def test_open_integration_epoch_requires_coordination_backlog_lineage_before_mutation() -> None:
     conn = _runtime_conn()
-    batch_id = "batch-missing-coordination"
+    batch_id = "mf-batch-parallel-missing-coordination"
     queue_id = "mq-missing-coordination"
     item = MergeQueueItem(
         project_id=PROJECT_ID,
@@ -1516,6 +1516,246 @@ def test_open_integration_epoch_requires_coordination_backlog_lineage_before_mut
         "coordination_backlog_lineage_unresolved"
     )
     assert pbr.get_integration_epoch(conn, PROJECT_ID, batch_id) is None
+
+
+def test_open_standalone_integration_epoch_uses_exact_batch_of_one_backlog() -> None:
+    conn = _runtime_conn()
+    batch_id = "standalone-dashboard-assets"
+    queue_id = "mq-standalone-dashboard-assets"
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-standalone-dashboard-assets",
+        task_id="task-standalone-dashboard-assets",
+        backlog_id="AC-STANDALONE-DASHBOARD-ASSETS",
+        branch_ref="refs/heads/codex/standalone-dashboard-assets",
+        queue_index=1,
+        status=STATE_MERGE_READY,
+        target_ref=TARGET_REF,
+    )
+    upsert_merge_queue_items(conn, [item])
+
+    epoch = open_or_validate_integration_epoch(
+        conn,
+        item=item,
+        batch_id=batch_id,
+        target_head="base-head",
+        checkpoint_id="checkpoint-standalone-dashboard-assets",
+    )
+
+    assert epoch.coordination_backlog_id == item.backlog_id
+    assert epoch.batch_id == batch_id
+    assert epoch.active_queue_item_id == item.queue_item_id
+    assert epoch.remaining_queue_item_ids == (item.queue_item_id,)
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM sqlite_master
+        WHERE type = 'table' AND name = 'task_timeline_events'
+        """
+    ).fetchone()[0] == 0
+
+
+def test_standalone_integration_epoch_rejects_non_single_durable_queue() -> None:
+    conn = _runtime_conn()
+    batch_id = "standalone-not-a-batch-of-one"
+    queue_id = "mq-standalone-not-a-batch-of-one"
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-standalone-one",
+        task_id="task-standalone-one",
+        backlog_id="AC-STANDALONE-ONE",
+        branch_ref="refs/heads/codex/standalone-one",
+        queue_index=1,
+        status=STATE_MERGE_READY,
+        target_ref=TARGET_REF,
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            item,
+            replace(
+                item,
+                queue_item_id="item-standalone-two",
+                task_id="task-standalone-two",
+                backlog_id="AC-STANDALONE-TWO",
+                branch_ref="refs/heads/codex/standalone-two",
+                queue_index=2,
+            ),
+        ],
+    )
+
+    with pytest.raises(IntegrationEpochFrozenError) as exc:
+        open_or_validate_integration_epoch(
+            conn,
+            item=item,
+            batch_id=batch_id,
+            target_head="base-head",
+        )
+
+    assert exc.value.epoch.failure_reason == "standalone_batch_of_one_scope_invalid"
+    assert pbr.get_integration_epoch(conn, PROJECT_ID, batch_id) is None
+
+
+def test_standalone_already_integrated_projection_records_without_ref_mutation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    conn = _runtime_conn()
+    batch_id = "standalone-already-integrated"
+    queue_id = "mq-standalone-already-integrated"
+    task_id = "task-standalone-already-integrated"
+    backlog_id = "AC-STANDALONE-ALREADY-INTEGRATED"
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-standalone-already-integrated",
+        task_id=task_id,
+        backlog_id=backlog_id,
+        branch_ref="refs/heads/codex/standalone-already-integrated",
+        queue_index=1,
+        status=STATE_MERGE_READY,
+        target_ref=TARGET_REF,
+        branch_head="candidate-head",
+        validated_target_head="current-head",
+        current_target_head="current-head",
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            branch_ref=item.branch_ref,
+            status=STATE_MERGE_READY,
+            checkpoint_id="checkpoint-standalone-already-integrated",
+            merge_queue_id=queue_id,
+        ),
+    )
+    upsert_merge_queue_items(conn, [item])
+    monkeypatch.setattr(
+        pbr,
+        "git_merge_preview_evidence",
+        lambda **_kwargs: {
+            "status": "pass",
+            "passed": True,
+            "target_commit": "current-head",
+            "branch_commit": "candidate-head",
+        },
+    )
+    monkeypatch.setattr(
+        pbr,
+        "_git_preview_branch_is_ancestor",
+        lambda *_args, **_kwargs: True,
+    )
+
+    result = execute_merge_queue_item(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        repo_root_path=tmp_path,
+        queue_item_id=item.queue_item_id,
+        target_ref=TARGET_REF,
+        evidence=_passing_merge_evidence(),
+        dry_run=False,
+        allow_target_ref_mutation=False,
+    )
+
+    assert result["ok"] is True
+    assert result["already_integrated"] is True
+    assert result["executed"] is False
+    assert result["target_ref_mutated"] is False
+    recorded = list_merge_queue_items(conn, PROJECT_ID, queue_id)[0]
+    assert recorded.status == STATE_MERGED
+    assert recorded.merge_commit == "current-head"
+    epoch = get_active_integration_epoch(
+        conn,
+        PROJECT_ID,
+        merge_queue_id=queue_id,
+    )
+    assert epoch is not None
+    assert epoch.coordination_backlog_id == backlog_id
+    assert epoch.status == pbr.INTEGRATION_EPOCH_RECONCILE_PENDING
+    assert epoch.current_head == "current-head"
+
+
+def test_standalone_exact_head_reconcile_attachment_releases_pending_epoch() -> None:
+    conn = _runtime_conn()
+    batch_id = "standalone-exact-head-reconcile"
+    queue_id = "mq-standalone-exact-head-reconcile"
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-standalone-exact-head-reconcile",
+        task_id="task-standalone-exact-head-reconcile",
+        backlog_id="AC-STANDALONE-EXACT-HEAD-RECONCILE",
+        branch_ref="refs/heads/codex/standalone-exact-head-reconcile",
+        queue_index=1,
+        status=STATE_MERGED,
+        target_ref=TARGET_REF,
+        current_target_head="exact-current-head",
+        merge_commit="exact-current-head",
+        target_head_after_merge="exact-current-head",
+    )
+    upsert_merge_queue_items(conn, [item])
+    upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            epoch_id="epoch-standalone-exact-head-reconcile",
+            coordination_backlog_id=item.backlog_id,
+            target_ref=TARGET_REF,
+            base_head="base-head",
+            current_head="exact-current-head",
+            merge_queue_id=queue_id,
+            merge_cursor=1,
+            merged_prefix=(item.queue_item_id,),
+            remaining_queue_item_ids=(),
+            status=pbr.INTEGRATION_EPOCH_RECONCILE_PENDING,
+            reconcile_state="pending",
+            last_merge_commit="exact-current-head",
+        ),
+    )
+
+    stale = record_merge_queue_graph_epoch_after_reconcile(
+        conn,
+        project_id=PROJECT_ID,
+        target_head_commit="stale-head",
+        snapshot_id="full-stale-head",
+        projection_id="",
+        merge_queue_id=queue_id,
+    )
+    assert stale["updated_count"] == 0
+    assert stale["integration_epoch"]["status"] == (
+        pbr.INTEGRATION_EPOCH_RECONCILE_PENDING
+    )
+    assert stale["integration_epoch"]["reconcile_state"] == "failed"
+
+    exact = record_merge_queue_graph_epoch_after_reconcile(
+        conn,
+        project_id=PROJECT_ID,
+        target_head_commit="exact-current-head",
+        snapshot_id="full-exact-current-head",
+        projection_id="",
+        merge_queue_id=queue_id,
+    )
+
+    assert exact["status"] == "recorded"
+    assert exact["updated_count"] == 1
+    assert exact["epoch_projection_recorded"] is True
+    assert exact["integration_epoch_barrier"] == "satisfied_and_closed"
+    assert exact["integration_epoch"]["status"] == INTEGRATION_EPOCH_CLOSED
+    assert get_active_integration_epoch(
+        conn,
+        PROJECT_ID,
+        merge_queue_id=queue_id,
+    ) is None
+    persisted = get_integration_epoch(conn, PROJECT_ID, batch_id)
+    assert persisted is not None
+    assert persisted.snapshot_id == "full-exact-current-head"
+    assert persisted.current_head == "exact-current-head"
 
 
 def test_integration_epoch_restart_recovers_already_integrated_item_and_freezes_unrelated_merge(
