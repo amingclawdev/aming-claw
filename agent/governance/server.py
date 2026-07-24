@@ -16596,6 +16596,14 @@ def _runtime_context_worker_guide_response(
         if isinstance(finish_attestation_hint.get("test_results"), Mapping)
         else {}
     )
+    if _runtime_context_finish_attestation_no_pass_results_accepted(
+        hinted_test_results
+    ):
+        hinted_test_results = (
+            _runtime_context_finish_attestation_test_results_payload(
+                hinted_test_results
+            )
+        )
     hinted_graph_trace_ids = [
         str(item)
         for item in (
@@ -22682,6 +22690,9 @@ def _runtime_context_test_results_passed(value: Any) -> bool:
 _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS = (
     "accepted_with_known_baseline_failure"
 )
+_RUNTIME_CONTEXT_FINISH_ATTESTATION_UNRELATED_SYSTEM_BLOCK_STATUS = (
+    "passed_with_unrelated_system_block_recorded"
+)
 _RUNTIME_CONTEXT_FINISH_ATTESTATION_AMBIGUOUS_STATUSES = frozenset(
     {
         "accepted",
@@ -22705,6 +22716,67 @@ _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_COUNT_FIELDS = (
 )
 
 
+def _runtime_context_finish_attestation_unrelated_system_block_results_accepted(
+    value: Any,
+) -> bool:
+    """Accept exact passed requirements plus bounded unrelated system blocks."""
+
+    if not isinstance(value, Mapping) or not value:
+        return False
+    if (
+        str(value.get("status") or "").strip().lower()
+        != _RUNTIME_CONTEXT_FINISH_ATTESTATION_UNRELATED_SYSTEM_BLOCK_STATUS
+        or ("no_pass" in value and value.get("no_pass") is not True)
+        or ("passed" in value and value.get("passed") is not False)
+        or (
+            "overall_release_pass" in value
+            and value.get("overall_release_pass") is not False
+        )
+        or (
+            "overall_release_pass_claimed" in value
+            and value.get("overall_release_pass_claimed") is not False
+        )
+    ):
+        return False
+    required_passed = value.get("required_passed")
+    unrelated_system_blocks = value.get("unrelated_system_blocks")
+    tests = value.get("tests")
+    if (
+        not isinstance(required_passed, int)
+        or isinstance(required_passed, bool)
+        or required_passed <= 0
+        or not isinstance(unrelated_system_blocks, int)
+        or isinstance(unrelated_system_blocks, bool)
+        or unrelated_system_blocks <= 0
+        or not isinstance(tests, list)
+        or not tests
+    ):
+        return False
+    passed_count = 0
+    blocked_count = 0
+    for test in tests:
+        if (
+            not isinstance(test, Mapping)
+            or not str(test.get("name") or "").strip()
+            or not str(test.get("command") or "").strip()
+        ):
+            return False
+        status = str(test.get("status") or "").strip().lower()
+        if status in {"pass", "passed", "ok", "succeeded", "success", "clean"}:
+            passed_count += 1
+        elif status == "blocked_unrelated" and str(
+            test.get("detail") or ""
+        ).strip():
+            blocked_count += 1
+        else:
+            return False
+    return bool(
+        passed_count == required_passed
+        and blocked_count == unrelated_system_blocks
+        and len(tests) == passed_count + blocked_count
+    )
+
+
 def _runtime_context_finish_attestation_no_pass_results_accepted(
     value: Any,
 ) -> bool:
@@ -22712,9 +22784,18 @@ def _runtime_context_finish_attestation_no_pass_results_accepted(
 
     if not isinstance(value, Mapping) or not value:
         return False
+    status = str(value.get("status") or "").strip().lower()
     if (
-        str(value.get("status") or "").strip().lower()
-        != _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS
+        status
+        == _RUNTIME_CONTEXT_FINISH_ATTESTATION_UNRELATED_SYSTEM_BLOCK_STATUS
+    ):
+        return (
+            _runtime_context_finish_attestation_unrelated_system_block_results_accepted(
+                value
+            )
+        )
+    if (
+        status != _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS
         or value.get("no_pass") is not True
         or ("passed" in value and value.get("passed") is not False)
         or (
@@ -22751,7 +22832,11 @@ def _runtime_context_finish_attestation_test_results_accepted(value: Any) -> boo
         return False
     status = str(value.get("status") or "").strip().lower()
     if (
-        status == _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS
+        status
+        in {
+            _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS,
+            _RUNTIME_CONTEXT_FINISH_ATTESTATION_UNRELATED_SYSTEM_BLOCK_STATUS,
+        }
         or value.get("no_pass") is True
     ):
         return _runtime_context_finish_attestation_no_pass_results_accepted(value)
@@ -22767,7 +22852,14 @@ def _runtime_context_finish_attestation_test_results_payload(
 
     result = dict(value)
     if _runtime_context_finish_attestation_no_pass_results_accepted(result):
+        result["no_pass"] = True
         result["overall_release_pass_claimed"] = False
+        if (
+            str(result.get("status") or "").strip().lower()
+            == _RUNTIME_CONTEXT_FINISH_ATTESTATION_UNRELATED_SYSTEM_BLOCK_STATUS
+        ):
+            result["passed"] = False
+            result["overall_release_pass"] = False
     return result
 
 
@@ -22861,9 +22953,14 @@ def _runtime_context_validate_finish_gate_test_results(
                 "schema_version": (
                     "runtime_context.finish_gate_no_pass_acceptance.v1"
                 ),
-                "status": _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS,
+                "status": str(public_results.get("status") or ""),
                 "no_pass": True,
-                "candidate_new_failures": 0,
+                "candidate_new_failures": int(
+                    public_results.get("candidate_new_failures") or 0
+                ),
+                "unrelated_system_blocks": int(
+                    public_results.get("unrelated_system_blocks") or 0
+                ),
                 "worker_finish_ready": True,
                 "overall_release_pass_claimed": False,
                 "source": "strict_finish_attestation_test_results",

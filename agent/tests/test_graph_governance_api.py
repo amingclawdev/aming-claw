@@ -60932,6 +60932,7 @@ def _record_mf_parallel_runtime_context_worker_evidence(
     graph_trace_id: str,
     head_commit: str,
     include_finish_evidence: bool = True,
+    test_results: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     parent_task_id = runtime_context.parent_task_id or backlog_id
     _insert_mf_sub_graph_query_trace(
@@ -61011,15 +61012,21 @@ def _record_mf_parallel_runtime_context_worker_evidence(
             "changed_files": ["agent/governance/server.py"],
             "graph_trace_ids": [graph_trace_id],
             "head_commit": head_commit,
-            "test_results": {
-                "passed": True,
-                "commands": [
-                    {
-                        "command": "pytest agent/tests/test_graph_governance_api.py",
-                        "status": "passed",
-                    }
-                ],
-            },
+            "test_results": (
+                dict(test_results)
+                if test_results is not None
+                else {
+                    "passed": True,
+                    "commands": [
+                        {
+                            "command": (
+                                "pytest agent/tests/test_graph_governance_api.py"
+                            ),
+                            "status": "passed",
+                        }
+                    ],
+                }
+            ),
         },
     )
     if not include_finish_evidence:
@@ -64337,6 +64344,93 @@ def test_finish_attestation_test_results_accept_exact_no_pass_only():
     assert server._runtime_context_test_results_passed(
         {"status": "accepted", "passed": True}
     ) is True
+
+    unrelated_system_block = {
+        "required_passed": 2,
+        "status": "passed_with_unrelated_system_block_recorded",
+        "tests": [
+            {
+                "command": "pytest -q focused",
+                "name": "focused",
+                "status": "passed",
+            },
+            {
+                "command": "npm run build",
+                "name": "build",
+                "status": "passed",
+            },
+            {
+                "command": "pytest -q broader",
+                "detail": "two pre-existing unrelated assertions failed",
+                "name": "broader diagnostic",
+                "status": "blocked_unrelated",
+            },
+        ],
+        "unrelated_system_blocks": 1,
+    }
+    assert server._runtime_context_finish_attestation_test_results_accepted(
+        unrelated_system_block
+    ) is True
+    assert server._runtime_context_finish_attestation_test_results_payload(
+        unrelated_system_block
+    ) == {
+        **unrelated_system_block,
+        "no_pass": True,
+        "passed": False,
+        "overall_release_pass": False,
+        "overall_release_pass_claimed": False,
+    }
+    rejected_system_blocks = []
+    for field in (
+        "required_passed",
+        "tests",
+        "unrelated_system_blocks",
+    ):
+        candidate = dict(unrelated_system_block)
+        candidate.pop(field)
+        rejected_system_blocks.append(candidate)
+    for update in (
+        {"required_passed": 1},
+        {"required_passed": "2"},
+        {"unrelated_system_blocks": 0},
+        {"unrelated_system_blocks": "1"},
+        {"no_pass": False},
+        {"passed": True},
+        {"overall_release_pass": True},
+        {"overall_release_pass_claimed": True},
+    ):
+        rejected_system_blocks.append(
+            {**unrelated_system_block, **update}
+        )
+    wrong_block_status = {
+        **unrelated_system_block,
+        "tests": [
+            *unrelated_system_block["tests"][:-1],
+            {
+                **unrelated_system_block["tests"][-1],
+                "status": "failed",
+            },
+        ],
+    }
+    missing_block_detail = {
+        **unrelated_system_block,
+        "tests": [
+            *unrelated_system_block["tests"][:-1],
+            {
+                **unrelated_system_block["tests"][-1],
+                "detail": "",
+            },
+        ],
+    }
+    rejected_system_blocks.extend(
+        [wrong_block_status, missing_block_detail]
+    )
+    assert all(
+        not server._runtime_context_finish_attestation_test_results_accepted(
+            candidate
+        )
+        for candidate in rejected_system_blocks
+    )
 
 
 def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage(
@@ -70405,10 +70499,15 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
     assert guide["contract_runtime_dispatch_identity"]["accepted"] is True
 
 
+@pytest.mark.parametrize(
+    "no_pass_kind",
+    ["baseline_failure", "unrelated_system_block"],
+)
 def test_mf_parallel_inflight_no_pass_finish_uses_contract_dispatch_without_backfill(
     conn,
     tmp_path,
     monkeypatch,
+    no_pass_kind,
 ):
     backlog_id = "AC-MF-PARALLEL-INFLIGHT-DISPATCH-BRIDGE"
     worker_task_id = "parallel-inflight-dispatch-bridge-worker"
@@ -70418,6 +70517,42 @@ def test_mf_parallel_inflight_no_pass_finish_uses_contract_dispatch_without_back
     worker_root.mkdir()
     graph_trace_id = "gqt-parallel-inflight-dispatch-bridge"
     head_commit = hashlib.sha1(b"parallel-inflight-dispatch-bridge").hexdigest()
+    if no_pass_kind == "baseline_failure":
+        no_pass_test_results = {
+            "status": "accepted_with_known_baseline_failure",
+            "no_pass": True,
+            "candidate_new_failures": 0,
+            "full_failed": 17,
+            "inherited_failed": 17,
+            "baseline_failed": 17,
+            "focused_passed": 11,
+            "full_passed": 713,
+            "baseline_passed": 712,
+        }
+    else:
+        no_pass_test_results = {
+            "required_passed": 2,
+            "status": "passed_with_unrelated_system_block_recorded",
+            "tests": [
+                {
+                    "command": "pytest -q focused",
+                    "name": "focused",
+                    "status": "passed",
+                },
+                {
+                    "command": "npm run build",
+                    "name": "build",
+                    "status": "passed",
+                },
+                {
+                    "command": "pytest -q broader",
+                    "detail": "two pre-existing unrelated assertions failed",
+                    "name": "broader diagnostic",
+                    "status": "blocked_unrelated",
+                },
+            ],
+            "unrelated_system_blocks": 1,
+        }
     successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
         conn,
         backlog_id=backlog_id,
@@ -70435,6 +70570,7 @@ def test_mf_parallel_inflight_no_pass_finish_uses_contract_dispatch_without_back
         graph_trace_id=graph_trace_id,
         head_commit=head_commit,
         include_finish_evidence=False,
+        test_results=no_pass_test_results,
     )
     _record_mf_parallel_contract_runtime_worker_prefix(
         conn,
@@ -70496,6 +70632,11 @@ def test_mf_parallel_inflight_no_pass_finish_uses_contract_dispatch_without_back
     ]["copy_safe_body"]
     assert finish_copy["observer_command_id"] == successor["contract_execution_id"]
     assert "<claimed execute_backlog_row" not in json.dumps(finish_copy)
+    assert finish_copy["test_results"] == (
+        server._runtime_context_finish_attestation_test_results_payload(
+            no_pass_test_results
+        )
+    )
 
     monkeypatch.setattr(
         server,
@@ -70541,17 +70682,6 @@ def test_mf_parallel_inflight_no_pass_finish_uses_contract_dispatch_without_back
         },
     )
     worker_session_id = f"session-{worker_task_id}"
-    no_pass_test_results = {
-        "status": "accepted_with_known_baseline_failure",
-        "no_pass": True,
-        "candidate_new_failures": 0,
-        "full_failed": 17,
-        "inherited_failed": 17,
-        "baseline_failed": 17,
-        "focused_passed": 11,
-        "full_passed": 713,
-        "baseline_passed": 712,
-    }
     attestation_body = {
         **worker_query,
         "worker_session_id": worker_session_id,
@@ -70573,18 +70703,31 @@ def test_mf_parallel_inflight_no_pass_finish_uses_contract_dispatch_without_back
         successor["contract_execution_id"]
     )["execution_state_revision"]
     rejected_results = []
-    for update in (
-        {"no_pass": None},
-        {"candidate_new_failures": 1},
-        {"inherited_failed": 16},
-        {"focused_passed": 0},
-        {"full_passed": None},
-        {"baseline_failed": "17"},
-        {"overall_release_pass": True},
-        {"status": "accepted", "passed": True},
-        {"status": "failed", "passed": True},
-        {"status": "blocked", "passed": True},
-    ):
+    rejected_updates = (
+        (
+            {"no_pass": None},
+            {"candidate_new_failures": 1},
+            {"inherited_failed": 16},
+            {"focused_passed": 0},
+            {"full_passed": None},
+            {"baseline_failed": "17"},
+            {"overall_release_pass": True},
+            {"status": "accepted", "passed": True},
+            {"status": "failed", "passed": True},
+            {"status": "blocked", "passed": True},
+        )
+        if no_pass_kind == "baseline_failure"
+        else (
+            {"required_passed": 1},
+            {"unrelated_system_blocks": 0},
+            {"no_pass": False},
+            {"overall_release_pass": True},
+            {"status": "accepted", "passed": True},
+            {"status": "failed", "passed": True},
+            {"status": "blocked", "passed": True},
+        )
+    )
+    for update in rejected_updates:
         rejected_results.append({**no_pass_test_results, **update})
     for rejected_test_results in rejected_results:
         with pytest.raises(
@@ -70636,10 +70779,11 @@ def test_mf_parallel_inflight_no_pass_finish_uses_contract_dispatch_without_back
     assert stored_payload["observer_command_id_source"] == (
         "contract_runtime_execution_id_bridge"
     )
-    expected_test_results = {
-        **no_pass_test_results,
-        "overall_release_pass_claimed": False,
-    }
+    expected_test_results = (
+        server._runtime_context_finish_attestation_test_results_payload(
+            no_pass_test_results
+        )
+    )
     assert stored_payload["test_results"] == expected_test_results
     assert stored_payload["no_pass"] is True
     assert stored_payload["overall_release_pass_claimed"] is False
