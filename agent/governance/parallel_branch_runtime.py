@@ -17025,6 +17025,17 @@ def queue_merge_item_for_branch_context(
         raise ValueError(
             "dependency revalidation current target changed after server preview"
         )
+    authoritative_validated_target_head = str(validated_target_head or "").strip()
+    if existing_item is not None:
+        if (
+            authoritative_validated_target_head
+            and authoritative_validated_target_head != refreshed_target_head
+        ):
+            raise ValueError(
+                "dependency revalidation validated target does not match "
+                "server-resolved current target"
+            )
+        authoritative_validated_target_head = refreshed_target_head
     item = MergeQueueItem(
         project_id=project_id,
         merge_queue_id=queue_id,
@@ -17053,7 +17064,7 @@ def queue_merge_item_for_branch_context(
         target_ref=target_ref or context.ref_name or "refs/heads/main",
         base_commit=context.base_commit,
         branch_head=refreshed_branch_head,
-        validated_target_head=validated_target_head,
+        validated_target_head=authoritative_validated_target_head,
         current_target_head=refreshed_target_head,
         validation_attempt=validation_attempt,
         merge_preview_id=merge_preview_id or context.merge_preview_id,

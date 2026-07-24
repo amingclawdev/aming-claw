@@ -7969,11 +7969,30 @@ def test_dependency_target_revalidation_preserves_immutable_candidate(
         task_id="T-dependency-revalidate",
         merge_queue_id="mq-dependency-revalidate",
         target_ref="target",
+        current_target_head=target_one,
         now_iso=NOW,
     )
     assert revalidated["queue_item"]["branch_head"] == candidate
     assert revalidated["context"]["head_commit"] == candidate
     assert revalidated["queue_item"]["current_target_head"] == target_two
+    assert revalidated["queue_item"]["validated_target_head"] == target_two
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "validated target does not match server-resolved current target"
+        ),
+    ):
+        queue_merge_item_for_branch_context(
+            conn,
+            project_id=PROJECT_ID,
+            task_id="T-dependency-revalidate",
+            merge_queue_id="mq-dependency-revalidate",
+            target_ref="target",
+            current_target_head=target_one,
+            validated_target_head=target_one,
+            now_iso=NOW,
+        )
 
 
 def test_overwritten_candidate_recovery_requires_typed_server_authority() -> None:
