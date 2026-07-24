@@ -1788,6 +1788,7 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
       && apiSource.match(/taskTimelineFor\([\s\S]*?taskPlaybackBootstrapFor\(projectId, backlogId, boundedLimit, signal\)/) !== null
       && apiSource.match(/backlogTimelineGateFor\([\s\S]*?taskPlaybackBootstrapFor\(projectId, backlogId, boundedLimit, signal\)/) !== null
       && apiSource.match(/recentTimelineFor\([\s\S]*?taskPlaybackHotWindowLimit\(limit\)/) !== null
+      && apiSource.match(/recentTimelineFor\([\s\S]*?response_view: "compact"/) !== null
       && apiSource.includes("bootstrap.backlog_timeline_gate")
       && !apiSource.includes("const authorityRequest = api.contractRuntimeVisualizationFor")
       && apiSource.includes("if (publicReadSingleFlights.get(key) === shared) publicReadSingleFlights.delete(key)"),

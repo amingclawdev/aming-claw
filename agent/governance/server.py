@@ -88460,55 +88460,79 @@ def _task_timeline_runtime_fresh_compact_ledger(
     ledger: Mapping[str, Any],
     task_timeline_module: Any,
 ) -> dict[str, Any]:
-    """Overlay ContractRuntime current state without changing raw history."""
+    """Apply runtime freshness metadata without recompiling every live guide.
 
+    ``backlog_contract_chain_current`` is refreshed by ContractRuntime writes
+    and already carries the authoritative current action.  Project Current is
+    a bounded read model, so it must not invoke the full single-row guide
+    compiler for every row.  A single indexed lookup keeps projection
+    timestamps aligned with ContractRuntime while explicit history/guide
+    endpoints retain their full-fidelity behavior.
+    """
+
+    del task_timeline_module
     result = dict(ledger)
-    rows: list[dict[str, Any]] = []
-    for item in ledger.get("rows") or []:
-        if not isinstance(item, Mapping):
-            continue
-        row = dict(item)
-        backlog_id = str(row.get("backlog_id") or "").strip()
-        if backlog_id:
-            current = _contract_chain_current_projection(
-                conn,
-                project_id=project_id,
-                backlog_id=backlog_id,
-                rebuild_if_missing=False,
+    source_rows = [
+        dict(item)
+        for item in ledger.get("rows") or []
+        if isinstance(item, Mapping)
+    ]
+    execution_ids = sorted(
+        {
+            str(
+                row.get("current_contract_execution_id")
+                or row.get("contract_execution_id")
+                or ""
+            ).strip()
+            for row in source_rows
+        }
+        - {""}
+    )
+    runtime_updated_at_by_execution: dict[str, str] = {}
+    has_runtime_executions = bool(
+        conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'contract_runtime_executions'
+            """
+        ).fetchone()
+    )
+    if execution_ids and has_runtime_executions:
+        placeholders = ", ".join("?" for _ in execution_ids)
+        runtime_rows = conn.execute(
+            f"""
+            SELECT contract_execution_id, updated_at
+            FROM contract_runtime_executions
+            WHERE project_id = ?
+              AND contract_execution_id IN ({placeholders})
+            """,
+            (project_id, *execution_ids),
+        ).fetchall()
+        runtime_updated_at_by_execution = {
+            str(_row_get(item, "contract_execution_id", "")): str(
+                _row_get(item, "updated_at", "")
             )
-            if current:
-                task_timeline_module._apply_compact_contract_chain_current(
-                    row,
-                    current,
+            for item in runtime_rows
+        }
+
+    rows: list[dict[str, Any]] = []
+    for row in source_rows:
+        execution_id = str(
+            row.get("current_contract_execution_id")
+            or row.get("contract_execution_id")
+            or ""
+        ).strip()
+        if execution_id:
+            row["contract_execution_id"] = execution_id
+            runtime_updated_at = runtime_updated_at_by_execution.get(
+                execution_id,
+                "",
+            )
+            if runtime_updated_at > str(row.get("projection_updated_at") or ""):
+                row["projection_updated_at"] = runtime_updated_at
+                row["projection_freshness_source"] = (
+                    "contract_runtime_executions.updated_at"
                 )
-                runtime_state = (
-                    current.get("contract_runtime_current_state")
-                    if isinstance(current.get("contract_runtime_current_state"), Mapping)
-                    else {}
-                )
-                execution_id = str(
-                    runtime_state.get("contract_execution_id")
-                    or row.get("current_contract_execution_id")
-                    or ""
-                ).strip()
-                if execution_id:
-                    row["contract_execution_id"] = execution_id
-                    runtime_row = conn.execute(
-                        """
-                        SELECT updated_at
-                        FROM contract_runtime_executions
-                        WHERE project_id = ? AND contract_execution_id = ?
-                        """,
-                        (project_id, execution_id),
-                    ).fetchone()
-                    runtime_updated_at = str(
-                        _row_get(runtime_row, "updated_at", "") if runtime_row else ""
-                    )
-                    if runtime_updated_at > str(row.get("projection_updated_at") or ""):
-                        row["projection_updated_at"] = runtime_updated_at
-                        row["projection_freshness_source"] = (
-                            "contract_runtime_executions.updated_at"
-                        )
         rows.append(row)
     result["rows"] = rows
     result["row_count"] = len(rows)

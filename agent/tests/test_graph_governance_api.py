@@ -9,6 +9,7 @@ import io
 import json
 import sqlite3
 import subprocess
+import time
 from threading import Event
 from pathlib import Path
 from types import SimpleNamespace
@@ -62022,6 +62023,44 @@ def test_recent_timeline_projects_runtime_newer_current_stream(conn):
     assert compact_row["projection_freshness_source"] == (
         "contract_runtime_executions.updated_at"
     )
+
+
+def test_recent_timeline_hot_window_avoids_per_row_guide_compile(conn, monkeypatch):
+    backlog_id = "AC-RECENT-BOUNDED-HOT-WINDOW"
+    _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="recent-bounded-hot-window-parent",
+        worker_task_id="recent-bounded-hot-window-worker",
+        fence_token="fence-recent-bounded-hot-window",
+        token="session-recent-bounded-hot-window",
+    )
+    conn.commit()
+    server._timeline_warm_cache_clear()
+
+    def reject_per_row_compile(*args, **kwargs):
+        raise AssertionError("Current hot window must not compile a guide per row")
+
+    monkeypatch.setattr(
+        server,
+        "_contract_chain_current_projection",
+        reject_per_row_compile,
+    )
+    request = _ctx(
+        {"project_id": PID},
+        query={"limit": "50", "response_view": "compact"},
+    )
+    cold = server.handle_task_timeline_recent(request)
+    warm_started = time.monotonic()
+    warm = server.handle_task_timeline_recent(request)
+    warm_elapsed_ms = (time.monotonic() - warm_started) * 1000
+
+    assert cold["count"] <= 50
+    assert cold["response_view"] == "compact"
+    assert cold["raw_event_payloads_omitted"] is True
+    assert warm["warm_cache"]["hit"] is True
+    assert warm["warm_cache"]["warm_latency_ms"] <= 250
+    assert warm_elapsed_ms <= 250
 
 
 def test_source_backed_mf_parallel_without_dispatch_rejects_ticket_authority(conn):

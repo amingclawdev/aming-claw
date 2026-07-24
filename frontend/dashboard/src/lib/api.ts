@@ -764,7 +764,10 @@ export const api = {
    *  Each event carries backlog_id and task_id for row-tag rendering.
    */
   recentTimelineFor(projectId: string, limit = 50, signal?: AbortSignal) {
-    const q = new URLSearchParams({ limit: String(taskPlaybackHotWindowLimit(limit)) }).toString();
+    const q = new URLSearchParams({
+      limit: String(taskPlaybackHotWindowLimit(limit)),
+      response_view: "compact",
+    }).toString();
     return getJSON<RecentTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline/recent?${q}`, signal);
   },
   backlogTimelineGateFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
@@ -1683,4 +1686,6 @@ export interface RecentTimelineResponse {
   contract_runtime_projection_event_count?: number;
   order?: string;
   cross_row?: boolean;
+  response_view?: "compact" | "full";
+  raw_event_payloads_omitted?: boolean;
 }
