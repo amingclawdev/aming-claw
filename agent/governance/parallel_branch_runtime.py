@@ -1837,6 +1837,37 @@ class IntegrationEpoch:
 
 
 @dataclass(frozen=True)
+class StandaloneHistoricalCheckpointAuthority:
+    schema_version: str
+    project_id: str
+    merge_queue_id: str
+    queue_item_id: str
+    batch_id: str
+    backlog_id: str
+    task_id: str
+    runtime_context_id: str
+    parent_task_id: str
+    branch_ref: str
+    target_ref: str
+    candidate_commit: str
+    current_target_commit: str
+    checkpoint_commit: str
+    target_head_before_merge: str
+    snapshot_id: str
+    provenance_id: str
+    provenance_hash: str
+    reconcile_event_id: int
+    reconcile_event_created_at: str
+    durable_state_hash: str
+    context_state_hash: str
+    integration_epoch_state_hash: str
+    authority_hash: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class BatchRollbackPlan:
     scenario_id: str
     project_id: str
@@ -17767,96 +17798,121 @@ def _standalone_advanced_head_catchup_claimed(
     return len(resolved_checkpoints) != 1 or next(iter(resolved_checkpoints)) != target
 
 
-def _standalone_historical_reconcile_checkpoint_authority(
+_STANDALONE_HISTORICAL_AUTHORITY_SCHEMA = (
+    "standalone.historical_checkpoint_authority.v2"
+)
+
+
+def _stable_authority_hash(payload: Mapping[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            dict(payload),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _standalone_authority_hash_valid(
+    authority: StandaloneHistoricalCheckpointAuthority,
+) -> bool:
+    payload = authority.to_dict()
+    authority_hash = str(payload.pop("authority_hash") or "")
+    return bool(authority_hash) and authority_hash == _stable_authority_hash(
+        payload
+    )
+
+
+def _derive_standalone_historical_checkpoint_authority(
     conn: sqlite3.Connection,
     *,
-    item: MergeQueueItem,
-    context: BranchTaskRuntimeContext | None,
+    project_id: str,
+    merge_queue_id: str,
+    queue_item_id: str,
     batch_id: str,
     repo_root: Path,
-    branch_commit: str,
-    target_commit: str,
     timeout_seconds: int,
-) -> dict[str, Any]:
-    """Resolve a server-authored historical standalone merge/reconcile checkpoint."""
+) -> tuple[StandaloneHistoricalCheckpointAuthority | None, dict[str, Any]]:
+    """Derive typed authority only from current durable DB and Git state."""
 
-    refused: dict[str, Any] = {
-        "schema_version": "standalone.historical_checkpoint_authority.v1",
+    refused = {
+        "schema_version": _STANDALONE_HISTORICAL_AUTHORITY_SCHEMA,
         "status": "refused",
         "error": "standalone_historical_checkpoint_unresolved",
         "fail_closed": True,
-        "project_id": item.project_id,
-        "merge_queue_id": item.merge_queue_id,
-        "queue_item_id": item.queue_item_id,
-        "batch_id": str(batch_id or "").strip(),
+        "project_id": project_id,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": queue_item_id,
+        "batch_id": batch_id,
     }
 
-    def reject(reason: str) -> dict[str, Any]:
-        return {**refused, "failure_reason": reason}
+    def reject(
+        reason: str,
+    ) -> tuple[None, dict[str, Any]]:
+        return None, {**refused, "failure_reason": reason}
 
-    durable = _standalone_integration_epoch_durable_item(
-        conn,
-        item=item,
-        batch_id=batch_id,
-    )
-    if durable is None:
+    rows = list_merge_queue_items(conn, project_id, merge_queue_id)
+    if len(rows) != 1 or rows[0].queue_item_id != queue_item_id:
         return reject("standalone_durable_queue_identity_invalid")
-    if context is None:
-        return reject("standalone_runtime_context_missing")
-    expected_context = {
-        "project_id": item.project_id,
-        "backlog_id": durable.backlog_id,
-        "task_id": durable.task_id,
-        "runtime_context_id": context.runtime_context_id,
-        "merge_queue_id": durable.merge_queue_id,
-    }
+    durable = rows[0]
+    context = get_branch_context(conn, project_id, durable.task_id)
     if (
-        context.batch_id != str(batch_id or "").strip()
+        not batch_id.startswith("standalone-")
+        or batch_id == "standalone-"
+        or context is None
+        or context.batch_id != batch_id
         or context.backlog_id != durable.backlog_id
-        or context.task_id != durable.task_id
-        or context.merge_queue_id != durable.merge_queue_id
+        or context.merge_queue_id != merge_queue_id
         or context.branch_ref != durable.branch_ref
         or not context.runtime_context_id
     ):
         return reject("standalone_runtime_context_scope_mismatch")
-    if context.parent_task_id:
-        expected_context["parent_task_id"] = context.parent_task_id
 
-    branch = str(branch_commit or "").strip().lower()
-    target = str(target_commit or "").strip().lower()
-    durable_branch, _durable_branch_error = _git_preview_commit(
+    candidate, _candidate_error = _git_preview_commit(
         repo_root,
-        str(durable.branch_head or "").strip(),
+        durable.branch_ref,
         timeout_seconds=timeout_seconds,
     )
-    if not durable_branch or durable_branch.lower() != branch:
+    durable_candidate, _durable_candidate_error = _git_preview_commit(
+        repo_root,
+        durable.branch_head,
+        timeout_seconds=timeout_seconds,
+    )
+    current_target, _target_error = _git_preview_commit(
+        repo_root,
+        durable.target_ref,
+        timeout_seconds=timeout_seconds,
+    )
+    if not candidate or candidate != durable_candidate or not current_target:
         return reject("standalone_durable_candidate_commit_mismatch")
 
     checkpoint_refs = (
-        str(durable.validated_target_head or "").strip(),
-        str(durable.current_target_head or "").strip(),
-        str(context.target_head_commit or "").strip(),
+        durable.validated_target_head,
+        durable.current_target_head,
+        context.target_head_commit,
     )
-    if any(not value for value in checkpoint_refs):
+    if any(not str(ref or "").strip() for ref in checkpoint_refs):
         return reject("standalone_durable_checkpoint_missing")
-    resolved_checkpoints: set[str] = set()
-    for checkpoint_ref in checkpoint_refs:
-        resolved, _resolve_error = _git_preview_commit(
+    resolved_checkpoints = {
+        _git_preview_commit(
             repo_root,
-            checkpoint_ref,
+            str(ref),
             timeout_seconds=timeout_seconds,
-        )
-        if not resolved:
-            return reject("standalone_durable_checkpoint_unresolvable")
-        resolved_checkpoints.add(resolved.lower())
+        )[0]
+        for ref in checkpoint_refs
+    }
+    if "" in resolved_checkpoints:
+        return reject("standalone_durable_checkpoint_unresolvable")
     if len(resolved_checkpoints) != 1:
         return reject("standalone_durable_checkpoint_drift")
     checkpoint = next(iter(resolved_checkpoints))
-    if not checkpoint or checkpoint == target:
+    if checkpoint == current_target:
         return reject("standalone_historical_checkpoint_not_behind_target")
     if not _git_preview_branch_is_ancestor(
         repo_root,
-        branch_commit=branch,
+        branch_commit=candidate,
         target_commit=checkpoint,
         timeout_seconds=timeout_seconds,
     ):
@@ -17864,7 +17920,7 @@ def _standalone_historical_reconcile_checkpoint_authority(
     if not _git_preview_branch_is_ancestor(
         repo_root,
         branch_commit=checkpoint,
-        target_commit=target,
+        target_commit=current_target,
         timeout_seconds=timeout_seconds,
     ):
         return reject("standalone_checkpoint_not_in_current_target")
@@ -17875,29 +17931,27 @@ def _standalone_historical_reconcile_checkpoint_authority(
             SELECT s.*, r.commit_sha AS active_ref_commit
             FROM graph_snapshot_refs r
             JOIN graph_snapshots s
-              ON s.project_id = r.project_id
-             AND s.snapshot_id = r.snapshot_id
+              ON s.project_id = r.project_id AND s.snapshot_id = r.snapshot_id
             WHERE r.project_id = ? AND r.ref_name = 'active'
             LIMIT 2
             """,
-            (item.project_id,),
+            (project_id,),
         ).fetchall()
     except sqlite3.Error:
-        return reject("standalone_current_snapshot_missing")
+        snapshot_rows = []
     if len(snapshot_rows) != 1:
         return reject("standalone_current_snapshot_missing")
     snapshot = dict(snapshot_rows[0])
-    snapshot_id = str(snapshot.get("snapshot_id") or "").strip()
+    snapshot_id = str(snapshot.get("snapshot_id") or "")
     if (
-        str(snapshot.get("status") or "").strip() != "active"
-        or str(snapshot.get("snapshot_kind") or "").strip() != "full"
+        snapshot.get("status") != "active"
+        or snapshot.get("snapshot_kind") != "full"
     ):
         return reject("standalone_current_snapshot_not_active_full")
-    if (
-        str(snapshot.get("commit_sha") or "").strip().lower() != checkpoint
-        or str(snapshot.get("active_ref_commit") or "").strip().lower()
-        != checkpoint
-    ):
+    if {
+        str(snapshot.get("commit_sha") or "").lower(),
+        str(snapshot.get("active_ref_commit") or "").lower(),
+    } != {checkpoint.lower()}:
         return reject("standalone_current_snapshot_checkpoint_mismatch")
     if durable.snapshot_id and durable.snapshot_id != snapshot_id:
         return reject("standalone_durable_snapshot_checkpoint_mismatch")
@@ -17905,78 +17959,100 @@ def _standalone_historical_reconcile_checkpoint_authority(
     try:
         provenance_rows = conn.execute(
             """
-            SELECT *
-            FROM graph_current_full_reconcile_provenance
+            SELECT * FROM graph_current_full_reconcile_provenance
             WHERE project_id = ? AND snapshot_id = ? AND target_commit_sha = ?
-            ORDER BY created_at DESC, provenance_id DESC
-            LIMIT 2
+            ORDER BY created_at DESC, provenance_id DESC LIMIT 2
             """,
-            (item.project_id, snapshot_id, checkpoint),
+            (project_id, snapshot_id, checkpoint.lower()),
         ).fetchall()
     except sqlite3.Error:
-        return reject("standalone_checkpoint_provenance_missing")
+        provenance_rows = []
     if len(provenance_rows) != 1:
         return reject("standalone_checkpoint_provenance_missing")
     provenance = dict(provenance_rows[0])
+    route_evidence = _decode_json_mapping(provenance.get("route_evidence_json"))
+    marker = _decode_json_mapping(provenance.get("marker_json"))
+    marker_core = dict(marker)
+    marker_hash = str(marker_core.pop("provenance_hash", "") or "")
     protected_entrypoint = (
         "POST /api/graph-governance/{project_id}/reconcile/current-full"
     )
     if (
-        str(provenance.get("protected_action") or "")
-        != "graph_current_full_reconcile"
-        or str(provenance.get("protected_entrypoint") or "")
-        != protected_entrypoint
+        provenance.get("protected_action") != "graph_current_full_reconcile"
+        or provenance.get("protected_entrypoint") != protected_entrypoint
+        or marker.get("source") != "graph_governance_api"
+        or marker.get("normal_update_path") is not True
+        or marker.get("activate") is not True
+        or marker.get("provenance_id") != provenance.get("provenance_id")
+        or marker.get("snapshot_id") != snapshot_id
+        or str(marker.get("target_commit_sha") or "").lower()
+        != checkpoint.lower()
+        or marker_hash != provenance.get("provenance_hash")
+        or marker_hash != _stable_authority_hash(marker_core)
+        or _decode_json_mapping(marker.get("route_evidence")) != route_evidence
+        or _decode_json_mapping(snapshot.get("notes")).get(
+            "current_full_reconcile"
+        )
+        != marker
     ):
         return reject("standalone_checkpoint_provenance_invalid")
 
-    route_evidence = _decode_json_mapping(provenance.get("route_evidence_json"))
+    expected_scope = {
+        "project_id": project_id,
+        "backlog_id": durable.backlog_id,
+        "task_id": durable.task_id,
+        "runtime_context_id": context.runtime_context_id,
+        "merge_queue_id": merge_queue_id,
+    }
+    if context.parent_task_id:
+        expected_scope["parent_task_id"] = context.parent_task_id
     runtime_scope = _decode_json_mapping(
         route_evidence.get("runtime_context_scope")
     )
     if (
-        runtime_scope.get("server_derived") is not True
-        or str(runtime_scope.get("source") or "")
-        != "parallel_branch_runtime_context"
+        runtime_scope.get("source") != "parallel_branch_runtime_context"
+        or runtime_scope.get("server_derived") is not True
         or any(
-            str(runtime_scope.get(key) or "").strip() != value
-            for key, value in expected_context.items()
+            runtime_scope.get(key) != value
+            for key, value in expected_scope.items()
         )
     ):
         return reject("standalone_checkpoint_provenance_scope_mismatch")
 
-    marker = _decode_json_mapping(provenance.get("marker_json"))
-    if (
-        marker.get("source") != "graph_governance_api"
-        or marker.get("normal_update_path") is not True
-        or marker.get("activate") is not True
-        or str(marker.get("provenance_id") or "")
-        != str(provenance.get("provenance_id") or "")
-        or str(marker.get("snapshot_id") or "") != snapshot_id
-        or str(marker.get("target_commit_sha") or "").strip().lower()
-        != checkpoint
-        or str(marker.get("protected_action") or "")
-        != "graph_current_full_reconcile"
-        or str(marker.get("protected_entrypoint") or "")
-        != protected_entrypoint
-        or str(marker.get("provenance_hash") or "")
-        != str(provenance.get("provenance_hash") or "")
-        or _decode_json_mapping(marker.get("route_evidence")) != route_evidence
-    ):
-        return reject("standalone_checkpoint_provenance_invalid")
-    snapshot_marker = _decode_json_mapping(
-        _decode_json_mapping(snapshot.get("notes")).get(
-            "current_full_reconcile"
-        )
-    )
-    if snapshot_marker != marker:
-        return reject("standalone_checkpoint_snapshot_marker_mismatch")
-
     try:
         reconcile_event_id = int(provenance.get("reconcile_event_id") or 0)
-    except (TypeError, ValueError):
-        reconcile_event_id = 0
-    if reconcile_event_id <= 0:
-        return reject("standalone_checkpoint_provenance_invalid")
+        timeline_row = conn.execute(
+            "SELECT * FROM task_timeline_events WHERE project_id = ? AND id = ?",
+            (project_id, reconcile_event_id),
+        ).fetchone()
+    except (sqlite3.Error, TypeError, ValueError):
+        timeline_row = None
+    timeline = dict(timeline_row) if timeline_row is not None else {}
+    timeline_payload = _decode_json_mapping(timeline.get("payload_json"))
+    timeline_scope = _decode_json_mapping(
+        timeline_payload.get("runtime_context_scope")
+    )
+    if (
+        timeline.get("event_type") != "graph.reconcile"
+        or timeline.get("event_kind") != "reconcile"
+        or timeline.get("phase") != "reconcile"
+        or timeline.get("status") != "passed"
+        or timeline.get("backlog_id") != durable.backlog_id
+        or timeline.get("task_id") != durable.task_id
+        or str(timeline.get("commit_sha") or "").lower() != checkpoint.lower()
+        or timeline.get("created_at") != provenance.get("reconcile_event_created_at")
+        or timeline_payload.get("snapshot_id") != snapshot_id
+        or str(timeline_payload.get("target_commit_sha") or "").lower()
+        != checkpoint.lower()
+        or timeline_payload.get("merge_queue_id") != merge_queue_id
+        or timeline_scope.get("source") != "parallel_branch_runtime_context"
+        or timeline_scope.get("server_derived") is not True
+        or any(
+            timeline_scope.get(key) != value
+            for key, value in expected_scope.items()
+        )
+    ):
+        return reject("standalone_checkpoint_reconcile_timeline_invalid")
 
     parents = _git_preview_command(
         repo_root,
@@ -17984,21 +18060,48 @@ def _standalone_historical_reconcile_checkpoint_authority(
         timeout_seconds=timeout_seconds,
     )
     parent_tokens = parents.stdout.strip().split() if parents.returncode == 0 else []
-    target_head_before_merge = parent_tokens[1] if len(parent_tokens) > 1 else checkpoint
-
-    return {
-        **refused,
+    target_before = parent_tokens[1] if len(parent_tokens) > 1 else checkpoint
+    existing_epoch = get_integration_epoch(conn, project_id, batch_id)
+    core = {
+        "schema_version": _STANDALONE_HISTORICAL_AUTHORITY_SCHEMA,
+        "project_id": project_id,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": queue_item_id,
+        "batch_id": batch_id,
+        "backlog_id": durable.backlog_id,
+        "task_id": durable.task_id,
+        "runtime_context_id": context.runtime_context_id,
+        "parent_task_id": context.parent_task_id,
+        "branch_ref": durable.branch_ref,
+        "target_ref": durable.target_ref,
+        "candidate_commit": candidate,
+        "current_target_commit": current_target,
+        "checkpoint_commit": checkpoint,
+        "target_head_before_merge": target_before,
+        "snapshot_id": snapshot_id,
+        "provenance_id": str(provenance.get("provenance_id") or ""),
+        "provenance_hash": str(provenance.get("provenance_hash") or ""),
+        "reconcile_event_id": reconcile_event_id,
+        "reconcile_event_created_at": str(
+            provenance.get("reconcile_event_created_at") or ""
+        ),
+        "durable_state_hash": _stable_authority_hash(asdict(durable)),
+        "context_state_hash": _stable_authority_hash(asdict(context)),
+        "integration_epoch_state_hash": (
+            _stable_authority_hash(asdict(existing_epoch))
+            if existing_epoch is not None
+            else "absent"
+        ),
+    }
+    authority = StandaloneHistoricalCheckpointAuthority(
+        **core,
+        authority_hash=_stable_authority_hash(core),
+    )
+    return authority, {
+        **authority.to_dict(),
         "status": "authorized",
         "error": "",
         "fail_closed": False,
-        "checkpoint_commit": checkpoint,
-        "target_head_before_merge": target_head_before_merge,
-        "snapshot_id": snapshot_id,
-        "projection_id": "",
-        "provenance_id": str(provenance.get("provenance_id") or ""),
-        "reconcile_event_id": reconcile_event_id,
-        "server_derived": True,
-        "ancestry_verified": True,
     }
 
 
@@ -18008,33 +18111,103 @@ def _apply_standalone_historical_checkpoint_catchup(
     item: MergeQueueItem,
     context: BranchTaskRuntimeContext,
     batch_id: str,
-    authority: Mapping[str, Any],
+    authority: object,
+    repo_root: Path,
+    timeout_seconds: int,
     fence_token: str,
     allow_route_gated_reclaimed_fence_without_token: bool,
     now_iso: str,
 ) -> dict[str, Any]:
     """Atomically bind one already-reconciled standalone merge to its ledger."""
 
+    if type(authority) is not StandaloneHistoricalCheckpointAuthority:
+        return {
+            "ok": False,
+            "error": "standalone_historical_checkpoint_authority_type_invalid",
+            "failure_reason": "typed_frozen_authority_required",
+            "recorded": None,
+        }
+    if not _standalone_authority_hash_valid(authority):
+        return {
+            "ok": False,
+            "error": "standalone_historical_checkpoint_authority_hash_invalid",
+            "failure_reason": "preflight_authority_hash_mismatch",
+            "recorded": None,
+        }
+    if (
+        authority.project_id != item.project_id
+        or authority.merge_queue_id != item.merge_queue_id
+        or authority.queue_item_id != item.queue_item_id
+        or authority.batch_id != batch_id
+        or authority.backlog_id != item.backlog_id
+        or authority.task_id != item.task_id
+        or authority.runtime_context_id != context.runtime_context_id
+        or authority.branch_ref != item.branch_ref
+        or authority.target_ref != item.target_ref
+    ):
+        return {
+            "ok": False,
+            "error": "standalone_historical_checkpoint_authority_scope_invalid",
+            "failure_reason": "preflight_authority_apply_scope_mismatch",
+            "recorded": None,
+        }
+
     ensure_branch_runtime_schema(conn)
-    checkpoint = str(authority.get("checkpoint_commit") or "").strip()
-    snapshot_id = str(authority.get("snapshot_id") or "").strip()
-    projection_id = str(authority.get("projection_id") or "").strip()
-    target_before = str(
-        authority.get("target_head_before_merge") or checkpoint
-    ).strip()
     savepoint = "standalone_historical_checkpoint_catchup"
     conn.execute(f"SAVEPOINT {savepoint}")
     try:
+        fresh_authority, fresh_refusal = (
+            _derive_standalone_historical_checkpoint_authority(
+                conn,
+                project_id=item.project_id,
+                merge_queue_id=item.merge_queue_id,
+                queue_item_id=item.queue_item_id,
+                batch_id=batch_id,
+                repo_root=repo_root,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+        if fresh_authority is None:
+            raise RuntimeError(
+                str(
+                    fresh_refusal.get("failure_reason")
+                    or "standalone_historical_checkpoint_revalidation_failed"
+                )
+            )
+        if (
+            not _standalone_authority_hash_valid(fresh_authority)
+            or fresh_authority != authority
+            or fresh_authority.authority_hash != authority.authority_hash
+        ):
+            raise RuntimeError(
+                "standalone_historical_checkpoint_authority_drift"
+            )
+        checkpoint = authority.checkpoint_commit
+        snapshot_id = authority.snapshot_id
+        projection_id = ""
+        target_before = authority.target_head_before_merge
         durable = _standalone_integration_epoch_durable_item(
             conn,
             item=item,
             batch_id=batch_id,
         )
-        if durable is None:
+        fresh_context = get_branch_context(
+            conn,
+            item.project_id,
+            item.task_id,
+        )
+        if (
+            durable is None
+            or fresh_context is None
+            or _stable_authority_hash(asdict(durable))
+            != authority.durable_state_hash
+            or _stable_authority_hash(asdict(fresh_context))
+            != authority.context_state_hash
+        ):
             raise RuntimeError("standalone_durable_queue_identity_changed")
         existing_epoch = get_integration_epoch(
             conn,
-            item.project_id,
+            durable.project_id,
             batch_id,
         )
         idempotent_replay = False
@@ -18059,19 +18232,19 @@ def _apply_standalone_historical_checkpoint_catchup(
             idempotent_replay = True
             auto_record = record_merge_queue_graph_epoch_after_reconcile(
                 conn,
-                project_id=item.project_id,
+                project_id=durable.project_id,
                 target_head_commit=checkpoint,
                 snapshot_id=snapshot_id,
                 projection_id=projection_id,
-                merge_queue_id=item.merge_queue_id,
-                queue_item_id=item.queue_item_id,
+                merge_queue_id=durable.merge_queue_id,
+                queue_item_id=durable.queue_item_id,
                 now_iso=now_iso,
             )
         else:
             epoch = open_or_validate_integration_epoch(
                 conn,
                 item=replace(
-                    item,
+                    durable,
                     status=STATE_MERGED,
                     merge_commit=checkpoint,
                     target_head_before_merge=target_before,
@@ -18080,16 +18253,16 @@ def _apply_standalone_historical_checkpoint_catchup(
                 ),
                 batch_id=batch_id,
                 target_head=checkpoint,
-                checkpoint_id=context.checkpoint_id,
+                checkpoint_id=fresh_context.checkpoint_id,
                 now_iso=now_iso,
             )
             record_merge_queue_result(
                 conn,
-                project_id=item.project_id,
-                merge_queue_id=item.merge_queue_id,
-                queue_item_id=item.queue_item_id,
-                task_id=item.task_id,
-                target_ref=item.target_ref,
+                project_id=durable.project_id,
+                merge_queue_id=durable.merge_queue_id,
+                queue_item_id=durable.queue_item_id,
+                task_id=durable.task_id,
+                target_ref=durable.target_ref,
                 status=STATE_MERGED,
                 merge_commit=checkpoint,
                 target_head_before_merge=target_before,
@@ -18102,37 +18275,37 @@ def _apply_standalone_historical_checkpoint_catchup(
             )
             advance_integration_epoch_after_merge(
                 conn,
-                project_id=item.project_id,
+                project_id=durable.project_id,
                 batch_id=epoch.batch_id,
-                queue_item_id=item.queue_item_id,
+                queue_item_id=durable.queue_item_id,
                 merge_commit=checkpoint,
                 now_iso=now_iso,
             )
             auto_record = record_merge_queue_graph_epoch_after_reconcile(
                 conn,
-                project_id=item.project_id,
+                project_id=durable.project_id,
                 target_head_commit=checkpoint,
                 snapshot_id=snapshot_id,
                 projection_id=projection_id,
-                merge_queue_id=item.merge_queue_id,
-                queue_item_id=item.queue_item_id,
+                merge_queue_id=durable.merge_queue_id,
+                queue_item_id=durable.queue_item_id,
                 now_iso=now_iso,
             )
 
         saved_item = get_merge_queue_item(
             conn,
-            item.project_id,
-            item.merge_queue_id,
-            item.queue_item_id,
+            durable.project_id,
+            durable.merge_queue_id,
+            durable.queue_item_id,
         )
         saved_context = get_branch_context(
             conn,
-            item.project_id,
-            item.task_id,
+            durable.project_id,
+            durable.task_id,
         )
         saved_epoch = get_integration_epoch(
             conn,
-            item.project_id,
+            durable.project_id,
             batch_id,
         )
         exact_terminal = bool(
@@ -18155,9 +18328,9 @@ def _apply_standalone_historical_checkpoint_catchup(
             and saved_context.snapshot_id == snapshot_id
             and saved_epoch is not None
             and saved_epoch.status == INTEGRATION_EPOCH_CLOSED
-            and saved_epoch.merge_queue_id == item.merge_queue_id
-            and saved_epoch.coordination_backlog_id == item.backlog_id
-            and saved_epoch.merged_prefix == (item.queue_item_id,)
+            and saved_epoch.merge_queue_id == durable.merge_queue_id
+            and saved_epoch.coordination_backlog_id == durable.backlog_id
+            and saved_epoch.merged_prefix == (durable.queue_item_id,)
             and not saved_epoch.remaining_queue_item_ids
             and _commit_ref_unambiguously_matches(
                 saved_epoch.current_head,
@@ -18618,7 +18791,10 @@ def execute_merge_queue_item(
             "recorded": None,
         }
     if already_integrated:
-        historical_checkpoint_authority: dict[str, Any] = {}
+        historical_checkpoint_authority: (
+            StandaloneHistoricalCheckpointAuthority | None
+        ) = None
+        historical_checkpoint_authority_payload: dict[str, Any] = {}
         if _standalone_advanced_head_catchup_claimed(
             conn,
             item=item,
@@ -18628,43 +18804,72 @@ def execute_merge_queue_item(
             target_commit=target_commit,
             timeout_seconds=timeout_seconds,
         ):
-            historical_checkpoint_authority = (
-                _standalone_historical_reconcile_checkpoint_authority(
-                    conn,
-                    item=item,
-                    context=item_context,
-                    batch_id=item_batch_id,
-                    repo_root=repo_root,
-                    branch_commit=branch_commit,
-                    target_commit=target_commit,
-                    timeout_seconds=timeout_seconds,
-                )
+            (
+                historical_checkpoint_authority,
+                historical_checkpoint_authority_payload,
+            ) = _derive_standalone_historical_checkpoint_authority(
+                conn,
+                project_id=project_id,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=item.queue_item_id,
+                batch_id=item_batch_id,
+                repo_root=repo_root,
+                timeout_seconds=timeout_seconds,
             )
-            if historical_checkpoint_authority.get("status") != "authorized":
+            if historical_checkpoint_authority is not None and (
+                historical_checkpoint_authority.candidate_commit != branch_commit
+                or historical_checkpoint_authority.current_target_commit
+                != target_commit
+                or historical_checkpoint_authority.backlog_id != item.backlog_id
+                or historical_checkpoint_authority.task_id != item.task_id
+                or historical_checkpoint_authority.branch_ref != item.branch_ref
+                or historical_checkpoint_authority.target_ref != item.target_ref
+                or item_context is None
+                or historical_checkpoint_authority.runtime_context_id
+                != item_context.runtime_context_id
+            ):
+                historical_checkpoint_authority = None
+                historical_checkpoint_authority_payload = {
+                    "schema_version": (
+                        _STANDALONE_HISTORICAL_AUTHORITY_SCHEMA
+                    ),
+                    "status": "refused",
+                    "error": "standalone_historical_checkpoint_unresolved",
+                    "fail_closed": True,
+                    "failure_reason": (
+                        "standalone_preflight_request_scope_mismatch"
+                    ),
+                }
+            if historical_checkpoint_authority is None:
                 return {
                     "ok": False,
                     "dry_run": dry_run,
                     "executed": False,
                     "already_integrated": True,
                     "target_ref_mutated": False,
-                    "error": historical_checkpoint_authority.get("error"),
+                    "error": historical_checkpoint_authority_payload.get(
+                        "error"
+                    ),
                     "message": (
                         "advanced-head standalone catch-up requires the exact "
                         "server-authored historical full-reconcile checkpoint"
                     ),
                     "historical_checkpoint_authority": (
-                        historical_checkpoint_authority
+                        historical_checkpoint_authority_payload
                     ),
                     "recorded": None,
                 }
-        historical_checkpoint = str(
-            historical_checkpoint_authority.get("checkpoint_commit") or ""
-        ).strip()
+        historical_checkpoint = (
+            historical_checkpoint_authority.checkpoint_commit
+            if historical_checkpoint_authority is not None
+            else ""
+        )
         merge_position = historical_checkpoint or target_commit
-        merge_position_before = str(
-            historical_checkpoint_authority.get("target_head_before_merge")
-            or ""
-        ).strip()
+        merge_position_before = (
+            historical_checkpoint_authority.target_head_before_merge
+            if historical_checkpoint_authority is not None
+            else ""
+        )
         integrated_item = replace(
             item,
             status=STATE_MERGED,
@@ -18706,7 +18911,9 @@ def execute_merge_queue_item(
                 "queue_item": merge_queue_item_to_dict(integrated_item),
                 "next_actions": ["record_merge_result_without_target_ref_mutation"],
                 "historical_checkpoint_authority": (
-                    historical_checkpoint_authority or None
+                    historical_checkpoint_authority.to_dict()
+                    if historical_checkpoint_authority is not None
+                    else None
                 ),
                 "recorded": None,
             }
@@ -18717,6 +18924,8 @@ def execute_merge_queue_item(
                 context=item_context,
                 batch_id=item_batch_id,
                 authority=historical_checkpoint_authority,
+                repo_root=repo_root,
+                timeout_seconds=timeout_seconds,
                 fence_token=fence_token,
                 allow_route_gated_reclaimed_fence_without_token=(
                     allow_route_gated_reclaimed_fence_without_token
@@ -18736,7 +18945,7 @@ def execute_merge_queue_item(
                         "because its exact ledger/reconcile barrier did not close"
                     ),
                     "historical_checkpoint_authority": (
-                        historical_checkpoint_authority
+                        historical_checkpoint_authority.to_dict()
                     ),
                     "historical_checkpoint_apply": applied,
                     "recorded": None,
@@ -18758,7 +18967,7 @@ def execute_merge_queue_item(
                 "recorded": applied.get("recorded"),
                 "integration_epoch": applied.get("integration_epoch"),
                 "historical_checkpoint_authority": (
-                    historical_checkpoint_authority
+                    historical_checkpoint_authority.to_dict()
                 ),
                 "merge_queue_graph_epoch_auto_record": applied.get(
                     "merge_queue_graph_epoch_auto_record"

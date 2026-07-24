@@ -195,6 +195,123 @@ def _seed_standalone_current_full_checkpoint(
     return int(timeline["id"])
 
 
+def _standalone_advanced_head_authority_case(tmp_path):
+    fixture = create_merge_preview_fixture_project(tmp_path)
+    repo = fixture.root
+    candidate_commit = fixture_git(
+        ["rev-parse", fixture.clean_branch],
+        cwd=repo,
+    ).stdout.strip()
+    fixture_git(
+        [
+            "merge",
+            "--no-ff",
+            fixture.clean_branch,
+            "-m",
+            "Merge standalone typed-authority candidate",
+        ],
+        cwd=repo,
+    )
+    checkpoint_commit = fixture_git(
+        ["rev-parse", "main"],
+        cwd=repo,
+    ).stdout.strip()
+    conn = _runtime_conn()
+    batch_id = "standalone-typed-authority"
+    queue_id = "mq-standalone-typed-authority"
+    backlog_id = "AC-STANDALONE-TYPED-AUTHORITY"
+    snapshot_id = f"full-{checkpoint_commit[:7]}-typed-authority"
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-standalone-typed-authority",
+        task_id="task-standalone-typed-authority",
+        backlog_id=backlog_id,
+        branch_ref=fixture.clean_branch,
+        queue_index=1,
+        status=STATE_MERGE_READY,
+        target_ref="main",
+        branch_head=candidate_commit,
+        validated_target_head=checkpoint_commit,
+        current_target_head=checkpoint_commit,
+    )
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        runtime_context_id="mfrctx-standalone-typed-authority",
+        batch_id=batch_id,
+        task_id=item.task_id,
+        backlog_id=backlog_id,
+        parent_task_id=backlog_id,
+        branch_ref=item.branch_ref,
+        status=STATE_MERGE_READY,
+        target_head_commit=checkpoint_commit,
+        checkpoint_id="checkpoint-standalone-typed-authority",
+        merge_queue_id=queue_id,
+    )
+    context = upsert_branch_context(conn, context)
+    item = upsert_merge_queue_items(conn, [item])[0]
+    reconcile_event_id = _seed_standalone_current_full_checkpoint(
+        conn,
+        checkpoint_commit=checkpoint_commit,
+        snapshot_id=snapshot_id,
+        item=item,
+        context=context,
+    )
+    repair_file = repo / "typed-authority-repair.txt"
+    repair_file.write_text("repair\n", encoding="utf-8")
+    fixture_git(["add", repair_file.name], cwd=repo)
+    fixture_git(["commit", "-m", "Repair after typed authority checkpoint"], cwd=repo)
+    repair_head = fixture_git(["rev-parse", "main"], cwd=repo).stdout.strip()
+    authority, refusal = (
+        pbr._derive_standalone_historical_checkpoint_authority(
+            conn,
+            project_id=PROJECT_ID,
+            merge_queue_id=queue_id,
+            queue_item_id=item.queue_item_id,
+            batch_id=batch_id,
+            repo_root=repo,
+            timeout_seconds=30,
+        )
+    )
+    assert authority is not None, refusal
+    return {
+        "conn": conn,
+        "repo": repo,
+        "item": item,
+        "context": context,
+        "batch_id": batch_id,
+        "snapshot_id": snapshot_id,
+        "reconcile_event_id": reconcile_event_id,
+        "checkpoint_commit": checkpoint_commit,
+        "repair_head": repair_head,
+        "authority": authority,
+    }
+
+
+def _assert_standalone_authority_apply_left_ledger_unchanged(case) -> None:
+    conn = case["conn"]
+    item = case["item"]
+    context = case["context"]
+    persisted = get_merge_queue_item(
+        conn,
+        item.project_id,
+        item.merge_queue_id,
+        item.queue_item_id,
+    )
+    persisted_context = get_branch_context(conn, item.project_id, item.task_id)
+    assert persisted == item
+    assert persisted_context == context
+    assert get_integration_epoch(
+        conn,
+        item.project_id,
+        case["batch_id"],
+    ) is None
+    assert fixture_git(
+        ["rev-parse", "main"],
+        cwd=case["repo"],
+    ).stdout.strip() == case["repair_head"]
+
+
 def _passing_merge_evidence() -> dict[str, dict[str, str]]:
     return {
         key: {"status": "pass", "evidence_id": f"evidence-{key}"}
@@ -1909,28 +2026,22 @@ def test_standalone_advanced_head_catchup_uses_historical_reconciled_checkpoint(
     assert result["executed"] is False
     assert result["target_ref_mutated"] is False
     assert result["merge_commit"] == checkpoint_commit
-    assert result["historical_checkpoint_authority"] == {
-        "schema_version": "standalone.historical_checkpoint_authority.v1",
-        "status": "authorized",
-        "error": "",
-        "fail_closed": False,
-        "project_id": PROJECT_ID,
-        "merge_queue_id": queue_id,
-        "queue_item_id": item.queue_item_id,
-        "batch_id": batch_id,
-        "checkpoint_commit": checkpoint_commit,
-        "target_head_before_merge": target_before,
-        "snapshot_id": snapshot_id,
-        "projection_id": "",
-        "provenance_id": result["historical_checkpoint_authority"][
-            "provenance_id"
-        ],
-        "reconcile_event_id": result["historical_checkpoint_authority"][
-            "reconcile_event_id"
-        ],
-        "server_derived": True,
-        "ancestry_verified": True,
-    }
+    authority = result["historical_checkpoint_authority"]
+    assert authority["schema_version"] == (
+        "standalone.historical_checkpoint_authority.v2"
+    )
+    assert authority["project_id"] == PROJECT_ID
+    assert authority["merge_queue_id"] == queue_id
+    assert authority["queue_item_id"] == item.queue_item_id
+    assert authority["batch_id"] == batch_id
+    assert authority["candidate_commit"] == candidate_commit
+    assert authority["current_target_commit"] == repair_head
+    assert authority["checkpoint_commit"] == checkpoint_commit
+    assert authority["target_head_before_merge"] == target_before
+    assert authority["snapshot_id"] == snapshot_id
+    authority_core = dict(authority)
+    authority_hash = authority_core.pop("authority_hash")
+    assert authority_hash == pbr._stable_authority_hash(authority_core)
     assert fixture_git(["rev-parse", "main"], cwd=repo).stdout.strip() == repair_head
     recorded = get_merge_queue_item(
         conn,
@@ -1969,6 +2080,193 @@ def test_standalone_advanced_head_catchup_uses_historical_reconciled_checkpoint(
     assert replay["historical_checkpoint_catchup"] is True
     assert replay["merge_commit"] == checkpoint_commit
     assert fixture_git(["rev-parse", "main"], cwd=repo).stdout.strip() == repair_head
+
+
+def test_standalone_historical_apply_rejects_raw_and_forged_authority(
+    tmp_path,
+) -> None:
+    case = _standalone_advanced_head_authority_case(tmp_path)
+    apply_kwargs = {
+        "item": case["item"],
+        "context": case["context"],
+        "batch_id": case["batch_id"],
+        "repo_root": case["repo"],
+        "timeout_seconds": 30,
+        "fence_token": "",
+        "allow_route_gated_reclaimed_fence_without_token": False,
+        "now_iso": "",
+    }
+
+    raw = pbr._apply_standalone_historical_checkpoint_catchup(
+        case["conn"],
+        authority=case["authority"].to_dict(),
+        **apply_kwargs,
+    )
+    assert raw["ok"] is False
+    assert raw["error"] == (
+        "standalone_historical_checkpoint_authority_type_invalid"
+    )
+    _assert_standalone_authority_apply_left_ledger_unchanged(case)
+
+    bad_hash = replace(
+        case["authority"],
+        authority_hash="sha256:" + "0" * 64,
+    )
+    forged_hash = pbr._apply_standalone_historical_checkpoint_catchup(
+        case["conn"],
+        authority=bad_hash,
+        **apply_kwargs,
+    )
+    assert forged_hash["ok"] is False
+    assert forged_hash["error"] == (
+        "standalone_historical_checkpoint_authority_hash_invalid"
+    )
+    _assert_standalone_authority_apply_left_ledger_unchanged(case)
+
+    forged_payload = case["authority"].to_dict()
+    forged_payload["checkpoint_commit"] = case["repair_head"]
+    forged_payload.pop("authority_hash")
+    forged = pbr.StandaloneHistoricalCheckpointAuthority(
+        **forged_payload,
+        authority_hash=pbr._stable_authority_hash(forged_payload),
+    )
+    forged_drift = pbr._apply_standalone_historical_checkpoint_catchup(
+        case["conn"],
+        authority=forged,
+        **apply_kwargs,
+    )
+    assert forged_drift["ok"] is False
+    assert forged_drift["error"] == (
+        "standalone_historical_checkpoint_attachment_failed"
+    )
+    assert forged_drift["failure_reason"] == (
+        "standalone_historical_checkpoint_authority_drift"
+    )
+    _assert_standalone_authority_apply_left_ledger_unchanged(case)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("provenance_hash", "standalone_checkpoint_provenance_invalid"),
+        ("marker", "standalone_checkpoint_provenance_invalid"),
+        ("timeline_deleted", "standalone_checkpoint_reconcile_timeline_invalid"),
+    ],
+)
+def test_standalone_historical_apply_revalidates_evidence_inside_savepoint(
+    tmp_path,
+    mutation,
+    expected_reason,
+) -> None:
+    case = _standalone_advanced_head_authority_case(tmp_path)
+    conn = case["conn"]
+    if mutation == "provenance_hash":
+        conn.execute(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET provenance_hash = ? WHERE project_id = ? AND snapshot_id = ?",
+            ("sha256:" + "f" * 64, PROJECT_ID, case["snapshot_id"]),
+        )
+    elif mutation == "marker":
+        row = conn.execute(
+            "SELECT provenance_id, marker_json "
+            "FROM graph_current_full_reconcile_provenance "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (PROJECT_ID, case["snapshot_id"]),
+        ).fetchone()
+        marker = json.loads(row["marker_json"])
+        marker["normal_update_path"] = False
+        conn.execute(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET marker_json = ? WHERE provenance_id = ?",
+            (json.dumps(marker, sort_keys=True), row["provenance_id"]),
+        )
+    elif mutation == "timeline_deleted":
+        conn.execute(
+            "DELETE FROM task_timeline_events WHERE project_id = ? AND id = ?",
+            (PROJECT_ID, case["reconcile_event_id"]),
+        )
+    conn.commit()
+
+    result = pbr._apply_standalone_historical_checkpoint_catchup(
+        conn,
+        item=case["item"],
+        context=case["context"],
+        batch_id=case["batch_id"],
+        authority=case["authority"],
+        repo_root=case["repo"],
+        timeout_seconds=30,
+        fence_token="",
+        allow_route_gated_reclaimed_fence_without_token=False,
+        now_iso="",
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == (
+        "standalone_historical_checkpoint_attachment_failed"
+    )
+    assert result["failure_reason"] == expected_reason
+    _assert_standalone_authority_apply_left_ledger_unchanged(case)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("durable_queue", "standalone_durable_checkpoint_drift"),
+        (
+            "current_target_ancestry",
+            "standalone_historical_checkpoint_authority_drift",
+        ),
+    ],
+)
+def test_standalone_historical_apply_rejects_state_or_ancestry_drift(
+    tmp_path,
+    mutation,
+    expected_reason,
+) -> None:
+    case = _standalone_advanced_head_authority_case(tmp_path)
+    if mutation == "durable_queue":
+        case["item"] = upsert_merge_queue_items(
+            case["conn"],
+            [
+                replace(
+                    case["item"],
+                    current_target_head=case["repair_head"],
+                )
+            ],
+        )[0]
+        case["conn"].commit()
+    elif mutation == "current_target_ancestry":
+        drift_file = case["repo"] / "post-preflight-target-drift.txt"
+        drift_file.write_text("target drift\n", encoding="utf-8")
+        fixture_git(["add", drift_file.name], cwd=case["repo"])
+        fixture_git(
+            ["commit", "-m", "Advance target after authority preflight"],
+            cwd=case["repo"],
+        )
+        case["repair_head"] = fixture_git(
+            ["rev-parse", "main"],
+            cwd=case["repo"],
+        ).stdout.strip()
+
+    result = pbr._apply_standalone_historical_checkpoint_catchup(
+        case["conn"],
+        item=case["item"],
+        context=case["context"],
+        batch_id=case["batch_id"],
+        authority=case["authority"],
+        repo_root=case["repo"],
+        timeout_seconds=30,
+        fence_token="",
+        allow_route_gated_reclaimed_fence_without_token=False,
+        now_iso="",
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == (
+        "standalone_historical_checkpoint_attachment_failed"
+    )
+    assert result["failure_reason"] == expected_reason
+    _assert_standalone_authority_apply_left_ledger_unchanged(case)
 
 
 @pytest.mark.parametrize(
@@ -2092,7 +2390,7 @@ def test_standalone_advanced_head_catchup_fails_closed_without_exact_authority(
         )
     elif tamper == "scope_mismatch":
         row = conn.execute(
-            "SELECT provenance_id, route_evidence_json "
+            "SELECT provenance_id, route_evidence_json, marker_json "
             "FROM graph_current_full_reconcile_provenance "
             "WHERE project_id = ? AND snapshot_id = ?",
             (PROJECT_ID, snapshot_id),
@@ -2102,10 +2400,33 @@ def test_standalone_advanced_head_catchup_fails_closed_without_exact_authority(
         route_evidence["runtime_context_scope"]["merge_queue_id"] = (
             "mq-forged-scope"
         )
+        marker = json.loads(row["marker_json"])
+        marker["route_evidence"] = route_evidence
+        marker_core = dict(marker)
+        marker_core.pop("provenance_hash", None)
+        marker["provenance_hash"] = pbr._stable_authority_hash(marker_core)
         conn.execute(
             "UPDATE graph_current_full_reconcile_provenance "
-            "SET route_evidence_json = ? WHERE provenance_id = ?",
-            (json.dumps(route_evidence, sort_keys=True), row["provenance_id"]),
+            "SET route_evidence_json = ?, marker_json = ?, provenance_hash = ? "
+            "WHERE provenance_id = ?",
+            (
+                json.dumps(route_evidence, sort_keys=True),
+                json.dumps(marker, sort_keys=True),
+                marker["provenance_hash"],
+                row["provenance_id"],
+            ),
+        )
+        notes_row = conn.execute(
+            "SELECT notes FROM graph_snapshots "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (PROJECT_ID, snapshot_id),
+        ).fetchone()
+        notes = json.loads(notes_row["notes"])
+        notes["current_full_reconcile"] = marker
+        conn.execute(
+            "UPDATE graph_snapshots SET notes = ? "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (json.dumps(notes, sort_keys=True), PROJECT_ID, snapshot_id),
         )
     conn.commit()
 

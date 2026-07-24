@@ -5935,6 +5935,7 @@ def test_server_authored_current_full_checkpoint_drives_advanced_head_standalone
             (
                 {
                     context.branch_ref: candidate_commit,
+                    "refs/heads/main": repair_head,
                     candidate_commit: candidate_commit,
                     checkpoint_commit: checkpoint_commit,
                     repair_head: repair_head,
