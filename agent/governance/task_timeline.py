@@ -20,8 +20,8 @@ from typing import Any, Mapping
 from urllib.parse import urlencode
 
 from .contracts.runtime import (
+    _current_projection_from_row,
     ensure_contract_chain_mapping_schema,
-    read_backlog_contract_chain_current,
 )
 
 log = logging.getLogger(__name__)
@@ -14663,17 +14663,40 @@ def _compact_contract_chain_current_rows(
     project_id: str,
     backlog_ids: set[str],
 ) -> dict[str, dict[str, Any]]:
-    projections: dict[str, dict[str, Any]] = {}
-    for backlog_id in sorted(backlog_ids):
-        current = read_backlog_contract_chain_current(
-            conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            rebuild_if_missing=False,
-        )
-        if current:
-            projections[backlog_id] = current
-    return projections
+    """Load bounded current projections in one indexed query.
+
+    Current/Playback hot windows may reference up to 50 different backlog rows.
+    Reading each durable projection separately turns an otherwise bounded
+    endpoint into an avoidable N+1 path.  The projection decoder is the same
+    one used by the canonical single-row reader, so batching does not create a
+    second interpretation of ContractRuntime authority.
+    """
+
+    normalized_ids = sorted(
+        backlog_id
+        for backlog_id in {
+            str(backlog_id or "").strip() for backlog_id in backlog_ids
+        }
+        if backlog_id
+    )
+    if not normalized_ids:
+        return {}
+    ensure_contract_chain_mapping_schema(conn)
+    placeholders = ", ".join("?" for _ in normalized_ids)
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM backlog_contract_chain_current
+        WHERE project_id = ? AND backlog_id IN ({placeholders})
+        """,
+        (project_id, *normalized_ids),
+    ).fetchall()
+    return {
+        backlog_id: projection
+        for raw_row in rows
+        if (backlog_id := str(dict(raw_row).get("backlog_id") or "").strip())
+        and (projection := _current_projection_from_row(raw_row))
+    }
 
 
 def _apply_compact_contract_chain_current(
@@ -14972,12 +14995,7 @@ def build_contract_runtime_current_ledger(
         backlog_id = str(data.get("backlog_id") or "").strip()
         if not backlog_id:
             continue
-        current = read_backlog_contract_chain_current(
-            conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            rebuild_if_missing=False,
-        )
+        current = _current_projection_from_row(raw_row)
         if not current:
             continue
         current_execution_id = str(

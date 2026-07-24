@@ -2481,7 +2481,19 @@ class TestTaskTimeline(unittest.TestCase):
             },
         )
 
-        ledger = task_timeline.build_compact_ledger(self.conn, "proj", [event])
+        projection_queries = []
+        self.conn.set_trace_callback(projection_queries.append)
+        try:
+            ledger = task_timeline.build_compact_ledger(self.conn, "proj", [event])
+        finally:
+            self.conn.set_trace_callback(None)
+        self.assertEqual(
+            sum(
+                "FROM backlog_contract_chain_current" in statement
+                for statement in projection_queries
+            ),
+            1,
+        )
 
         self.assertEqual(ledger["row_count"], 1)
         row = ledger["rows"][0]
@@ -2508,9 +2520,21 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(current["projection_source"], "backlog_contract_chain_current")
         self.assertEqual(current["projection_hash"], row["projection_hash"])
 
-        current_ledger = task_timeline.build_contract_runtime_current_ledger(
-            self.conn,
-            "proj",
+        projection_queries = []
+        self.conn.set_trace_callback(projection_queries.append)
+        try:
+            current_ledger = task_timeline.build_contract_runtime_current_ledger(
+                self.conn,
+                "proj",
+            )
+        finally:
+            self.conn.set_trace_callback(None)
+        self.assertEqual(
+            sum(
+                "FROM backlog_contract_chain_current" in statement
+                for statement in projection_queries
+            ),
+            1,
         )
         [current_row] = current_ledger["rows"]
         self.assertTrue(current_row["projection_updated_at"])
