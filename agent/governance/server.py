@@ -25477,39 +25477,31 @@ def _runtime_context_failed_qa_line_matches_context(
     *,
     context: Any,
 ) -> bool:
-    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+    runtime_context_id, task_id, _parent_task_id = _contract_runtime_context_identity(
         context
     )
-    scoped_candidates = []
-    for candidate in _contract_runtime_mapping_candidates(failed_line):
-        if _contract_runtime_mapping_value(
-            candidate,
-            "runtime_context_id",
-            "task_id",
-            "worker_task_id",
-            "parent_task_id",
-        ):
-            scoped_candidates.append(candidate)
-    if not scoped_candidates:
-        return True
+    if not runtime_context_id or not task_id:
+        return False
 
-    for candidate in scoped_candidates:
+    for candidate in _contract_runtime_mapping_candidates(failed_line):
         candidate_runtime_id = _contract_runtime_mapping_value(
             candidate,
             "runtime_context_id",
         )
-        if candidate_runtime_id and candidate_runtime_id != runtime_context_id:
+        if candidate_runtime_id != runtime_context_id:
             continue
         task_values = _contract_runtime_mapping_values(
             candidate,
             "task_id",
             "worker_task_id",
         )
-        if task_values and task_id not in task_values:
+        if task_id not in task_values:
             continue
-        parent_values = _contract_runtime_mapping_values(candidate, "parent_task_id")
-        if parent_values and parent_task_id not in parent_values:
-            continue
+        # The active runtime-context/task tuple is the durable worker identity.
+        # Older QA rows can carry a stale parent alias from a parent execution
+        # or backlog-shaped caller payload.  That alias must not erase an
+        # otherwise exact worker identity, and it is never sufficient by
+        # itself to authorize a rejoin.
         return True
     return False
 
@@ -63471,6 +63463,148 @@ def _contract_runtime_assigned_target_project_root(
     }
 
 
+def _contract_runtime_bind_qa_worker_identity_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind a QA row to the one active worker context selected by dispatch."""
+
+    expected = _contract_runtime_server_line_identity(record)
+    expected_runtime_context_id = str(
+        expected.get("runtime_context_id") or ""
+    ).strip()
+    expected_task_id = str(expected.get("task_id") or "").strip()
+    identities: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for line in record.get("completed_lines") or []:
+        if not isinstance(line, Mapping) or str(
+            line.get("line_id") or ""
+        ).strip() not in {
+            "observer_dispatch_bounded_workers",
+            "direct_fix_dispatch_context",
+        }:
+            continue
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=line,
+        ):
+            identity = _contract_runtime_context_identity(context)
+            runtime_context_id, task_id, parent_task_id = identity
+            if (
+                runtime_context_id != expected_runtime_context_id
+                or task_id != expected_task_id
+            ):
+                continue
+            if runtime_context_id and task_id and parent_task_id:
+                identities[(runtime_context_id, task_id)] = identity
+
+    if (
+        expected.get("identity_status") != "resolved"
+        or not expected_runtime_context_id
+        or not expected_task_id
+        or len(identities) != 1
+    ):
+        raise GovernanceError(
+            "contract_runtime_qa_worker_identity_unresolved",
+            (
+                "independent QA requires one server-verified active "
+                "runtime-context/task identity"
+            ),
+            409,
+            {
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "line_id": str(write.get("line_id") or ""),
+                "identity_status": str(
+                    expected.get("identity_status") or "missing"
+                ),
+                "identity_source_line_id": str(
+                    expected.get("identity_source_line_id") or ""
+                ),
+                "candidate_count": len(identities),
+                "fail_closed": True,
+            },
+        )
+
+    runtime_context_id, task_id, parent_task_id = next(iter(identities.values()))
+    claimed_runtime_context_ids: set[str] = set()
+    claimed_task_ids: set[str] = set()
+    for candidate in _contract_runtime_mapping_candidates(write):
+        claimed_runtime_context_ids.update(
+            _contract_runtime_mapping_values(candidate, "runtime_context_id")
+        )
+        claimed_task_ids.update(
+            _contract_runtime_mapping_values(
+                candidate,
+                "task_id",
+                "worker_task_id",
+            )
+        )
+    mismatches = []
+    for field, claimed, canonical in (
+        (
+            "runtime_context_id",
+            claimed_runtime_context_ids,
+            runtime_context_id,
+        ),
+        ("task_id", claimed_task_ids, task_id),
+    ):
+        wrong = sorted(value for value in claimed if value != canonical)
+        if wrong:
+            mismatches.append(
+                {
+                    "field": field,
+                    "expected": canonical,
+                    "actual": wrong,
+                }
+            )
+    if mismatches:
+        raise GovernanceError(
+            "contract_runtime_qa_worker_identity_mismatch",
+            (
+                "independent QA runtime-context/task claims do not match "
+                "the server-verified active worker"
+            ),
+            409,
+            {
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "line_id": str(write.get("line_id") or ""),
+                "identity_mismatches": mismatches,
+                "fail_closed": True,
+            },
+        )
+
+    effective = dict(write)
+    effective.update(
+        {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+        }
+    )
+    payload = (
+        dict(effective.get("payload"))
+        if isinstance(effective.get("payload"), Mapping)
+        else {}
+    )
+    payload.update(
+        {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+        }
+    )
+    effective["payload"] = payload
+    return effective
+
+
 def _contract_runtime_worker_commit_bypass_continuation_authority(
     conn,
     *,
@@ -64390,6 +64524,15 @@ def _contract_runtime_bind_qa_independent_verification_authority(
         source="contract_runtime_qa_independent_verification_binding",
         binding_claims={"independent_verification_session_matched": True},
     )
+    if _is_mf_parallel_record_contract_id(
+        str(record.get("contract_id") or "")
+    ):
+        effective = _contract_runtime_bind_qa_worker_identity_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+            write=effective,
+        )
     return _contract_runtime_bind_qa_no_pass_ledger_authority(
         conn,
         project_id=project_id,
