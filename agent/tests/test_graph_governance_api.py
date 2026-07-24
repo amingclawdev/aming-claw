@@ -64591,6 +64591,188 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     ] == "worker_finish_gate"
 
 
+def test_dependency_revalidation_recovers_only_source_backed_qa_candidate(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DEPENDENCY-REVALIDATE-PRESERVE-QA-CANDIDATE"
+    execution_id = "cex-dependency-revalidate-preserve-qa-candidate"
+    runtime_context_id = "mfrctx-dependency-revalidate-preserve-qa-candidate"
+    task_id = "dependency-revalidate-preserve-qa-candidate-worker"
+    queue_id = "mq-dependency-revalidate-preserve-qa-candidate"
+    queue_item_id = f"{queue_id}:{task_id}"
+    repo = tmp_path / "dependency-revalidate-preserve-qa-candidate"
+    _init_test_git_repo(repo)
+    base_commit = batch_jobs.git_commit(repo)
+    owned = repo / "owned.txt"
+    owned.write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "add", "owned.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "candidate"], cwd=repo, check=True)
+    candidate_commit = batch_jobs.git_commit(repo)
+    subprocess.run(
+        ["git", "branch", "candidate", candidate_commit],
+        cwd=repo,
+        check=True,
+    )
+    owned.write_text("overwritten live worker head\n", encoding="utf-8")
+    subprocess.run(["git", "add", "owned.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "mutable worker head"],
+        cwd=repo,
+        check=True,
+    )
+    overwritten_commit = batch_jobs.git_commit(repo)
+    subprocess.run(
+        ["git", "switch", "-c", "target", base_commit],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    owned.write_text("target conflict\n", encoding="utf-8")
+    subprocess.run(["git", "add", "owned.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "target"], cwd=repo, check=True)
+    target_commit = batch_jobs.git_commit(repo)
+
+    runtime_context = BranchTaskRuntimeContext(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        parent_task_id=execution_id,
+        runtime_context_id=runtime_context_id,
+        merge_queue_id=queue_id,
+        branch_ref="candidate",
+        target_project_root=str(repo),
+        worktree_path=str(repo),
+        status=STATE_VALIDATED,
+        base_commit=base_commit,
+        head_commit=overwritten_commit,
+        target_head_commit=target_commit,
+    )
+    queue_item = MergeQueueItem(
+        project_id=PID,
+        merge_queue_id=queue_id,
+        queue_item_id=queue_item_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        branch_ref="candidate",
+        queue_index=0,
+        status="merge_ready",
+        target_ref="target",
+        base_commit=base_commit,
+        branch_head=overwritten_commit,
+        current_target_head=target_commit,
+        validated_target_head=target_commit,
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "contract_execution_id": execution_id,
+        "completed_lines": [
+            {
+                "line_id": "worker_commit",
+                "actor_role": "mf_sub",
+                "evidence_kind": "worker_commit",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": execution_id,
+                "commit_sha": candidate_commit,
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": execution_id,
+                    "worker_commit_sha": candidate_commit,
+                    "commit_sha": candidate_commit,
+                    "immutable_head_commit": candidate_commit,
+                    "validated_head_commit": candidate_commit,
+                },
+            },
+            {
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": execution_id,
+                "commit_sha": candidate_commit,
+                "status": "passed",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": execution_id,
+                    "candidate_commit": candidate_commit,
+                    "status": "passed",
+                },
+            },
+        ],
+    }
+    fake_store = SimpleNamespace(get=lambda requested: record)
+    monkeypatch.setattr(server, "_contract_runtime_store", lambda _conn: fake_store)
+    materialize = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=execution_id,
+        event_type="parallel.merge_queue_item_materialize",
+        event_kind="merge_queue_item_materialize",
+        phase="merge_queue",
+        actor="observer",
+        status="accepted",
+        payload={
+            "merge_queue_id": queue_id,
+            "queue_item_id": queue_item_id,
+            "child_task_id": task_id,
+            "queue_item": {
+                "merge_queue_id": queue_id,
+                "queue_item_id": queue_item_id,
+                "task_id": task_id,
+                "branch_head": candidate_commit,
+            },
+            "source_of_authority": (
+                "parallel_branch_merge_queue_materialize"
+            ),
+        },
+        commit_sha=candidate_commit,
+    )
+    conn.commit()
+
+    authority = server._dependency_revalidation_qa_candidate_authority(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        queue_item=queue_item,
+        current_target_head=target_commit,
+        target_ref="target",
+    )
+    assert authority is not None
+    assert authority.candidate_commit == candidate_commit
+    assert authority.overwritten_candidate_commit == overwritten_commit
+    assert authority.current_target_head == target_commit
+    assert authority.worker_commit_source_ref.endswith(":completed_lines:0")
+    assert authority.qa_source_ref.endswith(":completed_lines:1")
+    assert authority.materialize_source_ref == f"timeline:{materialize['id']}"
+    assert authority.merge_preview_status == "fail"
+    assert authority.merge_conflict_verified is True
+    assert authority.caller_candidate_trusted is False
+
+    missing_qa = copy.deepcopy(record)
+    missing_qa["completed_lines"] = missing_qa["completed_lines"][:1]
+    fake_store.get = lambda requested: missing_qa
+    with pytest.raises(
+        GovernanceError,
+        match="later independent QA-passed line",
+    ):
+        server._dependency_revalidation_qa_candidate_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            queue_item=queue_item,
+            current_target_head=target_commit,
+            target_ref="target",
+        )
+
+
 def test_runtime_context_worker_guide_ambiguous_resolution_does_not_override(
     conn,
     tmp_path,
