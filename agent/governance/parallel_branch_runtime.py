@@ -17972,31 +17972,17 @@ def _derive_standalone_historical_checkpoint_authority(
     provenance = dict(provenance_rows[0])
     route_evidence = _decode_json_mapping(provenance.get("route_evidence_json"))
     marker = _decode_json_mapping(provenance.get("marker_json"))
+    snapshot_marker = _decode_json_mapping(
+        _decode_json_mapping(snapshot.get("notes")).get(
+            "current_full_reconcile"
+        )
+    )
     marker_core = dict(marker)
     marker_hash = str(marker_core.pop("provenance_hash", "") or "")
+    protected_action = "graph_current_full_reconcile"
     protected_entrypoint = (
         "POST /api/graph-governance/{project_id}/reconcile/current-full"
     )
-    if (
-        provenance.get("protected_action") != "graph_current_full_reconcile"
-        or provenance.get("protected_entrypoint") != protected_entrypoint
-        or marker.get("source") != "graph_governance_api"
-        or marker.get("normal_update_path") is not True
-        or marker.get("activate") is not True
-        or marker.get("provenance_id") != provenance.get("provenance_id")
-        or marker.get("snapshot_id") != snapshot_id
-        or str(marker.get("target_commit_sha") or "").lower()
-        != checkpoint.lower()
-        or marker_hash != provenance.get("provenance_hash")
-        or marker_hash != _stable_authority_hash(marker_core)
-        or _decode_json_mapping(marker.get("route_evidence")) != route_evidence
-        or _decode_json_mapping(snapshot.get("notes")).get(
-            "current_full_reconcile"
-        )
-        != marker
-    ):
-        return reject("standalone_checkpoint_provenance_invalid")
-
     expected_scope = {
         "project_id": project_id,
         "backlog_id": durable.backlog_id,
@@ -18009,29 +17995,115 @@ def _derive_standalone_historical_checkpoint_authority(
     runtime_scope = _decode_json_mapping(
         route_evidence.get("runtime_context_scope")
     )
+    contract_execution_id = str(
+        runtime_scope.get("contract_execution_id") or ""
+    ).strip()
+    contract_execution_scope_valid = True
+    if contract_execution_id:
+        expected_scope["contract_execution_id"] = contract_execution_id
+        try:
+            contract_execution_row = conn.execute(
+                """
+                SELECT project_id, backlog_id
+                FROM contract_runtime_executions
+                WHERE contract_execution_id = ?
+                """,
+                (contract_execution_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            contract_execution_row = None
+        contract_execution_scope_valid = bool(
+            contract_execution_row is not None
+            and str(contract_execution_row["project_id"] or "") == project_id
+            and str(contract_execution_row["backlog_id"] or "")
+            == durable.backlog_id
+        )
+    expected_runtime_scope = {
+        **expected_scope,
+        "source": "parallel_branch_runtime_context",
+        "server_derived": True,
+    }
+    marker_runtime_scope = _decode_json_mapping(
+        marker.get("runtime_context_scope")
+    )
+    try:
+        provenance_reconcile_event_id = int(
+            provenance.get("reconcile_event_id") or 0
+        )
+        marker_reconcile_event_id = int(
+            marker.get("reconcile_event_id") or 0
+        )
+    except (TypeError, ValueError):
+        provenance_reconcile_event_id = 0
+        marker_reconcile_event_id = 0
     if (
-        runtime_scope.get("source") != "parallel_branch_runtime_context"
-        or runtime_scope.get("server_derived") is not True
+        provenance.get("project_id") != project_id
+        or provenance.get("snapshot_id") != snapshot_id
+        or str(provenance.get("target_commit_sha") or "").lower()
+        != checkpoint.lower()
+        or provenance.get("protected_action") != protected_action
+        or provenance.get("protected_entrypoint") != protected_entrypoint
+        or marker.get("schema_version")
+        != "current_full_reconcile.provenance.v2"
+        or marker.get("source") != "graph_governance_api"
+        or marker.get("protected_action") != protected_action
+        or marker.get("protected_action")
+        != provenance.get("protected_action")
+        or marker.get("protected_entrypoint") != protected_entrypoint
+        or marker.get("protected_entrypoint")
+        != provenance.get("protected_entrypoint")
+        or marker.get("normal_update_path") is not True
+        or marker.get("activate") is not True
+        or marker.get("provenance_id") != provenance.get("provenance_id")
+        or marker.get("snapshot_id") != snapshot_id
+        or marker.get("snapshot_id") != provenance.get("snapshot_id")
+        or str(marker.get("target_commit_sha") or "").lower()
+        != checkpoint.lower()
+        or str(marker.get("target_commit_sha") or "").lower()
+        != str(provenance.get("target_commit_sha") or "").lower()
+        or provenance_reconcile_event_id <= 0
+        or marker_reconcile_event_id != provenance_reconcile_event_id
+        or marker.get("reconcile_event_created_at")
+        != provenance.get("reconcile_event_created_at")
+        or marker_runtime_scope != runtime_scope
+        or marker.get("route_evidence") != route_evidence
+        or marker_hash != provenance.get("provenance_hash")
+        or marker_hash != _stable_authority_hash(marker_core)
+        or snapshot_marker != marker
+    ):
+        return reject("standalone_checkpoint_provenance_invalid")
+
+    if (
+        route_evidence.get("schema_version")
+        != "graph_current_full_reconcile.route_evidence.v1"
+        or route_evidence.get("protected_action") != protected_action
+        or not contract_execution_scope_valid
+        or runtime_scope != expected_runtime_scope
+        or marker_runtime_scope != expected_runtime_scope
         or any(
-            runtime_scope.get(key) != value
+            route_evidence.get(key) != value
             for key, value in expected_scope.items()
+            if key != "project_id"
         )
     ):
         return reject("standalone_checkpoint_provenance_scope_mismatch")
 
     try:
-        reconcile_event_id = int(provenance.get("reconcile_event_id") or 0)
         timeline_row = conn.execute(
             "SELECT * FROM task_timeline_events WHERE project_id = ? AND id = ?",
-            (project_id, reconcile_event_id),
+            (project_id, provenance_reconcile_event_id),
         ).fetchone()
-    except (sqlite3.Error, TypeError, ValueError):
+    except sqlite3.Error:
         timeline_row = None
     timeline = dict(timeline_row) if timeline_row is not None else {}
     timeline_payload = _decode_json_mapping(timeline.get("payload_json"))
     timeline_scope = _decode_json_mapping(
         timeline_payload.get("runtime_context_scope")
     )
+    try:
+        timeline_event_id = int(timeline.get("id") or 0)
+    except (TypeError, ValueError):
+        timeline_event_id = 0
     if (
         timeline.get("event_type") != "graph.reconcile"
         or timeline.get("event_kind") != "reconcile"
@@ -18039,18 +18111,18 @@ def _derive_standalone_historical_checkpoint_authority(
         or timeline.get("status") != "passed"
         or timeline.get("backlog_id") != durable.backlog_id
         or timeline.get("task_id") != durable.task_id
+        or timeline_event_id != provenance_reconcile_event_id
         or str(timeline.get("commit_sha") or "").lower() != checkpoint.lower()
         or timeline.get("created_at") != provenance.get("reconcile_event_created_at")
+        or timeline.get("created_at")
+        != marker.get("reconcile_event_created_at")
         or timeline_payload.get("snapshot_id") != snapshot_id
         or str(timeline_payload.get("target_commit_sha") or "").lower()
         != checkpoint.lower()
         or timeline_payload.get("merge_queue_id") != merge_queue_id
-        or timeline_scope.get("source") != "parallel_branch_runtime_context"
-        or timeline_scope.get("server_derived") is not True
-        or any(
-            timeline_scope.get(key) != value
-            for key, value in expected_scope.items()
-        )
+        or timeline_scope != expected_runtime_scope
+        or timeline_scope != marker_runtime_scope
+        or timeline_scope != runtime_scope
     ):
         return reject("standalone_checkpoint_reconcile_timeline_invalid")
 
@@ -18081,7 +18153,7 @@ def _derive_standalone_historical_checkpoint_authority(
         "snapshot_id": snapshot_id,
         "provenance_id": str(provenance.get("provenance_id") or ""),
         "provenance_hash": str(provenance.get("provenance_hash") or ""),
-        "reconcile_event_id": reconcile_event_id,
+        "reconcile_event_id": provenance_reconcile_event_id,
         "reconcile_event_created_at": str(
             provenance.get("reconcile_event_created_at") or ""
         ),

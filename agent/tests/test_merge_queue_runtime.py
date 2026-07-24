@@ -2211,6 +2211,156 @@ def test_standalone_historical_apply_revalidates_evidence_inside_savepoint(
 @pytest.mark.parametrize(
     ("mutation", "expected_reason"),
     [
+        (
+            "reconcile_event_id",
+            "standalone_checkpoint_reconcile_timeline_invalid",
+        ),
+        (
+            "reconcile_event_created_at",
+            "standalone_checkpoint_reconcile_timeline_invalid",
+        ),
+        (
+            "runtime_context_scope",
+            "standalone_checkpoint_provenance_scope_mismatch",
+        ),
+        ("protected_action", "standalone_checkpoint_provenance_invalid"),
+        ("protected_entrypoint", "standalone_checkpoint_provenance_invalid"),
+        ("schema", "standalone_checkpoint_provenance_invalid"),
+    ],
+)
+def test_standalone_historical_authority_rejects_semantically_rehashed_marker(
+    tmp_path,
+    mutation,
+    expected_reason,
+) -> None:
+    case = _standalone_advanced_head_authority_case(tmp_path)
+    conn = case["conn"]
+    row = conn.execute(
+        "SELECT * FROM graph_current_full_reconcile_provenance "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (PROJECT_ID, case["snapshot_id"]),
+    ).fetchone()
+    assert row is not None
+    provenance = dict(row)
+    marker = json.loads(provenance["marker_json"])
+    route_evidence = json.loads(provenance["route_evidence_json"])
+
+    if mutation == "reconcile_event_id":
+        forged_event_id = int(provenance["reconcile_event_id"]) + 100_000
+        marker["reconcile_event_id"] = forged_event_id
+        conn.execute(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET reconcile_event_id = ? WHERE provenance_id = ?",
+            (forged_event_id, provenance["provenance_id"]),
+        )
+    elif mutation == "reconcile_event_created_at":
+        forged_event_created_at = "2099-12-31T23:59:59Z"
+        marker["reconcile_event_created_at"] = forged_event_created_at
+        conn.execute(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET reconcile_event_created_at = ? WHERE provenance_id = ?",
+            (forged_event_created_at, provenance["provenance_id"]),
+        )
+    elif mutation == "runtime_context_scope":
+        forged_queue_id = "mq-forged-semantically-rehashed-scope"
+        marker["runtime_context_scope"]["merge_queue_id"] = forged_queue_id
+        route_evidence["runtime_context_scope"]["merge_queue_id"] = (
+            forged_queue_id
+        )
+        route_evidence["merge_queue_id"] = forged_queue_id
+        marker["route_evidence"] = route_evidence
+    elif mutation == "protected_action":
+        forged_action = "forged_graph_current_full_reconcile"
+        marker["protected_action"] = forged_action
+        route_evidence["protected_action"] = forged_action
+        marker["route_evidence"] = route_evidence
+        conn.execute(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET protected_action = ? WHERE provenance_id = ?",
+            (forged_action, provenance["provenance_id"]),
+        )
+    elif mutation == "protected_entrypoint":
+        forged_entrypoint = "POST /forged/current-full"
+        marker["protected_entrypoint"] = forged_entrypoint
+        conn.execute(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET protected_entrypoint = ? WHERE provenance_id = ?",
+            (forged_entrypoint, provenance["provenance_id"]),
+        )
+    elif mutation == "schema":
+        marker["schema_version"] = (
+            "current_full_reconcile.provenance.forged"
+        )
+
+    marker_core = dict(marker)
+    marker_core.pop("provenance_hash", None)
+    marker["provenance_hash"] = pbr._stable_authority_hash(marker_core)
+    conn.execute(
+        "UPDATE graph_current_full_reconcile_provenance "
+        "SET route_evidence_json = ?, marker_json = ?, provenance_hash = ? "
+        "WHERE provenance_id = ?",
+        (
+            json.dumps(route_evidence, sort_keys=True),
+            json.dumps(marker, sort_keys=True),
+            marker["provenance_hash"],
+            provenance["provenance_id"],
+        ),
+    )
+    notes_row = conn.execute(
+        "SELECT notes FROM graph_snapshots "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (PROJECT_ID, case["snapshot_id"]),
+    ).fetchone()
+    notes = json.loads(notes_row["notes"])
+    notes["current_full_reconcile"] = marker
+    conn.execute(
+        "UPDATE graph_snapshots SET notes = ? "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (
+            json.dumps(notes, sort_keys=True),
+            PROJECT_ID,
+            case["snapshot_id"],
+        ),
+    )
+    conn.commit()
+
+    fresh_authority, refusal = (
+        pbr._derive_standalone_historical_checkpoint_authority(
+            conn,
+            project_id=PROJECT_ID,
+            merge_queue_id=case["item"].merge_queue_id,
+            queue_item_id=case["item"].queue_item_id,
+            batch_id=case["batch_id"],
+            repo_root=case["repo"],
+            timeout_seconds=30,
+        )
+    )
+    assert fresh_authority is None
+    assert refusal["failure_reason"] == expected_reason
+
+    result = pbr._apply_standalone_historical_checkpoint_catchup(
+        conn,
+        item=case["item"],
+        context=case["context"],
+        batch_id=case["batch_id"],
+        authority=case["authority"],
+        repo_root=case["repo"],
+        timeout_seconds=30,
+        fence_token="",
+        allow_route_gated_reclaimed_fence_without_token=False,
+        now_iso="",
+    )
+    assert result["ok"] is False
+    assert result["error"] == (
+        "standalone_historical_checkpoint_attachment_failed"
+    )
+    assert result["failure_reason"] == expected_reason
+    _assert_standalone_authority_apply_left_ledger_unchanged(case)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
         ("durable_queue", "standalone_durable_checkpoint_drift"),
         (
             "current_target_ancestry",
@@ -2400,8 +2550,12 @@ def test_standalone_advanced_head_catchup_fails_closed_without_exact_authority(
         route_evidence["runtime_context_scope"]["merge_queue_id"] = (
             "mq-forged-scope"
         )
+        route_evidence["merge_queue_id"] = "mq-forged-scope"
         marker = json.loads(row["marker_json"])
         marker["route_evidence"] = route_evidence
+        marker["runtime_context_scope"]["merge_queue_id"] = (
+            "mq-forged-scope"
+        )
         marker_core = dict(marker)
         marker_core.pop("provenance_hash", None)
         marker["provenance_hash"] = pbr._stable_authority_hash(marker_core)
