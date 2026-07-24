@@ -5838,6 +5838,181 @@ def test_current_full_reconcile_idempotent_attachment_rejects_stale_or_nonfull_s
     assert len(calls) == 1
 
 
+def test_server_authored_current_full_checkpoint_drives_advanced_head_standalone_catchup(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    checkpoint_commit, calls = _stub_current_full_reconcile(
+        monkeypatch,
+        tmp_path,
+    )
+    repair_head = "c" * 40
+    candidate_commit = "b" * 40
+    target_before = "d" * 40
+    backlog_id = "AC-STANDALONE-SERVER-CHECKPOINT-CATCHUP"
+    task_id = "standalone-server-checkpoint-catchup-worker"
+    runtime_context_id = "mfrctx-standalone-server-checkpoint-catchup"
+    merge_queue_id = "mq-standalone-server-checkpoint-catchup"
+    queue_item_id = "mqitem-standalone-server-checkpoint-catchup"
+    batch_id = "standalone-server-checkpoint-catchup"
+    route_token_ref = "rtok-standalone-server-checkpoint-catchup"
+    observer_session_id = (
+        _current_full_parallel_route_without_merge_authority_fixture(
+            conn,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            merge_queue_id=merge_queue_id,
+            head_commit=checkpoint_commit,
+            observer_session_id="obs-standalone-server-checkpoint-catchup",
+            route_token_ref=route_token_ref,
+        )
+    )
+    context = get_branch_context(conn, PID, task_id)
+    assert context is not None
+    context = upsert_branch_context(
+        conn,
+        replace(
+            context,
+            batch_id=batch_id,
+            status="merge_ready",
+            target_head_commit=checkpoint_commit,
+        ),
+    )
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=queue_item_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            branch_ref=context.branch_ref,
+            queue_index=1,
+            status="merge_ready",
+            target_ref="refs/heads/main",
+            branch_head=candidate_commit,
+            validated_target_head=checkpoint_commit,
+            current_target_head=checkpoint_commit,
+        ),
+    )
+    conn.commit()
+    body = {
+        "target_commit_sha": checkpoint_commit,
+        "activate": True,
+        "semantic_enrich": False,
+        "run_id": "current-full-standalone-server-checkpoint-catchup",
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": route_token_ref,
+    }
+
+    reconcile_status, reconcile = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+    )
+    assert reconcile_status == 201
+    assert reconcile["activated"] is True
+    assert len(calls) == 1
+
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "git_merge_preview_evidence",
+        lambda **_kwargs: {
+            "status": "pass",
+            "passed": True,
+            "target_commit": repair_head,
+            "branch_commit": candidate_commit,
+        },
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "_git_preview_commit",
+        lambda _root, ref, **_kwargs: (
+            (
+                {
+                    context.branch_ref: candidate_commit,
+                    candidate_commit: candidate_commit,
+                    checkpoint_commit: checkpoint_commit,
+                    repair_head: repair_head,
+                }.get(str(ref), str(ref))
+            ),
+            "",
+        ),
+    )
+    ancestry = {
+        (candidate_commit, checkpoint_commit),
+        (checkpoint_commit, repair_head),
+        (candidate_commit, repair_head),
+    }
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "_git_preview_branch_is_ancestor",
+        lambda _root, *, branch_commit, target_commit, **_kwargs: (
+            (branch_commit, target_commit) in ancestry
+            or branch_commit == target_commit
+        ),
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "_git_preview_command",
+        lambda _root, _args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                f"{checkpoint_commit} {target_before} {candidate_commit}\n"
+            ),
+            stderr="",
+        ),
+    )
+    evidence = {
+        key: {"status": "pass", "evidence_id": f"evidence-{key}"}
+        for key in parallel_branch_runtime.MERGE_GATE_REQUIRED_EVIDENCE
+    }
+
+    result = parallel_branch_runtime.execute_merge_queue_item(
+        conn,
+        project_id=PID,
+        merge_queue_id=merge_queue_id,
+        repo_root_path=tmp_path,
+        queue_item_id=queue_item_id,
+        target_ref="refs/heads/main",
+        current_target_head=repair_head,
+        evidence=evidence,
+        dry_run=False,
+        allow_target_ref_mutation=False,
+    )
+
+    assert result["ok"] is True
+    assert result["historical_checkpoint_catchup"] is True
+    assert result["target_ref_mutated"] is False
+    assert result["merge_commit"] == checkpoint_commit
+    assert result["merge_commit"] != repair_head
+    persisted = get_merge_queue_item(
+        conn,
+        PID,
+        merge_queue_id,
+        queue_item_id,
+    )
+    assert persisted is not None
+    assert persisted.merge_commit == checkpoint_commit
+    assert persisted.target_head_before_merge == target_before
+    assert persisted.target_head_after_merge == checkpoint_commit
+    assert persisted.current_target_head == checkpoint_commit
+    assert persisted.snapshot_id == reconcile["snapshot_id"]
+    epoch = parallel_branch_runtime.get_integration_epoch(
+        conn,
+        PID,
+        batch_id,
+    )
+    assert epoch is not None
+    assert epoch.status == parallel_branch_runtime.INTEGRATION_EPOCH_CLOSED
+    assert epoch.current_head == checkpoint_commit
+    assert epoch.snapshot_id == reconcile["snapshot_id"]
+
+
 def test_current_full_reconcile_terminal_replay_repairs_epoch_after_head_advances(
     conn,
     monkeypatch,

@@ -8,9 +8,13 @@ from dataclasses import replace
 
 import pytest
 
+from agent.governance import graph_snapshot_store
 from agent.governance import parallel_branch_runtime as pbr
 from agent.governance import task_timeline
-from agent.tests.fixtures.parallel_project import create_merge_preview_fixture_project
+from agent.tests.fixtures.parallel_project import (
+    create_merge_preview_fixture_project,
+    git as fixture_git,
+)
 from agent.governance.parallel_branch_runtime import (
     ACTION_ALLOW_MERGE,
     ACTION_BLOCKED_BY_DEPENDENCY,
@@ -48,6 +52,7 @@ from agent.governance.parallel_branch_runtime import (
     get_active_integration_epoch,
     get_integration_epoch,
     get_branch_context,
+    get_merge_queue_item,
     git_merge_preview_evidence,
     integration_epoch_resume_payload,
     list_merge_queue_items,
@@ -107,6 +112,87 @@ def _seed_batch_coordination_lineage(
             "2026-07-20T12:00:00Z",
         ),
     )
+
+
+def _seed_standalone_current_full_checkpoint(
+    conn: sqlite3.Connection,
+    *,
+    checkpoint_commit: str,
+    snapshot_id: str,
+    item: MergeQueueItem,
+    context: BranchTaskRuntimeContext,
+) -> int:
+    task_timeline.ensure_schema(conn)
+    runtime_scope = {
+        "project_id": item.project_id,
+        "backlog_id": item.backlog_id,
+        "task_id": item.task_id,
+        "parent_task_id": context.parent_task_id,
+        "runtime_context_id": context.runtime_context_id,
+        "merge_queue_id": item.merge_queue_id,
+        "source": "parallel_branch_runtime_context",
+        "server_derived": True,
+    }
+    graph_snapshot_store.create_graph_snapshot(
+        conn,
+        item.project_id,
+        snapshot_id=snapshot_id,
+        commit_sha=checkpoint_commit,
+        snapshot_kind="full",
+        graph_json={"deps_graph": {"nodes": [], "edges": []}},
+    )
+    graph_snapshot_store.activate_graph_snapshot(
+        conn,
+        item.project_id,
+        snapshot_id,
+        auto_rebuild_projection=False,
+        post_commit_hooks=False,
+    )
+    timeline = task_timeline.record_event(
+        conn,
+        project_id=item.project_id,
+        backlog_id=item.backlog_id,
+        task_id=item.task_id,
+        event_type="graph.reconcile",
+        event_kind="reconcile",
+        phase="reconcile",
+        actor="observer",
+        status="passed",
+        commit_sha=checkpoint_commit,
+        payload={
+            "snapshot_id": snapshot_id,
+            "target_commit_sha": checkpoint_commit,
+            "merge_queue_id": item.merge_queue_id,
+            "runtime_context_scope": runtime_scope,
+        },
+        post_commit_hooks=False,
+    )
+    route_evidence = {
+        "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+        "authenticated_role": "observer",
+        "authentication_source": "observer_session_route_token_ref",
+        "protected_action": "graph_current_full_reconcile",
+        "runtime_context_scope": runtime_scope,
+        **{
+            key: value
+            for key, value in runtime_scope.items()
+            if key not in {"source", "server_derived"}
+        },
+    }
+    graph_snapshot_store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=item.project_id,
+        snapshot_id=snapshot_id,
+        target_commit_sha=checkpoint_commit,
+        request_id=f"req-{snapshot_id}",
+        request_started_at=timeline["created_at"],
+        route_evidence=route_evidence,
+        reconcile_event_id=int(timeline["id"]),
+        reconcile_event_created_at=timeline["created_at"],
+        runtime_context_scope=runtime_scope,
+    )
+    conn.commit()
+    return int(timeline["id"])
 
 
 def _passing_merge_evidence() -> dict[str, dict[str, str]]:
@@ -1678,6 +1764,416 @@ def test_standalone_already_integrated_projection_records_without_ref_mutation(
     assert epoch.coordination_backlog_id == backlog_id
     assert epoch.status == pbr.INTEGRATION_EPOCH_RECONCILE_PENDING
     assert epoch.current_head == "current-head"
+
+
+def test_standalone_advanced_head_catchup_uses_historical_reconciled_checkpoint(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    fixture = create_merge_preview_fixture_project(tmp_path)
+    repo = fixture.root
+    candidate_commit = fixture_git(
+        ["rev-parse", fixture.clean_branch],
+        cwd=repo,
+    ).stdout.strip()
+    target_before = fixture_git(["rev-parse", "main"], cwd=repo).stdout.strip()
+    fixture_git(
+        [
+            "merge",
+            "--no-ff",
+            fixture.clean_branch,
+            "-m",
+            "Merge standalone candidate",
+        ],
+        cwd=repo,
+    )
+    checkpoint_commit = fixture_git(
+        ["rev-parse", "main"],
+        cwd=repo,
+    ).stdout.strip()
+
+    conn = _runtime_conn()
+    batch_id = "standalone-advanced-head-catchup"
+    queue_id = "mq-standalone-advanced-head-catchup"
+    task_id = "task-standalone-advanced-head-catchup"
+    backlog_id = "AC-STANDALONE-ADVANCED-HEAD-CATCHUP"
+    snapshot_id = f"full-{checkpoint_commit[:7]}-standalone"
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-standalone-advanced-head-catchup",
+        task_id=task_id,
+        backlog_id=backlog_id,
+        branch_ref=fixture.clean_branch,
+        queue_index=1,
+        status=STATE_MERGE_READY,
+        target_ref="main",
+        branch_head=candidate_commit,
+        validated_target_head=checkpoint_commit,
+        current_target_head=checkpoint_commit,
+    )
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        runtime_context_id="mfrctx-standalone-advanced-head-catchup",
+        batch_id=batch_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        parent_task_id=backlog_id,
+        branch_ref=item.branch_ref,
+        status=STATE_MERGE_READY,
+        target_head_commit=checkpoint_commit,
+        checkpoint_id="checkpoint-standalone-advanced-head-catchup",
+        merge_queue_id=queue_id,
+    )
+    upsert_branch_context(conn, context)
+    upsert_merge_queue_items(conn, [item])
+    _seed_standalone_current_full_checkpoint(
+        conn,
+        checkpoint_commit=checkpoint_commit,
+        snapshot_id=snapshot_id,
+        item=item,
+        context=context,
+    )
+
+    repair_file = repo / "repair.txt"
+    repair_file.write_text("repair\n", encoding="utf-8")
+    fixture_git(["add", "repair.txt"], cwd=repo)
+    fixture_git(["commit", "-m", "Repair after standalone reconcile"], cwd=repo)
+    repair_head = fixture_git(["rev-parse", "main"], cwd=repo).stdout.strip()
+    assert repair_head != checkpoint_commit
+
+    real_auto_record = record_merge_queue_graph_epoch_after_reconcile
+    monkeypatch.setattr(
+        pbr,
+        "record_merge_queue_graph_epoch_after_reconcile",
+        lambda *_args, **_kwargs: {
+            "status": "skipped",
+            "skipped_reason": "simulated_attachment_failure_after_record",
+        },
+    )
+    failed = execute_merge_queue_item(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        repo_root_path=repo,
+        queue_item_id=item.queue_item_id,
+        target_ref="main",
+        current_target_head=repair_head,
+        evidence=_passing_merge_evidence(),
+        dry_run=False,
+        allow_target_ref_mutation=False,
+    )
+    assert failed["ok"] is False
+    assert failed["error"] == (
+        "standalone_historical_checkpoint_attachment_failed"
+    )
+    rolled_back = get_merge_queue_item(
+        conn,
+        PROJECT_ID,
+        queue_id,
+        item.queue_item_id,
+    )
+    assert rolled_back is not None
+    assert rolled_back.status == STATE_MERGE_READY
+    assert rolled_back.merge_commit == ""
+    assert rolled_back.target_head_after_merge == ""
+    assert rolled_back.snapshot_id == ""
+    assert get_integration_epoch(conn, PROJECT_ID, batch_id) is None
+    rolled_back_context = get_branch_context(conn, PROJECT_ID, task_id)
+    assert rolled_back_context is not None
+    assert rolled_back_context.status == STATE_MERGE_READY
+    assert rolled_back_context.snapshot_id == ""
+    assert fixture_git(["rev-parse", "main"], cwd=repo).stdout.strip() == repair_head
+
+    monkeypatch.setattr(
+        pbr,
+        "record_merge_queue_graph_epoch_after_reconcile",
+        real_auto_record,
+    )
+    result = execute_merge_queue_item(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        repo_root_path=repo,
+        queue_item_id=item.queue_item_id,
+        target_ref="main",
+        current_target_head=repair_head,
+        evidence=_passing_merge_evidence(),
+        dry_run=False,
+        allow_target_ref_mutation=False,
+    )
+
+    assert result["ok"] is True
+    assert result["already_integrated"] is True
+    assert result["historical_checkpoint_catchup"] is True
+    assert result["executed"] is False
+    assert result["target_ref_mutated"] is False
+    assert result["merge_commit"] == checkpoint_commit
+    assert result["historical_checkpoint_authority"] == {
+        "schema_version": "standalone.historical_checkpoint_authority.v1",
+        "status": "authorized",
+        "error": "",
+        "fail_closed": False,
+        "project_id": PROJECT_ID,
+        "merge_queue_id": queue_id,
+        "queue_item_id": item.queue_item_id,
+        "batch_id": batch_id,
+        "checkpoint_commit": checkpoint_commit,
+        "target_head_before_merge": target_before,
+        "snapshot_id": snapshot_id,
+        "projection_id": "",
+        "provenance_id": result["historical_checkpoint_authority"][
+            "provenance_id"
+        ],
+        "reconcile_event_id": result["historical_checkpoint_authority"][
+            "reconcile_event_id"
+        ],
+        "server_derived": True,
+        "ancestry_verified": True,
+    }
+    assert fixture_git(["rev-parse", "main"], cwd=repo).stdout.strip() == repair_head
+    recorded = get_merge_queue_item(
+        conn,
+        PROJECT_ID,
+        queue_id,
+        item.queue_item_id,
+    )
+    assert recorded is not None
+    assert recorded.status == STATE_MERGED
+    assert recorded.merge_commit == checkpoint_commit
+    assert recorded.target_head_before_merge == target_before
+    assert recorded.target_head_after_merge == checkpoint_commit
+    assert recorded.current_target_head == checkpoint_commit
+    assert recorded.snapshot_id == snapshot_id
+    assert recorded.merge_commit != repair_head
+    epoch = get_integration_epoch(conn, PROJECT_ID, batch_id)
+    assert epoch is not None
+    assert epoch.status == INTEGRATION_EPOCH_CLOSED
+    assert epoch.current_head == checkpoint_commit
+    assert epoch.snapshot_id == snapshot_id
+
+    replay = execute_merge_queue_item(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        repo_root_path=repo,
+        queue_item_id=item.queue_item_id,
+        target_ref="main",
+        current_target_head=repair_head,
+        evidence=_passing_merge_evidence(),
+        dry_run=False,
+        allow_target_ref_mutation=False,
+    )
+    assert replay["ok"] is True
+    assert replay["idempotent_epoch_replay"] is True
+    assert replay["historical_checkpoint_catchup"] is True
+    assert replay["merge_commit"] == checkpoint_commit
+    assert fixture_git(["rev-parse", "main"], cwd=repo).stdout.strip() == repair_head
+
+
+@pytest.mark.parametrize(
+    ("tamper", "expected_reason"),
+    [
+        ("missing_current_snapshot", "standalone_current_snapshot_missing"),
+        (
+            "stale_current_snapshot",
+            "standalone_current_snapshot_checkpoint_mismatch",
+        ),
+        (
+            "non_full_current_snapshot",
+            "standalone_current_snapshot_not_active_full",
+        ),
+        (
+            "missing_provenance",
+            "standalone_checkpoint_provenance_missing",
+        ),
+        (
+            "scope_mismatch",
+            "standalone_checkpoint_provenance_scope_mismatch",
+        ),
+        (
+            "broken_candidate_checkpoint_ancestry",
+            "standalone_candidate_not_in_checkpoint",
+        ),
+    ],
+)
+def test_standalone_advanced_head_catchup_fails_closed_without_exact_authority(
+    tmp_path,
+    monkeypatch,
+    tamper,
+    expected_reason,
+) -> None:
+    fixture = create_merge_preview_fixture_project(tmp_path)
+    repo = fixture.root
+    candidate_commit = fixture_git(
+        ["rev-parse", fixture.clean_branch],
+        cwd=repo,
+    ).stdout.strip()
+    fixture_git(
+        [
+            "merge",
+            "--no-ff",
+            fixture.clean_branch,
+            "-m",
+            "Merge standalone candidate",
+        ],
+        cwd=repo,
+    )
+    checkpoint_commit = fixture_git(
+        ["rev-parse", "main"],
+        cwd=repo,
+    ).stdout.strip()
+
+    conn = _runtime_conn()
+    batch_id = "standalone-advanced-head-refusal"
+    queue_id = "mq-standalone-advanced-head-refusal"
+    backlog_id = "AC-STANDALONE-ADVANCED-HEAD-REFUSAL"
+    snapshot_id = f"full-{checkpoint_commit[:7]}-refusal"
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-standalone-advanced-head-refusal",
+        task_id="task-standalone-advanced-head-refusal",
+        backlog_id=backlog_id,
+        branch_ref=fixture.clean_branch,
+        queue_index=1,
+        status=STATE_MERGE_READY,
+        target_ref="main",
+        branch_head=candidate_commit,
+        validated_target_head=checkpoint_commit,
+        current_target_head=checkpoint_commit,
+    )
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        runtime_context_id="mfrctx-standalone-advanced-head-refusal",
+        batch_id=batch_id,
+        task_id=item.task_id,
+        backlog_id=backlog_id,
+        parent_task_id=backlog_id,
+        branch_ref=item.branch_ref,
+        status=STATE_MERGE_READY,
+        target_head_commit=checkpoint_commit,
+        checkpoint_id="checkpoint-standalone-advanced-head-refusal",
+        merge_queue_id=queue_id,
+    )
+    upsert_branch_context(conn, context)
+    upsert_merge_queue_items(conn, [item])
+    _seed_standalone_current_full_checkpoint(
+        conn,
+        checkpoint_commit=checkpoint_commit,
+        snapshot_id=snapshot_id,
+        item=item,
+        context=context,
+    )
+
+    if tamper == "missing_current_snapshot":
+        conn.execute(
+            "DELETE FROM graph_snapshot_refs "
+            "WHERE project_id = ? AND ref_name = 'active'",
+            (PROJECT_ID,),
+        )
+    elif tamper == "stale_current_snapshot":
+        conn.execute(
+            "UPDATE graph_snapshot_refs SET commit_sha = ? "
+            "WHERE project_id = ? AND ref_name = 'active'",
+            (fixture.main_head, PROJECT_ID),
+        )
+    elif tamper == "non_full_current_snapshot":
+        conn.execute(
+            "UPDATE graph_snapshots SET snapshot_kind = 'scope' "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (PROJECT_ID, snapshot_id),
+        )
+    elif tamper == "missing_provenance":
+        conn.execute(
+            "DELETE FROM graph_current_full_reconcile_provenance "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (PROJECT_ID, snapshot_id),
+        )
+    elif tamper == "scope_mismatch":
+        row = conn.execute(
+            "SELECT provenance_id, route_evidence_json "
+            "FROM graph_current_full_reconcile_provenance "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (PROJECT_ID, snapshot_id),
+        ).fetchone()
+        assert row is not None
+        route_evidence = json.loads(row["route_evidence_json"])
+        route_evidence["runtime_context_scope"]["merge_queue_id"] = (
+            "mq-forged-scope"
+        )
+        conn.execute(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET route_evidence_json = ? WHERE provenance_id = ?",
+            (json.dumps(route_evidence, sort_keys=True), row["provenance_id"]),
+        )
+    conn.commit()
+
+    repair_file = repo / "repair.txt"
+    repair_file.write_text("repair\n", encoding="utf-8")
+    fixture_git(["add", "repair.txt"], cwd=repo)
+    fixture_git(["commit", "-m", "Repair after standalone reconcile"], cwd=repo)
+    repair_head = fixture_git(["rev-parse", "main"], cwd=repo).stdout.strip()
+    if tamper == "broken_candidate_checkpoint_ancestry":
+        real_is_ancestor = pbr._git_preview_branch_is_ancestor
+
+        def reject_candidate_checkpoint(
+            repo_root,
+            *,
+            branch_commit,
+            target_commit,
+            timeout_seconds,
+        ):
+            if (
+                branch_commit == candidate_commit
+                and target_commit == checkpoint_commit
+            ):
+                return False
+            return real_is_ancestor(
+                repo_root,
+                branch_commit=branch_commit,
+                target_commit=target_commit,
+                timeout_seconds=timeout_seconds,
+            )
+
+        monkeypatch.setattr(
+            pbr,
+            "_git_preview_branch_is_ancestor",
+            reject_candidate_checkpoint,
+        )
+
+    result = execute_merge_queue_item(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        repo_root_path=repo,
+        queue_item_id=item.queue_item_id,
+        target_ref="main",
+        current_target_head=repair_head,
+        evidence=_passing_merge_evidence(),
+        dry_run=False,
+        allow_target_ref_mutation=False,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "standalone_historical_checkpoint_unresolved"
+    assert result["historical_checkpoint_authority"]["fail_closed"] is True
+    assert (
+        result["historical_checkpoint_authority"]["failure_reason"]
+        == expected_reason
+    )
+    persisted = get_merge_queue_item(
+        conn,
+        PROJECT_ID,
+        queue_id,
+        item.queue_item_id,
+    )
+    assert persisted is not None
+    assert persisted.status == STATE_MERGE_READY
+    assert persisted.merge_commit == ""
+    assert persisted.target_head_after_merge == ""
+    assert get_integration_epoch(conn, PROJECT_ID, batch_id) is None
+    assert fixture_git(["rev-parse", "main"], cwd=repo).stdout.strip() == repair_head
 
 
 def test_standalone_exact_head_reconcile_attachment_releases_pending_epoch() -> None:
