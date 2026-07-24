@@ -65162,11 +65162,143 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     assert recovery["invalidated_completed_line_indices"]
     assert recovery["fresh_evidence_required"][-1] == "observer_merge"
 
+    for rejoin_index in range(2):
+        auth_only_rejoin = (
+            server.handle_graph_governance_runtime_context_session_token_rejoin(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": runtime_context.runtime_context_id,
+                    },
+                    "coordinator",
+                    method="POST",
+                    body={
+                        "task_id": runtime_context.task_id,
+                        "parent_task_id": backlog_id,
+                        "contract_execution_id": successor[
+                            "contract_execution_id"
+                        ],
+                        "target_project_root": str(worktree),
+                        "reason": (
+                            "refresh worker auth while the typed post-QA "
+                            "target is unchanged"
+                        ),
+                        "now_iso": (
+                            f"2999-07-24T10:01:{rejoin_index + 1:02d}Z"
+                        ),
+                        **route_identity,
+                    },
+                )
+            )
+        )
+        assert auth_only_rejoin["reopen_for_revision"] is False
+        assert (
+            auth_only_rejoin["reopen_for_post_qa_merge_conflict"] is False
+        )
+        assert (
+            auth_only_rejoin["reopen_for_post_qa_target_retarget"] is False
+        )
+        assert auth_only_rejoin[
+            "post_qa_rejoin_retarget_diagnostics"
+        ]["status"] == "not_needed"
+        runtime_context = get_branch_context(
+            conn,
+            PID,
+            runtime_context.task_id,
+        )
+        assert runtime_context is not None
+        assert runtime_context.last_recovery_action == (
+            "mf_subagent_session_token_rejoin_issued"
+        )
+
     subprocess.run(
         ["git", "branch", "-f", "target", advanced_target_commit],
         cwd=worktree,
         check=True,
     )
+    typed_timeline_events = (
+        server._runtime_context_service_timeline_events(
+            conn,
+            project_id=PID,
+            task_id=runtime_context.task_id,
+            backlog_id=backlog_id,
+        )
+    )
+    missing_typed_authority, missing_typed_diagnostics = (
+        server._runtime_context_post_qa_rejoin_retarget_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=post_qa_record,
+            route_identity=route_identity,
+            timeline_events=[],
+        )
+    )
+    assert missing_typed_authority is None
+    assert "accepted prior post-QA rejoin authority is missing" in " ".join(
+        missing_typed_diagnostics["errors"]
+    )
+
+    typed_event = next(
+        event
+        for event in typed_timeline_events
+        if event.get("payload", {}).get(
+            "post_qa_merge_conflict_rejoin_authority"
+        )
+    )
+    invalid_hash_event = copy.deepcopy(typed_event)
+    invalid_hash_event["payload"][
+        "post_qa_merge_conflict_rejoin_authority"
+    ]["authority_hash"] = _fake_sha("invalid-post-qa-authority")
+    invalid_hash_authority, invalid_hash_diagnostics = (
+        server._runtime_context_post_qa_rejoin_retarget_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=post_qa_record,
+            route_identity=route_identity,
+            timeline_events=[invalid_hash_event],
+        )
+    )
+    assert invalid_hash_authority is None
+    assert "prior post-QA rejoin authority is invalid" in " ".join(
+        invalid_hash_diagnostics["errors"]
+    )
+
+    identity_drift_authority, identity_drift_diagnostics = (
+        server._runtime_context_post_qa_rejoin_retarget_authority(
+            conn,
+            project_id=PID,
+            context=replace(
+                runtime_context,
+                worker_id="worker-identity-drift",
+                worker_slot_id="worker-identity-drift",
+            ),
+            record=post_qa_record,
+            route_identity=route_identity,
+            timeline_events=typed_timeline_events,
+        )
+    )
+    assert identity_drift_authority is None
+    assert "prior post-QA rejoin worker identity mismatch" in " ".join(
+        identity_drift_diagnostics["errors"]
+    )
+
+    bypass_retarget_authority, bypass_retarget_diagnostics = (
+        server._runtime_context_post_qa_rejoin_retarget_authority(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            record=bypass_record,
+            route_identity=route_identity,
+            timeline_events=typed_timeline_events,
+        )
+    )
+    assert bypass_retarget_authority is None
+    assert "historical/bypass" in " ".join(
+        bypass_retarget_diagnostics["errors"]
+    )
+
     moved_during_retarget_preview = False
 
     def move_target_during_retarget_preview(**kwargs):
