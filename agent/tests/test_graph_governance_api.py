@@ -63626,6 +63626,136 @@ def test_runtime_context_worker_guide_uses_matching_mf_sub_contract_next_action(
     )
 
 
+def test_runtime_context_worker_guide_unifies_typed_retarget_fresh_evidence_order(
+    monkeypatch,
+):
+    runtime_context_id = "mfrctx-retarget-fresh-order"
+    task_id = "task-retarget-fresh-order"
+    recorded_commit = "c" * 40
+    actual_head = "4" * 40
+    current_target = "a" * 40
+    canonical_observer_merge = {
+        "schema_version": "contract_runtime_next_legal_action.v1",
+        "id": "observer_merge",
+        "action": "record_merge",
+        "stage_id": "observer_integration",
+        "line_id": "observer_merge",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "evidence_kind": "merge",
+        "contract_execution_id": "cex-retarget-fresh-order",
+    }
+    recovery = {
+        "schema_version": "runtime_context.same_lane_worker_commit_recovery.v1",
+        "status": "retarget_required",
+        "blocked": False,
+        "source_of_authority": "ContractRuntime.completed_lines.worker_commit+git",
+        "contract_execution_id": "cex-retarget-fresh-order",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "recorded_commit_sha": recorded_commit,
+        "actual_worktree_head_commit": actual_head,
+        "current_target_baseline_commit": current_target,
+        "next_legal_action": "merge_current_target_and_record_worker_commit",
+        "fresh_evidence_required": [
+            "worker_finish_time_attestation",
+            "worker_finish_gate",
+            "qa_graph_context",
+            "qa_independent_verification",
+            "observer_merge",
+        ],
+        "append_only_history_preserved": True,
+    }
+    recovery_next = server._runtime_context_same_lane_recovery_next_action(
+        canonical_observer_merge,
+        recovery,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    state = _worker_guide_state_with_contract_next_action(
+        recovery_next,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    state["contract_runtime_current_state"] = {
+        "schema_version": "contract_runtime_current_state.v1",
+        "contract_execution_id": "cex-retarget-fresh-order",
+        "same_lane_worker_commit_recovery": recovery,
+        "canonical_next_legal_action_before_same_lane_recovery": (
+            canonical_observer_merge
+        ),
+        "next_legal_action": recovery_next,
+    }
+    state["source_refs"] = {
+        "timeline": {
+            "head_commit": recorded_commit,
+            "worker_commit_sha": recorded_commit,
+        }
+    }
+    state["runtime_context_service"]["views"]["worker_view"][
+        "control_plane"
+    ]["next_legal_action"] = "handoff_to_independent_qa"
+    state["runtime_context_service"]["views"]["worker_view"][
+        "action_plan"
+    ]["next_legal_action"] = "handoff_to_independent_qa"
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_git_head_commit",
+        lambda *paths: actual_head,
+    )
+
+    response = server._runtime_context_worker_guide_response(state)
+
+    assert response["row_scoped_finish_head_projection"]["status"] == (
+        "post_qa_current_target_sync_required"
+    )
+    assert response["row_scoped_finish_head_projection"][
+        "next_legal_action"
+    ] == "merge_current_target_and_record_worker_commit"
+    assert response["contract_runtime_next_legal_action"] == recovery_next
+    assert response["contract_runtime_current_state"][
+        "next_legal_action"
+    ] == recovery_next
+    assert response["next_legal_action"] == (
+        "merge_current_target_and_record_worker_commit"
+    )
+    assert response["next_legal_action_decision_source"] == (
+        "contract_runtime_current_state"
+    )
+    assert response["contract_runtime_next_action_took_precedence"] is True
+    assert [
+        item["id"] for item in response["next_required_evidence"]
+    ] == [
+        "same_lane_worker_commit_recovery",
+        "finish_time_worker_attestation",
+        "finish_gate",
+        "qa_graph_context",
+        "independent_verification",
+        "observer_merge",
+    ]
+    assert response["next_required_evidence"][0]["is_next"] is True
+    assert response["next_required_evidence"][0]["next_action"] == (
+        "merge_current_target_and_record_worker_commit"
+    )
+    assert response["next_required_evidence"][-1]["requires"] == [
+        "independent_verification"
+    ]
+    assert recovery_next["canonical_next_action_before_recovery"][
+        "line_id"
+    ] == "observer_merge"
+    assert "writer_role_safe_copy_payload" not in recovery_next
+    assert recovery_next["submit_line_guidance"][
+        "generic_contract_runtime_submit_line_allowed"
+    ] is False
+    assert recovery_next["immutable_prior_evidence_policy"] == {
+        "prior_worker_and_qa_evidence_retained_as_raw_audit": True,
+        "prior_worker_and_qa_evidence_close_satisfying": False,
+        "fresh_worker_commit_required": True,
+        "fresh_independent_qa_required": True,
+        "historical_source_resume_allowed": False,
+    }
+
+
 def test_runtime_context_worker_guide_keeps_row_scope_stop_over_matching_contract_next_action(
     monkeypatch,
 ):
@@ -65412,6 +65542,32 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     assert retarget_required["next_legal_action"] == (
         "merge_current_target_and_record_worker_commit"
     )
+    retarget_contract_projection = (
+        server._runtime_context_contract_runtime_worker_projection(
+            conn,
+            contract_execution_id=successor["contract_execution_id"],
+            runtime_context_id=runtime_context.runtime_context_id,
+            task_id=runtime_context.task_id,
+            context=runtime_context,
+        )
+    )
+    retarget_contract_next = retarget_contract_projection[
+        "contract_runtime_next_legal_action"
+    ]
+    assert retarget_contract_next["action"] == (
+        "merge_current_target_and_record_worker_commit"
+    )
+    assert retarget_contract_next["line_id"] == "worker_commit"
+    assert retarget_contract_next["owner_role"] == "mf_sub"
+    assert retarget_contract_next[
+        "same_lane_worker_commit_recovery_projection"
+    ] is True
+    assert retarget_contract_projection["contract_runtime_current_state"][
+        "next_legal_action"
+    ] == retarget_contract_next
+    assert retarget_contract_projection["contract_runtime_current_state"][
+        "canonical_next_legal_action_before_same_lane_recovery"
+    ]["line_id"] == "observer_merge"
     subprocess.run(
         ["git", "merge", "--no-edit", advanced_target_commit],
         cwd=worktree,
@@ -65433,6 +65589,23 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         advanced_target_commit
     )
     assert recovery["target_baseline_changes_worker_authored"] is False
+    eligible_contract_projection = (
+        server._runtime_context_contract_runtime_worker_projection(
+            conn,
+            contract_execution_id=successor["contract_execution_id"],
+            runtime_context_id=runtime_context.runtime_context_id,
+            task_id=runtime_context.task_id,
+            context=runtime_context,
+        )
+    )
+    eligible_contract_next = eligible_contract_projection[
+        "contract_runtime_next_legal_action"
+    ]
+    assert eligible_contract_next["action"] == "record_worker_commit"
+    assert eligible_contract_next["recovery_status"] == "eligible"
+    assert eligible_contract_next["actual_worktree_head_commit"] == (
+        replacement_commit
+    )
 
     owned.write_text("dirty target-relative worker change\n", encoding="utf-8")
     dirty_recovery = (

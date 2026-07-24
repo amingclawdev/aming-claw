@@ -14467,6 +14467,275 @@ def _runtime_context_contract_next_action_override_eligible(
     return True
 
 
+def _runtime_context_same_lane_recovery_next_action(
+    canonical_next_action: Mapping[str, Any],
+    recovery: Mapping[str, Any] | None,
+    *,
+    runtime_context_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """Project the server-verified same-lane recovery ahead of stale QA/merge.
+
+    The source-backed ContractRuntime history remains append-only.  This
+    projection only replaces the *effective* next action while the current
+    clean worker HEAD still needs to absorb the latest target or record the
+    exact replacement worker_commit.  Once that worker_commit is accepted,
+    the persisted reset marker reopens the ordinary attestation -> QA -> merge
+    contract order.
+    """
+
+    next_action = (
+        dict(canonical_next_action)
+        if isinstance(canonical_next_action, Mapping)
+        else {}
+    )
+    recovery_payload = recovery if isinstance(recovery, Mapping) else {}
+    recovery_status = str(recovery_payload.get("status") or "").strip()
+    recovery_action = str(
+        recovery_payload.get("next_legal_action") or ""
+    ).strip()
+    allowed_actions = {
+        "eligible": "record_worker_commit",
+        "retarget_required": "merge_current_target_and_record_worker_commit",
+    }
+    if allowed_actions.get(recovery_status) != recovery_action:
+        return next_action
+
+    fresh_evidence_required = list(
+        dict.fromkeys(
+            [
+                "worker_commit",
+                *[
+                    str(item or "").strip()
+                    for item in recovery_payload.get(
+                        "fresh_evidence_required"
+                    )
+                    or []
+                    if str(item or "").strip()
+                ],
+            ]
+        )
+    )
+    ordered_actions = [
+        *(
+            ["merge_current_target"]
+            if recovery_status == "retarget_required"
+            else []
+        ),
+        "record_worker_commit",
+        "record_finish_time_worker_attestation",
+        "record_finish_gate",
+        "record_qa_graph_context",
+        "record_qa_independent_verification",
+        "record_observer_merge",
+    ]
+    canonical_before_recovery = {
+        key: next_action.get(key)
+        for key in (
+            "id",
+            "action",
+            "stage_id",
+            "line_id",
+            "owner_role",
+            "evidence_kind",
+        )
+        if next_action.get(key) not in (None, "")
+    }
+    # The canonical action being shadowed may carry observer-only generic
+    # submit payloads.  They are raw audit for the old action, not valid
+    # authority for this worker-owned recovery facade.
+    next_action.pop("writer_role_safe_copy_payload", None)
+    next_action.pop("mf_sub_host_bridge_guidance", None)
+    next_action.update(
+        {
+            "schema_version": "contract_runtime_next_legal_action.v1",
+            "id": (
+                "worker_commit_retarget_sync"
+                if recovery_status == "retarget_required"
+                else "worker_commit"
+            ),
+            "action": recovery_action,
+            "source": "contract_runtime_same_lane_worker_commit_recovery",
+            "source_of_authority": (
+                "ContractRuntime.completed_lines.worker_commit+git"
+            ),
+            "authority_decision_source": (
+                "contract_runtime_same_lane_worker_commit_recovery"
+            ),
+            "precedence": "server_verified_same_lane_recovery",
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+            "owner_role": "mf_sub",
+            "allowed_writer_roles": ["mf_sub"],
+            "evidence_kind": "worker_commit",
+            "required": True,
+            "meta_contract_gate_decision_source": False,
+            "runtime_context_id": str(runtime_context_id or "").strip(),
+            "task_id": str(task_id or "").strip(),
+            "same_lane_worker_commit_recovery_projection": True,
+            "recovery_status": recovery_status,
+            "current_target_baseline_commit": str(
+                recovery_payload.get("current_target_baseline_commit") or ""
+            ).strip(),
+            "actual_worktree_head_commit": str(
+                recovery_payload.get("actual_worktree_head_commit") or ""
+            ).strip(),
+            "fresh_evidence_required": fresh_evidence_required,
+            "ordered_recovery_actions": ordered_actions,
+            "canonical_next_action_before_recovery": (
+                canonical_before_recovery
+            ),
+            "immutable_prior_evidence_policy": {
+                "prior_worker_and_qa_evidence_retained_as_raw_audit": True,
+                "prior_worker_and_qa_evidence_close_satisfying": False,
+                "fresh_worker_commit_required": True,
+                "fresh_independent_qa_required": True,
+                "historical_source_resume_allowed": False,
+            },
+            "submit_line_guidance": {
+                "schema_version": (
+                    "contract_runtime.same_lane_recovery_submit_guidance.v1"
+                ),
+                "generic_contract_runtime_submit_line_allowed": False,
+                "worker_commit_facade_required": True,
+                "worker_commit_facade": "runtime_context_worker_commit",
+                "message": (
+                    "Use the same bounded worker lane. If retarget sync is "
+                    "required, merge only the server-derived current target; "
+                    "then record the exact clean HEAD through "
+                    "runtime_context_worker_commit."
+                ),
+            },
+        }
+    )
+    return next_action
+
+
+def _runtime_context_same_lane_recovery_required_evidence(
+    next_action: Mapping[str, Any],
+    recovery: Mapping[str, Any] | None,
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+) -> list[dict[str, Any]]:
+    """Return the one legal fresh-evidence order for a retargeted worker lane."""
+
+    if not (
+        isinstance(next_action, Mapping)
+        and next_action.get("same_lane_worker_commit_recovery_projection")
+        is True
+    ):
+        return []
+    recovery_payload = recovery if isinstance(recovery, Mapping) else {}
+    recovery_status = str(recovery_payload.get("status") or "").strip()
+    action = str(next_action.get("action") or "").strip()
+    if recovery_status not in {"eligible", "retarget_required"} or not action:
+        return []
+
+    identity = {
+        "runtime_context_id": str(runtime_context_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "parent_task_id": str(parent_task_id or "").strip(),
+    }
+    evidence = [
+        {
+            "id": "same_lane_worker_commit_recovery",
+            "status": recovery_status,
+            "field": "worker_commit_sha",
+            "gate": "finish",
+            "next_action": action,
+            "producer": "mf_subagent_worker",
+            "consumer": "ContractRuntime.completed_lines.worker_commit",
+            "expected_source": "runtime_context_worker_commit",
+            "evidence_ref": "contract_runtime",
+            "worker_owned": True,
+            "close_satisfying_required": True,
+            "requires": [],
+            "same_lane_worker_commit_recovery": dict(recovery_payload),
+        },
+        {
+            "id": "finish_time_worker_attestation",
+            "status": "fresh_required",
+            "field": "worker_self_attesting",
+            "gate": "finish",
+            "next_action": "record_finish_time_worker_attestation",
+            "producer": "mf_subagent_worker",
+            "consumer": "worker_finish_gate",
+            "expected_source": "runtime_context_finish_time_worker_attestation",
+            "evidence_ref": "contract_runtime",
+            "worker_owned": True,
+            "close_satisfying_required": True,
+            "requires": ["same_lane_worker_commit_recovery"],
+        },
+        {
+            "id": "finish_gate",
+            "status": "fresh_required",
+            "field": "finish_gate_ref",
+            "gate": "close",
+            "next_action": "record_finish_gate",
+            "producer": "mf_subagent_worker",
+            "consumer": "independent_qa",
+            "expected_source": "runtime_context_finish_gate",
+            "evidence_ref": "timeline",
+            "worker_owned": True,
+            "close_satisfying_required": True,
+            "requires": ["finish_time_worker_attestation"],
+        },
+        {
+            "id": "qa_graph_context",
+            "status": "fresh_required",
+            "field": "qa_graph_trace_ids",
+            "gate": "qa",
+            "next_action": "record_qa_graph_context",
+            "producer": "independent_qa",
+            "consumer": "qa_independent_verification",
+            "expected_source": "graph_query_trace",
+            "evidence_ref": "graph_trace",
+            "worker_owned": False,
+            "close_satisfying_required": False,
+            "requires": ["finish_gate"],
+        },
+        {
+            "id": "independent_verification",
+            "status": "fresh_required",
+            "field": "verification_event_refs",
+            "gate": "qa",
+            "next_action": "handoff_to_independent_qa",
+            "producer": "independent_qa",
+            "consumer": "observer_merge",
+            "expected_source": "qa_independent_verification",
+            "evidence_ref": "contract_runtime",
+            "worker_owned": False,
+            "close_satisfying_required": False,
+            "requires": ["qa_graph_context"],
+        },
+        {
+            "id": "observer_merge",
+            "status": "fresh_required",
+            "field": "merge_commit",
+            "gate": "merge",
+            "next_action": "record_merge",
+            "producer": "observer",
+            "consumer": "batch_full_reconcile",
+            "expected_source": "parallel_branch_merge_queue_apply",
+            "evidence_ref": "contract_runtime",
+            "worker_owned": False,
+            "close_satisfying_required": False,
+            "requires": ["independent_verification"],
+        },
+    ]
+    for index, item in enumerate(evidence):
+        item.update(identity)
+        item["schema_version"] = (
+            "runtime_context.next_required_evidence.item.v1"
+        )
+        item["sequence_index"] = index
+        item["is_next"] = index == 0
+        item["fresh_generation_required"] = True
+    return evidence
+
+
 def _runtime_context_contract_identity_from_record(
     record: Mapping[str, Any],
 ) -> dict[str, str]:
@@ -14656,6 +14925,20 @@ def _runtime_context_contract_runtime_worker_projection(
     )
     if isinstance(recovery, Mapping):
         current_state["same_lane_worker_commit_recovery"] = dict(recovery)
+        recovery_next_action = (
+            _runtime_context_same_lane_recovery_next_action(
+                next_action,
+                recovery,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+            )
+        )
+        if recovery_next_action != next_action:
+            current_state[
+                "canonical_next_legal_action_before_same_lane_recovery"
+            ] = dict(next_action)
+            next_action = recovery_next_action
+            current_state["next_legal_action"] = dict(next_action)
     contract_runtime_dispatch_identity = (
         _contract_runtime_dispatch_identity_resolution(canonical_record, context)
         if context is not None
@@ -16339,6 +16622,17 @@ def _runtime_context_worker_guide_response(
             *next_required_evidence,
         ]
         scope_blocking_reasons.append("worker_commit_drift_blocked")
+    recovery_required_evidence = (
+        _runtime_context_same_lane_recovery_required_evidence(
+            contract_runtime_next_legal_action,
+            same_lane_worker_commit_recovery,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+        )
+    )
+    if recovery_required_evidence:
+        next_required_evidence = recovery_required_evidence
     if _runtime_context_contract_next_action_override_eligible(
         contract_runtime_next_legal_action,
         runtime_context_id=runtime_context_id,
@@ -16358,6 +16652,8 @@ def _runtime_context_worker_guide_response(
         or action_plan.get("missing_evidence")
         or []
     )
+    if recovery_required_evidence:
+        missing_evidence = [dict(item) for item in recovery_required_evidence]
     blocking_reasons = [
         *list(
             control_plane.get("blocking_reasons")
