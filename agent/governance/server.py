@@ -25753,6 +25753,319 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
     return {}
 
 
+def _runtime_context_post_qa_exact_dispatch_line_match(
+    record: Mapping[str, Any],
+    *,
+    context: Any,
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return only a canonical dispatch that exactly binds this worker lane."""
+
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    expected_text = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": (
+            _runtime_context_effective_target_project_root(context)
+        ),
+        "worktree_path": str(
+            getattr(context, "worktree_path", "") or ""
+        ).strip(),
+        "branch_ref": str(getattr(context, "branch_ref", "") or "").strip(),
+        "merge_queue_id": str(
+            getattr(context, "merge_queue_id", "") or ""
+        ).strip(),
+    }
+    expected_owned_files = tuple(
+        sorted(
+            {
+                str(value or "").strip()
+                for value in (
+                    getattr(context, "owned_files", ())
+                    or getattr(context, "target_files", ())
+                    or ()
+                )
+                if str(value or "").strip()
+            }
+        )
+    )
+    expected_route = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if not (
+        all(expected_text.values())
+        and expected_owned_files
+        and all(expected_route.values())
+    ):
+        return {}
+
+    def _same_path(actual: str, expected: str) -> bool:
+        try:
+            return bool(
+                actual
+                and expected
+                and Path(actual).resolve() == Path(expected).resolve()
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+
+    completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        return {}
+    for index, line in enumerate(completed_lines):
+        if not isinstance(line, Mapping):
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        if (
+            str(line.get("stage_id") or "").strip() != "dispatch"
+            or str(line.get("line_id") or "").strip()
+            != "observer_dispatch_bounded_workers"
+            or str(line.get("evidence_kind") or "").strip()
+            != "dispatch_bounded_worker"
+            or str(line.get("actor_role") or "").strip() != "observer"
+            or not _contract_runtime_line_status_passes(line)
+            or not payload
+        ):
+            continue
+        exact = True
+        for field, expected in expected_text.items():
+            payload_value = str(payload.get(field) or "").strip()
+            line_value = str(line.get(field) or "").strip()
+            values = [value for value in (payload_value, line_value) if value]
+            if not values or any(value != expected for value in values):
+                exact = False
+                break
+            if field in {"target_project_root", "worktree_path"} and not all(
+                _same_path(value, expected) for value in values
+            ):
+                exact = False
+                break
+        if not exact:
+            continue
+        observer_command_values = [
+            str(source.get("observer_command_id") or "").strip()
+            for source in (line, payload)
+            if str(source.get("observer_command_id") or "").strip()
+        ]
+        if any(value != execution_id for value in observer_command_values):
+            continue
+        payload_owned_files = tuple(
+            sorted(
+                {
+                    str(value or "").strip()
+                    for value in payload.get("owned_files") or []
+                    if str(value or "").strip()
+                }
+            )
+        )
+        if payload_owned_files != expected_owned_files:
+            continue
+        if "owned_files" in line:
+            line_owned_files = tuple(
+                sorted(
+                    {
+                        str(value or "").strip()
+                        for value in line.get("owned_files") or []
+                        if str(value or "").strip()
+                    }
+                )
+            )
+            if line_owned_files != expected_owned_files:
+                continue
+        dispatch_route = (
+            payload.get("route_identity")
+            if isinstance(payload.get("route_identity"), Mapping)
+            else {}
+        )
+        if any(
+            str(dispatch_route.get(field) or "").strip() != expected
+            for field, expected in expected_route.items()
+        ):
+            continue
+        if any(
+            str(line.get(field) or "").strip()
+            and str(line.get(field) or "").strip() != expected
+            for field, expected in expected_route.items()
+        ):
+            continue
+        return {
+            "schema_version": (
+                "runtime_context.post_qa_exact_dispatch_line_match.v1"
+            ),
+            "contract_execution_id": execution_id,
+            "line_index": index,
+            "line": dict(line),
+            "payload": dict(payload),
+            "source_ref": (
+                f"contract_runtime:{execution_id}:completed_lines:{index}"
+            ),
+            "exact_identity": True,
+        }
+    return {}
+
+
+def _runtime_context_post_qa_worker_startup_lineage(
+    record: Mapping[str, Any],
+    *,
+    context: Any,
+) -> dict[str, Any]:
+    """Return the canonical startup identity for exact worker-commit binding."""
+
+    from .parallel_branch_runtime import (
+        runtime_context_secret_hash,
+        runtime_context_session_token_ref,
+    )
+
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    target_project_root = _runtime_context_effective_target_project_root(context)
+    expected_fence_token_hash = runtime_context_secret_hash(
+        str(getattr(context, "fence_token", "") or "").strip()
+    )
+    expected_owned_files = tuple(
+        sorted(
+            {
+                str(value or "").strip()
+                for value in (
+                    getattr(context, "owned_files", ())
+                    or getattr(context, "target_files", ())
+                    or ()
+                )
+                if str(value or "").strip()
+            }
+        )
+    )
+    if not all(
+        (
+            runtime_context_id,
+            task_id,
+            parent_task_id,
+            execution_id,
+            worker_id,
+            worker_slot_id,
+            target_project_root,
+            expected_fence_token_hash,
+            expected_owned_files,
+        )
+    ):
+        return {}
+
+    expected_text = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "fence_token_hash": expected_fence_token_hash,
+    }
+    completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        return {}
+    for index in range(len(completed_lines) - 1, -1, -1):
+        line = completed_lines[index]
+        if not isinstance(line, Mapping):
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        if (
+            str(line.get("stage_id") or "").strip() != "worker_startup"
+            or str(line.get("line_id") or "").strip() != "worker_startup"
+            or str(line.get("evidence_kind") or "").strip()
+            != "mf_subagent_startup"
+            or str(line.get("actor_role") or "").strip() != "mf_sub"
+            or bool(line.get("observer_impersonation"))
+            or bool(payload.get("observer_impersonation"))
+            or not _contract_runtime_line_status_passes(line)
+            or not payload
+        ):
+            continue
+        exact = True
+        for field, expected in expected_text.items():
+            payload_value = str(payload.get(field) or "").strip()
+            line_value = str(line.get(field) or "").strip()
+            values = [value for value in (payload_value, line_value) if value]
+            if not values or any(value != expected for value in values):
+                exact = False
+                break
+        if not exact:
+            continue
+        startup_owned_files = tuple(
+            sorted(
+                {
+                    str(value or "").strip()
+                    for value in payload.get("owned_files") or []
+                    if str(value or "").strip()
+                }
+            )
+        )
+        if startup_owned_files != expected_owned_files:
+            continue
+        worker_session_id = str(
+            payload.get("worker_session_id")
+            or line.get("worker_session_id")
+            or ""
+        ).strip()
+        startup_session_token_ref = str(
+            payload.get("session_token_ref")
+            or line.get("session_token_ref")
+            or ""
+        ).strip()
+        context_session_token_ref = runtime_context_session_token_ref(context)
+        return {
+            "schema_version": (
+                "runtime_context.post_qa_worker_startup_lineage.v1"
+            ),
+            "line_index": index,
+            "source_ref": (
+                f"contract_runtime:{execution_id}:completed_lines:{index}"
+            ),
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "worker_session_id": worker_session_id,
+            "session_token_ref": (
+                startup_session_token_ref or context_session_token_ref
+            ),
+            "session_token_ref_source": (
+                "worker_startup"
+                if startup_session_token_ref
+                else (
+                    "runtime_context_stored_hash_lineage"
+                    if context_session_token_ref
+                    else ""
+                )
+            ),
+            "fence_token_hash": expected_fence_token_hash,
+        }
+    return {}
+
+
 def _runtime_context_post_qa_merge_conflict_rejoin_authority(
     conn,
     *,
@@ -25855,7 +26168,11 @@ def _runtime_context_post_qa_merge_conflict_rejoin_authority(
     ):
         errors.append("historical/bypass ContractRuntime contexts cannot rejoin")
 
-    dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+    dispatch_match = _runtime_context_post_qa_exact_dispatch_line_match(
+        record,
+        context=context,
+        route_identity=route_identity,
+    )
     if not dispatch_match:
         errors.append("source-backed bounded worker dispatch identity is missing")
     dispatch_payload = (
@@ -25917,6 +26234,13 @@ def _runtime_context_post_qa_merge_conflict_rejoin_authority(
         ):
             errors.append(f"source-backed dispatch {field} identity mismatch")
 
+    startup_lineage = _runtime_context_post_qa_worker_startup_lineage(
+        record,
+        context=context,
+    )
+    if not startup_lineage:
+        errors.append("exact source-backed worker startup lineage is missing")
+
     completed_lines = list(record.get("completed_lines") or [])
     worker_commit_index = -1
     worker_commit_line: Mapping[str, Any] = {}
@@ -25927,6 +26251,10 @@ def _runtime_context_post_qa_merge_conflict_rejoin_authority(
         if (
             not isinstance(line, Mapping)
             or str(line.get("line_id") or "").strip() != "worker_commit"
+            or str(line.get("stage_id") or "").strip() != "worker_commit"
+            or str(line.get("evidence_kind") or "").strip() != "worker_commit"
+            or str(line.get("actor_role") or "").strip() != "mf_sub"
+            or bool(line.get("observer_impersonation"))
             or not _runtime_context_contract_line_matches_worker(
                 line,
                 runtime_context_id=runtime_context_id,
@@ -25939,6 +26267,56 @@ def _runtime_context_post_qa_merge_conflict_rejoin_authority(
             if isinstance(line.get("payload"), Mapping)
             else {}
         )
+        expected_worker_id = str(
+            startup_lineage.get("worker_id") or ""
+        ).strip()
+        expected_worker_slot_id = str(
+            startup_lineage.get("worker_slot_id") or ""
+        ).strip()
+        expected_worker_session_id = str(
+            startup_lineage.get("worker_session_id") or ""
+        ).strip()
+        expected_session_token_ref = str(
+            startup_lineage.get("session_token_ref") or ""
+        ).strip()
+        expected_fence_token_hash = str(
+            startup_lineage.get("fence_token_hash") or ""
+        ).strip()
+        if (
+            not payload
+            or bool(payload.get("observer_impersonation"))
+            or any(
+                str(source.get(field) or "").strip() != expected
+                for source in (line, payload)
+                for field, expected in (
+                    ("runtime_context_id", runtime_context_id),
+                    ("task_id", task_id),
+                    ("parent_task_id", parent_task_id),
+                    ("worker_id", expected_worker_id),
+                    ("worker_slot_id", expected_worker_slot_id),
+                )
+            )
+        ):
+            continue
+        lineage_fields = (
+            ("worker_session_id", expected_worker_session_id),
+            ("session_token_ref", expected_session_token_ref),
+            ("fence_token_hash", expected_fence_token_hash),
+        )
+        lineage_matches = True
+        for field, expected in lineage_fields:
+            values = [
+                str(source.get(field) or "").strip()
+                for source in (line, payload)
+                if str(source.get(field) or "").strip()
+            ]
+            if values and (
+                not expected or any(value != expected for value in values)
+            ):
+                lineage_matches = False
+                break
+        if not lineage_matches:
+            continue
         commits = {
             str(value or "").strip().lower()
             for value in (
@@ -26028,12 +26406,21 @@ def _runtime_context_post_qa_merge_conflict_rejoin_authority(
             or payload.get("actor_role")
             or ""
         ).strip().lower()
+        canonical_known_baseline = (
+            _contract_runtime_known_baseline_qa_acceptance(
+                line,
+                record=record,
+            )
+        )
+        true_passing_qa = bool(
+            not _contract_runtime_value_reports_failed_qa(line)
+            and _contract_runtime_line_status_passes(line)
+        )
         if (
             qa_commit == candidate_commit
             and actor_role == "qa"
             and not bool(line.get("observer_impersonation"))
-            and not _contract_runtime_value_reports_failed_qa(line)
-            and _contract_runtime_line_status_passes(line)
+            and (true_passing_qa or canonical_known_baseline)
         ):
             qa_index = index
             break
