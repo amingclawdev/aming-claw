@@ -35324,7 +35324,13 @@ def _dependency_revalidation_qa_candidate_authority(
             qa_commit == candidate_commit
             and actor_role == "qa"
             and not bool(line.get("observer_impersonation"))
-            and not _contract_runtime_value_reports_failed_qa(line)
+            and (
+                not _contract_runtime_value_reports_failed_qa(line)
+                or _contract_runtime_known_baseline_qa_acceptance(
+                    line,
+                    record=record,
+                )
+            )
             and _contract_runtime_line_status_passes(line)
         ):
             qa_index = index
