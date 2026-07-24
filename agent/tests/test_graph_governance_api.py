@@ -58810,6 +58810,11 @@ def test_contract_runtime_qa_bridge_preserves_precheck_submit_and_failure_fields
     passing_status_gate = persisted_qa["qa_evidence_provenance"][
         "completion_status_gate"
     ]
+    assert persisted_qa["observer_impersonation"] is False
+    assert persisted_qa["payload"]["observer_impersonation"] is False
+    assert persisted_qa["qa_evidence_provenance"][
+        "payload_observer_impersonation_explicit"
+    ] is True
     assert passing_status_gate == {
         "schema_version": "contract_runtime.qa_completion_status_gate.v1",
         "source": "contract_runtime_line_write_normalization",
@@ -61905,6 +61910,7 @@ def _mf_parallel_worker_proof_payloads(
     }
     worker_commit = {
         **common,
+        "status": "accepted",
         "evidence_owner_role": "mf_sub",
         "worker_session_id": worker_session_id,
         "actor_session_principal": worker_session_id,
@@ -64011,6 +64017,33 @@ def test_same_lane_worker_commit_revision_is_append_only_and_advances_to_attesta
             "diff_base_commit": base_commit,
         }
     )
+    statusless_payload = copy.deepcopy(initial_commit_payload)
+    statusless_payload.pop("status", None)
+    canonicalized_worker_commit = server._contract_runtime_line_write_body(
+        record,
+        {
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+            "evidence_kind": "worker_commit",
+            "payload": statusless_payload,
+        },
+        actor_role="mf_sub",
+        worker_proof={
+            field: initial_commit_payload[field]
+            for field in (
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_id",
+                "worker_slot_id",
+                "target_project_root",
+                "session_token_ref",
+                "fence_token_hash",
+            )
+        },
+    )
+    assert canonicalized_worker_commit["status"] == "accepted"
+    assert canonicalized_worker_commit["payload"]["status"] == "accepted"
     initial_write = server._contract_runtime_write_from_record(
         record,
         actor_role="mf_sub",
@@ -64353,11 +64386,14 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
             "task_id": runtime_context.task_id,
             "parent_task_id": backlog_id,
             "commit_sha": candidate_commit,
+            "status": "passed",
+            "observer_impersonation": False,
             "payload": {
                 "runtime_context_id": runtime_context.runtime_context_id,
                 "task_id": runtime_context.task_id,
                 "parent_task_id": backlog_id,
                 "status": "passed",
+                "observer_impersonation": False,
             },
         }
         for stage_id, line_id, evidence_kind, actor_role in downstream_specs
@@ -64378,6 +64414,23 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     assert post_qa_record["runtime_guide"]["next_legal_action"]["line_id"] == (
         "observer_merge"
     )
+    canonical_dispatch = next(
+        line
+        for line in post_qa_record["completed_lines"]
+        if line.get("line_id") == "observer_dispatch_bounded_workers"
+    )
+    assert canonical_dispatch["observer_impersonation"] is False
+    assert canonical_dispatch["payload"]["observer_impersonation"] is False
+    assert canonical_dispatch["payload"]["dispatch_ticket_authority"][
+        "observer_impersonation_explicit"
+    ] is True
+    canonical_worker_commit = next(
+        line
+        for line in reversed(post_qa_record["completed_lines"])
+        if line.get("line_id") == "worker_commit"
+    )
+    assert canonical_worker_commit["status"] == "accepted"
+    assert canonical_worker_commit["payload"]["status"] == "accepted"
     runtime_context = upsert_branch_context(
         conn,
         replace(
@@ -64609,6 +64662,48 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         "exact source-backed worker_commit is missing",
     )
 
+    for lineage_field in (
+        "worker_session_id",
+        "session_token_ref",
+        "fence_token_hash",
+    ):
+        missing_lineage = copy.deepcopy(post_qa_record)
+        missing_lineage_commit = next(
+            line
+            for line in reversed(missing_lineage["completed_lines"])
+            if line.get("line_id") == "worker_commit"
+        )
+        missing_lineage_commit.pop(lineage_field, None)
+        missing_lineage_commit["payload"].pop(lineage_field, None)
+        assert_exact_identity_rejected(
+            missing_lineage,
+            "exact source-backed worker_commit is missing",
+        )
+
+    for status_source in ("line", "payload"):
+        for status_mutation in ("failed", "missing"):
+            invalid_worker_commit_status = copy.deepcopy(post_qa_record)
+            invalid_status_line = next(
+                line
+                for line in reversed(
+                    invalid_worker_commit_status["completed_lines"]
+                )
+                if line.get("line_id") == "worker_commit"
+            )
+            status_container = (
+                invalid_status_line
+                if status_source == "line"
+                else invalid_status_line["payload"]
+            )
+            if status_mutation == "failed":
+                status_container["status"] = "failed"
+            else:
+                status_container.pop("status", None)
+            assert_exact_identity_rejected(
+                invalid_worker_commit_status,
+                "exact source-backed worker_commit is missing",
+            )
+
     wrong_dispatch = copy.deepcopy(post_qa_record)
     wrong_dispatch_line = next(
         line
@@ -64620,6 +64715,29 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         wrong_dispatch,
         "source-backed bounded worker dispatch identity is missing",
     )
+
+    for impersonation_source in ("line", "payload"):
+        for impersonation_mutation in ("true", "missing"):
+            invalid_dispatch_impersonation = copy.deepcopy(post_qa_record)
+            invalid_dispatch_line = next(
+                line
+                for line in invalid_dispatch_impersonation["completed_lines"]
+                if line.get("line_id")
+                == "observer_dispatch_bounded_workers"
+            )
+            impersonation_container = (
+                invalid_dispatch_line
+                if impersonation_source == "line"
+                else invalid_dispatch_line["payload"]
+            )
+            if impersonation_mutation == "true":
+                impersonation_container["observer_impersonation"] = True
+            else:
+                impersonation_container.pop("observer_impersonation", None)
+            assert_exact_identity_rejected(
+                invalid_dispatch_impersonation,
+                "source-backed bounded worker dispatch identity is missing",
+            )
 
     wrong_fence_authority, wrong_fence_diagnostics = (
         server._runtime_context_post_qa_merge_conflict_rejoin_authority(
@@ -64688,6 +64806,30 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     assert "independent QA-passed line is missing" in " ".join(
         failed_qa_diagnostics["errors"]
     )
+
+    for impersonation_source in ("line", "payload"):
+        for impersonation_mutation in ("true", "missing"):
+            invalid_qa_impersonation = copy.deepcopy(post_qa_record)
+            invalid_qa_line = next(
+                line
+                for line in reversed(
+                    invalid_qa_impersonation["completed_lines"]
+                )
+                if line.get("line_id") == "qa_independent_verification"
+            )
+            impersonation_container = (
+                invalid_qa_line
+                if impersonation_source == "line"
+                else invalid_qa_line["payload"]
+            )
+            if impersonation_mutation == "true":
+                impersonation_container["observer_impersonation"] = True
+            else:
+                impersonation_container.pop("observer_impersonation", None)
+            assert_exact_identity_rejected(
+                invalid_qa_impersonation,
+                "independent QA-passed line is missing",
+            )
 
     known_baseline_record = copy.deepcopy(post_qa_record)
     known_baseline_template = _known_baseline_accepted_qa_record()

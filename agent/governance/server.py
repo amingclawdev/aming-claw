@@ -25753,6 +25753,161 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
     return {}
 
 
+def _runtime_context_post_qa_explicit_positive_status(
+    value: Mapping[str, Any],
+) -> bool:
+    """Require one explicit positive status without accepting omissions."""
+
+    if not _contract_runtime_line_status_passes(value):
+        return False
+    return any(
+        str(value.get(field) or "").strip().lower()
+        in {
+            "accept",
+            "accepted",
+            "complete",
+            "completed",
+            "ok",
+            "pass",
+            "passed",
+            "success",
+            "succeeded",
+            "validate",
+            "validated",
+        }
+        for field in ("status", "verdict", "decision")
+    )
+
+
+def _runtime_context_post_qa_dispatch_impersonation_safe(
+    line: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> bool:
+    """Fail closed for impersonation except an immutable legacy dispatch."""
+
+    values = [
+        source.get("observer_impersonation")
+        for source in (line, payload)
+        if "observer_impersonation" in source
+    ]
+    if any(value is not False for value in values):
+        return False
+    if len(values) == 2:
+        return True
+
+    ticket = (
+        payload.get("dispatch_ticket_authority")
+        if isinstance(payload.get("dispatch_ticket_authority"), Mapping)
+        else {}
+    )
+    return bool(
+        not values
+        and str(ticket.get("schema_version") or "")
+        == "mf_parallel.dispatch_ticket_authority.v1"
+        and str(ticket.get("source") or "") == "observer_route_token_refs"
+        and ticket.get("server_resolved_child_route_identity") is True
+        and ticket.get("runtime_context_bound") is True
+        and "observer_impersonation_explicit" not in ticket
+    )
+
+
+def _runtime_context_post_qa_legacy_worker_commit_acceptance(
+    line: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> bool:
+    """Recognize the immutable pre-status worker-commit projection only."""
+
+    if any(
+        field in source
+        for source in (line, payload)
+        for field in ("status", "verdict", "decision")
+    ):
+        return False
+    implementation_lineage = (
+        payload.get("worker_implementation_lineage")
+        if isinstance(payload.get("worker_implementation_lineage"), Mapping)
+        else {}
+    )
+    graph_evidence = (
+        payload.get("graph_trace_db_evidence")
+        if isinstance(payload.get("graph_trace_db_evidence"), Mapping)
+        else {}
+    )
+    return bool(
+        _contract_runtime_line_status_passes(line)
+        and _contract_runtime_line_status_passes(payload)
+        and str(payload.get("schema_version") or "")
+        == "runtime_context.worker_commit.v1"
+        and payload.get("db_verified") is True
+        and payload.get("clean_worktree") is True
+        and payload.get("raw_session_token_persisted") is False
+        and payload.get("raw_fence_token_persisted") is False
+        and payload.get("observer_impersonation") is False
+        and str(payload.get("implementation_lineage_ref") or "").startswith(
+            "contract-runtime:worker-implementation:sha256:"
+        )
+        and str(implementation_lineage.get("schema_version") or "")
+        == "contract_runtime.worker_implementation_lineage.v1"
+        and str(graph_evidence.get("schema_version") or "")
+        == "mf_subagent_graph_trace_db_evidence.v1"
+        and graph_evidence.get("db_verified") is True
+    )
+
+
+def _runtime_context_post_qa_worker_commit_acceptance(
+    line: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> bool:
+    """Require accepted line and payload, with one sealed legacy exception."""
+
+    return bool(
+        (
+            _runtime_context_post_qa_explicit_positive_status(line)
+            and _runtime_context_post_qa_explicit_positive_status(payload)
+        )
+        or _runtime_context_post_qa_legacy_worker_commit_acceptance(
+            line,
+            payload,
+        )
+    )
+
+
+def _runtime_context_post_qa_qa_impersonation_safe(
+    line: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> bool:
+    """Require explicit non-impersonation or authenticated legacy QA."""
+
+    values = [
+        source.get("observer_impersonation")
+        for source in (line, payload)
+        if "observer_impersonation" in source
+    ]
+    if any(value is not False for value in values):
+        return False
+    if len(values) == 2:
+        return True
+    provenance = (
+        line.get("qa_evidence_provenance")
+        if isinstance(line.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    completion_gate = (
+        provenance.get("completion_status_gate")
+        if isinstance(provenance.get("completion_status_gate"), Mapping)
+        else {}
+    )
+    return bool(
+        values == [False]
+        and "payload_observer_impersonation_explicit" not in provenance
+        and _contract_runtime_authenticated_qa_provenance(line)
+        and str(completion_gate.get("schema_version") or "")
+        == "contract_runtime.qa_completion_status_gate.v1"
+        and completion_gate.get("server_derived") is True
+        and completion_gate.get("top_level_status_present") is True
+    )
+
+
 def _runtime_context_post_qa_exact_dispatch_line_match(
     record: Mapping[str, Any],
     *,
@@ -25841,6 +25996,10 @@ def _runtime_context_post_qa_exact_dispatch_line_match(
             or str(line.get("actor_role") or "").strip() != "observer"
             or not _contract_runtime_line_status_passes(line)
             or not payload
+            or not _runtime_context_post_qa_dispatch_impersonation_safe(
+                line,
+                payload,
+            )
         ):
             continue
         exact = True
@@ -26285,6 +26444,10 @@ def _runtime_context_post_qa_merge_conflict_rejoin_authority(
         if (
             not payload
             or bool(payload.get("observer_impersonation"))
+            or not _runtime_context_post_qa_worker_commit_acceptance(
+                line,
+                payload,
+            )
             or any(
                 str(source.get(field) or "").strip() != expected
                 for source in (line, payload)
@@ -26310,8 +26473,8 @@ def _runtime_context_post_qa_merge_conflict_rejoin_authority(
                 for source in (line, payload)
                 if str(source.get(field) or "").strip()
             ]
-            if values and (
-                not expected or any(value != expected for value in values)
+            if not values or not expected or any(
+                value != expected for value in values
             ):
                 lineage_matches = False
                 break
@@ -26419,7 +26582,10 @@ def _runtime_context_post_qa_merge_conflict_rejoin_authority(
         if (
             qa_commit == candidate_commit
             and actor_role == "qa"
-            and not bool(line.get("observer_impersonation"))
+            and _runtime_context_post_qa_qa_impersonation_safe(
+                line,
+                payload,
+            )
             and (true_passing_qa or canonical_known_baseline)
         ):
             qa_index = index
@@ -64681,6 +64847,23 @@ def _contract_runtime_line_write_body(
         from .runtime_context import attach_contract_runtime_worker_provenance
 
         write = attach_contract_runtime_worker_provenance(write, worker_proof)
+        if write.get("line_id") == "worker_commit":
+            payload = (
+                dict(write.get("payload"))
+                if isinstance(write.get("payload"), Mapping)
+                else {}
+            )
+            if (
+                _contract_runtime_line_status_passes(write)
+                and "status" not in write
+            ):
+                write["status"] = "accepted"
+            if (
+                _contract_runtime_line_status_passes(payload)
+                and "status" not in payload
+            ):
+                payload["status"] = "accepted"
+            write["payload"] = payload
     if write.get("line_id") == "worker_implementation":
         payload = (
             dict(write.get("payload"))
@@ -65849,10 +66032,17 @@ def _contract_runtime_bind_authenticated_qa_provenance(
             "submitter_principal": qa_principal,
             "submitter_session": qa_session_id,
             "observer_impersonation": False,
+            "payload_observer_impersonation_explicit": True,
             "parent_materialization_authorized": False,
             "authenticated_qa_binding": authenticated_binding,
         }
     )
+    payload = (
+        dict(effective.get("payload"))
+        if isinstance(effective.get("payload"), Mapping)
+        else {}
+    )
+    payload["observer_impersonation"] = False
     effective.update(
         {
             "actor_session_principal": qa_principal,
@@ -65865,6 +66055,7 @@ def _contract_runtime_bind_authenticated_qa_provenance(
             "observer_impersonation": False,
             "parent_materialization_authorized": False,
             "qa_evidence_provenance": canonical_provenance,
+            "payload": payload,
         }
     )
     return effective
@@ -69760,7 +69951,10 @@ def _contract_runtime_bind_mf_parallel_dispatch_authority(
         "source": "observer_route_token_refs",
         "server_resolved_child_route_identity": True,
         "runtime_context_bound": True,
+        "observer_impersonation_explicit": True,
     }
+    effective["observer_impersonation"] = False
+    payload["observer_impersonation"] = False
     effective["payload"] = payload
     return effective, []
 
