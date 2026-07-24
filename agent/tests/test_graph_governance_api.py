@@ -51196,7 +51196,7 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
         item["id"] for item in direct_fix_guide["classifications"]
     } == {
         "parentless_single_branch_direct_merge",
-        "blocked_parent_successor_return_to_parent",
+        "terminal_bypass_source_independent_root_repair",
         "multi_parallel_merge_queue",
     }
     assert (
@@ -52010,6 +52010,129 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
     assert "role_entries" in default_result["onboard_route_guide"]
     assert "capability_index" in default_result["onboard_route_guide"]
     assert "system_operation_index" in default_result["onboard_route_guide"]
+
+
+def test_onboard_route_guide_suppresses_direct_fix_for_no_direct_fix_backlog(conn):
+    backlog_id = "AC-ONBOARD-NO-DIRECT-FIX-POLICY"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET bypass_policy_json = ?,
+               chain_trigger_json = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(
+                {
+                    "no_direct_fix": True,
+                    "historical_source_resume": False,
+                }
+            ),
+            json.dumps(
+                {
+                    "no_direct_fix": True,
+                    "no_historical_source_resume": True,
+                    "after_merge": (
+                        "full_reconcile_then_resume_frozen_nonhistorical_candidate"
+                    ),
+                }
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": "rtok-onboard-no-direct-fix",
+            },
+        )
+    )
+
+    guide = result["onboard_route_guide"]
+    policy = guide["direct_fix_policy"]
+    assert policy["allowed"] is False
+    assert policy["reason"] == "no_direct_fix"
+    assert policy["historical_source_resume"] is False
+    assert policy["post_reconcile_action"] == (
+        "full_reconcile_then_resume_frozen_nonhistorical_candidate"
+    )
+    assert "direct_fix_enter" not in guide["interface_index"]
+    assert "direct_fix" not in guide["backlog_chain_binding"]["create_successor"]
+    assert "direct_fix_topology_guidance" not in guide
+    assert "direct_fix_topology_guidance" not in guide["capability_index"][
+        "query_returns"
+    ]
+    assert "direct_fix_enter" not in guide["capability_index"]["interfaces"]
+    assert "direct_fix_branch_service_takeover" not in guide[
+        "system_operation_index"
+    ]["operations"]
+    assert "direct_fix" not in {
+        item["contract_id"]
+        for item in guide["role_entries"]["observer"]["next_contracts"]
+    }
+    assert "direct_fix_enter" not in guide[
+        "observer_session_route_token_checklist"
+    ]["required_before"]
+
+    agent_guidance = result["agent_onboard_guidance"]
+    assert "direct_fix_enter" not in agent_guidance["entrypoints"]
+    assert agent_guidance["direct_fix_policy"] == policy
+    assert "direct_fix_enter" not in agent_guidance["route_token_issue"][
+        "allowed_actions"
+    ]
+    serialized = json.dumps(result, sort_keys=True)
+    assert "blocked_parent_successor_return_to_parent" not in serialized
+    assert '"return_to_parent_required"' not in serialized
+
+
+def test_direct_fix_topology_guidance_terminalizes_bypass_without_source_backedge():
+    guidance = server._direct_fix_topology_guidance()
+
+    terminal = guidance["classifications"][1]
+    assert terminal["id"] == "terminal_bypass_source_independent_root_repair"
+    assert terminal["source_terminal_disposition"] == (
+        "WAIVED/completed_with_exception"
+    )
+    assert terminal["source_scheduler_eligible"] is False
+    assert terminal["direct_fix_successor"] is False
+    assert terminal["repair_backlog"] == "separate_bounded_root_row"
+    assert guidance["failed_qa_rework_policy"] == {
+        "worker": "same authenticated worker",
+        "action": "revise the current candidate in its owned-file fence",
+        "qa": "register a fresh independent QA graph after the revision",
+        "successor_repair_allowed": False,
+    }
+    bypass_policy = guidance["audited_bypass_policy"]
+    assert bypass_policy["source_status_may_become_fixed"] is False
+    assert bypass_policy["root_repair_requires_source_batch_full_reconcile"] is True
+    assert bypass_policy["fresh_validation_generation_required_after_repair"] is True
+    assert bypass_policy["forbidden_backedges"] == [
+        "resume_original_contract",
+        "return_to_parent",
+        "parent_to_resume",
+        "retry_source_backlog_close_after_repair",
+        "retry_historical_source_backlog_close",
+    ]
+
+    projection = dict(guidance)
+    projection["audited_bypass_policy"] = dict(bypass_policy)
+    projection["audited_bypass_policy"].pop("forbidden_backedges")
+    serialized_legal_guidance = json.dumps(projection, sort_keys=True)
+    for forbidden in bypass_policy["forbidden_backedges"]:
+        assert forbidden not in serialized_legal_guidance
+    branch_validation = json.dumps(
+        guidance["branch_service_validation"], sort_keys=True
+    )
+    assert "returning to parent" not in branch_validation
+    assert "re-enter the parent backlog row" not in branch_validation
 
 
 def test_onboard_route_guide_service_guidance_matches_selected_worker_and_qa_roles(conn):
@@ -53190,7 +53313,7 @@ def test_onboard_route_guide_service_continues_blocked_candidate_with_audited_by
         "contract_template_id": "direct_fix.v1",
     }
     assert direct_fix_successor["guide"]["classifications"][1]["id"] == (
-        "blocked_parent_successor_return_to_parent"
+        "terminal_bypass_source_independent_root_repair"
     )
 
 
@@ -55855,7 +55978,7 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(
     assert takeover["canonical_port_required"] is True
     assert takeover["state_sharing"] == "reuse_existing_shared_volume"
     assert (
-        "do_not_treat_a_side_port_branch_service_as_parent_resume_unless_clients_are_rebound"
+        "do_not_treat_a_side_port_branch_service_as_canonical_validation_unless_clients_are_rebound"
         in takeover["forbidden_shortcuts"]
     )
     assert onboard["next_legal_action"]["id"] == "resume_parent_after_successor_return"

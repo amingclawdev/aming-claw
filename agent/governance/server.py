@@ -3315,7 +3315,7 @@ def _copy_safe_route_token_scope_payload(
 
 def _direct_fix_topology_guidance() -> dict[str, Any]:
     return {
-        "schema_version": "onboard_route_guide.direct_fix_topology_guidance.v1",
+        "schema_version": "onboard_route_guide.direct_fix_topology_guidance.v2",
         "default_entrypoint": "direct_fix_enter",
         "classifications": [
             {
@@ -3329,14 +3329,21 @@ def _direct_fix_topology_guidance() -> dict[str, Any]:
                 "merge_policy": "single_branch_direct_merge_after_evidence",
             },
             {
-                "id": "blocked_parent_successor_return_to_parent",
+                "id": "terminal_bypass_source_independent_root_repair",
                 "applies_when": (
-                    "a source-backed parent contract is blocked or failed QA and "
-                    "must be repaired by a child successor"
+                    "an audited bypass source has completed independent QA, its "
+                    "frozen batch has merged in order, and the batch current-HEAD "
+                    "full reconcile is active"
                 ),
-                "entrypoint": "direct_fix_enter",
-                "requires_parent_contract_execution_id": True,
-                "return_to_parent_required": True,
+                "source_terminal_disposition": "WAIVED/completed_with_exception",
+                "source_scheduler_eligible": False,
+                "entrypoint": "independently_filed_bounded_repair_row",
+                "direct_fix_successor": False,
+                "repair_backlog": "separate_bounded_root_row",
+                "repair_starts_after_source_batch_full_reconcile": True,
+                "after_repair_batch_full_reconcile": (
+                    "start a fresh validation generation from its first scenario"
+                ),
             },
             {
                 "id": "multi_parallel_merge_queue",
@@ -3346,9 +3353,34 @@ def _direct_fix_topology_guidance() -> dict[str, Any]:
                 ),
                 "entrypoints": ["mf_parallel_enter", "mf_batch_parallel_enter"],
                 "merge_queue_required": True,
-                "direct_fix_role": "repair blocked parent/child lane only",
+                "batch_policy": (
+                    "freeze independently QA-passed candidates, merge them in "
+                    "batch order, then run one current-HEAD full reconcile"
+                ),
             },
         ],
+        "failed_qa_rework_policy": {
+            "worker": "same authenticated worker",
+            "action": "revise the current candidate in its owned-file fence",
+            "qa": "register a fresh independent QA graph after the revision",
+            "successor_repair_allowed": False,
+        },
+        "audited_bypass_policy": {
+            "source_terminal_disposition": "WAIVED/completed_with_exception",
+            "source_scheduler_eligible": False,
+            "source_status_may_become_fixed": False,
+            "root_repair_requires_separate_bounded_row": True,
+            "root_repair_requires_source_batch_full_reconcile": True,
+            "fresh_validation_generation_required_after_repair": True,
+            "any_bypass_discards_entire_generation": True,
+            "forbidden_backedges": [
+                "resume_original_contract",
+                "return_to_parent",
+                "parent_to_resume",
+                "retry_source_backlog_close_after_repair",
+                "retry_historical_source_backlog_close",
+            ],
+        },
         "progress_audit_before_stopping_or_replacing_worker": {
             "required": True,
             "checks": [
@@ -69299,36 +69331,41 @@ def _onboard_missing_backlog_error_details(
 
 def _direct_fix_branch_service_takeover_guidance() -> dict[str, Any]:
     return {
-        "schema_version": "onboard_route_guide.branch_service_takeover.v1",
+        "schema_version": "onboard_route_guide.branch_service_takeover.v2",
         "id": "direct_fix_branch_service_takeover",
-        "purpose": "run QA-passed direct-fix branch code before returning to parent",
+        "purpose": (
+            "run a QA-passed independent repair candidate before ordered "
+            "integration and current-HEAD full reconcile"
+        ),
         "canonical_port_required": True,
         "canonical_port": 40000,
         "state_sharing": "reuse_existing_shared_volume",
         "steps": [
-            "confirm direct-fix implementation and independent QA have passed",
+            "confirm the independently filed repair row and independent QA have passed",
             "stop the current governance process bound to canonical port 40000",
-            "start governance from the direct-fix worktree on canonical port 40000",
+            "start governance from the repair worktree on canonical port 40000",
             "reuse the existing shared-volume state so contract/runtime lineage remains visible",
-            "re-enter the parent backlog row through onboard_route_guide",
+            "verify the repair row guide contains no source-row scheduling backedge",
+            "integrate the frozen repair candidate in order and run one current-HEAD full reconcile",
         ],
         "forbidden_shortcuts": [
             "do_not_use_governance_redeploy_until_worktree_isolated_redeploy_exists",
             "do_not_checkout_the_shared_operator_worktree_to_the_direct_fix_commit",
-            "do_not_treat_a_side_port_branch_service_as_parent_resume_unless_clients_are_rebound",
+            "do_not_treat_a_side_port_branch_service_as_canonical_validation_unless_clients_are_rebound",
             "do_not_merge_direct_fix_before_merge_queue_unless_operator_explicitly_approves",
+            "do_not_schedule_an_audited_bypass_source_again",
         ],
         "safe_when": [
-            "direct_fix_branch_clean",
+            "repair_branch_clean",
             "main_worktree_clean_or_dirty_scope_recorded",
             "operator_approval_recorded",
             "qa_pass_evidence_recorded",
             "mcp_and_onboard_clients_continue_to_target_canonical_port",
         ],
         "verification": [
-            "GET /api/health reports the direct-fix commit version",
-            "runtime_status reports governance.version at the direct-fix commit",
-            "onboard_route_guide for the parent row returns the expected runtime_resume",
+            "GET /api/health reports the repair candidate commit version",
+            "runtime_status reports governance.version at the repair candidate commit",
+            "onboard_route_guide for the repair row exposes no historical source-row backedge",
         ],
     }
 
@@ -69664,6 +69701,7 @@ def _onboard_contract_route_guide(
     contract_execution_id = str(record.get("contract_execution_id") or "")
     route_token_ref = str(record.get("route_token_ref") or "")
     metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+    no_direct_fix = metadata.get("no_direct_fix") is True
     legacy_onboard_contract_waived = bool(metadata.get("legacy_onboard_contract_waived"))
     service_source = str(metadata.get("service_source") or "").strip()
     if not service_source:
@@ -70430,7 +70468,7 @@ def _onboard_contract_route_guide(
         },
         "source_of_authority": "ContractRuntime",
     }
-    return {
+    guide = {
         "schema_version": "onboard_contract.route_guide_service.v1",
         "service": {
             "id": "onboard_route_guide",
@@ -70784,6 +70822,76 @@ def _onboard_contract_route_guide(
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
+    if no_direct_fix:
+        direct_fix_policy = {
+            "schema_version": "onboard_route_guide.direct_fix_policy.v1",
+            "allowed": False,
+            "source": str(
+                metadata.get("direct_fix_policy_source")
+                or "backlog_bypass_policy"
+            ),
+            "reason": "no_direct_fix",
+            "historical_source_resume": False,
+            "next_action": (
+                "continue only the current independently filed repair row; "
+                "after independent QA, ordered integration, and an activated "
+                "current-HEAD full reconcile, perform only the row-declared "
+                "nonhistorical successor activity"
+            ),
+        }
+        post_reconcile_action = str(
+            metadata.get("post_reconcile_action") or ""
+        ).strip()
+        if post_reconcile_action:
+            direct_fix_policy["post_reconcile_action"] = post_reconcile_action
+
+        guide["direct_fix_policy"] = direct_fix_policy
+        guide["interface_index"].pop("direct_fix_enter", None)
+        guide["backlog_chain_binding"]["create_successor"].pop(
+            "direct_fix", None
+        )
+        observer_entry = guide["role_entries"]["observer"]
+        observer_entry["next_contracts"] = [
+            item
+            for item in observer_entry["next_contracts"]
+            if str(item.get("contract_id") or "") != DIRECT_FIX_CONTRACT_ID
+        ]
+        guide["capability_index"]["query_returns"] = [
+            item
+            for item in guide["capability_index"]["query_returns"]
+            if item != "direct_fix_topology_guidance"
+        ]
+        guide["capability_index"]["interfaces"] = [
+            item
+            for item in guide["capability_index"]["interfaces"]
+            if item != "direct_fix_enter"
+        ]
+        guide["capability_index"]["index_paths"].pop(
+            "direct_fix_topology_guidance", None
+        )
+        guide["system_operation_index"]["operations"].pop(
+            "direct_fix_branch_service_takeover", None
+        )
+        guide.pop("direct_fix_topology_guidance", None)
+        required_before = guide["guide_steps"][2].get("required_before")
+        if isinstance(required_before, list):
+            guide["guide_steps"][2]["required_before"] = [
+                action
+                for action in required_before
+                if action != "direct_fix_enter"
+            ]
+        checklist_required = guide[
+            "observer_session_route_token_checklist"
+        ].get("required_before")
+        if isinstance(checklist_required, list):
+            guide["observer_session_route_token_checklist"][
+                "required_before"
+            ] = [
+                action
+                for action in checklist_required
+                if action != "direct_fix_enter"
+            ]
+    return guide
 
 
 def _onboard_contract_agent_guidance(
@@ -70797,6 +70905,12 @@ def _onboard_contract_agent_guidance(
     backlog_id = str(record.get("backlog_id") or "")
     contract_execution_id = str(record.get("contract_execution_id") or "")
     route_token_ref = str(record.get("route_token_ref") or "")
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    no_direct_fix = metadata.get("no_direct_fix") is True
     requested_role = str(
         selected_role or next_legal_action.get("role") or "observer"
     ).strip()
@@ -70815,6 +70929,10 @@ def _onboard_contract_agent_guidance(
             else _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS
         )
     )
+    if no_direct_fix:
+        allowed_actions = [
+            action for action in allowed_actions if action != "direct_fix_enter"
+        ]
     issue_payload = {
         "project_id": project_id,
         "caller_role": "observer",
@@ -71068,7 +71186,7 @@ def _onboard_contract_agent_guidance(
     route_token_ref_guidance.setdefault("renewal", renewal_guidance)
     route_token_ref_guidance.setdefault("route_token_ref_renewal", renewal_guidance)
     route_token_issue.setdefault("renewal", renewal_guidance)
-    return {
+    guidance = {
         "schema_version": "onboard_contract.agent_onboard_guidance.v1",
         "role": requested_role,
         "actor_role": requested_role,
@@ -71156,6 +71274,12 @@ def _onboard_contract_agent_guidance(
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
+    if no_direct_fix:
+        guidance["entrypoints"].pop("direct_fix_enter", None)
+        guidance["direct_fix_policy"] = dict(
+            route_guide.get("direct_fix_policy") or {}
+        )
+    return guidance
 
 
 def _onboard_route_guide_target_contract_execution_id(
@@ -72344,6 +72468,30 @@ def _onboard_route_guide_service_response(
         preexisting_projection
     )
     backlog_row_status = _backlog_row_status_for_onboard_route(conn, backlog_id)
+    backlog_policy_row = conn.execute(
+        """
+        SELECT bypass_policy_json, chain_trigger_json
+          FROM backlog_bugs
+         WHERE bug_id = ?
+        """,
+        (backlog_id,),
+    ).fetchone()
+    bypass_policy = backlog_runtime.parse_json_object(
+        _row_get(backlog_policy_row, "bypass_policy_json", "{}")
+    )
+    chain_trigger = backlog_runtime.parse_json_object(
+        _row_get(backlog_policy_row, "chain_trigger_json", "{}")
+    )
+    no_direct_fix = (
+        bypass_policy.get("no_direct_fix") is True
+        or chain_trigger.get("no_direct_fix") is True
+    )
+    historical_source_resume = bypass_policy.get("historical_source_resume")
+    if (
+        historical_source_resume is None
+        and chain_trigger.get("no_historical_source_resume") is True
+    ):
+        historical_source_resume = False
     record = _onboard_service_materialize_parent_record(
         conn,
         project_id=project_id,
@@ -72398,6 +72546,18 @@ def _onboard_route_guide_service_response(
     record["metadata"] = {
         **dict(record.get("metadata") or {}),
         "route_token_issue_target_files": target_files,
+        "no_direct_fix": no_direct_fix,
+        "direct_fix_policy_source": (
+            "backlog_bypass_policy"
+            if bypass_policy.get("no_direct_fix") is True
+            else "backlog_chain_trigger"
+        )
+        if no_direct_fix
+        else "",
+        "historical_source_resume": historical_source_resume,
+        "post_reconcile_action": str(
+            chain_trigger.get("after_merge") or ""
+        ).strip(),
     }
     runtime_resume = {}
     if current_projection and not projection_degraded:
