@@ -44,6 +44,7 @@ from agent.governance.contracts.instructions import resolve_instruction_bundle
 from agent.governance.contracts import write_gate as contract_write_gate
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
+    _active_failed_qa_line,
     _contract_completion_satisfying_lines,
     _line_status_allows_contract_completion,
     _mf_parallel_worker_commit_errors,
@@ -33744,6 +33745,18 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         ),
         now_iso="2026-07-06T02:00:00Z",
     )
+    prior_session_token_ref = runtime_context_session_token_ref(runtime_context)
+    prior_rejoin_identity = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": runtime_context.parent_task_id,
+        "worker_id": runtime_context.worker_id,
+        "worker_slot_id": runtime_context.worker_slot_id,
+        "fence_token": runtime_context.fence_token,
+        "head_commit": runtime_context.head_commit,
+        "target_project_root": runtime_context.target_project_root,
+        "owned_files": tuple(runtime_context.owned_files),
+    }
 
     current = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
@@ -33902,6 +33915,19 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     assert saved is not None
     assert saved.status == STATE_WORKTREE_READY
     assert saved.last_recovery_action == "mf_subagent_failed_qa_revision_rejoin_issued"
+    assert result["session_token_ref"] != prior_session_token_ref
+    assert runtime_context_session_token_ref(saved) == result["session_token_ref"]
+    assert {
+        "runtime_context_id": saved.runtime_context_id,
+        "task_id": saved.task_id,
+        "parent_task_id": saved.parent_task_id,
+        "worker_id": saved.worker_id,
+        "worker_slot_id": saved.worker_slot_id,
+        "fence_token": saved.fence_token,
+        "head_commit": saved.head_commit,
+        "target_project_root": saved.target_project_root,
+        "owned_files": tuple(saved.owned_files),
+    } == prior_rejoin_identity
 
     revision_before_duplicate_read = server._contract_runtime(conn).store.get(
         successor["contract_execution_id"]
@@ -36571,6 +36597,14 @@ def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_with
                 "task_id": "worker-canonical-rejoin",
                 "parent_task_id": "stale-parent-alias",
             },
+            False,
+        ),
+        (
+            {
+                "runtime_context_id": "mfrctx-canonical-rejoin",
+                "task_id": "worker-canonical-rejoin",
+                "parent_task_id": "parent-canonical-rejoin",
+            },
             True,
         ),
         (
@@ -36591,7 +36625,7 @@ def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_with
         ({}, False),
     ],
 )
-def test_failed_qa_rejoin_requires_exact_runtime_and_task_identity(
+def test_failed_qa_rejoin_requires_exact_runtime_task_and_parent_identity(
     failed_line,
     matches,
 ):
@@ -55236,10 +55270,15 @@ def _known_baseline_accepted_qa_record() -> dict:
         }
         if not graph:
             result["completion_status_gate"] = {
+                "schema_version": (
+                    "contract_runtime.qa_completion_status_gate.v1"
+                ),
+                "source": "contract_runtime_line_write_normalization",
                 "server_derived": True,
                 "top_level_status_present": True,
                 "top_level_status_passing": True,
                 "normalized_status": "accepted",
+                "nested_payload_decision_satisfies": False,
             }
         return result
 
@@ -55249,6 +55288,7 @@ def _known_baseline_accepted_qa_record() -> dict:
         "evidence_kind": "graph_trace",
         "authorization_source": "qa_session_token_ref",
         "observer_impersonation": False,
+        "parent_materialization_authorized": False,
         "commit_sha": candidate_commit,
         "qa_evidence_provenance": provenance(graph=True),
         "payload": {
@@ -55270,6 +55310,7 @@ def _known_baseline_accepted_qa_record() -> dict:
         "parent_task_id": "cex-known-baseline-qa-selection",
         "authorization_source": "qa_session_token_ref",
         "observer_impersonation": False,
+        "parent_materialization_authorized": False,
         "commit_sha": candidate_commit,
         "status": "accepted",
         "verdict": "accepted",
@@ -55287,6 +55328,13 @@ def _known_baseline_accepted_qa_record() -> dict:
             "no_pass_claim": True,
             "overall_release_pass_claimed": False,
             "test_results": {
+                "status": "accepted",
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "no_pass_claim": True,
+                "passed": False,
+                "overall_release_pass": False,
+                "overall_release_pass_claimed": False,
                 "baseline": {"failed": len(failures)},
                 "candidate": {"failed": len(failures), "passed": 741},
             },
@@ -55300,7 +55348,7 @@ def _known_baseline_accepted_qa_record() -> dict:
             "overall_release_pass": False,
             "overall_release_pass_claimed": False,
             "baseline": {"failed": len(failures)},
-            "full_module": {"failed": len(failures), "passed": 741},
+            "candidate": {"failed": len(failures), "passed": 741},
         },
         "verification": {
             "status": "accepted",
@@ -55315,6 +55363,7 @@ def _known_baseline_accepted_qa_record() -> dict:
                 "schema_version": (
                     "contract_runtime.external_no_pass_baseline_ledger.v2"
                 ),
+                "server_normalized": True,
                 "base_commit_sha": base_commit,
                 "candidate_commit_sha": candidate_commit,
                 "base_failure_identities": failures,
@@ -55337,18 +55386,50 @@ def _known_baseline_accepted_qa_record() -> dict:
             }
         },
     }
+    worker_commit = {
+        "stage_id": "worker_commit",
+        "line_id": "worker_commit",
+        "actor_role": "mf_sub",
+        "evidence_kind": "worker_commit",
+        "runtime_context_id": "mfrctx-known-baseline-qa-selection",
+        "task_id": "worker-known-baseline-qa-selection",
+        "parent_task_id": "cex-known-baseline-qa-selection",
+        "worker_role": "mf_sub",
+        "worker_id": "worker-known-baseline-qa-selection",
+        "worker_slot_id": "worker-known-baseline-qa-selection",
+        "fence_token_hash": runtime_context_secret_hash(
+            "fence-known-baseline-qa-selection"
+        ),
+        "commit_sha": candidate_commit,
+        "payload": {
+            "runtime_context_id": "mfrctx-known-baseline-qa-selection",
+            "task_id": "worker-known-baseline-qa-selection",
+            "parent_task_id": "cex-known-baseline-qa-selection",
+            "worker_role": "mf_sub",
+            "worker_id": "worker-known-baseline-qa-selection",
+            "worker_slot_id": "worker-known-baseline-qa-selection",
+            "fence_token_hash": runtime_context_secret_hash(
+                "fence-known-baseline-qa-selection"
+            ),
+            "worker_commit_sha": candidate_commit,
+            "head_commit": candidate_commit,
+            "immutable_head_commit": candidate_commit,
+            "validated_head_commit": candidate_commit,
+        },
+    }
     return {
         "project_id": PID,
         "backlog_id": "AC-KNOWN-BASELINE-QA-SELECTION",
         "contract_execution_id": "cex-known-baseline-qa-selection",
         "contract_id": "mf_parallel.v2",
-        "completed_lines": [graph_line, qa_line],
+        "completed_lines": [worker_commit, graph_line, qa_line],
     }
 
 
 def _known_baseline_failed_qa_revision_evidence(
     monkeypatch,
     record: dict,
+    **context_overrides,
 ) -> dict:
     monkeypatch.setattr(
         server,
@@ -55360,18 +55441,26 @@ def _known_baseline_failed_qa_revision_evidence(
     monkeypatch.setattr(
         server,
         "_contract_runtime_dispatch_line_match",
-        lambda _record, _context: {"source_ref": "contract_runtime:dispatch"},
+        lambda _record, _context: {
+            "source_ref": "contract_runtime:dispatch",
+        },
     )
-    context = SimpleNamespace(
-        status=STATE_WORKTREE_READY,
-        last_recovery_action="mf_subagent_failed_qa_revision_rejoin_issued",
-        attempt=2,
-        retry_round=1,
-        backlog_id=record["backlog_id"],
-        runtime_context_id="mfrctx-known-baseline-qa-selection",
-        task_id="worker-known-baseline-qa-selection",
-        parent_task_id=record["contract_execution_id"],
-    )
+    context_values = {
+        "status": STATE_WORKTREE_READY,
+        "last_recovery_action": "mf_subagent_failed_qa_revision_rejoin_issued",
+        "attempt": 2,
+        "retry_round": 1,
+        "backlog_id": record["backlog_id"],
+        "runtime_context_id": "mfrctx-known-baseline-qa-selection",
+        "task_id": "worker-known-baseline-qa-selection",
+        "parent_task_id": record["contract_execution_id"],
+        "worker_id": "worker-known-baseline-qa-selection",
+        "worker_slot_id": "worker-known-baseline-qa-selection",
+        "fence_token": "fence-known-baseline-qa-selection",
+        "head_commit": "b" * 40,
+    }
+    context_values.update(context_overrides)
+    context = SimpleNamespace(**context_values)
     return server._runtime_context_failed_qa_revision_contract_runtime_evidence(
         object(),
         project_id=PID,
@@ -55392,6 +55481,278 @@ def test_latest_failed_qa_ignores_authenticated_exact_known_baseline_acceptance(
     ) is True
     assert server._contract_runtime_latest_failed_qa_line(record) == {}
     assert _known_baseline_failed_qa_revision_evidence(monkeypatch, record) == {}
+
+
+def test_accepted_no_pass_completion_mismatch_projects_exact_failed_qa_rejoin(
+    monkeypatch,
+):
+    record = _known_baseline_accepted_qa_record()
+    qa_line = record["completed_lines"][-1]
+    qa_line["test_results"]["baseline"]["failed"] = 3
+    qa_line["payload"]["test_results"]["baseline"]["failed"] = 3
+
+    # The legacy server-side no-PASS shape remains intentionally narrower than
+    # the canonical ContractRuntime completion decision. Runtime Context must
+    # select the latter as its source of authority.
+    assert server._contract_runtime_known_baseline_qa_acceptance(
+        qa_line,
+        record=record,
+    ) is True
+    failed_index, failed_line = _active_failed_qa_line(
+        record["completed_lines"],
+        source_record=record,
+    )
+    assert failed_index == 2
+    assert failed_line is qa_line
+
+    selected = server._contract_runtime_latest_failed_qa_line(record)
+    assert selected["_completed_line_index"] == 2
+    assert selected["_failure_selection_source"] == (
+        "ContractRuntime.active_failed_qa_completion_state"
+    )
+    revision = _known_baseline_failed_qa_revision_evidence(
+        monkeypatch,
+        record,
+    )
+    assert revision["status"] == "revision_required"
+    binding = revision["identity_binding"]
+    assert binding["accepted_no_pass_completion_failure"] is True
+    assert binding["runtime_context_id"] == (
+        "mfrctx-known-baseline-qa-selection"
+    )
+    assert binding["task_id"] == "worker-known-baseline-qa-selection"
+    assert binding["parent_task_id"] == "cex-known-baseline-qa-selection"
+    assert binding["worker_id"] == "worker-known-baseline-qa-selection"
+    assert binding["candidate_commit_sha"] == "b" * 40
+    assert binding["fence_token_hash"] == runtime_context_secret_hash(
+        "fence-known-baseline-qa-selection"
+    )
+    assert binding["binding_hash"].startswith("sha256:")
+
+
+def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-ACCEPTED-NO-PASS-REV19-REJOIN"
+    target_root = tmp_path / "accepted-no-pass-rev19-rejoin"
+    worker_head_commit = _init_test_git_repo(target_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: target_root,
+    )
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="accepted-no-pass-rev19-parent",
+        worker_task_id="accepted-no-pass-rev19-worker",
+        fence_token="fence-accepted-no-pass-rev19",
+        token="token-accepted-no-pass-rev19",
+        worktree_path=str(target_root),
+        base_commit=worker_head_commit,
+    )
+    worker_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token=runtime_context.fence_token,
+        graph_trace_id="gqt-accepted-no-pass-rev19-worker",
+        head_commit=worker_head_commit,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id="gqt-accepted-no-pass-rev19-worker",
+        head_commit=worker_head_commit,
+        implementation_event_ref=f"timeline:{worker_events['implementation']}",
+    )
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(
+            runtime_context,
+            status=STATE_VALIDATED,
+            attempt=1,
+            retry_round=0,
+        ),
+        now_iso="2026-07-24T01:00:00Z",
+    )
+    prior_session_ref = runtime_context_session_token_ref(runtime_context)
+    prior_identity = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": runtime_context.parent_task_id,
+        "worker_id": runtime_context.worker_id,
+        "worker_slot_id": runtime_context.worker_slot_id,
+        "fence_token": runtime_context.fence_token,
+        "head_commit": runtime_context.head_commit,
+        "target_project_root": runtime_context.target_project_root,
+        "owned_files": tuple(runtime_context.owned_files),
+    }
+
+    failures = [f"test_live_baseline_{index:02d}" for index in range(19)]
+    qa_line = copy.deepcopy(_known_baseline_accepted_qa_record()["completed_lines"][-1])
+    qa_line.update(
+        {
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": backlog_id,
+            "commit_sha": worker_head_commit,
+        }
+    )
+    qa_line["payload"].update(
+        {
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": backlog_id,
+        }
+    )
+    for results in (
+        qa_line["test_results"],
+        qa_line["payload"]["test_results"],
+    ):
+        results["baseline"] = {"failed": 20}
+        results["candidate"] = {"failed": 19, "passed": 741}
+    ledger = qa_line["artifact_refs"]["external_no_pass_baseline_ledger"]
+    ledger.update(
+        {
+            "base_commit_sha": runtime_context.base_commit,
+            "candidate_commit_sha": worker_head_commit,
+            "base_failure_identities": failures,
+            "candidate_failure_identities": failures,
+            "base_reproduction": {
+                "reproduced": 19,
+                "total": 19,
+                "failure_identities": failures,
+            },
+            "candidate_suite_counts": {
+                "baseline_known_non_green": 19,
+                "failed": 19,
+                "passed": 741,
+            },
+        }
+    )
+
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(successor["contract_execution_id"])
+    updated = dict(record)
+    updated["completed_lines"] = [*list(record["completed_lines"]), qa_line]
+    updated["execution_state_revision"] = int(record["execution_state_revision"]) + 1
+    runtime.store.update(successor["contract_execution_id"], updated)
+    runtime.current_guide(
+        successor["contract_execution_id"],
+        actor_role="mf_sub",
+    )
+    persisted = runtime.store.get(successor["contract_execution_id"])
+    assert persisted["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "worker_read_runtime_guide"
+    )
+    assert server._contract_runtime_latest_failed_qa_line(persisted)[
+        "_completed_line_index"
+    ] == len(persisted["completed_lines"]) - 1
+    selected_failed_qa = server._contract_runtime_latest_failed_qa_line(
+        persisted
+    )
+    dispatch_match = server._contract_runtime_dispatch_line_match(
+        persisted,
+        runtime_context,
+    )
+    assert dispatch_match
+    accepted_binding = (
+        server._runtime_context_failed_qa_accepted_line_binding(
+            persisted,
+            selected_failed_qa,
+            context=runtime_context,
+            dispatch_match=dispatch_match,
+        )
+    )
+    assert accepted_binding["accepted_no_pass_completion_failure"] is True
+    direct_revision = (
+        server._runtime_context_failed_qa_revision_contract_runtime_evidence(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+        )
+    )
+    assert direct_revision["status"] == "revision_required"
+    assert direct_revision["identity_binding"][
+        "accepted_no_pass_completion_failure"
+    ] is True
+
+    rejoin = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "target_project_root": str(target_root),
+                "reason": "accepted no-PASS rev19 completion mismatch requires revision",
+                "now_iso": "2999-07-24T01:01:00Z",
+            },
+        )
+    )
+
+    assert rejoin["reopen_for_revision"] is True
+    assert rejoin["timeline_reopen_for_revision"] is False
+    projected = rejoin["contract_runtime_failed_qa_revision"]
+    assert projected["status"] == "revision_required"
+    assert projected["identity_binding"][
+        "accepted_no_pass_completion_failure"
+    ] is True
+    assert projected["identity_binding"]["candidate_commit_sha"] == (
+        worker_head_commit
+    )
+    saved = get_branch_context(conn, PID, runtime_context.task_id)
+    assert saved is not None
+    assert rejoin["session_token_ref"] != prior_session_ref
+    assert runtime_context_session_token_ref(saved) == rejoin["session_token_ref"]
+    assert {
+        "runtime_context_id": saved.runtime_context_id,
+        "task_id": saved.task_id,
+        "parent_task_id": saved.parent_task_id,
+        "worker_id": saved.worker_id,
+        "worker_slot_id": saved.worker_slot_id,
+        "fence_token": saved.fence_token,
+        "head_commit": saved.head_commit,
+        "target_project_root": saved.target_project_root,
+        "owned_files": tuple(saved.owned_files),
+    } == prior_identity
+
+
+@pytest.mark.parametrize(
+    "context_overrides",
+    [
+        {"runtime_context_id": "mfrctx-wrong"},
+        {"task_id": "worker-wrong"},
+        {"parent_task_id": "parent-wrong"},
+        {"worker_id": "worker-wrong"},
+        {"worker_slot_id": "worker-wrong"},
+        {"fence_token": "fence-wrong"},
+        {"head_commit": "c" * 40},
+    ],
+)
+def test_accepted_no_pass_failed_qa_rejoin_binding_fails_closed(
+    monkeypatch,
+    context_overrides,
+):
+    record = _known_baseline_accepted_qa_record()
+    qa_line = record["completed_lines"][-1]
+    qa_line["test_results"]["baseline"]["failed"] = 3
+    qa_line["payload"]["test_results"]["baseline"]["failed"] = 3
+
+    assert _known_baseline_failed_qa_revision_evidence(
+        monkeypatch,
+        record,
+        **context_overrides,
+    ) == {}
 
 
 @pytest.mark.parametrize(
@@ -55444,13 +55805,13 @@ def test_latest_failed_qa_keeps_noncanonical_or_candidate_failure_fail_closed(
     ) is False
     selected = server._contract_runtime_latest_failed_qa_line(record)
     assert selected["line_id"] == "qa_independent_verification"
-    assert selected["_completed_line_index"] == 1
+    assert selected["_completed_line_index"] == 2
     revision = _known_baseline_failed_qa_revision_evidence(
         monkeypatch,
         record,
     )
     assert revision["status"] == "revision_required"
-    assert revision["failed_qa_source_ref"].endswith("completed_lines:1")
+    assert revision["failed_qa_source_ref"].endswith("completed_lines:2")
 
 
 def test_direct_fix_enter_accepts_blocked_onboard_service_parent(conn):
