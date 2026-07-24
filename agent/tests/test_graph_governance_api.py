@@ -64156,6 +64156,441 @@ def test_same_lane_worker_commit_revision_is_append_only_and_advances_to_attesta
     assert canonical_line["commit_sha"] == repair_commit
 
 
+def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fresh_qa(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-POST-QA-MERGE-CONFLICT-SAME-LANE-REVISION"
+    worker_task_id = "post-qa-merge-conflict-same-lane-worker"
+    worktree = tmp_path / worker_task_id
+    worktree.mkdir()
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "worker@example.test"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Worker Commit Test"],
+        cwd=worktree,
+        check=True,
+    )
+    owned = worktree / "agent" / "governance" / "server.py"
+    owned.parent.mkdir(parents=True)
+    owned.write_text("base\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True)
+    base_commit = batch_jobs.git_commit(worktree)
+    subprocess.run(
+        ["git", "switch", "-c", "candidate"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+    )
+    owned.write_text("candidate\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "candidate"],
+        cwd=worktree,
+        check=True,
+    )
+    candidate_commit = batch_jobs.git_commit(worktree)
+    subprocess.run(
+        ["git", "switch", "-c", "target", base_commit],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+    )
+    owned.write_text("target\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "target"],
+        cwd=worktree,
+        check=True,
+    )
+    target_commit = batch_jobs.git_commit(worktree)
+    owned.write_text("target advanced after durable snapshot\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "advance target ref"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "switch", "candidate"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+    )
+    owned.write_text("bounded repair before target merge\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "bounded repair before target merge"],
+        cwd=worktree,
+        check=True,
+    )
+
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="post-qa-merge-conflict-same-lane-parent",
+        worker_task_id=worker_task_id,
+        fence_token="fence-post-qa-merge-conflict-same-lane",
+        token="token-post-qa-merge-conflict-same-lane",
+        worktree_path=str(worktree),
+        target_project_root=str(worktree),
+        base_commit=base_commit,
+    )
+    graph_trace_id = "gqt-post-qa-merge-conflict-same-lane"
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=candidate_commit,
+        implementation_event_ref="timeline:post-qa-merge-conflict-implementation",
+        include_worker_commit=False,
+    )
+    runtime = server._contract_runtime(conn)
+    runtime.current_guide(successor["contract_execution_id"], actor_role="mf_sub")
+    record = runtime.store.get(successor["contract_execution_id"])
+    implementation = server._runtime_context_actual_worker_implementation_line(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+    )[2]
+    _implementation_payload, initial_commit_payload = (
+        _mf_parallel_worker_proof_payloads(
+            runtime_context,
+            parent_task_id=backlog_id,
+            graph_trace_id=graph_trace_id,
+            head_commit=candidate_commit,
+            implementation_event_ref=(
+                "timeline:post-qa-merge-conflict-implementation"
+            ),
+        )
+    )
+    initial_commit_payload.update(
+        {
+            "implementation_lineage_ref": implementation[
+                "implementation_lineage_ref"
+            ],
+            "worker_implementation_lineage": implementation,
+            "commit_parent_sha": base_commit,
+            "diff_base_commit": base_commit,
+        }
+    )
+    initial_write = server._contract_runtime_write_from_record(
+        record,
+        actor_role="mf_sub",
+        stage_id="worker_commit",
+        line_id="worker_commit",
+        evidence_kind="worker_commit",
+    )
+    initial_write.update(initial_commit_payload)
+    initial_write["payload"] = initial_commit_payload
+    assert runtime.submit_line_write(
+        successor["contract_execution_id"],
+        initial_write,
+        actor_role="mf_sub",
+    )["ok"] is True
+
+    stored = runtime.store.get(successor["contract_execution_id"])
+    line_instance_id = f"runtime_context:{runtime_context.runtime_context_id}"
+    downstream_specs = [
+        (
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "record_finish_time_worker_attestation",
+            "mf_sub",
+        ),
+        (
+            "worker_finish",
+            "worker_finish_gate",
+            "mf_subagent_finish_gate",
+            "mf_sub",
+        ),
+        ("qa_graph_context", "qa_graph_context", "graph_trace", "qa"),
+        (
+            "qa",
+            "qa_independent_verification",
+            "independent_verification",
+            "qa",
+        ),
+    ]
+    old_downstream_lines = [
+        {
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "line_instance_id": line_instance_id,
+            "actor_role": actor_role,
+            "evidence_kind": evidence_kind,
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": backlog_id,
+            "commit_sha": candidate_commit,
+            "payload": {
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "status": "passed",
+            },
+        }
+        for stage_id, line_id, evidence_kind, actor_role in downstream_specs
+    ]
+    expected_revision = int(stored["execution_state_revision"])
+    stored["completed_lines"] = [
+        *stored["completed_lines"],
+        *old_downstream_lines,
+    ]
+    stored["execution_state_revision"] = expected_revision + 1
+    runtime.store.update(
+        successor["contract_execution_id"],
+        stored,
+        expected_revision=expected_revision,
+    )
+    runtime.current_guide(successor["contract_execution_id"], actor_role="mf_sub")
+    post_qa_record = runtime.store.get(successor["contract_execution_id"])
+    assert post_qa_record["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "observer_merge"
+    )
+
+    queue_item = MergeQueueItem(
+        project_id=PID,
+        merge_queue_id=runtime_context.merge_queue_id,
+        queue_item_id=f"{runtime_context.merge_queue_id}:item",
+        task_id=runtime_context.task_id,
+        branch_ref=runtime_context.branch_ref,
+        queue_index=0,
+        status="queued_for_merge",
+        backlog_id=backlog_id,
+        target_ref="target",
+        base_commit=base_commit,
+        branch_head=candidate_commit,
+        validated_target_head=target_commit,
+        current_target_head=target_commit,
+    )
+    upsert_merge_queue_item(conn, queue_item)
+    conn.commit()
+
+    assert server._runtime_context_same_lane_worker_commit_recovery(
+        post_qa_record,
+        runtime_context,
+    ) == {}
+    not_qa_ready = server._runtime_context_same_lane_worker_commit_recovery(
+        post_qa_record,
+        runtime_context,
+        conn=conn,
+        project_id=PID,
+        allow_post_qa_merge_conflict_recovery=True,
+    )
+    assert not_qa_ready["status"] == "blocked"
+    assert "not QA-passed merge_ready" in " ".join(not_qa_ready["errors"])
+
+    upsert_merge_queue_item(
+        conn,
+        replace(queue_item, status="merge_ready"),
+    )
+    conn.commit()
+    stale_target = server._runtime_context_same_lane_worker_commit_recovery(
+        post_qa_record,
+        runtime_context,
+        conn=conn,
+        project_id=PID,
+        allow_post_qa_merge_conflict_recovery=True,
+    )
+    assert stale_target["status"] == "blocked"
+    assert "did not reproduce a merge conflict" in " ".join(
+        stale_target["errors"]
+    )
+
+    subprocess.run(
+        ["git", "branch", "-f", "target", target_commit],
+        cwd=worktree,
+        check=True,
+    )
+    missing_target_parent = (
+        server._runtime_context_same_lane_worker_commit_recovery(
+            post_qa_record,
+            runtime_context,
+            conn=conn,
+            project_id=PID,
+            allow_post_qa_merge_conflict_recovery=True,
+        )
+    )
+    assert missing_target_parent["status"] == "blocked"
+    assert "not a descendant of current target parent" in " ".join(
+        missing_target_parent["errors"]
+    )
+
+    merge = subprocess.run(
+        ["git", "merge", "--no-commit", "--no-ff", target_commit],
+        cwd=worktree,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert merge.returncode != 0
+    owned.write_text("resolved candidate and target\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "resolve target merge conflict"],
+        cwd=worktree,
+        check=True,
+    )
+    replacement_commit = batch_jobs.git_commit(worktree)
+    recovery = server._runtime_context_same_lane_worker_commit_recovery(
+        post_qa_record,
+        runtime_context,
+        conn=conn,
+        project_id=PID,
+        allow_post_qa_merge_conflict_recovery=True,
+    )
+    assert recovery["status"] == "eligible"
+    assert recovery["merge_conflict_recovery_authority"][
+        "server_revalidated"
+    ] is True
+    assert recovery["merge_conflict_recovery_authority"][
+        "current_target_parent_commit"
+    ] == target_commit
+    assert recovery["invalidated_completed_line_indices"]
+    assert recovery["fresh_evidence_required"][-1] == "observer_merge"
+
+    replacement_diff = server._runtime_context_worker_commit_revision_diff(
+        str(worktree),
+        replacement_commit,
+        base_commit=base_commit,
+    )
+    replacement_payload = {
+        **initial_commit_payload,
+        "worker_commit_sha": replacement_commit,
+        "commit_sha": replacement_commit,
+        "head_commit": replacement_commit,
+        "immutable_head_commit": replacement_commit,
+        "validated_head_commit": replacement_commit,
+        "commit_parent_sha": replacement_diff["parent_commit"],
+        "diff_base_commit": replacement_diff["base_commit"],
+    }
+    old_completed_lines = copy.deepcopy(post_qa_record["completed_lines"])
+    gate = server._runtime_context_append_same_lane_worker_commit_revision(
+        runtime=runtime,
+        record=post_qa_record,
+        context=runtime_context,
+        payload=replacement_payload,
+        conn=conn,
+        project_id=PID,
+    )
+    assert gate["accepted"] is True
+    after = runtime.store.get(successor["contract_execution_id"])
+    assert after["completed_lines"][:-1] == old_completed_lines
+    revision = after["completed_lines"][-1]["payload"][
+        "canonical_same_lane_repair_head_revision"
+    ]
+    assert revision["server_revalidated_merge_conflict"] is True
+    assert revision["invalidated_completed_line_indices"] == recovery[
+        "invalidated_completed_line_indices"
+    ]
+
+    projected_worker, worker_projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=after,
+            actor_role="mf_sub",
+        )
+    )
+    projected_observer, _observer_projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=after,
+            actor_role="observer",
+        )
+    )
+    assert worker_projection["post_qa_merge_conflict_revision_resets"]
+    assert projected_worker["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "worker_finish_time_attestation"
+    )
+    assert projected_observer["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "worker_finish_time_attestation"
+    )
+    assert all(
+        old_line in after["completed_lines"]
+        for old_line in old_downstream_lines
+    )
+    fresh_attestation_write = server._contract_runtime_write_from_record(
+        projected_worker,
+        actor_role="mf_sub",
+        stage_id="worker_attestation",
+        line_id="worker_finish_time_attestation",
+        evidence_kind="record_finish_time_worker_attestation",
+    )
+    fresh_attestation_write.update(
+        {
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": backlog_id,
+            "commit_sha": replacement_commit,
+            "payload": {
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "status": "passed",
+            },
+        }
+    )
+    fresh_attestation = runtime.submit_line_write(
+        successor["contract_execution_id"],
+        fresh_attestation_write,
+        actor_role="mf_sub",
+        projected_completed_lines=worker_projection[
+            "projected_completed_lines"
+        ],
+        projection=worker_projection,
+    )
+    assert fresh_attestation["ok"] is True
+    after_fresh_attestation = runtime.store.get(
+        successor["contract_execution_id"]
+    )
+    projected_after_fresh, _ = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=after_fresh_attestation,
+            actor_role="mf_sub",
+        )
+    )
+    assert projected_after_fresh["runtime_guide"]["next_legal_action"][
+        "line_id"
+    ] == "worker_finish_gate"
+
+
 def test_runtime_context_worker_guide_ambiguous_resolution_does_not_override(
     conn,
     tmp_path,

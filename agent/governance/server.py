@@ -26896,9 +26896,278 @@ def _runtime_context_actual_worker_commit_line(
     )
 
 
+_POST_QA_MERGE_CONFLICT_RESET_LINE_IDS = frozenset(
+    {
+        "worker_commit",
+        "worker_finish_time_attestation",
+        "worker_finish_gate",
+        "worker_review_ready_handoff",
+        "qa_graph_context",
+        "qa_independent_verification",
+    }
+)
+
+
+def _runtime_context_server_revalidated_merge_conflict_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    recorded_commit: str,
+) -> dict[str, Any]:
+    """Re-run merge preview from durable queue identity, never caller claims."""
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    merge_queue_id = str(
+        getattr(context, "merge_queue_id", "") or ""
+    ).strip()
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    authority: dict[str, Any] = {
+        "schema_version": (
+            "runtime_context.server_revalidated_merge_conflict_authority.v1"
+        ),
+        "status": "blocked",
+        "verified": False,
+        "server_revalidated": False,
+        "server_derived": True,
+        "source": "durable_merge_queue+server_git_merge_preview",
+        "source_of_authority": (
+            "parallel_branch_merge_queue_items+git_merge_preview_evidence"
+        ),
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": backlog_id,
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": "",
+        "recorded_candidate_commit": str(recorded_commit or "").strip(),
+        "current_target_parent_commit": "",
+        "preview_evidence_id": "",
+        "preview_status": "",
+        "preview_reason": "",
+        "errors": [],
+        "raw_preview_output_persisted": False,
+    }
+    errors: list[str] = authority["errors"]
+    if conn is None:
+        errors.append("durable merge queue connection is required")
+        return authority
+    if not all(
+        (
+            project_id,
+            backlog_id,
+            runtime_context_id,
+            task_id,
+            merge_queue_id,
+            worktree_path,
+        )
+    ):
+        errors.append("runtime merge identity is incomplete")
+        return authority
+    if str(record.get("project_id") or "").strip() != str(project_id).strip():
+        errors.append("ContractRuntime project identity mismatch")
+    if str(record.get("backlog_id") or "").strip() != backlog_id:
+        errors.append("ContractRuntime backlog identity mismatch")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", str(recorded_commit or "").strip()):
+        errors.append("recorded candidate commit is not a full SHA")
+    if errors:
+        return authority
+
+    from .parallel_branch_runtime import (
+        STATE_MERGE_READY,
+        git_merge_preview_evidence,
+        list_merge_queue_items,
+    )
+
+    items = list_merge_queue_items(
+        conn,
+        str(project_id).strip(),
+        merge_queue_id,
+    )
+    matches = [item for item in items if str(item.task_id or "").strip() == task_id]
+    if len(matches) != 1:
+        errors.append("durable merge queue task identity is missing or ambiguous")
+        return authority
+    item = matches[0]
+    authority["queue_item_id"] = str(item.queue_item_id or "").strip()
+    if str(item.backlog_id or "").strip() != backlog_id:
+        errors.append("durable merge queue backlog identity mismatch")
+    if str(item.merge_queue_id or "").strip() != merge_queue_id:
+        errors.append("durable merge queue id mismatch")
+    target_ref = str(item.target_ref or "").strip()
+    if not target_ref:
+        errors.append("durable merge queue target ref is missing")
+    context_branch_ref = str(getattr(context, "branch_ref", "") or "").strip()
+    if (
+        context_branch_ref
+        and str(item.branch_ref or "").strip() != context_branch_ref
+    ):
+        errors.append("durable merge queue branch identity mismatch")
+    if str(item.branch_head or "").strip() != str(recorded_commit or "").strip():
+        errors.append("durable merge queue candidate differs from worker_commit")
+    if str(item.status or "").strip() != STATE_MERGE_READY:
+        errors.append("durable merge queue item is not QA-passed merge_ready")
+    target_commit = str(
+        item.current_target_head or item.validated_target_head or ""
+    ).strip()
+    authority["current_target_parent_commit"] = target_commit
+    if not re.fullmatch(r"[0-9a-f]{40,64}", target_commit):
+        errors.append("durable merge queue current target is not a full SHA")
+    if errors:
+        return authority
+
+    try:
+        preview = git_merge_preview_evidence(
+            repo_root_path=worktree_path,
+            target_ref=target_ref,
+            branch_ref=str(recorded_commit).strip(),
+            expected_target_head=target_commit,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        errors.append(f"server merge preview failed: {exc}")
+        return authority
+    authority.update(
+        {
+            "preview_evidence_id": str(
+                preview.get("evidence_id") or ""
+            ).strip(),
+            "preview_status": str(preview.get("status") or "").strip(),
+            "preview_reason": str(preview.get("reason") or "").strip(),
+            "preview_merge_base": str(
+                preview.get("merge_base") or ""
+            ).strip(),
+        }
+    )
+    if str(preview.get("branch_commit") or "").strip() != str(
+        recorded_commit
+    ).strip():
+        errors.append("server merge preview candidate identity mismatch")
+    if str(preview.get("target_commit") or "").strip() != target_commit:
+        errors.append("server merge preview target identity mismatch")
+    if (
+        preview.get("passed") is not False
+        or str(preview.get("status") or "").strip() != "fail"
+        or "conflict" not in str(preview.get("reason") or "").strip().lower()
+    ):
+        errors.append("server merge preview did not reproduce a merge conflict")
+    if errors:
+        return authority
+    authority.update(
+        {
+            "status": "verified_conflict",
+            "verified": True,
+            "server_revalidated": True,
+        }
+    )
+    authority["authority_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in authority.items()
+            if key not in {"authority_hash", "errors"}
+        }
+    )
+    return authority
+
+
+def _runtime_context_post_qa_conflict_reset_indices(
+    record: Mapping[str, Any],
+    context: Any,
+    *,
+    superseded_index: int,
+    replacement_index: int | None = None,
+) -> list[int]:
+    """Return the same-candidate lines invalidated by a fresh commit revision."""
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    completed_lines = list(record.get("completed_lines") or [])
+    stop = len(completed_lines) if replacement_index is None else replacement_index
+    reset: list[int] = []
+    for index in range(max(0, superseded_index), min(stop, len(completed_lines))):
+        line = completed_lines[index]
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() not in (
+            _POST_QA_MERGE_CONFLICT_RESET_LINE_IDS
+        ):
+            continue
+        if not _runtime_context_contract_line_matches_worker(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        ):
+            continue
+        reset.append(index)
+    return reset
+
+
+def _runtime_context_persisted_post_qa_conflict_reset_indices(
+    record: Mapping[str, Any],
+    context: Any,
+) -> list[int]:
+    """Re-derive reset indices from the latest server-authored revision marker."""
+
+    completed_lines = list(record.get("completed_lines") or [])
+    for replacement_index in range(len(completed_lines) - 1, -1, -1):
+        line = completed_lines[replacement_index]
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() != "worker_commit":
+            continue
+        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        marker = (
+            payload.get("canonical_same_lane_repair_head_revision")
+            if isinstance(
+                payload.get("canonical_same_lane_repair_head_revision"),
+                Mapping,
+            )
+            else {}
+        )
+        if (
+            str(marker.get("schema_version") or "").strip()
+            != "runtime_context.canonical_same_lane_repair_head_revision.v2"
+            or str(marker.get("source") or "").strip()
+            != "server_revalidated_post_qa_merge_conflict"
+            or marker.get("server_revalidated_merge_conflict") is not True
+        ):
+            continue
+        if not _runtime_context_contract_line_matches_worker(
+            line,
+            runtime_context_id=str(
+                getattr(context, "runtime_context_id", "") or ""
+            ).strip(),
+            task_id=str(getattr(context, "task_id", "") or "").strip(),
+        ):
+            continue
+        superseded_index = marker.get("superseded_completed_line_index")
+        if not isinstance(superseded_index, int):
+            return []
+        return _runtime_context_post_qa_conflict_reset_indices(
+            record,
+            context,
+            superseded_index=superseded_index,
+            replacement_index=replacement_index,
+        )
+    return []
+
+
 def _runtime_context_same_lane_worker_commit_recovery(
     record: Mapping[str, Any],
     context: Any,
+    *,
+    conn=None,
+    project_id: str = "",
+    allow_post_qa_merge_conflict_recovery: bool = False,
 ) -> dict[str, Any]:
     """Resolve a bounded append-only refresh of a stale same-lane commit.
 
@@ -26923,8 +27192,14 @@ def _runtime_context_same_lane_worker_commit_recovery(
         if isinstance(guide.get("next_legal_action"), Mapping)
         else {}
     )
-    if str(next_line.get("line_id") or "").strip() != (
-        "worker_finish_time_attestation"
+    next_line_id = str(next_line.get("line_id") or "").strip()
+    legacy_attestation_recovery = next_line_id == "worker_finish_time_attestation"
+    post_qa_merge_conflict_recovery = next_line_id == "observer_merge"
+    if not legacy_attestation_recovery and not post_qa_merge_conflict_recovery:
+        return {}
+    if (
+        post_qa_merge_conflict_recovery
+        and not allow_post_qa_merge_conflict_recovery
     ):
         return {}
     completed_lines = list(record.get("completed_lines") or [])
@@ -26982,6 +27257,11 @@ def _runtime_context_same_lane_worker_commit_recovery(
         "errors": [],
         "append_only_history_preserved": True,
         "next_legal_action": "stop_and_report_worker_commit_drift",
+        "recovery_reason": (
+            "post_qa_merge_conflict"
+            if post_qa_merge_conflict_recovery
+            else "pre_attestation_same_lane_descendant"
+        ),
     }
     errors: list[str] = result["errors"]
     if not worktree_path or not os.path.exists(worktree_path):
@@ -27005,6 +27285,26 @@ def _runtime_context_same_lane_worker_commit_recovery(
             }
         )
         return result
+    merge_conflict_authority: dict[str, Any] = {}
+    if post_qa_merge_conflict_recovery:
+        merge_conflict_authority = (
+            _runtime_context_server_revalidated_merge_conflict_authority(
+                conn,
+                project_id=str(project_id or record.get("project_id") or ""),
+                record=record,
+                context=context,
+                recorded_commit=recorded_commit,
+            )
+        )
+        result["merge_conflict_recovery_authority"] = dict(
+            merge_conflict_authority
+        )
+        if merge_conflict_authority.get("verified") is not True:
+            result["errors"].extend(
+                merge_conflict_authority.get("errors") or [
+                    "server merge conflict revalidation failed"
+                ]
+            )
     try:
         dirty_files = _runtime_context_git_dirty_files(worktree_path)
         revision_diff = _runtime_context_worker_commit_revision_diff(
@@ -27079,6 +27379,18 @@ def _runtime_context_same_lane_worker_commit_recovery(
         actual_head,
     ):
         errors.append("current HEAD is not a descendant of recorded worker_commit")
+    target_parent = str(
+        merge_conflict_authority.get("current_target_parent_commit") or ""
+    ).strip()
+    if post_qa_merge_conflict_recovery and (
+        not target_parent
+        or not _git_commit_is_ancestor(
+            Path(worktree_path),
+            target_parent,
+            actual_head,
+        )
+    ):
+        errors.append("replacement HEAD is not a descendant of current target parent")
     if not actual_files or actual_files != recorded_files:
         errors.append("current cumulative diff widened or changed worker_commit scope")
     if recorded_diff_files != recorded_files:
@@ -27102,6 +27414,18 @@ def _runtime_context_same_lane_worker_commit_recovery(
         errors.append("current cumulative diff contains files outside the owned fence")
     if errors:
         return result
+    invalidated_indices: list[int] = []
+    if post_qa_merge_conflict_recovery:
+        invalidated_indices = _runtime_context_post_qa_conflict_reset_indices(
+            record,
+            context,
+            superseded_index=latest_commit_index,
+        )
+        if latest_commit_index not in invalidated_indices:
+            result["errors"].append(
+                "post-QA recovery did not invalidate the superseded worker_commit"
+            )
+            return result
     result.update(
         {
             "status": "eligible",
@@ -27109,6 +27433,18 @@ def _runtime_context_same_lane_worker_commit_recovery(
             "implementation_lineage_ref": expected_lineage_ref,
             "graph_trace_ids": implementation_traces,
             "next_legal_action": "record_worker_commit",
+            "invalidated_completed_line_indices": invalidated_indices,
+            "fresh_evidence_required": (
+                [
+                    "worker_finish_time_attestation",
+                    "worker_finish_gate",
+                    "qa_graph_context",
+                    "qa_independent_verification",
+                    "observer_merge",
+                ]
+                if post_qa_merge_conflict_recovery
+                else []
+            ),
         }
     )
     return result
@@ -27120,10 +27456,26 @@ def _runtime_context_append_same_lane_worker_commit_revision(
     record: Mapping[str, Any],
     context: Any,
     payload: Mapping[str, Any],
+    conn=None,
+    project_id: str = "",
 ) -> dict[str, Any]:
     """Append the replacement worker-commit line after full facade validation."""
 
-    recovery = _runtime_context_same_lane_worker_commit_recovery(record, context)
+    next_line = (
+        record.get("runtime_guide", {}).get("next_legal_action", {})
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    post_qa_merge_conflict_recovery = (
+        str(next_line.get("line_id") or "").strip() == "observer_merge"
+    )
+    recovery = _runtime_context_same_lane_worker_commit_recovery(
+        record,
+        context,
+        conn=conn,
+        project_id=str(project_id or record.get("project_id") or ""),
+        allow_post_qa_merge_conflict_recovery=post_qa_merge_conflict_recovery,
+    )
     if recovery.get("status") != "eligible":
         return {}
     runtime_context_id = str(
@@ -27164,14 +27516,27 @@ def _runtime_context_append_same_lane_worker_commit_revision(
 
     completed_lines = list(record.get("completed_lines") or [])
     superseded_index = int(recovery["superseded_completed_line_index"])
+    invalidated_indices = {
+        int(index)
+        for index in (
+            recovery.get("invalidated_completed_line_indices")
+            or [superseded_index]
+        )
+        if isinstance(index, int)
+    }
     projection_lines = [
         line
         for index, line in enumerate(completed_lines)
-        if index != superseded_index
+        if index not in invalidated_indices
     ]
+    projection_source = (
+        "server_revalidated_post_qa_merge_conflict"
+        if post_qa_merge_conflict_recovery
+        else "server_verified_same_lane_clean_git_descendant"
+    )
     projection = {
         "schema_version": "contract_runtime.same_lane_worker_commit_recovery_projection.v1",
-        "source": "server_verified_same_lane_clean_git_descendant",
+        "source": projection_source,
         "same_lane_worker_commit_recovery": dict(recovery),
         "projected_completed_lines": projection_lines,
         "persistence": {
@@ -27206,9 +27571,11 @@ def _runtime_context_append_same_lane_worker_commit_revision(
     canonical_payload = dict(payload)
     canonical_payload["canonical_same_lane_repair_head_revision"] = {
         "schema_version": (
-            "runtime_context.canonical_same_lane_repair_head_revision.v1"
+            "runtime_context.canonical_same_lane_repair_head_revision.v2"
+            if post_qa_merge_conflict_recovery
+            else "runtime_context.canonical_same_lane_repair_head_revision.v1"
         ),
-        "source": "server_verified_same_lane_clean_git_descendant",
+        "source": projection_source,
         "server_derived": True,
         "superseded_completed_line_index": superseded_index,
         "superseded_worker_commit_sha": recovery.get("recorded_commit_sha"),
@@ -27217,6 +27584,18 @@ def _runtime_context_append_same_lane_worker_commit_revision(
         "cumulative_changed_files": list(recovery.get("changed_files") or []),
         "clean_worktree": True,
         "append_only_history_preserved": True,
+        "invalidated_completed_line_indices": sorted(invalidated_indices),
+        "server_revalidated_merge_conflict": (
+            post_qa_merge_conflict_recovery
+        ),
+        "merge_conflict_recovery_authority": (
+            dict(recovery.get("merge_conflict_recovery_authority") or {})
+            if post_qa_merge_conflict_recovery
+            else {}
+        ),
+        "fresh_evidence_required": list(
+            recovery.get("fresh_evidence_required") or []
+        ),
         "raw_worker_tokens_persisted": False,
     }
     write = _contract_runtime_write_from_record(
@@ -27242,15 +27621,20 @@ def _runtime_context_append_same_lane_worker_commit_revision(
         *completed_lines,
         _line_evidence_from_write(write, "mf_sub"),
     ]
+    revised_projection_lines = [
+        line
+        for index, line in enumerate(revised_lines)
+        if index not in invalidated_indices
+    ]
     projected_after = runtime.projected_record(
         execution_id,
         actor_role="mf_sub",
-        completed_lines=revised_lines,
+        completed_lines=revised_projection_lines,
         projection={
             "schema_version": (
                 "contract_runtime.same_lane_worker_commit_revision_result.v1"
             ),
-            "source": "server_verified_same_lane_clean_git_descendant",
+            "source": projection_source,
         },
     )
     projected_after_next = (
@@ -27293,9 +27677,24 @@ def _runtime_context_append_same_lane_worker_commit_revision(
                 "fail_closed": True,
             },
         ) from exc
-    runtime.current_guide(execution_id, actor_role="mf_sub")
     persisted = runtime.store.get(execution_id)
-    current_state = _runtime_current_state_from_record(persisted)
+    persisted_projection_lines = [
+        line
+        for index, line in enumerate(persisted.get("completed_lines") or [])
+        if index not in invalidated_indices
+    ]
+    persisted_view = runtime.projected_record(
+        execution_id,
+        actor_role="mf_sub",
+        completed_lines=persisted_projection_lines,
+        projection={
+            "schema_version": (
+                "contract_runtime.same_lane_worker_commit_revision_result.v1"
+            ),
+            "source": projection_source,
+        },
+    )
+    current_state = _runtime_current_state_from_record(persisted_view)
     return {
         "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
         "accepted": True,
@@ -30730,6 +31129,8 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             record=stored_record,
             context=context,
             payload=payload,
+            conn=conn,
+            project_id=project_id,
         )
         if not contract_gate:
             contract_gate = _contract_runtime_close_gate(
@@ -59318,6 +59719,7 @@ def _contract_runtime_apply_mf_parallel_context_projection(
         conn,
         project_id=project_id,
         record=record,
+        actor_role=actor_role,
     )
     if not projection:
         return dict(record), {}
@@ -59339,6 +59741,7 @@ def _contract_runtime_mf_parallel_context_projection(
     *,
     project_id: str,
     record: Mapping[str, Any],
+    actor_role: str = "",
 ) -> dict[str, Any]:
     if conn is None:
         return {}
@@ -59390,6 +59793,11 @@ def _contract_runtime_mf_parallel_context_projection(
             recovery = _runtime_context_same_lane_worker_commit_recovery(
                 record,
                 context,
+                conn=conn,
+                project_id=project_id,
+                allow_post_qa_merge_conflict_recovery=(
+                    str(actor_role or "").strip() == "mf_sub"
+                ),
             )
             if recovery and recovery.get("status") in {"eligible", "blocked"}:
                 same_lane_recoveries.append(dict(recovery))
@@ -59447,11 +59855,47 @@ def _contract_runtime_mf_parallel_context_projection(
         for item in expected_context_summaries
         if item.get("failed_qa_revision_rejoin")
     ]
+    persisted_revision_resets: list[dict[str, Any]] = []
+    persisted_reset_indices: set[int] = set()
+    for dispatch_line in dispatch_lines:
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=dispatch_line,
+        ):
+            reset_indices = (
+                _runtime_context_persisted_post_qa_conflict_reset_indices(
+                    record,
+                    context,
+                )
+            )
+            if not reset_indices:
+                continue
+            persisted_reset_indices.update(reset_indices)
+            persisted_revision_resets.append(
+                {
+                    "runtime_context_id": str(
+                        getattr(context, "runtime_context_id", "") or ""
+                    ),
+                    "task_id": str(getattr(context, "task_id", "") or ""),
+                    "invalidated_completed_line_indices": reset_indices,
+                    "fresh_evidence_required": [
+                        "worker_finish_time_attestation",
+                        "worker_finish_gate",
+                        "qa_graph_context",
+                        "qa_independent_verification",
+                        "observer_merge",
+                    ],
+                    "append_only_history_preserved": True,
+                }
+            )
     if (
         not projected_lines
         and not identity_mismatch
         and not failed_qa_rejoin_contexts
         and not same_lane_recoveries
+        and not persisted_revision_resets
     ):
         return {}
     superseded_line_indices = {
@@ -59460,6 +59904,17 @@ def _contract_runtime_mf_parallel_context_projection(
         if item.get("status") == "eligible"
         and isinstance(item.get("superseded_completed_line_index"), int)
     }
+    for item in same_lane_recoveries:
+        if item.get("status") != "eligible":
+            continue
+        superseded_line_indices.update(
+            int(index)
+            for index in (
+                item.get("invalidated_completed_line_indices") or []
+            )
+            if isinstance(index, int)
+        )
+    superseded_line_indices.update(persisted_reset_indices)
     projection_base_lines = [
         line
         for index, line in enumerate(completed_lines)
@@ -59515,6 +59970,10 @@ def _contract_runtime_mf_parallel_context_projection(
             projection["same_lane_worker_commit_recovery"] = dict(
                 same_lane_recoveries[0]
             )
+    if persisted_revision_resets:
+        projection["post_qa_merge_conflict_revision_resets"] = (
+            persisted_revision_resets
+        )
     return projection
 
 
