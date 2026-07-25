@@ -45190,6 +45190,287 @@ def test_mf_parallel_close_authority_accepts_close_ready_merge_commit_batch_brid
     )
 
 
+def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-MF-PARALLEL-DESCENDANT-CLOSE-HEAD-BRIDGE"
+    worktree = tmp_path / "mf-parallel-descendant-close-head-bridge"
+    base_commit = _init_test_git_repo(worktree)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: worktree,
+    )
+    (worktree / "row-merge.txt").write_text(
+        "durable row merge\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "row-merge.txt"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "durable row merge"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    row_merge_commit = batch_jobs.git_commit(worktree)
+    fixture = _start_completed_source_backed_mf_parallel_close_authority_chain(
+        conn,
+        backlog_id=backlog_id,
+        close_commit=row_merge_commit,
+        worker_commit=row_merge_commit,
+        route_label="mf-parallel-descendant-close-head-bridge",
+        worktree_path=str(worktree),
+    )
+    record = json.loads(json.dumps(fixture["completed"]))
+    record["completed_lines"] = [
+        line
+        for line in record["completed_lines"]
+        if line["line_id"] != "observer_close_ready"
+    ]
+    record["runtime_guide"]["completed_lines"] = json.loads(
+        json.dumps(record["completed_lines"])
+    )
+    raw_merge_commit = next(
+        line
+        for line in record["completed_lines"]
+        if line["line_id"] == "observer_merge"
+    )["commit_sha"]
+    raw_reconcile_commit = next(
+        line
+        for line in record["completed_lines"]
+        if line["line_id"] == "observer_reconcile"
+    )["commit_sha"]
+    assert raw_merge_commit == row_merge_commit
+    assert raw_reconcile_commit == row_merge_commit
+
+    def activate_current_full(snapshot_id: str, commit_sha: str) -> None:
+        _activate_basic_graph(
+            conn,
+            snapshot_id,
+            commit_sha=commit_sha,
+        )
+        conn.execute(
+            "UPDATE graph_snapshots SET notes = ? "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (
+                json.dumps(
+                    {
+                        "current_full_reconcile": {
+                            "schema_version": "current_full_reconcile.v1",
+                            "source": "graph_governance_api",
+                            "normal_update_path": True,
+                            "target_commit_sha": commit_sha,
+                            "activate": True,
+                        }
+                    }
+                ),
+                PID,
+                snapshot_id,
+            ),
+        )
+        conn.commit()
+
+    def close_ready_write(close_commit: str) -> dict:
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role="observer",
+            stage_id="observer_integration",
+            line_id="observer_close_ready",
+            evidence_kind="close_ready",
+        )
+        write["commit_sha"] = close_commit
+        write["payload"] = {
+            "close_readiness": {
+                "qa_independent_verification": True,
+                "governance_redeploy": True,
+                "graph_reconcile": True,
+            }
+        }
+        return write
+
+    activate_current_full(
+        "full-descendant-close-head-same",
+        row_merge_commit,
+    )
+    same_head_gate = server._contract_runtime_mf_parallel_close_ready_precheck(
+        record,
+        close_ready_write(row_merge_commit),
+        conn=conn,
+        project_id=PID,
+    )
+    assert same_head_gate["passed"] is True, same_head_gate
+    assert same_head_gate["descendant_close_head_bridge"] == {}
+
+    (worktree / "closing-head.txt").write_text(
+        "later reconciled closing head\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "closing-head.txt"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "later reconciled closing head"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    descendant_head = batch_jobs.git_commit(worktree)
+    activate_current_full(
+        "full-descendant-close-head-current",
+        descendant_head,
+    )
+    record_before = server.stable_sha256(record)
+    descendant_gate = (
+        server._contract_runtime_mf_parallel_close_ready_precheck(
+            record,
+            close_ready_write(descendant_head),
+            conn=conn,
+            project_id=PID,
+        )
+    )
+    assert descendant_gate["passed"] is True, {
+        "missing": descendant_gate["missing_requirement_ids"],
+        "mismatches": descendant_gate["commit_mismatches"],
+        "bridge": descendant_gate["descendant_close_head_bridge"],
+        "reconcile": descendant_gate["reconcile_close_diagnostic"],
+        "lineage": descendant_gate["server_post_qa_lineage_diagnostics"],
+    }
+    assert server.stable_sha256(record) == record_before
+    assert descendant_gate["commit_mismatches"] == []
+    assert {
+        item["requirement_id"]
+        for item in descendant_gate["commit_bridge_diagnostics"]
+        if item.get("bridge")
+        == "durable_reconcile_to_active_descendant_close_head"
+    } == {"observer_merge", "observer_reconcile"}
+    bridge = descendant_gate["descendant_close_head_bridge"]
+    assert bridge["durable_merge_commit"] == row_merge_commit
+    assert bridge["reconciled_commit"] == row_merge_commit
+    assert bridge["closing_head_commit"] == descendant_head
+    assert bridge["active_snapshot_commit"] == descendant_head
+    assert bridge["raw_merge_reconcile_commits_preserved"] is True
+    assert descendant_gate["checks"][
+        "descendant_close_head_bridge_verified"
+    ] is True
+    assert descendant_gate["checks"][
+        "observer_reconcile_descendant_close_head_bridged"
+    ] is True
+
+    activate_current_full(
+        "full-descendant-close-head-stale",
+        row_merge_commit,
+    )
+    stale_snapshot_gate = (
+        server._contract_runtime_mf_parallel_close_ready_precheck(
+            record,
+            close_ready_write(descendant_head),
+            conn=conn,
+            project_id=PID,
+        )
+    )
+    assert stale_snapshot_gate["passed"] is False
+    assert stale_snapshot_gate["descendant_close_head_bridge"] == {}
+    assert {
+        "contract_runtime.observer_merge_close_commit",
+        "contract_runtime.observer_reconcile_close_commit",
+    }.issubset(stale_snapshot_gate["missing_requirement_ids"])
+
+    activate_current_full(
+        "full-descendant-close-head-authority",
+        descendant_head,
+    )
+    prospective = server._contract_runtime_bind_close_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    prospective["completed_lines"].append(
+        close_ready_write(descendant_head)
+    )
+    prospective["runtime_guide"]["completed_lines"] = json.loads(
+        json.dumps(prospective["completed_lines"])
+    )
+    for lines in (
+        prospective["completed_lines"],
+        prospective["runtime_guide"]["completed_lines"],
+    ):
+        reconcile_line = next(
+            line
+            for line in lines
+            if line["line_id"] == "observer_reconcile"
+        )
+        reconcile_line["payload"].pop(
+            "close_authority_binding",
+            None,
+        )
+    missing_authority_gate = (
+        server._contract_runtime_mf_parallel_close_authority_gate(
+            [prospective],
+            chain_projection=_mf_parallel_close_authority_chain_projection(
+                record["contract_execution_id"]
+            ),
+            close_commit=descendant_head,
+            conn=conn,
+            project_id=PID,
+        )
+    )
+    assert missing_authority_gate["passed"] is False
+    assert missing_authority_gate["descendant_close_head_bridge"] == {}
+
+    subprocess.run(
+        ["git", "checkout", "-B", "non-descendant", base_commit],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (worktree / "sibling-head.txt").write_text(
+        "non-descendant sibling\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "sibling-head.txt"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "non-descendant sibling"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    sibling_head = batch_jobs.git_commit(worktree)
+    activate_current_full(
+        "full-descendant-close-head-sibling",
+        sibling_head,
+    )
+    non_descendant_gate = (
+        server._contract_runtime_mf_parallel_close_ready_precheck(
+            record,
+            close_ready_write(sibling_head),
+            conn=conn,
+            project_id=PID,
+        )
+    )
+    assert non_descendant_gate["passed"] is False
+    assert non_descendant_gate["descendant_close_head_bridge"] == {}
+    assert {
+        "contract_runtime.observer_merge_close_commit",
+        "contract_runtime.observer_reconcile_close_commit",
+    }.issubset(non_descendant_gate["missing_requirement_ids"])
+
+
 def test_mf_parallel_close_authority_rejects_wrong_batch_final_commit_bridge():
     contract_execution_id = "cex-mf-parallel-batch-final-bridge-fail"
     close_commit = "ef11752d00c30b2212ff357bb7ade4ebce6acdca"
