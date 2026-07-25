@@ -62877,10 +62877,24 @@ def _contract_runtime_apply_mf_parallel_context_projection(
             ).strip(),
             task_id=str(recovery.get("task_id") or "").strip(),
         )
+        projected_line_id = str(
+            projected_next_action.get("line_id") or ""
+        ).strip()
+        retarget_recovery_overrides_historical_merge = (
+            str(recovery.get("status") or "").strip()
+            == "retarget_required"
+            and str(recovery.get("next_legal_action") or "").strip()
+            == "merge_current_target_and_record_worker_commit"
+            and str(canonical_next_action.get("line_id") or "").strip()
+            == "observer_merge"
+            and projected_line_id == "observer_merge"
+        )
         if (
             recovery_next_action != canonical_next_action
-            and str(projected_next_action.get("line_id") or "").strip()
-            == "worker_commit"
+            and (
+                projected_line_id == "worker_commit"
+                or retarget_recovery_overrides_historical_merge
+            )
         ):
             canonical_reader_hash = str(
                 guide.get("runtime_guide_hash") or ""
