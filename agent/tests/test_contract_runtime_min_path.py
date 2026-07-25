@@ -21,6 +21,7 @@ from agent.governance.contracts.runtime import (
     StalePinnedContractExecutionError,
     upsert_contract_chain_successor_binding,
 )
+from agent.governance.contracts.write_gate import validate_contract_write
 
 
 def test_failed_qa_rejoin_marker_resets_only_prior_revision_proof_lines():
@@ -1683,6 +1684,85 @@ def test_minimal_runtime_rejects_stale_runtime_guide_hash(tmp_path):
 
     assert result["ok"] is False
     assert "runtime_guide_hash mismatch" in result["decision"]["errors"]
+
+
+def test_write_gate_accepts_exact_server_copy_safe_writer_hash_from_reader_guide(
+    tmp_path,
+):
+    _write_minimal_contract(tmp_path)
+    registry = ContractDefinitionRegistry(tmp_path)
+    runtime = ContractRuntime(registry, instruction_root=tmp_path)
+    record = runtime.start_execution(
+        "observer_onboard",
+        project_id="aming-claw",
+        backlog_id="AC-MIN-PATH-CROSS-ROLE-HASH",
+        contract_execution_id="cex-min-path-cross-role-hash",
+        actor_role="observer",
+    )
+    first = runtime.submit_line_write(
+        record["contract_execution_id"],
+        _write_from(
+            record,
+            actor_role="observer",
+            stage_id="bootstrap",
+            line_id="read_context",
+        ),
+    )
+    assert first["ok"] is True
+    reader_record = first["record"]
+    reader_guide = reader_record["runtime_guide"]
+    safe_copy = reader_guide["writer_role_safe_copy_payload"]["copy_payload"]
+    assert reader_guide["runtime_guide_hash"] != safe_copy[
+        "runtime_guide_hash"
+    ]
+
+    definition = registry.get(
+        reader_record["contract_id"],
+        version=reader_record["version"],
+        revision=reader_record["revision"],
+    )
+    accepted = validate_contract_write(
+        definition,
+        reader_record["execution_state"],
+        safe_copy,
+        runtime_guide=reader_guide,
+    )
+    assert accepted.ok is True
+
+    stale = dict(safe_copy)
+    stale["runtime_guide_hash"] = "sha256:" + "0" * 64
+    rejected = validate_contract_write(
+        definition,
+        reader_record["execution_state"],
+        stale,
+        runtime_guide=reader_guide,
+    )
+    assert rejected.ok is False
+    detailed = next(
+        error
+        for error in rejected.errors
+        if error.startswith("runtime_guide_hash mismatch:")
+    )
+    assert safe_copy["runtime_guide_hash"] in detailed
+    assert reader_guide["runtime_guide_hash"] in detailed
+    assert (
+        f"({stale['runtime_guide_hash']})" in detailed
+        or repr(stale["runtime_guide_hash"]) in detailed
+    )
+
+    wrong_line = dict(safe_copy)
+    wrong_line["line_id"] = "different_line"
+    cross_line = validate_contract_write(
+        definition,
+        reader_record["execution_state"],
+        wrong_line,
+        runtime_guide=reader_guide,
+    )
+    assert cross_line.ok is False
+    assert any(
+        error.startswith("runtime_guide_hash mismatch:")
+        for error in cross_line.errors
+    )
 
 
 def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_path):

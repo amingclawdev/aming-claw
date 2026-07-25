@@ -66465,6 +66465,221 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         "line_id"
     ] == "worker_finish_gate"
 
+    fresh_finish_write = server._contract_runtime_write_from_record(
+        projected_after_fresh,
+        actor_role="mf_sub",
+        stage_id="worker_finish",
+        line_id="worker_finish_gate",
+        evidence_kind="mf_subagent_finish_gate",
+    )
+    fresh_finish_write.update(
+        {
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": backlog_id,
+            "commit_sha": replacement_commit,
+            "status": "passed",
+            "payload": {
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "status": "passed",
+            },
+        }
+    )
+    _projected_before_finish, projection_before_finish = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=after_repeated_attestation,
+            actor_role="mf_sub",
+        )
+    )
+    fresh_finish = runtime.submit_line_write(
+        successor["contract_execution_id"],
+        fresh_finish_write,
+        actor_role="mf_sub",
+        projected_completed_lines=(
+            server._contract_runtime_projection_completed_lines(
+                projection_before_finish
+            )
+        ),
+        projection=projection_before_finish,
+    )
+    assert fresh_finish["ok"] is True
+    assert fresh_finish["record"]["runtime_guide"]["next_legal_action"][
+        "line_id"
+    ] == "qa_graph_context"
+
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: worktree.resolve(),
+    )
+    qa_graph_trace_id = "gqt-post-qa-merge-conflict-fresh-qa"
+    _insert_exact_qa_graph_query_trace(
+        conn,
+        trace_id=qa_graph_trace_id,
+        snapshot_id="scope-post-qa-merge-conflict-fresh-qa",
+        candidate_commit_sha=replacement_commit,
+        backlog_id=backlog_id,
+        task_id=runtime_context.task_id,
+        target_project_root=str(worktree.resolve()),
+        canonical_project_root=str(worktree.resolve()),
+    )
+    fresh_qa_graph_current = (
+        server.handle_project_contract_runtime_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor[
+                        "contract_execution_id"
+                    ],
+                },
+                "qa",
+            )
+        )
+    )
+    assert fresh_qa_graph_current["next_legal_action"]["line_id"] == (
+        "qa_graph_context"
+    )
+    fresh_qa_graph_body = {
+        **fresh_qa_graph_current["runtime_guide"][
+            "writer_role_safe_copy_payload"
+        ]["copy_payload"],
+        "status": "accepted",
+        "commit_sha": replacement_commit,
+        "graph_trace_ids": [qa_graph_trace_id],
+        "graph_query_trace_ids": [qa_graph_trace_id],
+        "payload": {
+            "schema_version": "mf_parallel.qa_graph_context.v1",
+            "acceptance_scope": (
+                "candidate_regression_and_acceptance_criteria"
+            ),
+            "candidate_new_graph_failures": 0,
+            "exact_candidate": True,
+            "no_pass_claim": False,
+            "overall_release_pass_claimed": False,
+            "graph_trace_ids": [qa_graph_trace_id],
+            "graph_query_trace_ids": [qa_graph_trace_id],
+        },
+    }
+    fresh_qa_graph = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor[
+                    "contract_execution_id"
+                ],
+            },
+            "qa",
+            method="POST",
+            body=fresh_qa_graph_body,
+        )
+    )
+    assert fresh_qa_graph["ok"] is True
+    assert fresh_qa_graph["next_legal_action"]["line_id"] == (
+        "qa_independent_verification"
+    )
+
+    fresh_qa_current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor[
+                    "contract_execution_id"
+                ],
+            },
+            "qa",
+        )
+    )
+    assert fresh_qa_current["next_legal_action"]["line_id"] == (
+        "qa_independent_verification"
+    )
+    fresh_observer_current = (
+        server.handle_project_contract_runtime_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor[
+                        "contract_execution_id"
+                    ],
+                },
+                "observer",
+            )
+        )
+    )
+    assert fresh_observer_current["runtime_guide"][
+        "writer_role_safe_copy_payload"
+    ]["copy_payload"]["runtime_guide_hash"] == fresh_qa_current[
+        "runtime_guide_hash"
+    ]
+    fresh_qa_body = {
+        **fresh_qa_current["runtime_guide"][
+            "writer_role_safe_copy_payload"
+        ]["copy_payload"],
+        "status": "passed",
+        "commit_sha": replacement_commit,
+        "payload": {
+            "schema_version": "qa_independent_verification.v1",
+            "acceptance_scope": (
+                "candidate_regression_and_acceptance_criteria"
+            ),
+            "verdict": "passed",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": False,
+            "overall_release_pass_claimed": False,
+            "status": "passed",
+        },
+        "test_results": {
+            "scope": "candidate_regression_and_acceptance_criteria",
+            "focused_failed": 0,
+            "focused_passed": 1,
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": False,
+            "overall_release_pass_claimed": False,
+            "status": "passed",
+        },
+        "verification": {
+            "acceptance_scope": (
+                "candidate_regression_and_acceptance_criteria"
+            ),
+            "verdict": "passed",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": False,
+            "overall_release_pass_claimed": False,
+            "status": "passed",
+        },
+    }
+    fresh_qa_result = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor[
+                    "contract_execution_id"
+                ],
+            },
+            "qa",
+            method="POST",
+            body=fresh_qa_body,
+        )
+    )
+    assert fresh_qa_result["ok"] is True
+    assert fresh_qa_result["next_legal_action"]["line_id"] == (
+        "observer_merge"
+    )
+    canonical_after_fresh_qa = runtime.store.get(
+        successor["contract_execution_id"]
+    )
+    assert [
+        line["commit_sha"]
+        for line in canonical_after_fresh_qa["completed_lines"]
+        if line.get("line_id") == "qa_independent_verification"
+    ][-2:] == [candidate_commit, replacement_commit]
+
 
 def test_dependency_revalidation_recovers_only_source_backed_qa_candidate(
     conn,

@@ -1083,14 +1083,84 @@ def _expect_runtime_guide_hash(
     runtime_guide: Mapping[str, Any],
 ) -> None:
     field = "runtime_guide_hash"
-    expected = runtime_guide.get(field)
+    top_level_expected = runtime_guide.get(field)
+    writer_expected = _writer_role_safe_copy_runtime_guide_hash(
+        write,
+        runtime_guide,
+    )
+    expected = writer_expected or top_level_expected
     if field not in write:
         errors.append(f"missing {field}")
         return
     actual = write.get(field)
     if actual == expected:
         return
-    errors.append(_runtime_guide_hash_mismatch_message(write, runtime_guide, actual, expected))
+    errors.append(
+        _runtime_guide_hash_mismatch_message(
+            write,
+            runtime_guide,
+            actual,
+            expected,
+            top_level_expected=top_level_expected,
+            writer_expected=writer_expected,
+        )
+    )
+
+
+def _writer_role_safe_copy_runtime_guide_hash(
+    write: Mapping[str, Any],
+    runtime_guide: Mapping[str, Any],
+) -> str:
+    """Resolve the server-issued hash for the exact writer/line tuple.
+
+    A current guide may be rendered for an observer while its next line belongs
+    to QA (or another role). In that case the top-level hash is the reader hash
+    and the copy-safe payload is the write authority. Only an exact binding may
+    select that writer hash; stale or cross-line copy payloads fail closed.
+    """
+
+    safe_copy = _mapping(runtime_guide.get("writer_role_safe_copy_payload"))
+    submit_payload = _mapping(safe_copy.get("copy_payload"))
+    safe_hash = str(submit_payload.get("runtime_guide_hash") or "").strip()
+    if not safe_hash:
+        return ""
+
+    binding_fields = (
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "definition_hash",
+        "instruction_bundle_hash",
+        "execution_state_revision",
+        "stage_id",
+        "line_id",
+        "actor_role",
+        "evidence_kind",
+    )
+    if any(
+        field in submit_payload
+        and submit_payload.get(field) != write.get(field)
+        for field in binding_fields
+    ):
+        return ""
+
+    alignment = _mapping(safe_copy.get("hash_alignment"))
+    if alignment:
+        required_role = str(
+            alignment.get("required_writer_role")
+            or alignment.get("required_owner_role")
+            or ""
+        ).strip()
+        aligned_hash = str(
+            alignment.get("required_writer_runtime_guide_hash") or ""
+        ).strip()
+        if required_role and required_role != str(
+            write.get("actor_role") or ""
+        ).strip():
+            return ""
+        if aligned_hash and aligned_hash != safe_hash:
+            return ""
+    return safe_hash
 
 
 def _runtime_guide_hash_mismatch_message(
@@ -1098,6 +1168,9 @@ def _runtime_guide_hash_mismatch_message(
     runtime_guide: Mapping[str, Any],
     actual: Any,
     expected: Any,
+    *,
+    top_level_expected: Any = None,
+    writer_expected: Any = None,
 ) -> str:
     copy_payload = _mapping(runtime_guide.get("writer_role_safe_copy_payload"))
     alignment = _mapping(copy_payload.get("hash_alignment"))
@@ -1108,12 +1181,7 @@ def _runtime_guide_hash_mismatch_message(
         or alignment.get("required_owner_role")
         or actor_role
     )
-    required_hash = str(
-        alignment.get("required_writer_runtime_guide_hash")
-        or submit_payload.get("runtime_guide_hash")
-        or expected
-        or ""
-    )
+    required_hash = str(expected or "")
     actual_hash = str(actual or "")
     reader_role = _matching_reader_role(alignment, actual_hash, required_role)
     if not reader_role:
@@ -1123,6 +1191,14 @@ def _runtime_guide_hash_mismatch_message(
         if reader_role and actual_hash
         else f"received {actual_hash!r}, which is not the required owner/writer-role hash"
     )
+    top_level_hash = str(top_level_expected or "")
+    copy_safe_hash = str(writer_expected or "")
+    authority_fragment = (
+        f" The top-level reader hash is {top_level_hash}; the exact "
+        f"copy-safe writer hash is {copy_safe_hash}."
+        if copy_safe_hash and top_level_hash and copy_safe_hash != top_level_hash
+        else ""
+    )
     return (
         "runtime_guide_hash mismatch: "
         f"{reader_fragment}; submit_line requires owner/writer-role guide hash "
@@ -1130,6 +1206,7 @@ def _runtime_guide_hash_mismatch_message(
         "Recover by copying writer_role_safe_copy_payload.copy_payload.runtime_guide_hash "
         "or the full writer_role_safe_copy_payload.copy_payload from the current guide "
         "before calling contract_runtime_submit_line."
+        f"{authority_fragment}"
     )
 
 
