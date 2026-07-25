@@ -22856,6 +22856,7 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
                 "merge_queue_id": queue_id,
                 "target_ref": "main",
                 "task_id": "execute-task",
+                "flow": "mf_batch_parallel",
                 "evidence": evidence,
                 "dry_run": False,
                 "allow_target_ref_mutation": True,
@@ -22874,6 +22875,12 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
     assert all(char in "0123456789abcdef" for char in live["merge_commit"])
     assert live["merge_commit_canonicalized"] is True
     assert live["merge_commit_source"] == "server_git_rev_parse"
+    assert live["integration_epoch"]["coordination_backlog_id"] == (
+        "ARCH-PARALLEL-AGENT-MULTIBRANCH-EXECUTION"
+    )
+    assert live["integration_epoch"]["status"] == (
+        parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILE_PENDING
+    )
     assert live["recorded"]["queue_item"]["status"] == "merged"
     assert live["recorded"]["queue_item"]["merge_commit"] == live["merge_commit"]
     assert (
@@ -22944,6 +22951,113 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
         capture_output=True,
         text=True,
     ).stdout.find("Chain-Source-Stage: merge") != -1
+
+
+@pytest.mark.parametrize(
+    ("flow_field", "flow_value"),
+    [
+        ("flow", "mf_parallel"),
+        ("lane", "mf_parallel"),
+        ("flow", "direct_fix"),
+        ("flow", "hotfix"),
+    ],
+)
+def test_parallel_branch_merge_execute_explicit_standalone_flow_skips_legacy_batch_epoch(
+    conn,
+    tmp_path,
+    flow_field,
+    flow_value,
+):
+    repo = _git_repo(tmp_path)
+    main_head = subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    queue_id = "mergeq-explicit-mf-parallel"
+    task_id = "execute-explicit-mf-parallel"
+    backlog_id = "AC-EXECUTE-EXPLICIT-MF-PARALLEL"
+    legacy_batch_id = "legacy-noncanonical-batch-id"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id=legacy_batch_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            branch_ref="main",
+            status="merge_ready",
+            fence_token="fence-explicit-mf-parallel",
+            target_head_commit=main_head,
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-07-25T18:00:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-explicit-mf-parallel",
+                task_id=task_id,
+                backlog_id=backlog_id,
+                branch_ref="main",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="main",
+                branch_head=main_head,
+                validated_target_head=main_head,
+                current_target_head=main_head,
+            )
+        ],
+        now_iso="2026-07-25T18:00:00Z",
+    )
+    evidence = {
+        "dirty_worktree_check": {"status": "pass"},
+        "test_evidence": {"status": "pass"},
+        "graph_currentness": {"status": "current"},
+        "scope_reconcile": {"status": "pass"},
+        "semantic_projection": {"status": "pass"},
+        "backlog_acceptance": {"status": "satisfied"},
+    }
+
+    live = server.handle_graph_governance_parallel_branch_merge_execute(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "repo_root_path": str(repo),
+                "merge_queue_id": queue_id,
+                "target_ref": "main",
+                "task_id": task_id,
+                flow_field: flow_value,
+                "evidence": evidence,
+                "dry_run": False,
+                "allow_target_ref_mutation": True,
+                "fence_token": "fence-explicit-mf-parallel",
+                "route_waiver": _route_waiver(
+                    "merge_execute",
+                    task_id=task_id,
+                ),
+                "bug_id": backlog_id,
+                "now_iso": "2026-07-25T18:01:00Z",
+            },
+        )
+    )
+
+    assert live["ok"] is True
+    assert live["already_integrated"] is True
+    assert live["executed"] is False
+    assert live["integration_epoch"] is None
+    assert parallel_branch_runtime.get_integration_epoch(
+        conn,
+        PID,
+        legacy_batch_id,
+    ) is None
+    assert live["recorded"]["queue_item"]["status"] == "merged"
 
 
 def test_parallel_branch_merge_execute_mutates_target_owner_not_candidate_worktree(

@@ -40256,6 +40256,9 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
     if not isinstance(evidence, dict):
         raise ValidationError("evidence must be an object when provided")
     target_ref = str(ctx.body.get("target_ref") or "refs/heads/main")
+    requested_flow = str(
+        ctx.body.get("flow") or ctx.body.get("lane") or ""
+    ).strip()
 
     conn = get_connection(project_id)
     try:
@@ -40329,6 +40332,7 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                     or ""
                 ),
                 fence_token=str(ctx.body.get("fence_token") or ""),
+                flow=requested_flow,
                 now_iso=str(ctx.body.get("now_iso") or ""),
                 timeout_seconds=_query_int(ctx.body, "timeout_seconds", 30),
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-016"),
