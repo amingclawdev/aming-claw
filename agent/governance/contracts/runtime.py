@@ -1836,6 +1836,20 @@ def _audited_bypass_terminal_disposition(
             )
         except (TypeError, ValueError):
             authority_qa_index = -1
+        try:
+            audit_only_bypass_index = int(
+                audit_only_qa.get("bypass_completed_line_index")
+            )
+        except (TypeError, ValueError):
+            audit_only_bypass_index = -1
+        try:
+            audit_only_qa_index = int(
+                audit_only_qa.get(
+                    "qa_independent_verification_completed_line_index"
+                )
+            )
+        except (TypeError, ValueError):
+            audit_only_qa_index = -1
         merge_candidate_commit = str(
             durable_merge.get("branch_head") or ""
         ).strip().lower()
@@ -1854,9 +1868,39 @@ def _audited_bypass_terminal_disposition(
                 or qa_candidate_commit == merge_candidate_commit
             )
         )
+        graph_context_bypass_round_bound = bool(
+            not qa_barrier_is_audit_only_bypass
+            and str(audit_only_qa.get("source_shape") or "")
+            == "qa_graph_context_bypass_then_independent_verification"
+            and str(audit_only_qa.get("bypass_line_id") or "")
+            == "qa_graph_context"
+            and audit_only_bypass_index == bypass_index
+            and audit_only_qa_index == qa_barrier_index
+            and (
+                authority_qa_index < 0
+                or authority_qa_index == qa_barrier_index
+            )
+            and (
+                not qa_candidate_commit
+                or str(audit_only_qa.get("candidate_commit_sha") or "")
+                .strip()
+                .lower()
+                == qa_candidate_commit
+            )
+            and (
+                not merge_candidate_commit
+                or str(audit_only_qa.get("candidate_commit_sha") or "")
+                .strip()
+                .lower()
+                == merge_candidate_commit
+            )
+        )
         audited_no_pass_bound = bool(
             qa_barrier_ready()
-            and qa_barrier_is_audit_only_bypass
+            and (
+                qa_barrier_is_audit_only_bypass
+                or graph_context_bypass_round_bound
+            )
             and str(audit_only_qa.get("schema_version") or "")
             == "contract_runtime.audit_only_no_pass_bypass_round_authority.v1"
             and audit_only_qa.get("server_derived") is True
@@ -1865,6 +1909,14 @@ def _audited_bypass_terminal_disposition(
             and audit_only_qa.get("authoritative_pass_synthesized") is False
             and str(audit_only_qa.get("authority_hash") or "")
             == str(durable_merge.get("qa_acceptance_ref") or "")
+            and str(audit_only_qa.get("authority_hash") or "")
+            == stable_sha256(
+                {
+                    key: value
+                    for key, value in audit_only_qa.items()
+                    if key != "authority_hash"
+                }
+            )
         )
         if (
             qa_barrier_ready()
@@ -1873,7 +1925,11 @@ def _audited_bypass_terminal_disposition(
             and str(line.get("line_id") or "") == "observer_merge"
             and str(line.get("actor_role") or "") == "observer"
             and str(line.get("evidence_kind") or "") == "merge"
-            and str(line.get("status") or "").lower() in {"accepted", "passed"}
+            and _line_status_allows_contract_completion(
+                line,
+                source_record=record,
+                source_line_index=index,
+            )
             and str(durable_merge.get("schema_version") or "")
             == "contract_runtime.observer_merge_durable_authority.v1"
             and durable_merge.get("server_derived") is True
@@ -1897,7 +1953,11 @@ def _audited_bypass_terminal_disposition(
             and str(line.get("line_id") or "") == "observer_reconcile"
             and str(line.get("actor_role") or "") == "observer"
             and str(line.get("evidence_kind") or "") == "reconcile"
-            and str(line.get("status") or "").lower() in {"accepted", "passed"}
+            and _line_status_allows_contract_completion(
+                line,
+                source_record=record,
+                source_line_index=index,
+            )
         ):
             continue
         if reconcile_stage_closed:

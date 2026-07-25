@@ -1904,6 +1904,29 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
     assert terminal["source_backlog_mutated"] is False
     assert terminal["terminal_barrier"]["bypass_line_index"] == 0
     assert terminal["terminal_barrier"]["reconcile_source_ref"] == "timeline:43"
+    accepted_without_explicit_status = json.loads(json.dumps(terminal_lines))
+    accepted_without_explicit_status[-2].pop("status")
+    accepted_without_explicit_status[-1].pop("status")
+    statusless_terminal = _audited_bypass_terminal_disposition(
+        {"completed_lines": accepted_without_explicit_status}
+    )
+    assert statusless_terminal["row_status"] == "WAIVED"
+    assert statusless_terminal["readiness_state"] == "completed_with_exception"
+    assert statusless_terminal["terminal_barrier"]["reconcile_line_index"] == 3
+    explicit_failed_merge = json.loads(
+        json.dumps(accepted_without_explicit_status)
+    )
+    explicit_failed_merge[-2]["status"] = "failed"
+    assert _audited_bypass_terminal_disposition(
+        {"completed_lines": explicit_failed_merge}
+    ) == {}
+    explicit_failed_reconcile = json.loads(
+        json.dumps(accepted_without_explicit_status)
+    )
+    explicit_failed_reconcile[-1]["status"] = "failed"
+    assert _audited_bypass_terminal_disposition(
+        {"completed_lines": explicit_failed_reconcile}
+    ) == {}
     projected_terminal = _project_record_state(
         {
             "contract_execution_id": record["contract_execution_id"],
@@ -2003,6 +2026,96 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
                 "continuation_authority": {},
             }
         )
+
+    graph_context_bypass = json.loads(json.dumps(result["written_line"]))
+    graph_context_bypass["stage_id"] = "independent_qa"
+    graph_context_bypass["line_id"] = "qa_graph_context"
+    graph_context_bypass["payload"].update(
+        {
+            "bypass_identity": (
+                "bypass:cex-mf-parallel-ff19447376e89875a7f1:"
+                "revision-10:independent_qa:qa_graph_context"
+            ),
+            "blocked_owner_role": "qa",
+            "blocked_evidence_kind": "graph_trace",
+            "execution_state_revision": 10,
+        }
+    )
+    bind_bypass_request_hash(graph_context_bypass)
+    graph_context_round_authority = {
+        "schema_version": (
+            "contract_runtime.audit_only_no_pass_bypass_round_authority.v1"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+        "source_shape": (
+            "qa_graph_context_bypass_then_independent_verification"
+        ),
+        "bypass_line_id": "qa_graph_context",
+        "bypass_completed_line_index": 0,
+        "qa_independent_verification_completed_line_index": 1,
+        "candidate_commit_sha": candidate_commit,
+    }
+    graph_context_round_authority["authority_hash"] = stable_sha256(
+        graph_context_round_authority
+    )
+    graph_context_merge_authority = {
+        **durable_merge_authority,
+        "branch_head": candidate_commit,
+        "qa_completed_line_index": 1,
+        "qa_contract_runtime_verified": False,
+        "qa_acceptance_ref": graph_context_round_authority["authority_hash"],
+        "qa_audit_only_no_pass_authority": graph_context_round_authority,
+    }
+    graph_context_merge_line = {
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "evidence_kind": "merge",
+        "payload": {
+            "durable_merge_authority": graph_context_merge_authority,
+        },
+    }
+    graph_context_reconcile_line = json.loads(json.dumps(terminal_lines[-1]))
+    graph_context_reconcile_line.pop("status")
+    graph_context_terminal_lines = [
+        graph_context_bypass,
+        live_qa_line,
+        graph_context_merge_line,
+        graph_context_reconcile_line,
+    ]
+    graph_context_terminal = _audited_bypass_terminal_disposition(
+        {"completed_lines": graph_context_terminal_lines}
+    )
+    assert graph_context_terminal["status"] == "WAIVED"
+    assert graph_context_terminal["readiness_state"] == (
+        "completed_with_exception"
+    )
+    assert graph_context_terminal["terminal_barrier"][
+        "reconcile_line_index"
+    ] == 3
+
+    graph_context_wrong_round = json.loads(
+        json.dumps(graph_context_terminal_lines)
+    )
+    wrong_round_authority = graph_context_wrong_round[2]["payload"][
+        "durable_merge_authority"
+    ]["qa_audit_only_no_pass_authority"]
+    wrong_round_authority["bypass_completed_line_index"] = 99
+    wrong_round_authority["authority_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in wrong_round_authority.items()
+            if key != "authority_hash"
+        }
+    )
+    graph_context_wrong_round[2]["payload"]["durable_merge_authority"][
+        "qa_acceptance_ref"
+    ] = wrong_round_authority["authority_hash"]
+    assert _audited_bypass_terminal_disposition(
+        {"completed_lines": graph_context_wrong_round}
+    ) == {}
 
     late_merge_bypass = json.loads(json.dumps(result["written_line"]))
     late_merge_bypass["stage_id"] = "observer_integration"
