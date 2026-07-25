@@ -17,12 +17,17 @@ import sqlite3
 import threading
 import time
 from typing import Any, Mapping
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from .contracts.runtime import (
     _current_projection_from_row,
     ensure_contract_chain_mapping_schema,
     read_backlog_contract_chain_current,
+)
+from .dashboard_read_cache import (
+    TIMELINE_READ_CACHE,
+    timeline_database_scope,
+    timeline_database_scope_from_path,
 )
 
 log = logging.getLogger(__name__)
@@ -69,6 +74,73 @@ CREATE INDEX IF NOT EXISTS idx_task_timeline_correlation
     ON task_timeline_events(project_id, correlation_id, id);
 CREATE INDEX IF NOT EXISTS idx_task_timeline_kind
     ON task_timeline_events(project_id, event_kind, phase, id);
+CREATE INDEX IF NOT EXISTS idx_task_timeline_project_keyset
+    ON task_timeline_events(project_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_timeline_task_keyset
+    ON task_timeline_events(project_id, task_id, id DESC);
+"""
+
+SEARCH_INDEX_SQL = """
+CREATE TABLE IF NOT EXISTS task_timeline_search_index_state (
+    singleton_id          INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    last_indexed_event_id INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO task_timeline_search_index_state
+    (singleton_id, last_indexed_event_id)
+VALUES (1, 0);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS task_timeline_events_fts
+USING fts5(search_text, tokenize = 'unicode61');
+
+CREATE TRIGGER IF NOT EXISTS task_timeline_events_fts_insert
+AFTER INSERT ON task_timeline_events
+BEGIN
+    INSERT INTO task_timeline_events_fts(rowid, search_text)
+    VALUES (
+        new.id,
+        COALESCE(new.backlog_id, '') || ' ' ||
+        COALESCE(new.task_id, '') || ' ' ||
+        COALESCE(new.event_type, '') || ' ' ||
+        COALESCE(new.event_kind, '') || ' ' ||
+        COALESCE(new.phase, '') || ' ' ||
+        COALESCE(new.status, '') || ' ' ||
+        COALESCE(new.actor, '') || ' ' ||
+        COALESCE(new.commit_sha, '') || ' ' ||
+        COALESCE(new.payload_json, '') || ' ' ||
+        COALESCE(new.verification_json, '') || ' ' ||
+        COALESCE(new.artifact_refs_json, '')
+    );
+    UPDATE task_timeline_search_index_state
+       SET last_indexed_event_id = MAX(last_indexed_event_id, new.id)
+     WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_timeline_events_fts_delete
+AFTER DELETE ON task_timeline_events
+BEGIN
+    DELETE FROM task_timeline_events_fts WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_timeline_events_fts_update
+AFTER UPDATE ON task_timeline_events
+BEGIN
+    DELETE FROM task_timeline_events_fts WHERE rowid = old.id;
+    INSERT INTO task_timeline_events_fts(rowid, search_text)
+    VALUES (
+        new.id,
+        COALESCE(new.backlog_id, '') || ' ' ||
+        COALESCE(new.task_id, '') || ' ' ||
+        COALESCE(new.event_type, '') || ' ' ||
+        COALESCE(new.event_kind, '') || ' ' ||
+        COALESCE(new.phase, '') || ' ' ||
+        COALESCE(new.status, '') || ' ' ||
+        COALESCE(new.actor, '') || ' ' ||
+        COALESCE(new.commit_sha, '') || ' ' ||
+        COALESCE(new.payload_json, '') || ' ' ||
+        COALESCE(new.verification_json, '') || ' ' ||
+        COALESCE(new.artifact_refs_json, '')
+    );
+END;
 """
 
 TIMELINE_SCHEMA_VERSION = 2
@@ -509,6 +581,69 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         if column not in existing:
             conn.execute(f"ALTER TABLE task_timeline_events ADD COLUMN {column} {ddl}")
     conn.executescript(INDEX_SQL)
+
+
+def _ensure_public_timeline_search_index(conn: sqlite3.Connection) -> bool:
+    """Lazily initialize/search-sync FTS so Current never pays DDL/backfill."""
+
+    try:
+        conn.executescript(SEARCH_INDEX_SQL)
+        state_row = conn.execute(
+            """
+            SELECT last_indexed_event_id
+            FROM task_timeline_search_index_state
+            WHERE singleton_id = 1
+            """
+        ).fetchone()
+        last_indexed_event_id = int(state_row[0] or 0) if state_row else 0
+        newest_event_id = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM task_timeline_events"
+            ).fetchone()[0]
+            or 0
+        )
+        if newest_event_id and not conn.execute(
+            "SELECT 1 FROM task_timeline_events_fts LIMIT 1"
+        ).fetchone():
+            last_indexed_event_id = 0
+        conn.execute(
+            """
+            INSERT INTO task_timeline_events_fts(rowid, search_text)
+            SELECT events.id,
+                   COALESCE(events.backlog_id, '') || ' ' ||
+                   COALESCE(events.task_id, '') || ' ' ||
+                   COALESCE(events.event_type, '') || ' ' ||
+                   COALESCE(events.event_kind, '') || ' ' ||
+                   COALESCE(events.phase, '') || ' ' ||
+                   COALESCE(events.status, '') || ' ' ||
+                   COALESCE(events.actor, '') || ' ' ||
+                   COALESCE(events.commit_sha, '') || ' ' ||
+                   COALESCE(events.payload_json, '') || ' ' ||
+                   COALESCE(events.verification_json, '') || ' ' ||
+                   COALESCE(events.artifact_refs_json, '')
+            FROM task_timeline_events AS events
+            LEFT JOIN task_timeline_events_fts AS indexed
+              ON indexed.rowid = events.id
+            WHERE events.id > ?
+              AND indexed.rowid IS NULL
+            """,
+            (last_indexed_event_id,),
+        )
+        if newest_event_id > last_indexed_event_id:
+            conn.execute(
+                """
+                UPDATE task_timeline_search_index_state
+                   SET last_indexed_event_id = ?
+                 WHERE singleton_id = 1
+                """,
+                (newest_event_id,),
+            )
+        return True
+    except sqlite3.OperationalError as exc:
+        # Some minimal SQLite builds omit FTS5. Exact/keyset history remains
+        # available; text search reports the fallback in its scope metadata.
+        log.debug("timeline FTS5 search index unavailable: %s", exc)
+        return False
 
 
 def _utc_iso() -> str:
@@ -1356,57 +1491,559 @@ def _run_service_router_hook(conn: sqlite3.Connection, inserted_event: dict[str,
         log.debug("service router timeline hook failed", exc_info=True)
 
 
-def _publish_timeline_event(inserted_event: dict[str, Any]) -> None:
-    try:
-        from agent.governance import event_bus
+_COMMIT_IDENTITY_FIELDS = (
+    "id",
+    "project_id",
+    "backlog_id",
+    "mf_id",
+    "task_id",
+    "attempt_num",
+    "event_type",
+    "phase",
+    "event_kind",
+    "scenario_id",
+    "parent_event_id",
+    "correlation_id",
+    "severity",
+    "decision",
+    "schema_version",
+    "actor",
+    "status",
+    "payload",
+    "verification",
+    "artifact_refs",
+    "trace_id",
+    "commit_sha",
+    "created_at",
+)
 
-        payload = {
-            "project_id": _text(inserted_event.get("project_id")),
-            "backlog_id": _text(inserted_event.get("backlog_id")),
-            "task_id": _text(inserted_event.get("task_id")),
-            "event_id": inserted_event.get("id", ""),
-            "event_type": _text(inserted_event.get("event_type")),
-            "event_kind": _text(inserted_event.get("event_kind")),
-            "phase": _text(inserted_event.get("phase")),
-            "status": _text(inserted_event.get("status")),
-        }
-        for key in (
-            "contract_execution_id",
-            "contract_chain_id",
-            "contract_revision_id",
-            "runtime_context_id",
-        ):
-            value = _first_deep_text(inserted_event, key)
-            if value:
-                payload[key] = value
-        revision = _first_deep_value(inserted_event, "execution_state_revision")
+
+def _timeline_event_commit_identity(event: Mapping[str, Any]) -> str:
+    projection = {
+        field: event.get(field)
+        for field in _COMMIT_IDENTITY_FIELDS
+    }
+    return hashlib.sha256(
+        json.dumps(
+            projection,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _timeline_connection_database_path(conn: sqlite3.Connection) -> str:
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error:
+        return ""
+    for row in rows:
         try:
-            revision = int(revision or 0)
-        except (TypeError, ValueError):
-            revision = 0
-        if revision:
-            payload["execution_state_revision"] = revision
-        event_bus._bus.publish("task_timeline.appended", payload)
-        event_bus._bus.publish("current_task.changed", {
+            name = str(row["name"])
+            path = str(row["file"])
+        except (IndexError, TypeError):
+            name = str(row[1] if len(row) > 1 else "")
+            path = str(row[2] if len(row) > 2 else "")
+        if name == "main":
+            return path
+    return ""
+
+
+def _publish_committed_timeline_event(
+    inserted_event: dict[str, Any],
+    *,
+    database_scope: str = "",
+) -> None:
+    from agent.governance import event_bus
+
+    TIMELINE_READ_CACHE.append(
+        dict(inserted_event),
+        database_scope=database_scope,
+    )
+    payload = {
+        "project_id": _text(inserted_event.get("project_id")),
+        "backlog_id": _text(inserted_event.get("backlog_id")),
+        "task_id": _text(inserted_event.get("task_id")),
+        "event_id": inserted_event.get("id", ""),
+        "event_type": _text(inserted_event.get("event_type")),
+        "event_kind": _text(inserted_event.get("event_kind")),
+        "phase": _text(inserted_event.get("phase")),
+        "status": _text(inserted_event.get("status")),
+    }
+    for key in (
+        "contract_execution_id",
+        "contract_chain_id",
+        "contract_revision_id",
+        "runtime_context_id",
+    ):
+        value = _first_deep_text(inserted_event, key)
+        if value:
+            payload[key] = value
+    revision = _first_deep_value(inserted_event, "execution_state_revision")
+    try:
+        revision = int(revision or 0)
+    except (TypeError, ValueError):
+        revision = 0
+    if revision:
+        payload["execution_state_revision"] = revision
+    event_bus._bus.publish("task_timeline.appended", payload)
+    event_bus._bus.publish(
+        "current_task.changed",
+        {
             **payload,
             "source": "task_timeline.record_event",
             "runtime_state": payload["status"],
-        })
-        if payload.get("contract_execution_id"):
-            event_bus._bus.publish("contract_runtime.changed", {
+        },
+    )
+    if payload.get("contract_execution_id"):
+        event_bus._bus.publish(
+            "contract_runtime.changed",
+            {
                 **payload,
                 "source": "task_timeline.record_event",
-            })
-        if payload.get("contract_chain_id"):
-            event_bus._bus.publish("contract_chain.current_changed", {
+            },
+        )
+    if payload.get("contract_chain_id"):
+        event_bus._bus.publish(
+            "contract_chain.current_changed",
+            {
                 **payload,
                 "source": "task_timeline.record_event",
-            })
-        if payload.get("runtime_context_id"):
-            event_bus._bus.publish("runtime_context.changed", {
+            },
+        )
+    if payload.get("runtime_context_id"):
+        event_bus._bus.publish(
+            "runtime_context.changed",
+            {
                 **payload,
                 "source": "task_timeline.record_event",
-            })
+            },
+        )
+
+
+class _CommittedTimelinePublisher:
+    """Publish only rows that another SQLite connection can observe.
+
+    ``record_event`` participates in caller-owned transactions, so it cannot
+    know whether the caller will commit or roll back.  This bounded verifier
+    waits for the exact inserted row to become durable before mutating hot
+    deques or emitting process events.  A rolled-back id that is later reused
+    with different content is discarded instead of becoming a phantom. The
+    verifier intentionally processes its bounded queue serially: a later item
+    can incur at most one visibility timeout per earlier retained item. Queue
+    overflow or timeout marks the affected scope cold-only until SQLite reaches
+    the expected event id, so head-of-line latency cannot become data loss.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_pending: int = 4096,
+        visibility_timeout_seconds: float = 30.0,
+    ) -> None:
+        self._max_pending = max(1, int(max_pending))
+        self._queue: queue.Queue[dict[str, Any]] = queue.Queue(
+            maxsize=self._max_pending
+        )
+        self._capacity = threading.BoundedSemaphore(self._max_pending)
+        self._visibility_timeout_seconds = max(
+            1.0,
+            float(visibility_timeout_seconds),
+        )
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._idle = threading.Event()
+        self._idle.set()
+        self._active_count = 0
+        self._outstanding = 0
+        self._overflow_count = 0
+
+    def defer_committing(
+        self,
+        database_path: str,
+        inserted_event: Mapping[str, Any],
+        *,
+        database_scope: str = "",
+    ) -> bool:
+        event = dict(inserted_event)
+        event_id = int(event.get("id") or 0)
+        if not database_path or event_id <= 0:
+            return False
+        canonical_scope = (
+            str(database_scope or "").strip()
+            or timeline_database_scope_from_path(database_path)
+        )
+        if not self._capacity.acquire(blocking=False):
+            self._degrade_event(
+                event,
+                database_scope=canonical_scope,
+            )
+            with self._lock:
+                self._overflow_count += 1
+            log.warning(
+                "timeline post-commit publisher capacity is full; "
+                "forcing authoritative cold reload"
+            )
+            return False
+        item = {
+            "database_path": database_path,
+            "database_scope": canonical_scope,
+            "event_id": event_id,
+            "identity": _timeline_event_commit_identity(event),
+            "deadline": time.monotonic() + self._visibility_timeout_seconds,
+            "project_id": _text(event.get("project_id")),
+        }
+        self._ensure_started()
+        with self._lock:
+            self._active_count += 1
+            self._idle.clear()
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            self._degrade_event(
+                event,
+                database_scope=canonical_scope,
+            )
+            with self._lock:
+                self._active_count = max(0, self._active_count - 1)
+                self._overflow_count += 1
+                if self._active_count == 0:
+                    self._idle.set()
+            self._capacity.release()
+            log.warning(
+                "timeline post-commit publisher queue is full; "
+                "forcing authoritative cold reload"
+            )
+            return False
+        return True
+
+    def wait_for_idle(self, timeout: float = 5.0) -> bool:
+        return self._idle.wait(max(0.0, float(timeout)))
+
+    def _ensure_started(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(
+                target=self._run,
+                name="task-timeline-post-commit-publisher",
+                daemon=True,
+            )
+            self._thread.start()
+
+    @staticmethod
+    def _degrade_event(
+        event: Mapping[str, Any],
+        *,
+        database_scope: str,
+    ) -> None:
+        TIMELINE_READ_CACHE.invalidate_until(
+            database_scope=str(database_scope or ""),
+            project_id=_text(event.get("project_id")),
+            expected_event_id=int(event.get("id") or 0),
+        )
+
+    def _complete(self) -> None:
+        with self._lock:
+            self._outstanding = max(0, self._outstanding - 1)
+            self._active_count = max(0, self._active_count - 1)
+            if self._active_count == 0:
+                self._idle.set()
+        self._capacity.release()
+
+    def stats(self) -> dict[str, Any]:
+        """Expose disjoint retained-state counts for deterministic QA."""
+
+        with self._lock:
+            queued = self._queue.qsize()
+            processing = int(self._outstanding)
+            return {
+                "limit": self._max_pending,
+                "queued": queued,
+                "pending": 0,
+                "outstanding": processing,
+                "active": int(self._active_count),
+                "retained_total": queued + processing,
+                "overflow_count": int(self._overflow_count),
+                "visibility_timeout_ms": int(
+                    self._visibility_timeout_seconds * 1000
+                ),
+                "head_of_line_policy": (
+                    "serial_bounded_by_visibility_timeout_per_retained_item"
+                ),
+            }
+
+    @staticmethod
+    def _visible_event(item: Mapping[str, Any]) -> tuple[str, dict[str, Any] | None]:
+        try:
+            conn = sqlite3.connect(
+                "file:{}?mode=ro".format(
+                    quote(
+                        str(item.get("database_path") or ""),
+                        safe="/",
+                    )
+                ),
+                timeout=0.1,
+                uri=True,
+            )
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT * FROM task_timeline_events WHERE id = ?",
+                    (int(item.get("event_id") or 0),),
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return "pending", None
+        if row is None:
+            return "pending", None
+        event = _row_to_dict(row)
+        if _timeline_event_commit_identity(event) != str(item.get("identity") or ""):
+            return "mismatch", None
+        return "committed", event
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            with self._lock:
+                self._outstanding += 1
+            try:
+                while True:
+                    now = time.monotonic()
+                    state, event = self._visible_event(item)
+                    if state == "committed" and event is not None:
+                        try:
+                            _publish_committed_timeline_event(
+                                event,
+                                database_scope=str(
+                                    item.get("database_scope") or ""
+                                ),
+                            )
+                        except Exception:
+                            log.debug(
+                                "committed timeline event publish failed",
+                                exc_info=True,
+                            )
+                        break
+                    if (
+                        state == "mismatch"
+                    ):
+                        break
+                    if now >= float(item["deadline"]):
+                        TIMELINE_READ_CACHE.invalidate_until(
+                            database_scope=str(
+                                item.get("database_scope") or ""
+                            ),
+                            project_id=str(
+                                item.get("project_id") or ""
+                            ),
+                            expected_event_id=int(
+                                item.get("event_id") or 0
+                            ),
+                        )
+                        break
+                    time.sleep(0.005)
+            finally:
+                self._queue.task_done()
+                self._complete()
+
+
+_POST_COMMIT_PUBLISHER = _CommittedTimelinePublisher()
+_TRANSACTION_PUBLISH_LOCK = threading.Lock()
+_TRANSACTION_PUBLISH_PENDING: dict[int, dict[str, Any]] = {}
+_TRANSACTION_PUBLISH_CLEANER: threading.Thread | None = None
+_TRANSACTION_PUBLISH_CONNECTION_LIMIT = 128
+_TRANSACTION_PUBLISH_EVENT_LIMIT = 256
+
+
+def _invalidate_timeline_event_until_visible(
+    inserted_event: Mapping[str, Any],
+    *,
+    database_scope: str,
+) -> None:
+    TIMELINE_READ_CACHE.invalidate_until(
+        database_scope=database_scope,
+        project_id=_text(inserted_event.get("project_id")),
+        expected_event_id=int(inserted_event.get("id") or 0),
+    )
+
+
+def _ensure_transaction_publish_cleaner() -> None:
+    global _TRANSACTION_PUBLISH_CLEANER
+    with _TRANSACTION_PUBLISH_LOCK:
+        if (
+            _TRANSACTION_PUBLISH_CLEANER is not None
+            and _TRANSACTION_PUBLISH_CLEANER.is_alive()
+        ):
+            return
+
+        def clean_abandoned_transactions() -> None:
+            while True:
+                time.sleep(30.0)
+                cutoff = time.monotonic() - 300.0
+                abandoned: list[dict[str, Any]] = []
+                with _TRANSACTION_PUBLISH_LOCK:
+                    for connection_id in [
+                        pending_id
+                        for pending_id, pending in (
+                            _TRANSACTION_PUBLISH_PENDING.items()
+                        )
+                        if float(pending.get("registered_at") or 0.0) < cutoff
+                    ]:
+                        pending = _TRANSACTION_PUBLISH_PENDING.pop(
+                            connection_id,
+                            None,
+                        )
+                        if pending:
+                            abandoned.append(pending)
+                for pending in abandoned:
+                    for event in pending.get("events") or []:
+                        _invalidate_timeline_event_until_visible(
+                            event,
+                            database_scope=str(
+                                pending.get("database_scope") or ""
+                            ),
+                        )
+
+        _TRANSACTION_PUBLISH_CLEANER = threading.Thread(
+            target=clean_abandoned_transactions,
+            name="task-timeline-transaction-publish-cleaner",
+            daemon=True,
+        )
+        _TRANSACTION_PUBLISH_CLEANER.start()
+
+
+def _defer_timeline_event_until_commit(
+    conn: sqlite3.Connection,
+    inserted_event: Mapping[str, Any],
+) -> bool:
+    """Buffer one event on its connection until SQLite begins COMMIT.
+
+    A trace callback is intentionally used only as the transaction boundary
+    signal.  The callback never publishes: it hands committed candidates to
+    the separate-connection verifier, which waits until COMMIT is actually
+    visible before touching process state.  ROLLBACK drops the buffer without
+    starting any filesystem work.
+    """
+
+    database_path = _timeline_connection_database_path(conn)
+    database_scope = timeline_database_scope(conn)
+    _ensure_transaction_publish_cleaner()
+    connection_id = id(conn)
+    now = time.monotonic()
+    degraded = False
+    abandoned: list[dict[str, Any]] = []
+    with _TRANSACTION_PUBLISH_LOCK:
+        for stale_id in [
+            pending_id
+            for pending_id, pending in _TRANSACTION_PUBLISH_PENDING.items()
+            if now - float(pending.get("registered_at") or now) > 300.0
+        ]:
+            stale_pending = _TRANSACTION_PUBLISH_PENDING.pop(
+                stale_id,
+                None,
+            )
+            if stale_pending:
+                abandoned.append(stale_pending)
+        pending = _TRANSACTION_PUBLISH_PENDING.get(connection_id)
+        if pending is None or pending.get("connection") is not conn:
+            if (
+                len(_TRANSACTION_PUBLISH_PENDING)
+                >= _TRANSACTION_PUBLISH_CONNECTION_LIMIT
+            ):
+                degraded = True
+            else:
+                pending = {
+                    "connection": conn,
+                    "database_path": database_path,
+                    "database_scope": database_scope,
+                    "events": [],
+                    "registered_at": now,
+                }
+                _TRANSACTION_PUBLISH_PENDING[connection_id] = pending
+        if not degraded:
+            pending["registered_at"] = now
+            if (
+                len(pending["events"])
+                >= _TRANSACTION_PUBLISH_EVENT_LIMIT
+            ):
+                degraded = True
+            else:
+                pending["events"].append(dict(inserted_event))
+    for stale_pending in abandoned:
+        for stale_event in stale_pending.get("events") or []:
+            _invalidate_timeline_event_until_visible(
+                stale_event,
+                database_scope=str(
+                    stale_pending.get("database_scope") or ""
+                ),
+            )
+    if degraded:
+        # This may run before COMMIT visibility (or for a later rollback).
+        # Retaining the expected id is conservative: rolled-back overflow
+        # leaves only a cold-read degradation, never a false warm event.
+        _invalidate_timeline_event_until_visible(
+            inserted_event,
+            database_scope=database_scope,
+        )
+
+    def transaction_trace(statement: str) -> None:
+        command = str(statement or "").strip().upper()
+        if command != "COMMIT" and not command.startswith("ROLLBACK"):
+            return
+        with _TRANSACTION_PUBLISH_LOCK:
+            transaction = _TRANSACTION_PUBLISH_PENDING.pop(
+                connection_id,
+                None,
+            )
+        if command != "COMMIT" or not transaction:
+            return
+        for event in transaction.get("events") or []:
+            transaction_path = str(
+                transaction.get("database_path") or ""
+            )
+            transaction_scope = str(
+                transaction.get("database_scope") or ""
+            )
+            if transaction_path:
+                _POST_COMMIT_PUBLISHER.defer_committing(
+                    transaction_path,
+                    event,
+                    database_scope=transaction_scope,
+                )
+            else:
+                # Pathless SQLite cannot be checked from a second connection.
+                # Keep the exact scope cold until this same connection exposes
+                # the committed event id to the next authoritative read.
+                _invalidate_timeline_event_until_visible(
+                    event,
+                    database_scope=transaction_scope,
+                )
+
+    conn.set_trace_callback(transaction_trace)
+    return True
+
+
+def _publish_timeline_event(
+    inserted_event: dict[str, Any],
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    try:
+        if conn is not None and conn.in_transaction:
+            _defer_timeline_event_until_commit(conn, inserted_event)
+            return
+        _publish_committed_timeline_event(
+            dict(inserted_event),
+            database_scope=(
+                timeline_database_scope(conn)
+                if conn is not None
+                else ""
+            ),
+        )
     except Exception:
         log.debug("task timeline event publish failed", exc_info=True)
 
@@ -1419,7 +2056,7 @@ def run_post_commit_hooks(
 
     event = dict(inserted_event)
     _run_service_router_hook(conn, event)
-    _publish_timeline_event(event)
+    _publish_timeline_event(event, conn=conn)
 
 
 def record_event(
@@ -1480,7 +2117,7 @@ def record_event(
         post_commit_hooks=post_commit_hooks,
     )
     if post_commit_hooks:
-        _publish_timeline_event(inserted)
+        _publish_timeline_event(inserted, conn=conn)
     return inserted
 
 
@@ -1665,7 +2302,7 @@ class _TimelineWriteQueue:
                 try:
                     inserted = _insert_event(conn, event)
                     conn.commit()
-                    _publish_timeline_event(inserted)
+                    _publish_timeline_event(inserted, conn=conn)
                     item["result"] = inserted
                 finally:
                     conn.close()
@@ -14340,6 +14977,14 @@ def _public_timeline_event(
     return public_event
 
 
+def _public_timeline_fts_query(value: str) -> str:
+    """Return a bounded prefix-token FTS5 query without syntax injection."""
+
+    tokens = re.findall(r"[^\W_]+", str(value or "").casefold(), re.UNICODE)
+    deduped = list(dict.fromkeys(tokens))[:16]
+    return " AND ".join(f'"{token}"*' for token in deduped)
+
+
 def search_public_events(
     conn: sqlite3.Connection,
     project_id: str,
@@ -14357,18 +15002,20 @@ def search_public_events(
     limit: int = PUBLIC_TIMELINE_SEARCH_DEFAULT_LIMIT,
     offset: int = 0,
     scan_limit: int = PUBLIC_TIMELINE_SEARCH_DEFAULT_SCAN_LIMIT,
+    before_event_id: int = 0,
 ) -> dict[str, Any]:
-    """Search historical timeline evidence without exposing raw event bodies."""
+    """Search historical evidence through FTS5 plus stable id keyset paging."""
 
     ensure_schema(conn)
     query = str(q or "").strip()[:PUBLIC_TIMELINE_SEARCH_MAX_QUERY_CHARS]
     page_limit = max(1, min(int(limit or 0), PUBLIC_TIMELINE_SEARCH_MAX_LIMIT))
     page_offset = max(0, int(offset or 0))
+    keyset_before = max(0, int(before_event_id or 0))
     bounded_scan_limit = max(
         page_limit,
         min(int(scan_limit or 0), PUBLIC_TIMELINE_SEARCH_MAX_SCAN_LIMIT),
     )
-    clauses = ["project_id = ?"]
+    clauses = ["events.project_id = ?"]
     params: list[Any] = [project_id]
     exact_filters = {
         "task_id": task_id,
@@ -14382,25 +15029,83 @@ def search_public_events(
         value = str(raw_value or "").strip()
         if not value:
             continue
-        clauses.append(f"LOWER({column}) = LOWER(?)")
+        clauses.append(f"events.{column} = ? COLLATE NOCASE")
         params.append(value)
     if event_kind:
-        event_kind_query = _timeline_event_kind_query_parts(event_kind)
-        if event_kind_query is not None:
-            clause, query_params = event_kind_query
-            clauses.append(clause)
-            params.extend(query_params)
-    where_sql = " AND ".join(clauses)
+        aliases = _EVENT_KIND_QUERY_ALIASES.get(
+            str(event_kind).strip().lower().replace("-", "_"),
+            {},
+        )
+        event_kind_clauses: list[str] = []
+        for column in ("event_kind", "event_type", "phase"):
+            values = set(aliases.get(column, set()))
+            if column == "event_kind":
+                values.add(str(event_kind).strip())
+            normalized_values = sorted(value for value in values if value)
+            if not normalized_values:
+                continue
+            event_kind_clauses.append(
+                f"events.{column} IN ({', '.join('?' for _ in normalized_values)})"
+            )
+            params.extend(normalized_values)
+        if event_kind_clauses:
+            clauses.append("(" + " OR ".join(event_kind_clauses) + ")")
+    source_where_sql = " AND ".join(clauses)
+    source_params = list(params)
     source_total = int(
         conn.execute(
-            f"SELECT COUNT(*) AS count FROM task_timeline_events WHERE {where_sql}",
-            params,
+            f"""
+            SELECT COUNT(*) AS count
+            FROM task_timeline_events AS events
+            WHERE {source_where_sql}
+            """,
+            source_params,
         ).fetchone()["count"]
         or 0
     )
-    search_clauses: list[str] = []
-    search_params: list[Any] = []
-    if query:
+    if keyset_before:
+        clauses.append("events.id < ?")
+        params.append(keyset_before)
+    normalized_backlog_status = _normalize_token(backlog_status)
+    closed_statuses = sorted(_PUBLIC_TIMELINE_CLOSED_BACKLOG_STATUSES)
+    if normalized_backlog_status == "open":
+        clauses.append(
+            "LOWER(COALESCE(backlog.status, '')) "
+            f"NOT IN ({', '.join('?' for _ in closed_statuses)})"
+        )
+        params.extend(closed_statuses)
+    elif normalized_backlog_status == "closed":
+        clauses.append(
+            "LOWER(COALESCE(backlog.status, '')) "
+            f"IN ({', '.join('?' for _ in closed_statuses)})"
+        )
+        params.extend(closed_statuses)
+    elif normalized_backlog_status not in {"", "all"}:
+        clauses.append("backlog.status = ? COLLATE NOCASE")
+        params.append(normalized_backlog_status)
+    normalized_priority = str(priority or "").strip().casefold()
+    if normalized_priority not in {"", "all"}:
+        clauses.append("backlog.priority = ? COLLATE NOCASE")
+        params.append(normalized_priority)
+
+    fts_available = _ensure_public_timeline_search_index(conn)
+    fts_query = _public_timeline_fts_query(query)
+    use_fts = bool(query and fts_available and fts_query)
+    from_sql = """
+        task_timeline_events AS events
+        LEFT JOIN backlog_bugs AS backlog
+          ON backlog.bug_id = events.backlog_id
+    """
+    if use_fts:
+        from_sql += """
+        JOIN task_timeline_events_fts
+          ON task_timeline_events_fts.rowid = events.id
+        """
+        clauses.append("task_timeline_events_fts MATCH ?")
+        params.append(fts_query)
+    elif query:
+        # Compatibility fallback for SQLite builds without FTS5. Normal
+        # supported deployments always use the indexed branch above.
         escaped_query = (
             query.casefold()
             .replace("\\", "\\\\")
@@ -14408,39 +15113,39 @@ def search_public_events(
             .replace("_", "\\_")
         )
         needle = f"%{escaped_query}%"
-        for column in (
-            "backlog_id",
-            "task_id",
-            "event_type",
-            "event_kind",
-            "phase",
-            "status",
-            "actor",
-            "commit_sha",
-            "payload_json",
-            "verification_json",
-            "artifact_refs_json",
-        ):
-            search_clauses.append(
-                f"LOWER(COALESCE({column}, '')) LIKE ? ESCAPE '\\'"
+        fallback_clauses = [
+            f"LOWER(COALESCE(events.{column}, '')) LIKE ? ESCAPE '\\'"
+            for column in (
+                "backlog_id",
+                "task_id",
+                "event_type",
+                "event_kind",
+                "phase",
+                "status",
+                "actor",
+                "commit_sha",
+                "payload_json",
+                "verification_json",
+                "artifact_refs_json",
             )
-            search_params.append(needle)
-    candidate_where_sql = where_sql
-    if search_clauses:
-        candidate_where_sql += " AND (" + " OR ".join(search_clauses) + ")"
+        ]
+        clauses.append("(" + " OR ".join(fallback_clauses) + ")")
+        params.extend([needle] * len(fallback_clauses))
+
+    where_sql = " AND ".join(clauses)
     candidate_total = int(
         conn.execute(
-            f"SELECT COUNT(*) AS count FROM task_timeline_events WHERE {candidate_where_sql}",
-            [*params, *search_params],
+            f"SELECT COUNT(*) AS count FROM {from_sql} WHERE {where_sql}",
+            params,
         ).fetchone()["count"]
         or 0
     )
     rows = conn.execute(
-        f"""SELECT * FROM task_timeline_events
-            WHERE {candidate_where_sql}
-            ORDER BY id DESC
+        f"""SELECT events.* FROM {from_sql}
+            WHERE {where_sql}
+            ORDER BY events.id DESC
             LIMIT ?""",
-        [*params, *search_params, bounded_scan_limit],
+        [*params, bounded_scan_limit],
     ).fetchall()
     decoded = [_row_to_dict(row) for row in rows]
     backlog_rows = _compact_backlog_rows(
@@ -14459,26 +15164,7 @@ def search_public_events(
         )
         for event in decoded
     ]
-    normalized_backlog_status = _normalize_token(backlog_status)
-    normalized_priority = str(priority or "").strip().casefold()
-    if normalized_backlog_status or normalized_priority:
-        filtered_events: list[dict[str, Any]] = []
-        for event in public_events:
-            backlog_row = event.get("backlog")
-            backlog_row = backlog_row if isinstance(backlog_row, Mapping) else {}
-            row_status = _normalize_token(backlog_row.get("status"))
-            row_priority = str(backlog_row.get("priority") or "").strip().casefold()
-            if normalized_backlog_status == "open" and row_status in _PUBLIC_TIMELINE_CLOSED_BACKLOG_STATUSES:
-                continue
-            if normalized_backlog_status == "closed" and row_status not in _PUBLIC_TIMELINE_CLOSED_BACKLOG_STATUSES:
-                continue
-            if normalized_backlog_status not in {"", "all", "open", "closed"} and row_status != normalized_backlog_status:
-                continue
-            if normalized_priority not in {"", "all"} and row_priority != normalized_priority:
-                continue
-            filtered_events.append(event)
-        public_events = filtered_events
-    if query:
+    if query and not use_fts:
         needle = query.casefold()
         public_events = [
             event
@@ -14488,7 +15174,24 @@ def search_public_events(
         ]
     total = len(public_events)
     page = public_events[page_offset : page_offset + page_limit]
-    has_more = page_offset + len(page) < total
+    has_more = (
+        page_offset + len(page) < total
+        or candidate_total > len(rows)
+    )
+    cursor_event = page[-1] if page else (
+        public_events[-1] if public_events else (
+            _row_to_dict(rows[-1]) if rows else {}
+        )
+    )
+    next_cursor = (
+        int(
+            cursor_event.get("id")
+            or cursor_event.get("event_id")
+            or 0
+        )
+        if has_more and cursor_event
+        else None
+    )
     return {
         "ok": True,
         "schema_version": PUBLIC_TIMELINE_SEARCH_SCHEMA_VERSION,
@@ -14501,8 +15204,10 @@ def search_public_events(
         "total": total,
         "limit": page_limit,
         "offset": page_offset,
+        "before_event_id": keyset_before or None,
         "has_more": has_more,
         "next_offset": page_offset + len(page) if has_more else None,
+        "next_cursor": next_cursor,
         "scope": {
             "schema_version": "task_timeline.public_search_scope.v1",
             "project_id": project_id,
@@ -14538,6 +15243,14 @@ def search_public_events(
             "scan_truncated": candidate_total > len(rows),
             "total_is_bounded_to_scan": candidate_total > len(rows),
             "order": "newest_first",
+            "pagination": "stable_id_keyset",
+            "cursor_field": "before_event_id",
+            "search_index": (
+                "sqlite_fts5"
+                if use_fts
+                else ("sqlite_like_fallback" if query else "sqlite_btree")
+            ),
+            "hot_window_pollution": False,
         },
         "public_safe": True,
         "raw_event_payloads_omitted": True,
