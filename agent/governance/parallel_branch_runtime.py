@@ -309,6 +309,23 @@ INTEGRATION_EPOCH_ACTIVE_STATES = frozenset(
         INTEGRATION_EPOCH_RECONCILED,
     }
 )
+MERGE_EXECUTION_FLOW_MF_PARALLEL = "mf_parallel"
+MERGE_EXECUTION_FLOW_MF_BATCH_PARALLEL = "mf_batch_parallel"
+MERGE_EXECUTION_FLOW_DIRECT_FIX = "direct_fix"
+MERGE_EXECUTION_FLOW_HOTFIX = "hotfix"
+MERGE_EXECUTION_STANDALONE_FLOWS = frozenset(
+    {
+        MERGE_EXECUTION_FLOW_MF_PARALLEL,
+        MERGE_EXECUTION_FLOW_DIRECT_FIX,
+        MERGE_EXECUTION_FLOW_HOTFIX,
+    }
+)
+MERGE_EXECUTION_FLOWS = frozenset(
+    {
+        *MERGE_EXECUTION_STANDALONE_FLOWS,
+        MERGE_EXECUTION_FLOW_MF_BATCH_PARALLEL,
+    }
+)
 
 ACTION_LEAVE_MERGED = "leave_merged"
 ACTION_OBSERVER_DECISION_REQUIRED = "observer_decision_required"
@@ -19182,6 +19199,7 @@ def execute_merge_queue_item(
     bug_id: str = "",
     source_contract_id: str = "",
     fence_token: str = "",
+    flow: str = "",
     now_iso: str = "",
     timeout_seconds: int = 30,
     scenario_id: str = "PB-016",
@@ -19234,6 +19252,39 @@ def execute_merge_queue_item(
     item_checkpoint_id = str(
         item_context.checkpoint_id if item_context is not None else ""
     ).strip()
+    requested_flow = str(flow or "").strip()
+    if requested_flow and requested_flow not in MERGE_EXECUTION_FLOWS:
+        return {
+            "ok": False,
+            "dry_run": dry_run,
+            "executed": False,
+            "error": "merge_execution_flow_invalid",
+            "message": (
+                "flow must be omitted for compatibility inference or be one of "
+                "mf_parallel/mf_batch_parallel/direct_fix/hotfix"
+            ),
+            "requested_flow": requested_flow,
+            "recorded": None,
+        }
+    if (
+        requested_flow == MERGE_EXECUTION_FLOW_MF_BATCH_PARALLEL
+        and not item_batch_id
+    ):
+        return {
+            "ok": False,
+            "dry_run": dry_run,
+            "executed": False,
+            "error": "mf_batch_parallel_batch_id_required",
+            "message": (
+                "explicit mf_batch_parallel merge execution requires the "
+                "runtime context's canonical non-empty batch_id"
+            ),
+            "requested_flow": requested_flow,
+            "recorded": None,
+        }
+    integration_epoch_required = bool(item_batch_id) and (
+        requested_flow not in MERGE_EXECUTION_STANDALONE_FLOWS
+    )
     active_epoch = get_active_integration_epoch(
         conn,
         project_id,
@@ -19530,7 +19581,7 @@ def execute_merge_queue_item(
                 "integration_epoch": integration_epoch_to_dict(active_epoch),
             }
         epoch: IntegrationEpoch | None = None
-        if item_batch_id:
+        if integration_epoch_required:
             try:
                 epoch = open_or_validate_integration_epoch(
                     conn,
@@ -19781,7 +19832,7 @@ def execute_merge_queue_item(
         }
 
     epoch = None
-    if item_batch_id:
+    if integration_epoch_required:
         try:
             epoch = open_or_validate_integration_epoch(
                 conn,
