@@ -64771,8 +64771,6 @@ def test_runtime_context_worker_guide_current_qa_supersedes_historical_failed_qa
         "owner_role": "qa",
         "allowed_writer_roles": ["qa"],
         "contract_execution_id": "cex-rev38-historical-failed-qa",
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
         "execution_state_revision": 38,
         "authority_decision_source": "contract_runtime_current_state",
         "source_of_authority": "contract_runtime_current_state",
@@ -64793,6 +64791,12 @@ def test_runtime_context_worker_guide_current_qa_supersedes_historical_failed_qa
         "execution_state_revision": 38,
         "completed_lines": [historical_failed_line],
         "next_legal_action": canonical_next,
+    }
+    state["contract_runtime_execution_resolution"] = {
+        "schema_version": "runtime_context.contract_execution_resolution.v1",
+        "status": "resolved_revision_contract_execution_id",
+        "contract_execution_id": "cex-rev38-historical-failed-qa",
+        "fail_closed": False,
     }
     worker_view = state["runtime_context_service"]["views"]["worker_view"]
     stale_evidence = [
@@ -64881,6 +64885,47 @@ def test_runtime_context_worker_guide_current_qa_supersedes_historical_failed_qa
     )
     assert worker_guide["historical_audit_reasons"] == (
         response["historical_audit_reasons"]
+    )
+
+
+def test_runtime_context_worker_guide_rejects_unbound_qa_precedence():
+    runtime_context_id = "mfrctx-unbound-qa-precedence"
+    task_id = "task-unbound-qa-precedence"
+    canonical_next = {
+        "schema_version": "contract_runtime_next_legal_action.v1",
+        "id": "qa_graph_context",
+        "action": "record_graph_trace",
+        "line_id": "qa_graph_context",
+        "owner_role": "qa",
+        "allowed_writer_roles": ["qa"],
+        "contract_execution_id": "cex-foreign-qa-precedence",
+        "authority_decision_source": "contract_runtime_current_state",
+    }
+    state = _worker_guide_state_with_contract_next_action(
+        canonical_next,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    state["contract_runtime_execution_resolution"] = {
+        "schema_version": "runtime_context.contract_execution_resolution.v1",
+        "status": "resolved_revision_contract_execution_id",
+        "contract_execution_id": "cex-b2a-worker-guide",
+        "fail_closed": False,
+    }
+    worker_view = state["runtime_context_service"]["views"]["worker_view"]
+    for view_name in ("control_plane", "action_plan"):
+        worker_view[view_name]["next_legal_action"] = (
+            "revise_after_failed_independent_qa"
+        )
+
+    response = server._runtime_context_worker_guide_response(state)
+
+    assert response["next_legal_action"] == (
+        "revise_after_failed_independent_qa"
+    )
+    assert response["contract_runtime_next_action_took_precedence"] is False
+    assert response["next_legal_action_decision_source"] == (
+        "runtime_context_timeline_projection"
     )
 
 

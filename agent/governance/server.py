@@ -14718,6 +14718,8 @@ def _runtime_context_contract_post_revision_qa_action_takes_precedence(
     runtime_context_id: str,
     task_id: str,
     current_next_legal_action: str,
+    contract_runtime_current_state: Mapping[str, Any] | None = None,
+    contract_runtime_execution_resolution: Mapping[str, Any] | None = None,
 ) -> bool:
     """Let current ContractRuntime QA authority retire stale failed-QA routing."""
 
@@ -14726,12 +14728,49 @@ def _runtime_context_contract_post_revision_qa_action_takes_precedence(
         "record_implementation_evidence",
     }:
         return False
-    if not _runtime_context_contract_line_matches_worker(
-        next_action,
-        runtime_context_id=runtime_context_id,
-        task_id=task_id,
-    ):
-        return False
+    action_runtime_context_id = str(
+        next_action.get("runtime_context_id") or ""
+    ).strip()
+    action_task_id = str(next_action.get("task_id") or "").strip()
+    if action_runtime_context_id or action_task_id:
+        if not _runtime_context_contract_line_matches_worker(
+            next_action,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        ):
+            return False
+    else:
+        current_state = (
+            contract_runtime_current_state
+            if isinstance(contract_runtime_current_state, Mapping)
+            else {}
+        )
+        resolution = (
+            contract_runtime_execution_resolution
+            if isinstance(contract_runtime_execution_resolution, Mapping)
+            else {}
+        )
+        action_execution_id = str(
+            next_action.get("contract_execution_id") or ""
+        ).strip()
+        current_execution_id = str(
+            current_state.get("contract_execution_id") or ""
+        ).strip()
+        resolved_execution_id = str(
+            resolution.get("contract_execution_id") or ""
+        ).strip()
+        resolution_status = str(resolution.get("status") or "").strip()
+        if (
+            not action_execution_id
+            or action_execution_id != current_execution_id
+            or resolution.get("fail_closed")
+            or not resolution_status.startswith("resolved_")
+            or (
+                resolved_execution_id
+                and resolved_execution_id != action_execution_id
+            )
+        ):
+            return False
     owner_role = str(next_action.get("owner_role") or "").strip()
     raw_allowed_roles = next_action.get("allowed_writer_roles") or []
     if isinstance(raw_allowed_roles, str):
@@ -17103,6 +17142,10 @@ def _runtime_context_worker_guide_response(
         runtime_context_id=runtime_context_id,
         task_id=task_id,
         current_next_legal_action=next_legal_action,
+        contract_runtime_current_state=contract_runtime_current_state,
+        contract_runtime_execution_resolution=(
+            contract_runtime_execution_resolution
+        ),
     ):
         canonical_next_action = str(
             contract_runtime_next_legal_action.get("action") or ""
