@@ -69207,6 +69207,24 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
         # the one current rework generation.
         qa_verification(fresh_commit, "passed", task_id),
     ]
+    completed_lines[-1]["validated_head_commit"] = fresh_commit
+    completed_lines[-1]["test_results"] = {
+        "baseline": {"commit_sha": old_commit},
+        "candidate": {"commit_sha": fresh_commit},
+    }
+    completed_lines[-1]["artifact_refs"] = {
+        "external_no_pass_baseline_ledger": {
+            "schema_version": (
+                "contract_runtime.external_no_pass_baseline_ledger.v2"
+            ),
+            "base_commit_sha": old_commit,
+            "candidate_commit_sha": fresh_commit,
+        }
+    }
+    completed_lines[-1]["payload"]["candidate_commit_sha"] = fresh_commit
+    completed_lines[-1]["payload"]["test_results"] = json.loads(
+        json.dumps(completed_lines[-1]["test_results"])
+    )
     record = {
         "project_id": PID,
         "backlog_id": backlog_id,
@@ -69240,6 +69258,21 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
     assert resolved["qa_graph_completed_line_index"] == 5
     assert resolved["qa_completed_line_index"] == 6
     assert resolved["qa_contract_runtime_verified"] is True
+
+    canonical_candidate_conflict = json.loads(json.dumps(record))
+    canonical_candidate_conflict["completed_lines"][6]["payload"][
+        "candidate_commit_sha"
+    ] = old_commit
+    assert (
+        server._contract_runtime_observer_merge_completed_round(
+            conn,
+            project_id=PID,
+            record=canonical_candidate_conflict,
+            context=context,
+            branch_head=fresh_commit,
+        )
+        == {}
+    )
 
     unrelated_parent = json.loads(json.dumps(record))
     unrelated_parent["completed_lines"][6]["parent_task_id"] = (

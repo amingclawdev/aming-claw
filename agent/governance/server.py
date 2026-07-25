@@ -69428,11 +69428,41 @@ def _contract_runtime_observer_merge_completed_round(
             if str(candidate.get(key) or "").strip()
         }
 
+    def candidate_authority_mappings(
+        value: Any,
+        *,
+        depth: int = 0,
+    ) -> list[Mapping[str, Any]]:
+        """Return candidate evidence without treating baseline audit as identity."""
+
+        if depth > 6:
+            return []
+        if isinstance(value, Mapping):
+            candidates: list[Mapping[str, Any]] = [value]
+            for key, child in value.items():
+                if str(key or "").strip() in {
+                    "baseline",
+                    "external_no_pass_baseline_ledger",
+                }:
+                    continue
+                candidates.extend(
+                    candidate_authority_mappings(child, depth=depth + 1)
+                )
+            return candidates
+        if isinstance(value, list):
+            candidates = []
+            for child in value:
+                candidates.extend(
+                    candidate_authority_mappings(child, depth=depth + 1)
+                )
+            return candidates
+        return []
+
     def commit_values(line: Mapping[str, Any]) -> set[str]:
         return {
-            value.lower()
-            for value in values(
-                line,
+            str(candidate.get(key) or "").strip().lower()
+            for candidate in candidate_authority_mappings(line)
+            for key in (
                 "commit_sha",
                 "worker_commit_sha",
                 "candidate_commit_sha",
@@ -69440,7 +69470,10 @@ def _contract_runtime_observer_merge_completed_round(
                 "validated_head_commit",
                 "immutable_head_commit",
             )
-            if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value)
+            if re.fullmatch(
+                r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}",
+                str(candidate.get(key) or "").strip(),
+            )
         }
 
     def has_no_identity_conflict(
