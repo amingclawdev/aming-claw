@@ -7773,6 +7773,162 @@ def _qa_checkout_root_identity(
     return identity
 
 
+def _qa_exact_candidate_diff_identity(
+    canonical_project_root: Path,
+    *,
+    base_commit_sha: str,
+    candidate_commit_sha: str,
+) -> dict[str, Any]:
+    """Derive the immutable base-to-candidate tuple for an exact snapshot.
+
+    An exact candidate graph snapshot is materialized at the candidate commit,
+    so its graph base commit intentionally equals the candidate.  QA still
+    needs the worker's cumulative runtime diff for scope and evidence binding.
+    Keep that comparison tuple separate from the graph snapshot base and do not
+    attempt to rebuild an overlay that the exact snapshot already replaces.
+    """
+
+    canonical_root = Path(canonical_project_root).resolve()
+    base_commit_sha = str(base_commit_sha or "").strip().lower()
+    candidate_commit_sha = str(candidate_commit_sha or "").strip().lower()
+    for field, commit_sha in (
+        ("comparison_base_commit_sha", base_commit_sha),
+        ("candidate_commit_sha", candidate_commit_sha),
+    ):
+        resolved = _qa_git_bytes(
+            canonical_root,
+            ["rev-parse", "--verify", f"{commit_sha}^{{commit}}"],
+        )
+        resolved_sha = resolved.stdout.decode(
+            "ascii", errors="ignore"
+        ).strip().lower()
+        if resolved.returncode != 0 or resolved_sha != commit_sha:
+            _qa_overlay_fail(
+                "exact_candidate_comparison_commit_unavailable",
+                f"{field} is not an available full commit",
+                field=field,
+                commit_sha=commit_sha,
+            )
+    if base_commit_sha == candidate_commit_sha:
+        _qa_overlay_fail(
+            "exact_candidate_comparison_base_not_distinct",
+            "exact candidate comparison base must differ from the candidate",
+            comparison_base_commit_sha=base_commit_sha,
+            candidate_commit_sha=candidate_commit_sha,
+        )
+    ancestry = _qa_git_bytes(
+        canonical_root,
+        ["merge-base", "--is-ancestor", base_commit_sha, candidate_commit_sha],
+    )
+    if ancestry.returncode != 0:
+        _qa_overlay_fail(
+            "exact_candidate_comparison_base_not_ancestor",
+            "trusted runtime comparison base is not an ancestor of the candidate",
+            comparison_base_commit_sha=base_commit_sha,
+            candidate_commit_sha=candidate_commit_sha,
+        )
+
+    changed = _qa_git_bytes(
+        canonical_root,
+        [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--name-status",
+            "-z",
+            "-M",
+            f"{base_commit_sha}..{candidate_commit_sha}",
+            "--",
+            ".",
+        ],
+    )
+    if changed.returncode != 0:
+        _qa_overlay_fail(
+            "exact_candidate_comparison_diff_unavailable",
+            "server could not derive the exact candidate file changes",
+        )
+    file_changes = _qa_parse_name_status_z(changed.stdout)
+    changed_files: list[str] = []
+    for item in file_changes:
+        for candidate_path in (item.get("old_path"), item.get("path")):
+            normalized = str(candidate_path or "")
+            if normalized and normalized not in changed_files:
+                changed_files.append(normalized)
+
+    diff = _qa_git_bytes(
+        canonical_root,
+        [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "-M",
+            f"{base_commit_sha}..{candidate_commit_sha}",
+            "--",
+            ".",
+        ],
+    )
+    if diff.returncode != 0:
+        _qa_overlay_fail(
+            "exact_candidate_comparison_diff_hash_unavailable",
+            "server could not hash the exact candidate diff",
+        )
+    return {
+        "changed_files": changed_files,
+        "candidate_diff_hash": f"sha256:{hashlib.sha256(diff.stdout).hexdigest()}",
+        "changed_files_source": (
+            "server_runtime_context_base_to_exact_candidate_diff"
+        ),
+        "comparison_base_commit_sha": base_commit_sha,
+        "comparison_base_commit_source": (
+            "ContractRuntime.completed_lines.worker_commit+"
+            "parallel_branch_runtime_context.base_commit"
+        ),
+    }
+
+
+def _qa_exact_candidate_runtime_comparison_base(
+    conn,
+    *,
+    project_id: str,
+    proof: Mapping[str, Any],
+) -> str:
+    """Resolve a worker base only through persisted ContractRuntime authority."""
+
+    from .parallel_branch_runtime import get_branch_context
+
+    task_id = str(proof.get("task_id") or "").strip()
+    backlog_id = str(proof.get("backlog_id") or "").strip()
+    candidate_commit_sha = str(proof.get("commit_sha") or "").strip().lower()
+    context = get_branch_context(conn, project_id, task_id) if task_id else None
+    if context is None or str(
+        getattr(context, "backlog_id", "") or ""
+    ).strip() != backlog_id:
+        return ""
+    execution_ids = [
+        str(getattr(context, field, "") or "").strip()
+        for field in ("parent_task_id", "root_task_id")
+    ]
+    for execution_id in dict.fromkeys(
+        item for item in execution_ids if item
+    ):
+        record = _contract_runtime_store(conn).get(execution_id)
+        if not isinstance(record, Mapping):
+            continue
+        if str(record.get("backlog_id") or "").strip() != backlog_id:
+            continue
+        base_commit = _contract_runtime_server_candidate_base_commit(
+            conn,
+            project_id=project_id,
+            record=record,
+            expected_candidate_commit=candidate_commit_sha,
+        )
+        if base_commit:
+            return base_commit
+    return ""
+
+
 def _qa_exact_candidate_context(
     project_root: Path,
     *,
@@ -7780,6 +7936,7 @@ def _qa_exact_candidate_context(
     canonical_project_root: Path,
     candidate_commit_sha: str,
     escalation: Mapping[str, Any] | None = None,
+    comparison_base_commit_sha: str = "",
 ) -> dict[str, Any]:
     from . import graph_query_trace
 
@@ -7799,6 +7956,35 @@ def _qa_exact_candidate_context(
         require_canonical_base_head=False,
         require_query_candidate_head=True,
     )
+    comparison_base_commit_sha = str(
+        comparison_base_commit_sha or ""
+    ).strip().lower()
+    if comparison_base_commit_sha:
+        diff_identity = _qa_exact_candidate_diff_identity(
+            canonical_project_root,
+            base_commit_sha=comparison_base_commit_sha,
+            candidate_commit_sha=candidate_commit_sha,
+        )
+        root_identity.update(
+            {
+                "comparison_base_commit_sha": diff_identity[
+                    "comparison_base_commit_sha"
+                ],
+                "comparison_base_commit_source": diff_identity[
+                    "comparison_base_commit_source"
+                ],
+            }
+        )
+    else:
+        diff_identity = {
+            "changed_files": [],
+            "candidate_diff_hash": (
+                "sha256:" + hashlib.sha256(b"").hexdigest()
+            ),
+            "changed_files_source": "server_exact_candidate_snapshot",
+            "comparison_base_commit_sha": "",
+            "comparison_base_commit_source": "",
+        }
     escalation = escalation if isinstance(escalation, Mapping) else {}
     graph_basis_decision = graph_query_trace.bounded_qa_graph_basis_decision(
         "exact_candidate_snapshot",
@@ -7814,6 +8000,7 @@ def _qa_exact_candidate_context(
         ),
     )
     return {
+        **diff_identity,
         "graph_basis_decision": graph_basis_decision,
         "graph_basis_decision_hash": stable_sha256(graph_basis_decision),
         "root_identity": root_identity,
@@ -8188,6 +8375,11 @@ _QA_REVIEW_CLAIM_ALIASES = {
     "changed_files": ("candidate_changed_files", "changed_files"),
     "candidate_diff_hash": ("candidate_diff_hash", "diff_hash"),
     "changed_files_source": ("changed_files_source",),
+    "comparison_base_commit_sha": (
+        "comparison_base_commit_sha",
+        "comparison_base_commit",
+    ),
+    "comparison_base_commit_source": ("comparison_base_commit_source",),
     "candidate_overlay_hash": ("candidate_overlay_hash",),
     "root_identity_hash": ("root_identity_hash",),
     "query_root": ("query_root",),
@@ -8350,6 +8542,19 @@ def _qa_graph_review_context_from_trace_row(
         "changed_files": changed_files,
         "candidate_diff_hash": str(row["candidate_diff_hash"] or "").strip().lower(),
         "changed_files_source": str(row["changed_files_source"] or "").strip(),
+        "comparison_base_commit_sha": (
+            str(root_identity_raw.get("comparison_base_commit_sha") or "")
+            .strip()
+            .lower()
+            if isinstance(root_identity_raw, Mapping)
+            else ""
+        ),
+        "comparison_base_commit_source": (
+            str(root_identity_raw.get("comparison_base_commit_source") or "")
+            .strip()
+            if isinstance(root_identity_raw, Mapping)
+            else ""
+        ),
         "candidate_overlay_hash": str(
             row["candidate_overlay_hash"] or ""
         ).strip().lower(),
@@ -8461,25 +8666,83 @@ def _qa_graph_review_context_from_trace_row(
                     "actual": review_context["base_commit_sha"],
                 }
             )
-        if changed_files:
-            mismatches.append(
-                {
-                    "trace_id": trace_id,
-                    "field": "changed_files",
-                    "expected": [],
-                    "actual": changed_files,
-                }
-            )
         empty_diff_hash = f"sha256:{hashlib.sha256(b'').hexdigest()}"
-        if review_context["candidate_diff_hash"] != empty_diff_hash:
-            mismatches.append(
-                {
-                    "trace_id": trace_id,
-                    "field": "candidate_diff_hash",
-                    "expected": empty_diff_hash,
-                    "actual": review_context["candidate_diff_hash"],
-                }
-            )
+        comparison_base_commit = review_context[
+            "comparison_base_commit_sha"
+        ]
+        comparison_base_source = review_context[
+            "comparison_base_commit_source"
+        ]
+        if comparison_base_commit:
+            if not re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}", comparison_base_commit
+            ) or comparison_base_commit == review_context[
+                "candidate_commit_sha"
+            ]:
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "comparison_base_commit_sha",
+                        "expected": "distinct full ancestor commit",
+                        "actual": comparison_base_commit,
+                    }
+                )
+            if comparison_base_source != (
+                "ContractRuntime.completed_lines.worker_commit+"
+                "parallel_branch_runtime_context.base_commit"
+            ):
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "comparison_base_commit_source",
+                        "expected": (
+                            "ContractRuntime.completed_lines.worker_commit+"
+                            "parallel_branch_runtime_context.base_commit"
+                        ),
+                        "actual": comparison_base_source,
+                    }
+                )
+            if review_context["changed_files_source"] != (
+                "server_runtime_context_base_to_exact_candidate_diff"
+            ):
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "changed_files_source",
+                        "expected": (
+                            "server_runtime_context_base_to_exact_candidate_diff"
+                        ),
+                        "actual": review_context["changed_files_source"],
+                    }
+                )
+        else:
+            if changed_files:
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "changed_files",
+                        "expected": [],
+                        "actual": changed_files,
+                    }
+                )
+            if review_context["candidate_diff_hash"] != empty_diff_hash:
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "candidate_diff_hash",
+                        "expected": empty_diff_hash,
+                        "actual": review_context["candidate_diff_hash"],
+                    }
+                )
+            if comparison_base_source:
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "comparison_base_commit_source",
+                        "expected": "",
+                        "actual": comparison_base_source,
+                    }
+                )
         if candidate_overlay_raw or review_context["candidate_overlay_hash"]:
             mismatches.append(
                 {
@@ -9123,6 +9386,9 @@ def _qa_reverify_candidate_trace_context(
                         or ""
                     ),
                 },
+                comparison_base_commit_sha=str(
+                    root_identity.get("comparison_base_commit_sha") or ""
+                ),
             )
         except _QACandidateOverlayError as exc:
             mismatches.append(
@@ -9136,6 +9402,11 @@ def _qa_reverify_candidate_trace_context(
             )
             return review_context, mismatches
         for field in (
+            "changed_files",
+            "candidate_diff_hash",
+            "changed_files_source",
+            "comparison_base_commit_sha",
+            "comparison_base_commit_source",
             "query_root_identity_hash",
             "repository_identity_hash",
         ):
@@ -9770,16 +10041,15 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                         review_context.get("candidate_commit_sha") or ""
                     ),
                 )
+                comparison_base_commit = (
+                    _qa_exact_candidate_runtime_comparison_base(
+                        conn,
+                        project_id=ctx.get_project_id(),
+                        proof=proof,
+                    )
+                )
                 review_context.update(
                     {
-                        "changed_files": [],
-                        "candidate_diff_hash": (
-                            "sha256:"
-                            + hashlib.sha256(b"").hexdigest()
-                        ),
-                        "changed_files_source": (
-                            "server_exact_candidate_snapshot"
-                        ),
                         **_qa_exact_candidate_context(
                             query_root,
                             project_id=ctx.get_project_id(),
@@ -9788,6 +10058,9 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                                 review_context.get("candidate_commit_sha") or ""
                             ),
                             escalation=escalation,
+                            comparison_base_commit_sha=(
+                                comparison_base_commit
+                            ),
                         ),
                     }
                 )
@@ -13423,6 +13696,8 @@ def _runtime_context_service_qa_graph_trace_refs(
                 "changed_files",
                 "candidate_diff_hash",
                 "changed_files_source",
+                "comparison_base_commit_sha",
+                "comparison_base_commit_source",
                 "candidate_overlay_hash",
                 "root_identity_hash",
                 "query_root_identity_hash",
@@ -44482,10 +44757,25 @@ def handle_graph_governance_query(ctx: RequestContext):
                             qa_proof.get("graph_basis_decision"), Mapping
                         )
                         else {},
+                        comparison_base_commit_sha=str(
+                            (
+                                qa_proof.get("root_identity")
+                                if isinstance(
+                                    qa_proof.get("root_identity"), Mapping
+                                )
+                                else {}
+                            ).get("comparison_base_commit_sha")
+                            or ""
+                        ),
                     )
                     exact_mismatches = [
                         field
                         for field in (
+                            "changed_files",
+                            "candidate_diff_hash",
+                            "changed_files_source",
+                            "comparison_base_commit_sha",
+                            "comparison_base_commit_source",
                             "root_identity_hash",
                             "query_root_identity_hash",
                             "repository_identity_hash",
@@ -64535,6 +64825,8 @@ def _contract_runtime_projected_qa_graph_line(
             "changed_files",
             "candidate_diff_hash",
             "changed_files_source",
+            "comparison_base_commit_sha",
+            "comparison_base_commit_source",
             "candidate_overlay_hash",
             "root_identity_hash",
             "query_root_identity_hash",
@@ -67939,6 +68231,7 @@ def _contract_runtime_server_candidate_base_commit(
         return ""
 
     context_bases: set[str] = set()
+    context_retarget_bases: set[str] = set()
     for dispatch_line in record.get("completed_lines") or []:
         if not isinstance(dispatch_line, Mapping) or str(
             dispatch_line.get("line_id") or ""
@@ -67962,15 +68255,31 @@ def _contract_runtime_server_candidate_base_commit(
                     .strip()
                     .lower()
                 )
-    base_commits = {
+                context_retarget_bases.add(
+                    str(
+                        getattr(context, "target_head_commit", "") or ""
+                    )
+                    .strip()
+                    .lower()
+                )
+    valid_context_bases = {
         value
-        for value in {worker_commit_base, *context_bases}
+        for value in {*context_bases, *context_retarget_bases}
         if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value)
         and value != expected_candidate_commit
     }
-    if len(base_commits) != 1:
-        return ""
-    return next(iter(base_commits))
+    if (
+        re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}", worker_commit_base
+        )
+        and worker_commit_base != expected_candidate_commit
+    ):
+        return (
+            worker_commit_base
+            if worker_commit_base in valid_context_bases
+            else ""
+        )
+    return next(iter(valid_context_bases)) if len(valid_context_bases) == 1 else ""
 
 
 def _contract_runtime_strip_authority_claims(

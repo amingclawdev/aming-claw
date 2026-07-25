@@ -733,13 +733,49 @@ def _normalize_candidate_review_context(
             raise ValueError(
                 "exact candidate graph basis requires matching base and candidate commits"
             )
-        if context["changed_files"]:
-            raise ValueError(
-                "exact candidate graph basis requires an empty changed_files list"
-            )
         empty_diff_hash = f"sha256:{hashlib.sha256(b'').hexdigest()}"
-        if context["candidate_diff_hash"] != empty_diff_hash:
-            raise ValueError("exact candidate graph basis requires the empty diff hash")
+        comparison_base_commit = str(
+            normalized_root_identity.get("comparison_base_commit_sha") or ""
+        ).strip().lower()
+        comparison_base_source = str(
+            normalized_root_identity.get("comparison_base_commit_source") or ""
+        ).strip()
+        if comparison_base_commit:
+            if (
+                not _is_full_commit(comparison_base_commit)
+                or comparison_base_commit == context["candidate_commit_sha"]
+            ):
+                raise ValueError(
+                    "exact candidate comparison base must be a distinct full commit"
+                )
+            if comparison_base_source != (
+                "ContractRuntime.completed_lines.worker_commit+"
+                "parallel_branch_runtime_context.base_commit"
+            ):
+                raise ValueError(
+                    "exact candidate comparison base requires trusted runtime authority"
+                )
+            if context["changed_files_source"] != (
+                "server_runtime_context_base_to_exact_candidate_diff"
+            ):
+                raise ValueError(
+                    "exact candidate runtime diff requires its canonical server source"
+                )
+        else:
+            if context["changed_files"]:
+                raise ValueError(
+                    "exact candidate graph basis without runtime comparison "
+                    "authority requires an empty changed_files list"
+                )
+            if context["candidate_diff_hash"] != empty_diff_hash:
+                raise ValueError(
+                    "exact candidate graph basis without runtime comparison "
+                    "authority requires the empty diff hash"
+                )
+            if comparison_base_source:
+                raise ValueError(
+                    "exact candidate comparison source requires a comparison base"
+                )
         if context["candidate_overlay"] or context["candidate_overlay_hash"]:
             raise ValueError("exact candidate graph basis does not use an overlay")
     elif context["base_commit_sha"] == context["candidate_commit_sha"]:

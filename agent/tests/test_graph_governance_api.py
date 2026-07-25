@@ -28944,6 +28944,277 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
     assert event_count == 2
 
 
+def test_exact_candidate_snapshot_uses_runtime_comparison_diff_tuple(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-EXACT-CANDIDATE-RUNTIME-DIFF"
+    task_id = "exact-candidate-runtime-diff-worker"
+    execution_id = "cex-exact-candidate-runtime-diff"
+    runtime_context_id = "mfrctx-exact-candidate-runtime-diff"
+    project_root = tmp_path / "exact-candidate-runtime-diff"
+    original_base_commit = _init_test_git_repo(project_root)
+    retarget_path = project_root / "src" / "retarget_base.py"
+    retarget_path.parent.mkdir(parents=True, exist_ok=True)
+    retarget_path.write_text("RETARGET_BASE = True\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "src/retarget_base.py"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "exact candidate retarget base"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    base_commit = batch_jobs.git_commit(project_root)
+    changed_path = project_root / "src" / "exact_candidate.py"
+    changed_path.parent.mkdir(parents=True, exist_ok=True)
+    changed_path.write_text(
+        "def exact_candidate_value():\n"
+        "    return 'candidate'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "src/exact_candidate.py"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "exact candidate runtime diff"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(project_root)
+    expected_diff = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "-M",
+            f"{base_commit}..{candidate_commit}",
+            "--",
+            ".",
+        ],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+    ).stdout
+    expected_diff_hash = "sha256:" + hashlib.sha256(expected_diff).hexdigest()
+
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, raw=None, **_kwargs: (
+            Path(raw).resolve() if raw else project_root
+        ),
+    )
+    _activate_basic_graph(
+        conn,
+        "full-exact-candidate-runtime-diff",
+        commit_sha=candidate_commit,
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=backlog_id,
+            parent_task_id=execution_id,
+            branch_ref="refs/heads/codex/exact-candidate-runtime-diff",
+            worktree_path=str(project_root),
+            target_project_root=str(project_root),
+            base_commit=original_base_commit,
+            head_commit=candidate_commit,
+            target_head_commit=base_commit,
+            status=STATE_VALIDATED,
+        ),
+        now_iso="2026-07-25T04:00:00Z",
+    )
+    runtime_record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "actor_role": "observer",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": execution_id,
+                    "worker_role": "mf_sub",
+                },
+            },
+            {
+                "stage_id": "implementation",
+                "line_id": "worker_commit",
+                "evidence_kind": "worker_commit",
+                "commit_sha": candidate_commit,
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "commit_sha": candidate_commit,
+                    "worker_commit_sha": candidate_commit,
+                    "validated_head_commit": candidate_commit,
+                    "diff_base_commit": base_commit,
+                },
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: {execution_id: runtime_record},
+    )
+
+    assert server._contract_runtime_server_candidate_base_commit(
+        conn,
+        project_id=PID,
+        record=runtime_record,
+        expected_candidate_commit=candidate_commit,
+    ) == base_commit
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=candidate_commit,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{candidate_commit}",
+        qa_scope_binding_ref,
+    ]
+    registered = server.role_service.register(
+        conn,
+        "qa:exact-runtime-diff",
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    query_body = {
+        "snapshot_id": "active",
+        "tool": "query_schema",
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "commit_sha": candidate_commit,
+        "project_root": str(project_root),
+        "candidate_review_context": {
+            "changed_files": ["src/exact_candidate.py"],
+            "candidate_diff_hash": expected_diff_hash,
+            "comparison_base_commit_sha": base_commit,
+        },
+    }
+    qa_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=query_body,
+    )
+    qa_ctx._session.update(
+        {
+            "session_id": registered["session_id"],
+            "principal_id": "qa:exact-runtime-diff",
+            "scope": qa_scope,
+        }
+    )
+
+    queried = server.handle_graph_governance_query(qa_ctx)
+    trace = server.handle_graph_governance_query_trace_get(
+        _ctx({"project_id": PID, "trace_id": queried["trace_id"]})
+    )["trace"]
+    identity = trace["graph_query_identity"]
+    assert identity["graph_basis"] == "exact_candidate_snapshot"
+    assert identity["base_commit_sha"] == candidate_commit
+    assert identity["candidate_commit_sha"] == candidate_commit
+    assert identity["changed_files"] == ["src/exact_candidate.py"]
+    assert identity["candidate_diff_hash"] == expected_diff_hash
+    assert identity["changed_files_source"] == (
+        "server_runtime_context_base_to_exact_candidate_diff"
+    )
+    assert trace["root_identity"]["comparison_base_commit_sha"] == base_commit
+    assert trace["root_identity"]["comparison_base_commit_source"] == (
+        "ContractRuntime.completed_lines.worker_commit+"
+        "parallel_branch_runtime_context.base_commit"
+    )
+
+    timeline_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "event_type": "qa.independent_verification",
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "actor": "qa:exact-runtime-diff",
+            "status": "passed",
+            "commit_sha": candidate_commit,
+            "payload": {
+                "graph_trace_ids": [queried["trace_id"]],
+                "changed_files": ["src/exact_candidate.py"],
+                "candidate_diff_hash": expected_diff_hash,
+                "test_results": {"status": "passed"},
+                "observer_impersonation": False,
+            },
+            "verification": {
+                "authorization_source": "bounded_qa_session",
+                "changed_files": ["src/exact_candidate.py"],
+                "candidate_diff_hash": expected_diff_hash,
+            },
+        },
+    )
+    timeline_ctx._session = dict(qa_ctx._session)
+    result = server.handle_task_timeline_append(timeline_ctx)
+    proof = result["payload"]["source_backed_contract_gate_authority"][
+        "qa_session_proof"
+    ]
+    assert proof["changed_files"] == ["src/exact_candidate.py"]
+    assert proof["candidate_diff_hash"] == expected_diff_hash
+    assert proof["comparison_base_commit_sha"] == base_commit
+    assert proof["close_satisfying"] is True
+
+    forged_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            **query_body,
+            "candidate_review_context": {
+                "changed_files": [
+                    "src/exact_candidate.py",
+                    "src/not-in-candidate.py",
+                ],
+            },
+        },
+    )
+    forged_ctx._session = dict(qa_ctx._session)
+    with pytest.raises(GovernanceError) as forged:
+        server.handle_graph_governance_query(forged_ctx)
+    assert forged.value.code == "qa_graph_review_context_mismatch"
+
+
 def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
     conn,
     monkeypatch,
