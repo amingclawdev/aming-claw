@@ -37137,6 +37137,23 @@ def test_failed_qa_rejoin_marker_composes_authority_and_active_auth_rotation(
         server,
         "_runtime_context_latest_route_identity",
         lambda *_args, **_kwargs: {
+            "route_id": route_identity["route_id"],
+        },
+    )
+    assert (
+        server._runtime_context_failed_qa_revision_rejoin_marker(
+            conn=object(),
+            context=context,
+            runtime_context_id=context.runtime_context_id,
+            timeline_events=events,
+        )
+        == {}
+    )
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_route_identity",
+        lambda *_args, **_kwargs: {
             **route_identity,
             "route_token_ref": "rtok-stale-auth-rotation",
         },

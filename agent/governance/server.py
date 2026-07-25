@@ -25638,8 +25638,17 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             )
             else {}
         )
+        expected_route_identity_complete = all(
+            str(expected_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
+        latest_rotation_route_identity_complete = all(
+            str(latest_rotation_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
         if (
-            not expected_route_identity
+            not expected_route_identity_complete
+            or not latest_rotation_route_identity_complete
             or _runtime_context_route_identity_mismatch_fields(
                 expected_route_identity,
                 latest_rotation_route_identity,
