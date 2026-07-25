@@ -78067,6 +78067,134 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert failed_authority["close_satisfying"] is False
     assert failed_authority["qa_session_proof"]["evidence_status"] == "failed"
 
+    after_no_pass = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            "observer",
+        )
+    )
+    assert after_no_pass["next_legal_action"]["line_id"] in {
+        "qa_graph_context",
+        "qa_independent_verification",
+    }
+    no_pass_record, _no_pass_projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=server._contract_runtime_store(conn).get(
+                successor["contract_execution_id"]
+            ),
+            actor_role="observer",
+        )
+    )
+    assert "observer_merge" not in {
+        line["line_id"]
+        for line in no_pass_record["completed_lines"]
+    }
+    for forbidden in (
+        "return_to_worker",
+        "direct_fix",
+        "return_to_parent",
+        "resume_original_contract",
+        "bypass",
+    ):
+        assert forbidden not in json.dumps(
+            after_no_pass["next_legal_action"]
+        )
+
+    recovered_principal = "qa:recovered-runtime-context-projection"
+    recovered_session = server.role_service.register(
+        conn,
+        recovered_principal,
+        PID,
+        "qa",
+        scope=fresh_scope,
+    )
+    recovered_trace_id = "gqt-runtime-context-projection-recovered-session"
+    _insert_exact_qa_graph_query_trace(
+        conn,
+        trace_id=recovered_trace_id,
+        snapshot_id="scope-runtime-context-projection-recovered-session",
+        candidate_commit_sha=head_commit,
+        backlog_id=backlog_id,
+        task_id=runtime_context.task_id,
+        target_project_root=str(worktree),
+        canonical_project_root=str(canonical_root),
+        actor=recovered_principal,
+        qa_session_id=recovered_session["session_id"],
+    )
+    conn.commit()
+    recovered_body = json.loads(json.dumps(fresh_body))
+    recovered_body["actor"] = recovered_principal
+    recovered_body["payload"]["graph_trace_ids"] = [recovered_trace_id]
+    recovered_ctx = fresh_qa_context(recovered_body)
+    recovered_ctx._session.update(
+        {
+            "session_id": recovered_session["session_id"],
+            "principal_id": recovered_principal,
+        }
+    )
+    recovered_pass = server.handle_task_timeline_append(recovered_ctx)
+    assert recovered_pass["id"] > fresh_failed["id"]
+    assert recovered_pass["payload"]["source_backed_contract_gate_authority"][
+        "qa_session_proof"
+    ]["qa_session_id"] == recovered_session["session_id"]
+
+    authoritative_events = server._runtime_context_service_timeline_events(
+        conn,
+        project_id=PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+    )
+    for authority_mutation in ("missing", "forged"):
+        forged_events = json.loads(json.dumps(authoritative_events))
+        forged_recovery = next(
+            event
+            for event in forged_events
+            if event["id"] == recovered_pass["id"]
+        )
+        assert forged_recovery["payload"]["contract_gate_decision"][
+            "source_of_authority"
+        ] == "contract_runtime"
+        if authority_mutation == "missing":
+            forged_recovery["payload"].pop(
+                "source_backed_contract_gate_authority"
+            )
+        else:
+            forged_recovery["payload"][
+                "source_backed_contract_gate_authority"
+            ]["authority_hash"] = "sha256:" + "0" * 64
+        forged_verdict = (
+            server._contract_runtime_authoritative_qa_projection_verdict(
+                conn,
+                project_id=PID,
+                record=server._contract_runtime_store(conn).get(
+                    successor["contract_execution_id"]
+                ),
+                context=runtime_context,
+                runtime_context_id=runtime_context.runtime_context_id,
+                timeline_events=forged_events,
+            )
+        )
+        assert forged_verdict["event_id"] == fresh_failed["id"]
+        assert forged_verdict["effective_status"] == "failed"
+        assert "observer_merge" not in {
+            line["line_id"]
+            for line in server._contract_runtime_projection_post_worker_lines(
+                conn=conn,
+                project_id=PID,
+                record=server._contract_runtime_store(conn).get(
+                    successor["contract_execution_id"]
+                ),
+                context=runtime_context,
+                timeline_events=forged_events,
+                authoritative_qa_verdict=forged_verdict,
+            )
+        }
+
     cross_session = server.role_service.register(
         conn,
         "qa:cross-session",
@@ -78090,8 +78218,8 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     stored_after_fresh_qa = server._contract_runtime_store(conn).get(
         successor["contract_execution_id"]
     )
-    assert len(stored_after_fresh_qa["completed_lines"]) == len(
-        stored_lines_after_qa
+    assert len(stored_after_fresh_qa["completed_lines"]) == (
+        len(stored_lines_after_qa) + 1
     )
 
     after = server.handle_project_contract_runtime_current_state(
