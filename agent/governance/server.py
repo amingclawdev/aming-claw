@@ -14925,20 +14925,46 @@ def _runtime_context_contract_runtime_worker_projection(
     )
     if isinstance(recovery, Mapping):
         current_state["same_lane_worker_commit_recovery"] = dict(recovery)
-        recovery_next_action = (
-            _runtime_context_same_lane_recovery_next_action(
-                next_action,
-                recovery,
-                runtime_context_id=runtime_context_id,
-                task_id=task_id,
+        canonical_before_recovery = (
+            guide.get(
+                "canonical_next_legal_action_before_same_lane_recovery"
             )
+            if isinstance(
+                guide.get(
+                    "canonical_next_legal_action_before_same_lane_recovery"
+                ),
+                Mapping,
+            )
+            else {}
         )
-        if recovery_next_action != next_action:
+        if next_action.get("same_lane_worker_commit_recovery_projection"):
+            if canonical_before_recovery:
+                current_state[
+                    "canonical_next_legal_action_before_same_lane_recovery"
+                ] = dict(canonical_before_recovery)
+        else:
+            recovery_next_action = (
+                _runtime_context_same_lane_recovery_next_action(
+                    next_action,
+                    recovery,
+                    runtime_context_id=runtime_context_id,
+                    task_id=task_id,
+                )
+            )
+            if recovery_next_action != next_action:
+                current_state[
+                    "canonical_next_legal_action_before_same_lane_recovery"
+                ] = dict(next_action)
+                next_action = recovery_next_action
+                current_state["next_legal_action"] = dict(next_action)
+        if (
+            canonical_before_recovery
+            and "canonical_next_legal_action_before_same_lane_recovery"
+            not in current_state
+        ):
             current_state[
                 "canonical_next_legal_action_before_same_lane_recovery"
-            ] = dict(next_action)
-            next_action = recovery_next_action
-            current_state["next_legal_action"] = dict(next_action)
+            ] = dict(canonical_before_recovery)
     contract_runtime_dispatch_identity = (
         _contract_runtime_dispatch_identity_resolution(canonical_record, context)
         if context is not None
@@ -60254,6 +60280,21 @@ def _contract_runtime_stable_id(prefix: str, *parts: Any) -> str:
 
 
 def _contract_runtime_submit_line_guidance(guide: Mapping[str, Any]) -> dict[str, Any]:
+    next_action = (
+        guide.get("next_legal_action")
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    recovery_guidance = (
+        next_action.get("submit_line_guidance")
+        if isinstance(next_action.get("submit_line_guidance"), Mapping)
+        else {}
+    )
+    if (
+        recovery_guidance.get("generic_contract_runtime_submit_line_allowed")
+        is False
+    ):
+        return dict(recovery_guidance)
     safe_copy = (
         guide.get("writer_role_safe_copy_payload")
         if isinstance(guide.get("writer_role_safe_copy_payload"), Mapping)
@@ -60835,6 +60876,15 @@ def _runtime_next_action_from_guide(
         "retry_policy",
         "worker_session_lifecycle_policy",
         "write_authorization_policy",
+        "same_lane_worker_commit_recovery_projection",
+        "recovery_status",
+        "current_target_baseline_commit",
+        "actual_worktree_head_commit",
+        "fresh_evidence_required",
+        "ordered_recovery_actions",
+        "canonical_next_action_before_recovery",
+        "immutable_prior_evidence_policy",
+        "submit_line_guidance",
     ):
         if key in next_line:
             result[key] = next_line[key]
@@ -62801,6 +62851,82 @@ def _contract_runtime_apply_mf_parallel_context_projection(
     recovery = projection.get("same_lane_worker_commit_recovery")
     if isinstance(recovery, Mapping):
         projected["same_lane_worker_commit_recovery"] = dict(recovery)
+        guide = (
+            dict(projected.get("runtime_guide") or {})
+            if isinstance(projected.get("runtime_guide"), Mapping)
+            else {}
+        )
+        canonical_guide = (
+            record.get("runtime_guide")
+            if isinstance(record.get("runtime_guide"), Mapping)
+            else {}
+        )
+        canonical_next_action = _runtime_next_action_from_guide(
+            canonical_guide,
+            source="contract_runtime_current_state",
+        )
+        projected_next_action = _runtime_next_action_from_guide(
+            guide,
+            source="contract_runtime_current_state",
+        )
+        recovery_next_action = _runtime_context_same_lane_recovery_next_action(
+            canonical_next_action,
+            recovery,
+            runtime_context_id=str(
+                recovery.get("runtime_context_id") or ""
+            ).strip(),
+            task_id=str(recovery.get("task_id") or "").strip(),
+        )
+        if (
+            recovery_next_action != canonical_next_action
+            and str(projected_next_action.get("line_id") or "").strip()
+            == "worker_commit"
+        ):
+            canonical_reader_hash = str(
+                guide.get("runtime_guide_hash") or ""
+            ).strip()
+            recovery_reader_hash = stable_sha256(
+                {
+                    "schema_version": (
+                        "contract_runtime.same_lane_recovery_reader_hash.v1"
+                    ),
+                    "canonical_runtime_guide_hash": canonical_reader_hash,
+                    "contract_execution_id": str(
+                        record.get("contract_execution_id") or ""
+                    ).strip(),
+                    "runtime_context_id": str(
+                        recovery.get("runtime_context_id") or ""
+                    ).strip(),
+                    "task_id": str(recovery.get("task_id") or "").strip(),
+                    "recovery_status": str(
+                        recovery.get("status") or ""
+                    ).strip(),
+                    "recovery_action": str(
+                        recovery.get("next_legal_action") or ""
+                    ).strip(),
+                    "recorded_commit_sha": str(
+                        recovery.get("recorded_commit_sha") or ""
+                    ).strip(),
+                    "actual_worktree_head_commit": str(
+                        recovery.get("actual_worktree_head_commit") or ""
+                    ).strip(),
+                    "current_target_baseline_commit": str(
+                        recovery.get("current_target_baseline_commit") or ""
+                    ).strip(),
+                }
+            )
+            recovery_next_action["runtime_guide_hash"] = (
+                recovery_reader_hash
+            )
+            guide.pop("writer_role_safe_copy_payload", None)
+            guide["runtime_guide_hash"] = recovery_reader_hash
+            guide["next_legal_action"] = dict(recovery_next_action)
+            guide[
+                "canonical_next_legal_action_before_same_lane_recovery"
+            ] = dict(canonical_next_action)
+            guide["same_lane_worker_commit_recovery"] = dict(recovery)
+            guide["same_lane_worker_commit_recovery_projection"] = True
+            projected["runtime_guide"] = guide
     return projected, projection
 
 
@@ -62863,9 +62989,12 @@ def _contract_runtime_mf_parallel_context_projection(
                 context,
                 conn=conn,
                 project_id=project_id,
-                allow_post_qa_merge_conflict_recovery=(
-                    str(actor_role or "").strip() == "mf_sub"
-                ),
+                # The recovery action is server-derived read/write authority,
+                # not a worker-private hint. Every generic ContractRuntime
+                # reader must see the same effective barrier so an observer
+                # cannot write the historical observer_merge while the lane
+                # is awaiting a fresh worker commit and independent QA.
+                allow_post_qa_merge_conflict_recovery=True,
             )
             if recovery and recovery.get("status") in {
                 "eligible",
@@ -71782,7 +71911,10 @@ def _contract_runtime_same_lane_worker_commit_precheck(
     """Precheck the projected reopen without weakening normal commit writes."""
 
     recovery = projection.get("same_lane_worker_commit_recovery")
-    if not isinstance(recovery, Mapping) or recovery.get("status") != "eligible":
+    if (
+        not isinstance(recovery, Mapping)
+        or recovery.get("status") not in {"eligible", "retarget_required"}
+    ):
         return {}
     next_line = (
         projected_record.get("runtime_guide", {}).get("next_legal_action", {})
@@ -71806,6 +71938,11 @@ def _contract_runtime_same_lane_worker_commit_precheck(
         for field, expected_value in expected.items()
         if requested[field] != expected_value
     ]
+    if recovery.get("status") == "retarget_required":
+        errors.append(
+            "same-lane worker_commit recovery requires current target sync "
+            "before worker_commit"
+        )
     if str(next_line.get("line_id") or "").strip() != "worker_commit":
         errors.append("projected ContractRuntime is not awaiting worker_commit")
     expected_write = _contract_runtime_write_from_record(
@@ -71824,10 +71961,14 @@ def _contract_runtime_same_lane_worker_commit_precheck(
     ).strip():
         errors.append("runtime_guide_hash is stale")
     if errors:
-        return _contract_runtime_unchanged_line_rejection(
-            stored_record,
+        rejected = _contract_runtime_unchanged_line_rejection(
+            projected_record,
             errors,
         )
+        rejected["same_lane_worker_commit_recovery"] = dict(recovery)
+        rejected["generic_contract_runtime_submit_line_allowed"] = False
+        rejected["required_facade"] = "runtime_context_worker_commit"
+        return rejected
     guide = (
         projected_record.get("runtime_guide")
         if isinstance(projected_record.get("runtime_guide"), Mapping)
@@ -103422,89 +103563,107 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                     body=body,
                     worker_proof=getattr(ctx, "_contract_runtime_mf_sub_proof", None),
                 )
-                write = _direct_fix_materialize_dispatch_runtime_context(
-                    conn,
-                    project_id=project_id,
-                    record=record,
-                    write=write,
-                    request_id=ctx.request_id,
+                recovery_gate = (
+                    _contract_runtime_same_lane_worker_commit_precheck(
+                        stored_record=runtime.store.get(
+                            contract_execution_id
+                        ),
+                        projected_record=record,
+                        projection=projection,
+                        write=write,
+                        actor_role=actor_role,
+                    )
                 )
-                write = _contract_runtime_bind_server_line_authority(
-                    ctx,
-                    conn,
-                    project_id=project_id,
-                    record=record,
-                    write=write,
-                    body=body,
-                )
-                write, dispatch_errors = (
-                    _contract_runtime_bind_mf_parallel_dispatch_authority(
+                if recovery_gate and not recovery_gate.get("ok"):
+                    result = recovery_gate
+                else:
+                    write = _direct_fix_materialize_dispatch_runtime_context(
                         conn,
                         project_id=project_id,
                         record=record,
                         write=write,
+                        request_id=ctx.request_id,
                     )
-                )
-                close_authority_precheck = (
-                    _contract_runtime_mf_parallel_close_ready_precheck(
-                        record,
-                        write,
+                    write = _contract_runtime_bind_server_line_authority(
+                        ctx,
                         conn=conn,
                         project_id=project_id,
-                    )
-                )
-                reconcile_idempotency = (
-                    _contract_runtime_observer_reconcile_idempotency(
                         record=record,
                         write=write,
-                        actor_role=actor_role,
+                        body=body,
                     )
-                )
-                if reconcile_idempotency:
-                    result = reconcile_idempotency
-                elif dispatch_errors:
-                    result = _contract_runtime_unchanged_line_rejection(
-                        record,
-                        dispatch_errors,
+                    write, dispatch_errors = (
+                        _contract_runtime_bind_mf_parallel_dispatch_authority(
+                            conn,
+                            project_id=project_id,
+                            record=record,
+                            write=write,
+                        )
                     )
-                elif (
-                    close_authority_precheck
-                    and not close_authority_precheck.get("passed")
-                ):
-                    missing = list(
-                        close_authority_precheck.get("missing_requirement_ids")
-                        or []
+                    close_authority_precheck = (
+                        _contract_runtime_mf_parallel_close_ready_precheck(
+                            record,
+                            write,
+                            conn=conn,
+                            project_id=project_id,
+                        )
                     )
-                    result = _contract_runtime_unchanged_line_rejection(
-                        record,
-                        [
-                            "contract_runtime_close_authority_incomplete: "
-                            + ", ".join(missing)
-                        ],
+                    reconcile_idempotency = (
+                        _contract_runtime_observer_reconcile_idempotency(
+                            record=record,
+                            write=write,
+                            actor_role=actor_role,
+                        )
                     )
-                    result["close_authority_precheck"] = (
+                    if reconcile_idempotency:
+                        result = reconcile_idempotency
+                    elif dispatch_errors:
+                        result = _contract_runtime_unchanged_line_rejection(
+                            record,
+                            dispatch_errors,
+                        )
+                    elif (
                         close_authority_precheck
+                        and not close_authority_precheck.get("passed")
+                    ):
+                        missing = list(
+                            close_authority_precheck.get(
+                                "missing_requirement_ids"
+                            )
+                            or []
+                        )
+                        result = _contract_runtime_unchanged_line_rejection(
+                            record,
+                            [
+                                "contract_runtime_close_authority_incomplete: "
+                                + ", ".join(missing)
+                            ],
+                        )
+                        result["close_authority_precheck"] = (
+                            close_authority_precheck
+                        )
+                    else:
+                        result = runtime.submit_line_write(
+                            contract_execution_id,
+                            write,
+                            actor_role=actor_role,
+                            projected_completed_lines=(
+                                _contract_runtime_projection_completed_lines(
+                                    projection
+                                )
+                            ),
+                            projection=projection,
+                        )
+                    dispatch_timeline_event = (
+                        _record_contract_runtime_mf_parallel_dispatch_event(
+                            conn,
+                            project_id=project_id,
+                            record=record,
+                            write=write,
+                            result=result,
+                            request_id=str(ctx.request_id),
+                        )
                     )
-                else:
-                    result = runtime.submit_line_write(
-                        contract_execution_id,
-                        write,
-                        actor_role=actor_role,
-                        projected_completed_lines=(
-                            _contract_runtime_projection_completed_lines(projection)
-                        ),
-                        projection=projection,
-                    )
-                dispatch_timeline_event = (
-                    _record_contract_runtime_mf_parallel_dispatch_event(
-                        conn,
-                        project_id=project_id,
-                        record=record,
-                        write=write,
-                        result=result,
-                        request_id=str(ctx.request_id),
-                    )
-                )
         except StalePinnedContractExecutionError as exc:
             response = _contract_runtime_stale_recovery_projection(
                 exc,
@@ -103820,82 +103979,90 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                     body=body,
                     worker_proof=getattr(ctx, "_contract_runtime_mf_sub_proof", None),
                 )
-                write = _contract_runtime_bind_server_line_authority(
-                    ctx,
-                    conn,
-                    project_id=project_id,
-                    record=record,
-                    write=write,
-                    body=body,
-                )
-                write, dispatch_errors = (
-                    _contract_runtime_bind_mf_parallel_dispatch_authority(
-                        conn,
-                        project_id=project_id,
-                        record=record,
-                        write=write,
-                    )
-                )
-                close_authority_precheck = (
-                    _contract_runtime_mf_parallel_close_ready_precheck(
-                        record,
-                        write,
-                        conn=conn,
-                        project_id=project_id,
-                    )
-                )
-                reconcile_idempotency = (
-                    _contract_runtime_observer_reconcile_idempotency(
-                        record=record,
+                recovery_gate = (
+                    _contract_runtime_same_lane_worker_commit_precheck(
+                        stored_record=stored_record,
+                        projected_record=record,
+                        projection=projection,
                         write=write,
                         actor_role=actor_role,
                     )
                 )
-                if reconcile_idempotency:
-                    result = reconcile_idempotency
-                elif dispatch_errors:
-                    result = _contract_runtime_unchanged_line_rejection(
-                        record,
-                        dispatch_errors,
-                    )
-                elif (
-                    close_authority_precheck
-                    and not close_authority_precheck.get("passed")
-                ):
-                    missing = list(
-                        close_authority_precheck.get("missing_requirement_ids")
-                        or []
-                    )
-                    result = _contract_runtime_unchanged_line_rejection(
-                        record,
-                        [
-                            "contract_runtime_close_authority_incomplete: "
-                            + ", ".join(missing)
-                        ],
-                    )
-                    result["close_authority_precheck"] = (
-                        close_authority_precheck
-                    )
+                if recovery_gate and not recovery_gate.get("ok"):
+                    result = recovery_gate
                 else:
-                    result = (
-                        _contract_runtime_same_lane_worker_commit_precheck(
-                            stored_record=stored_record,
-                            projected_record=record,
-                            projection=projection,
+                    write = _contract_runtime_bind_server_line_authority(
+                        ctx,
+                        conn,
+                        project_id=project_id,
+                        record=record,
+                        write=write,
+                        body=body,
+                    )
+                    write, dispatch_errors = (
+                        _contract_runtime_bind_mf_parallel_dispatch_authority(
+                            conn,
+                            project_id=project_id,
+                            record=record,
+                            write=write,
+                        )
+                    )
+                    close_authority_precheck = (
+                        _contract_runtime_mf_parallel_close_ready_precheck(
+                            record,
+                            write,
+                            conn=conn,
+                            project_id=project_id,
+                        )
+                    )
+                    reconcile_idempotency = (
+                        _contract_runtime_observer_reconcile_idempotency(
+                            record=record,
                             write=write,
                             actor_role=actor_role,
                         )
                     )
-                    if not result:
-                        result = runtime.precheck_line_write(
-                            contract_execution_id,
-                            write,
-                            actor_role=actor_role,
-                            projected_completed_lines=(
-                                _contract_runtime_projection_completed_lines(projection)
-                            ),
-                            projection=projection,
+                    if reconcile_idempotency:
+                        result = reconcile_idempotency
+                    elif dispatch_errors:
+                        result = _contract_runtime_unchanged_line_rejection(
+                            record,
+                            dispatch_errors,
                         )
+                    elif (
+                        close_authority_precheck
+                        and not close_authority_precheck.get("passed")
+                    ):
+                        missing = list(
+                            close_authority_precheck.get(
+                                "missing_requirement_ids"
+                            )
+                            or []
+                        )
+                        result = _contract_runtime_unchanged_line_rejection(
+                            record,
+                            [
+                                "contract_runtime_close_authority_incomplete: "
+                                + ", ".join(missing)
+                            ],
+                        )
+                        result["close_authority_precheck"] = (
+                            close_authority_precheck
+                        )
+                    else:
+                        result = recovery_gate
+                        if not result:
+                            result = runtime.precheck_line_write(
+                                contract_execution_id,
+                                write,
+                                actor_role=actor_role,
+                                projected_completed_lines=(
+                                    _contract_runtime_projection_completed_lines(
+                                        projection
+                                    )
+                                ),
+                                projection=projection,
+                            )
         except StalePinnedContractExecutionError as exc:
             response = _contract_runtime_stale_recovery_projection(
                 exc,

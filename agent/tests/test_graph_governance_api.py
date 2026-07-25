@@ -65606,6 +65606,119 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
     assert eligible_contract_next["actual_worktree_head_commit"] == (
         replacement_commit
     )
+    generic_worker_query = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": backlog_id,
+        "fence_token": rejoin["fence_token"],
+        "session_token": rejoin["session_token"],
+        "session_token_ref": rejoin["session_token_ref"],
+        "target_project_root": str(worktree),
+    }
+    for response_view in ("current", "guide"):
+        generic_current = (
+            server.handle_project_contract_runtime_current_state(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "contract_execution_id": successor[
+                            "contract_execution_id"
+                        ],
+                    },
+                    "mf_sub",
+                    query={
+                        **generic_worker_query,
+                        "response_view": response_view,
+                    },
+                )
+            )
+        )
+        assert generic_current["actor_role"] == "mf_sub"
+        assert generic_current["next_legal_action"]["action"] == (
+            "record_worker_commit"
+        )
+        assert generic_current["next_legal_action"]["line_id"] == (
+            "worker_commit"
+        )
+        assert generic_current["next_legal_action"]["owner_role"] == "mf_sub"
+        assert generic_current["next_legal_action"][
+            "same_lane_worker_commit_recovery_projection"
+        ] is True
+        assert generic_current["runtime_guide"]["next_legal_action"][
+            "canonical_next_action_before_recovery"
+        ]["line_id"] == "observer_merge"
+        assert (
+            "writer_role_safe_copy_payload"
+            not in generic_current["runtime_guide"]
+        )
+        assert generic_current["submit_line_guidance"][
+            "generic_contract_runtime_submit_line_allowed"
+        ] is False
+        assert generic_current["contract_runtime_current_state"][
+            "next_legal_action"
+        ] == generic_current["next_legal_action"]
+
+    observer_merge_precheck = (
+        server.handle_project_contract_runtime_line_write_precheck(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor[
+                        "contract_execution_id"
+                    ],
+                },
+                "observer",
+                method="POST",
+                body={
+                    "stage_id": "observer_integration",
+                    "line_id": "observer_merge",
+                    "evidence_kind": "merge",
+                },
+            )
+        )
+    )
+    assert observer_merge_precheck["ok"] is False
+    assert observer_merge_precheck["next_legal_action"]["action"] == (
+        "record_worker_commit"
+    )
+    assert observer_merge_precheck["next_legal_action"]["owner_role"] == (
+        "mf_sub"
+    )
+    assert any(
+        "same-lane worker_commit recovery" in error
+        for error in observer_merge_precheck["decision"]["errors"]
+    )
+    completed_lines_before_blocked_write = copy.deepcopy(
+        runtime.store.get(successor["contract_execution_id"])[
+            "completed_lines"
+        ]
+    )
+    observer_merge_write = (
+        server.handle_project_contract_runtime_line_write(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor[
+                        "contract_execution_id"
+                    ],
+                },
+                "observer",
+                method="POST",
+                body={
+                    "stage_id": "observer_integration",
+                    "line_id": "observer_merge",
+                    "evidence_kind": "merge",
+                },
+            )
+        )
+    )
+    assert observer_merge_write["ok"] is False
+    assert observer_merge_write["next_legal_action"]["action"] == (
+        "record_worker_commit"
+    )
+    assert runtime.store.get(successor["contract_execution_id"])[
+        "completed_lines"
+    ] == completed_lines_before_blocked_write
 
     owned.write_text("dirty target-relative worker change\n", encoding="utf-8")
     dirty_recovery = (
