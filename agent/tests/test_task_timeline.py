@@ -13805,6 +13805,291 @@ class TestTaskTimeline(unittest.TestCase):
             1,
         )
 
+    def test_current_cold_prewarm_atomically_merges_committed_appends(self):
+        from agent.governance.dashboard_read_cache import DashboardTimelineReadCache
+
+        cache = DashboardTimelineReadCache(current_window_limit=3)
+        loader_started = threading.Event()
+        release_loader = threading.Event()
+
+        def stale_loader():
+            loader_started.set()
+            if not release_loader.wait(timeout=2.0):
+                raise AssertionError("test did not release Current loader")
+            return [{"id": 1, "project_id": "project-a", "backlog_id": "A"}]
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                cache.load_current,
+                database_scope="db",
+                project_id="project-a",
+                authority_generation=1,
+                loader=stale_loader,
+            )
+            self.assertTrue(loader_started.wait(timeout=2.0))
+            try:
+                for event_id in range(2, 6):
+                    cache.append(
+                        {
+                            "id": event_id,
+                            "project_id": "project-a",
+                            "backlog_id": "A",
+                        }
+                    )
+                cache.append(
+                    {
+                        "id": 100,
+                        "project_id": "project-b",
+                        "backlog_id": "A",
+                    }
+                )
+            finally:
+                release_loader.set()
+            rows, metrics = future.result(timeout=2.0)
+
+        self.assertEqual([row["id"] for row in rows], [5, 4, 3])
+        self.assertEqual(metrics["authority_generation"], 5)
+        self.assertEqual(metrics["merged_append_count"], 3)
+        self.assertTrue(metrics["cold_load_append_merge"])
+        self.assertTrue(metrics["generation_never_regresses"])
+
+        warm, warm_metrics = cache.load_current(
+            database_scope="db",
+            project_id="project-a",
+            authority_generation=4,
+            loader=lambda: self.fail("older generation must not replace warm Current"),
+        )
+        self.assertEqual([row["id"] for row in warm], [5, 4, 3])
+        self.assertEqual(warm_metrics["authority_generation"], 5)
+        self.assertTrue(warm_metrics["hit"])
+
+    def test_playback_cold_prewarm_merges_only_matching_backlog_appends(self):
+        from agent.governance.dashboard_read_cache import DashboardTimelineReadCache
+
+        cache = DashboardTimelineReadCache(playback_window_limit=3)
+        loader_started = threading.Event()
+        release_loader = threading.Event()
+
+        def stale_loader():
+            loader_started.set()
+            if not release_loader.wait(timeout=2.0):
+                raise AssertionError("test did not release Playback loader")
+            return [
+                {
+                    "id": 1,
+                    "project_id": "project-a",
+                    "backlog_id": "backlog-a",
+                }
+            ]
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                cache.load_playback,
+                database_scope="db",
+                project_id="project-a",
+                backlog_id="backlog-a",
+                authority_generation=1,
+                loader=stale_loader,
+            )
+            self.assertTrue(loader_started.wait(timeout=2.0))
+            try:
+                cache.append(
+                    {
+                        "id": 2,
+                        "project_id": "project-a",
+                        "backlog_id": "backlog-a",
+                    }
+                )
+                cache.append(
+                    {
+                        "id": 3,
+                        "project_id": "project-a",
+                        "backlog_id": "backlog-b",
+                    }
+                )
+                cache.append(
+                    {
+                        "id": 4,
+                        "project_id": "project-a",
+                        "backlog_id": "backlog-a",
+                        "revision": "first",
+                    }
+                )
+                cache.append(
+                    {
+                        "id": 4,
+                        "project_id": "project-a",
+                        "backlog_id": "backlog-a",
+                        "revision": "committed",
+                    }
+                )
+                cache.append(
+                    {
+                        "id": 99,
+                        "project_id": "project-b",
+                        "backlog_id": "backlog-a",
+                    }
+                )
+            finally:
+                release_loader.set()
+            rows, metrics = future.result(timeout=2.0)
+
+        self.assertEqual([row["id"] for row in rows], [4, 2, 1])
+        self.assertEqual(rows[0]["revision"], "committed")
+        self.assertEqual(metrics["authority_generation"], 4)
+        self.assertEqual(metrics["merged_append_count"], 2)
+        self.assertEqual(
+            cache.playback_generation(
+                database_scope="db",
+                project_id="project-a",
+                backlog_id="backlog-a",
+            ),
+            4,
+        )
+
+    def test_failed_cold_loader_retains_committed_appends_for_retry(self):
+        from agent.governance.dashboard_read_cache import DashboardTimelineReadCache
+
+        for pool in ("current", "playback"):
+            with self.subTest(pool=pool):
+                cache = DashboardTimelineReadCache(
+                    current_window_limit=3,
+                    playback_window_limit=3,
+                )
+                loader_started = threading.Event()
+                release_loader = threading.Event()
+
+                def failing_loader():
+                    loader_started.set()
+                    if not release_loader.wait(timeout=2.0):
+                        raise AssertionError(f"test did not release {pool} loader")
+                    raise RuntimeError("deterministic cold loader failure")
+
+                def load(loader):
+                    if pool == "current":
+                        return cache.load_current(
+                            database_scope="db",
+                            project_id="project-a",
+                            authority_generation=1,
+                            loader=loader,
+                        )
+                    return cache.load_playback(
+                        database_scope="db",
+                        project_id="project-a",
+                        backlog_id="backlog-a",
+                        authority_generation=1,
+                        loader=loader,
+                    )
+
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(load, failing_loader)
+                    self.assertTrue(loader_started.wait(timeout=2.0))
+                    try:
+                        cache.append(
+                            {
+                                "id": 2,
+                                "project_id": "project-a",
+                                "backlog_id": "backlog-a",
+                            }
+                        )
+                        cache.append(
+                            {
+                                "id": 3,
+                                "project_id": "project-a",
+                                "backlog_id": "backlog-a",
+                            }
+                        )
+                    finally:
+                        release_loader.set()
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "deterministic cold loader failure",
+                    ):
+                        future.result(timeout=2.0)
+
+                rows, metrics = load(
+                    lambda: [
+                        {
+                            "id": 1,
+                            "project_id": "project-a",
+                            "backlog_id": "backlog-a",
+                        }
+                    ]
+                )
+                self.assertEqual([row["id"] for row in rows], [3, 2, 1])
+                self.assertEqual(metrics["authority_generation"], 3)
+                self.assertEqual(metrics["merged_append_count"], 2)
+
+    def test_cold_prewarm_append_merge_is_single_flight_under_contention(self):
+        from agent.governance.dashboard_read_cache import DashboardTimelineReadCache
+
+        for pool in ("current", "playback"):
+            with self.subTest(pool=pool):
+                cache = DashboardTimelineReadCache(
+                    current_window_limit=50,
+                    playback_window_limit=50,
+                )
+                loader_started = threading.Event()
+                release_loader = threading.Event()
+                callers_ready = threading.Barrier(9)
+                loader_calls = 0
+                loader_calls_lock = threading.Lock()
+
+                def stale_loader():
+                    nonlocal loader_calls
+                    with loader_calls_lock:
+                        loader_calls += 1
+                    loader_started.set()
+                    if not release_loader.wait(timeout=3.0):
+                        raise AssertionError(f"test did not release {pool} loader")
+                    return [
+                        {
+                            "id": 1,
+                            "project_id": "project-a",
+                            "backlog_id": "backlog-a",
+                        }
+                    ]
+
+                def load():
+                    callers_ready.wait(timeout=3.0)
+                    if pool == "current":
+                        return cache.load_current(
+                            database_scope="db",
+                            project_id="project-a",
+                            authority_generation=1,
+                            loader=stale_loader,
+                        )
+                    return cache.load_playback(
+                        database_scope="db",
+                        project_id="project-a",
+                        backlog_id="backlog-a",
+                        authority_generation=1,
+                        loader=stale_loader,
+                    )
+
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = [executor.submit(load) for _ in range(8)]
+                    callers_ready.wait(timeout=3.0)
+                    self.assertTrue(loader_started.wait(timeout=2.0))
+                    try:
+                        for event_id in range(2, 62):
+                            cache.append(
+                                {
+                                    "id": event_id,
+                                    "project_id": "project-a",
+                                    "backlog_id": "backlog-a",
+                                }
+                            )
+                    finally:
+                        release_loader.set()
+                    results = [future.result(timeout=3.0) for future in futures]
+
+                expected_ids = list(range(61, 11, -1))
+                self.assertEqual(loader_calls, 1)
+                for rows, metrics in results:
+                    self.assertEqual([row["id"] for row in rows], expected_ids)
+                    self.assertEqual(metrics["authority_generation"], 61)
+
     def test_recent_current_deque_prewarms_50_and_append_avoids_cold_reload(self):
         from agent.governance import server, task_timeline
         from agent.governance.dashboard_read_cache import TIMELINE_READ_CACHE
