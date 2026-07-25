@@ -25086,11 +25086,17 @@ def _runtime_context_authenticated_failed_qa_rejoin_continuity(
         ).strip()
         if not identity_matches or not event_session_token_ref:
             return {}
+        event_route_identity = (
+            payload.get("route_identity")
+            if isinstance(payload.get("route_identity"), Mapping)
+            else {}
+        )
 
         latest_rotation = {
             "event_id": event_id,
             "event_ref": f"timeline:{event_id}",
             "session_token_ref": event_session_token_ref,
+            "route_identity": dict(event_route_identity),
         }
         if (
             _truthy_flag(payload.get("reopen_for_revision"))
@@ -25100,6 +25106,7 @@ def _runtime_context_authenticated_failed_qa_rejoin_continuity(
                 "event_id": event_id,
                 "event_ref": f"timeline:{event_id}",
                 "session_token_ref": event_session_token_ref,
+                "route_identity": dict(event_route_identity),
             }
 
     if (
@@ -25117,6 +25124,12 @@ def _runtime_context_authenticated_failed_qa_rejoin_continuity(
         "failed_qa_event_ref": active_failed_qa.get("source_ref") or "",
         "authoritative_rejoin_event_ref": authoritative_rejoin["event_ref"],
         "latest_rotation_event_ref": latest_rotation["event_ref"],
+        "authoritative_rejoin_route_identity": dict(
+            authoritative_rejoin.get("route_identity") or {}
+        ),
+        "latest_rotation_route_identity": dict(
+            latest_rotation.get("route_identity") or {}
+        ),
         "active_session_token_ref": active_session_token_ref,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
@@ -25594,10 +25607,50 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
         or expected_retry_round <= 0
     ):
         return {}
+    active_timeline_failed_qa = (
+        _runtime_context_authenticated_failed_qa_timeline_boundary(
+            conn=conn,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            timeline_events=timeline_events,
+        )
+    )
+    rejoin_continuity = {}
+    if active_timeline_failed_qa:
+        rejoin_continuity = (
+            _runtime_context_authenticated_failed_qa_rejoin_continuity(
+                context=context,
+                runtime_context_id=runtime_context_id,
+                timeline_events=timeline_events,
+                active_failed_qa=active_timeline_failed_qa,
+            )
+        )
+    if rejoin_continuity:
+        expected_route_identity = _runtime_context_latest_route_identity(
+            conn,
+            context,
+        )
+        latest_rotation_route_identity = (
+            rejoin_continuity.get("latest_rotation_route_identity")
+            if isinstance(
+                rejoin_continuity.get("latest_rotation_route_identity"),
+                Mapping,
+            )
+            else {}
+        )
+        if expected_route_identity and _runtime_context_route_identity_mismatch_fields(
+            expected_route_identity,
+            latest_rotation_route_identity,
+        ):
+            rejoin_continuity = {}
     for event in reversed(list(timeline_events)):
         if not isinstance(event, Mapping):
             continue
         payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        event_id = int(event.get("id") or 0)
+        if event_id <= 0:
+            continue
+        event_ref = f"timeline:{event_id}"
         event_type = str(event.get("event_type") or "").strip().lower()
         event_kind = str(event.get("event_kind") or "").strip().lower()
         status = str(event.get("status") or "").strip().lower()
@@ -25637,7 +25690,18 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             and str(contract_runtime_failed_qa.get("task_id") or "").strip()
             == task_id
         )
-        if not (timeline_reopen_authority or contract_runtime_reopen_authority):
+        composed_timeline_reopen_authority = bool(
+            rejoin_continuity
+            and str(
+                rejoin_continuity.get("latest_rotation_event_ref") or ""
+            ).strip()
+            == event_ref
+        )
+        if not (
+            timeline_reopen_authority
+            or contract_runtime_reopen_authority
+            or composed_timeline_reopen_authority
+        ):
             continue
         if str(payload.get("runtime_context_id") or "").strip() != runtime_context_id:
             continue
@@ -25678,9 +25742,6 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
         ).strip()
         if backlog_id and event_backlog_id != backlog_id:
             continue
-        event_id = int(event.get("id") or 0)
-        if event_id <= 0:
-            continue
         timeline_failed_qa_boundary = (
             _runtime_context_authenticated_failed_qa_timeline_boundary(
                 conn=conn,
@@ -25691,7 +25752,11 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             )
         )
         canonical_timeline_reopen_authority = bool(
-            timeline_reopen_authority and timeline_failed_qa_boundary
+            (
+                timeline_reopen_authority
+                or composed_timeline_reopen_authority
+            )
+            and timeline_failed_qa_boundary
         )
         legacy_timeline_reopen_authority = bool(
             timeline_reopen_authority
@@ -25748,7 +25813,18 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
                 else "contract_runtime_failed_qa_revision"
             ),
             "revision_event_id": event_id,
-            "revision_event_ref": f"timeline:{event_id}",
+            "revision_event_ref": event_ref,
+            "authoritative_rejoin_event_ref": str(
+                rejoin_continuity.get("authoritative_rejoin_event_ref") or ""
+            ).strip()
+            if composed_timeline_reopen_authority
+            else event_ref,
+            "latest_rotation_event_ref": str(
+                rejoin_continuity.get("latest_rotation_event_ref") or ""
+            ).strip()
+            if composed_timeline_reopen_authority
+            else event_ref,
+            "composed_across_auth_rotation": composed_timeline_reopen_authority,
             "contract_execution_id": marker_contract_execution_id,
             "failed_qa_source_ref": failed_qa_source_ref,
             "failed_qa_source": (
@@ -25781,7 +25857,23 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
                 ),
                 "source": "accepted_runtime_context_rejoin_event",
                 "server_derived": True,
-                "revision_event_ref": f"timeline:{event_id}",
+                "revision_event_ref": event_ref,
+                "authoritative_rejoin_event_ref": str(
+                    rejoin_continuity.get(
+                        "authoritative_rejoin_event_ref"
+                    )
+                    or ""
+                ).strip()
+                if composed_timeline_reopen_authority
+                else event_ref,
+                "latest_rotation_event_ref": str(
+                    rejoin_continuity.get("latest_rotation_event_ref") or ""
+                ).strip()
+                if composed_timeline_reopen_authority
+                else event_ref,
+                "composed_across_auth_rotation": (
+                    composed_timeline_reopen_authority
+                ),
                 "contract_execution_id": marker_contract_execution_id,
                 "runtime_context_id": runtime_context_id,
                 "task_id": task_id,
@@ -26093,6 +26185,7 @@ def _runtime_context_failed_qa_line_matches_context(
     failed_line: Mapping[str, Any],
     *,
     context: Any,
+    server_identity: Mapping[str, Any] | None = None,
 ) -> bool:
     runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
         context
@@ -26100,6 +26193,8 @@ def _runtime_context_failed_qa_line_matches_context(
     if not runtime_context_id or not task_id or not parent_task_id:
         return False
 
+    exact_mapping = False
+    incomplete_runtime_mapping = False
     for candidate in _contract_runtime_mapping_candidates(failed_line):
         candidate_runtime_id = _contract_runtime_mapping_value(
             candidate,
@@ -26112,15 +26207,34 @@ def _runtime_context_failed_qa_line_matches_context(
             "task_id",
             "worker_task_id",
         )
-        if task_id not in task_values:
+        candidate_parent_task_id = _contract_runtime_mapping_value(
+            candidate,
+            "parent_task_id",
+        )
+        if task_values and task_id not in task_values:
+            return False
+        if candidate_parent_task_id and candidate_parent_task_id != parent_task_id:
+            return False
+        if task_id in task_values and candidate_parent_task_id == parent_task_id:
+            exact_mapping = True
             continue
-        if (
-            _contract_runtime_mapping_value(candidate, "parent_task_id")
-            != parent_task_id
-        ):
-            continue
+        incomplete_runtime_mapping = True
+    if exact_mapping:
         return True
-    return False
+    if not incomplete_runtime_mapping or not isinstance(server_identity, Mapping):
+        return False
+    return bool(
+        str(server_identity.get("schema_version") or "").strip()
+        == "contract_runtime.dispatch_line_match.v1"
+        and str(server_identity.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(server_identity.get("task_id") or "").strip() == task_id
+        and str(server_identity.get("parent_task_id") or "").strip()
+        == parent_task_id
+        and str(server_identity.get("source_ref") or "").strip().startswith(
+            "contract_runtime:"
+        )
+    )
 
 
 def _runtime_context_failed_qa_accepted_line_binding(
@@ -26152,6 +26266,7 @@ def _runtime_context_failed_qa_accepted_line_binding(
     if not _runtime_context_failed_qa_line_matches_context(
         failed_line,
         context=context,
+        server_identity=dispatch_match,
     ):
         return {}
 
@@ -26319,6 +26434,7 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
         if not _runtime_context_failed_qa_line_matches_context(
             failed_line,
             context=context,
+            server_identity=dispatch_match,
         ):
             continue
         identity_binding = _runtime_context_failed_qa_accepted_line_binding(

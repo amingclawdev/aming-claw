@@ -35914,9 +35914,14 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     # failed-QA/rejoin marker rather than requiring the stale observer_merge
     # guide that existed before the failure.
     reopened_record = runtime.store.get(successor["contract_execution_id"])
+    legacy_failed_common = {
+        key: value
+        for key, value in passed_common.items()
+        if key not in {"task_id", "parent_task_id"}
+    }
     reopened_record["completed_lines"].append(
         {
-            **passed_common,
+            **legacy_failed_common,
             "stage_id": "qa",
             "line_id": "qa_independent_verification",
             "actor_role": "qa",
@@ -35924,7 +35929,7 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
             "status": "failed",
             "verification": {"result": "failed", "verdict": "FAIL"},
             "payload": {
-                **passed_common,
+                **legacy_failed_common,
                 "status": "failed",
                 "verdict": "FAIL",
                 "source_ref": f"timeline:{failed_qa['id']}",
@@ -36106,6 +36111,38 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     )
     assert all(item["attempt"] == 2 for item in legacy_rotations)
     assert all(item["retry_round"] == 1 for item in legacy_rotations)
+
+    composed_context = get_branch_context(
+        conn,
+        PID,
+        runtime_context.task_id,
+    )
+    assert composed_context is not None
+    composed_marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=conn,
+        context=composed_context,
+        runtime_context_id=composed_context.runtime_context_id,
+        timeline_events=task_timeline.list_events(
+            conn,
+            PID,
+            task_id=composed_context.task_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        ),
+    )
+    assert composed_marker["revision_event_ref"] == (
+        legacy_rotations[-1]["audit_event_ref"]
+    )
+    assert composed_marker["authoritative_rejoin_event_ref"] == (
+        first_rejoin["audit_event_ref"]
+    )
+    assert composed_marker["latest_rotation_event_ref"] == (
+        legacy_rotations[-1]["audit_event_ref"]
+    )
+    assert composed_marker["composed_across_auth_rotation"] is True
+    assert composed_marker["session_token_ref_rotation"][
+        "active_session_token_ref"
+    ] == legacy_rotations[-1]["session_token_ref"]
 
     # The next server revision continues the historical timeline authority,
     # while the newly accepted event becomes the strict current-session marker.
@@ -36912,6 +36949,192 @@ def test_failed_qa_rejoin_requires_exact_runtime_task_and_parent_identity(
         failed_line,
         context=context,
     ) is matches
+
+
+def test_failed_qa_rejoin_derives_missing_identity_only_from_exact_dispatch():
+    context = SimpleNamespace(
+        runtime_context_id="mfrctx-canonical-rejoin",
+        task_id="worker-canonical-rejoin",
+        parent_task_id="parent-canonical-rejoin",
+    )
+    incomplete_failed_line = {
+        "runtime_context_id": context.runtime_context_id,
+        "status": "failed",
+    }
+    exact_dispatch = {
+        "schema_version": "contract_runtime.dispatch_line_match.v1",
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "source_ref": (
+            "contract_runtime:cex-canonical-rejoin:completed_lines:0"
+        ),
+    }
+
+    assert not server._runtime_context_failed_qa_line_matches_context(
+        incomplete_failed_line,
+        context=context,
+    )
+    assert server._runtime_context_failed_qa_line_matches_context(
+        incomplete_failed_line,
+        context=context,
+        server_identity=exact_dispatch,
+    )
+    assert not server._runtime_context_failed_qa_line_matches_context(
+        {
+            **incomplete_failed_line,
+            "task_id": "worker-cross-context",
+        },
+        context=context,
+        server_identity=exact_dispatch,
+    )
+    assert not server._runtime_context_failed_qa_line_matches_context(
+        incomplete_failed_line,
+        context=context,
+        server_identity={
+            **exact_dispatch,
+            "parent_task_id": "parent-cross-context",
+        },
+    )
+
+
+def test_failed_qa_rejoin_marker_composes_authority_and_active_auth_rotation(
+    monkeypatch,
+    tmp_path,
+):
+    from agent.governance.parallel_branch_runtime import (
+        mf_subagent_session_token_hash,
+    )
+
+    target_root = tmp_path / "failed-qa-auth-rotation"
+    target_root.mkdir()
+    context = SimpleNamespace(
+        project_id=PID,
+        runtime_context_id="mfrctx-auth-rotation",
+        task_id="worker-auth-rotation",
+        parent_task_id="parent-auth-rotation",
+        root_task_id="parent-auth-rotation",
+        backlog_id="AC-AUTH-ROTATION",
+        attempt=2,
+        retry_round=1,
+        worker_id="worker-auth-rotation",
+        worker_slot_id="slot-auth-rotation",
+        fence_token="fence-auth-rotation",
+        session_token_hash=mf_subagent_session_token_hash(
+            "active-auth-rotation-token"
+        ),
+        target_project_root=str(target_root),
+        worktree_path=str(target_root),
+    )
+    active_session_ref = runtime_context_session_token_ref(context)
+    route_identity = {
+        "route_id": "route-auth-rotation",
+        "route_context_hash": "sha256:route-auth-rotation",
+        "prompt_contract_id": "rprompt-auth-rotation",
+        "prompt_contract_hash": "sha256:prompt-auth-rotation",
+        "route_token_ref": "rtok-auth-rotation",
+        "visible_injection_manifest_hash": "sha256:visible-auth-rotation",
+    }
+
+    def rejoin_event(
+        event_id,
+        *,
+        session_token_ref,
+        timeline_reopen_for_revision,
+    ):
+        return {
+            "id": event_id,
+            "project_id": PID,
+            "backlog_id": context.backlog_id,
+            "task_id": context.task_id,
+            "event_type": "observer.runtime_context_session_token_rejoin",
+            "event_kind": "observer_command",
+            "status": "accepted",
+            "payload": {
+                "action": "runtime_context_session_token_rejoin",
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": context.parent_task_id,
+                "attempt": context.attempt,
+                "retry_round": context.retry_round,
+                "current_status": "worktree_ready",
+                "worker_id": context.worker_id,
+                "worker_slot_id": context.worker_slot_id,
+                "fence_token_hash": runtime_context_secret_hash(
+                    context.fence_token
+                ),
+                "target_project_root": str(target_root),
+                "session_token_ref": session_token_ref,
+                "reopen_for_revision": True,
+                "timeline_reopen_for_revision": (
+                    timeline_reopen_for_revision
+                ),
+                "route_identity": dict(route_identity),
+            },
+        }
+
+    failed_qa = {
+        "event_id": 10,
+        "source_ref": "timeline:10",
+        "source": "server_qa_session_verification",
+        "authority_hash": "sha256:failed-qa-authority",
+    }
+    events = [
+        rejoin_event(
+            20,
+            session_token_ref="wstok-prior-auth-rotation",
+            timeline_reopen_for_revision=True,
+        ),
+        rejoin_event(
+            21,
+            session_token_ref=active_session_ref,
+            timeline_reopen_for_revision=False,
+        ),
+    ]
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_authenticated_failed_qa_timeline_boundary",
+        lambda **_kwargs: dict(failed_qa),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_route_identity",
+        lambda *_args, **_kwargs: dict(route_identity),
+    )
+
+    marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=object(),
+        context=context,
+        runtime_context_id=context.runtime_context_id,
+        timeline_events=events,
+    )
+
+    assert marker["revision_event_ref"] == "timeline:21"
+    assert marker["authoritative_rejoin_event_ref"] == "timeline:20"
+    assert marker["latest_rotation_event_ref"] == "timeline:21"
+    assert marker["composed_across_auth_rotation"] is True
+    assert marker["failed_qa_source_ref"] == "timeline:10"
+    assert marker["session_token_ref_rotation"][
+        "active_session_token_ref"
+    ] == active_session_ref
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_route_identity",
+        lambda *_args, **_kwargs: {
+            **route_identity,
+            "route_token_ref": "rtok-stale-auth-rotation",
+        },
+    )
+    assert (
+        server._runtime_context_failed_qa_revision_rejoin_marker(
+            conn=object(),
+            context=context,
+            runtime_context_id=context.runtime_context_id,
+            timeline_events=events,
+        )
+        == {}
+    )
 
 
 @pytest.mark.parametrize(
