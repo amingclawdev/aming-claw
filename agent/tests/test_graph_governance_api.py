@@ -77451,6 +77451,164 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         stored_lines_after_qa
     )
 
+    fresh_principal = "qa:fresh-runtime-context-projection"
+    fresh_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=runtime_context.task_id,
+        commit_sha=head_commit,
+    )
+    fresh_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{runtime_context.task_id}",
+        f"commit:{head_commit}",
+        fresh_scope_binding_ref,
+    ]
+    fresh_session = server.role_service.register(
+        conn,
+        fresh_principal,
+        PID,
+        "qa",
+        scope=fresh_scope,
+    )
+    fresh_trace_id = "gqt-runtime-context-projection-fresh-session"
+    _insert_exact_qa_graph_query_trace(
+        conn,
+        trace_id=fresh_trace_id,
+        snapshot_id="scope-runtime-context-projection-fresh-session",
+        candidate_commit_sha=head_commit,
+        backlog_id=backlog_id,
+        task_id=runtime_context.task_id,
+        target_project_root=str(worktree),
+        canonical_project_root=str(canonical_root),
+        actor=fresh_principal,
+        qa_session_id=fresh_session["session_id"],
+    )
+    conn.commit()
+    fresh_body = {
+        "backlog_id": backlog_id,
+        "task_id": runtime_context.task_id,
+        "event_type": "qa.independent_verification",
+        "event_kind": "independent_verification",
+        "phase": "qa",
+        "actor": fresh_principal,
+        "status": "passed",
+        "commit_sha": head_commit,
+        "payload": {
+            "contract_execution_id": successor["contract_execution_id"],
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "graph_trace_ids": [fresh_trace_id],
+            "observer_impersonation": False,
+        },
+        "verification": {
+            "tests_run": [
+                "pytest -q agent/tests/test_graph_governance_api.py"
+            ],
+            "diff_check": {"unexpected_files": []},
+        },
+    }
+
+    def fresh_qa_context(body):
+        ctx = _ctx_with_role(
+            {"project_id": PID},
+            "qa",
+            method="POST",
+            body=json.loads(json.dumps(body)),
+        )
+        ctx._session.update(
+            {
+                "session_id": fresh_session["session_id"],
+                "principal_id": fresh_principal,
+                "scope": fresh_scope,
+            }
+        )
+        return ctx
+
+    fresh_pass = server.handle_task_timeline_append(
+        fresh_qa_context(fresh_body)
+    )
+    assert fresh_pass["id"] != duplicate_result["id"]
+    fresh_gate = fresh_pass["contract_runtime_close_evidence_gate"]
+    assert fresh_gate["status"] == "accepted_completed_line_already_recorded"
+    assert fresh_gate["completed_line_already_recorded"] is True
+    assert fresh_gate["contract_runtime_line_mutated"] is False
+    assert fresh_gate["contract_runtime_completed_line_remains_authoritative"] is True
+    assert fresh_gate["fresh_qa_session_authority_precedence"] is True
+    assert fresh_gate["timeline_append_required"] is True
+    assert fresh_gate["timeline_append_authoritative"] is True
+    assert fresh_gate["duplicate_timeline_append_non_authoritative"] is False
+    assert fresh_gate["fresh_qa_session_id"] == fresh_session["session_id"]
+    assert fresh_gate["fresh_qa_scope_binding_ref"] == (
+        fresh_scope_binding_ref
+    )
+    assert fresh_gate["fresh_qa_db_verified_graph_trace"] is True
+    fresh_authority = fresh_pass["payload"][
+        "source_backed_contract_gate_authority"
+    ]
+    assert fresh_authority["source_of_authority"] == "qa_session_verification"
+    assert fresh_authority["authority_scope"] == "close_satisfying"
+    assert fresh_authority["qa_session_proof"]["qa_session_id"] == (
+        fresh_session["session_id"]
+    )
+    assert fresh_authority["qa_session_proof"]["graph_trace_ids"] == [
+        fresh_trace_id
+    ]
+    assert fresh_pass["contract_gate_decision"]["source_of_authority"] == (
+        "qa_session_verification"
+    )
+
+    fresh_replay = server.handle_task_timeline_append(
+        fresh_qa_context(fresh_body)
+    )
+    assert fresh_replay["id"] == fresh_pass["id"]
+    assert fresh_replay["idempotent_replay"] is True
+    assert fresh_replay["idempotency_scope"] == (
+        "authenticated_qa_exact_authority"
+    )
+
+    fresh_failed_body = json.loads(json.dumps(fresh_body))
+    fresh_failed_body["status"] = "failed"
+    fresh_failed = server.handle_task_timeline_append(
+        fresh_qa_context(fresh_failed_body)
+    )
+    assert fresh_failed["id"] != fresh_pass["id"]
+    assert fresh_failed["contract_runtime_close_evidence_gate"][
+        "timeline_append_authoritative"
+    ] is True
+    failed_authority = fresh_failed["payload"][
+        "source_backed_contract_gate_authority"
+    ]
+    assert failed_authority["authority_scope"] == "audit_only"
+    assert failed_authority["close_satisfying"] is False
+    assert failed_authority["qa_session_proof"]["evidence_status"] == "failed"
+
+    cross_session = server.role_service.register(
+        conn,
+        "qa:cross-session",
+        PID,
+        "qa",
+        scope=fresh_scope,
+    )
+    conn.commit()
+    cross_session_ctx = fresh_qa_context(fresh_body)
+    cross_session_ctx._session.update(
+        {
+            "session_id": cross_session["session_id"],
+            "principal_id": "qa:cross-session",
+        }
+    )
+    cross_session_ctx.body["actor"] = "qa:cross-session"
+    with pytest.raises(GovernanceError) as cross_session_error:
+        server.handle_task_timeline_append(cross_session_ctx)
+    assert cross_session_error.value.code == "qa_graph_trace_mismatch"
+
+    stored_after_fresh_qa = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    assert len(stored_after_fresh_qa["completed_lines"]) == len(
+        stored_lines_after_qa
+    )
+
     after = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},

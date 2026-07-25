@@ -83730,6 +83730,7 @@ def _contract_runtime_completed_line_projection_preflight_gate(
     body: Mapping[str, Any],
     event_kind: str,
     trusted_actor_role: str = "",
+    trusted_qa_verification_authority: Mapping[str, Any] | None = None,
     historical_route_correction: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     contract_execution_id = _contract_runtime_close_execution_id(body, conn=conn)
@@ -83804,6 +83805,64 @@ def _contract_runtime_completed_line_projection_preflight_gate(
                 gate["timeline_append_required"] = False
                 gate["timeline_append_authoritative"] = False
                 gate["contract_runtime_completed_line_remains_authoritative"] = True
+                fresh_qa_authority = (
+                    dict(trusted_qa_verification_authority)
+                    if (
+                        actor_role == "qa"
+                        and isinstance(
+                            trusted_qa_verification_authority,
+                            Mapping,
+                        )
+                        and trusted_qa_verification_authority
+                        and trusted_qa_verification_authority.get(
+                            "db_verified_graph_trace"
+                        )
+                        is True
+                        and str(
+                            trusted_qa_verification_authority.get(
+                                "qa_session_id"
+                            )
+                            or ""
+                        ).strip()
+                        and str(
+                            trusted_qa_verification_authority.get(
+                                "qa_scope_binding_ref"
+                            )
+                            or ""
+                        ).strip()
+                    )
+                    else {}
+                )
+                if fresh_qa_authority:
+                    gate.update(
+                        {
+                            "timeline_append_required": True,
+                            "timeline_append_authoritative": True,
+                            "timeline_append_primary_decision_source": True,
+                            "primary_decision_source": False,
+                            "duplicate_timeline_append_non_authoritative": False,
+                            "fresh_qa_session_authority_precedence": True,
+                            "timeline_authority_decision_source": (
+                                "qa_session_verification"
+                            ),
+                            "fresh_qa_session_id": str(
+                                fresh_qa_authority.get("qa_session_id") or ""
+                            ).strip(),
+                            "fresh_qa_scope_binding_ref": str(
+                                fresh_qa_authority.get(
+                                    "qa_scope_binding_ref"
+                                )
+                                or ""
+                            ).strip(),
+                            "fresh_qa_db_verified_graph_trace": bool(
+                                fresh_qa_authority.get(
+                                    "db_verified_graph_trace"
+                                )
+                                is True
+                            ),
+                            "contract_runtime_line_mutated": False,
+                        }
+                    )
                 if not actor_role:
                     gate["actor_role_source"] = "completed_contract_runtime_line"
                     gate[
@@ -91127,12 +91186,29 @@ def handle_task_timeline_append(ctx: RequestContext):
             trusted_contract_runtime_actor_role = (
                 _trusted_contract_runtime_actor_role_from_context(ctx, conn)
             )
+            if (
+                trusted_contract_runtime_actor_role == "qa"
+                and not _body_has_route_token_input(ctx.body or {})
+                and not _body_has_route_waiver(ctx.body or {})
+            ):
+                trusted_qa_verification_authority = (
+                    _timeline_trusted_qa_verification_authority(
+                        ctx,
+                        conn,
+                        project_id=project_id,
+                        body=ctx.body or {},
+                        event=event,
+                    )
+                )
             contract_runtime_completed_projection_gate = (
                 _contract_runtime_completed_line_projection_preflight_gate(
                     conn,
                     body=ctx.body or {},
                     event_kind=str(event.get("event_kind") or ""),
                     trusted_actor_role=trusted_contract_runtime_actor_role,
+                    trusted_qa_verification_authority=(
+                        trusted_qa_verification_authority
+                    ),
                     historical_route_correction=(
                         trusted_historical_route_correction
                     ),
@@ -91140,7 +91216,8 @@ def handle_task_timeline_append(ctx: RequestContext):
             )
             if not contract_runtime_completed_projection_gate:
                 if (
-                    not _body_has_route_token_input(ctx.body or {})
+                    not trusted_qa_verification_authority
+                    and not _body_has_route_token_input(ctx.body or {})
                     and not _body_has_route_waiver(ctx.body or {})
                 ):
                     trusted_qa_verification_authority = (
