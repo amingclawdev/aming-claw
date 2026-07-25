@@ -25369,7 +25369,7 @@ def _runtime_context_server_derived_legacy_qa_runtime_binding(
     }
 
 
-def _runtime_context_authenticated_failed_qa_timeline_boundary(
+def _runtime_context_latest_authenticated_qa_timeline_verdict(
     *,
     conn,
     context: Any,
@@ -25377,7 +25377,14 @@ def _runtime_context_authenticated_failed_qa_timeline_boundary(
     timeline_events: Sequence[Mapping[str, Any]],
     before_event_id: int = 0,
 ) -> dict[str, Any]:
-    """Return the latest active server-authenticated QA timeline verdict."""
+    """Return the latest server-authenticated QA timeline verdict.
+
+    Historical PASS rows are immutable audit evidence, but they are not
+    current authority once a newer authenticated QA verdict exists.  Keep the
+    selection neutral here so callers can apply either the failed-QA rework
+    boundary or the current merge-readiness barrier without falling back to an
+    older PASS.
+    """
 
     from . import task_timeline
 
@@ -25539,11 +25546,15 @@ def _runtime_context_authenticated_failed_qa_timeline_boundary(
             if not runtime_context_binding:
                 continue
         latest = {
-            "schema_version": "runtime_context.authenticated_failed_qa_timeline_boundary.v1",
+            "schema_version": "runtime_context.authenticated_qa_timeline_verdict.v1",
             "source": "server_qa_session_verification",
             "source_of_authority": "qa_session_verification",
             "event_id": event_id,
             "source_ref": f"timeline:{event_id}",
+            "created_at": str(event.get("created_at") or "").strip(),
+            "execution_state_revision": int(
+                gate.get("execution_state_revision") or 0
+            ),
             "status": status,
             "commit_sha": event_commit,
             "actor": actor,
@@ -25563,8 +25574,39 @@ def _runtime_context_authenticated_failed_qa_timeline_boundary(
             "task_id": task_id,
             "backlog_id": backlog_id,
         }
-    if str(latest.get("status") or "") not in blocking_statuses:
+    return latest
+
+
+def _runtime_context_authenticated_failed_qa_timeline_boundary(
+    *,
+    conn,
+    context: Any,
+    runtime_context_id: str,
+    timeline_events: Sequence[Mapping[str, Any]],
+    before_event_id: int = 0,
+) -> dict[str, Any]:
+    """Return the latest active server-authenticated failed-QA boundary."""
+
+    latest = _runtime_context_latest_authenticated_qa_timeline_verdict(
+        conn=conn,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        timeline_events=timeline_events,
+        before_event_id=before_event_id,
+    )
+    if str(latest.get("status") or "") not in {
+        "blocked",
+        "error",
+        "fail",
+        "failed",
+        "invalid",
+        "rejected",
+    }:
         return {}
+    latest = dict(latest)
+    latest["schema_version"] = (
+        "runtime_context.authenticated_failed_qa_timeline_boundary.v1"
+    )
     return latest
 
 
@@ -63588,6 +63630,7 @@ def _contract_runtime_mf_parallel_context_projection(
     same_lane_recoveries: list[dict[str, Any]] = []
     persisted_revision_resets: list[dict[str, Any]] = []
     persisted_reset_indices: set[int] = set()
+    authoritative_qa_superseded_indices: set[int] = set()
     runtime = _contract_runtime(conn)
     for dispatch_line in dispatch_lines:
         for context in _contract_runtime_contexts_for_dispatch_line(
@@ -63608,6 +63651,16 @@ def _contract_runtime_mf_parallel_context_projection(
                     context,
                     projection=context_projection,
                 )
+            )
+            authoritative_qa_superseded_indices.update(
+                int(index)
+                for index in (
+                    context_projection.get(
+                        "authoritative_qa_superseded_completed_line_indices"
+                    )
+                    or []
+                )
+                if isinstance(index, int)
             )
             reset_indices = (
                 _runtime_context_persisted_post_qa_conflict_reset_indices(
@@ -63732,6 +63785,7 @@ def _contract_runtime_mf_parallel_context_projection(
         and not failed_qa_rejoin_contexts
         and not same_lane_recoveries
         and not persisted_revision_resets
+        and not authoritative_qa_superseded_indices
     ):
         return {}
     superseded_line_indices = {
@@ -63751,6 +63805,7 @@ def _contract_runtime_mf_parallel_context_projection(
             if isinstance(index, int)
         )
     superseded_line_indices.update(persisted_reset_indices)
+    superseded_line_indices.update(authoritative_qa_superseded_indices)
     projection_base_lines = [
         line
         for index, line in enumerate(completed_lines)
@@ -63810,6 +63865,11 @@ def _contract_runtime_mf_parallel_context_projection(
         projection["post_qa_merge_conflict_revision_resets"] = (
             persisted_revision_resets
         )
+    if authoritative_qa_superseded_indices:
+        projection["authoritative_qa_superseded_completed_line_indices"] = (
+            sorted(authoritative_qa_superseded_indices)
+        )
+        projection["authoritative_qa_append_only_history_preserved"] = True
     return projection
 
 
@@ -63954,6 +64014,288 @@ def _contract_runtime_contexts_for_dispatch_line(
     return contexts
 
 
+_CONTRACT_RUNTIME_AUTHORITATIVE_QA_PASS_STATUSES = frozenset(
+    {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+)
+_CONTRACT_RUNTIME_AUTHORITATIVE_QA_BLOCKING_STATUSES = frozenset(
+    {"blocked", "error", "fail", "failed", "invalid", "rejected"}
+)
+_CONTRACT_RUNTIME_AUTHORITATIVE_QA_SUPERSEDED_LINE_IDS = frozenset(
+    {
+        "qa_graph_context",
+        "qa_independent_verification",
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
+    }
+)
+
+
+def _contract_runtime_authoritative_qa_projection_verdict(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    runtime_context_id: str,
+    timeline_events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Select the one authenticated QA verdict allowed to drive projection."""
+
+    latest = _runtime_context_latest_authenticated_qa_timeline_verdict(
+        conn=conn,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        timeline_events=timeline_events,
+    )
+    if not latest:
+        return {}
+    expected_candidate_commit = str(
+        _contract_runtime_server_candidate_commit(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
+        or getattr(context, "head_commit", "")
+        or ""
+    ).strip()
+    if (
+        expected_candidate_commit
+        and str(latest.get("commit_sha") or "").strip()
+        != expected_candidate_commit
+    ):
+        return {}
+
+    projected = {
+        **latest,
+        "expected_candidate_commit": expected_candidate_commit,
+        "candidate_scope_verified": True,
+        "effective_status": str(latest.get("status") or "").strip().lower(),
+        "fresh_session_pass_verified": True,
+    }
+    if projected["effective_status"] in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_PASS_STATUSES:
+        prior = _runtime_context_latest_authenticated_qa_timeline_verdict(
+            conn=conn,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            timeline_events=timeline_events,
+            before_event_id=int(projected.get("event_id") or 0),
+        )
+        prior_status = str(prior.get("status") or "").strip().lower()
+        if prior_status not in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_BLOCKING_STATUSES:
+            return {}
+        projected["prior_no_pass_event_id"] = int(prior.get("event_id") or 0)
+        projected["prior_no_pass_qa_session_id"] = str(
+            prior.get("qa_session_id") or ""
+        ).strip()
+        projected["prior_no_pass_created_at"] = str(
+            prior.get("created_at") or ""
+        ).strip()
+        projected["prior_no_pass_execution_state_revision"] = int(
+            prior.get("execution_state_revision") or 0
+        )
+        projected["fresh_session_pass_verified"] = bool(
+            int(projected.get("event_id") or 0)
+            > int(prior.get("event_id") or 0)
+            and str(projected.get("qa_session_id") or "").strip()
+            != str(prior.get("qa_session_id") or "").strip()
+        )
+        if not projected["fresh_session_pass_verified"]:
+            projected["effective_status"] = "failed"
+    return projected
+
+
+def _contract_runtime_authoritative_qa_superseded_line_indices(
+    conn,
+    record: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    authoritative_qa_verdict: Mapping[str, Any],
+) -> list[int]:
+    """Invalidate historical QA/integration only in the current read model."""
+
+    if not authoritative_qa_verdict:
+        return []
+    completed_lines = list(record.get("completed_lines") or [])
+    expected_commit = str(
+        authoritative_qa_verdict.get("expected_candidate_commit") or ""
+    ).strip()
+    failed_qa_session_id = str(
+        authoritative_qa_verdict.get("prior_no_pass_qa_session_id")
+        or authoritative_qa_verdict.get("qa_session_id")
+        or ""
+    ).strip()
+    failed_qa_created_at = str(
+        authoritative_qa_verdict.get("prior_no_pass_created_at")
+        or authoritative_qa_verdict.get("created_at")
+        or ""
+    ).strip()
+    failed_qa_time = _contract_runtime_close_authority_time_order_value(
+        failed_qa_created_at
+    )
+    failed_qa_revision = int(
+        authoritative_qa_verdict.get(
+            "prior_no_pass_execution_state_revision"
+        )
+        or authoritative_qa_verdict.get("execution_state_revision")
+        or 0
+    )
+
+    def qa_session_id(line: Mapping[str, Any]) -> str:
+        provenance = (
+            line.get("qa_evidence_provenance")
+            if isinstance(line.get("qa_evidence_provenance"), Mapping)
+            else {}
+        )
+        binding = (
+            provenance.get("authenticated_qa_binding")
+            if isinstance(
+                provenance.get("authenticated_qa_binding"), Mapping
+            )
+            else {}
+        )
+        return str(binding.get("qa_session_id") or "").strip()
+
+    superseded: list[int] = []
+    for index, line in enumerate(completed_lines):
+        if not isinstance(line, Mapping):
+            continue
+        line_id = str(line.get("line_id") or "").strip()
+        if line_id not in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_SUPERSEDED_LINE_IDS:
+            continue
+        context_keys = _contract_runtime_line_context_keys(line)
+        runtime_context_ids = {
+            value
+            for kind, value in context_keys
+            if kind == "runtime_context_id"
+        }
+        task_ids = {
+            value for kind, value in context_keys if kind == "task_id"
+        }
+        if (
+            runtime_context_ids != {runtime_context_id}
+            or task_ids != {task_id}
+        ):
+            continue
+        if line_id == "qa_graph_context":
+            payload = (
+                line.get("payload")
+                if isinstance(line.get("payload"), Mapping)
+                else {}
+            )
+            graph = (
+                payload.get("graph_trace_evidence")
+                if isinstance(
+                    payload.get("graph_trace_evidence"), Mapping
+                )
+                else {}
+            )
+            graph_qa_session_id = qa_session_id(line)
+            trace_ids = _runtime_context_service_dedupe(
+                _runtime_context_service_query_values(
+                    graph,
+                    "verified_trace_ids",
+                    "trace_ids",
+                )
+            )
+            trace_rows: list[Any] = []
+            if trace_ids:
+                placeholders = ",".join("?" for _ in trace_ids)
+                try:
+                    trace_rows = conn.execute(
+                        f"""
+                        SELECT trace_id, actor, backlog_id, task_id,
+                               runtime_context_id, qa_session_id, commit_sha,
+                               candidate_commit_sha, status, created_at
+                        FROM graph_query_traces
+                        WHERE project_id = ?
+                          AND trace_id IN ({placeholders})
+                        """,
+                        (project_id, *trace_ids),
+                    ).fetchall()
+                except sqlite3.Error:
+                    trace_rows = []
+            fresh_trace_rows = bool(
+                failed_qa_time is not None
+                and len(trace_rows) == len(trace_ids)
+                and {
+                    str(row["trace_id"] or "").strip() for row in trace_rows
+                }
+                == set(trace_ids)
+                and all(
+                    str(row["backlog_id"] or "").strip() == backlog_id
+                    and str(row["task_id"] or "").strip() == task_id
+                    and str(row["runtime_context_id"] or "").strip()
+                    == runtime_context_id
+                    and str(row["actor"] or "").strip()
+                    == str(graph.get("qa_principal") or "").strip()
+                    and str(row["qa_session_id"] or "").strip()
+                    == graph_qa_session_id
+                    and (
+                        not expected_commit
+                        or (
+                            str(row["commit_sha"] or "").strip()
+                            == expected_commit
+                            and str(
+                                row["candidate_commit_sha"] or ""
+                            ).strip()
+                            == expected_commit
+                        )
+                    )
+                    and str(row["status"] or "").strip().lower()
+                    == "complete"
+                    and (
+                        _contract_runtime_close_authority_time_order_value(
+                            str(row["created_at"] or "").strip()
+                        )
+                        or 0.0
+                    )
+                    > failed_qa_time
+                    for row in trace_rows
+                )
+            )
+            acceptance = _contract_runtime_completed_line_acceptance(
+                conn,
+                project_id=project_id,
+                record=record,
+                completed_line_index=index,
+                expected_line=line,
+            )
+            if (
+                failed_qa_revision > 0
+                and fresh_trace_rows
+                and acceptance.get("db_verified") is True
+                and int(
+                    acceptance.get("execution_state_revision") or 0
+                )
+                > failed_qa_revision
+                and _contract_runtime_authenticated_qa_provenance(line)
+                and graph.get("db_verified") is True
+                and not list(graph.get("identity_mismatches") or [])
+                and list(graph.get("verified_trace_ids") or [])
+                and graph_qa_session_id
+                and graph_qa_session_id != failed_qa_session_id
+                and str(graph.get("qa_session_id") or "").strip()
+                == graph_qa_session_id
+                and str(graph.get("runtime_context_id") or "").strip()
+                == runtime_context_id
+                and str(graph.get("task_id") or "").strip() == task_id
+                and (
+                    not expected_commit
+                    or str(
+                        graph.get("candidate_commit_sha") or ""
+                    ).strip()
+                    == expected_commit
+                )
+            ):
+                continue
+        superseded.append(index)
+    return superseded
+
+
 def _contract_runtime_projection_for_context(
     conn,
     *,
@@ -63974,6 +64316,27 @@ def _contract_runtime_projection_for_context(
         project_id=project_id,
         task_id=task_id,
         backlog_id=backlog_id,
+    )
+    authoritative_qa_verdict = (
+        _contract_runtime_authoritative_qa_projection_verdict(
+            conn,
+            project_id=project_id,
+            record=record,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            timeline_events=timeline_events,
+        )
+    )
+    authoritative_qa_superseded_line_indices = (
+        _contract_runtime_authoritative_qa_superseded_line_indices(
+            conn,
+            record,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            authoritative_qa_verdict=authoritative_qa_verdict,
+        )
     )
     timeline_refs, startup_payload, finish_payload, _close_payload = (
         _runtime_context_service_timeline_refs(
@@ -64025,6 +64388,12 @@ def _contract_runtime_projection_for_context(
     projected_line_refs: list[dict[str, Any]] = []
     source_refs: list[str] = []
     local_keys = set(existing_keys)
+    for index in authoritative_qa_superseded_line_indices:
+        completed_line = (record.get("completed_lines") or [])[index]
+        if isinstance(completed_line, Mapping):
+            local_keys.discard(
+                _contract_runtime_projection_line_key(completed_line)
+            )
     contract_execution_id = str(
         record.get("contract_execution_id") or ""
     ).strip()
@@ -64117,6 +64486,7 @@ def _contract_runtime_projection_for_context(
         record=record,
         context=context,
         timeline_events=timeline_events,
+        authoritative_qa_verdict=authoritative_qa_verdict,
     ):
         key = _contract_runtime_projection_line_key(line)
         if _contract_runtime_projection_key_completed(key, local_keys):
@@ -64145,6 +64515,10 @@ def _contract_runtime_projection_for_context(
         "source_refs": source_refs,
         "failed_qa_revision_rejoin": failed_qa_revision_rejoin,
         "failed_qa_revision_rejoin_marker": failed_qa_revision_rejoin_marker,
+        "authoritative_qa_verdict": authoritative_qa_verdict,
+        "authoritative_qa_superseded_completed_line_indices": (
+            authoritative_qa_superseded_line_indices
+        ),
     }
 
 
@@ -64569,6 +64943,7 @@ def _contract_runtime_projection_post_worker_lines(
     record: Mapping[str, Any],
     context: Any,
     timeline_events: Sequence[Mapping[str, Any]],
+    authoritative_qa_verdict: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
         context
@@ -64602,6 +64977,11 @@ def _contract_runtime_projection_post_worker_lines(
     qa_event: Mapping[str, Any] = {}
     qa_graph_refs: dict[str, Any] = {}
     stored_qa_trace_ids: list[str] = []
+    authoritative_qa_verdict = (
+        dict(authoritative_qa_verdict)
+        if isinstance(authoritative_qa_verdict, Mapping)
+        else {}
+    )
     if bounded_qa_policy:
         for completed_line in reversed(
             [
@@ -64626,7 +65006,57 @@ def _contract_runtime_projection_post_worker_lines(
             )
             if stored_qa_trace_ids:
                 break
-    while qa_candidates:
+    authoritative_qa_event_id = int(
+        authoritative_qa_verdict.get("event_id") or 0
+    )
+    authoritative_qa_status = str(
+        authoritative_qa_verdict.get("effective_status")
+        or authoritative_qa_verdict.get("status")
+        or ""
+    ).strip().lower()
+    authoritative_qa_passed = bool(
+        authoritative_qa_event_id > 0
+        and authoritative_qa_status
+        in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_PASS_STATUSES
+        and authoritative_qa_verdict.get("candidate_scope_verified") is True
+        and authoritative_qa_verdict.get("fresh_session_pass_verified") is True
+    )
+    if authoritative_qa_event_id > 0 and authoritative_qa_passed:
+        candidate_qa_event = next(
+            (
+                event
+                for event in timeline_events
+                if isinstance(event, Mapping)
+                and int(event.get("id") or 0) == authoritative_qa_event_id
+            ),
+            {},
+        )
+        if candidate_qa_event:
+            qa_graph_refs = _runtime_context_service_qa_graph_trace_refs(
+                conn,
+                project_id=project_id,
+                explicit_trace_ids=(
+                    _runtime_context_service_graph_trace_values_from_event(
+                        candidate_qa_event
+                    )
+                ),
+                target_project_root=str(
+                    getattr(context, "worktree_path", "")
+                    or getattr(context, "target_project_root", "")
+                    or ""
+                ),
+                expected_backlog_id=backlog_id,
+                expected_task_id=task_id,
+                expected_candidate_commit_sha=str(
+                    authoritative_qa_verdict.get("expected_candidate_commit")
+                    or ""
+                ),
+                require_complete_authority=True,
+                strict_bounded_qa=True,
+            )
+            if qa_graph_refs.get("db_verified") is True:
+                qa_event = candidate_qa_event
+    while not authoritative_qa_event_id and qa_candidates:
         candidate_qa_event = _contract_runtime_projection_latest_timeline_event(
             qa_candidates,
             runtime_context_id=runtime_context_id,
@@ -64724,6 +65154,23 @@ def _contract_runtime_projection_post_worker_lines(
         related_task_ids=related_task_ids,
         direct_parent_task_id=parent_task_id,
     )
+    if authoritative_qa_event_id > 0:
+        qa_event_id = _contract_runtime_projection_timeline_event_id(qa_event)
+        merge_event_id = _contract_runtime_projection_timeline_event_id(
+            merge_event
+        )
+        current_pass_is_authoritative = bool(
+            authoritative_qa_passed
+            and qa_graph_refs.get("db_verified") is True
+            and qa_event_id == authoritative_qa_event_id
+        )
+        if (
+            not current_pass_is_authoritative
+            or merge_event_id <= authoritative_qa_event_id
+        ):
+            merge_event = {}
+            reconcile_event = {}
+            close_ready_event = {}
     if reconcile_policy:
         qa_event_id = _contract_runtime_projection_timeline_event_id(qa_event)
         merge_event_id = _contract_runtime_projection_timeline_event_id(merge_event)
