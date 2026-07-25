@@ -13725,6 +13725,195 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(get_fresh["count"], 2)
         self.assertEqual(current_fresh["latest_event"]["id"], newest_event["id"])
 
+    def test_timeline_hot_deques_are_bounded_appendable_and_project_isolated(self):
+        from agent.governance.dashboard_read_cache import DashboardTimelineReadCache
+
+        cache = DashboardTimelineReadCache(
+            current_window_limit=3,
+            playback_window_limit=2,
+            current_project_limit=2,
+            playback_resource_limit=2,
+        )
+        loaded_a, miss_a = cache.load_current(
+            database_scope="db",
+            project_id="project-a",
+            authority_generation=3,
+            loader=lambda: [
+                {"id": 3, "project_id": "project-a"},
+                {"id": 2, "project_id": "project-a"},
+                {"id": 1, "project_id": "project-a"},
+            ],
+        )
+        self.assertEqual([row["id"] for row in loaded_a], [3, 2, 1])
+        self.assertTrue(miss_a["miss"])
+        cache.append({"id": 4, "project_id": "project-a", "backlog_id": "A"})
+        warm_a, hit_a = cache.load_current(
+            database_scope="db",
+            project_id="project-a",
+            authority_generation=4,
+            loader=lambda: self.fail("append-updated Current must not cold-load"),
+        )
+        self.assertEqual([row["id"] for row in warm_a], [4, 3, 2])
+        self.assertTrue(hit_a["hit"])
+        self.assertEqual(hit_a["pool"], "current_project_deque")
+        self.assertEqual(hit_a["window_limit"], 3)
+        self.assertTrue(hit_a["project_isolated"])
+        self.assertTrue(hit_a["stale_while_revalidate"])
+        self.assertFalse(hit_a["redis"])
+
+        cache.load_current(
+            database_scope="db",
+            project_id="project-b",
+            authority_generation=1,
+            loader=lambda: [{"id": 1, "project_id": "project-b"}],
+        )
+        _, miss_c = cache.load_current(
+            database_scope="db",
+            project_id="project-c",
+            authority_generation=1,
+            loader=lambda: [{"id": 1, "project_id": "project-c"}],
+        )
+        self.assertGreaterEqual(miss_c["eviction_count"], 1)
+        self.assertEqual(
+            cache.current_generation(
+                database_scope="db",
+                project_id="project-b",
+            ),
+            1,
+        )
+
+    def test_recent_current_deque_prewarms_50_and_append_avoids_cold_reload(self):
+        from agent.governance import server, task_timeline
+
+        server._timeline_warm_cache_clear()
+        inserted = []
+        for index in range(55):
+            inserted.append(
+                task_timeline.record_event(
+                    self.conn,
+                    project_id="proj",
+                    backlog_id=f"AC-CURRENT-{index % 3}",
+                    task_id=f"current-{index:03d}",
+                    event_type="worker.progress",
+                    event_kind="implementation",
+                    actor="mf_sub",
+                    status="running",
+                    payload={"sequence": index},
+                    post_commit_hooks=False,
+                )
+            )
+        self.conn.commit()
+        server._timeline_warm_cache_clear()
+
+        cold = server.handle_task_timeline_recent(_ctx({"limit": "500"}))
+        warm = server.handle_task_timeline_recent(_ctx({"limit": "500"}))
+        self.assertEqual(cold["count"], 50)
+        self.assertEqual(
+            [event["id"] for event in cold["events"]],
+            sorted((event["id"] for event in inserted), reverse=True)[:50],
+        )
+        self.assertTrue(cold["current_hot_window"]["miss"])
+        self.assertTrue(warm["current_hot_window"]["hit"])
+        self.assertEqual(
+            warm["current_hot_window"]["pool"],
+            "current_project_deque",
+        )
+        self.assertEqual(warm["current_hot_window"]["window_limit"], 50)
+
+        newest = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="AC-CURRENT-APPEND",
+            task_id="current-appended",
+            event_type="worker.progress",
+            event_kind="implementation",
+            actor="mf_sub",
+            status="running",
+            payload={"sequence": 56},
+        )
+        self.conn.commit()
+        appended = server.handle_task_timeline_recent(_ctx({"limit": "500"}))
+        self.assertEqual(appended["events"][0]["id"], newest["id"])
+        self.assertEqual(appended["count"], 50)
+        self.assertTrue(appended["current_hot_window"]["hit"])
+        self.assertEqual(
+            appended["current_hot_window"]["authority_generation"],
+            newest["id"],
+        )
+
+    def test_public_timeline_search_uses_fts_keyset_without_hot_pollution(self):
+        from agent.governance import server, task_timeline
+
+        server._timeline_warm_cache_clear()
+        for index in range(70):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=f"AC-HISTORY-{index % 4}",
+                task_id=f"history-{index:03d}",
+                event_type="worker.progress",
+                event_kind="implementation",
+                actor="mf_sub",
+                status="recorded",
+                payload={"summary": f"keyset needle evidence {index:03d}"},
+                post_commit_hooks=False,
+            )
+        self.conn.commit()
+        server._timeline_warm_cache_clear()
+        current = server.handle_task_timeline_recent(_ctx({"limit": "50"}))
+        current_generation = current["current_hot_window"]["authority_generation"]
+
+        first = server.handle_task_timeline_list(
+            _ctx({"q": "keyset needle", "limit": "10", "scan_limit": "100"})
+        )
+        second = server.handle_task_timeline_list(
+            _ctx(
+                {
+                    "q": "keyset needle",
+                    "limit": "10",
+                    "scan_limit": "100",
+                    "before_event_id": str(first["next_cursor"]),
+                }
+            )
+        )
+        first_ids = [event["id"] for event in first["events"]]
+        second_ids = [event["id"] for event in second["events"]]
+        self.assertEqual(len(first_ids), 10)
+        self.assertEqual(len(second_ids), 10)
+        self.assertTrue(set(first_ids).isdisjoint(second_ids))
+        self.assertGreater(min(first_ids), max(second_ids))
+        self.assertEqual(first["scope"]["search_index"], "sqlite_fts5")
+        self.assertEqual(first["scope"]["pagination"], "stable_id_keyset")
+        self.assertFalse(first["scope"]["hot_window_pollution"])
+        self.assertEqual(first["warm_cache"]["cache_pool"], "historical_ttl_lru")
+        self.assertEqual(second["before_event_id"], first["next_cursor"])
+        query_plan = self.conn.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT events.id
+            FROM task_timeline_events AS events
+            JOIN task_timeline_events_fts
+              ON task_timeline_events_fts.rowid = events.id
+            WHERE events.project_id = ?
+              AND task_timeline_events_fts MATCH ?
+              AND events.id < ?
+            ORDER BY events.id DESC
+            LIMIT 10
+            """,
+            ("proj", '"keyset"* AND "needle"*', first["next_cursor"]),
+        ).fetchall()
+        self.assertIn(
+            "VIRTUAL TABLE INDEX",
+            " ".join(str(row[3]) for row in query_plan).upper(),
+        )
+
+        current_again = server.handle_task_timeline_recent(_ctx({"limit": "50"}))
+        self.assertTrue(current_again["current_hot_window"]["hit"])
+        self.assertEqual(
+            current_again["current_hot_window"]["authority_generation"],
+            current_generation,
+        )
+
     def test_backlog_warm_cache_generation_ignores_unrelated_row_writes(self):
         from agent.governance import server, task_timeline
 

@@ -46,7 +46,7 @@ from . import backlog_runtime
 from . import raw_requirement
 from . import observer_session
 from . import context_registry
-from .dashboard_read_cache import BACKLOG_READ_CACHE
+from .dashboard_read_cache import BACKLOG_READ_CACHE, TIMELINE_READ_CACHE
 from .idempotency import check_idempotency, store_idempotency
 from .redis_client import get_redis
 from .models import Evidence, MemoryEntry, NodeDef
@@ -92502,6 +92502,7 @@ def _timeline_warm_cache_clear() -> None:
         _TIMELINE_WARM_CACHE_IN_FLIGHT.clear()
         _TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES.clear()
         _TIMELINE_WARM_CACHE_EVICTION_COUNT = 0
+        TIMELINE_READ_CACHE.clear()
     for event in pending:
         event.set()
 
@@ -92764,6 +92765,50 @@ def _timeline_warm_cache_resource_generation(
         or _timeline_warm_cache_query_value(query, "contract_execution_id")
     ).strip()
     db_scope = _timeline_warm_cache_db_scope(conn)
+    if str(resource.get("scope") or "") == "project_current_stream":
+        def current_event_generation() -> int:
+            return int(
+                _timeline_warm_cache_scalar(
+                    conn,
+                    """
+                    SELECT COALESCE(MAX(id), 0)
+                    FROM task_timeline_events
+                    WHERE project_id = ?
+                    """,
+                    (project_id,),
+                )
+                or 0
+            )
+
+        cached_generation = TIMELINE_READ_CACHE.current_generation(
+            database_scope=db_scope,
+            project_id=project_id,
+            revalidator=current_event_generation,
+        )
+        newest_event_id = (
+            int(cached_generation)
+            if cached_generation is not None
+            else current_event_generation()
+        )
+        return {
+            "db_scope": db_scope,
+            "scope": "project_current_stream",
+            "backlog_id": "",
+            "task_id": "",
+            "contract_execution_id": "",
+            "contract_chain_id": "",
+            "contract_chain_generation": "0",
+            "projection_watermark": "0",
+            "projection_hash": "",
+            "timeline_event_id": str(newest_event_id),
+            "runtime_revision_rowid": "",
+            "runtime_context_updated_at": "",
+            "contract_runtime_updated_at": "",
+            "contract_chain_updated_at": "",
+            "contract_chain_edge_id": "0",
+            "backlog_updated_at": "",
+            "generation_source": "timeline_event_id",
+        }
 
     if contract_execution_id and not backlog_id:
         backlog_id = _timeline_warm_cache_scalar(
@@ -93722,6 +93767,7 @@ def handle_task_timeline_list(ctx: RequestContext):
                 limit=limit,
                 offset=offset,
                 scan_limit=scan_limit,
+                before_event_id=before_event_id,
             )
             return _timeline_warm_cache_store(
                 cache_key,
@@ -94223,9 +94269,9 @@ def handle_task_timeline_recent(ctx: RequestContext):
     project_id = ctx.get_project_id()
     try:
         limit = int(_first_query_value(ctx.query, "limit", "100") or "100")
-        limit = max(1, min(limit, 500))
+        limit = max(1, min(limit, 50))
     except (TypeError, ValueError):
-        limit = 100
+        limit = 50
     response_view = str(
         _first_query_value(ctx.query, "response_view")
         or _first_query_value(ctx.query, "view")
@@ -94236,6 +94282,19 @@ def handle_task_timeline_recent(ctx: RequestContext):
 
     with DBContext(project_id) as conn:
         task_timeline.ensure_schema(conn)
+
+        def load_current_rows() -> list[dict[str, Any]]:
+            return [
+                task_timeline._row_to_dict(row)
+                for row in conn.execute(
+                    """SELECT * FROM task_timeline_events
+                       WHERE project_id = ?
+                       ORDER BY id DESC
+                       LIMIT 50""",
+                    (project_id,),
+                ).fetchall()
+            ]
+
         cache_key, cache_watermark, cached_response, cache_metadata = (
             _timeline_warm_cache_prepare(
                 conn,
@@ -94249,15 +94308,25 @@ def handle_task_timeline_recent(ctx: RequestContext):
             )
         )
         if cached_response is not None:
+            _, hot_window_metrics = TIMELINE_READ_CACHE.load_current(
+                database_scope=str(cache_watermark.get("db_scope") or ""),
+                project_id=project_id,
+                authority_generation=int(
+                    cache_watermark.get("timeline_event_id") or 0
+                ),
+                loader=load_current_rows,
+            )
+            cached_response["current_hot_window"] = hot_window_metrics
             return cached_response
-        rows = conn.execute(
-            """SELECT * FROM task_timeline_events
-               WHERE project_id = ?
-               ORDER BY id DESC
-               LIMIT ?""",
-            (project_id, limit),
-        ).fetchall()
-        events = [task_timeline._row_to_dict(row) for row in rows]
+        events, hot_window_metrics = TIMELINE_READ_CACHE.load_current(
+            database_scope=str(cache_watermark.get("db_scope") or ""),
+            project_id=project_id,
+            authority_generation=int(
+                cache_watermark.get("timeline_event_id") or 0
+            ),
+            loader=load_current_rows,
+        )
+        events = events[:limit]
         event_ledger = task_timeline.build_compact_ledger(conn, project_id, events)
         current_ledger = task_timeline.build_contract_runtime_current_ledger(
             conn,
@@ -94309,6 +94378,7 @@ def handle_task_timeline_recent(ctx: RequestContext):
         "cross_row": True,
         "response_view": "compact" if compact_response else "full",
         "raw_event_payloads_omitted": compact_response,
+        "current_hot_window": hot_window_metrics,
     }
     return _timeline_warm_cache_store(
         cache_key,

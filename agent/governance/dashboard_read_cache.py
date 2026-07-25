@@ -23,6 +23,335 @@ class _CacheEntry:
     expires_at: float
 
 
+@dataclass
+class _TimelineWindow:
+    project_id: str
+    resource_id: str
+    authority_generation: int
+    rows: deque[dict[str, Any]]
+    stored_at: float
+    validated_at: float
+
+
+class DashboardTimelineReadCache:
+    """Bounded Current/Playback deques kept apart from historical pages.
+
+    Current is keyed by database scope plus project. Playback is additionally
+    keyed by backlog. Timeline append notifications update only already-warm
+    windows; first project/backlog activation performs one bounded indexed
+    prewarm.
+    """
+
+    def __init__(
+        self,
+        *,
+        current_window_limit: int = 50,
+        playback_window_limit: int = 50,
+        current_project_limit: int = 64,
+        playback_resource_limit: int = 256,
+    ) -> None:
+        self.current_window_limit = max(1, int(current_window_limit))
+        self.playback_window_limit = max(1, int(playback_window_limit))
+        self.current_project_limit = max(1, int(current_project_limit))
+        self.playback_resource_limit = max(1, int(playback_resource_limit))
+        self._current: OrderedDict[str, _TimelineWindow] = OrderedDict()
+        self._playback: OrderedDict[str, _TimelineWindow] = OrderedDict()
+        self._in_flight: dict[str, tuple[Event, str]] = {}
+        self._lock = RLock()
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+
+    @staticmethod
+    def _current_key(database_scope: str, project_id: str) -> str:
+        return f"current:{database_scope}:{project_id}"
+
+    @staticmethod
+    def _playback_key(
+        database_scope: str,
+        project_id: str,
+        backlog_id: str,
+    ) -> str:
+        return f"playback:{database_scope}:{project_id}:{backlog_id}"
+
+    def clear(self) -> None:
+        with self._lock:
+            pending = [event for event, _ in self._in_flight.values()]
+            self._current.clear()
+            self._playback.clear()
+            self._in_flight.clear()
+            self._hits = 0
+            self._misses = 0
+            self._evictions = 0
+        for event in pending:
+            event.set()
+
+    def current_generation(
+        self,
+        *,
+        database_scope: str,
+        project_id: str,
+        revalidator: Callable[[], int] | None = None,
+        revalidate_after_seconds: float = 1.0,
+    ) -> int | None:
+        key = self._current_key(database_scope, project_id)
+        with self._lock:
+            window = self._current.get(key)
+            if window is None:
+                return None
+            generation = int(window.authority_generation)
+            validation_age = max(0.0, time.monotonic() - window.validated_at)
+            if (
+                revalidator is None
+                or validation_age < max(0.0, float(revalidate_after_seconds))
+            ):
+                return generation
+        observed_generation = max(0, int(revalidator() or 0))
+        with self._lock:
+            current = self._current.get(key)
+            if current is not None:
+                current.validated_at = time.monotonic()
+                generation = int(current.authority_generation)
+        return max(generation, observed_generation)
+
+    def load_current(
+        self,
+        *,
+        database_scope: str,
+        project_id: str,
+        authority_generation: int,
+        loader: Callable[[], list[dict[str, Any]]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        return self._load_window(
+            pool="current",
+            key=self._current_key(database_scope, project_id),
+            project_id=project_id,
+            resource_id=project_id,
+            authority_generation=authority_generation,
+            limit=self.current_window_limit,
+            loader=loader,
+        )
+
+    def load_playback(
+        self,
+        *,
+        database_scope: str,
+        project_id: str,
+        backlog_id: str,
+        authority_generation: int,
+        loader: Callable[[], list[dict[str, Any]]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        return self._load_window(
+            pool="playback",
+            key=self._playback_key(database_scope, project_id, backlog_id),
+            project_id=project_id,
+            resource_id=backlog_id,
+            authority_generation=authority_generation,
+            limit=self.playback_window_limit,
+            loader=loader,
+        )
+
+    def _load_window(
+        self,
+        *,
+        pool: str,
+        key: str,
+        project_id: str,
+        resource_id: str,
+        authority_generation: int,
+        limit: int,
+        loader: Callable[[], list[dict[str, Any]]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        started = time.monotonic()
+        leader_token = f"{id(Event)}:{started:.9f}"
+        joined = False
+        while True:
+            with self._lock:
+                entries = self._current if pool == "current" else self._playback
+                window = entries.get(key)
+                if (
+                    window is not None
+                    and int(window.authority_generation)
+                    == int(authority_generation)
+                ):
+                    entries.move_to_end(key)
+                    self._hits += 1
+                    age_ms = max(
+                        0,
+                        int((time.monotonic() - window.stored_at) * 1000),
+                    )
+                    return (
+                        [deepcopy(row) for row in window.rows],
+                        self._metrics(
+                            pool=pool,
+                            hit=True,
+                            age_ms=age_ms,
+                            joined=joined,
+                            generation=authority_generation,
+                            window_count=len(window.rows),
+                        ),
+                    )
+                in_flight = self._in_flight.get(key)
+                if in_flight is None:
+                    event = Event()
+                    self._in_flight[key] = (event, leader_token)
+                    self._misses += 1
+                    break
+                event = in_flight[0]
+                joined = True
+            event.wait(timeout=5.0)
+
+        try:
+            loaded = [
+                deepcopy(row)
+                for row in loader()
+                if isinstance(row, dict)
+            ][:limit]
+        except BaseException:
+            self._release_leader(key, leader_token)
+            raise
+
+        rows = deque(loaded, maxlen=limit)
+        window = _TimelineWindow(
+            project_id=str(project_id),
+            resource_id=str(resource_id),
+            authority_generation=max(
+                int(authority_generation),
+                max((int(row.get("id") or 0) for row in rows), default=0),
+            ),
+            rows=rows,
+            stored_at=time.monotonic(),
+            validated_at=time.monotonic(),
+        )
+        release_event: Event | None = None
+        with self._lock:
+            in_flight = self._in_flight.get(key)
+            if in_flight is not None and in_flight[1] == leader_token:
+                entries = self._current if pool == "current" else self._playback
+                entries[key] = window
+                entries.move_to_end(key)
+                pool_limit = (
+                    self.current_project_limit
+                    if pool == "current"
+                    else self.playback_resource_limit
+                )
+                while len(entries) > pool_limit:
+                    entries.popitem(last=False)
+                    self._evictions += 1
+                release_event = in_flight[0]
+                self._in_flight.pop(key, None)
+        if release_event is not None:
+            release_event.set()
+        return (
+            [deepcopy(row) for row in rows],
+            self._metrics(
+                pool=pool,
+                hit=False,
+                age_ms=0,
+                joined=joined,
+                generation=window.authority_generation,
+                window_count=len(rows),
+            ),
+        )
+
+    def _release_leader(self, key: str, leader_token: str) -> None:
+        release_event: Event | None = None
+        with self._lock:
+            in_flight = self._in_flight.get(key)
+            if in_flight is not None and in_flight[1] == leader_token:
+                release_event = in_flight[0]
+                self._in_flight.pop(key, None)
+        if release_event is not None:
+            release_event.set()
+
+    def append(self, event: dict[str, Any]) -> None:
+        """Append one committed/projected event to matching warm deques."""
+
+        project_id = str(event.get("project_id") or "")
+        backlog_id = str(event.get("backlog_id") or "")
+        event_id = int(event.get("id") or 0)
+        if not project_id or event_id <= 0:
+            return
+        with self._lock:
+            for entries, include in (
+                (self._current, lambda window: window.project_id == project_id),
+                (
+                    self._playback,
+                    lambda window: (
+                        window.project_id == project_id
+                        and window.resource_id == backlog_id
+                    ),
+                ),
+            ):
+                for key, window in list(entries.items()):
+                    if not include(window):
+                        continue
+                    retained = [
+                        row
+                        for row in window.rows
+                        if int(row.get("id") or 0) != event_id
+                    ]
+                    retained.append(deepcopy(event))
+                    retained.sort(
+                        key=lambda row: int(row.get("id") or 0),
+                        reverse=True,
+                    )
+                    window.rows.clear()
+                    window.rows.extend(retained[: window.rows.maxlen])
+                    window.authority_generation = max(
+                        window.authority_generation,
+                        event_id,
+                    )
+                    window.stored_at = time.monotonic()
+                    window.validated_at = window.stored_at
+                    entries.move_to_end(key)
+
+    def _metrics(
+        self,
+        *,
+        pool: str,
+        hit: bool,
+        age_ms: int,
+        joined: bool,
+        generation: int,
+        window_count: int,
+    ) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "schema_version": "dashboard.timeline_hot_window.v1",
+                "pool": (
+                    "current_project_deque"
+                    if pool == "current"
+                    else "playback_backlog_deque"
+                ),
+                "storage": "process_memory",
+                "redis": False,
+                "hit": bool(hit),
+                "miss": not hit,
+                "age_ms": int(age_ms),
+                "authority_generation": int(generation),
+                "window_count": int(window_count),
+                "window_limit": (
+                    self.current_window_limit
+                    if pool == "current"
+                    else self.playback_window_limit
+                ),
+                "hit_count": int(self._hits),
+                "miss_count": int(self._misses),
+                "eviction_count": int(self._evictions),
+                "single_flight": "joined" if joined else "leader",
+                "newest_first": True,
+                "project_isolated": True,
+                "stale_while_revalidate": True,
+                "revalidate_after_ms": 1000,
+                "prewarm_source": (
+                    "process_memory"
+                    if hit
+                    else "sqlite_indexed_bounded_loader"
+                ),
+            }
+
+
 class DashboardBacklogReadCache:
     """Project-isolated hot windows plus bounded TTL/LRU historical pages."""
 
@@ -291,3 +620,4 @@ class DashboardBacklogReadCache:
 
 
 BACKLOG_READ_CACHE = DashboardBacklogReadCache()
+TIMELINE_READ_CACHE = DashboardTimelineReadCache()

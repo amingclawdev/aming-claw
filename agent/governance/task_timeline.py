@@ -69,6 +69,73 @@ CREATE INDEX IF NOT EXISTS idx_task_timeline_correlation
     ON task_timeline_events(project_id, correlation_id, id);
 CREATE INDEX IF NOT EXISTS idx_task_timeline_kind
     ON task_timeline_events(project_id, event_kind, phase, id);
+CREATE INDEX IF NOT EXISTS idx_task_timeline_project_keyset
+    ON task_timeline_events(project_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_timeline_task_keyset
+    ON task_timeline_events(project_id, task_id, id DESC);
+"""
+
+SEARCH_INDEX_SQL = """
+CREATE TABLE IF NOT EXISTS task_timeline_search_index_state (
+    singleton_id          INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    last_indexed_event_id INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO task_timeline_search_index_state
+    (singleton_id, last_indexed_event_id)
+VALUES (1, 0);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS task_timeline_events_fts
+USING fts5(search_text, tokenize = 'unicode61');
+
+CREATE TRIGGER IF NOT EXISTS task_timeline_events_fts_insert
+AFTER INSERT ON task_timeline_events
+BEGIN
+    INSERT INTO task_timeline_events_fts(rowid, search_text)
+    VALUES (
+        new.id,
+        COALESCE(new.backlog_id, '') || ' ' ||
+        COALESCE(new.task_id, '') || ' ' ||
+        COALESCE(new.event_type, '') || ' ' ||
+        COALESCE(new.event_kind, '') || ' ' ||
+        COALESCE(new.phase, '') || ' ' ||
+        COALESCE(new.status, '') || ' ' ||
+        COALESCE(new.actor, '') || ' ' ||
+        COALESCE(new.commit_sha, '') || ' ' ||
+        COALESCE(new.payload_json, '') || ' ' ||
+        COALESCE(new.verification_json, '') || ' ' ||
+        COALESCE(new.artifact_refs_json, '')
+    );
+    UPDATE task_timeline_search_index_state
+       SET last_indexed_event_id = MAX(last_indexed_event_id, new.id)
+     WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_timeline_events_fts_delete
+AFTER DELETE ON task_timeline_events
+BEGIN
+    DELETE FROM task_timeline_events_fts WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_timeline_events_fts_update
+AFTER UPDATE ON task_timeline_events
+BEGIN
+    DELETE FROM task_timeline_events_fts WHERE rowid = old.id;
+    INSERT INTO task_timeline_events_fts(rowid, search_text)
+    VALUES (
+        new.id,
+        COALESCE(new.backlog_id, '') || ' ' ||
+        COALESCE(new.task_id, '') || ' ' ||
+        COALESCE(new.event_type, '') || ' ' ||
+        COALESCE(new.event_kind, '') || ' ' ||
+        COALESCE(new.phase, '') || ' ' ||
+        COALESCE(new.status, '') || ' ' ||
+        COALESCE(new.actor, '') || ' ' ||
+        COALESCE(new.commit_sha, '') || ' ' ||
+        COALESCE(new.payload_json, '') || ' ' ||
+        COALESCE(new.verification_json, '') || ' ' ||
+        COALESCE(new.artifact_refs_json, '')
+    );
+END;
 """
 
 TIMELINE_SCHEMA_VERSION = 2
@@ -509,6 +576,69 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         if column not in existing:
             conn.execute(f"ALTER TABLE task_timeline_events ADD COLUMN {column} {ddl}")
     conn.executescript(INDEX_SQL)
+
+
+def _ensure_public_timeline_search_index(conn: sqlite3.Connection) -> bool:
+    """Lazily initialize/search-sync FTS so Current never pays DDL/backfill."""
+
+    try:
+        conn.executescript(SEARCH_INDEX_SQL)
+        state_row = conn.execute(
+            """
+            SELECT last_indexed_event_id
+            FROM task_timeline_search_index_state
+            WHERE singleton_id = 1
+            """
+        ).fetchone()
+        last_indexed_event_id = int(state_row[0] or 0) if state_row else 0
+        newest_event_id = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM task_timeline_events"
+            ).fetchone()[0]
+            or 0
+        )
+        if newest_event_id and not conn.execute(
+            "SELECT 1 FROM task_timeline_events_fts LIMIT 1"
+        ).fetchone():
+            last_indexed_event_id = 0
+        conn.execute(
+            """
+            INSERT INTO task_timeline_events_fts(rowid, search_text)
+            SELECT events.id,
+                   COALESCE(events.backlog_id, '') || ' ' ||
+                   COALESCE(events.task_id, '') || ' ' ||
+                   COALESCE(events.event_type, '') || ' ' ||
+                   COALESCE(events.event_kind, '') || ' ' ||
+                   COALESCE(events.phase, '') || ' ' ||
+                   COALESCE(events.status, '') || ' ' ||
+                   COALESCE(events.actor, '') || ' ' ||
+                   COALESCE(events.commit_sha, '') || ' ' ||
+                   COALESCE(events.payload_json, '') || ' ' ||
+                   COALESCE(events.verification_json, '') || ' ' ||
+                   COALESCE(events.artifact_refs_json, '')
+            FROM task_timeline_events AS events
+            LEFT JOIN task_timeline_events_fts AS indexed
+              ON indexed.rowid = events.id
+            WHERE events.id > ?
+              AND indexed.rowid IS NULL
+            """,
+            (last_indexed_event_id,),
+        )
+        if newest_event_id > last_indexed_event_id:
+            conn.execute(
+                """
+                UPDATE task_timeline_search_index_state
+                   SET last_indexed_event_id = ?
+                 WHERE singleton_id = 1
+                """,
+                (newest_event_id,),
+            )
+        return True
+    except sqlite3.OperationalError as exc:
+        # Some minimal SQLite builds omit FTS5. Exact/keyset history remains
+        # available; text search reports the fallback in its scope metadata.
+        log.debug("timeline FTS5 search index unavailable: %s", exc)
+        return False
 
 
 def _utc_iso() -> str:
@@ -1356,10 +1486,16 @@ def _run_service_router_hook(conn: sqlite3.Connection, inserted_event: dict[str,
         log.debug("service router timeline hook failed", exc_info=True)
 
 
-def _publish_timeline_event(inserted_event: dict[str, Any]) -> None:
+def _publish_timeline_event(
+    inserted_event: dict[str, Any],
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> None:
     try:
+        from agent.governance.dashboard_read_cache import TIMELINE_READ_CACHE
         from agent.governance import event_bus
 
+        TIMELINE_READ_CACHE.append(dict(inserted_event))
         payload = {
             "project_id": _text(inserted_event.get("project_id")),
             "backlog_id": _text(inserted_event.get("backlog_id")),
@@ -1419,7 +1555,7 @@ def run_post_commit_hooks(
 
     event = dict(inserted_event)
     _run_service_router_hook(conn, event)
-    _publish_timeline_event(event)
+    _publish_timeline_event(event, conn=conn)
 
 
 def record_event(
@@ -1480,7 +1616,7 @@ def record_event(
         post_commit_hooks=post_commit_hooks,
     )
     if post_commit_hooks:
-        _publish_timeline_event(inserted)
+        _publish_timeline_event(inserted, conn=conn)
     return inserted
 
 
@@ -1665,7 +1801,7 @@ class _TimelineWriteQueue:
                 try:
                     inserted = _insert_event(conn, event)
                     conn.commit()
-                    _publish_timeline_event(inserted)
+                    _publish_timeline_event(inserted, conn=conn)
                     item["result"] = inserted
                 finally:
                     conn.close()
@@ -14340,6 +14476,14 @@ def _public_timeline_event(
     return public_event
 
 
+def _public_timeline_fts_query(value: str) -> str:
+    """Return a bounded prefix-token FTS5 query without syntax injection."""
+
+    tokens = re.findall(r"[^\W_]+", str(value or "").casefold(), re.UNICODE)
+    deduped = list(dict.fromkeys(tokens))[:16]
+    return " AND ".join(f'"{token}"*' for token in deduped)
+
+
 def search_public_events(
     conn: sqlite3.Connection,
     project_id: str,
@@ -14357,18 +14501,20 @@ def search_public_events(
     limit: int = PUBLIC_TIMELINE_SEARCH_DEFAULT_LIMIT,
     offset: int = 0,
     scan_limit: int = PUBLIC_TIMELINE_SEARCH_DEFAULT_SCAN_LIMIT,
+    before_event_id: int = 0,
 ) -> dict[str, Any]:
-    """Search historical timeline evidence without exposing raw event bodies."""
+    """Search historical evidence through FTS5 plus stable id keyset paging."""
 
     ensure_schema(conn)
     query = str(q or "").strip()[:PUBLIC_TIMELINE_SEARCH_MAX_QUERY_CHARS]
     page_limit = max(1, min(int(limit or 0), PUBLIC_TIMELINE_SEARCH_MAX_LIMIT))
     page_offset = max(0, int(offset or 0))
+    keyset_before = max(0, int(before_event_id or 0))
     bounded_scan_limit = max(
         page_limit,
         min(int(scan_limit or 0), PUBLIC_TIMELINE_SEARCH_MAX_SCAN_LIMIT),
     )
-    clauses = ["project_id = ?"]
+    clauses = ["events.project_id = ?"]
     params: list[Any] = [project_id]
     exact_filters = {
         "task_id": task_id,
@@ -14382,25 +14528,83 @@ def search_public_events(
         value = str(raw_value or "").strip()
         if not value:
             continue
-        clauses.append(f"LOWER({column}) = LOWER(?)")
+        clauses.append(f"events.{column} = ? COLLATE NOCASE")
         params.append(value)
     if event_kind:
-        event_kind_query = _timeline_event_kind_query_parts(event_kind)
-        if event_kind_query is not None:
-            clause, query_params = event_kind_query
-            clauses.append(clause)
-            params.extend(query_params)
-    where_sql = " AND ".join(clauses)
+        aliases = _EVENT_KIND_QUERY_ALIASES.get(
+            str(event_kind).strip().lower().replace("-", "_"),
+            {},
+        )
+        event_kind_clauses: list[str] = []
+        for column in ("event_kind", "event_type", "phase"):
+            values = set(aliases.get(column, set()))
+            if column == "event_kind":
+                values.add(str(event_kind).strip())
+            normalized_values = sorted(value for value in values if value)
+            if not normalized_values:
+                continue
+            event_kind_clauses.append(
+                f"events.{column} IN ({', '.join('?' for _ in normalized_values)})"
+            )
+            params.extend(normalized_values)
+        if event_kind_clauses:
+            clauses.append("(" + " OR ".join(event_kind_clauses) + ")")
+    source_where_sql = " AND ".join(clauses)
+    source_params = list(params)
     source_total = int(
         conn.execute(
-            f"SELECT COUNT(*) AS count FROM task_timeline_events WHERE {where_sql}",
-            params,
+            f"""
+            SELECT COUNT(*) AS count
+            FROM task_timeline_events AS events
+            WHERE {source_where_sql}
+            """,
+            source_params,
         ).fetchone()["count"]
         or 0
     )
-    search_clauses: list[str] = []
-    search_params: list[Any] = []
-    if query:
+    if keyset_before:
+        clauses.append("events.id < ?")
+        params.append(keyset_before)
+    normalized_backlog_status = _normalize_token(backlog_status)
+    closed_statuses = sorted(_PUBLIC_TIMELINE_CLOSED_BACKLOG_STATUSES)
+    if normalized_backlog_status == "open":
+        clauses.append(
+            "LOWER(COALESCE(backlog.status, '')) "
+            f"NOT IN ({', '.join('?' for _ in closed_statuses)})"
+        )
+        params.extend(closed_statuses)
+    elif normalized_backlog_status == "closed":
+        clauses.append(
+            "LOWER(COALESCE(backlog.status, '')) "
+            f"IN ({', '.join('?' for _ in closed_statuses)})"
+        )
+        params.extend(closed_statuses)
+    elif normalized_backlog_status not in {"", "all"}:
+        clauses.append("backlog.status = ? COLLATE NOCASE")
+        params.append(normalized_backlog_status)
+    normalized_priority = str(priority or "").strip().casefold()
+    if normalized_priority not in {"", "all"}:
+        clauses.append("backlog.priority = ? COLLATE NOCASE")
+        params.append(normalized_priority)
+
+    fts_available = _ensure_public_timeline_search_index(conn)
+    fts_query = _public_timeline_fts_query(query)
+    use_fts = bool(query and fts_available and fts_query)
+    from_sql = """
+        task_timeline_events AS events
+        LEFT JOIN backlog_bugs AS backlog
+          ON backlog.bug_id = events.backlog_id
+    """
+    if use_fts:
+        from_sql += """
+        JOIN task_timeline_events_fts
+          ON task_timeline_events_fts.rowid = events.id
+        """
+        clauses.append("task_timeline_events_fts MATCH ?")
+        params.append(fts_query)
+    elif query:
+        # Compatibility fallback for SQLite builds without FTS5. Normal
+        # supported deployments always use the indexed branch above.
         escaped_query = (
             query.casefold()
             .replace("\\", "\\\\")
@@ -14408,39 +14612,39 @@ def search_public_events(
             .replace("_", "\\_")
         )
         needle = f"%{escaped_query}%"
-        for column in (
-            "backlog_id",
-            "task_id",
-            "event_type",
-            "event_kind",
-            "phase",
-            "status",
-            "actor",
-            "commit_sha",
-            "payload_json",
-            "verification_json",
-            "artifact_refs_json",
-        ):
-            search_clauses.append(
-                f"LOWER(COALESCE({column}, '')) LIKE ? ESCAPE '\\'"
+        fallback_clauses = [
+            f"LOWER(COALESCE(events.{column}, '')) LIKE ? ESCAPE '\\'"
+            for column in (
+                "backlog_id",
+                "task_id",
+                "event_type",
+                "event_kind",
+                "phase",
+                "status",
+                "actor",
+                "commit_sha",
+                "payload_json",
+                "verification_json",
+                "artifact_refs_json",
             )
-            search_params.append(needle)
-    candidate_where_sql = where_sql
-    if search_clauses:
-        candidate_where_sql += " AND (" + " OR ".join(search_clauses) + ")"
+        ]
+        clauses.append("(" + " OR ".join(fallback_clauses) + ")")
+        params.extend([needle] * len(fallback_clauses))
+
+    where_sql = " AND ".join(clauses)
     candidate_total = int(
         conn.execute(
-            f"SELECT COUNT(*) AS count FROM task_timeline_events WHERE {candidate_where_sql}",
-            [*params, *search_params],
+            f"SELECT COUNT(*) AS count FROM {from_sql} WHERE {where_sql}",
+            params,
         ).fetchone()["count"]
         or 0
     )
     rows = conn.execute(
-        f"""SELECT * FROM task_timeline_events
-            WHERE {candidate_where_sql}
-            ORDER BY id DESC
+        f"""SELECT events.* FROM {from_sql}
+            WHERE {where_sql}
+            ORDER BY events.id DESC
             LIMIT ?""",
-        [*params, *search_params, bounded_scan_limit],
+        [*params, bounded_scan_limit],
     ).fetchall()
     decoded = [_row_to_dict(row) for row in rows]
     backlog_rows = _compact_backlog_rows(
@@ -14459,25 +14663,6 @@ def search_public_events(
         )
         for event in decoded
     ]
-    normalized_backlog_status = _normalize_token(backlog_status)
-    normalized_priority = str(priority or "").strip().casefold()
-    if normalized_backlog_status or normalized_priority:
-        filtered_events: list[dict[str, Any]] = []
-        for event in public_events:
-            backlog_row = event.get("backlog")
-            backlog_row = backlog_row if isinstance(backlog_row, Mapping) else {}
-            row_status = _normalize_token(backlog_row.get("status"))
-            row_priority = str(backlog_row.get("priority") or "").strip().casefold()
-            if normalized_backlog_status == "open" and row_status in _PUBLIC_TIMELINE_CLOSED_BACKLOG_STATUSES:
-                continue
-            if normalized_backlog_status == "closed" and row_status not in _PUBLIC_TIMELINE_CLOSED_BACKLOG_STATUSES:
-                continue
-            if normalized_backlog_status not in {"", "all", "open", "closed"} and row_status != normalized_backlog_status:
-                continue
-            if normalized_priority not in {"", "all"} and row_priority != normalized_priority:
-                continue
-            filtered_events.append(event)
-        public_events = filtered_events
     if query:
         needle = query.casefold()
         public_events = [
@@ -14488,7 +14673,15 @@ def search_public_events(
         ]
     total = len(public_events)
     page = public_events[page_offset : page_offset + page_limit]
-    has_more = page_offset + len(page) < total
+    has_more = bool(page) and (
+        page_offset + len(page) < total
+        or candidate_total > len(rows)
+    )
+    next_cursor = (
+        int(page[-1].get("id") or page[-1].get("event_id") or 0)
+        if has_more and page
+        else None
+    )
     return {
         "ok": True,
         "schema_version": PUBLIC_TIMELINE_SEARCH_SCHEMA_VERSION,
@@ -14501,8 +14694,10 @@ def search_public_events(
         "total": total,
         "limit": page_limit,
         "offset": page_offset,
+        "before_event_id": keyset_before or None,
         "has_more": has_more,
         "next_offset": page_offset + len(page) if has_more else None,
+        "next_cursor": next_cursor,
         "scope": {
             "schema_version": "task_timeline.public_search_scope.v1",
             "project_id": project_id,
@@ -14538,6 +14733,14 @@ def search_public_events(
             "scan_truncated": candidate_total > len(rows),
             "total_is_bounded_to_scan": candidate_total > len(rows),
             "order": "newest_first",
+            "pagination": "stable_id_keyset",
+            "cursor_field": "before_event_id",
+            "search_index": (
+                "sqlite_fts5"
+                if use_fts
+                else ("sqlite_like_fallback" if query else "sqlite_btree")
+            ),
+            "hot_window_pollution": False,
         },
         "public_safe": True,
         "raw_event_payloads_omitted": True,
