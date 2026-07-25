@@ -14751,12 +14751,10 @@ def _runtime_context_contract_post_revision_qa_action_takes_precedence(
     if (
         not action_execution_id
         or action_execution_id != current_execution_id
+        or not resolved_execution_id
         or resolution.get("fail_closed")
         or not resolution_status.startswith("resolved_")
-        or (
-            resolved_execution_id
-            and resolved_execution_id != action_execution_id
-        )
+        or resolved_execution_id != action_execution_id
     ):
         return False
     action_runtime_context_id = str(
