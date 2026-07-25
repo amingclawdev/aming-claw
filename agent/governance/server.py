@@ -84949,6 +84949,172 @@ def _contract_runtime_mf_parallel_merge_commit_bridge(
     }
 
 
+def _contract_runtime_mf_parallel_descendant_close_head_bridge(
+    *,
+    close_commit: str,
+    merge_line: Mapping[str, Any],
+    reconcile_line: Mapping[str, Any],
+    server_post_qa_lineage_passed: bool,
+) -> dict[str, Any]:
+    """Bridge durable merge/reconcile commits to a reconciled descendant HEAD."""
+
+    if not server_post_qa_lineage_passed:
+        return {}
+    reconcile_payload = _contract_runtime_close_authority_line_payload(
+        reconcile_line
+    )
+    authority = (
+        reconcile_payload.get("reconcile_authority")
+        if isinstance(
+            reconcile_payload.get("reconcile_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    binding = (
+        reconcile_payload.get("close_authority_binding")
+        if isinstance(
+            reconcile_payload.get("close_authority_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    if not (
+        binding.get("server_derived") is True
+        and binding.get("persisted_to_completed_line") is False
+        and str(binding.get("source") or "")
+        == "server_close_authority_projection"
+        and str(authority.get("source") or "")
+        == "graph_snapshot_store.current_full_reconcile_state"
+        and _contract_runtime_close_authority_hash_matches(authority)
+    ):
+        return {}
+
+    merge_commit = _contract_runtime_close_authority_explicit_commit(
+        merge_line
+    ).lower()
+    reconcile_commit = _contract_runtime_close_authority_explicit_commit(
+        reconcile_line
+    ).lower()
+    durable_merge_commit = str(
+        authority.get("merged_commit_sha") or ""
+    ).strip().lower()
+    reconciled_commit = str(
+        authority.get("reconciled_commit_sha") or ""
+    ).strip().lower()
+    canonical_head = str(
+        authority.get("canonical_head_commit")
+        or authority.get("current_canonical_commit_sha")
+        or ""
+    ).strip().lower()
+    active_snapshot_commit = str(
+        authority.get("active_snapshot_commit") or ""
+    ).strip().lower()
+    target_project_root = str(
+        authority.get("target_project_root") or ""
+    ).strip()
+    if not (
+        merge_commit
+        and reconcile_commit
+        and durable_merge_commit
+        and reconciled_commit
+        and canonical_head
+        and active_snapshot_commit
+        and target_project_root
+        and _contract_runtime_authority_commit_matches(
+            merge_commit,
+            durable_merge_commit,
+        )
+        and _contract_runtime_authority_commit_matches(
+            reconcile_commit,
+            reconciled_commit,
+        )
+        and _contract_runtime_authority_commit_matches(
+            durable_merge_commit,
+            reconciled_commit,
+        )
+        and not _contract_runtime_authority_commit_matches(
+            reconciled_commit,
+            close_commit,
+        )
+        and _contract_runtime_authority_commit_matches(
+            canonical_head,
+            close_commit,
+        )
+        and _contract_runtime_authority_commit_matches(
+            active_snapshot_commit,
+            close_commit,
+        )
+    ):
+        return {}
+
+    required_authority_checks = (
+        "db_verified",
+        "live_verified",
+        "canonical_head_verified",
+        "active_snapshot_verified",
+        "active_snapshot_matches_canonical_head",
+        "graph_reconciled",
+        "provenance_verified",
+        "provenance_scope_verified",
+        "durable_order_verified",
+        "contract_execution_scope_verified",
+        "task_scope_verified",
+        "runtime_context_scope_verified",
+        "parent_task_scope_verified",
+        "merge_queue_scope_verified",
+        "dispatch_lineage_verified",
+        "reconcile_snapshot_verified",
+        "reconciled_commit_is_ancestor_of_canonical_head",
+    )
+    if not all(
+        authority.get(field) is True
+        for field in required_authority_checks
+    ):
+        return {}
+    if not (
+        authority.get("current_full_reconcile") is True
+        and str(authority.get("strategy") or "")
+        == "current_full_reconcile"
+        and str(authority.get("active_snapshot_status") or "")
+        == "active"
+        and _git_commit_is_ancestor(
+            Path(target_project_root),
+            reconciled_commit,
+            canonical_head,
+        )
+    ):
+        return {}
+    return {
+        "schema_version": (
+            "contract_runtime.mf_parallel_descendant_close_head_bridge.v1"
+        ),
+        "passed": True,
+        "server_derived": True,
+        "bridge": "durable_reconcile_to_active_descendant_close_head",
+        "merge_line_commit": merge_commit,
+        "reconcile_line_commit": reconcile_commit,
+        "durable_merge_commit": durable_merge_commit,
+        "reconciled_commit": reconciled_commit,
+        "closing_head_commit": canonical_head,
+        "active_snapshot_id": str(
+            authority.get("active_snapshot_id") or ""
+        ),
+        "active_snapshot_commit": active_snapshot_commit,
+        "reconcile_source_ref": str(
+            authority.get("reconcile_source_ref") or ""
+        ),
+        "merge_source_ref": str(merge_line.get("_source_ref") or ""),
+        "reconcile_line_source_ref": str(
+            reconcile_line.get("_source_ref") or ""
+        ),
+        "durable_lineage_verified": True,
+        "reconciled_commit_is_ancestor_of_closing_head": True,
+        "active_full_snapshot_matches_closing_head": True,
+        "raw_merge_reconcile_commits_preserved": True,
+    }
+
+
 def _contract_runtime_close_authority_explicit_commit(
     line: Mapping[str, Any],
 ) -> str:
@@ -86713,6 +86879,20 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         )
         and bypass_reconcile_diagnostic.get("passed") is True
     )
+    descendant_close_head_bridge = (
+        _contract_runtime_mf_parallel_descendant_close_head_bridge(
+            close_commit=close_commit,
+            merge_line=found["observer_merge"],
+            reconcile_line=found["observer_reconcile"],
+            server_post_qa_lineage_passed=server_post_qa_lineage_passed,
+        )
+        if (
+            close_commit
+            and "observer_merge" in found
+            and "observer_reconcile" in found
+        )
+        else {}
+    )
 
     commit_mismatches: list[dict[str, Any]] = []
     commit_bridge_diagnostics: list[dict[str, Any]] = []
@@ -86769,6 +86949,18 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                     if bridge:
                         commit_bridge_diagnostics.append(bridge)
                         continue
+                if requirement_id in {
+                    "observer_merge",
+                    "observer_reconcile",
+                } and descendant_close_head_bridge:
+                    commit_bridge_diagnostics.append({
+                        **descendant_close_head_bridge,
+                        "requirement_id": requirement_id,
+                        "line_id": str(line.get("line_id") or ""),
+                        "actual_commit": actual_commit,
+                        "expected_close_commit": close_commit,
+                    })
+                    continue
                 missing.append(close_commit_id)
                 commit_mismatches.append({
                     "requirement_id": requirement_id,
@@ -87041,6 +87233,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         },
         "commit_mismatches": commit_mismatches,
         "commit_bridge_diagnostics": commit_bridge_diagnostics,
+        "descendant_close_head_bridge": descendant_close_head_bridge,
         "reconcile_close_diagnostic": reconcile_close_diagnostic,
         "formal_no_pass_bypass_exceptions": applied_no_pass_exceptions,
         "server_post_qa_lineage_diagnostics": server_lineage_diagnostics,
@@ -87081,7 +87274,21 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             ),
             "formal_bypass_synthesized_pass": False,
             "observer_merge_close_commit_bridged_by_close_ready": bool(
-                commit_bridge_diagnostics
+                any(
+                    item.get("requirement_id") == "observer_merge"
+                    for item in commit_bridge_diagnostics
+                )
+            ),
+            "observer_reconcile_descendant_close_head_bridged": bool(
+                any(
+                    item.get("requirement_id") == "observer_reconcile"
+                    and item.get("bridge")
+                    == "durable_reconcile_to_active_descendant_close_head"
+                    for item in commit_bridge_diagnostics
+                )
+            ),
+            "descendant_close_head_bridge_verified": bool(
+                descendant_close_head_bridge
             ),
             "observer_close_commit_matches": not commit_mismatches,
         },
