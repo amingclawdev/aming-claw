@@ -3869,6 +3869,11 @@ def _runtime_context_timeline_refs(
             or source.get("read_receipt_event_id")
             or source.get("read_receipt_ref")
         ),
+        "read_receipt_hash": _runtime_context_text(
+            source.get("read_receipt_hash")
+            or source.get("launch_text_hash")
+            or source.get("receipt_hash")
+        ),
         "route_action_precheck_event_ref": _runtime_context_text(
             source.get("route_action_precheck_event_ref")
             or source.get("route_action_precheck_event_id")
@@ -4374,6 +4379,12 @@ def _runtime_context_timeline_derived_evidence(
             "read_receipt",
         }:
             timeline_refs.setdefault("read_receipt_event_ref", event_ref)
+            timeline_refs.setdefault(
+                "read_receipt_hash",
+                _runtime_context_deep_text(event, "read_receipt_hash")
+                or _runtime_context_deep_text(event, "launch_text_hash")
+                or _runtime_context_deep_text(event, "receipt_hash"),
+            )
         if (
             event_kind == "route_action_precheck"
             and _runtime_context_event_matches_route_identity(
@@ -4708,6 +4719,7 @@ def _runtime_context_current_values(
         startup_gate.get("read_receipt_hash")
         or startup_read_receipt.get("hash")
         or startup_read_receipt.get("read_receipt_hash")
+        or timeline_refs.get("read_receipt_hash")
     )
     startup_read_receipt_event_id = _runtime_context_text(
         startup_gate.get("read_receipt_event_id")
@@ -7156,6 +7168,15 @@ def _runtime_context_read_receipt_hash_action(
     values = _runtime_context_mapping(current_view.get("current_values"))
     runtime_context_id = _runtime_context_text(current_view.get("runtime_context_id"))
     read_receipt_ref = _runtime_context_text(values.get("read_receipt_event_ref"))
+    startup_read_receipt_hash = _runtime_context_text(
+        values.get("startup_read_receipt_hash")
+    )
+    invalid_foundational_evidence = bool(
+        read_receipt_ref
+        and not _runtime_context_valid_worker_receipt_hash(
+            startup_read_receipt_hash
+        )
+    )
     current_node = _runtime_context_projection_node(
         runtime_context_id=runtime_context_id,
         view_name="current",
@@ -7171,7 +7192,11 @@ def _runtime_context_read_receipt_hash_action(
         view_name="close_gate_view",
         payload=close_gate_view,
     )
-    status = "present" if read_receipt_ref else "missing"
+    status = (
+        "invalid_foundational_evidence"
+        if invalid_foundational_evidence
+        else ("present" if read_receipt_ref else "missing")
+    )
     worker_query = _runtime_context_mapping(values.get("graph_query_identity"))
     owned_files = _runtime_context_dedupe(
         _runtime_context_string_list(values.get("owned_files"))
@@ -7248,9 +7273,15 @@ def _runtime_context_read_receipt_hash_action(
             "hash_bridge": {
                 "accepted_inputs": ["read_receipt_hash", "launch_text_hash"],
                 "startup_field": "read_receipt_hash",
+                "must_replace_before_submit": [
+                    "<worker-computed-read-receipt-hash>",
+                    "<launch-text-sha256-if-known>",
+                ],
+                "placeholder_submission_forbidden": True,
                 "rule": (
                     "if no dedicated read_receipt_hash exists, carry the "
-                    "accepted launch_text_hash as the startup read_receipt_hash"
+                    "accepted non-placeholder sha256: launch_text_hash as the "
+                    "startup read_receipt_hash"
                 ),
             },
             "must_precede": ["record_startup", "worker_graph_query", "implementation"],
@@ -7378,10 +7409,38 @@ def _runtime_context_read_receipt_hash_action(
         "guide_hash": guide_hash,
         "worker_identity": worker_identity,
         "status": status,
-        "next_action": "none"
-        if read_receipt_ref
-        else "submit_mf_subagent_read_receipt",
+        "next_action": (
+            "discard_generation_and_repair_root"
+            if invalid_foundational_evidence
+            else (
+                "none"
+                if read_receipt_ref
+                else "submit_mf_subagent_read_receipt"
+            )
+        ),
         "read_receipt_event_ref": read_receipt_ref,
+        "startup_read_receipt_hash_valid": bool(
+            startup_read_receipt_hash
+            and _runtime_context_valid_worker_receipt_hash(
+                startup_read_receipt_hash
+            )
+        ),
+        "invalid_foundational_evidence": (
+            {
+                "schema_version": (
+                    "runtime_context.invalid_foundational_evidence.v1"
+                ),
+                "status": "generation_discard_required",
+                "reason": "worker_read_receipt_hash_invalid",
+                "source_event_ref": read_receipt_ref,
+                "historical_evidence_immutable": True,
+                "historical_backfill_allowed": False,
+                "resume_source_after_repair": False,
+                "next_action": "repair_root_then_start_fresh_generation",
+            }
+            if invalid_foundational_evidence
+            else {}
+        ),
         "content_address_nodes": {
             "current": current_node,
             "gate_inputs": gate_inputs_node,
@@ -15653,6 +15712,14 @@ def _startup_read_receipt_hash(payload: Mapping[str, Any]) -> tuple[str, str]:
     return "", ""
 
 
+def _runtime_context_valid_worker_receipt_hash(value: Any) -> bool:
+    # Import lazily to keep the runtime persistence module free of task-timeline
+    # initialization side effects while sharing the write-time hash contract.
+    from .task_timeline import valid_worker_read_receipt_hash
+
+    return valid_worker_read_receipt_hash(value)
+
+
 def _startup_route_identity_mismatches(
     *,
     expected: Mapping[str, Any],
@@ -15947,6 +16014,25 @@ def record_mf_subagent_startup(
             token_evidence=token_evidence,
             registered_host_adapter_identity=registered_host_adapter_identity,
             expected_runtime_context_id=expected_runtime_context_id,
+        )
+
+    if read_receipt_hash and not _runtime_context_valid_worker_receipt_hash(
+        read_receipt_hash
+    ):
+        return _blocked(
+            _startup_blocker(
+                blocker_id="invalid_worker_read_receipt_hash",
+                message=(
+                    "mf_subagent startup requires a worker-computed "
+                    "non-placeholder sha256: read receipt hash"
+                ),
+                context=context,
+                details={
+                    "read_receipt_hash_source": read_receipt_hash_source,
+                    "placeholder_submission_forbidden": True,
+                    "historical_backfill_allowed": False,
+                },
+            )
         )
 
     missing: list[str] = []

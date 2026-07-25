@@ -6,6 +6,35 @@ from types import SimpleNamespace
 from agent.governance import parallel_branch_runtime
 from agent.governance import graph_snapshot_store
 from agent.governance import server
+from agent.governance.contracts.write_gate import (
+    _validate_worker_receipt_hash_evidence,
+)
+
+
+def test_contract_write_gate_rejects_nested_worker_receipt_placeholders():
+    errors: list[str] = []
+
+    _validate_worker_receipt_hash_evidence(
+        errors,
+        {
+            "evidence_kind": "read_receipt",
+            "payload": {
+                "read_receipt_hash": "sha256:valid-top-level",
+                "contract_context_read_receipt": {
+                    "schema_version": "contract_context_read_receipt.v1",
+                    "event_kind": "contract_context_read_receipt",
+                    "receipt_hash": "<worker-computed-read-receipt-hash>",
+                },
+            },
+        },
+    )
+
+    assert errors == [
+        (
+            "payload.contract_context_read_receipt.receipt_hash requires a "
+            "worker-computed non-placeholder sha256: value"
+        )
+    ]
 
 
 def _audit_only_merge_line(*, status: str | None = None):

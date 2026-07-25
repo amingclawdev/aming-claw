@@ -1955,7 +1955,10 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
             "prompt_contract_hash": "sha256:prompt-runtime-context",
             "route_token_ref": "rtok-runtime-context",
         },
-        timeline_refs={"read_receipt_event_ref": "timeline:read-runtime-context"},
+        timeline_refs={
+            "read_receipt_event_ref": "timeline:read-runtime-context",
+            "read_receipt_hash": "sha256:read-runtime-context",
+        },
         target_files=["agent/governance/parallel_branch_runtime.py"],
         generated_at=NOW,
     ).to_dict()
@@ -1969,6 +1972,34 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     assert present_handoff["status"] == "no_worker_startup_evidence"
     assert present_handoff["missing_worker_lineage"] == ["mf_subagent_startup"]
     assert present_handoff["worker_next_action"] == "record_mf_subagent_startup"
+
+    with_placeholder_receipt = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={
+            "read_receipt_event_ref": "timeline:placeholder-read-runtime-context",
+            "read_receipt_hash": "<worker-computed-read-receipt-hash>",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        generated_at=NOW,
+    ).to_dict()
+    invalid_action = with_placeholder_receipt["views"]["action_plan"][
+        "read_receipt_hash_action"
+    ]
+    assert invalid_action["status"] == "invalid_foundational_evidence"
+    assert invalid_action["next_action"] == "discard_generation_and_repair_root"
+    assert invalid_action["invalid_foundational_evidence"][
+        "historical_backfill_allowed"
+    ] is False
+    assert invalid_action["invalid_foundational_evidence"][
+        "resume_source_after_repair"
+    ] is False
 
     with_progress = build_runtime_context_projection(
         context,
@@ -5398,6 +5429,30 @@ def test_startup_bridges_launch_text_hash_read_receipt_without_close_satisfying(
     assert gate["close_satisfying"] is False
     assert "missing_worker_session_id" in gate["worker_self_attestation"]["blockers"]
     assert "missing_worker_transcript_ref_or_path" in gate["worker_self_attestation"]["blockers"]
+
+
+def test_startup_rejects_placeholder_read_receipt_hash(tmp_path) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-placeholder-receipt"
+    worktree.mkdir(parents=True)
+    _insert_startup_context(conn, str(worktree))
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            read_receipt_hash="<worker-computed-read-receipt-hash>",
+            launch_text_hash="",
+        ),
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is False
+    assert result["startup_accepted"] is False
+    assert result["blocker_id"] == "invalid_worker_read_receipt_hash"
+    assert result["details"]["historical_backfill_allowed"] is False
 
 
 def test_mf_sub_startup_rejects_same_owner_self_filled_unissued_session_token(

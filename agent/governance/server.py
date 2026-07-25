@@ -19809,6 +19809,7 @@ def _runtime_context_worker_recovery_payloads(
         "nested_payload_only_identity",
         "payload_posted_without_top_level_identity",
         "worktree_path_as_target_project_root_for_write_facades",
+        "placeholder_hash_submitted_verbatim",
     ]
     startup_identity_required_fields = [
         "worker_session_id",
@@ -20470,6 +20471,35 @@ def _runtime_context_worker_recovery_payloads(
             ],
             "canonical_event_kind": "contract_context_read_receipt",
             "legacy_event_kind": "mf_subagent_read_receipt",
+            "copy_safe_body_is_template_not_executable_until_replaced": True,
+            "placeholder_submission_forbidden": True,
+            "must_replace_before_submit": [
+                "copy_safe_body.read_receipt_hash",
+                "copy_safe_body.launch_text_hash when placeholder-valued",
+                (
+                    "copy_safe_body.contract_context_read_receipt."
+                    "read_receipt_hash"
+                ),
+                (
+                    "copy_safe_body.contract_context_read_receipt."
+                    "receipt_hash"
+                ),
+                "copy_safe_body.payload.read_receipt_hash",
+                "copy_safe_body.payload.launch_text_hash when placeholder-valued",
+                (
+                    "copy_safe_body.payload.contract_context_read_receipt."
+                    "read_receipt_hash"
+                ),
+                (
+                    "copy_safe_body.payload.contract_context_read_receipt."
+                    "receipt_hash"
+                ),
+            ],
+            "hash_replacement_rule": (
+                "Compute a non-placeholder sha256: receipt hash after reading "
+                "the launch context, then replace every copied placeholder in "
+                "the top-level and nested canonical receipt copies before POST."
+            ),
             "contract_context_read_receipt": {
                 "schema_version": "contract_context_read_receipt.v1",
                 "event_kind": "contract_context_read_receipt",
@@ -63214,10 +63244,15 @@ def _branch_service_validation_runtime_guide(guide: Mapping[str, Any]) -> dict[s
     return enriched
 
 
-def _contract_runtime_guide_for_response(record: Mapping[str, Any]) -> dict[str, Any]:
+def _contract_runtime_guide_for_response(
+    record: Mapping[str, Any],
+    *,
+    actor_role: str = "",
+) -> dict[str, Any]:
     guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
     guide = dict(guide)
     bypass_actor_hash = str(guide.get("runtime_guide_hash") or "").strip()
+    normalized_actor_role = str(actor_role or "").strip().lower()
     bypass_guidance = (
         guide.get("line_bypass_guidance")
         if isinstance(guide.get("line_bypass_guidance"), Mapping)
@@ -63225,20 +63260,48 @@ def _contract_runtime_guide_for_response(record: Mapping[str, Any]) -> dict[str,
     )
     if bypass_actor_hash and bypass_guidance:
         aligned_bypass = dict(bypass_guidance)
-        for key in (
-            "current_line_binding",
-            "create_new_copy_safe_body",
-            "reuse_existing_open_copy_safe_body",
-        ):
-            value = aligned_bypass.get(key)
-            if isinstance(value, Mapping):
-                aligned_value = dict(value)
-                aligned_value["runtime_guide_hash"] = bypass_actor_hash
-                aligned_bypass[key] = aligned_value
-        aligned_bypass["runtime_guide_hash_source"] = (
-            "runtime_guide.runtime_guide_hash"
-        )
-        aligned_bypass["bypass_actor_role_hash_aligned"] = True
+        if normalized_actor_role in {"observer", "qa"}:
+            for key in (
+                "current_line_binding",
+                "create_new_copy_safe_body",
+                "reuse_existing_open_copy_safe_body",
+            ):
+                value = aligned_bypass.get(key)
+                if isinstance(value, Mapping):
+                    aligned_value = dict(value)
+                    aligned_value["runtime_guide_hash"] = bypass_actor_hash
+                    aligned_bypass[key] = aligned_value
+            aligned_bypass["runtime_guide_hash_source"] = (
+                "runtime_guide.runtime_guide_hash"
+            )
+            aligned_bypass["bypass_actor_role"] = normalized_actor_role
+            aligned_bypass["bypass_actor_role_hash_aligned"] = True
+            aligned_bypass["status"] = "executable_for_authenticated_bypass_actor"
+        else:
+            for key in (
+                "current_line_binding",
+                "create_new_copy_safe_body",
+                "reuse_existing_open_copy_safe_body",
+            ):
+                value = aligned_bypass.get(key)
+                if isinstance(value, Mapping):
+                    unavailable_value = dict(value)
+                    unavailable_value.pop("runtime_guide_hash", None)
+                    unavailable_value["status"] = (
+                        "authorized_bypass_actor_refresh_required"
+                    )
+                    aligned_bypass[key] = unavailable_value
+            aligned_bypass["runtime_guide_hash_source"] = (
+                "authenticated_observer_or_qa_runtime_guide_required"
+            )
+            aligned_bypass["bypass_actor_role"] = normalized_actor_role
+            aligned_bypass["bypass_actor_role_hash_aligned"] = False
+            aligned_bypass["status"] = (
+                "authorized_bypass_actor_refresh_required"
+            )
+            aligned_bypass["next_action"] = (
+                "authenticate_as_observer_or_qa_and_refresh_runtime_guide"
+            )
         guide["line_bypass_guidance"] = aligned_bypass
     if str(record.get("contract_id") or "").strip() == "direct_fix":
         return _branch_service_validation_runtime_guide(guide)
@@ -63252,7 +63315,10 @@ def _contract_runtime_response(
     response_view: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
-    guide = _contract_runtime_guide_for_response(record)
+    guide = _contract_runtime_guide_for_response(
+        record,
+        actor_role=actor_role,
+    )
     current_state = _runtime_current_state_from_record(record)
     response = {
         "schema_version": "contract_runtime.runtime_facade_response.v1",
@@ -106523,7 +106589,12 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
         "agent_facing_decision_source": "contract_runtime_first_missing_line",
     }
     if isinstance(result.get("record"), Mapping):
-        response.update(_contract_runtime_response(result["record"]))
+        response.update(
+            _contract_runtime_response(
+                result["record"],
+                actor_role=actor_role,
+            )
+        )
         response["ok"] = bool(result.get("ok"))
         response["decision"] = result.get("decision") or {}
         response["actor_role"] = actor_role
@@ -106747,7 +106818,12 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
         "timeline_events": timeline_events,
     }
     if isinstance(result.get("record"), Mapping):
-        response.update(_contract_runtime_response(result["record"]))
+        response.update(
+            _contract_runtime_response(
+                result["record"],
+                actor_role=actor_role,
+            )
+        )
         response["schema_version"] = "contract_runtime.line_bypass_response.v1"
     return response
 
@@ -106922,7 +106998,12 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
         "agent_facing_decision_source": "contract_runtime_line_write_precheck",
     }
     if isinstance(result.get("record"), Mapping):
-        response.update(_contract_runtime_response(result["record"]))
+        response.update(
+            _contract_runtime_response(
+                result["record"],
+                actor_role=actor_role,
+            )
+        )
         response["schema_version"] = "contract_runtime.line_write_precheck_response.v1"
         response["ok"] = bool(result.get("ok"))
         response["decision"] = result.get("decision") or {}

@@ -3398,6 +3398,72 @@ _RECEIPT_FENCE_LINEAGE_FIELDS = ("fence_token", "fence_token_hash")
 _RECEIPT_HASH_FIELDS = ("read_receipt_hash", "launch_text_hash")
 
 
+def valid_worker_read_receipt_hash(value: Any) -> bool:
+    """Return whether a worker read/startup hash is executable evidence.
+
+    Runtime guides intentionally contain angle-bracket placeholders so callers
+    know which values they must compute.  Those templates are not evidence and
+    must never become durable timeline or ContractRuntime state.  Keep the
+    accepted format compatible with existing synthetic test hashes while
+    requiring the canonical ``sha256:`` namespace.
+    """
+
+    text = str(value or "").strip()
+    return bool(
+        text
+        and "<" not in text
+        and ">" not in text
+        and text.startswith("sha256:")
+        and len(text) > len("sha256:")
+    )
+
+
+def _invalid_worker_receipt_hash_paths(
+    value: Any,
+    *,
+    path: str = "payload",
+) -> list[str]:
+    invalid: list[str] = []
+    if isinstance(value, Mapping):
+        event_kind = str(
+            value.get("event_kind")
+            or value.get("canonical_event_kind")
+            or ""
+        ).strip()
+        schema_version = str(value.get("schema_version") or "").strip()
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if key in {
+                "read_receipt_hash",
+                "worker_read_receipt_hash",
+                "launch_text_hash",
+            }:
+                if str(child or "").strip() and not valid_worker_read_receipt_hash(
+                    child
+                ):
+                    invalid.append(child_path)
+            elif key == "receipt_hash" and (
+                "read_receipt" in event_kind
+                or schema_version == "contract_context_read_receipt.v1"
+            ):
+                if str(child or "").strip() and not valid_worker_read_receipt_hash(
+                    child
+                ):
+                    invalid.append(child_path)
+            invalid.extend(
+                _invalid_worker_receipt_hash_paths(child, path=child_path)
+            )
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            invalid.extend(
+                _invalid_worker_receipt_hash_paths(
+                    child,
+                    path=f"{path}[{index}]",
+                )
+            )
+    return invalid
+
+
 def validate_and_normalize_mf_read_receipt_append(
     event_type: str,
     event_kind: str,
@@ -3466,10 +3532,26 @@ def validate_and_normalize_mf_read_receipt_append(
     if not normalized_status_val or normalized_status_val not in MF_CLOSE_PASS_STATUSES:
         missing.append("status (must be one of: " + ", ".join(sorted(MF_CLOSE_PASS_STATUSES)) + ")")
 
-    # At least one of read_receipt_hash or launch_text_hash must be present.
-    has_hash = any(str(p.get(f) or "").strip() for f in _RECEIPT_HASH_FIELDS)
+    # At least one executable hash must be present.  Reject every supplied
+    # placeholder/malformed value even when the companion field is valid so a
+    # copied guide skeleton cannot be persisted partially unchanged.
+    supplied_hashes = {
+        field: str(p.get(field) or "").strip()
+        for field in _RECEIPT_HASH_FIELDS
+        if str(p.get(field) or "").strip()
+    }
+    invalid_hashes = _invalid_worker_receipt_hash_paths(p)
+    has_hash = any(
+        valid_worker_read_receipt_hash(value)
+        for value in supplied_hashes.values()
+    )
     if not has_hash:
         missing.append("read_receipt_hash or launch_text_hash")
+    if invalid_hashes:
+        missing.append(
+            "invalid placeholder or malformed receipt hash: "
+            + ", ".join(sorted(invalid_hashes))
+        )
 
     # Lineage fields required for close-gate projection.
     for field in _RECEIPT_LINEAGE_REQUIRED:
@@ -3499,7 +3581,7 @@ def validate_and_normalize_mf_read_receipt_append(
             + ", ".join(_RECEIPT_LINEAGE_REQUIRED)
             + ", fence_token or fence_token_hash, worker_slot_id, and at least one of "
             + "/".join(_RECEIPT_HASH_FIELDS)
-            + "."
+            + " using a non-placeholder sha256: value."
         )
 
     return normalized_kind, status, p

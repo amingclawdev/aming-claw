@@ -20429,6 +20429,38 @@ def test_validate_receipt_accepts_launch_text_hash_without_read_receipt_hash():
     assert status == "ok"
 
 
+def test_validate_receipt_rejects_placeholder_or_malformed_hashes_recursively():
+    """Guide templates must be substituted before they can become evidence."""
+    from agent.governance import task_timeline
+
+    invalid_values = [
+        "<worker-computed-read-receipt-hash>",
+        "<launch-text-sha256-if-known>",
+        "not-a-sha256-hash",
+        "sha256:",
+    ]
+    for invalid_value in invalid_values:
+        payload = _well_formed_receipt_payload()
+        payload["read_receipt_hash"] = "sha256:valid-companion"
+        payload["contract_context_read_receipt"] = {
+            "schema_version": "contract_context_read_receipt.v1",
+            "event_kind": "contract_context_read_receipt",
+            "receipt_hash": invalid_value,
+        }
+        with unittest.TestCase().assertRaises(ValueError) as ctx:
+            task_timeline.validate_and_normalize_mf_read_receipt_append(
+                event_type="mf_subagent.read_receipt",
+                event_kind="mf_subagent_read_receipt",
+                actor="mf_sub:worker",
+                status="ok",
+                payload=payload,
+            )
+
+        message = str(ctx.exception)
+        assert "non-placeholder sha256:" in message, message
+        assert "contract_context_read_receipt.receipt_hash" in message, message
+
+
 def test_validate_receipt_accepts_redacted_fence_hash_lineage():
     """Runtime-context facade receipts may persist fence hash lineage without raw fence."""
     from agent.governance import task_timeline

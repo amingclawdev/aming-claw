@@ -37937,22 +37937,71 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
     copied_body = dict(receipt_skeleton["copy_safe_body"])
 
     assert copied_body["target_project_root"] == str(target_root)
+    assert receipt_skeleton["placeholder_submission_forbidden"] is True
+    assert (
+        receipt_skeleton[
+            "copy_safe_body_is_template_not_executable_until_replaced"
+        ]
+        is True
+    )
+    assert receipt_skeleton["must_replace_before_submit"]
+    assert "placeholder_hash_submitted_verbatim" in receipt_skeleton[
+        "forbidden_shapes"
+    ]
     for field, value in route_identity.items():
         assert copied_body[field] == value
+
+    with pytest.raises(GovernanceError) as unchanged_template:
+        server.handle_graph_governance_runtime_context_read_receipt(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                method="POST",
+                body={
+                    **copied_body,
+                    "session_token": "copy-safe-session",
+                    "fence_token": "fence-copy-safe-receipt",
+                },
+            )
+        )
+    assert unchanged_template.value.code == "mf_read_receipt_validation_failed"
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id="worker-copy-safe-receipt",
+        event_kind="mf_subagent_read_receipt",
+    ) == []
 
     submitted_body = dict(copied_body)
     submitted_body["session_token"] = "copy-safe-session"
     submitted_body["fence_token"] = "fence-copy-safe-receipt"
-    if str(submitted_body.get("read_receipt_hash") or "").startswith("<"):
-        submitted_body["read_receipt_hash"] = "sha256:copy-safe-receipt"
-    if str(submitted_body.get("launch_text_hash") or "").startswith("<"):
-        submitted_body["launch_text_hash"] = "sha256:copy-safe-launch"
+    submitted_body["read_receipt_hash"] = "sha256:copy-safe-receipt"
+    submitted_body["launch_text_hash"] = "sha256:copy-safe-launch"
+    submitted_body["contract_context_read_receipt"] = {
+        **submitted_body["contract_context_read_receipt"],
+        "receipt_hash": "sha256:copy-safe-receipt",
+        "read_receipt_hash": "sha256:copy-safe-receipt",
+    }
+    submitted_body["payload"] = {
+        **submitted_body["payload"],
+        "read_receipt_hash": "sha256:copy-safe-receipt",
+        "launch_text_hash": "sha256:copy-safe-launch",
+        "contract_context_read_receipt": {
+            **submitted_body["payload"]["contract_context_read_receipt"],
+            "receipt_hash": "sha256:copy-safe-receipt",
+            "read_receipt_hash": "sha256:copy-safe-receipt",
+        },
+    }
     for field, value in copied_body.items():
         if field not in {
             "session_token",
             "fence_token",
             "read_receipt_hash",
             "launch_text_hash",
+            "contract_context_read_receipt",
+            "payload",
         }:
             assert submitted_body[field] == value
 
@@ -75004,6 +75053,12 @@ def test_contract_runtime_cli_views_are_compact_and_role_actionable():
         response_view="cli_guide",
         request_id="req-compact-guide",
     )
+    coordinator = server._contract_runtime_response(
+        record,
+        actor_role="coordinator",
+        response_view="cli_guide",
+        request_id="req-compact-coordinator",
+    )
 
     assert len(json.dumps(full)) > 150_000
     assert len(json.dumps(observer_current)) < 16_384
@@ -75066,6 +75121,20 @@ def test_contract_runtime_cli_views_are_compact_and_role_actionable():
             "reuse_existing_open_copy_safe_body",
         ):
             assert bypass[key]["runtime_guide_hash"] == reader_hash
+    coordinator_bypass = coordinator["runtime_guide"]["line_bypass_guidance"]
+    assert coordinator_bypass["bypass_actor_role_hash_aligned"] is False
+    assert coordinator_bypass["status"] == (
+        "authorized_bypass_actor_refresh_required"
+    )
+    assert coordinator_bypass["next_action"] == (
+        "authenticate_as_observer_or_qa_and_refresh_runtime_guide"
+    )
+    for key in (
+        "current_line_binding",
+        "create_new_copy_safe_body",
+        "reuse_existing_open_copy_safe_body",
+    ):
+        assert "runtime_guide_hash" not in coordinator_bypass[key]
 
 
 def test_contract_runtime_write_uses_exact_writer_line_hash_without_mutating_reader_guide():

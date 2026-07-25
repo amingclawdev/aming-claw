@@ -249,6 +249,8 @@ def validate_contract_write(
             elif write_evidence_kind != expected_evidence_kind:
                 errors.append("evidence_kind mismatch")
 
+    _validate_worker_receipt_hash_evidence(errors, write)
+
     candidate_commit_policy = contract_line_evidence_policy(
         definition,
         _CANDIDATE_COMMIT_POLICY_NAME,
@@ -303,6 +305,59 @@ def validate_contract_write(
         )
 
     return WriteGateDecision(ok=not errors, errors=tuple(errors))
+
+
+def _validate_worker_receipt_hash_evidence(
+    errors: list[str],
+    write: Mapping[str, Any],
+) -> None:
+    """Reject copied guide placeholders before ContractRuntime persistence."""
+
+    def _valid(value: Any) -> bool:
+        text = str(value or "").strip()
+        return bool(
+            text
+            and "<" not in text
+            and ">" not in text
+            and text.startswith("sha256:")
+            and len(text) > len("sha256:")
+        )
+
+    def _walk(value: Any, path: str) -> None:
+        if isinstance(value, Mapping):
+            schema_version = str(value.get("schema_version") or "").strip()
+            event_kind = str(
+                value.get("event_kind")
+                or value.get("canonical_event_kind")
+                or ""
+            ).strip()
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                if key in {
+                    "read_receipt_hash",
+                    "worker_read_receipt_hash",
+                    "launch_text_hash",
+                }:
+                    if str(child or "").strip() and not _valid(child):
+                        errors.append(
+                            f"{child_path} requires a worker-computed "
+                            "non-placeholder sha256: value"
+                        )
+                elif key == "receipt_hash" and (
+                    "read_receipt" in event_kind
+                    or schema_version == "contract_context_read_receipt.v1"
+                ):
+                    if str(child or "").strip() and not _valid(child):
+                        errors.append(
+                            f"{child_path} requires a worker-computed "
+                            "non-placeholder sha256: value"
+                        )
+                _walk(child, child_path)
+        elif isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                _walk(child, f"{path}[{index}]")
+
+    _walk(write, "")
 
 
 def _validate_candidate_commit_evidence(

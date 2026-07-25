@@ -6436,7 +6436,21 @@ def _runtime_text_executable_worker_launch(
             "nested_payload_only_identity",
             "payload_posted_without_top_level_identity",
             "worktree_path_as_target_project_root_for_write_facades",
+            "placeholder_hash_submitted_verbatim",
         ],
+        "copy_safe_body_is_template_not_executable_until_replaced": True,
+        "placeholder_submission_forbidden": True,
+        "must_replace_before_submit": [
+            "copy_safe_body.read_receipt_hash",
+            "copy_safe_body.launch_text_hash when placeholder-valued",
+            "copy_safe_body.payload.read_receipt_hash",
+            "copy_safe_body.payload.launch_text_hash when placeholder-valued",
+        ],
+        "hash_replacement_rule": (
+            "Compute a non-placeholder sha256: receipt hash after reading the "
+            "launch context, then replace every copied placeholder in both "
+            "top-level and nested receipt copies before POST."
+        ),
         "field_pointers": read_receipt_field_pointers,
         "auth_fields": {
             "session_token": session_token_placeholder,
