@@ -14712,6 +14712,149 @@ def _runtime_context_contract_next_action_matches_worker(
     )
 
 
+def _runtime_context_contract_post_revision_qa_action_takes_precedence(
+    next_action: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    current_next_legal_action: str,
+) -> bool:
+    """Let current ContractRuntime QA authority retire stale failed-QA routing."""
+
+    if str(current_next_legal_action or "").strip() not in {
+        "revise_after_failed_independent_qa",
+        "record_implementation_evidence",
+    }:
+        return False
+    if not _runtime_context_contract_line_matches_worker(
+        next_action,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    ):
+        return False
+    owner_role = str(next_action.get("owner_role") or "").strip()
+    raw_allowed_roles = next_action.get("allowed_writer_roles") or []
+    if isinstance(raw_allowed_roles, str):
+        allowed_roles = {raw_allowed_roles.strip()}
+    else:
+        allowed_roles = {
+            str(role or "").strip()
+            for role in raw_allowed_roles
+            if str(role or "").strip()
+        }
+    line_id = str(
+        next_action.get("line_id")
+        or next_action.get("stage_id")
+        or next_action.get("id")
+        or ""
+    ).strip()
+    return (
+        owner_role == "qa"
+        and "qa" in allowed_roles
+        and line_id in {"qa_graph_context", "qa_independent_verification"}
+    )
+
+
+def _runtime_context_post_revision_qa_required_evidence(
+    next_action: Mapping[str, Any],
+    current_items: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    line_id = str(
+        next_action.get("line_id")
+        or next_action.get("stage_id")
+        or next_action.get("id")
+        or ""
+    ).strip()
+    action = str(next_action.get("action") or "").strip()
+    canonical_item = {
+        "schema_version": "runtime_context.next_required_evidence.item.v1",
+        "id": line_id,
+        "status": "required",
+        "field": line_id,
+        "gate": "contract_runtime",
+        "next_action": action,
+        "producer": "qa",
+        "consumer": "contract_runtime",
+        "source_of_authority": "contract_runtime_current_state",
+        "contract_execution_id": str(
+            next_action.get("contract_execution_id") or ""
+        ).strip(),
+        "sequence_index": 0,
+        "is_next": True,
+    }
+    projected: list[dict[str, Any]] = [canonical_item]
+    historical: list[dict[str, Any]] = []
+    for raw_item in current_items:
+        if not isinstance(raw_item, Mapping):
+            continue
+        item = dict(raw_item)
+        item_id = str(item.get("id") or "").strip()
+        if item_id == line_id:
+            continue
+        if item_id == "failed_qa_revision":
+            item.update(
+                {
+                    "status": "historical_audit_only",
+                    "next_action": "",
+                    "is_next": False,
+                    "authorization_blocker": False,
+                    "historical_raw_audit": True,
+                    "superseded_by_contract_runtime_line": line_id,
+                }
+            )
+            historical.append(dict(item))
+        projected.append(item)
+    for index, item in enumerate(projected):
+        item["sequence_index"] = index
+        item["is_next"] = index == 0
+    return projected, historical
+
+
+def _runtime_context_demote_historical_failed_qa_blocking_reasons(
+    reasons: Sequence[Any],
+    *,
+    superseding_line_id: str,
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    active: list[Any] = []
+    historical: list[dict[str, Any]] = []
+    for raw_reason in reasons:
+        if not isinstance(raw_reason, Mapping):
+            active.append(raw_reason)
+            continue
+        reason = dict(raw_reason)
+        code = str(reason.get("code") or "").strip()
+        message = str(reason.get("message") or "").strip().lower()
+        status = str(reason.get("status") or "").strip().lower()
+        failed_qa_reason = code in {
+            "failed_independent_qa",
+            "failed_independent_qa_revision_in_progress",
+        } or (
+            code == "lane_blocking_event"
+            and status in {"blocked", "fail", "failed", "rejected"}
+            and any(
+                marker in message
+                for marker in (
+                    "independent_verification",
+                    "independent_qa",
+                    "qa_independent_verification",
+                )
+            )
+        )
+        if not failed_qa_reason:
+            active.append(reason)
+            continue
+        reason.update(
+            {
+                "historical_audit_only": True,
+                "authorization_blocker": False,
+                "next_action": "",
+                "superseded_by_contract_runtime_line": superseding_line_id,
+            }
+        )
+        historical.append(reason)
+    return active, historical
+
+
 def _runtime_context_contract_next_action_override_eligible(
     next_action: Mapping[str, Any],
     *,
@@ -16774,6 +16917,7 @@ def _runtime_context_worker_guide_response(
         or ""
     ).strip()
     contract_runtime_next_action_took_precedence = False
+    contract_runtime_post_revision_qa_precedence = False
     next_legal_action_decision_source = "runtime_context_timeline_projection"
     parent_task_id = str(graph_identity.get("parent_task_id") or task.get("parent_task_id") or "")
     session_token_ref_value = str(worker_view.get("session_token_ref") or "").strip()
@@ -16954,6 +17098,28 @@ def _runtime_context_worker_guide_response(
             next_legal_action = canonical_next_action
             next_legal_action_decision_source = "contract_runtime_current_state"
             contract_runtime_next_action_took_precedence = True
+    elif _runtime_context_contract_post_revision_qa_action_takes_precedence(
+        contract_runtime_next_legal_action,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        current_next_legal_action=next_legal_action,
+    ):
+        canonical_next_action = str(
+            contract_runtime_next_legal_action.get("action") or ""
+        ).strip()
+        if canonical_next_action:
+            next_legal_action = canonical_next_action
+            next_legal_action_decision_source = "contract_runtime_current_state"
+            contract_runtime_next_action_took_precedence = True
+            contract_runtime_post_revision_qa_precedence = True
+    historical_audit_evidence: list[dict[str, Any]] = []
+    if contract_runtime_post_revision_qa_precedence:
+        next_required_evidence, historical_audit_evidence = (
+            _runtime_context_post_revision_qa_required_evidence(
+                contract_runtime_next_legal_action,
+                next_required_evidence,
+            )
+        )
     missing_evidence = list(
         control_plane.get("missing_evidence")
         or action_plan.get("missing_evidence")
@@ -16969,6 +17135,18 @@ def _runtime_context_worker_guide_response(
         ),
         *scope_blocking_reasons,
     ]
+    historical_audit_reasons: list[dict[str, Any]] = []
+    if contract_runtime_post_revision_qa_precedence:
+        blocking_reasons, historical_audit_reasons = (
+            _runtime_context_demote_historical_failed_qa_blocking_reasons(
+                blocking_reasons,
+                superseding_line_id=str(
+                    contract_runtime_next_legal_action.get("line_id")
+                    or contract_runtime_next_legal_action.get("id")
+                    or ""
+                ).strip(),
+            )
+        )
     def _auth_guide(location: str) -> dict[str, Any]:
         return {
             "primary": "runtime_context_session_token_or_ref",
@@ -18285,6 +18463,8 @@ def _runtime_context_worker_guide_response(
         "next_required_evidence": next_required_evidence,
         "missing_evidence": missing_evidence,
         "blocking_reasons": blocking_reasons,
+        "historical_audit_evidence": historical_audit_evidence,
+        "historical_audit_reasons": historical_audit_reasons,
         "worker_session_lifecycle_policy": actionable_payloads.get(
             "worker_session_lifecycle_policy",
             {},
@@ -18365,6 +18545,8 @@ def _runtime_context_worker_guide_response(
             ),
             "missing_evidence": missing_evidence,
             "blocking_reasons": blocking_reasons,
+            "historical_audit_evidence": historical_audit_evidence,
+            "historical_audit_reasons": historical_audit_reasons,
             "read_endpoints": read_endpoints,
             "write_guides": write_guides,
             "actionable_payloads": actionable_payloads,

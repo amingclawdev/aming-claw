@@ -64759,6 +64759,181 @@ def test_runtime_context_worker_guide_uses_matching_mf_sub_contract_next_action(
     )
 
 
+def test_runtime_context_worker_guide_current_qa_supersedes_historical_failed_qa():
+    runtime_context_id = "mfrctx-rev38-historical-failed-qa"
+    task_id = "task-rev38-historical-failed-qa"
+    canonical_next = {
+        "schema_version": "contract_runtime_next_legal_action.v1",
+        "id": "qa_graph_context",
+        "action": "record_graph_trace",
+        "line_id": "qa_graph_context",
+        "stage_id": "qa_graph_context",
+        "owner_role": "qa",
+        "allowed_writer_roles": ["qa"],
+        "contract_execution_id": "cex-rev38-historical-failed-qa",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "execution_state_revision": 38,
+        "authority_decision_source": "contract_runtime_current_state",
+        "source_of_authority": "contract_runtime_current_state",
+    }
+    historical_failed_line = {
+        "line_id": "qa_independent_verification",
+        "status": "failed",
+        "source_ref": "contract_runtime:cex-rev38-historical-failed-qa:completed_lines:31",
+    }
+    state = _worker_guide_state_with_contract_next_action(
+        canonical_next,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    state["contract_runtime_current_state"] = {
+        "schema_version": "contract_runtime_current_state.v1",
+        "contract_execution_id": "cex-rev38-historical-failed-qa",
+        "execution_state_revision": 38,
+        "completed_lines": [historical_failed_line],
+        "next_legal_action": canonical_next,
+    }
+    worker_view = state["runtime_context_service"]["views"]["worker_view"]
+    stale_evidence = [
+        {
+            "id": "failed_qa_revision",
+            "status": "blocked",
+            "next_action": "revise_after_failed_independent_qa",
+            "event_ref": historical_failed_line["source_ref"],
+            "sequence_index": 0,
+            "is_next": True,
+        },
+        {
+            "id": "route_action_precheck",
+            "status": "missing",
+            "next_action": "record_route_action_precheck",
+            "sequence_index": 1,
+            "is_next": False,
+        },
+    ]
+    stale_reasons = [
+        {
+            "code": "failed_independent_qa",
+            "status": "failed",
+            "next_action": "revise_after_failed_independent_qa",
+            "source_ref": historical_failed_line["source_ref"],
+        },
+        {
+            "code": "lane_blocking_event",
+            "message": "qa_independent_verification",
+            "status": "failed",
+            "event_ref": historical_failed_line["source_ref"],
+        },
+        {
+            "code": "route_token_missing",
+            "next_action": "refresh_route_token_ref",
+        },
+    ]
+    for view_name in ("control_plane", "action_plan"):
+        view = worker_view[view_name]
+        view["next_legal_action"] = "revise_after_failed_independent_qa"
+        view["next_required_evidence"] = stale_evidence
+        view["blocking_reasons"] = stale_reasons
+
+    response = server._runtime_context_worker_guide_response(state)
+
+    assert response["next_legal_action"] == "record_graph_trace"
+    assert response["next_legal_action_decision_source"] == (
+        "contract_runtime_current_state"
+    )
+    assert response["contract_runtime_next_action_took_precedence"] is True
+    assert response["next_required_evidence"][0] == {
+        "schema_version": "runtime_context.next_required_evidence.item.v1",
+        "id": "qa_graph_context",
+        "status": "required",
+        "field": "qa_graph_context",
+        "gate": "contract_runtime",
+        "next_action": "record_graph_trace",
+        "producer": "qa",
+        "consumer": "contract_runtime",
+        "source_of_authority": "contract_runtime_current_state",
+        "contract_execution_id": "cex-rev38-historical-failed-qa",
+        "sequence_index": 0,
+        "is_next": True,
+    }
+    failed_qa_item = next(
+        item
+        for item in response["next_required_evidence"]
+        if item["id"] == "failed_qa_revision"
+    )
+    assert failed_qa_item["status"] == "historical_audit_only"
+    assert failed_qa_item["is_next"] is False
+    assert failed_qa_item["authorization_blocker"] is False
+    assert [item["code"] for item in response["blocking_reasons"]] == [
+        "route_token_missing"
+    ]
+    assert {
+        item["code"] for item in response["historical_audit_reasons"]
+    } == {"failed_independent_qa", "lane_blocking_event"}
+    assert response["contract_runtime_current_state"]["completed_lines"] == [
+        historical_failed_line
+    ]
+    worker_guide = response["worker_guide"]
+    assert worker_guide["next_legal_action"] == "record_graph_trace"
+    assert worker_guide["next_required_evidence"] == (
+        response["next_required_evidence"]
+    )
+    assert worker_guide["historical_audit_reasons"] == (
+        response["historical_audit_reasons"]
+    )
+
+
+def test_runtime_context_worker_guide_failed_qa_revision_stays_worker_owned():
+    runtime_context_id = "mfrctx-active-failed-qa-revision"
+    task_id = "task-active-failed-qa-revision"
+    canonical_next = {
+        "schema_version": "contract_runtime_next_legal_action.v1",
+        "id": "worker_implementation",
+        "action": "record_implementation",
+        "line_id": "worker_implementation",
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "authority_decision_source": "contract_runtime_current_state",
+        "source_of_authority": "contract_runtime_current_state",
+    }
+    state = _worker_guide_state_with_contract_next_action(
+        canonical_next,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    worker_view = state["runtime_context_service"]["views"]["worker_view"]
+    for view_name in ("control_plane", "action_plan"):
+        view = worker_view[view_name]
+        view["next_legal_action"] = "revise_after_failed_independent_qa"
+        view["next_required_evidence"] = [
+            {
+                "id": "failed_qa_revision",
+                "status": "blocked",
+                "next_action": "revise_after_failed_independent_qa",
+                "is_next": True,
+            }
+        ]
+        view["blocking_reasons"] = [
+            {
+                "code": "failed_independent_qa",
+                "next_action": "revise_after_failed_independent_qa",
+            }
+        ]
+
+    response = server._runtime_context_worker_guide_response(state)
+
+    assert response["next_legal_action"] == "record_implementation"
+    assert response["contract_runtime_next_action_took_precedence"] is True
+    assert response["historical_audit_evidence"] == []
+    assert response["historical_audit_reasons"] == []
+    assert response["next_required_evidence"][0]["id"] == "failed_qa_revision"
+    assert response["next_required_evidence"][0]["is_next"] is True
+    assert response["blocking_reasons"][0]["code"] == "failed_independent_qa"
+
+
 def test_runtime_context_worker_guide_unifies_typed_retarget_fresh_evidence_order(
     monkeypatch,
 ):
