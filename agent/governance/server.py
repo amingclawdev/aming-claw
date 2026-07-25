@@ -14498,6 +14498,12 @@ def _runtime_context_same_lane_recovery_next_action(
         "eligible": "record_worker_commit",
         "retarget_required": "merge_current_target_and_record_worker_commit",
     }
+    if (
+        recovery_status == "blocked"
+        and str(recovery_payload.get("recovery_reason") or "").strip()
+        == "post_qa_replacement_marker_invalid"
+    ):
+        allowed_actions["blocked"] = "stop_and_report_worker_commit_drift"
     if allowed_actions.get(recovery_status) != recovery_action:
         return next_action
 
@@ -29304,6 +29310,79 @@ def _runtime_context_persisted_post_qa_conflict_reset_indices(
             )
         ):
             continue
+        payload_commit = str(
+            payload.get("worker_commit_sha")
+            or payload.get("commit_sha")
+            or payload.get("head_commit")
+            or ""
+        ).strip()
+        line_commit = str(line.get("commit_sha") or "").strip()
+        replacement_commit = str(
+            marker.get("replacement_worker_commit_sha") or ""
+        ).strip()
+        target_baseline = str(
+            marker.get("current_target_baseline_commit") or ""
+        ).strip()
+        write_target_revalidation = (
+            marker.get("write_target_revalidation")
+            if isinstance(marker.get("write_target_revalidation"), Mapping)
+            else {}
+        )
+        write_target_payload = dict(write_target_revalidation)
+        write_target_hash = str(
+            write_target_payload.pop("authority_hash", "") or ""
+        ).strip()
+        write_target_payload.pop("errors", None)
+        if (
+            marker.get("server_derived") is not True
+            or not re.fullmatch(r"[0-9a-f]{40,64}", line_commit)
+            or replacement_commit != line_commit
+            or payload_commit != line_commit
+            or str(payload.get("diff_base_commit") or "").strip()
+            != target_baseline
+            or sorted(
+                set(
+                    marker.get("worker_authored_candidate_delta_files")
+                    or []
+                )
+            )
+            != sorted(
+                set(
+                    _runtime_context_service_query_values(
+                        payload,
+                        "changed_files",
+                    )
+                )
+            )
+            or sorted(
+                set(
+                    _runtime_context_service_query_values(
+                        payload,
+                        "commit_diff_files",
+                    )
+                )
+            )
+            != sorted(
+                set(
+                    _runtime_context_service_query_values(
+                        payload,
+                        "changed_files",
+                    )
+                )
+            )
+            or write_target_revalidation.get("verified") is not True
+            or write_target_revalidation.get("server_revalidated") is not True
+            or str(
+                write_target_revalidation.get(
+                    "current_target_parent_commit"
+                )
+                or ""
+            ).strip()
+            != target_baseline
+            or not write_target_hash.startswith("sha256:")
+            or write_target_hash != stable_sha256(write_target_payload)
+        ):
+            return []
         if not _runtime_context_contract_line_matches_worker(
             line,
             runtime_context_id=str(
@@ -29315,12 +29394,22 @@ def _runtime_context_persisted_post_qa_conflict_reset_indices(
         superseded_index = marker.get("superseded_completed_line_index")
         if not isinstance(superseded_index, int):
             return []
-        return _runtime_context_post_qa_conflict_reset_indices(
+        reset_indices = _runtime_context_post_qa_conflict_reset_indices(
             record,
             context,
             superseded_index=superseded_index,
             replacement_index=replacement_index,
         )
+        if sorted(
+            index
+            for index in marker.get(
+                "invalidated_completed_line_indices"
+            )
+            or []
+            if isinstance(index, int)
+        ) != reset_indices:
+            return []
+        return reset_indices
     return []
 
 
@@ -29399,6 +29488,59 @@ def _runtime_context_same_lane_worker_commit_recovery(
         or payload.get("commit_sha")
         or ""
     ).strip()
+    replacement_marker = (
+        payload.get("canonical_same_lane_repair_head_revision")
+        if isinstance(
+            payload.get("canonical_same_lane_repair_head_revision"),
+            Mapping,
+        )
+        else {}
+    )
+    replacement_marker_schema = str(
+        replacement_marker.get("schema_version") or ""
+    ).strip()
+    if (
+        post_qa_merge_conflict_recovery
+        and str(
+            getattr(context, "last_recovery_action", "") or ""
+        ).strip()
+        == "mf_subagent_post_qa_replacement_worker_commit_recorded"
+        and replacement_marker_schema
+        in {
+            "runtime_context.canonical_same_lane_repair_head_revision.v2",
+            "runtime_context.canonical_same_lane_repair_head_revision.v3",
+        }
+        and not _runtime_context_persisted_post_qa_conflict_reset_indices(
+            record,
+            context,
+        )
+    ):
+        return {
+            "schema_version": (
+                "runtime_context.same_lane_worker_commit_recovery.v1"
+            ),
+            "status": "blocked",
+            "blocked": True,
+            "server_derived": True,
+            "source_of_authority": (
+                "ContractRuntime.completed_lines.worker_commit"
+            ),
+            "contract_execution_id": str(
+                record.get("contract_execution_id") or ""
+            ).strip(),
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "recorded_commit_sha": recorded_commit,
+            "errors": [
+                (
+                    "accepted post-QA replacement worker_commit marker "
+                    "failed exact authority validation"
+                )
+            ],
+            "append_only_history_preserved": True,
+            "next_legal_action": "stop_and_report_worker_commit_drift",
+            "recovery_reason": "post_qa_replacement_marker_invalid",
+        }
     worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
     runtime_base = str(getattr(context, "base_commit", "") or "").strip()
     result = {
@@ -60790,7 +60932,13 @@ def _runtime_next_action_from_guide(
     line_id = str(next_line.get("line_id") or "")
     action = str(next_line.get("action") or "").strip()
     if not action:
-        action = f"record_{evidence_kind}" if evidence_kind else "record_contract_line"
+        action = (
+            evidence_kind
+            if evidence_kind.startswith("record_")
+            else f"record_{evidence_kind}"
+            if evidence_kind
+            else "record_contract_line"
+        )
     result = {
         "schema_version": "contract_runtime_next_legal_action.v1",
         "id": line_id,
@@ -62889,11 +63037,20 @@ def _contract_runtime_apply_mf_parallel_context_projection(
             == "observer_merge"
             and projected_line_id == "observer_merge"
         )
+        invalid_replacement_blocks_historical_merge = (
+            str(recovery.get("status") or "").strip() == "blocked"
+            and str(recovery.get("recovery_reason") or "").strip()
+            == "post_qa_replacement_marker_invalid"
+            and str(canonical_next_action.get("line_id") or "").strip()
+            == "observer_merge"
+            and projected_line_id == "observer_merge"
+        )
         if (
             recovery_next_action != canonical_next_action
             and (
                 projected_line_id == "worker_commit"
                 or retarget_recovery_overrides_historical_merge
+                or invalid_replacement_blocks_historical_merge
             )
         ):
             canonical_reader_hash = str(
@@ -62978,6 +63135,9 @@ def _contract_runtime_mf_parallel_context_projection(
     existing_keys = _contract_runtime_projection_line_keys(completed_lines)
     expected_context_summaries: list[dict[str, Any]] = []
     same_lane_recoveries: list[dict[str, Any]] = []
+    persisted_revision_resets: list[dict[str, Any]] = []
+    persisted_reset_indices: set[int] = set()
+    runtime = _contract_runtime(conn)
     for dispatch_line in dispatch_lines:
         for context in _contract_runtime_contexts_for_dispatch_line(
             conn,
@@ -62998,8 +63158,53 @@ def _contract_runtime_mf_parallel_context_projection(
                     projection=context_projection,
                 )
             )
+            reset_indices = (
+                _runtime_context_persisted_post_qa_conflict_reset_indices(
+                    record,
+                    context,
+                )
+            )
+            recovery_record = record
+            if reset_indices:
+                persisted_reset_indices.update(reset_indices)
+                persisted_revision_resets.append(
+                    {
+                        "runtime_context_id": str(
+                            getattr(context, "runtime_context_id", "") or ""
+                        ),
+                        "task_id": str(
+                            getattr(context, "task_id", "") or ""
+                        ),
+                        "invalidated_completed_line_indices": reset_indices,
+                        "fresh_evidence_required": [
+                            "worker_finish_time_attestation",
+                            "worker_finish_gate",
+                            "qa_graph_context",
+                            "qa_independent_verification",
+                            "observer_merge",
+                        ],
+                        "append_only_history_preserved": True,
+                    }
+                )
+                recovery_record = runtime.projected_record(
+                    str(record.get("contract_execution_id") or ""),
+                    actor_role=actor_role,
+                    completed_lines=[
+                        line
+                        for index, line in enumerate(completed_lines)
+                        if index not in set(reset_indices)
+                    ],
+                    projection={
+                        "schema_version": (
+                            "contract_runtime.persisted_post_qa_revision_reset.v1"
+                        ),
+                        "source": (
+                            "canonical_same_lane_repair_head_revision"
+                        ),
+                    },
+                )
             recovery = _runtime_context_same_lane_worker_commit_recovery(
-                record,
+                recovery_record,
                 context,
                 conn=conn,
                 project_id=project_id,
@@ -63070,41 +63275,6 @@ def _contract_runtime_mf_parallel_context_projection(
         for item in expected_context_summaries
         if item.get("failed_qa_revision_rejoin")
     ]
-    persisted_revision_resets: list[dict[str, Any]] = []
-    persisted_reset_indices: set[int] = set()
-    for dispatch_line in dispatch_lines:
-        for context in _contract_runtime_contexts_for_dispatch_line(
-            conn,
-            project_id=project_id,
-            record=record,
-            line=dispatch_line,
-        ):
-            reset_indices = (
-                _runtime_context_persisted_post_qa_conflict_reset_indices(
-                    record,
-                    context,
-                )
-            )
-            if not reset_indices:
-                continue
-            persisted_reset_indices.update(reset_indices)
-            persisted_revision_resets.append(
-                {
-                    "runtime_context_id": str(
-                        getattr(context, "runtime_context_id", "") or ""
-                    ),
-                    "task_id": str(getattr(context, "task_id", "") or ""),
-                    "invalidated_completed_line_indices": reset_indices,
-                    "fresh_evidence_required": [
-                        "worker_finish_time_attestation",
-                        "worker_finish_gate",
-                        "qa_graph_context",
-                        "qa_independent_verification",
-                        "observer_merge",
-                    ],
-                    "append_only_history_preserved": True,
-                }
-            )
     if (
         not projected_lines
         and not identity_mismatch

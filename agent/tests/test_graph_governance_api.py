@@ -66275,6 +66275,89 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         "invalidated_completed_line_indices"
     ]
 
+    post_replacement_worker_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                query=generic_worker_query,
+            )
+        )
+    )
+    assert post_replacement_worker_guide["next_legal_action"] == (
+        "record_finish_time_worker_attestation"
+    )
+    assert post_replacement_worker_guide[
+        "contract_runtime_next_legal_action"
+    ]["line_id"] == "worker_finish_time_attestation"
+    assert post_replacement_worker_guide[
+        "contract_runtime_next_legal_action"
+    ]["action"] == "record_finish_time_worker_attestation"
+    assert (
+        "same_lane_worker_commit_recovery_projection"
+        not in post_replacement_worker_guide[
+            "contract_runtime_next_legal_action"
+        ]
+    )
+    for response_view in ("current", "guide"):
+        post_replacement_generic_current = (
+            server.handle_project_contract_runtime_current_state(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "contract_execution_id": successor[
+                            "contract_execution_id"
+                        ],
+                    },
+                    "mf_sub",
+                    query={
+                        **generic_worker_query,
+                        "response_view": response_view,
+                    },
+                )
+            )
+        )
+        assert post_replacement_generic_current["next_legal_action"][
+            "line_id"
+        ] == "worker_finish_time_attestation"
+        assert post_replacement_generic_current["next_legal_action"][
+            "action"
+        ] == "record_finish_time_worker_attestation"
+        assert (
+            "same_lane_worker_commit_recovery_projection"
+            not in post_replacement_generic_current["next_legal_action"]
+        )
+        assert post_replacement_generic_current[
+            "contract_runtime_current_state"
+        ]["next_legal_action"] == post_replacement_generic_current[
+            "next_legal_action"
+        ]
+
+    tampered_revision_record = copy.deepcopy(after)
+    tampered_revision_record["completed_lines"][-1]["payload"][
+        "canonical_same_lane_repair_head_revision"
+    ]["write_target_revalidation"]["authority_hash"] = "sha256:tampered"
+    tampered_projected, tampered_projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=tampered_revision_record,
+            actor_role="mf_sub",
+        )
+    )
+    assert not tampered_projection.get(
+        "post_qa_merge_conflict_revision_resets"
+    )
+    assert tampered_projection["same_lane_worker_commit_recovery"][
+        "status"
+    ] == "blocked"
+    assert tampered_projected["runtime_guide"]["next_legal_action"][
+        "line_id"
+    ] != "worker_finish_time_attestation"
+
     projected_worker, worker_projection = (
         server._contract_runtime_apply_mf_parallel_context_projection(
             conn,
