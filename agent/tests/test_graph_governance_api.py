@@ -73567,6 +73567,479 @@ def test_contract_runtime_recovers_exact_audit_only_qa_bypass_round(
     assert int(source_bypass_event["id"]) < int(diagnostic_event["id"])
 
 
+def test_contract_runtime_recovers_graph_context_bypass_then_independent_qa(
+    conn,
+    tmp_path,
+):
+    project_id = PID
+    backlog_id = "AC-QA-GRAPH-BYPASS-THEN-INDEPENDENT-QA"
+    diagnostic_id = "AC-QA-GRAPH-BYPASS-DIAGNOSTIC"
+    execution_id = "cex-qa-graph-bypass-then-independent-qa"
+    task_id = "worker-qa-graph-bypass-then-independent-qa"
+    runtime_context_id = "mfrctx-qa-graph-bypass-then-independent-qa"
+    merge_queue_id = "mq-qa-graph-bypass-then-independent-qa"
+    queue_item_id = "mqitem-qa-graph-bypass-then-independent-qa"
+    qa_principal = "qa:graph-bypass-independent"
+    qa_session_id = "ses-graph-bypass-independent"
+    trace_id = "gqt-graph-bypass-independent"
+    snapshot_id = "full-graph-bypass-independent"
+    candidate_commit = "a" * 40
+    merged_commit = "b" * 40
+    bypass_revision = 10
+    changed_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    candidate_diff_hash = "sha256:" + "c" * 64
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    _activate_basic_graph(
+        conn,
+        snapshot_id,
+        project_id=project_id,
+        commit_sha=candidate_commit,
+    )
+
+    context = BranchTaskRuntimeContext(
+        project_id=project_id,
+        task_id=task_id,
+        branch_ref="refs/heads/codex/qa-graph-bypass-independent",
+        status=STATE_VALIDATED,
+        runtime_context_id=runtime_context_id,
+        backlog_id=backlog_id,
+        parent_task_id=execution_id,
+        target_project_id="qa-graph-bypass-target",
+        target_project_root=str(tmp_path.resolve()),
+        worktree_path=str(tmp_path.resolve()),
+        merge_queue_id=merge_queue_id,
+    )
+    upsert_branch_context(conn, context)
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=project_id,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=queue_item_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                branch_ref=context.branch_ref,
+                queue_index=0,
+                status="merged",
+                target_ref="refs/heads/main",
+                branch_head=candidate_commit,
+                merge_commit=merged_commit,
+                target_head_before_merge="d" * 40,
+                target_head_after_merge=merged_commit,
+            )
+        ],
+    )
+    qa_scope_ref = server._qa_scope_binding_ref(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=candidate_commit,
+    )
+    graph_query_trace.ensure_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_query_traces (
+          trace_id, project_id, snapshot_id, actor, query_source,
+          query_purpose, status, created_at, updated_at, runtime_context_id,
+          task_id, backlog_id, commit_sha, qa_session_id,
+          qa_scope_binding_ref, graph_basis, base_commit_sha,
+          candidate_commit_sha, changed_files_json, candidate_diff_hash
+        ) VALUES (
+          ?, ?, ?, ?, 'qa', 'independent_verification', 'complete', ?, ?, ?,
+          ?, ?, ?, ?, ?, 'exact_candidate_snapshot', ?, ?, ?, ?
+        )
+        """,
+        (
+            trace_id,
+            project_id,
+            snapshot_id,
+            qa_principal,
+            "2026-07-25T16:56:00Z",
+            "2026-07-25T16:56:00Z",
+            runtime_context_id,
+            task_id,
+            backlog_id,
+            candidate_commit,
+            qa_session_id,
+            qa_scope_ref,
+            candidate_commit,
+            candidate_commit,
+            json.dumps(changed_files),
+            candidate_diff_hash,
+        ),
+    )
+
+    block_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="observer.system_block",
+        event_kind="record_blocker",
+        phase="qa_graph_context",
+        actor="observer",
+        status="blocked",
+        commit_sha=candidate_commit,
+        payload={
+            "contract_execution_id": execution_id,
+            "runtime_context_id": runtime_context_id,
+            "candidate_commit": candidate_commit,
+            "candidate_snapshot_id": snapshot_id,
+            "fresh_qa_graph_trace_id": trace_id,
+            "contract_runtime_revision": bypass_revision,
+            "no_pass_accounting": True,
+            "acceptance_tests_recorded": False,
+            "server_trace_authority": {
+                "graph_basis": "exact_candidate_snapshot",
+                "base_commit_sha": candidate_commit,
+                "candidate_commit_sha": candidate_commit,
+                "changed_files": changed_files,
+                # Immutable historical events stored the server digest prefix.
+                "candidate_diff_hash": candidate_diff_hash[:15],
+            },
+        },
+    )
+    bypass_identity = (
+        f"bypass:{execution_id}:revision-{bypass_revision}:"
+        "qa_graph_context:qa_graph_context"
+    )
+    bypass_event_payload = {
+        "bypass_identity": bypass_identity,
+        "contract_execution_id": execution_id,
+        "source_backlog_id": backlog_id,
+        "diagnostic_backlog_id": diagnostic_id,
+        "classification": "system_logic",
+        "disposition": "proceeded_with_exception",
+        "no_pass_claim": True,
+    }
+    correlation_id = f"contract-line-bypass:{bypass_identity}"
+    source_bypass_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="contract_line_bypass",
+        event_kind="record_blocker",
+        phase="qa_graph_context",
+        actor="qa",
+        status="waived",
+        correlation_id=correlation_id,
+        commit_sha=candidate_commit,
+        payload=bypass_event_payload,
+    )
+    diagnostic_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=diagnostic_id,
+        task_id=task_id,
+        event_type="contract_line_bypass_diagnostic_linked",
+        event_kind="record_blocker",
+        phase="qa_graph_context",
+        actor="qa",
+        status="open",
+        correlation_id=correlation_id,
+        commit_sha=candidate_commit,
+        payload=bypass_event_payload,
+    )
+    exact_binding = {
+        "source_backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "line_id": "qa_graph_context",
+        "execution_state_revision": bypass_revision,
+        "bypass_identity": bypass_identity,
+        "classification": "system_logic",
+        "disposition": "proceeded_with_exception",
+        "no_pass_claim": True,
+    }
+    conn.execute(
+        """
+        INSERT INTO backlog_bugs (
+          bug_id, title, status, mf_type, chain_trigger_json,
+          bypass_policy_json, target_files, test_files, created_at, updated_at
+        ) VALUES (?, ?, 'OPEN', 'chain_rescue', ?, ?, '[]', '[]', ?, ?)
+        """,
+        (
+            diagnostic_id,
+            "QA graph bypass diagnostic",
+            json.dumps(exact_binding),
+            json.dumps({**exact_binding, "keep_open": True}),
+            "2026-07-25T16:56:03Z",
+            "2026-07-25T16:56:03Z",
+        ),
+    )
+    merge_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="parallel.live_merge",
+        event_kind="live_merge",
+        phase="live_merge",
+        actor="observer",
+        status="passed",
+        commit_sha=merged_commit,
+        payload={
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": execution_id,
+            "contract_execution_id": execution_id,
+            "merge_commit": merged_commit,
+            "target_head_after_merge": merged_commit,
+        },
+    )
+    bypass_line = {
+        "stage_id": "qa_graph_context",
+        "line_id": "qa_graph_context",
+        "actor_role": "qa",
+        "evidence_kind": "contract_line_bypass",
+        "status": "waived",
+        "no_pass_claim": True,
+        "payload": {
+            "schema_version": "contract_line_bypass.v1",
+            **exact_binding,
+            "blocked_owner_role": "qa",
+            "blocked_evidence_kind": "graph_trace",
+            "diagnostic_backlog_id": diagnostic_id,
+            "evidence_refs": [
+                f"backlog:{backlog_id}",
+                f"contract-runtime:{execution_id}:revision:{bypass_revision}",
+                f"timeline:{block_event['id']}",
+                f"graph-snapshot:{snapshot_id}",
+                f"graph-trace:{trace_id}",
+            ],
+        },
+    }
+    qa_payload = {
+        "schema_version": "mf_parallel.qa_independent_verification.v1",
+        "acceptance_scope": "candidate_regression_and_acceptance_criteria",
+        "verdict": "accepted",
+        "candidate_commit_sha": candidate_commit,
+        "candidate_snapshot_id": snapshot_id,
+        "graph_trace_id": trace_id,
+        "candidate_new_failures": 0,
+        "candidate_specific_issues": [],
+        "overall_release_pass_claimed": False,
+        "source_backlog_pass_claimed": False,
+        "source_generation_pass_claimed": False,
+        "source_release_pass_claimed": False,
+        "source_qa_graph_context_disposition": "waived",
+        "source_disposition": "proceeded_with_exception",
+        "source_bypass_event_ref": f"timeline:{source_bypass_event['id']}",
+        "source_diagnostic_backlog_id": diagnostic_id,
+    }
+    qa_line = {
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "status": "accepted",
+        "authorization_source": "qa_session_token_ref",
+        "observer_impersonation": False,
+        "commit_sha": candidate_commit,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": execution_id,
+        "qa_evidence_provenance": {
+            "schema_version": "qa_evidence_provenance.v1",
+            "server_derived": True,
+            "authorization_source": "qa_session_token_ref",
+            "evidence_owner_role": "qa",
+            "observer_impersonation": False,
+            "parent_materialization_authorized": False,
+            "authenticated_qa_binding": {
+                "schema_version": (
+                    "contract_runtime.authenticated_qa_binding.v1"
+                ),
+                "server_derived": True,
+                "qa_principal": qa_principal,
+                "qa_session_id": qa_session_id,
+                "independent_verification_session_matched": True,
+            },
+        },
+        "payload": qa_payload,
+        "verification": {
+            key: value
+            for key, value in qa_payload.items()
+            if key
+            in {
+                "schema_version",
+                "verdict",
+                "candidate_new_failures",
+                "candidate_specific_issues",
+                "overall_release_pass_claimed",
+                "source_backlog_pass_claimed",
+                "source_generation_pass_claimed",
+                "source_release_pass_claimed",
+                "source_qa_graph_context_disposition",
+                "source_bypass_event_ref",
+            }
+        },
+    }
+    record = server._contract_runtime_store(conn).create(
+        {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "contract_id": "mf_parallel.v2",
+            "version": "v2",
+            "revision": "rev5",
+            "execution_state_revision": bypass_revision,
+            "contract_chain_id": "cchain-qa-graph-bypass-independent",
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch",
+                    "line_id": "observer_dispatch_bounded_workers",
+                    "actor_role": "observer",
+                    "evidence_kind": "dispatch_bounded_worker",
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": execution_id,
+                    "payload": {
+                        "runtime_context_id": runtime_context_id,
+                        "worker_task_id": task_id,
+                        "parent_task_id": execution_id,
+                        "worker_role": "mf_sub",
+                    },
+                },
+                {
+                    "stage_id": "worker_commit",
+                    "line_id": "worker_commit",
+                    "actor_role": "mf_sub",
+                    "evidence_kind": "worker_commit",
+                    "status": "accepted",
+                    "commit_sha": candidate_commit,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": execution_id,
+                },
+                bypass_line,
+                qa_line,
+            ],
+        }
+    )
+    binding_identity = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": record["contract_id"],
+        "contract_chain_id": record["contract_chain_id"],
+        "parent_contract_execution_id": str(
+            record.get("parent_contract_execution_id") or ""
+        ),
+        "root_contract_execution_id": str(
+            record.get("root_contract_execution_id") or ""
+        ),
+    }
+    conn.executemany(
+        """
+        INSERT INTO backlog_contract_chain_bindings (
+          idempotency_key, project_id, backlog_id, contract_chain_id,
+          contract_execution_id, binding_kind, execution_state_revision,
+          source_ref, source_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                f"qa-graph-bypass-acceptance-{revision}",
+                project_id,
+                backlog_id,
+                record["contract_chain_id"],
+                execution_id,
+                "mf_parallel_child_current",
+                revision,
+                f"contract_runtime:{execution_id}:revision:{revision}",
+                server.stable_sha256(
+                    {
+                        **binding_identity,
+                        "execution_state_revision": revision,
+                        "completed_line_count": completed_count,
+                    }
+                ),
+                created_at,
+            )
+            for revision, completed_count, created_at in (
+                (bypass_revision - 1, 3, "2026-07-25T16:56:04Z"),
+            )
+        ],
+    )
+    conn.commit()
+
+    bound = server._contract_runtime_bind_observer_merge_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        write={
+            "stage_id": "observer_integration",
+            "line_id": "observer_merge",
+            "actor_role": "observer",
+            "evidence_kind": "merge",
+            "status": "accepted",
+            "payload": {},
+        },
+    )
+    audit = bound["payload"]["qa_audit_only_no_pass_authority"]
+    assert audit["source_shape"] == (
+        "qa_graph_context_bypass_then_independent_verification"
+    )
+    assert audit["qa_independent_verification_verified"] is True
+    assert audit["bypass_completed_line_index"] == 2
+    assert audit["qa_independent_verification_completed_line_index"] == 3
+    assert audit["qa_event_ref"] == f"timeline:{block_event['id']}"
+    assert audit["diagnostic_event_ref"] == f"timeline:{diagnostic_event['id']}"
+    assert audit["historical_diagnostic_backfill_required"] is False
+    assert bound["payload"]["durable_merge_authority"]["merge_event_ref"] == (
+        f"timeline:{merge_event['id']}"
+    )
+
+    merged_record = json.loads(json.dumps(record))
+    merged_record["completed_lines"].append(bound)
+    completed = server._contract_runtime_completed_merge_authority(
+        conn,
+        project_id=project_id,
+        record=merged_record,
+        context=context,
+        timeline_events=task_timeline.list_events(
+            conn,
+            project_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        ),
+    )
+    assert completed["authority_verified"] is True
+    assert completed["qa_contract_runtime_verified"] is False
+    assert completed["qa_graph_completed_line_index"] == 2
+    assert completed["qa_completed_line_index"] == 3
+    assert completed["no_pass_claim"] is True
+    assert completed["close_satisfying"] is False
+
+    bad_record = json.loads(json.dumps(record))
+    bad_record["completed_lines"][3]["payload"]["graph_trace_id"] = (
+        "gqt-unrelated"
+    )
+    with pytest.raises(GovernanceError) as wrong_trace:
+        server._contract_runtime_bind_observer_merge_authority(
+            conn,
+            project_id=project_id,
+            record=bad_record,
+            write={
+                "stage_id": "observer_integration",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge",
+                "status": "accepted",
+                "payload": {},
+            },
+        )
+    assert wrong_trace.value.code == (
+        "contract_runtime_observer_merge_durable_authority_required"
+    )
+
+
 def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
     conn,
     monkeypatch,
