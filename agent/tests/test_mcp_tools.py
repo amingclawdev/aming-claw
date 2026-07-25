@@ -126,6 +126,49 @@ def test_parallel_branch_merge_queue_apply_forwards_branch_ref():
     )
 
 
+def test_parallel_branch_merge_queue_apply_forwards_explicit_flow():
+    properties = _tool_properties("parallel_branch_merge_queue_apply")
+    assert set(properties["flow"]["enum"]) == {
+        "mf_parallel",
+        "mf_batch_parallel",
+        "direct_fix",
+        "hotfix",
+    }
+
+    builders = (
+        governance_mcp_server._parallel_branch_merge_queue_apply_body,
+        mcp_tools._parallel_branch_merge_queue_apply_body,
+    )
+    for flow in properties["flow"]["enum"]:
+        args = {
+            "merge_queue_id": "mq-flow",
+            "task_id": "task-flow",
+            "flow": flow,
+            "unsupported_flow_probe": "must-not-forward",
+        }
+        for builder in builders:
+            body = builder(args)
+            assert body["flow"] == flow
+            assert "unsupported_flow_probe" not in body
+
+        recorder = _Recorder()
+        dispatcher = _dispatcher(recorder)
+        dispatcher.dispatch(
+            "parallel_branch_merge_queue_apply",
+            {"project_id": "aming-claw", **args},
+        )
+        assert recorder.calls[-1][2]["flow"] == flow
+        assert "unsupported_flow_probe" not in recorder.calls[-1][2]
+
+    for builder in builders:
+        assert "flow" not in builder(
+            {
+                "merge_queue_id": "mq-legacy",
+                "task_id": "task-legacy",
+            }
+        )
+
+
 def test_parallel_branch_merge_queue_materialize_forwards_checkpoint():
     properties = _tool_properties("parallel_branch_merge_queue_materialize")
     assert "checkpoint_id" in properties

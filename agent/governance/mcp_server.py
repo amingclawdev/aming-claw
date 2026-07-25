@@ -1126,6 +1126,7 @@ def _parallel_branch_merge_queue_apply_body(args: dict) -> dict:
         "current_target_head",
         "evidence",
         "batch_status",
+        "flow",
         "dry_run",
         "allow_target_ref_mutation",
         "message",
