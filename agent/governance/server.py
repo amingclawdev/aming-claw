@@ -25638,9 +25638,12 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             )
             else {}
         )
-        if expected_route_identity and _runtime_context_route_identity_mismatch_fields(
-            expected_route_identity,
-            latest_rotation_route_identity,
+        if (
+            not expected_route_identity
+            or _runtime_context_route_identity_mismatch_fields(
+                expected_route_identity,
+                latest_rotation_route_identity,
+            )
         ):
             rejoin_continuity = {}
     for event in reversed(list(timeline_events)):
