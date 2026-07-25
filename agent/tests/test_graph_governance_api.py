@@ -2850,6 +2850,7 @@ def _insert_exact_qa_graph_query_trace(
     canonical_project_root: str = "",
     actor: str = "qa-principal",
     qa_session_id: str = "ses-qa",
+    runtime_context_id: str = "",
     query_purpose: str = "independent_verification",
     created_at: str = "2026-07-04T10:00:00Z",
 ) -> dict[str, Any]:
@@ -2924,6 +2925,7 @@ def _insert_exact_qa_graph_query_trace(
         query_source="qa",
         query_purpose=query_purpose,
         backlog_id=backlog_id,
+        runtime_context_id=runtime_context_id,
         task_id=task_id,
         commit_sha=candidate_commit_sha,
         graph_basis="exact_candidate_snapshot",
@@ -2993,6 +2995,100 @@ def _insert_exact_qa_graph_query_trace(
             )
         },
     }
+
+
+def _write_exact_runtime_context_qa_graph_line(
+    conn,
+    *,
+    contract_execution_id: str,
+    backlog_id: str,
+    runtime_context,
+    candidate_commit_sha: str,
+    target_project_root: str,
+    canonical_project_root: str,
+    scope: list[str],
+    principal: str,
+    trace_id: str,
+    created_at: str,
+    after_revision: int,
+) -> dict[str, Any]:
+    session = server.role_service.register(
+        conn,
+        principal,
+        PID,
+        "qa",
+        scope=scope,
+    )
+    _insert_exact_qa_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        snapshot_id=f"scope-{trace_id}",
+        candidate_commit_sha=candidate_commit_sha,
+        backlog_id=backlog_id,
+        task_id=runtime_context.task_id,
+        runtime_context_id=runtime_context.runtime_context_id,
+        target_project_root=target_project_root,
+        canonical_project_root=canonical_project_root,
+        actor=principal,
+        qa_session_id=session["session_id"],
+        created_at=created_at,
+    )
+    body = {
+        "stage_id": "qa_graph_context",
+        "line_id": "qa_graph_context",
+        "evidence_kind": "graph_trace",
+        "status": "accepted",
+        "commit_sha": candidate_commit_sha,
+        "graph_trace_ids": [trace_id],
+        "graph_query_trace_ids": [trace_id],
+        "payload": {
+            "schema_version": "mf_parallel.qa_graph_context.v1",
+            "acceptance_scope": "candidate_regression_and_acceptance_criteria",
+            "candidate_new_graph_failures": 0,
+            "exact_candidate": True,
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "graph_trace_ids": [trace_id],
+            "graph_query_trace_ids": [trace_id],
+        },
+    }
+    ctx = _ctx_with_role(
+        {
+            "project_id": PID,
+            "contract_execution_id": contract_execution_id,
+        },
+        "qa",
+        method="POST",
+        body=body,
+    )
+    ctx._session.update(
+        {
+            "session_id": session["session_id"],
+            "principal_id": principal,
+            "scope": scope,
+        }
+    )
+    result = server.handle_project_contract_runtime_line_write(ctx)
+    assert result["ok"] is True
+    record = server._contract_runtime_store(conn).get(contract_execution_id)
+    line_index = next(
+        index
+        for index, line in reversed(
+            list(enumerate(record["completed_lines"]))
+        )
+        if line.get("line_id") == "qa_graph_context"
+        and line.get("evidence_owner_session") == session["session_id"]
+    )
+    acceptance = server._contract_runtime_completed_line_acceptance(
+        conn,
+        project_id=PID,
+        record=record,
+        completed_line_index=line_index,
+        expected_line=record["completed_lines"][line_index],
+    )
+    assert acceptance["db_verified"] is True
+    assert int(acceptance["execution_state_revision"]) > after_revision
+    return session
 
 
 def _route_waiver(action: str, *, task_id: str = "", backlog_id: str = "") -> dict:
@@ -76736,6 +76832,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         candidate_commit_sha=head_commit,
         backlog_id=backlog_id,
         task_id=runtime_context.task_id,
+        runtime_context_id=runtime_context.runtime_context_id,
         target_project_root=str(worktree),
         canonical_project_root=str(canonical_root),
     )
@@ -77964,6 +78061,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         candidate_commit_sha=head_commit,
         backlog_id=backlog_id,
         task_id=runtime_context.task_id,
+        runtime_context_id=runtime_context.runtime_context_id,
         target_project_root=str(worktree),
         canonical_project_root=str(canonical_root),
         actor=fresh_principal,
@@ -78066,6 +78164,18 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert failed_authority["authority_scope"] == "audit_only"
     assert failed_authority["close_satisfying"] is False
     assert failed_authority["qa_session_proof"]["evidence_status"] == "failed"
+    failed_time = "2026-07-25T12:00:00Z"
+    fresh_trace_time = "2026-07-25T12:00:01Z"
+    conn.execute(
+        "UPDATE task_timeline_events SET created_at = ? "
+        "WHERE project_id = ? AND id = ?",
+        (failed_time, PID, fresh_failed["id"]),
+    )
+    conn.commit()
+    fresh_failed["created_at"] = failed_time
+    failed_revision = int(
+        fresh_failed["contract_gate_decision"]["execution_state_revision"]
+    )
 
     after_no_pass = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
@@ -78076,10 +78186,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
             "observer",
         )
     )
-    assert after_no_pass["next_legal_action"]["line_id"] in {
-        "qa_graph_context",
-        "qa_independent_verification",
-    }
+    assert after_no_pass["next_legal_action"]["line_id"] == "qa_graph_context"
     no_pass_record, _no_pass_projection = (
         server._contract_runtime_apply_mf_parallel_context_projection(
             conn,
@@ -78105,28 +78212,83 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
             after_no_pass["next_legal_action"]
         )
 
-    recovered_principal = "qa:recovered-runtime-context-projection"
-    recovered_session = server.role_service.register(
+    _write_exact_runtime_context_qa_graph_line(
         conn,
-        recovered_principal,
-        PID,
-        "qa",
-        scope=fresh_scope,
-    )
-    recovered_trace_id = "gqt-runtime-context-projection-recovered-session"
-    _insert_exact_qa_graph_query_trace(
-        conn,
-        trace_id=recovered_trace_id,
-        snapshot_id="scope-runtime-context-projection-recovered-session",
-        candidate_commit_sha=head_commit,
+        contract_execution_id=successor["contract_execution_id"],
         backlog_id=backlog_id,
-        task_id=runtime_context.task_id,
+        runtime_context=runtime_context,
+        candidate_commit_sha=head_commit,
         target_project_root=str(worktree),
         canonical_project_root=str(canonical_root),
-        actor=recovered_principal,
-        qa_session_id=recovered_session["session_id"],
+        scope=fresh_scope,
+        principal="qa:same-second-runtime-context-projection",
+        trace_id="gqt-runtime-context-projection-same-second",
+        created_at=failed_time,
+        after_revision=failed_revision,
     )
-    conn.commit()
+    same_second_current = (
+        server.handle_project_contract_runtime_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor[
+                        "contract_execution_id"
+                    ],
+                },
+                "observer",
+            )
+        )
+    )
+    assert same_second_current["next_legal_action"]["line_id"] == (
+        "qa_graph_context"
+    )
+    same_second_record, _same_second_projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=server._contract_runtime_store(conn).get(
+                successor["contract_execution_id"]
+            ),
+            actor_role="observer",
+        )
+    )
+    assert "qa_graph_context" not in {
+        line["line_id"]
+        for line in same_second_record["completed_lines"]
+    }
+
+    recovered_principal = "qa:recovered-runtime-context-projection"
+    recovered_trace_id = "gqt-runtime-context-projection-recovered-session"
+    recovered_session = _write_exact_runtime_context_qa_graph_line(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        backlog_id=backlog_id,
+        runtime_context=runtime_context,
+        candidate_commit_sha=head_commit,
+        target_project_root=str(worktree),
+        canonical_project_root=str(canonical_root),
+        scope=fresh_scope,
+        principal=recovered_principal,
+        trace_id=recovered_trace_id,
+        created_at=fresh_trace_time,
+        after_revision=failed_revision,
+    )
+    after_recovered_graph = (
+        server.handle_project_contract_runtime_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor[
+                        "contract_execution_id"
+                    ],
+                },
+                "observer",
+            )
+        )
+    )
+    assert after_recovered_graph["next_legal_action"]["line_id"] == (
+        "qa_independent_verification"
+    )
     recovered_body = json.loads(json.dumps(fresh_body))
     recovered_body["actor"] = recovered_principal
     recovered_body["payload"]["graph_trace_ids"] = [recovered_trace_id]
@@ -78219,7 +78381,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         successor["contract_execution_id"]
     )
     assert len(stored_after_fresh_qa["completed_lines"]) == (
-        len(stored_lines_after_qa) + 1
+        len(stored_lines_after_qa) + 3
     )
 
     after = server.handle_project_contract_runtime_current_state(

@@ -25551,6 +25551,10 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
             "source_of_authority": "qa_session_verification",
             "event_id": event_id,
             "source_ref": f"timeline:{event_id}",
+            "created_at": str(event.get("created_at") or "").strip(),
+            "execution_state_revision": int(
+                gate.get("execution_state_revision") or 0
+            ),
             "status": status,
             "commit_sha": event_commit,
             "actor": actor,
@@ -64018,6 +64022,7 @@ _CONTRACT_RUNTIME_AUTHORITATIVE_QA_BLOCKING_STATUSES = frozenset(
 )
 _CONTRACT_RUNTIME_AUTHORITATIVE_QA_SUPERSEDED_LINE_IDS = frozenset(
     {
+        "qa_graph_context",
         "qa_independent_verification",
         "observer_merge",
         "observer_reconcile",
@@ -64080,6 +64085,15 @@ def _contract_runtime_authoritative_qa_projection_verdict(
         if prior_status not in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_BLOCKING_STATUSES:
             return {}
         projected["prior_no_pass_event_id"] = int(prior.get("event_id") or 0)
+        projected["prior_no_pass_qa_session_id"] = str(
+            prior.get("qa_session_id") or ""
+        ).strip()
+        projected["prior_no_pass_created_at"] = str(
+            prior.get("created_at") or ""
+        ).strip()
+        projected["prior_no_pass_execution_state_revision"] = int(
+            prior.get("execution_state_revision") or 0
+        )
         projected["fresh_session_pass_verified"] = bool(
             int(projected.get("event_id") or 0)
             > int(prior.get("event_id") or 0)
@@ -64092,8 +64106,11 @@ def _contract_runtime_authoritative_qa_projection_verdict(
 
 
 def _contract_runtime_authoritative_qa_superseded_line_indices(
+    conn,
     record: Mapping[str, Any],
     *,
+    project_id: str,
+    backlog_id: str,
     runtime_context_id: str,
     task_id: str,
     authoritative_qa_verdict: Mapping[str, Any],
@@ -64102,8 +64119,48 @@ def _contract_runtime_authoritative_qa_superseded_line_indices(
 
     if not authoritative_qa_verdict:
         return []
+    completed_lines = list(record.get("completed_lines") or [])
+    expected_commit = str(
+        authoritative_qa_verdict.get("expected_candidate_commit") or ""
+    ).strip()
+    failed_qa_session_id = str(
+        authoritative_qa_verdict.get("prior_no_pass_qa_session_id")
+        or authoritative_qa_verdict.get("qa_session_id")
+        or ""
+    ).strip()
+    failed_qa_created_at = str(
+        authoritative_qa_verdict.get("prior_no_pass_created_at")
+        or authoritative_qa_verdict.get("created_at")
+        or ""
+    ).strip()
+    failed_qa_time = _contract_runtime_close_authority_time_order_value(
+        failed_qa_created_at
+    )
+    failed_qa_revision = int(
+        authoritative_qa_verdict.get(
+            "prior_no_pass_execution_state_revision"
+        )
+        or authoritative_qa_verdict.get("execution_state_revision")
+        or 0
+    )
+
+    def qa_session_id(line: Mapping[str, Any]) -> str:
+        provenance = (
+            line.get("qa_evidence_provenance")
+            if isinstance(line.get("qa_evidence_provenance"), Mapping)
+            else {}
+        )
+        binding = (
+            provenance.get("authenticated_qa_binding")
+            if isinstance(
+                provenance.get("authenticated_qa_binding"), Mapping
+            )
+            else {}
+        )
+        return str(binding.get("qa_session_id") or "").strip()
+
     superseded: list[int] = []
-    for index, line in enumerate(record.get("completed_lines") or []):
+    for index, line in enumerate(completed_lines):
         if not isinstance(line, Mapping):
             continue
         line_id = str(line.get("line_id") or "").strip()
@@ -64123,6 +64180,118 @@ def _contract_runtime_authoritative_qa_superseded_line_indices(
             or task_ids != {task_id}
         ):
             continue
+        if line_id == "qa_graph_context":
+            payload = (
+                line.get("payload")
+                if isinstance(line.get("payload"), Mapping)
+                else {}
+            )
+            graph = (
+                payload.get("graph_trace_evidence")
+                if isinstance(
+                    payload.get("graph_trace_evidence"), Mapping
+                )
+                else {}
+            )
+            graph_qa_session_id = qa_session_id(line)
+            trace_ids = _runtime_context_service_dedupe(
+                _runtime_context_service_query_values(
+                    graph,
+                    "verified_trace_ids",
+                    "trace_ids",
+                )
+            )
+            trace_rows: list[Any] = []
+            if trace_ids:
+                placeholders = ",".join("?" for _ in trace_ids)
+                try:
+                    trace_rows = conn.execute(
+                        f"""
+                        SELECT trace_id, actor, backlog_id, task_id,
+                               runtime_context_id, qa_session_id, commit_sha,
+                               candidate_commit_sha, status, created_at
+                        FROM graph_query_traces
+                        WHERE project_id = ?
+                          AND trace_id IN ({placeholders})
+                        """,
+                        (project_id, *trace_ids),
+                    ).fetchall()
+                except sqlite3.Error:
+                    trace_rows = []
+            fresh_trace_rows = bool(
+                failed_qa_time is not None
+                and len(trace_rows) == len(trace_ids)
+                and {
+                    str(row["trace_id"] or "").strip() for row in trace_rows
+                }
+                == set(trace_ids)
+                and all(
+                    str(row["backlog_id"] or "").strip() == backlog_id
+                    and str(row["task_id"] or "").strip() == task_id
+                    and str(row["runtime_context_id"] or "").strip()
+                    == runtime_context_id
+                    and str(row["actor"] or "").strip()
+                    == str(graph.get("qa_principal") or "").strip()
+                    and str(row["qa_session_id"] or "").strip()
+                    == graph_qa_session_id
+                    and (
+                        not expected_commit
+                        or (
+                            str(row["commit_sha"] or "").strip()
+                            == expected_commit
+                            and str(
+                                row["candidate_commit_sha"] or ""
+                            ).strip()
+                            == expected_commit
+                        )
+                    )
+                    and str(row["status"] or "").strip().lower()
+                    == "complete"
+                    and (
+                        _contract_runtime_close_authority_time_order_value(
+                            str(row["created_at"] or "").strip()
+                        )
+                        or 0.0
+                    )
+                    > failed_qa_time
+                    for row in trace_rows
+                )
+            )
+            acceptance = _contract_runtime_completed_line_acceptance(
+                conn,
+                project_id=project_id,
+                record=record,
+                completed_line_index=index,
+                expected_line=line,
+            )
+            if (
+                failed_qa_revision > 0
+                and fresh_trace_rows
+                and acceptance.get("db_verified") is True
+                and int(
+                    acceptance.get("execution_state_revision") or 0
+                )
+                > failed_qa_revision
+                and _contract_runtime_authenticated_qa_provenance(line)
+                and graph.get("db_verified") is True
+                and not list(graph.get("identity_mismatches") or [])
+                and list(graph.get("verified_trace_ids") or [])
+                and graph_qa_session_id
+                and graph_qa_session_id != failed_qa_session_id
+                and str(graph.get("qa_session_id") or "").strip()
+                == graph_qa_session_id
+                and str(graph.get("runtime_context_id") or "").strip()
+                == runtime_context_id
+                and str(graph.get("task_id") or "").strip() == task_id
+                and (
+                    not expected_commit
+                    or str(
+                        graph.get("candidate_commit_sha") or ""
+                    ).strip()
+                    == expected_commit
+                )
+            ):
+                continue
         superseded.append(index)
     return superseded
 
@@ -64160,7 +64329,10 @@ def _contract_runtime_projection_for_context(
     )
     authoritative_qa_superseded_line_indices = (
         _contract_runtime_authoritative_qa_superseded_line_indices(
+            conn,
             record,
+            project_id=project_id,
+            backlog_id=backlog_id,
             runtime_context_id=runtime_context_id,
             task_id=task_id,
             authoritative_qa_verdict=authoritative_qa_verdict,
