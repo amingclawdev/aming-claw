@@ -32558,16 +32558,35 @@ def _runtime_context_submit_canonical_contract_line(
             if isinstance(candidate_projection, Mapping)
             else []
         )
+        post_qa_revision_resets = (
+            candidate_projection.get(
+                "post_qa_merge_conflict_revision_resets"
+            )
+            if isinstance(candidate_projection, Mapping)
+            else []
+        )
         use_failed_qa_rejoin_projection = any(
             isinstance(item, Mapping)
             and str(item.get("runtime_context_id") or "").strip()
             == runtime_context_id
             for item in (failed_qa_rejoin_contexts or [])
         )
-        context_projection = (
-            candidate_projection if use_failed_qa_rejoin_projection else {}
+        use_persisted_post_qa_revision_reset_projection = any(
+            isinstance(item, Mapping)
+            and str(item.get("runtime_context_id") or "").strip()
+            == runtime_context_id
+            and str(item.get("task_id") or "").strip() == task_id
+            and bool(item.get("invalidated_completed_line_indices"))
+            for item in (post_qa_revision_resets or [])
         )
-        if use_failed_qa_rejoin_projection:
+        use_context_projection = (
+            use_failed_qa_rejoin_projection
+            or use_persisted_post_qa_revision_reset_projection
+        )
+        context_projection = (
+            candidate_projection if use_context_projection else {}
+        )
+        if use_context_projection:
             record = projected_record
     except ContractRuntimeError as exc:
         raise GovernanceError(

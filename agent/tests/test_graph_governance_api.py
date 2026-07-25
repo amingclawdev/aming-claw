@@ -66406,24 +66406,58 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
             },
         }
     )
-    fresh_attestation = runtime.submit_line_write(
-        successor["contract_execution_id"],
-        fresh_attestation_write,
-        actor_role="mf_sub",
-        projected_completed_lines=worker_projection[
-            "projected_completed_lines"
-        ],
-        projection=worker_projection,
+    historical_attestation_count = sum(
+        line.get("line_id") == "worker_finish_time_attestation"
+        for line in after["completed_lines"]
     )
-    assert fresh_attestation["ok"] is True
+    fresh_attestation = server._runtime_context_submit_canonical_contract_line(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        stage_id="worker_attestation",
+        line_id="worker_finish_time_attestation",
+        evidence_kind="record_finish_time_worker_attestation",
+        payload=fresh_attestation_write["payload"],
+        contract_execution_id=successor["contract_execution_id"],
+    )
+    assert fresh_attestation["accepted"] is True
+    assert fresh_attestation["status"] == "completed"
+    assert fresh_attestation["next_legal_action"]["line_id"] == (
+        "worker_finish_gate"
+    )
     after_fresh_attestation = runtime.store.get(
         successor["contract_execution_id"]
     )
+    assert sum(
+        line.get("line_id") == "worker_finish_time_attestation"
+        for line in after_fresh_attestation["completed_lines"]
+    ) == historical_attestation_count + 1
+    repeated_attestation = (
+        server._runtime_context_submit_canonical_contract_line(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            stage_id="worker_attestation",
+            line_id="worker_finish_time_attestation",
+            evidence_kind="record_finish_time_worker_attestation",
+            payload=fresh_attestation_write["payload"],
+            contract_execution_id=successor["contract_execution_id"],
+        )
+    )
+    assert repeated_attestation["accepted"] is True
+    assert repeated_attestation["status"] == "already_completed"
+    after_repeated_attestation = runtime.store.get(
+        successor["contract_execution_id"]
+    )
+    assert sum(
+        line.get("line_id") == "worker_finish_time_attestation"
+        for line in after_repeated_attestation["completed_lines"]
+    ) == historical_attestation_count + 1
     projected_after_fresh, _ = (
         server._contract_runtime_apply_mf_parallel_context_projection(
             conn,
             project_id=PID,
-            record=after_fresh_attestation,
+            record=after_repeated_attestation,
             actor_role="mf_sub",
         )
     )
