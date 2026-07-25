@@ -36998,6 +36998,102 @@ def test_failed_qa_rejoin_derives_missing_identity_only_from_exact_dispatch():
     )
 
 
+@pytest.mark.parametrize(
+    ("gate_authority", "accepted"),
+    [
+        ("qa_session_verification", True),
+        ("contract_runtime", True),
+        ("route_token_gate", False),
+        ("caller_claim", False),
+        ("", False),
+    ],
+)
+def test_failed_qa_timeline_boundary_accepts_only_server_qa_gate_authorities(
+    monkeypatch,
+    gate_authority,
+    accepted,
+):
+    context = SimpleNamespace(
+        project_id=PID,
+        runtime_context_id="mfrctx-failed-qa-gate-authority",
+        task_id="worker-failed-qa-gate-authority",
+        backlog_id="AC-FAILED-QA-GATE-AUTHORITY",
+    )
+    qa_principal = "qa:failed-qa-gate-authority"
+    candidate_commit = "a" * 40
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        commit_sha=candidate_commit,
+    )
+    source_authority = {
+        "schema_version": "source_backed_contract_gate_authority.v1",
+        "source": "server_qa_session_verification",
+        "source_of_authority": "qa_session_verification",
+        "authority_hash": _fake_sha("failed-qa-gate-authority"),
+        "qa_session_proof": {
+            "verified": True,
+            "source": "authenticated_qa_session",
+            "role": "qa",
+            "qa_session_id": "ses-failed-qa-gate-authority",
+            "qa_scope_binding_ref": qa_scope_binding_ref,
+            "project_id": PID,
+            "task_id": context.task_id,
+            "backlog_id": context.backlog_id,
+            "event_kind": "independent_verification",
+            "evidence_status": "failed",
+            "principal_id": qa_principal,
+            "commit_sha": candidate_commit,
+            "observer_impersonation": False,
+        },
+    }
+    event = {
+        "id": 1,
+        "project_id": PID,
+        "backlog_id": context.backlog_id,
+        "task_id": context.task_id,
+        "event_type": "qa.independent_verification",
+        "event_kind": "independent_verification",
+        "status": "failed",
+        "actor": qa_principal,
+        "commit_sha": candidate_commit,
+        "payload": {
+            "runtime_context_id": context.runtime_context_id,
+            "observer_impersonation": False,
+            "source_backed_contract_gate_authority": source_authority,
+            "contract_gate_decision": {
+                "ok": True,
+                "primary_decision_source": True,
+                "source_of_authority": gate_authority,
+                "required_role": "qa",
+                "missing_proof_fields": [],
+            },
+        },
+        "verification": {
+            "result": "failed",
+            "runtime_context_id": context.runtime_context_id,
+        },
+    }
+    monkeypatch.setattr(
+        task_timeline,
+        "_source_backed_qa_session_authority_valid",
+        lambda _authority, *, conn: _authority is source_authority,
+    )
+
+    boundary = server._runtime_context_authenticated_failed_qa_timeline_boundary(
+        conn=object(),
+        context=context,
+        runtime_context_id=context.runtime_context_id,
+        timeline_events=[event],
+    )
+
+    assert bool(boundary) is accepted
+    if accepted:
+        assert boundary["source_ref"] == "timeline:1"
+        assert boundary["status"] == "failed"
+
+
 def test_failed_qa_rejoin_marker_composes_authority_and_active_auth_rotation(
     monkeypatch,
     tmp_path,
@@ -37164,6 +37260,59 @@ def test_failed_qa_rejoin_marker_composes_authority_and_active_auth_rotation(
             context=context,
             runtime_context_id=context.runtime_context_id,
             timeline_events=events,
+        )
+        == {}
+    )
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_route_identity",
+        lambda *_args, **_kwargs: dict(route_identity),
+    )
+    running_contract_rejoin = rejoin_event(
+        30,
+        session_token_ref=active_session_ref,
+        timeline_reopen_for_revision=False,
+    )
+    running_contract_rejoin["payload"]["current_status"] = "running"
+    running_contract_rejoin["payload"]["contract_runtime_failed_qa_revision"] = {
+        "schema_version": (
+            "runtime_context.contract_runtime_failed_qa_revision_evidence.v1"
+        ),
+        "source": "contract_runtime_completed_lines",
+        "status": "revision_required",
+        "contract_execution_id": "cex-auth-rotation",
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "failed_qa_source_ref": (
+            "contract_runtime:cex-auth-rotation:completed_lines:10"
+        ),
+    }
+    running_marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=object(),
+        context=context,
+        runtime_context_id=context.runtime_context_id,
+        timeline_events=[running_contract_rejoin],
+    )
+    assert running_marker["revision_event_ref"] == "timeline:30"
+    assert running_marker["contract_execution_id"] == "cex-auth-rotation"
+    assert running_marker["failed_qa_source_ref"] == (
+        "contract_runtime:cex-auth-rotation:completed_lines:10"
+    )
+    assert running_marker["failed_qa_source"] == (
+        "contract_runtime_completed_lines"
+    )
+
+    running_auth_only = copy.deepcopy(running_contract_rejoin)
+    running_auth_only["payload"].pop(
+        "contract_runtime_failed_qa_revision"
+    )
+    assert (
+        server._runtime_context_failed_qa_revision_rejoin_marker(
+            conn=object(),
+            context=context,
+            runtime_context_id=context.runtime_context_id,
+            timeline_events=[running_auth_only],
         )
         == {}
     )
@@ -56395,6 +56544,16 @@ def test_accepted_no_pass_completion_mismatch_projects_exact_failed_qa_rejoin(
         "fence-known-baseline-qa-selection"
     )
     assert binding["binding_hash"].startswith("sha256:")
+    running_revision = _known_baseline_failed_qa_revision_evidence(
+        monkeypatch,
+        record,
+        status="running",
+        last_recovery_action="mf_subagent_session_token_rejoin_issued",
+    )
+    assert running_revision["status"] == "revision_required"
+    assert running_revision["failed_qa_source_ref"].startswith(
+        "contract_runtime:"
+    )
 
 
 def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(

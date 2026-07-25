@@ -25477,7 +25477,7 @@ def _runtime_context_authenticated_failed_qa_timeline_boundary(
             and gate.get("ok") is True
             and gate.get("primary_decision_source") is True
             and str(gate.get("source_of_authority") or "").strip()
-            == "qa_session_verification"
+            in {"contract_runtime", "qa_session_verification"}
             and str(gate.get("required_role") or "").strip() == "qa"
             and not list(gate.get("missing_proof_fields") or [])
             and str(source_authority.get("source") or "").strip()
@@ -25729,7 +25729,16 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             continue
         if int(payload.get("retry_round") or 0) != expected_retry_round:
             continue
-        if str(payload.get("current_status") or "").strip() != "worktree_ready":
+        event_context_status = str(
+            payload.get("current_status") or ""
+        ).strip()
+        if (
+            event_context_status != "worktree_ready"
+            and not (
+                event_context_status == "running"
+                and contract_runtime_reopen_authority
+            )
+        ):
             continue
         event_session_token_ref = str(
             payload.get("session_token_ref") or ""
@@ -26401,12 +26410,13 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
 ) -> dict[str, Any]:
     from .parallel_branch_runtime import (
         FAILED_QA_REVISION_REJOIN_STATES,
+        STATE_RUNNING,
         STATE_WORKTREE_READY,
     )
 
     context_status = str(getattr(context, "status", "") or "")
     failed_qa_rejoin_reopened = (
-        context_status == STATE_WORKTREE_READY
+        context_status in {STATE_RUNNING, STATE_WORKTREE_READY}
         and (
             str(getattr(context, "last_recovery_action", "") or "")
             == "mf_subagent_failed_qa_revision_rejoin_issued"
