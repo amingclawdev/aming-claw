@@ -1546,11 +1546,18 @@ def _timeline_connection_database_path(conn: sqlite3.Connection) -> str:
     return ""
 
 
-def _publish_committed_timeline_event(inserted_event: dict[str, Any]) -> None:
+def _publish_committed_timeline_event(
+    inserted_event: dict[str, Any],
+    *,
+    database_scope: str = "",
+) -> None:
     from agent.governance.dashboard_read_cache import TIMELINE_READ_CACHE
     from agent.governance import event_bus
 
-    TIMELINE_READ_CACHE.append(dict(inserted_event))
+    TIMELINE_READ_CACHE.append(
+        dict(inserted_event),
+        database_scope=database_scope,
+    )
     payload = {
         "project_id": _text(inserted_event.get("project_id")),
         "backlog_id": _text(inserted_event.get("backlog_id")),
@@ -1737,7 +1744,12 @@ class _CommittedTimelinePublisher:
                 state, event = self._visible_event(item)
                 if state == "committed" and event is not None:
                     try:
-                        _publish_committed_timeline_event(event)
+                        _publish_committed_timeline_event(
+                            event,
+                            database_scope=str(
+                                item.get("database_path") or ""
+                            ),
+                        )
                     except Exception:
                         log.debug(
                             "committed timeline event publish failed",
@@ -1858,7 +1870,14 @@ def _publish_timeline_event(
         if conn is not None and conn.in_transaction:
             _defer_timeline_event_until_commit(conn, inserted_event)
             return
-        _publish_committed_timeline_event(dict(inserted_event))
+        _publish_committed_timeline_event(
+            dict(inserted_event),
+            database_scope=(
+                _timeline_connection_database_path(conn)
+                if conn is not None
+                else ""
+            ),
+        )
     except Exception:
         log.debug("task timeline event publish failed", exc_info=True)
 

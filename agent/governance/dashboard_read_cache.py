@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter, OrderedDict, deque
 from copy import deepcopy
 from dataclasses import dataclass
-from threading import Event, RLock
+from threading import BoundedSemaphore, Event, RLock
 import time
 from typing import Any, Callable
 
@@ -31,6 +31,7 @@ class _TimelineWindow:
     rows: deque[dict[str, Any]]
     stored_at: float
     validated_at: float
+    cold_complete: bool = True
 
 
 @dataclass
@@ -82,6 +83,14 @@ class DashboardTimelineReadCache:
             _TimelinePendingAppends,
         ] = OrderedDict()
         self._lock = RLock()
+        self._current_admission = BoundedSemaphore(
+            self.current_project_limit
+        )
+        self._playback_admission = BoundedSemaphore(
+            self.playback_resource_limit
+        )
+        self._current_admission_waiters = 0
+        self._playback_admission_waiters = 0
         self._hits = 0
         self._misses = 0
         self._evictions = 0
@@ -100,7 +109,7 @@ class DashboardTimelineReadCache:
 
     def clear(self) -> None:
         with self._lock:
-            pending = [flight.event for flight in self._in_flight.values()]
+            pending = list(self._in_flight.values())
             self._current.clear()
             self._playback.clear()
             self._in_flight.clear()
@@ -108,8 +117,9 @@ class DashboardTimelineReadCache:
             self._hits = 0
             self._misses = 0
             self._evictions = 0
-        for event in pending:
-            event.set()
+        for flight in pending:
+            flight.event.set()
+            self._release_admission_permit(flight.pool)
 
     def current_generation(
         self,
@@ -202,15 +212,20 @@ class DashboardTimelineReadCache:
         started = time.monotonic()
         leader_token = f"{id(Event)}:{started:.9f}"
         joined = False
+        permit_acquired = False
         while True:
             with self._lock:
                 entries = self._current if pool == "current" else self._playback
                 window = entries.get(key)
                 if (
                     window is not None
+                    and window.cold_complete
                     and int(window.authority_generation)
                     >= int(authority_generation)
                 ):
+                    if permit_acquired:
+                        self._release_admission_permit(pool)
+                        permit_acquired = False
                     entries.move_to_end(key)
                     self._hits += 1
                     age_ms = max(
@@ -229,27 +244,52 @@ class DashboardTimelineReadCache:
                         ),
                     )
                 flight = self._in_flight.get(key)
-                if flight is None:
-                    event = Event()
-                    self._in_flight[key] = _TimelineLoadFlight(
-                        event=event,
-                        leader_token=leader_token,
-                        pool=pool,
-                        project_id=str(project_id),
-                        resource_id=str(resource_id),
-                    )
-                    self._ensure_pending_buffer_locked(
-                        key=key,
-                        pool=pool,
-                        project_id=project_id,
-                        resource_id=resource_id,
-                        limit=limit,
-                    )
-                    self._misses += 1
-                    break
-                event = flight.event
-                joined = True
-            event.wait(timeout=5.0)
+                if flight is None and permit_acquired:
+                    if self._prepare_admission_locked(pool=pool, key=key):
+                        try:
+                            pending = self._ensure_pending_buffer_locked(
+                                key=key,
+                                pool=pool,
+                                project_id=project_id,
+                                resource_id=resource_id,
+                                limit=limit,
+                            )
+                        except BaseException:
+                            self._release_admission_permit(pool)
+                            permit_acquired = False
+                            raise
+                        event = Event()
+                        self._in_flight[key] = _TimelineLoadFlight(
+                            event=event,
+                            leader_token=leader_token,
+                            pool=pool,
+                            project_id=str(project_id),
+                            resource_id=str(resource_id),
+                        )
+                        if window is not None and not window.cold_complete:
+                            for row in window.rows:
+                                event_id = int(row.get("id") or 0)
+                                if event_id > 0:
+                                    pending.rows[event_id] = deepcopy(row)
+                            while len(pending.rows) > pending.limit:
+                                pending.rows.pop(min(pending.rows), None)
+                        self._misses += 1
+                        break
+                    self._release_admission_permit(pool)
+                    permit_acquired = False
+                if flight is not None:
+                    if permit_acquired:
+                        self._release_admission_permit(pool)
+                        permit_acquired = False
+                    event = flight.event
+                    joined = True
+                else:
+                    event = None
+            if event is not None:
+                event.wait(timeout=5.0)
+                continue
+            self._acquire_admission_permit(pool)
+            permit_acquired = True
 
         try:
             loaded = [
@@ -306,6 +346,7 @@ class DashboardTimelineReadCache:
                     rows=deque(result_rows, maxlen=limit),
                     stored_at=now,
                     validated_at=now,
+                    cold_complete=True,
                 )
                 entries[key] = window
                 entries.move_to_end(key)
@@ -314,14 +355,16 @@ class DashboardTimelineReadCache:
                     if pool == "current"
                     else self.playback_resource_limit
                 )
-                while len(entries) > pool_limit:
-                    entries.popitem(last=False)
-                    self._evictions += 1
+                self._enforce_window_limit_locked(
+                    entries=entries,
+                    pool_limit=pool_limit,
+                )
                 release_event = flight.event
                 self._in_flight.pop(key, None)
                 self._pending_appends.pop(key, None)
         if release_event is not None:
             release_event.set()
+            self._release_admission_permit(pool)
         return (
             [deepcopy(row) for row in result_rows],
             self._metrics(
@@ -337,16 +380,101 @@ class DashboardTimelineReadCache:
 
     def _release_leader(self, key: str, leader_token: str) -> None:
         release_event: Event | None = None
+        release_pool = ""
         with self._lock:
             flight = self._in_flight.get(key)
             if flight is not None and flight.leader_token == leader_token:
                 release_event = flight.event
+                release_pool = flight.pool
                 self._in_flight.pop(key, None)
                 pending = self._pending_appends.get(key)
                 if pending is not None and not pending.rows:
                     self._pending_appends.pop(key, None)
         if release_event is not None:
             release_event.set()
+            self._release_admission_permit(release_pool)
+
+    def _admission_semaphore(self, pool: str) -> BoundedSemaphore:
+        return (
+            self._current_admission
+            if pool == "current"
+            else self._playback_admission
+        )
+
+    def _acquire_admission_permit(self, pool: str) -> None:
+        with self._lock:
+            if pool == "current":
+                self._current_admission_waiters += 1
+            else:
+                self._playback_admission_waiters += 1
+        try:
+            self._admission_semaphore(pool).acquire()
+        finally:
+            with self._lock:
+                if pool == "current":
+                    self._current_admission_waiters -= 1
+                else:
+                    self._playback_admission_waiters -= 1
+
+    def _release_admission_permit(self, pool: str) -> None:
+        self._admission_semaphore(pool).release()
+
+    def _pool_limit(self, pool: str) -> int:
+        return (
+            self.current_project_limit
+            if pool == "current"
+            else self.playback_resource_limit
+        )
+
+    def _pool_in_flight_count_locked(self, pool: str) -> int:
+        return sum(
+            1 for flight in self._in_flight.values() if flight.pool == pool
+        )
+
+    def _pool_pending_count_locked(self, pool: str) -> int:
+        return sum(
+            1
+            for pending in self._pending_appends.values()
+            if pending.pool == pool
+        )
+
+    def _prepare_admission_locked(self, *, pool: str, key: str) -> bool:
+        """Reserve room without ever evicting an active cold-load buffer."""
+
+        pool_limit = self._pool_limit(pool)
+        global_limit = (
+            self.current_project_limit + self.playback_resource_limit
+        )
+        if (
+            self._pool_in_flight_count_locked(pool) >= pool_limit
+            or len(self._in_flight) >= global_limit
+        ):
+            return False
+        if key in self._pending_appends:
+            return True
+
+        while (
+            self._pool_pending_count_locked(pool) >= pool_limit
+            or len(self._pending_appends) >= global_limit
+        ):
+            victim = next(
+                (
+                    pending_key
+                    for pending_key, pending
+                    in self._pending_appends.items()
+                    if pending_key not in self._in_flight
+                    and (
+                        self._pool_pending_count_locked(pool) < pool_limit
+                        or pending.pool == pool
+                    )
+                ),
+                "",
+            )
+            if not victim:
+                return False
+            self._pending_appends.pop(victim, None)
+            self._evictions += 1
+        return True
 
     def _ensure_pending_buffer_locked(
         self,
@@ -359,6 +487,17 @@ class DashboardTimelineReadCache:
     ) -> _TimelinePendingAppends:
         pending = self._pending_appends.get(key)
         if pending is None:
+            pool_limit = self._pool_limit(pool)
+            global_limit = (
+                self.current_project_limit + self.playback_resource_limit
+            )
+            if (
+                self._pool_pending_count_locked(pool) >= pool_limit
+                or len(self._pending_appends) >= global_limit
+            ):
+                raise RuntimeError(
+                    "timeline cold-load admission exceeded pending bounds"
+                )
             pending = _TimelinePendingAppends(
                 pool=pool,
                 project_id=str(project_id),
@@ -369,20 +508,6 @@ class DashboardTimelineReadCache:
             )
             self._pending_appends[key] = pending
         self._pending_appends.move_to_end(key)
-        pending_limit = self.current_project_limit + self.playback_resource_limit
-        while len(self._pending_appends) > pending_limit:
-            victim = next(
-                (
-                    pending_key
-                    for pending_key in self._pending_appends
-                    if pending_key not in self._in_flight
-                ),
-                "",
-            )
-            if not victim:
-                break
-            self._pending_appends.pop(victim, None)
-            self._evictions += 1
         return pending
 
     @staticmethod
@@ -404,7 +529,12 @@ class DashboardTimelineReadCache:
             for event_id in sorted(by_id, reverse=True)[: max(1, int(limit))]
         ]
 
-    def append(self, event: dict[str, Any]) -> None:
+    def append(
+        self,
+        event: dict[str, Any],
+        *,
+        database_scope: str = "",
+    ) -> None:
         """Append one committed/projected event to matching warm deques."""
 
         project_id = str(event.get("project_id") or "")
@@ -413,6 +543,35 @@ class DashboardTimelineReadCache:
         if not project_id or event_id <= 0:
             return
         with self._lock:
+            exact_keys: set[str] = set()
+            if database_scope:
+                current_key = self._current_key(database_scope, project_id)
+                self._append_to_window_locked(
+                    entries=self._current,
+                    key=current_key,
+                    project_id=project_id,
+                    resource_id=project_id,
+                    limit=self.current_window_limit,
+                    pool_limit=self.current_project_limit,
+                    event=event,
+                )
+                exact_keys.add(current_key)
+                if backlog_id:
+                    playback_key = self._playback_key(
+                        database_scope,
+                        project_id,
+                        backlog_id,
+                    )
+                    self._append_to_window_locked(
+                        entries=self._playback,
+                        key=playback_key,
+                        project_id=project_id,
+                        resource_id=backlog_id,
+                        limit=self.playback_window_limit,
+                        pool_limit=self.playback_resource_limit,
+                        event=event,
+                    )
+                    exact_keys.add(playback_key)
             for entries, include in (
                 (self._current, lambda window: window.project_id == project_id),
                 (
@@ -424,27 +583,16 @@ class DashboardTimelineReadCache:
                 ),
             ):
                 for key, window in list(entries.items()):
+                    if key in exact_keys:
+                        continue
                     if not include(window):
                         continue
-                    retained = [
-                        row
-                        for row in window.rows
-                        if int(row.get("id") or 0) != event_id
-                    ]
-                    retained.append(deepcopy(event))
-                    retained.sort(
-                        key=lambda row: int(row.get("id") or 0),
-                        reverse=True,
+                    self._append_to_existing_window_locked(
+                        entries=entries,
+                        key=key,
+                        window=window,
+                        event=event,
                     )
-                    window.rows.clear()
-                    window.rows.extend(retained[: window.rows.maxlen])
-                    window.authority_generation = max(
-                        window.authority_generation,
-                        event_id,
-                    )
-                    window.stored_at = time.monotonic()
-                    window.validated_at = window.stored_at
-                    entries.move_to_end(key)
             for key, pending in list(self._pending_appends.items()):
                 if pending.project_id != project_id:
                     continue
@@ -458,6 +606,89 @@ class DashboardTimelineReadCache:
                     pending.rows.pop(min(pending.rows), None)
                 pending.stored_at = time.monotonic()
                 self._pending_appends.move_to_end(key)
+
+    def _append_to_window_locked(
+        self,
+        *,
+        entries: OrderedDict[str, _TimelineWindow],
+        key: str,
+        project_id: str,
+        resource_id: str,
+        limit: int,
+        pool_limit: int,
+        event: dict[str, Any],
+    ) -> None:
+        window = entries.get(key)
+        if window is None:
+            now = time.monotonic()
+            window = _TimelineWindow(
+                project_id=str(project_id),
+                resource_id=str(resource_id),
+                authority_generation=0,
+                rows=deque(maxlen=max(1, int(limit))),
+                stored_at=now,
+                validated_at=now,
+                cold_complete=False,
+            )
+            entries[key] = window
+        self._append_to_existing_window_locked(
+            entries=entries,
+            key=key,
+            window=window,
+            event=event,
+        )
+        self._enforce_window_limit_locked(
+            entries=entries,
+            pool_limit=pool_limit,
+        )
+
+    def _enforce_window_limit_locked(
+        self,
+        *,
+        entries: OrderedDict[str, _TimelineWindow],
+        pool_limit: int,
+    ) -> None:
+        while len(entries) > pool_limit:
+            victim = next(
+                (
+                    candidate_key
+                    for candidate_key, candidate
+                    in entries.items()
+                    if candidate.cold_complete
+                ),
+                next(iter(entries)),
+            )
+            entries.pop(victim, None)
+            self._evictions += 1
+
+    @staticmethod
+    def _append_to_existing_window_locked(
+        *,
+        entries: OrderedDict[str, _TimelineWindow],
+        key: str,
+        window: _TimelineWindow,
+        event: dict[str, Any],
+    ) -> None:
+        event_id = int(event.get("id") or 0)
+        retained = [
+            row
+            for row in window.rows
+            if int(row.get("id") or 0) != event_id
+        ]
+        retained.append(deepcopy(event))
+        retained.sort(
+            key=lambda row: int(row.get("id") or 0),
+            reverse=True,
+        )
+        window.rows.clear()
+        window.rows.extend(retained[: window.rows.maxlen])
+        window.authority_generation = max(
+            window.authority_generation,
+            event_id,
+        )
+        window.stored_at = time.monotonic()
+        window.validated_at = window.stored_at
+        entries.move_to_end(key)
 
     def _metrics(
         self,
@@ -503,6 +734,23 @@ class DashboardTimelineReadCache:
                 "cold_load_append_merge": True,
                 "merged_append_count": int(merged_append_count),
                 "generation_never_regresses": True,
+                "admission_backpressure": "bounded_semaphore",
+                "admission_waiter_state": "fixed_per_pool_counters",
+                "admission_waiters": (
+                    self._current_admission_waiters
+                    if pool == "current"
+                    else self._playback_admission_waiters
+                ),
+                "in_flight_count": self._pool_in_flight_count_locked(pool),
+                "in_flight_limit": self._pool_limit(pool),
+                "pending_append_count": self._pool_pending_count_locked(pool),
+                "pending_append_limit": self._pool_limit(pool),
+                "global_in_flight_count": len(self._in_flight),
+                "global_pending_append_count": len(self._pending_appends),
+                "global_admission_limit": (
+                    self.current_project_limit
+                    + self.playback_resource_limit
+                ),
                 "prewarm_source": (
                     "process_memory"
                     if hit

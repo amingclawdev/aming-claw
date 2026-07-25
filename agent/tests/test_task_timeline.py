@@ -1,7 +1,12 @@
 """Tests for task implementation timeline evidence."""
 
 import copy
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    CancelledError,
+    ThreadPoolExecutor,
+    wait,
+)
 import hashlib
 import json
 import os
@@ -14089,6 +14094,556 @@ class TestTaskTimeline(unittest.TestCase):
                 for rows, metrics in results:
                     self.assertEqual([row["id"] for row in rows], expected_ids)
                     self.assertEqual(metrics["authority_generation"], 61)
+
+    def test_cold_admission_three_distinct_keys_never_exceeds_pool_limit(self):
+        from agent.governance.dashboard_read_cache import DashboardTimelineReadCache
+
+        cache = DashboardTimelineReadCache(
+            current_window_limit=3,
+            current_project_limit=2,
+            playback_resource_limit=1,
+        )
+        started = {
+            project_id: threading.Event()
+            for project_id in ("project-a", "project-b", "project-c")
+        }
+        release = {
+            project_id: threading.Event()
+            for project_id in ("project-a", "project-b", "project-c")
+        }
+        observed: list[tuple[int, int, int, int]] = []
+        observed_lock = threading.Lock()
+
+        def load(project_id):
+            def loader():
+                with cache._lock:
+                    snapshot = (
+                        len(cache._in_flight),
+                        len(cache._pending_appends),
+                        cache._pool_in_flight_count_locked("current"),
+                        cache._pool_pending_count_locked("current"),
+                    )
+                with observed_lock:
+                    observed.append(snapshot)
+                started[project_id].set()
+                if not release[project_id].wait(timeout=3.0):
+                    raise AssertionError(f"did not release {project_id}")
+                return [{"id": 1, "project_id": project_id, "backlog_id": "A"}]
+
+            return cache.load_current(
+                database_scope="db",
+                project_id=project_id,
+                authority_generation=1,
+                loader=loader,
+            )
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            first = executor.submit(load, "project-a")
+            second = executor.submit(load, "project-b")
+            self.assertTrue(started["project-a"].wait(timeout=2.0))
+            self.assertTrue(started["project-b"].wait(timeout=2.0))
+            third = executor.submit(load, "project-c")
+            deadline = time.monotonic() + 2.0
+            while (
+                cache._current_admission_waiters < 1
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            self.assertEqual(cache._current_admission_waiters, 1)
+            self.assertFalse(started["project-c"].is_set())
+            with cache._lock:
+                self.assertEqual(len(cache._in_flight), 2)
+                self.assertEqual(len(cache._pending_appends), 2)
+                self.assertEqual(
+                    cache._pool_in_flight_count_locked("current"),
+                    2,
+                )
+                self.assertEqual(
+                    cache._pool_pending_count_locked("current"),
+                    2,
+                )
+
+            cache.append(
+                {
+                    "id": 5,
+                    "project_id": "project-c",
+                    "backlog_id": "A",
+                },
+                database_scope="db",
+            )
+            self.assertFalse(started["project-c"].is_set())
+            release["project-a"].set()
+            self.assertTrue(started["project-c"].wait(timeout=2.0))
+            release["project-b"].set()
+            release["project-c"].set()
+
+            first.result(timeout=3.0)
+            second.result(timeout=3.0)
+            third_rows, third_metrics = third.result(timeout=3.0)
+
+        self.assertEqual([row["id"] for row in third_rows], [5, 1])
+        self.assertEqual(third_metrics["authority_generation"], 5)
+        self.assertTrue(observed)
+        self.assertLessEqual(max(row[0] for row in observed), 3)
+        self.assertLessEqual(max(row[1] for row in observed), 3)
+        self.assertLessEqual(max(row[2] for row in observed), 2)
+        self.assertLessEqual(max(row[3] for row in observed), 2)
+        self.assertEqual(cache._in_flight, {})
+        self.assertEqual(cache._pending_appends, {})
+
+    def test_many_key_cold_admission_is_bounded_and_eventually_newest_fifty(self):
+        from agent.governance.dashboard_read_cache import DashboardTimelineReadCache
+
+        cache = DashboardTimelineReadCache(
+            current_window_limit=50,
+            playback_window_limit=50,
+            current_project_limit=2,
+            playback_resource_limit=2,
+        )
+        observed = {
+            "global_in_flight": 0,
+            "global_pending": 0,
+            "current_in_flight": 0,
+            "current_pending": 0,
+            "playback_in_flight": 0,
+            "playback_pending": 0,
+        }
+        observed_lock = threading.Lock()
+
+        def observe():
+            with cache._lock:
+                snapshot = {
+                    "global_in_flight": len(cache._in_flight),
+                    "global_pending": len(cache._pending_appends),
+                    "current_in_flight": (
+                        cache._pool_in_flight_count_locked("current")
+                    ),
+                    "current_pending": (
+                        cache._pool_pending_count_locked("current")
+                    ),
+                    "playback_in_flight": (
+                        cache._pool_in_flight_count_locked("playback")
+                    ),
+                    "playback_pending": (
+                        cache._pool_pending_count_locked("playback")
+                    ),
+                }
+            with observed_lock:
+                for key, value in snapshot.items():
+                    observed[key] = max(observed[key], value)
+
+        def run(pool, index):
+            project_id = f"{pool}-project-{index}"
+            backlog_id = f"{pool}-backlog-{index}"
+            first_id = index * 1000 + 1
+
+            def loader():
+                observe()
+                time.sleep(0.005)
+                return [
+                    {
+                        "id": first_id + offset,
+                        "project_id": project_id,
+                        "backlog_id": backlog_id,
+                    }
+                    for offset in range(59, -1, -1)
+                ]
+
+            if pool == "current":
+                return (
+                    pool,
+                    project_id,
+                    backlog_id,
+                    cache.load_current(
+                        database_scope="db",
+                        project_id=project_id,
+                        authority_generation=first_id,
+                        loader=loader,
+                    ),
+                )
+            return (
+                pool,
+                project_id,
+                backlog_id,
+                cache.load_playback(
+                    database_scope="db",
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    authority_generation=first_id,
+                    loader=loader,
+                ),
+            )
+
+        requests = [
+            (pool, index)
+            for index in range(12)
+            for pool in ("current", "playback")
+        ]
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            futures = [
+                executor.submit(run, pool, index)
+                for pool, index in requests
+            ]
+            results = [future.result(timeout=8.0) for future in futures]
+
+        self.assertLessEqual(observed["global_in_flight"], 4)
+        self.assertLessEqual(observed["global_pending"], 4)
+        self.assertLessEqual(observed["current_in_flight"], 2)
+        self.assertLessEqual(observed["current_pending"], 2)
+        self.assertLessEqual(observed["playback_in_flight"], 2)
+        self.assertLessEqual(observed["playback_pending"], 2)
+        for pool, project_id, backlog_id, (rows, metrics) in results:
+            expected_last = (
+                int(project_id.rsplit("-", 1)[1]) * 1000 + 60
+            )
+            self.assertEqual(
+                [row["id"] for row in rows],
+                list(range(expected_last, expected_last - 50, -1)),
+            )
+            self.assertTrue(
+                all(row["project_id"] == project_id for row in rows)
+            )
+            self.assertTrue(
+                all(row["backlog_id"] == backlog_id for row in rows)
+            )
+            self.assertEqual(metrics["in_flight_limit"], 2)
+            self.assertEqual(metrics["pending_append_limit"], 2)
+            self.assertEqual(metrics["global_admission_limit"], 4)
+            self.assertEqual(
+                metrics["admission_backpressure"],
+                "bounded_semaphore",
+            )
+        self.assertEqual(cache._in_flight, {})
+        self.assertEqual(cache._pending_appends, {})
+
+    def test_cold_admission_failure_cancellation_and_clear_wake_waiters(self):
+        from agent.governance.dashboard_read_cache import DashboardTimelineReadCache
+
+        cache = DashboardTimelineReadCache(
+            current_window_limit=3,
+            current_project_limit=1,
+            playback_resource_limit=1,
+        )
+        cancelled_started = threading.Event()
+        release_cancelled = threading.Event()
+        waiting_started = threading.Event()
+
+        def cancelled_loader():
+            cancelled_started.set()
+            if not release_cancelled.wait(timeout=3.0):
+                raise AssertionError("did not release cancelled loader")
+            raise CancelledError("deterministic loader cancellation")
+
+        def waiting_loader():
+            waiting_started.set()
+            return [{"id": 1, "project_id": "project-b", "backlog_id": "B"}]
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            cancelled = executor.submit(
+                cache.load_current,
+                database_scope="db",
+                project_id="project-a",
+                authority_generation=1,
+                loader=cancelled_loader,
+            )
+            self.assertTrue(cancelled_started.wait(timeout=2.0))
+            waiting = executor.submit(
+                cache.load_current,
+                database_scope="db",
+                project_id="project-b",
+                authority_generation=1,
+                loader=waiting_loader,
+            )
+            deadline = time.monotonic() + 2.0
+            while (
+                cache._current_admission_waiters < 1
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            cache.append(
+                {
+                    "id": 4,
+                    "project_id": "project-b",
+                    "backlog_id": "B",
+                },
+                database_scope="db",
+            )
+            self.assertFalse(waiting_started.is_set())
+            release_cancelled.set()
+            with self.assertRaises(CancelledError):
+                cancelled.result(timeout=3.0)
+            waiting_rows, _ = waiting.result(timeout=3.0)
+
+        self.assertTrue(waiting_started.is_set())
+        self.assertEqual([row["id"] for row in waiting_rows], [4, 1])
+
+        clear_cache = DashboardTimelineReadCache(
+            current_window_limit=3,
+            current_project_limit=1,
+            playback_resource_limit=1,
+        )
+        leader_started = threading.Event()
+        release_leader = threading.Event()
+        after_clear_started = threading.Event()
+
+        def blocked_loader():
+            leader_started.set()
+            if not release_leader.wait(timeout=3.0):
+                raise AssertionError("did not release pre-clear loader")
+            return [{"id": 1, "project_id": "project-a"}]
+
+        def after_clear_loader():
+            after_clear_started.set()
+            return [{"id": 1, "project_id": "project-b"}]
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            leader = executor.submit(
+                clear_cache.load_current,
+                database_scope="db",
+                project_id="project-a",
+                authority_generation=1,
+                loader=blocked_loader,
+            )
+            self.assertTrue(leader_started.wait(timeout=2.0))
+            after_clear = executor.submit(
+                clear_cache.load_current,
+                database_scope="db",
+                project_id="project-b",
+                authority_generation=1,
+                loader=after_clear_loader,
+            )
+            deadline = time.monotonic() + 2.0
+            while (
+                clear_cache._current_admission_waiters < 1
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            clear_cache.clear()
+            self.assertTrue(after_clear_started.wait(timeout=2.0))
+            release_leader.set()
+            leader.result(timeout=3.0)
+            after_clear_rows, _ = after_clear.result(timeout=3.0)
+
+        self.assertEqual([row["id"] for row in after_clear_rows], [1])
+        self.assertEqual(clear_cache._in_flight, {})
+        self.assertEqual(clear_cache._pending_appends, {})
+
+    def test_cold_admission_old_waiter_completes_under_repeated_new_arrivals(self):
+        from agent.governance.dashboard_read_cache import DashboardTimelineReadCache
+
+        cache = DashboardTimelineReadCache(
+            current_window_limit=3,
+            current_project_limit=1,
+            playback_resource_limit=1,
+        )
+        self.assertFalse(hasattr(cache, "_admission_waiters"))
+        self.assertFalse(hasattr(cache, "_admission_queues"))
+        leader_started = threading.Event()
+        release_leader = threading.Event()
+        sentinel_started = threading.Event()
+        stop_churn = threading.Event()
+        observed_max = 0
+        observed_lock = threading.Lock()
+
+        def observe_and_rows(project_id):
+            nonlocal observed_max
+            with cache._lock:
+                active = len(cache._in_flight)
+            with observed_lock:
+                observed_max = max(observed_max, active)
+            return [{"id": 1, "project_id": project_id}]
+
+        def leader_loader():
+            leader_started.set()
+            if not release_leader.wait(timeout=3.0):
+                raise AssertionError("did not release fairness leader")
+            return observe_and_rows("leader")
+
+        def sentinel_loader():
+            sentinel_started.set()
+            return observe_and_rows("sentinel")
+
+        def churn(worker_index):
+            completed = 0
+            while not stop_churn.is_set() and completed < 40:
+                project_id = f"churn-{worker_index}-{completed}"
+                cache.load_current(
+                    database_scope="db",
+                    project_id=project_id,
+                    authority_generation=1,
+                    loader=lambda project_id=project_id: (
+                        time.sleep(0.001)
+                        or observe_and_rows(project_id)
+                    ),
+                )
+                completed += 1
+            return completed
+
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            leader = executor.submit(
+                cache.load_current,
+                database_scope="db",
+                project_id="leader",
+                authority_generation=1,
+                loader=leader_loader,
+            )
+            self.assertTrue(leader_started.wait(timeout=2.0))
+            sentinel = executor.submit(
+                cache.load_current,
+                database_scope="db",
+                project_id="sentinel",
+                authority_generation=1,
+                loader=sentinel_loader,
+            )
+            deadline = time.monotonic() + 2.0
+            while (
+                cache._current_admission_waiters < 1
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            self.assertEqual(cache._current_admission_waiters, 1)
+            churners = [
+                executor.submit(churn, worker_index)
+                for worker_index in range(4)
+            ]
+            deadline = time.monotonic() + 2.0
+            while (
+                cache._current_admission_waiters < 5
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            release_leader.set()
+            self.assertTrue(
+                sentinel_started.wait(timeout=2.0),
+                "oldest waiter starved behind repeated new arrivals",
+            )
+            sentinel_rows, _ = sentinel.result(timeout=2.0)
+            stop_churn.set()
+            leader.result(timeout=2.0)
+            for churner in churners:
+                churner.result(timeout=3.0)
+
+        self.assertEqual([row["id"] for row in sentinel_rows], [1])
+        self.assertLessEqual(observed_max, 1)
+        self.assertIsInstance(cache._current_admission_waiters, int)
+        self.assertIsInstance(cache._playback_admission_waiters, int)
+        self.assertEqual(cache._in_flight, {})
+        self.assertEqual(cache._pending_appends, {})
+
+    def test_cold_incomplete_lru_eviction_preserves_active_or_uses_durable_load(self):
+        from agent.governance.dashboard_read_cache import DashboardTimelineReadCache
+
+        cache = DashboardTimelineReadCache(
+            current_window_limit=3,
+            current_project_limit=2,
+            playback_resource_limit=2,
+        )
+        for event_id, project_id in (
+            (10, "project-a"),
+            (20, "project-b"),
+            (30, "project-c"),
+        ):
+            cache.append(
+                {
+                    "id": event_id,
+                    "project_id": project_id,
+                    "backlog_id": f"backlog-{project_id}",
+                },
+                database_scope="db",
+            )
+
+        with cache._lock:
+            self.assertEqual(len(cache._current), 2)
+            self.assertTrue(
+                all(
+                    not window.cold_complete
+                    for window in cache._current.values()
+                )
+            )
+            self.assertNotIn(
+                cache._current_key("db", "project-a"),
+                cache._current,
+            )
+
+        recovered, _ = cache.load_current(
+            database_scope="db",
+            project_id="project-a",
+            authority_generation=10,
+            loader=lambda: [
+                {
+                    "id": 10,
+                    "project_id": "project-a",
+                    "backlog_id": "backlog-project-a",
+                },
+                {
+                    "id": 9,
+                    "project_id": "project-a",
+                    "backlog_id": "backlog-project-a",
+                },
+            ],
+        )
+        self.assertEqual([row["id"] for row in recovered], [10, 9])
+
+        active_cache = DashboardTimelineReadCache(
+            current_window_limit=3,
+            current_project_limit=1,
+            playback_resource_limit=1,
+        )
+        active_started = threading.Event()
+        release_active = threading.Event()
+
+        def stale_active_loader():
+            active_started.set()
+            if not release_active.wait(timeout=3.0):
+                raise AssertionError("did not release active loader")
+            return [
+                {
+                    "id": 1,
+                    "project_id": "project-active",
+                    "backlog_id": "active",
+                }
+            ]
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            active = executor.submit(
+                active_cache.load_current,
+                database_scope="db",
+                project_id="project-active",
+                authority_generation=1,
+                loader=stale_active_loader,
+            )
+            self.assertTrue(active_started.wait(timeout=2.0))
+            active_cache.append(
+                {
+                    "id": 5,
+                    "project_id": "project-active",
+                    "backlog_id": "active",
+                },
+                database_scope="db",
+            )
+            active_cache.append(
+                {
+                    "id": 6,
+                    "project_id": "project-other",
+                    "backlog_id": "other",
+                },
+                database_scope="db",
+            )
+            with active_cache._lock:
+                self.assertNotIn(
+                    active_cache._current_key("db", "project-active"),
+                    active_cache._current,
+                )
+                active_pending = active_cache._pending_appends[
+                    active_cache._current_key("db", "project-active")
+                ]
+                self.assertEqual(sorted(active_pending.rows), [5])
+                self.assertEqual(len(active_cache._pending_appends), 1)
+                self.assertEqual(len(active_cache._in_flight), 1)
+            release_active.set()
+            active_rows, _ = active.result(timeout=3.0)
+
+        self.assertEqual([row["id"] for row in active_rows], [5, 1])
 
     def test_recent_current_deque_prewarms_50_and_append_avoids_cold_reload(self):
         from agent.governance import server, task_timeline
