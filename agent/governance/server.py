@@ -70262,13 +70262,33 @@ def _contract_runtime_completed_merge_reconcile_authority(
     reconcile_scope = _contract_runtime_projection_timeline_scope_values(
         reconcile_event
     )
+    reconcile_source_ref = _runtime_context_event_ref(reconcile_event)
+    reconcile_event_id = _contract_runtime_projection_timeline_event_id(
+        reconcile_event
+    )
+    audit_authority = (
+        trusted_merge.get("qa_audit_only_no_pass_authority")
+        if isinstance(
+            trusted_merge.get("qa_audit_only_no_pass_authority"), Mapping
+        )
+        else {}
+    )
+    expected_reconcile_event_ref = str(
+        audit_authority.get("expected_reconcile_event_ref") or ""
+    ).strip()
+    if expected_reconcile_event_ref and (
+        expected_reconcile_event_ref != reconcile_source_ref
+    ):
+        return trusted_merge
+    if audit_authority and reconcile_event_id <= int(
+        trusted_merge.get("merge_event_id") or 0
+    ):
+        return trusted_merge
     reconcile_projection = {
         "timeline_verified": True,
         "allow_taskless_reconcile": allow_taskless_reconcile,
-        "reconcile_source_ref": _runtime_context_event_ref(reconcile_event),
-        "reconcile_event_id": (
-            _contract_runtime_projection_timeline_event_id(reconcile_event)
-        ),
+        "reconcile_source_ref": reconcile_source_ref,
+        "reconcile_event_id": reconcile_event_id,
         "reconcile_event_created_at": (
             _contract_runtime_projection_timeline_event_time(reconcile_event)
         ),
@@ -70564,6 +70584,7 @@ def _contract_runtime_audit_only_no_pass_bypass_round_authority(
         "disposition": "proceeded_with_exception",
         "no_pass_claim": True,
     }
+    qa_ref_claim = str(chain.get("source_qa_event_ref") or "").strip()
     merge_ref = str(chain.get("source_merge_event_ref") or "").strip()
     reconcile_ref = str(chain.get("source_reconcile_event_ref") or "").strip()
     if not (
@@ -70572,9 +70593,15 @@ def _contract_runtime_audit_only_no_pass_bypass_round_authority(
         and all(chain.get(key) == value for key, value in binding_shape.items())
         and all(policy.get(key) == value for key, value in binding_shape.items())
         and policy.get("keep_open") is True
-        and str(chain.get("source_qa_event_ref") or "") == qa_ref
-        and re.fullmatch(r"timeline:\d+", merge_ref)
-        and (not reconcile_ref or re.fullmatch(r"timeline:\d+", reconcile_ref))
+        and (not qa_ref_claim or qa_ref_claim == qa_ref)
+        and (not merge_ref or re.fullmatch(r"timeline:\d+", merge_ref))
+        and (
+            not reconcile_ref
+            or (
+                merge_ref
+                and re.fullmatch(r"timeline:\d+", reconcile_ref)
+            )
+        )
     ):
         return {}
 
@@ -70734,7 +70761,8 @@ def _contract_runtime_audit_only_no_pass_bypass_round_authority(
     if not (
         event_identity(bypass_event) == expected_event_identity
         and event_identity(diagnostic_event) == expected_event_identity
-        and qa_event_id < bypass_event_id < diagnostic_event_id < merge_event_id
+        and qa_event_id < bypass_event_id < diagnostic_event_id
+        and (not merge_ref or diagnostic_event_id < merge_event_id)
         and (not reconcile_ref or merge_event_id < reconcile_event_id)
     ):
         return {}
@@ -70770,6 +70798,14 @@ def _contract_runtime_audit_only_no_pass_bypass_round_authority(
         "qa_event_created_at": qa_created_at,
         "diagnostic_backlog_id": diagnostic_id,
         "diagnostic_status": diagnostic_status,
+        "diagnostic_event_ref": _runtime_context_event_ref(diagnostic_event),
+        "diagnostic_event_id": diagnostic_event_id,
+        "source_reference_mode": (
+            "explicit_post_diagnostic_event_refs"
+            if merge_ref
+            else "server_derived_post_diagnostic_events"
+        ),
+        "historical_diagnostic_backfill_required": False,
         "expected_merge_event_ref": merge_ref,
         "expected_reconcile_event_ref": reconcile_ref,
     }
@@ -71153,6 +71189,13 @@ def _contract_runtime_observer_merge_durable_authority(
                 audit_authority.get("expected_merge_event_ref") or ""
             ).strip()
             if expected_merge_event_ref and expected_merge_event_ref != event_ref:
+                continue
+            diagnostic_event_id = int(
+                audit_authority.get("diagnostic_event_id") or 0
+            )
+            if audit_authority and (
+                diagnostic_event_id <= 0 or event_id <= diagnostic_event_id
+            ):
                 continue
             candidates.append(
                 {

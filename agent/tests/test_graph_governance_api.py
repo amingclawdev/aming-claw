@@ -73330,6 +73330,56 @@ def test_contract_runtime_recovers_exact_audit_only_qa_bypass_round(
     assert bound["payload"]["overall_release_pass_claimed"] is False
     assert bound["payload"]["close_satisfying"] is False
 
+    # Atomic audited bypass diagnostics are created before the observer merge
+    # and reconcile exist.  Their immutable binding may therefore omit those
+    # future timeline refs.  The server must derive the unique later merge
+    # from the durable queue and timeline instead of requiring a historical
+    # diagnostic backfill.
+    immutable_premerge_chain = json.dumps(exact_binding)
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (immutable_premerge_chain, diagnostic_id),
+    )
+    conn.commit()
+    immutable_bound = server._contract_runtime_bind_observer_merge_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        write=write,
+    )
+    immutable_audit = immutable_bound["payload"][
+        "qa_audit_only_no_pass_authority"
+    ]
+    assert immutable_audit["source_reference_mode"] == (
+        "server_derived_post_diagnostic_events"
+    )
+    assert immutable_audit["historical_diagnostic_backfill_required"] is False
+    assert immutable_audit["diagnostic_event_ref"] == (
+        f"timeline:{diagnostic_event['id']}"
+    )
+    assert immutable_bound["payload"]["durable_merge_authority"][
+        "merge_event_ref"
+    ] == f"timeline:{merge_event['id']}"
+    persisted_premerge_chain = conn.execute(
+        "SELECT chain_trigger_json FROM backlog_bugs WHERE bug_id = ?",
+        (diagnostic_id,),
+    ).fetchone()[0]
+    assert persisted_premerge_chain == immutable_premerge_chain
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                {
+                    **exact_binding,
+                    "source_qa_event_ref": f"timeline:{qa_event['id']}",
+                    "source_merge_event_ref": f"timeline:{merge_event['id']}",
+                }
+            ),
+            diagnostic_id,
+        ),
+    )
+    conn.commit()
+
     merged_record = json.loads(json.dumps(record))
     merged_record["completed_lines"].append(bound)
     timeline_events = task_timeline.list_events(
