@@ -17,7 +17,7 @@ import sqlite3
 import threading
 import time
 from typing import Any, Mapping
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from .contracts.runtime import (
     _current_projection_from_row,
@@ -1486,63 +1486,379 @@ def _run_service_router_hook(conn: sqlite3.Connection, inserted_event: dict[str,
         log.debug("service router timeline hook failed", exc_info=True)
 
 
+_COMMIT_IDENTITY_FIELDS = (
+    "id",
+    "project_id",
+    "backlog_id",
+    "mf_id",
+    "task_id",
+    "attempt_num",
+    "event_type",
+    "phase",
+    "event_kind",
+    "scenario_id",
+    "parent_event_id",
+    "correlation_id",
+    "severity",
+    "decision",
+    "schema_version",
+    "actor",
+    "status",
+    "payload",
+    "verification",
+    "artifact_refs",
+    "trace_id",
+    "commit_sha",
+    "created_at",
+)
+
+
+def _timeline_event_commit_identity(event: Mapping[str, Any]) -> str:
+    projection = {
+        field: event.get(field)
+        for field in _COMMIT_IDENTITY_FIELDS
+    }
+    return hashlib.sha256(
+        json.dumps(
+            projection,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _timeline_connection_database_path(conn: sqlite3.Connection) -> str:
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error:
+        return ""
+    for row in rows:
+        try:
+            name = str(row["name"])
+            path = str(row["file"])
+        except (IndexError, TypeError):
+            name = str(row[1] if len(row) > 1 else "")
+            path = str(row[2] if len(row) > 2 else "")
+        if name == "main":
+            return path
+    return ""
+
+
+def _publish_committed_timeline_event(inserted_event: dict[str, Any]) -> None:
+    from agent.governance.dashboard_read_cache import TIMELINE_READ_CACHE
+    from agent.governance import event_bus
+
+    TIMELINE_READ_CACHE.append(dict(inserted_event))
+    payload = {
+        "project_id": _text(inserted_event.get("project_id")),
+        "backlog_id": _text(inserted_event.get("backlog_id")),
+        "task_id": _text(inserted_event.get("task_id")),
+        "event_id": inserted_event.get("id", ""),
+        "event_type": _text(inserted_event.get("event_type")),
+        "event_kind": _text(inserted_event.get("event_kind")),
+        "phase": _text(inserted_event.get("phase")),
+        "status": _text(inserted_event.get("status")),
+    }
+    for key in (
+        "contract_execution_id",
+        "contract_chain_id",
+        "contract_revision_id",
+        "runtime_context_id",
+    ):
+        value = _first_deep_text(inserted_event, key)
+        if value:
+            payload[key] = value
+    revision = _first_deep_value(inserted_event, "execution_state_revision")
+    try:
+        revision = int(revision or 0)
+    except (TypeError, ValueError):
+        revision = 0
+    if revision:
+        payload["execution_state_revision"] = revision
+    event_bus._bus.publish("task_timeline.appended", payload)
+    event_bus._bus.publish(
+        "current_task.changed",
+        {
+            **payload,
+            "source": "task_timeline.record_event",
+            "runtime_state": payload["status"],
+        },
+    )
+    if payload.get("contract_execution_id"):
+        event_bus._bus.publish(
+            "contract_runtime.changed",
+            {
+                **payload,
+                "source": "task_timeline.record_event",
+            },
+        )
+    if payload.get("contract_chain_id"):
+        event_bus._bus.publish(
+            "contract_chain.current_changed",
+            {
+                **payload,
+                "source": "task_timeline.record_event",
+            },
+        )
+    if payload.get("runtime_context_id"):
+        event_bus._bus.publish(
+            "runtime_context.changed",
+            {
+                **payload,
+                "source": "task_timeline.record_event",
+            },
+        )
+
+
+class _CommittedTimelinePublisher:
+    """Publish only rows that another SQLite connection can observe.
+
+    ``record_event`` participates in caller-owned transactions, so it cannot
+    know whether the caller will commit or roll back.  This bounded verifier
+    waits for the exact inserted row to become durable before mutating hot
+    deques or emitting process events.  A rolled-back id that is later reused
+    with different content is discarded instead of becoming a phantom.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_pending: int = 4096,
+        visibility_timeout_seconds: float = 30.0,
+    ) -> None:
+        self._queue: queue.Queue[dict[str, Any]] = queue.Queue(
+            maxsize=max(1, int(max_pending))
+        )
+        self._visibility_timeout_seconds = max(
+            1.0,
+            float(visibility_timeout_seconds),
+        )
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._idle = threading.Event()
+        self._idle.set()
+        self._outstanding = 0
+
+    def defer_committing(
+        self,
+        database_path: str,
+        inserted_event: Mapping[str, Any],
+    ) -> bool:
+        event = dict(inserted_event)
+        event_id = int(event.get("id") or 0)
+        if not database_path or event_id <= 0:
+            return False
+        item = {
+            "database_path": database_path,
+            "event_id": event_id,
+            "identity": _timeline_event_commit_identity(event),
+            "deadline": time.monotonic() + self._visibility_timeout_seconds,
+        }
+        self._ensure_started()
+        with self._lock:
+            self._outstanding += 1
+            self._idle.clear()
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            self._complete()
+            log.warning("timeline post-commit publisher queue is full")
+            return False
+        return True
+
+    def wait_for_idle(self, timeout: float = 5.0) -> bool:
+        return self._idle.wait(max(0.0, float(timeout)))
+
+    def _ensure_started(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(
+                target=self._run,
+                name="task-timeline-post-commit-publisher",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _complete(self) -> None:
+        with self._lock:
+            self._outstanding = max(0, self._outstanding - 1)
+            if self._outstanding == 0:
+                self._idle.set()
+
+    @staticmethod
+    def _visible_event(item: Mapping[str, Any]) -> tuple[str, dict[str, Any] | None]:
+        try:
+            conn = sqlite3.connect(
+                "file:{}?mode=ro".format(
+                    quote(
+                        str(item.get("database_path") or ""),
+                        safe="/",
+                    )
+                ),
+                timeout=0.1,
+                uri=True,
+            )
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT * FROM task_timeline_events WHERE id = ?",
+                    (int(item.get("event_id") or 0),),
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return "pending", None
+        if row is None:
+            return "pending", None
+        event = _row_to_dict(row)
+        if _timeline_event_commit_identity(event) != str(item.get("identity") or ""):
+            return "mismatch", None
+        return "committed", event
+
+    def _run(self) -> None:
+        pending: list[dict[str, Any]] = []
+        while True:
+            try:
+                pending.append(
+                    self._queue.get(timeout=0.01 if pending else 1.0)
+                )
+                self._queue.task_done()
+                while True:
+                    pending.append(self._queue.get_nowait())
+                    self._queue.task_done()
+            except queue.Empty:
+                pass
+            now = time.monotonic()
+            retained: list[dict[str, Any]] = []
+            for item in pending:
+                state, event = self._visible_event(item)
+                if state == "committed" and event is not None:
+                    try:
+                        _publish_committed_timeline_event(event)
+                    except Exception:
+                        log.debug(
+                            "committed timeline event publish failed",
+                            exc_info=True,
+                        )
+                    self._complete()
+                elif state == "mismatch" or now >= float(item["deadline"]):
+                    self._complete()
+                else:
+                    retained.append(item)
+            pending = retained
+            if pending:
+                time.sleep(0.005)
+
+
+_POST_COMMIT_PUBLISHER = _CommittedTimelinePublisher()
+_TRANSACTION_PUBLISH_LOCK = threading.Lock()
+_TRANSACTION_PUBLISH_PENDING: dict[int, dict[str, Any]] = {}
+_TRANSACTION_PUBLISH_CLEANER: threading.Thread | None = None
+
+
+def _ensure_transaction_publish_cleaner() -> None:
+    global _TRANSACTION_PUBLISH_CLEANER
+    with _TRANSACTION_PUBLISH_LOCK:
+        if (
+            _TRANSACTION_PUBLISH_CLEANER is not None
+            and _TRANSACTION_PUBLISH_CLEANER.is_alive()
+        ):
+            return
+
+        def clean_abandoned_transactions() -> None:
+            while True:
+                time.sleep(30.0)
+                cutoff = time.monotonic() - 300.0
+                with _TRANSACTION_PUBLISH_LOCK:
+                    for connection_id in [
+                        pending_id
+                        for pending_id, pending in (
+                            _TRANSACTION_PUBLISH_PENDING.items()
+                        )
+                        if float(pending.get("registered_at") or 0.0) < cutoff
+                    ]:
+                        _TRANSACTION_PUBLISH_PENDING.pop(connection_id, None)
+
+        _TRANSACTION_PUBLISH_CLEANER = threading.Thread(
+            target=clean_abandoned_transactions,
+            name="task-timeline-transaction-publish-cleaner",
+            daemon=True,
+        )
+        _TRANSACTION_PUBLISH_CLEANER.start()
+
+
+def _defer_timeline_event_until_commit(
+    conn: sqlite3.Connection,
+    inserted_event: Mapping[str, Any],
+) -> bool:
+    """Buffer one event on its connection until SQLite begins COMMIT.
+
+    A trace callback is intentionally used only as the transaction boundary
+    signal.  The callback never publishes: it hands committed candidates to
+    the separate-connection verifier, which waits until COMMIT is actually
+    visible before touching process state.  ROLLBACK drops the buffer without
+    starting any filesystem work.
+    """
+
+    database_path = _timeline_connection_database_path(conn)
+    if not database_path:
+        return False
+    _ensure_transaction_publish_cleaner()
+    connection_id = id(conn)
+    now = time.monotonic()
+    with _TRANSACTION_PUBLISH_LOCK:
+        for stale_id in [
+            pending_id
+            for pending_id, pending in _TRANSACTION_PUBLISH_PENDING.items()
+            if now - float(pending.get("registered_at") or now) > 300.0
+        ]:
+            _TRANSACTION_PUBLISH_PENDING.pop(stale_id, None)
+        pending = _TRANSACTION_PUBLISH_PENDING.get(connection_id)
+        if pending is None or pending.get("connection") is not conn:
+            pending = {
+                "connection": conn,
+                "database_path": database_path,
+                "events": [],
+                "registered_at": now,
+            }
+            _TRANSACTION_PUBLISH_PENDING[connection_id] = pending
+        pending["registered_at"] = now
+        pending["events"].append(dict(inserted_event))
+
+    def transaction_trace(statement: str) -> None:
+        command = str(statement or "").strip().upper()
+        if command != "COMMIT" and not command.startswith("ROLLBACK"):
+            return
+        with _TRANSACTION_PUBLISH_LOCK:
+            transaction = _TRANSACTION_PUBLISH_PENDING.pop(
+                connection_id,
+                None,
+            )
+        if command != "COMMIT" or not transaction:
+            return
+        for event in transaction.get("events") or []:
+            _POST_COMMIT_PUBLISHER.defer_committing(
+                str(transaction.get("database_path") or ""),
+                event,
+            )
+
+    conn.set_trace_callback(transaction_trace)
+    return True
+
+
 def _publish_timeline_event(
     inserted_event: dict[str, Any],
     *,
     conn: sqlite3.Connection | None = None,
 ) -> None:
     try:
-        from agent.governance.dashboard_read_cache import TIMELINE_READ_CACHE
-        from agent.governance import event_bus
-
-        TIMELINE_READ_CACHE.append(dict(inserted_event))
-        payload = {
-            "project_id": _text(inserted_event.get("project_id")),
-            "backlog_id": _text(inserted_event.get("backlog_id")),
-            "task_id": _text(inserted_event.get("task_id")),
-            "event_id": inserted_event.get("id", ""),
-            "event_type": _text(inserted_event.get("event_type")),
-            "event_kind": _text(inserted_event.get("event_kind")),
-            "phase": _text(inserted_event.get("phase")),
-            "status": _text(inserted_event.get("status")),
-        }
-        for key in (
-            "contract_execution_id",
-            "contract_chain_id",
-            "contract_revision_id",
-            "runtime_context_id",
-        ):
-            value = _first_deep_text(inserted_event, key)
-            if value:
-                payload[key] = value
-        revision = _first_deep_value(inserted_event, "execution_state_revision")
-        try:
-            revision = int(revision or 0)
-        except (TypeError, ValueError):
-            revision = 0
-        if revision:
-            payload["execution_state_revision"] = revision
-        event_bus._bus.publish("task_timeline.appended", payload)
-        event_bus._bus.publish("current_task.changed", {
-            **payload,
-            "source": "task_timeline.record_event",
-            "runtime_state": payload["status"],
-        })
-        if payload.get("contract_execution_id"):
-            event_bus._bus.publish("contract_runtime.changed", {
-                **payload,
-                "source": "task_timeline.record_event",
-            })
-        if payload.get("contract_chain_id"):
-            event_bus._bus.publish("contract_chain.current_changed", {
-                **payload,
-                "source": "task_timeline.record_event",
-            })
-        if payload.get("runtime_context_id"):
-            event_bus._bus.publish("runtime_context.changed", {
-                **payload,
-                "source": "task_timeline.record_event",
-            })
+        if conn is not None and conn.in_transaction:
+            _defer_timeline_event_until_commit(conn, inserted_event)
+            return
+        _publish_committed_timeline_event(dict(inserted_event))
     except Exception:
         log.debug("task timeline event publish failed", exc_info=True)
 

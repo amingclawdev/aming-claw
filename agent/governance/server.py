@@ -92783,7 +92783,6 @@ def _timeline_warm_cache_resource_generation(
         cached_generation = TIMELINE_READ_CACHE.current_generation(
             database_scope=db_scope,
             project_id=project_id,
-            revalidator=current_event_generation,
         )
         newest_event_id = (
             int(cached_generation)
@@ -93729,8 +93728,44 @@ def handle_task_timeline_list(ctx: RequestContext):
     contract_runtime_visualization: dict[str, Any] | None = None
     backlog_timeline_gate: dict[str, Any] | None = None
     compact_timeline_events: list[dict[str, Any]] | None = None
+    playback_hot_window_metrics: dict[str, Any] | None = None
     with DBContext(project_id) as conn:
         task_timeline.ensure_schema(conn)
+
+        playback_hot_window_request = bool(
+            compact_playback_bootstrap
+            and backlog_id
+            and not search
+            and offset == 0
+            and before_event_id <= 0
+            and exact_event_id <= 0
+            and not any(
+                (
+                    task_id,
+                    trace_id,
+                    phase,
+                    event_kind,
+                    scenario_id,
+                    correlation_id,
+                    severity,
+                    decision,
+                    parent_event_id,
+                )
+            )
+        )
+
+        def load_playback_rows() -> list[dict[str, Any]]:
+            return [
+                task_timeline._row_to_dict(row)
+                for row in conn.execute(
+                    """SELECT * FROM task_timeline_events
+                       WHERE project_id = ? AND backlog_id = ?
+                       ORDER BY id DESC
+                       LIMIT 50""",
+                    (project_id, backlog_id),
+                ).fetchall()
+            ]
+
         cache_key, cache_watermark, cached_response, cache_metadata = (
             _timeline_warm_cache_prepare(
                 conn,
@@ -93748,7 +93783,25 @@ def handle_task_timeline_list(ctx: RequestContext):
                 },
             )
         )
+        playback_hot_events: list[dict[str, Any]] | None = None
+        if playback_hot_window_request:
+            (
+                playback_hot_events,
+                playback_hot_window_metrics,
+            ) = TIMELINE_READ_CACHE.load_playback(
+                database_scope=str(cache_watermark.get("db_scope") or ""),
+                project_id=project_id,
+                backlog_id=backlog_id,
+                authority_generation=int(
+                    cache_watermark.get("timeline_event_id") or 0
+                ),
+                loader=load_playback_rows,
+            )
         if cached_response is not None:
+            if playback_hot_window_metrics is not None:
+                cached_response["playback_hot_window"] = (
+                    playback_hot_window_metrics
+                )
             return cached_response
         if search:
             response = task_timeline.search_public_events(
@@ -93805,11 +93858,15 @@ def handle_task_timeline_list(ctx: RequestContext):
                 backlog_id=backlog_id,
                 limit=max(limit, 1000),
             )
-            direct_events = [
-                event
-                for event in gate_events
-                if str(event.get("backlog_id") or "") == backlog_id
-            ]
+            direct_events = (
+                list(playback_hot_events)
+                if playback_hot_events is not None
+                else [
+                    event
+                    for event in gate_events
+                    if str(event.get("backlog_id") or "") == backlog_id
+                ]
+            )
             if before_event_id > 0:
                 direct_events = [
                     event
@@ -93817,6 +93874,8 @@ def handle_task_timeline_list(ctx: RequestContext):
                     if int(event.get("id") or 0) < before_event_id
                 ]
             events = direct_events[: max(1, min(limit, 1000))]
+        elif playback_hot_events is not None:
+            events = playback_hot_events[: max(1, min(limit, 50))]
         else:
             events = task_timeline.list_events(
                 conn,
@@ -93892,20 +93951,30 @@ def handle_task_timeline_list(ctx: RequestContext):
                 ).fetchone()["count"]
                 or 0
             )
-            visualization_limit = max(1, min(limit, 500))
-            visualization_events = sorted(
-                (
-                    event
-                    for event in gate_events
-                    if str(event.get("backlog_id") or "") == backlog_id
-                    and (
-                        before_event_id <= 0
-                        or int(event.get("id") or 0) < before_event_id
-                    )
+            visualization_limit = max(
+                1,
+                min(
+                    limit,
+                    50 if playback_hot_events is not None else 500,
                 ),
-                key=lambda event: int(event.get("id") or 0),
-                reverse=True,
-            )[:visualization_limit]
+            )
+            visualization_events = (
+                list(playback_hot_events)[:visualization_limit]
+                if playback_hot_events is not None
+                else sorted(
+                    (
+                        event
+                        for event in gate_events
+                        if str(event.get("backlog_id") or "") == backlog_id
+                        and (
+                            before_event_id <= 0
+                            or int(event.get("id") or 0) < before_event_id
+                        )
+                    ),
+                    key=lambda event: int(event.get("id") or 0),
+                    reverse=True,
+                )[:visualization_limit]
+            )
             contract_runtime_visualization = (
                 _task_playback_contract_runtime_visualization_from_loaded(
                     conn,
@@ -93950,6 +94019,8 @@ def handle_task_timeline_list(ctx: RequestContext):
         "events": compact_timeline_events or events,
         "count": len(events),
     }
+    if playback_hot_window_metrics is not None:
+        response["playback_hot_window"] = playback_hot_window_metrics
     if compact_ledger is not None:
         response["compact_ledger"] = compact_ledger
     if exact_event is not None:

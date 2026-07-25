@@ -94,25 +94,21 @@ class DashboardTimelineReadCache:
         revalidator: Callable[[], int] | None = None,
         revalidate_after_seconds: float = 1.0,
     ) -> int | None:
+        """Return the warm generation without synchronously touching SQLite.
+
+        Committed timeline notifications advance the generation exactly.  The
+        optional arguments remain accepted for compatibility with older
+        callers, but a warm read never executes the revalidator: Current must
+        serve process memory immediately.
+        """
+
+        del revalidator, revalidate_after_seconds
         key = self._current_key(database_scope, project_id)
         with self._lock:
             window = self._current.get(key)
             if window is None:
                 return None
-            generation = int(window.authority_generation)
-            validation_age = max(0.0, time.monotonic() - window.validated_at)
-            if (
-                revalidator is None
-                or validation_age < max(0.0, float(revalidate_after_seconds))
-            ):
-                return generation
-        observed_generation = max(0, int(revalidator() or 0))
-        with self._lock:
-            current = self._current.get(key)
-            if current is not None:
-                current.validated_at = time.monotonic()
-                generation = int(current.authority_generation)
-        return max(generation, observed_generation)
+            return int(window.authority_generation)
 
     def load_current(
         self,
@@ -150,6 +146,22 @@ class DashboardTimelineReadCache:
             limit=self.playback_window_limit,
             loader=loader,
         )
+
+    def playback_generation(
+        self,
+        *,
+        database_scope: str,
+        project_id: str,
+        backlog_id: str,
+    ) -> int | None:
+        key = self._playback_key(database_scope, project_id, backlog_id)
+        with self._lock:
+            window = self._playback.get(key)
+            return (
+                int(window.authority_generation)
+                if window is not None
+                else None
+            )
 
     def _load_window(
         self,
@@ -343,7 +355,9 @@ class DashboardTimelineReadCache:
                 "newest_first": True,
                 "project_isolated": True,
                 "stale_while_revalidate": True,
-                "revalidate_after_ms": 1000,
+                "revalidate_after_ms": 0,
+                "revalidation": "commit_driven_exact_invalidation",
+                "warm_read_database_queries": 0,
                 "prewarm_source": (
                     "process_memory"
                     if hit

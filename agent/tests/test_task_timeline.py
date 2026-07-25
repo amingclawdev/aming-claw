@@ -1899,6 +1899,11 @@ class TestTaskTimeline(unittest.TestCase):
         self.conn = _conn(self.tmp.name)
 
     def tearDown(self):
+        from agent.governance import task_timeline
+
+        self.assertTrue(
+            task_timeline._POST_COMMIT_PUBLISHER.wait_for_idle(timeout=2.0)
+        )
         self.conn.close()
         os.environ.pop("SHARED_VOLUME_PATH", None)
         self.tmp.cleanup()
@@ -4852,6 +4857,7 @@ class TestTaskTimeline(unittest.TestCase):
 
         bus = event_bus.get_event_bus()
         published = []
+        committed_publish = threading.Event()
 
         def on_event(name, payload):
             if name in {
@@ -4862,6 +4868,8 @@ class TestTaskTimeline(unittest.TestCase):
                 "runtime_context.changed",
             }:
                 published.append((name, payload))
+                if name == "task_timeline.appended":
+                    committed_publish.set()
 
         bus.subscribe_all(on_event)
         try:
@@ -4883,6 +4891,9 @@ class TestTaskTimeline(unittest.TestCase):
                     "runtime_context_id": "mfrctx-sse",
                 },
             )
+            self.assertEqual(published, [])
+            self.conn.commit()
+            self.assertTrue(committed_publish.wait(2.0))
         finally:
             bus.unsubscribe_all(on_event)
 
@@ -13599,6 +13610,7 @@ class TestTaskTimeline(unittest.TestCase):
 
     def test_timeline_slow_paths_use_bounded_fresh_warm_cache(self):
         from agent.governance import server, task_timeline
+        from agent.governance.dashboard_read_cache import TIMELINE_READ_CACHE
 
         server._timeline_warm_cache_clear()
         self.conn.execute(
@@ -13702,6 +13714,17 @@ class TestTaskTimeline(unittest.TestCase):
         finally:
             conn.close()
 
+        database_scope = recent_hit["warm_cache"]["resource_generation"]["db_scope"]
+        deadline = time.monotonic() + 2.0
+        while (
+            TIMELINE_READ_CACHE.current_generation(
+                database_scope=database_scope,
+                project_id="proj",
+            )
+            != newest_event["id"]
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
         recent_fresh = server.handle_task_timeline_recent(_ctx({"limit": "10"}))
         list_fresh = server.handle_task_timeline_list(_ctx(list_query))
         search_fresh = server.handle_task_timeline_list(_ctx(search_query))
@@ -13784,6 +13807,7 @@ class TestTaskTimeline(unittest.TestCase):
 
     def test_recent_current_deque_prewarms_50_and_append_avoids_cold_reload(self):
         from agent.governance import server, task_timeline
+        from agent.governance.dashboard_read_cache import TIMELINE_READ_CACHE
 
         server._timeline_warm_cache_clear()
         inserted = []
@@ -13832,12 +13856,253 @@ class TestTaskTimeline(unittest.TestCase):
             payload={"sequence": 56},
         )
         self.conn.commit()
+        database_scope = warm["warm_cache"]["resource_generation"]["db_scope"]
+        deadline = time.monotonic() + 2.0
+        while (
+            TIMELINE_READ_CACHE.current_generation(
+                database_scope=database_scope,
+                project_id="proj",
+            )
+            != newest["id"]
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
         appended = server.handle_task_timeline_recent(_ctx({"limit": "500"}))
         self.assertEqual(appended["events"][0]["id"], newest["id"])
         self.assertEqual(appended["count"], 50)
         self.assertTrue(appended["current_hot_window"]["hit"])
         self.assertEqual(
             appended["current_hot_window"]["authority_generation"],
+            newest["id"],
+        )
+
+    def test_rolled_back_timeline_event_never_mutates_hot_deque(self):
+        from agent.governance import server, task_timeline
+        from agent.governance.dashboard_read_cache import TIMELINE_READ_CACHE
+
+        server._timeline_warm_cache_clear()
+        committed = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="AC-CURRENT-ROLLBACK",
+            task_id="current-rollback-committed",
+            event_type="worker.progress",
+            event_kind="implementation",
+            actor="mf_sub",
+            status="running",
+            post_commit_hooks=False,
+        )
+        self.conn.commit()
+        server._timeline_warm_cache_clear()
+        current = server.handle_task_timeline_recent(_ctx({"limit": "50"}))
+        database_scope = current["warm_cache"]["resource_generation"]["db_scope"]
+        self.assertEqual(
+            current["current_hot_window"]["authority_generation"],
+            committed["id"],
+        )
+
+        phantom = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="AC-CURRENT-ROLLBACK",
+            task_id="current-rollback-phantom",
+            event_type="worker.progress",
+            event_kind="implementation",
+            actor="mf_sub",
+            status="running",
+            payload={"must_not_publish": True},
+        )
+        self.assertTrue(self.conn.in_transaction)
+        self.assertEqual(
+            TIMELINE_READ_CACHE.current_generation(
+                database_scope=database_scope,
+                project_id="proj",
+            ),
+            committed["id"],
+        )
+        warm_rows, warm_metrics = TIMELINE_READ_CACHE.load_current(
+            database_scope=database_scope,
+            project_id="proj",
+            authority_generation=committed["id"],
+            loader=lambda: self.fail("uncommitted event must not cold-load Current"),
+        )
+        self.assertTrue(warm_metrics["hit"])
+        self.assertNotIn(phantom["id"], [row["id"] for row in warm_rows])
+        self.conn.rollback()
+
+        reused = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="AC-CURRENT-ROLLBACK",
+            task_id="current-rollback-reused-id",
+            event_type="worker.progress",
+            event_kind="implementation",
+            actor="mf_sub",
+            status="running",
+            payload={"different_committed_event": True},
+            post_commit_hooks=False,
+        )
+        self.conn.commit()
+        self.assertEqual(reused["id"], phantom["id"])
+        time.sleep(0.05)
+        self.assertEqual(
+            TIMELINE_READ_CACHE.current_generation(
+                database_scope=database_scope,
+                project_id="proj",
+            ),
+            committed["id"],
+        )
+        warm_rows, _ = TIMELINE_READ_CACHE.load_current(
+            database_scope=database_scope,
+            project_id="proj",
+            authority_generation=committed["id"],
+            loader=lambda: self.fail("rollback/reused id must not invalidate Current"),
+        )
+        self.assertNotIn(phantom["id"], [row["id"] for row in warm_rows])
+
+    def test_aged_warm_current_serves_memory_without_sync_database_query(self):
+        from agent.governance import server, task_timeline
+        from agent.governance.dashboard_read_cache import TIMELINE_READ_CACHE
+
+        server._timeline_warm_cache_clear()
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="AC-CURRENT-NO-SYNC-DB",
+            task_id="current-no-sync-db",
+            event_type="worker.progress",
+            event_kind="implementation",
+            actor="mf_sub",
+            status="running",
+            post_commit_hooks=False,
+        )
+        self.conn.commit()
+        server._timeline_warm_cache_clear()
+        server.handle_task_timeline_recent(_ctx({"limit": "50"}))
+        with TIMELINE_READ_CACHE._lock:
+            for window in TIMELINE_READ_CACHE._current.values():
+                if window.project_id == "proj":
+                    window.validated_at -= 2.0
+
+        with mock.patch.object(
+            server,
+            "_timeline_warm_cache_scalar",
+            side_effect=AssertionError(
+                "warm Current must not synchronously query SQLite"
+            ),
+        ):
+            warm = server.handle_task_timeline_recent(_ctx({"limit": "50"}))
+        self.assertTrue(warm["current_hot_window"]["hit"])
+        self.assertEqual(
+            warm["current_hot_window"]["revalidation"],
+            "commit_driven_exact_invalidation",
+        )
+        self.assertEqual(
+            warm["current_hot_window"]["warm_read_database_queries"],
+            0,
+        )
+
+    def test_production_playback_uses_backlog_hot_deque_and_committed_append(self):
+        from agent.governance import server, task_timeline
+        from agent.governance.dashboard_read_cache import TIMELINE_READ_CACHE
+
+        server._timeline_warm_cache_clear()
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, created_at, updated_at)
+               VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
+            (
+                "AC-PLAYBACK-HOT",
+                "Playback hot window fixture",
+                "2026-07-25T00:00:00Z",
+                "2026-07-25T00:00:00Z",
+            ),
+        )
+        inserted = []
+        for index in range(55):
+            inserted.append(
+                task_timeline.record_event(
+                    self.conn,
+                    project_id="proj",
+                    backlog_id="AC-PLAYBACK-HOT",
+                    task_id=f"playback-hot-{index:03d}",
+                    event_type="worker.progress",
+                    event_kind="implementation",
+                    actor="mf_sub",
+                    status="running",
+                    payload={"sequence": index, "raw_compatibility": True},
+                    post_commit_hooks=False,
+                )
+            )
+        self.conn.commit()
+        server._timeline_warm_cache_clear()
+        query = {
+            "backlog_id": "AC-PLAYBACK-HOT",
+            "limit": "50",
+            "playback_bootstrap": "compact",
+        }
+
+        cold = server.handle_task_timeline_list(_ctx(query))
+        warm = server.handle_task_timeline_list(_ctx(query))
+        expected_ids = sorted(
+            (event["id"] for event in inserted),
+            reverse=True,
+        )[:50]
+        self.assertEqual([event["id"] for event in cold["events"]], expected_ids)
+        self.assertEqual(cold["count"], 50)
+        self.assertTrue(cold["playback_hot_window"]["miss"])
+        self.assertTrue(warm["playback_hot_window"]["hit"])
+        self.assertEqual(
+            warm["playback_hot_window"]["pool"],
+            "playback_backlog_deque",
+        )
+        self.assertEqual(warm["playback_hot_window"]["window_limit"], 50)
+        self.assertTrue(warm["raw_event_payloads_omitted"])
+        self.assertEqual(
+            warm["playback_bootstrap"]["raw_compatibility"],
+            "exact_event_lazy",
+        )
+        raw = server.handle_task_timeline_list(
+            _ctx(
+                {
+                    "backlog_id": "AC-PLAYBACK-HOT",
+                    "exact_event_id": str(inserted[-1]["id"]),
+                    "limit": "50",
+                }
+            )
+        )
+        self.assertTrue(raw["exact_event"]["payload"]["raw_compatibility"])
+
+        newest = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="AC-PLAYBACK-HOT",
+            task_id="playback-hot-appended",
+            event_type="worker.progress",
+            event_kind="implementation",
+            actor="mf_sub",
+            status="running",
+            payload={"sequence": 56, "raw_compatibility": "committed"},
+        )
+        self.conn.commit()
+        database_scope = cold["warm_cache"]["resource_generation"]["db_scope"]
+        deadline = time.monotonic() + 2.0
+        while (
+            TIMELINE_READ_CACHE.playback_generation(
+                database_scope=database_scope,
+                project_id="proj",
+                backlog_id="AC-PLAYBACK-HOT",
+            )
+            != newest["id"]
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        appended = server.handle_task_timeline_list(_ctx(query))
+        self.assertEqual(appended["events"][0]["id"], newest["id"])
+        self.assertEqual(appended["count"], 50)
+        self.assertTrue(appended["playback_hot_window"]["hit"])
+        self.assertEqual(
+            appended["playback_hot_window"]["authority_generation"],
             newest["id"],
         )
 
