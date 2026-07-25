@@ -19,7 +19,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from functools import wraps
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
-from threading import Event, RLock, local
+from threading import BoundedSemaphore, Event, RLock, local
 from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -46,7 +46,11 @@ from . import backlog_runtime
 from . import raw_requirement
 from . import observer_session
 from . import context_registry
-from .dashboard_read_cache import BACKLOG_READ_CACHE, TIMELINE_READ_CACHE
+from .dashboard_read_cache import (
+    BACKLOG_READ_CACHE,
+    TIMELINE_READ_CACHE,
+    timeline_database_scope,
+)
 from .idempotency import check_idempotency, store_idempotency
 from .redis_client import get_redis
 from .models import Evidence, MemoryEntry, NodeDef
@@ -92464,12 +92468,19 @@ except (TypeError, ValueError):
 _TIMELINE_WARM_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _TIMELINE_WARM_CACHE_RESOURCE_KEYS: OrderedDict[str, str] = OrderedDict()
 _TIMELINE_WARM_CACHE_IN_FLIGHT: dict[str, dict[str, Any]] = {}
-_TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES: OrderedDict[
-    int, tuple[sqlite3.Connection, str]
-] = OrderedDict()
 _TIMELINE_WARM_CACHE_LOCK = RLock()
 _TIMELINE_WARM_CACHE_LOCAL = local()
 _TIMELINE_WARM_CACHE_EVICTION_COUNT = 0
+_TIMELINE_WARM_CACHE_ADMISSION = {
+    "hot_window": BoundedSemaphore(_TIMELINE_WARM_CACHE_MAX_ENTRIES),
+    "historical_ttl_lru": BoundedSemaphore(
+        _TIMELINE_HISTORICAL_CACHE_MAX_ENTRIES
+    ),
+}
+_TIMELINE_WARM_CACHE_ADMISSION_WAITERS = {
+    "hot_window": 0,
+    "historical_ttl_lru": 0,
+}
 try:
     _TIMELINE_WARM_CACHE_SINGLE_FLIGHT_WAIT_SECONDS = max(
         0.1,
@@ -92493,24 +92504,75 @@ def _timeline_warm_cache_clear() -> None:
     global _TIMELINE_WARM_CACHE_EVICTION_COUNT
     with _TIMELINE_WARM_CACHE_LOCK:
         pending = [
-            item.get("event")
+            item
             for item in _TIMELINE_WARM_CACHE_IN_FLIGHT.values()
-            if isinstance(item.get("event"), Event)
         ]
         _TIMELINE_WARM_CACHE.clear()
         _TIMELINE_WARM_CACHE_RESOURCE_KEYS.clear()
         _TIMELINE_WARM_CACHE_IN_FLIGHT.clear()
-        _TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES.clear()
         _TIMELINE_WARM_CACHE_EVICTION_COUNT = 0
         TIMELINE_READ_CACHE.clear()
-    for event in pending:
-        event.set()
+    for item in pending:
+        event = item.get("event")
+        if isinstance(event, Event):
+            event.set()
+        _timeline_warm_cache_release_admission(item)
+
+
+def _timeline_warm_cache_release_admission(
+    record: Mapping[str, Any],
+) -> None:
+    if record.get("admission_held") is not True:
+        return
+    cache_pool = str(record.get("cache_pool") or "hot_window")
+    semaphore = _TIMELINE_WARM_CACHE_ADMISSION.get(cache_pool)
+    if semaphore is not None:
+        semaphore.release()
+
+
+def _timeline_warm_cache_claim_leadership(
+    identity_hash: str,
+    *,
+    cache_pool: str,
+) -> tuple[dict[str, Any], str, Event | None]:
+    """Claim one bounded distinct-key slot or join an existing same-key lease."""
+
+    semaphore = _TIMELINE_WARM_CACHE_ADMISSION[cache_pool]
+    while True:
+        with _TIMELINE_WARM_CACHE_LOCK:
+            current = _TIMELINE_WARM_CACHE_IN_FLIGHT.get(identity_hash)
+            if isinstance(current, Mapping):
+                return current, "", current.get("event")
+            _TIMELINE_WARM_CACHE_ADMISSION_WAITERS[cache_pool] += 1
+        try:
+            acquired = semaphore.acquire(timeout=0.01)
+        finally:
+            with _TIMELINE_WARM_CACHE_LOCK:
+                _TIMELINE_WARM_CACHE_ADMISSION_WAITERS[cache_pool] -= 1
+        if not acquired:
+            continue
+        with _TIMELINE_WARM_CACHE_LOCK:
+            current = _TIMELINE_WARM_CACHE_IN_FLIGHT.get(identity_hash)
+            if isinstance(current, Mapping):
+                semaphore.release()
+                return current, "", current.get("event")
+            leader_token = uuid.uuid4().hex
+            record = {
+                "event": Event(),
+                "started_at": time.monotonic(),
+                "leader_token": leader_token,
+                "cache_pool": cache_pool,
+                "admission_held": True,
+            }
+            _TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash] = record
+            return record, leader_token, None
 
 
 def _timeline_warm_cache_cancel(identity_hash: str, leader_token: str) -> None:
     """Release a failed leader without retaining its partial/exception state."""
 
     release_event: Event | None = None
+    release_record: Mapping[str, Any] | None = None
     with _TIMELINE_WARM_CACHE_LOCK:
         in_flight = _TIMELINE_WARM_CACHE_IN_FLIGHT.get(identity_hash)
         # A timed-out waiter may already have promoted itself.  The old
@@ -92520,10 +92582,13 @@ def _timeline_warm_cache_cancel(identity_hash: str, leader_token: str) -> None:
             and str(in_flight.get("leader_token") or "") == leader_token
         ):
             _TIMELINE_WARM_CACHE_IN_FLIGHT.pop(identity_hash, None)
+            release_record = in_flight
             if isinstance(in_flight.get("event"), Event):
                 release_event = in_flight.get("event")
     if release_event is not None:
         release_event.set()
+    if release_record is not None:
+        _timeline_warm_cache_release_admission(release_record)
 
 
 def _timeline_warm_cache_endpoint(handler):
@@ -92576,75 +92641,10 @@ def _timeline_warm_cache_query_identity(query: Mapping[str, Any]) -> list[list[A
     return normalized
 
 
-def _timeline_warm_cache_anonymous_db_scope(conn: sqlite3.Connection) -> str:
-    """Return one connection-lifetime scope for a pathless SQLite database.
-
-    sqlite3.Connection cannot be weak-referenced or assigned arbitrary Python
-    attributes.  A TEMP view is connection-local and is dropped automatically
-    when the connection closes, so its random suffix is a natural lifetime
-    identity with no global retention or ``id()`` reuse risk.  The bounded
-    object registry is only a fail-safe for unusual connections that reject
-    TEMP DDL; retaining the object alongside its id makes reuse impossible
-    while an entry is live, and eviction only causes a safe cache miss.
-    """
-
-    marker_prefix = "__aming_timeline_warm_cache_scope_"
-    try:
-        row = conn.execute(
-            """
-            SELECT name
-            FROM sqlite_temp_master
-            WHERE type = 'view' AND name LIKE ?
-            ORDER BY name
-            LIMIT 1
-            """,
-            (f"{marker_prefix}%",),
-        ).fetchone()
-        marker_name = str(row[0] or "") if row is not None else ""
-        if not marker_name:
-            marker_name = f"{marker_prefix}{uuid.uuid4().hex}"
-            conn.execute(f'CREATE TEMP VIEW "{marker_name}" AS SELECT 1 AS scope')
-        marker_token = marker_name[len(marker_prefix) :]
-    except (sqlite3.Error, TypeError, IndexError):
-        connection_id = id(conn)
-        with _TIMELINE_WARM_CACHE_LOCK:
-            entry = _TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES.get(connection_id)
-            if entry is None or entry[0] is not conn:
-                entry = (conn, uuid.uuid4().hex)
-                _TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES[connection_id] = entry
-            _TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES.move_to_end(connection_id)
-            while (
-                len(_TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES)
-                > _TIMELINE_WARM_CACHE_MAX_ENTRIES
-            ):
-                _TIMELINE_WARM_CACHE_ANONYMOUS_DB_SCOPES.popitem(last=False)
-            marker_token = entry[1]
-    return hashlib.sha256(
-        f"anonymous-sqlite:{marker_token}".encode("utf-8")
-    ).hexdigest()[:20]
-
-
 def _timeline_warm_cache_db_scope(conn: sqlite3.Connection) -> str:
-    """Scope file DBs by canonical path and pathless DBs by connection."""
+    """Compatibility wrapper around the shared producer/consumer derivation."""
 
-    try:
-        rows = conn.execute("PRAGMA database_list").fetchall()
-        database_path = next(
-            (
-                str(row[2] or "")
-                for row in rows
-                if len(row) > 2 and str(row[1] or "") == "main"
-            ),
-            "",
-        )
-    except (sqlite3.Error, TypeError, IndexError):
-        database_path = ""
-    if not database_path or database_path == ":memory:":
-        return _timeline_warm_cache_anonymous_db_scope(conn)
-    canonical_path = str(Path(database_path).expanduser().resolve(strict=False))
-    return hashlib.sha256(
-        f"sqlite-file:{canonical_path}".encode("utf-8")
-    ).hexdigest()[:20]
+    return timeline_database_scope(conn)
 
 
 def _timeline_warm_cache_rows_digest(
@@ -92765,8 +92765,36 @@ def _timeline_warm_cache_resource_generation(
         or _timeline_warm_cache_query_value(query, "contract_execution_id")
     ).strip()
     db_scope = _timeline_warm_cache_db_scope(conn)
+    required_authority_generation = (
+        TIMELINE_READ_CACHE.required_authority_generation(
+            database_scope=db_scope,
+            project_id=project_id,
+        )
+    )
+    observed_project_generation: int | None = None
+    if required_authority_generation is not None:
+        observed_project_generation = int(
+            _timeline_warm_cache_scalar(
+                conn,
+                """
+                SELECT COALESCE(MAX(id), 0)
+                FROM task_timeline_events
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            )
+            or 0
+        )
+        if required_authority_generation >= 0:
+            TIMELINE_READ_CACHE.acknowledge_authority_generation(
+                database_scope=db_scope,
+                project_id=project_id,
+                observed_generation=observed_project_generation,
+            )
     if str(resource.get("scope") or "") == "project_current_stream":
         def current_event_generation() -> int:
+            if observed_project_generation is not None:
+                return observed_project_generation
             return int(
                 _timeline_warm_cache_scalar(
                     conn,
@@ -93102,6 +93130,7 @@ def _timeline_warm_cache_prepare(
     wait_record: dict[str, Any] | None = None
     leader_token = ""
     response_bytes = 0
+    needs_admission = False
     with _TIMELINE_WARM_CACHE_LOCK:
         expired_keys = [
             key
@@ -93142,20 +93171,58 @@ def _timeline_warm_cache_prepare(
         if cached_payload is None:
             wait_record = _TIMELINE_WARM_CACHE_IN_FLIGHT.get(identity_hash)
             if wait_record is None:
-                leader_token = uuid.uuid4().hex
-                wait_record = {
-                    "event": Event(),
-                    "started_at": now,
-                    "leader_token": leader_token,
-                }
-                _TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash] = wait_record
+                needs_admission = True
             else:
                 wait_event = wait_record.get("event")
                 single_flight_status = "waiting"
         entry_count = len(_TIMELINE_WARM_CACHE)
         in_flight_count = len(_TIMELINE_WARM_CACHE_IN_FLIGHT)
 
+    if cached_payload is None and needs_admission:
+        wait_record, leader_token, wait_event = (
+            _timeline_warm_cache_claim_leadership(
+                identity_hash,
+                cache_pool=cache_pool,
+            )
+        )
+        if isinstance(wait_event, Event):
+            single_flight_status = "waiting"
+        with _TIMELINE_WARM_CACHE_LOCK:
+            entry = _TIMELINE_WARM_CACHE.get(identity_hash)
+            if entry is not None:
+                cached_payload = deepcopy(entry.get("payload") or {})
+                response_bytes = int(entry.get("response_bytes") or 0)
+                age_ms = int(
+                    max(
+                        0.0,
+                        time.monotonic()
+                        - float(entry.get("stored_at") or time.monotonic()),
+                    )
+                    * 1000
+                )
+                _TIMELINE_WARM_CACHE.move_to_end(identity_hash)
+                current_record = _TIMELINE_WARM_CACHE_IN_FLIGHT.get(
+                    identity_hash
+                )
+                if (
+                    leader_token
+                    and current_record is wait_record
+                ):
+                    _TIMELINE_WARM_CACHE_IN_FLIGHT.pop(
+                        identity_hash,
+                        None,
+                    )
+                    _timeline_warm_cache_release_admission(wait_record)
+                    if isinstance(wait_record.get("event"), Event):
+                        wait_record.get("event").set()
+                leader_token = ""
+                wait_event = None
+                single_flight_status = "cache_hit_after_admission"
+            entry_count = len(_TIMELINE_WARM_CACHE)
+            in_flight_count = len(_TIMELINE_WARM_CACHE_IN_FLIGHT)
+
     while cached_payload is None and isinstance(wait_event, Event):
+        reclaim_missing_lease = False
         wait_started = time.monotonic()
         wait_event.wait(_TIMELINE_WARM_CACHE_SINGLE_FLIGHT_WAIT_SECONDS)
         single_flight_wait_ms += int(
@@ -93191,6 +93258,12 @@ def _timeline_warm_cache_prepare(
                         "event": Event(),
                         "started_at": time.monotonic(),
                         "leader_token": leader_token,
+                        "cache_pool": str(
+                            wait_record.get("cache_pool") or cache_pool
+                        ),
+                        "admission_held": (
+                            wait_record.get("admission_held") is True
+                        ),
                     }
                     _TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash] = promoted_record
                     wait_record = promoted_record
@@ -93213,21 +93286,23 @@ def _timeline_warm_cache_prepare(
                     wait_event = current_record.get("event")
                     single_flight_status = "waiting_on_promoted_leader"
                 else:
-                    # The previous leader failed and removed its lease before
-                    # this waiter reacquired the lock.  Claim the empty slot.
-                    leader_token = uuid.uuid4().hex
-                    promoted_record = {
-                        "event": Event(),
-                        "started_at": time.monotonic(),
-                        "leader_token": leader_token,
-                    }
-                    _TIMELINE_WARM_CACHE_IN_FLIGHT[identity_hash] = promoted_record
-                    wait_record = promoted_record
+                    # The failed leader released its bounded slot. Claim a new
+                    # one outside the lock so finish/cancel cannot deadlock.
+                    reclaim_missing_lease = True
                     wait_event = None
                     single_flight_status = "retry_after_failure"
                     miss_reason = "single_flight_leader_failed"
             entry_count = len(_TIMELINE_WARM_CACHE)
             in_flight_count = len(_TIMELINE_WARM_CACHE_IN_FLIGHT)
+        if reclaim_missing_lease:
+            wait_record, leader_token, wait_event = (
+                _timeline_warm_cache_claim_leadership(
+                    identity_hash,
+                    cache_pool=cache_pool,
+                )
+            )
+            if isinstance(wait_event, Event):
+                single_flight_status = "waiting_on_replacement_leader"
     if cached_payload is None:
         leader_identity_hashes = getattr(
             _TIMELINE_WARM_CACHE_LOCAL,
@@ -93240,6 +93315,15 @@ def _timeline_warm_cache_prepare(
             and (identity_hash, leader_token) not in leader_identity_hashes
         ):
             leader_identity_hashes.append((identity_hash, leader_token))
+    with _TIMELINE_WARM_CACHE_LOCK:
+        pool_in_flight_count = sum(
+            1
+            for record in _TIMELINE_WARM_CACHE_IN_FLIGHT.values()
+            if str(record.get("cache_pool") or "hot_window") == cache_pool
+        )
+        admission_waiters = int(
+            _TIMELINE_WARM_CACHE_ADMISSION_WAITERS.get(cache_pool, 0)
+        )
     lookup_ms = int(max(0.0, time.monotonic() - prepare_started) * 1000)
     metadata = {
         "schema_version": _TIMELINE_WARM_CACHE_SCHEMA_VERSION,
@@ -93259,6 +93343,11 @@ def _timeline_warm_cache_prepare(
         "single_flight_joined": single_flight_joined,
         "single_flight_wait_ms": single_flight_wait_ms,
         "in_flight_count": in_flight_count,
+        "pool_in_flight_count": pool_in_flight_count,
+        "pool_in_flight_limit": cache_max_entries,
+        "admission_backpressure": "bounded_semaphore",
+        "admission_waiter_state": "fixed_per_pool_counter",
+        "admission_waiters": admission_waiters,
         "eviction_count": _TIMELINE_WARM_CACHE_EVICTION_COUNT,
         "lookup_ms": lookup_ms,
         "compute_ms": 0,
@@ -93301,6 +93390,7 @@ def _timeline_warm_cache_store(
     prepared_at = float(miss_metadata.get("_prepared_at") or time.monotonic())
     compute_ms = int(max(0.0, time.monotonic() - prepared_at) * 1000)
     release_event: Event | None = None
+    release_record: Mapping[str, Any] | None = None
     evicted_count = 0
     leader_token = str(miss_metadata.get("_leader_token") or "")
     store_status = "stored"
@@ -93339,15 +93429,26 @@ def _timeline_warm_cache_store(
                 evicted_count += 1
             _TIMELINE_WARM_CACHE_EVICTION_COUNT += evicted_count
             _TIMELINE_WARM_CACHE_IN_FLIGHT.pop(identity_hash, None)
+            release_record = in_flight
             if isinstance(in_flight.get("event"), Event):
                 release_event = in_flight.get("event")
         else:
             store_status = "stale_leader_discarded"
         entry_count = len(_TIMELINE_WARM_CACHE)
         in_flight_count = len(_TIMELINE_WARM_CACHE_IN_FLIGHT)
+        cache_pool = str(
+            miss_metadata.get("cache_pool") or "hot_window"
+        )
+        pool_in_flight_count = sum(
+            1
+            for record in _TIMELINE_WARM_CACHE_IN_FLIGHT.values()
+            if str(record.get("cache_pool") or "hot_window") == cache_pool
+        )
         eviction_count = _TIMELINE_WARM_CACHE_EVICTION_COUNT
     if release_event is not None:
         release_event.set()
+    if release_record is not None:
+        _timeline_warm_cache_release_admission(release_record)
     leader_identity_hashes = getattr(
         _TIMELINE_WARM_CACHE_LOCAL,
         "leader_identity_hashes",
@@ -93371,6 +93472,7 @@ def _timeline_warm_cache_store(
         "age_ms": 0,
         "entry_count": entry_count,
         "in_flight_count": in_flight_count,
+        "pool_in_flight_count": pool_in_flight_count,
         "evicted_count": evicted_count,
         "eviction_count": eviction_count,
         "compute_ms": compute_ms,

@@ -24,6 +24,11 @@ from .contracts.runtime import (
     ensure_contract_chain_mapping_schema,
     read_backlog_contract_chain_current,
 )
+from .dashboard_read_cache import (
+    TIMELINE_READ_CACHE,
+    timeline_database_scope,
+    timeline_database_scope_from_path,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1551,7 +1556,6 @@ def _publish_committed_timeline_event(
     *,
     database_scope: str = "",
 ) -> None:
-    from agent.governance.dashboard_read_cache import TIMELINE_READ_CACHE
     from agent.governance import event_bus
 
     TIMELINE_READ_CACHE.append(
@@ -1626,7 +1630,11 @@ class _CommittedTimelinePublisher:
     know whether the caller will commit or roll back.  This bounded verifier
     waits for the exact inserted row to become durable before mutating hot
     deques or emitting process events.  A rolled-back id that is later reused
-    with different content is discarded instead of becoming a phantom.
+    with different content is discarded instead of becoming a phantom. The
+    verifier intentionally processes its bounded queue serially: a later item
+    can incur at most one visibility timeout per earlier retained item. Queue
+    overflow or timeout marks the affected scope cold-only until SQLite reaches
+    the expected event id, so head-of-line latency cannot become data loss.
     """
 
     def __init__(
@@ -1635,9 +1643,11 @@ class _CommittedTimelinePublisher:
         max_pending: int = 4096,
         visibility_timeout_seconds: float = 30.0,
     ) -> None:
+        self._max_pending = max(1, int(max_pending))
         self._queue: queue.Queue[dict[str, Any]] = queue.Queue(
-            maxsize=max(1, int(max_pending))
+            maxsize=self._max_pending
         )
+        self._capacity = threading.BoundedSemaphore(self._max_pending)
         self._visibility_timeout_seconds = max(
             1.0,
             float(visibility_timeout_seconds),
@@ -1646,32 +1656,66 @@ class _CommittedTimelinePublisher:
         self._lock = threading.Lock()
         self._idle = threading.Event()
         self._idle.set()
+        self._active_count = 0
         self._outstanding = 0
+        self._overflow_count = 0
 
     def defer_committing(
         self,
         database_path: str,
         inserted_event: Mapping[str, Any],
+        *,
+        database_scope: str = "",
     ) -> bool:
         event = dict(inserted_event)
         event_id = int(event.get("id") or 0)
         if not database_path or event_id <= 0:
             return False
+        canonical_scope = (
+            str(database_scope or "").strip()
+            or timeline_database_scope_from_path(database_path)
+        )
+        if not self._capacity.acquire(blocking=False):
+            self._degrade_event(
+                event,
+                database_scope=canonical_scope,
+            )
+            with self._lock:
+                self._overflow_count += 1
+            log.warning(
+                "timeline post-commit publisher capacity is full; "
+                "forcing authoritative cold reload"
+            )
+            return False
         item = {
             "database_path": database_path,
+            "database_scope": canonical_scope,
             "event_id": event_id,
             "identity": _timeline_event_commit_identity(event),
             "deadline": time.monotonic() + self._visibility_timeout_seconds,
+            "project_id": _text(event.get("project_id")),
         }
         self._ensure_started()
         with self._lock:
-            self._outstanding += 1
+            self._active_count += 1
             self._idle.clear()
         try:
             self._queue.put_nowait(item)
         except queue.Full:
-            self._complete()
-            log.warning("timeline post-commit publisher queue is full")
+            self._degrade_event(
+                event,
+                database_scope=canonical_scope,
+            )
+            with self._lock:
+                self._active_count = max(0, self._active_count - 1)
+                self._overflow_count += 1
+                if self._active_count == 0:
+                    self._idle.set()
+            self._capacity.release()
+            log.warning(
+                "timeline post-commit publisher queue is full; "
+                "forcing authoritative cold reload"
+            )
             return False
         return True
 
@@ -1689,11 +1733,47 @@ class _CommittedTimelinePublisher:
             )
             self._thread.start()
 
+    @staticmethod
+    def _degrade_event(
+        event: Mapping[str, Any],
+        *,
+        database_scope: str,
+    ) -> None:
+        TIMELINE_READ_CACHE.invalidate_until(
+            database_scope=str(database_scope or ""),
+            project_id=_text(event.get("project_id")),
+            expected_event_id=int(event.get("id") or 0),
+        )
+
     def _complete(self) -> None:
         with self._lock:
             self._outstanding = max(0, self._outstanding - 1)
-            if self._outstanding == 0:
+            self._active_count = max(0, self._active_count - 1)
+            if self._active_count == 0:
                 self._idle.set()
+        self._capacity.release()
+
+    def stats(self) -> dict[str, Any]:
+        """Expose disjoint retained-state counts for deterministic QA."""
+
+        with self._lock:
+            queued = self._queue.qsize()
+            processing = int(self._outstanding)
+            return {
+                "limit": self._max_pending,
+                "queued": queued,
+                "pending": 0,
+                "outstanding": processing,
+                "active": int(self._active_count),
+                "retained_total": queued + processing,
+                "overflow_count": int(self._overflow_count),
+                "visibility_timeout_ms": int(
+                    self._visibility_timeout_seconds * 1000
+                ),
+                "head_of_line_policy": (
+                    "serial_bounded_by_visibility_timeout_per_retained_item"
+                ),
+            }
 
     @staticmethod
     def _visible_event(item: Mapping[str, Any]) -> tuple[str, dict[str, Any] | None]:
@@ -1726,49 +1806,69 @@ class _CommittedTimelinePublisher:
         return "committed", event
 
     def _run(self) -> None:
-        pending: list[dict[str, Any]] = []
         while True:
+            item = self._queue.get()
+            with self._lock:
+                self._outstanding += 1
             try:
-                pending.append(
-                    self._queue.get(timeout=0.01 if pending else 1.0)
-                )
-                self._queue.task_done()
                 while True:
-                    pending.append(self._queue.get_nowait())
-                    self._queue.task_done()
-            except queue.Empty:
-                pass
-            now = time.monotonic()
-            retained: list[dict[str, Any]] = []
-            for item in pending:
-                state, event = self._visible_event(item)
-                if state == "committed" and event is not None:
-                    try:
-                        _publish_committed_timeline_event(
-                            event,
+                    now = time.monotonic()
+                    state, event = self._visible_event(item)
+                    if state == "committed" and event is not None:
+                        try:
+                            _publish_committed_timeline_event(
+                                event,
+                                database_scope=str(
+                                    item.get("database_scope") or ""
+                                ),
+                            )
+                        except Exception:
+                            log.debug(
+                                "committed timeline event publish failed",
+                                exc_info=True,
+                            )
+                        break
+                    if (
+                        state == "mismatch"
+                    ):
+                        break
+                    if now >= float(item["deadline"]):
+                        TIMELINE_READ_CACHE.invalidate_until(
                             database_scope=str(
-                                item.get("database_path") or ""
+                                item.get("database_scope") or ""
+                            ),
+                            project_id=str(
+                                item.get("project_id") or ""
+                            ),
+                            expected_event_id=int(
+                                item.get("event_id") or 0
                             ),
                         )
-                    except Exception:
-                        log.debug(
-                            "committed timeline event publish failed",
-                            exc_info=True,
-                        )
-                    self._complete()
-                elif state == "mismatch" or now >= float(item["deadline"]):
-                    self._complete()
-                else:
-                    retained.append(item)
-            pending = retained
-            if pending:
-                time.sleep(0.005)
+                        break
+                    time.sleep(0.005)
+            finally:
+                self._queue.task_done()
+                self._complete()
 
 
 _POST_COMMIT_PUBLISHER = _CommittedTimelinePublisher()
 _TRANSACTION_PUBLISH_LOCK = threading.Lock()
 _TRANSACTION_PUBLISH_PENDING: dict[int, dict[str, Any]] = {}
 _TRANSACTION_PUBLISH_CLEANER: threading.Thread | None = None
+_TRANSACTION_PUBLISH_CONNECTION_LIMIT = 128
+_TRANSACTION_PUBLISH_EVENT_LIMIT = 256
+
+
+def _invalidate_timeline_event_until_visible(
+    inserted_event: Mapping[str, Any],
+    *,
+    database_scope: str,
+) -> None:
+    TIMELINE_READ_CACHE.invalidate_until(
+        database_scope=database_scope,
+        project_id=_text(inserted_event.get("project_id")),
+        expected_event_id=int(inserted_event.get("id") or 0),
+    )
 
 
 def _ensure_transaction_publish_cleaner() -> None:
@@ -1784,6 +1884,7 @@ def _ensure_transaction_publish_cleaner() -> None:
             while True:
                 time.sleep(30.0)
                 cutoff = time.monotonic() - 300.0
+                abandoned: list[dict[str, Any]] = []
                 with _TRANSACTION_PUBLISH_LOCK:
                     for connection_id in [
                         pending_id
@@ -1792,7 +1893,20 @@ def _ensure_transaction_publish_cleaner() -> None:
                         )
                         if float(pending.get("registered_at") or 0.0) < cutoff
                     ]:
-                        _TRANSACTION_PUBLISH_PENDING.pop(connection_id, None)
+                        pending = _TRANSACTION_PUBLISH_PENDING.pop(
+                            connection_id,
+                            None,
+                        )
+                        if pending:
+                            abandoned.append(pending)
+                for pending in abandoned:
+                    for event in pending.get("events") or []:
+                        _invalidate_timeline_event_until_visible(
+                            event,
+                            database_scope=str(
+                                pending.get("database_scope") or ""
+                            ),
+                        )
 
         _TRANSACTION_PUBLISH_CLEANER = threading.Thread(
             target=clean_abandoned_transactions,
@@ -1816,29 +1930,65 @@ def _defer_timeline_event_until_commit(
     """
 
     database_path = _timeline_connection_database_path(conn)
-    if not database_path:
-        return False
+    database_scope = timeline_database_scope(conn)
     _ensure_transaction_publish_cleaner()
     connection_id = id(conn)
     now = time.monotonic()
+    degraded = False
+    abandoned: list[dict[str, Any]] = []
     with _TRANSACTION_PUBLISH_LOCK:
         for stale_id in [
             pending_id
             for pending_id, pending in _TRANSACTION_PUBLISH_PENDING.items()
             if now - float(pending.get("registered_at") or now) > 300.0
         ]:
-            _TRANSACTION_PUBLISH_PENDING.pop(stale_id, None)
+            stale_pending = _TRANSACTION_PUBLISH_PENDING.pop(
+                stale_id,
+                None,
+            )
+            if stale_pending:
+                abandoned.append(stale_pending)
         pending = _TRANSACTION_PUBLISH_PENDING.get(connection_id)
         if pending is None or pending.get("connection") is not conn:
-            pending = {
-                "connection": conn,
-                "database_path": database_path,
-                "events": [],
-                "registered_at": now,
-            }
-            _TRANSACTION_PUBLISH_PENDING[connection_id] = pending
-        pending["registered_at"] = now
-        pending["events"].append(dict(inserted_event))
+            if (
+                len(_TRANSACTION_PUBLISH_PENDING)
+                >= _TRANSACTION_PUBLISH_CONNECTION_LIMIT
+            ):
+                degraded = True
+            else:
+                pending = {
+                    "connection": conn,
+                    "database_path": database_path,
+                    "database_scope": database_scope,
+                    "events": [],
+                    "registered_at": now,
+                }
+                _TRANSACTION_PUBLISH_PENDING[connection_id] = pending
+        if not degraded:
+            pending["registered_at"] = now
+            if (
+                len(pending["events"])
+                >= _TRANSACTION_PUBLISH_EVENT_LIMIT
+            ):
+                degraded = True
+            else:
+                pending["events"].append(dict(inserted_event))
+    for stale_pending in abandoned:
+        for stale_event in stale_pending.get("events") or []:
+            _invalidate_timeline_event_until_visible(
+                stale_event,
+                database_scope=str(
+                    stale_pending.get("database_scope") or ""
+                ),
+            )
+    if degraded:
+        # This may run before COMMIT visibility (or for a later rollback).
+        # Retaining the expected id is conservative: rolled-back overflow
+        # leaves only a cold-read degradation, never a false warm event.
+        _invalidate_timeline_event_until_visible(
+            inserted_event,
+            database_scope=database_scope,
+        )
 
     def transaction_trace(statement: str) -> None:
         command = str(statement or "").strip().upper()
@@ -1852,10 +2002,26 @@ def _defer_timeline_event_until_commit(
         if command != "COMMIT" or not transaction:
             return
         for event in transaction.get("events") or []:
-            _POST_COMMIT_PUBLISHER.defer_committing(
-                str(transaction.get("database_path") or ""),
-                event,
+            transaction_path = str(
+                transaction.get("database_path") or ""
             )
+            transaction_scope = str(
+                transaction.get("database_scope") or ""
+            )
+            if transaction_path:
+                _POST_COMMIT_PUBLISHER.defer_committing(
+                    transaction_path,
+                    event,
+                    database_scope=transaction_scope,
+                )
+            else:
+                # Pathless SQLite cannot be checked from a second connection.
+                # Keep the exact scope cold until this same connection exposes
+                # the committed event id to the next authoritative read.
+                _invalidate_timeline_event_until_visible(
+                    event,
+                    database_scope=transaction_scope,
+                )
 
     conn.set_trace_callback(transaction_trace)
     return True
@@ -1873,7 +2039,7 @@ def _publish_timeline_event(
         _publish_committed_timeline_event(
             dict(inserted_event),
             database_scope=(
-                _timeline_connection_database_path(conn)
+                timeline_database_scope(conn)
                 if conn is not None
                 else ""
             ),
@@ -14998,7 +15164,7 @@ def search_public_events(
         )
         for event in decoded
     ]
-    if query:
+    if query and not use_fts:
         needle = query.casefold()
         public_events = [
             event
@@ -15008,13 +15174,22 @@ def search_public_events(
         ]
     total = len(public_events)
     page = public_events[page_offset : page_offset + page_limit]
-    has_more = bool(page) and (
+    has_more = (
         page_offset + len(page) < total
         or candidate_total > len(rows)
     )
+    cursor_event = page[-1] if page else (
+        public_events[-1] if public_events else (
+            _row_to_dict(rows[-1]) if rows else {}
+        )
+    )
     next_cursor = (
-        int(page[-1].get("id") or page[-1].get("event_id") or 0)
-        if has_more and page
+        int(
+            cursor_event.get("id")
+            or cursor_event.get("event_id")
+            or 0
+        )
+        if has_more and cursor_event
         else None
     )
     return {

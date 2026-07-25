@@ -9,9 +9,90 @@ from __future__ import annotations
 from collections import Counter, OrderedDict, deque
 from copy import deepcopy
 from dataclasses import dataclass
+import hashlib
+from pathlib import Path
+import sqlite3
 from threading import BoundedSemaphore, Event, RLock
 import time
 from typing import Any, Callable
+import uuid
+
+
+_TIMELINE_DATABASE_SCOPE_LOCK = RLock()
+_TIMELINE_ANONYMOUS_DATABASE_SCOPES: OrderedDict[
+    int, tuple[sqlite3.Connection, str]
+] = OrderedDict()
+_TIMELINE_ANONYMOUS_DATABASE_SCOPE_LIMIT = 256
+
+
+def timeline_database_scope_from_path(database_path: str) -> str:
+    """Return the canonical cache scope for one file-backed SQLite database."""
+
+    raw_path = str(database_path or "").strip()
+    if not raw_path or raw_path == ":memory:":
+        return ""
+    canonical_path = str(Path(raw_path).expanduser().resolve(strict=False))
+    return hashlib.sha256(
+        f"sqlite-file:{canonical_path}".encode("utf-8")
+    ).hexdigest()[:20]
+
+
+def _anonymous_timeline_database_scope(conn: sqlite3.Connection) -> str:
+    """Return a stable connection-lifetime scope for pathless SQLite."""
+
+    marker_prefix = "__aming_timeline_database_scope_"
+    try:
+        row = conn.execute(
+            """
+            SELECT name
+            FROM sqlite_temp_master
+            WHERE type = 'view' AND name LIKE ?
+            ORDER BY name
+            LIMIT 1
+            """,
+            (f"{marker_prefix}%",),
+        ).fetchone()
+        marker_name = str(row[0] or "") if row is not None else ""
+        if not marker_name:
+            marker_name = f"{marker_prefix}{uuid.uuid4().hex}"
+            conn.execute(f'CREATE TEMP VIEW "{marker_name}" AS SELECT 1 AS scope')
+        marker_token = marker_name[len(marker_prefix) :]
+    except (sqlite3.Error, TypeError, IndexError):
+        connection_id = id(conn)
+        with _TIMELINE_DATABASE_SCOPE_LOCK:
+            entry = _TIMELINE_ANONYMOUS_DATABASE_SCOPES.get(connection_id)
+            if entry is None or entry[0] is not conn:
+                entry = (conn, uuid.uuid4().hex)
+                _TIMELINE_ANONYMOUS_DATABASE_SCOPES[connection_id] = entry
+            _TIMELINE_ANONYMOUS_DATABASE_SCOPES.move_to_end(connection_id)
+            while (
+                len(_TIMELINE_ANONYMOUS_DATABASE_SCOPES)
+                > _TIMELINE_ANONYMOUS_DATABASE_SCOPE_LIMIT
+            ):
+                _TIMELINE_ANONYMOUS_DATABASE_SCOPES.popitem(last=False)
+            marker_token = entry[1]
+    return hashlib.sha256(
+        f"anonymous-sqlite:{marker_token}".encode("utf-8")
+    ).hexdigest()[:20]
+
+
+def timeline_database_scope(conn: sqlite3.Connection) -> str:
+    """Derive the exact producer/consumer cache scope for SQLite."""
+
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        database_path = next(
+            (
+                str(row[2] or "")
+                for row in rows
+                if len(row) > 2 and str(row[1] or "") == "main"
+            ),
+            "",
+        )
+    except (sqlite3.Error, TypeError, IndexError):
+        database_path = ""
+    file_scope = timeline_database_scope_from_path(database_path)
+    return file_scope or _anonymous_timeline_database_scope(conn)
 
 
 @dataclass
@@ -82,6 +163,11 @@ class DashboardTimelineReadCache:
             str,
             _TimelinePendingAppends,
         ] = OrderedDict()
+        self._dirty_authority: OrderedDict[str, int] = OrderedDict()
+        self._dirty_authority_limit = (
+            self.current_project_limit + self.playback_resource_limit
+        )
+        self._global_authoritative_reload_required = False
         self._lock = RLock()
         self._current_admission = BoundedSemaphore(
             self.current_project_limit
@@ -114,6 +200,8 @@ class DashboardTimelineReadCache:
             self._playback.clear()
             self._in_flight.clear()
             self._pending_appends.clear()
+            self._dirty_authority.clear()
+            self._global_authoritative_reload_required = False
             self._hits = 0
             self._misses = 0
             self._evictions = 0
@@ -140,6 +228,11 @@ class DashboardTimelineReadCache:
         del revalidator, revalidate_after_seconds
         key = self._current_key(database_scope, project_id)
         with self._lock:
+            if self._scope_requires_authoritative_reload_locked(
+                database_scope,
+                project_id,
+            ):
+                return None
             window = self._current.get(key)
             if window is None:
                 return None
@@ -191,6 +284,11 @@ class DashboardTimelineReadCache:
     ) -> int | None:
         key = self._playback_key(database_scope, project_id, backlog_id)
         with self._lock:
+            if self._scope_requires_authoritative_reload_locked(
+                database_scope,
+                project_id,
+            ):
+                return None
             window = self._playback.get(key)
             return (
                 int(window.authority_generation)
@@ -217,8 +315,16 @@ class DashboardTimelineReadCache:
             with self._lock:
                 entries = self._current if pool == "current" else self._playback
                 window = entries.get(key)
+                database_scope = self._database_scope_from_key(key, pool)
+                authoritative_reload_required = (
+                    self._scope_requires_authoritative_reload_locked(
+                        database_scope,
+                        project_id,
+                    )
+                )
                 if (
-                    window is not None
+                    not authoritative_reload_required
+                    and window is not None
                     and window.cold_complete
                     and int(window.authority_generation)
                     >= int(authority_generation)
@@ -348,17 +454,23 @@ class DashboardTimelineReadCache:
                     validated_at=now,
                     cold_complete=True,
                 )
-                entries[key] = window
-                entries.move_to_end(key)
-                pool_limit = (
-                    self.current_project_limit
-                    if pool == "current"
-                    else self.playback_resource_limit
-                )
-                self._enforce_window_limit_locked(
-                    entries=entries,
-                    pool_limit=pool_limit,
-                )
+                if not self._scope_requires_authoritative_reload_locked(
+                    self._database_scope_from_key(key, pool),
+                    project_id,
+                ):
+                    entries[key] = window
+                    entries.move_to_end(key)
+                    pool_limit = (
+                        self.current_project_limit
+                        if pool == "current"
+                        else self.playback_resource_limit
+                    )
+                    self._enforce_window_limit_locked(
+                        entries=entries,
+                        pool_limit=pool_limit,
+                    )
+                else:
+                    entries.pop(key, None)
                 release_event = flight.event
                 self._in_flight.pop(key, None)
                 self._pending_appends.pop(key, None)
@@ -437,6 +549,119 @@ class DashboardTimelineReadCache:
             for pending in self._pending_appends.values()
             if pending.pool == pool
         )
+
+    @staticmethod
+    def _database_scope_from_key(key: str, pool: str) -> str:
+        prefix = f"{pool}:"
+        if not key.startswith(prefix):
+            return ""
+        remainder = key[len(prefix) :]
+        return remainder.split(":", 1)[0]
+
+    @staticmethod
+    def _dirty_authority_key(database_scope: str, project_id: str) -> str:
+        return f"{database_scope}:{project_id}"
+
+    def _scope_requires_authoritative_reload_locked(
+        self,
+        database_scope: str,
+        project_id: str,
+    ) -> bool:
+        if self._global_authoritative_reload_required:
+            return True
+        return (
+            self._dirty_authority_key(database_scope, project_id)
+            in self._dirty_authority
+        )
+
+    def required_authority_generation(
+        self,
+        *,
+        database_scope: str,
+        project_id: str,
+    ) -> int | None:
+        """Return the durable event watermark that must be observed before warm use."""
+
+        with self._lock:
+            if self._global_authoritative_reload_required:
+                return -1
+            expected = self._dirty_authority.get(
+                self._dirty_authority_key(database_scope, project_id)
+            )
+            return int(expected) if expected is not None else None
+
+    def acknowledge_authority_generation(
+        self,
+        *,
+        database_scope: str,
+        project_id: str,
+        observed_generation: int,
+    ) -> bool:
+        """Clear one dirty scope only after SQLite reaches its expected id."""
+
+        with self._lock:
+            if self._global_authoritative_reload_required:
+                return False
+            dirty_key = self._dirty_authority_key(database_scope, project_id)
+            expected = self._dirty_authority.get(dirty_key)
+            if expected is None:
+                return True
+            if int(observed_generation) < int(expected):
+                return False
+            self._dirty_authority.pop(dirty_key, None)
+            return True
+
+    def invalidate_until(
+        self,
+        *,
+        database_scope: str,
+        project_id: str,
+        expected_event_id: int,
+    ) -> None:
+        """Force cold reads across the COMMIT-visibility race.
+
+        Publisher overflow and bounded transaction degradation call this from
+        SQLite's COMMIT trace, which runs before another connection is
+        guaranteed to observe the row.  The expected event id therefore stays
+        resident until a later authoritative query reaches it.  The map is
+        bounded; excess distinct scopes fail safely into a single global
+        cold-only mode rather than dropping a correctness marker.
+        """
+
+        expected = max(1, int(expected_event_id or 0))
+        with self._lock:
+            if not database_scope:
+                self._global_authoritative_reload_required = True
+                self._dirty_authority.clear()
+                self._current.clear()
+                self._playback.clear()
+                return
+            dirty_key = self._dirty_authority_key(database_scope, project_id)
+            if (
+                dirty_key not in self._dirty_authority
+                and len(self._dirty_authority) >= self._dirty_authority_limit
+            ):
+                self._global_authoritative_reload_required = True
+                self._dirty_authority.clear()
+                self._current.clear()
+                self._playback.clear()
+                return
+            self._dirty_authority[dirty_key] = max(
+                expected,
+                int(self._dirty_authority.get(dirty_key) or 0),
+            )
+            self._dirty_authority.move_to_end(dirty_key)
+            self._current.pop(
+                self._current_key(database_scope, project_id),
+                None,
+            )
+            for key, window in list(self._playback.items()):
+                if (
+                    window.project_id == project_id
+                    and self._database_scope_from_key(key, "playback")
+                    == database_scope
+                ):
+                    self._playback.pop(key, None)
 
     def _prepare_admission_locked(self, *, pool: str, key: str) -> bool:
         """Reserve room without ever evicting an active cold-load buffer."""
@@ -543,69 +768,98 @@ class DashboardTimelineReadCache:
         if not project_id or event_id <= 0:
             return
         with self._lock:
-            exact_keys: set[str] = set()
-            if database_scope:
-                current_key = self._current_key(database_scope, project_id)
-                self._append_to_window_locked(
-                    entries=self._current,
-                    key=current_key,
+            if not database_scope:
+                compatible_scope = self._unique_compatible_scope_locked(
                     project_id=project_id,
-                    resource_id=project_id,
-                    limit=self.current_window_limit,
-                    pool_limit=self.current_project_limit,
+                    backlog_id=backlog_id,
+                )
+                if compatible_scope is None:
+                    # An unscoped compatibility notification cannot safely
+                    # choose among multiple matching databases.
+                    self._global_authoritative_reload_required = True
+                    self._dirty_authority.clear()
+                    self._current.clear()
+                    self._playback.clear()
+                    return
+                if not compatible_scope:
+                    # No warm or loading target exists, so a no-op is safer
+                    # than inventing a scope or degrading unrelated databases.
+                    return
+                database_scope = compatible_scope
+            dirty_key = self._dirty_authority_key(database_scope, project_id)
+            expected = self._dirty_authority.get(dirty_key)
+            if (
+                not self._global_authoritative_reload_required
+                and expected is not None
+                and event_id >= int(expected)
+            ):
+                self._dirty_authority.pop(dirty_key, None)
+            current_key = self._current_key(database_scope, project_id)
+            self._append_to_window_locked(
+                entries=self._current,
+                key=current_key,
+                project_id=project_id,
+                resource_id=project_id,
+                limit=self.current_window_limit,
+                pool_limit=self.current_project_limit,
+                event=event,
+            )
+            exact_keys = {current_key}
+            if backlog_id:
+                playback_key = self._playback_key(
+                    database_scope,
+                    project_id,
+                    backlog_id,
+                )
+                self._append_to_window_locked(
+                    entries=self._playback,
+                    key=playback_key,
+                    project_id=project_id,
+                    resource_id=backlog_id,
+                    limit=self.playback_window_limit,
+                    pool_limit=self.playback_resource_limit,
                     event=event,
                 )
-                exact_keys.add(current_key)
-                if backlog_id:
-                    playback_key = self._playback_key(
-                        database_scope,
-                        project_id,
-                        backlog_id,
-                    )
-                    self._append_to_window_locked(
-                        entries=self._playback,
-                        key=playback_key,
-                        project_id=project_id,
-                        resource_id=backlog_id,
-                        limit=self.playback_window_limit,
-                        pool_limit=self.playback_resource_limit,
-                        event=event,
-                    )
-                    exact_keys.add(playback_key)
-            for entries, include in (
-                (self._current, lambda window: window.project_id == project_id),
-                (
-                    self._playback,
-                    lambda window: (
-                        window.project_id == project_id
-                        and window.resource_id == backlog_id
-                    ),
-                ),
-            ):
-                for key, window in list(entries.items()):
-                    if key in exact_keys:
-                        continue
-                    if not include(window):
-                        continue
-                    self._append_to_existing_window_locked(
-                        entries=entries,
-                        key=key,
-                        window=window,
-                        event=event,
-                    )
-            for key, pending in list(self._pending_appends.items()):
-                if pending.project_id != project_id:
-                    continue
-                if (
-                    pending.pool == "playback"
-                    and pending.resource_id != backlog_id
-                ):
+                exact_keys.add(playback_key)
+            for key in exact_keys:
+                pending = self._pending_appends.get(key)
+                if pending is None:
                     continue
                 pending.rows[event_id] = deepcopy(event)
                 while len(pending.rows) > pending.limit:
                     pending.rows.pop(min(pending.rows), None)
                 pending.stored_at = time.monotonic()
                 self._pending_appends.move_to_end(key)
+
+    def _unique_compatible_scope_locked(
+        self,
+        *,
+        project_id: str,
+        backlog_id: str,
+    ) -> str | None:
+        scopes: set[str] = set()
+        for key, window in self._current.items():
+            if window.project_id == project_id:
+                scopes.add(self._database_scope_from_key(key, "current"))
+        for key, window in self._playback.items():
+            if (
+                window.project_id == project_id
+                and window.resource_id == backlog_id
+            ):
+                scopes.add(self._database_scope_from_key(key, "playback"))
+        for key, pending in self._pending_appends.items():
+            if pending.project_id != project_id:
+                continue
+            if (
+                pending.pool == "playback"
+                and pending.resource_id != backlog_id
+            ):
+                continue
+            scopes.add(self._database_scope_from_key(key, pending.pool))
+        scopes.discard("")
+        if not scopes:
+            return ""
+        return next(iter(scopes)) if len(scopes) == 1 else None
 
     def _append_to_window_locked(
         self,
@@ -702,6 +956,10 @@ class DashboardTimelineReadCache:
         merged_append_count: int = 0,
     ) -> dict[str, Any]:
         with self._lock:
+            authoritative_reload_required = (
+                self._global_authoritative_reload_required
+                or bool(self._dirty_authority)
+            )
             return {
                 "schema_version": "dashboard.timeline_hot_window.v1",
                 "pool": (
@@ -751,6 +1009,16 @@ class DashboardTimelineReadCache:
                     self.current_project_limit
                     + self.playback_resource_limit
                 ),
+                "authoritative_reload_required": (
+                    authoritative_reload_required
+                ),
+                "global_authoritative_reload_required": (
+                    self._global_authoritative_reload_required
+                ),
+                "degraded_cold_only": authoritative_reload_required,
+                "warm_sla_applicable": not authoritative_reload_required,
+                "dirty_authority_count": len(self._dirty_authority),
+                "dirty_authority_limit": self._dirty_authority_limit,
                 "prewarm_source": (
                     "process_memory"
                     if hit
