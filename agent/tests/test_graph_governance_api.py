@@ -64929,6 +64929,68 @@ def test_runtime_context_worker_guide_rejects_unbound_qa_precedence():
     )
 
 
+@pytest.mark.parametrize(
+    ("action_execution_id", "resolution_status", "fail_closed"),
+    [
+        (
+            "cex-foreign-embedded-qa-precedence",
+            "resolved_revision_contract_execution_id",
+            False,
+        ),
+        (
+            "cex-b2a-worker-guide",
+            "no_active_source_backed_worker_lineage",
+            True,
+        ),
+    ],
+)
+def test_runtime_context_worker_guide_embedded_qa_identity_cannot_bypass_resolution(
+    action_execution_id,
+    resolution_status,
+    fail_closed,
+):
+    runtime_context_id = "mfrctx-embedded-qa-precedence"
+    task_id = "task-embedded-qa-precedence"
+    canonical_next = {
+        "schema_version": "contract_runtime_next_legal_action.v1",
+        "id": "qa_graph_context",
+        "action": "record_graph_trace",
+        "line_id": "qa_graph_context",
+        "owner_role": "qa",
+        "allowed_writer_roles": ["qa"],
+        "contract_execution_id": action_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "authority_decision_source": "contract_runtime_current_state",
+    }
+    state = _worker_guide_state_with_contract_next_action(
+        canonical_next,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    state["contract_runtime_execution_resolution"] = {
+        "schema_version": "runtime_context.contract_execution_resolution.v1",
+        "status": resolution_status,
+        "contract_execution_id": "cex-b2a-worker-guide",
+        "fail_closed": fail_closed,
+    }
+    worker_view = state["runtime_context_service"]["views"]["worker_view"]
+    for view_name in ("control_plane", "action_plan"):
+        worker_view[view_name]["next_legal_action"] = (
+            "revise_after_failed_independent_qa"
+        )
+
+    response = server._runtime_context_worker_guide_response(state)
+
+    assert response["next_legal_action"] == (
+        "revise_after_failed_independent_qa"
+    )
+    assert response["contract_runtime_next_action_took_precedence"] is False
+    assert response["next_legal_action_decision_source"] == (
+        "runtime_context_timeline_projection"
+    )
+
+
 def test_runtime_context_worker_guide_failed_qa_revision_stays_worker_owned():
     runtime_context_id = "mfrctx-active-failed-qa-revision"
     task_id = "task-active-failed-qa-revision"

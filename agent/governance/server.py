@@ -14728,6 +14728,37 @@ def _runtime_context_contract_post_revision_qa_action_takes_precedence(
         "record_implementation_evidence",
     }:
         return False
+    current_state = (
+        contract_runtime_current_state
+        if isinstance(contract_runtime_current_state, Mapping)
+        else {}
+    )
+    resolution = (
+        contract_runtime_execution_resolution
+        if isinstance(contract_runtime_execution_resolution, Mapping)
+        else {}
+    )
+    action_execution_id = str(
+        next_action.get("contract_execution_id") or ""
+    ).strip()
+    current_execution_id = str(
+        current_state.get("contract_execution_id") or ""
+    ).strip()
+    resolved_execution_id = str(
+        resolution.get("contract_execution_id") or ""
+    ).strip()
+    resolution_status = str(resolution.get("status") or "").strip()
+    if (
+        not action_execution_id
+        or action_execution_id != current_execution_id
+        or resolution.get("fail_closed")
+        or not resolution_status.startswith("resolved_")
+        or (
+            resolved_execution_id
+            and resolved_execution_id != action_execution_id
+        )
+    ):
+        return False
     action_runtime_context_id = str(
         next_action.get("runtime_context_id") or ""
     ).strip()
@@ -14737,38 +14768,6 @@ def _runtime_context_contract_post_revision_qa_action_takes_precedence(
             next_action,
             runtime_context_id=runtime_context_id,
             task_id=task_id,
-        ):
-            return False
-    else:
-        current_state = (
-            contract_runtime_current_state
-            if isinstance(contract_runtime_current_state, Mapping)
-            else {}
-        )
-        resolution = (
-            contract_runtime_execution_resolution
-            if isinstance(contract_runtime_execution_resolution, Mapping)
-            else {}
-        )
-        action_execution_id = str(
-            next_action.get("contract_execution_id") or ""
-        ).strip()
-        current_execution_id = str(
-            current_state.get("contract_execution_id") or ""
-        ).strip()
-        resolved_execution_id = str(
-            resolution.get("contract_execution_id") or ""
-        ).strip()
-        resolution_status = str(resolution.get("status") or "").strip()
-        if (
-            not action_execution_id
-            or action_execution_id != current_execution_id
-            or resolution.get("fail_closed")
-            or not resolution_status.startswith("resolved_")
-            or (
-                resolved_execution_id
-                and resolved_execution_id != action_execution_id
-            )
         ):
             return False
     owner_role = str(next_action.get("owner_role") or "").strip()
