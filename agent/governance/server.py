@@ -26415,16 +26415,20 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
     )
 
     context_status = str(getattr(context, "status", "") or "")
+    revision_counters_advanced = (
+        int(getattr(context, "attempt", 0) or 0) > 1
+        and int(getattr(context, "retry_round", 0) or 0) > 0
+    )
     failed_qa_rejoin_reopened = (
-        context_status in {STATE_RUNNING, STATE_WORKTREE_READY}
+        context_status == STATE_WORKTREE_READY
         and (
             str(getattr(context, "last_recovery_action", "") or "")
             == "mf_subagent_failed_qa_revision_rejoin_issued"
-            or (
-                int(getattr(context, "attempt", 0) or 0) > 1
-                and int(getattr(context, "retry_round", 0) or 0) > 0
-            )
+            or revision_counters_advanced
         )
+    ) or (
+        context_status == STATE_RUNNING
+        and revision_counters_advanced
     )
     if (
         context_status not in FAILED_QA_REVISION_REJOIN_STATES

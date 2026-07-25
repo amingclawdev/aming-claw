@@ -56554,6 +56554,19 @@ def test_accepted_no_pass_completion_mismatch_projects_exact_failed_qa_rejoin(
     assert running_revision["failed_qa_source_ref"].startswith(
         "contract_runtime:"
     )
+    assert (
+        _known_baseline_failed_qa_revision_evidence(
+            monkeypatch,
+            record,
+            status="running",
+            last_recovery_action=(
+                "mf_subagent_failed_qa_revision_rejoin_issued"
+            ),
+            attempt=1,
+            retry_round=0,
+        )
+        == {}
+    )
 
 
 def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
