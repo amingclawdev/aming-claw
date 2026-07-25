@@ -64838,6 +64838,20 @@ def test_runtime_context_worker_guide_current_qa_supersedes_historical_failed_qa
         view = worker_view[view_name]
         view["next_legal_action"] = "revise_after_failed_independent_qa"
         view["next_required_evidence"] = stale_evidence
+        view["missing_evidence"] = [
+            {
+                "id": "failed_qa_revision",
+                "field": "failed_qa_event_ref",
+                "status": "missing",
+                "next_action": "revise_after_failed_independent_qa",
+            },
+            {
+                "id": "route_action_precheck",
+                "field": "route_action_precheck_event_ref",
+                "status": "missing",
+                "next_action": "record_route_action_precheck",
+            },
+        ]
         view["blocking_reasons"] = stale_reasons
 
     response = server._runtime_context_worker_guide_response(state)
@@ -64875,6 +64889,24 @@ def test_runtime_context_worker_guide_current_qa_supersedes_historical_failed_qa
     assert {
         item["code"] for item in response["historical_audit_reasons"]
     } == {"failed_independent_qa", "lane_blocking_event"}
+    assert [item["id"] for item in response["missing_evidence"]] == [
+        "route_action_precheck"
+    ]
+    assert any(
+        item["id"] == "failed_qa_revision"
+        and item["status"] == "historical_audit_only"
+        and item["next_action"] == ""
+        for item in response["historical_audit_evidence"]
+    )
+    executable = response["executable_contract"]
+    assert executable["next_legal_action"] == "record_graph_trace"
+    assert executable["next_required_evidence"] == (
+        response["next_required_evidence"]
+    )
+    assert not any(
+        item.get("next_action") == "revise_after_failed_independent_qa"
+        for item in executable["next_required_evidence"]
+    )
     assert response["contract_runtime_current_state"]["completed_lines"] == [
         historical_failed_line
     ]
@@ -64886,6 +64918,8 @@ def test_runtime_context_worker_guide_current_qa_supersedes_historical_failed_qa
     assert worker_guide["historical_audit_reasons"] == (
         response["historical_audit_reasons"]
     )
+    assert worker_guide["missing_evidence"] == response["missing_evidence"]
+    assert worker_guide["executable_contract"] == executable
 
 
 def test_runtime_context_worker_guide_rejects_unbound_qa_precedence():

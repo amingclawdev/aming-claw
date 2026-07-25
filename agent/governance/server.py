@@ -14846,6 +14846,52 @@ def _runtime_context_post_revision_qa_required_evidence(
     return projected, historical
 
 
+def _runtime_context_demote_historical_failed_qa_missing_evidence(
+    items: Sequence[Any],
+    *,
+    superseding_line_id: str,
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    active: list[Any] = []
+    historical: list[dict[str, Any]] = []
+    for raw_item in items:
+        if not isinstance(raw_item, Mapping):
+            active.append(raw_item)
+            continue
+        item = dict(raw_item)
+        item_id = str(item.get("id") or "").strip()
+        field = str(item.get("field") or "").strip()
+        next_action = str(
+            item.get("next_action")
+            or item.get("next_legal_action")
+            or ""
+        ).strip()
+        stale_failed_qa = (
+            item_id == "failed_qa_revision"
+            or field == "failed_qa_event_ref"
+            or next_action
+            in {
+                "revise_after_failed_independent_qa",
+                "record_implementation_evidence",
+            }
+        )
+        if not stale_failed_qa:
+            active.append(item)
+            continue
+        item.update(
+            {
+                "status": "historical_audit_only",
+                "next_action": "",
+                "next_legal_action": "",
+                "is_next": False,
+                "authorization_blocker": False,
+                "historical_raw_audit": True,
+                "superseded_by_contract_runtime_line": superseding_line_id,
+            }
+        )
+        historical.append(item)
+    return active, historical
+
+
 def _runtime_context_demote_historical_failed_qa_blocking_reasons(
     reasons: Sequence[Any],
     *,
@@ -15735,6 +15781,8 @@ def _runtime_context_executable_contract_envelope(
     latest_revision_payload: Mapping[str, Any] | None = None,
     route_identity: Mapping[str, Any] | None = None,
     actionable_payloads: Mapping[str, Any] | None = None,
+    effective_next_legal_action: str = "",
+    effective_next_required_evidence: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     service = (
         current_state_response.get("runtime_context_service")
@@ -15861,10 +15909,12 @@ def _runtime_context_executable_contract_envelope(
         or action_plan.get("next_legal_action")
         or ""
     )
+    if effective_next_legal_action:
+        next_legal_action = str(effective_next_legal_action).strip()
     contract_runtime_next_action = dict(
         current_state_response.get("contract_runtime_next_legal_action") or {}
     )
-    if _runtime_context_contract_next_action_override_eligible(
+    if not effective_next_legal_action and _runtime_context_contract_next_action_override_eligible(
         contract_runtime_next_action,
         runtime_context_id=runtime_context_id,
         task_id=task_id,
@@ -15873,11 +15923,19 @@ def _runtime_context_executable_contract_envelope(
         next_legal_action = str(
             contract_runtime_next_action.get("action") or next_legal_action
         ).strip()
-    next_required_evidence = list(
-        control_plane.get("next_required_evidence")
-        or action_plan.get("next_required_evidence")
-        or worker_view.get("next_required_evidence")
-        or []
+    next_required_evidence = (
+        [
+            dict(item)
+            for item in effective_next_required_evidence
+            if isinstance(item, Mapping)
+        ]
+        if effective_next_required_evidence is not None
+        else list(
+            control_plane.get("next_required_evidence")
+            or action_plan.get("next_required_evidence")
+            or worker_view.get("next_required_evidence")
+            or []
+        )
     )
     read_receipt_event_ref = str(
         worker_view.get("read_receipt_event_ref")
@@ -17167,6 +17225,18 @@ def _runtime_context_worker_guide_response(
     )
     if recovery_required_evidence:
         missing_evidence = [dict(item) for item in recovery_required_evidence]
+    if contract_runtime_post_revision_qa_precedence:
+        missing_evidence, historical_missing_evidence = (
+            _runtime_context_demote_historical_failed_qa_missing_evidence(
+                missing_evidence,
+                superseding_line_id=str(
+                    contract_runtime_next_legal_action.get("line_id")
+                    or contract_runtime_next_legal_action.get("id")
+                    or ""
+                ).strip(),
+            )
+        )
+        historical_audit_evidence.extend(historical_missing_evidence)
     blocking_reasons = [
         *list(
             control_plane.get("blocking_reasons")
@@ -18433,6 +18503,8 @@ def _runtime_context_worker_guide_response(
     executable_contract = _runtime_context_executable_contract_envelope(
         current_state_response,
         actionable_payloads=actionable_payloads,
+        effective_next_legal_action=next_legal_action,
+        effective_next_required_evidence=next_required_evidence,
     )
     response = {
         "ok": True,
