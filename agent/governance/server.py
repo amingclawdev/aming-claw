@@ -74234,6 +74234,119 @@ def _onboard_parentless_direct_main_graph_query_guidance(
     }
 
 
+def _onboard_parentless_direct_main_pre_mutation_event_guidance(
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    route_token_ref: str,
+    target_files: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Return one compact, copy-safe canonical direct-main event template."""
+
+    allowed_files = _runtime_context_service_dedupe(
+        [str(path or "").strip() for path in target_files]
+    )
+    graph_trace_placeholder = (
+        "<replace with DB-verified trace_id from the immediately preceding "
+        "graph_query>"
+    )
+    reason_placeholder = "<replace with the bounded operator-approved reason>"
+    approval_ref_placeholder = "<replace with the operator approval reference>"
+    arguments_template = {
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "event_type": "mf.observer_direct_implementation_exception",
+        "event_kind": "observer_direct_implementation_exception",
+        "phase": "pre_mutation",
+        "status": "accepted",
+        "decision": "operator_supervised_direct_main_approved",
+        "actor": "observer",
+        "payload": {
+            "reason": reason_placeholder,
+            "observer_direct_mutation": True,
+            "tiny_deterministic_scope": True,
+            "allowed_files": allowed_files,
+            "dirty_scope_check": {
+                "allowed_files": allowed_files,
+                "dirty_files": [],
+                "exact_match": True,
+            },
+            "operator_approval": {
+                "approved": True,
+                "approved_by": "operator",
+                "approval_ref": approval_ref_placeholder,
+            },
+            "graph_trace_ids": [graph_trace_placeholder],
+            "graph_query_trace_ids": [graph_trace_placeholder],
+        },
+        "verification": {
+            "db_verified_pre_implementation_graph_trace": True,
+            "dirty_scope": {
+                "allowed_files": allowed_files,
+                "dirty_files": [],
+                "exact_match": True,
+            },
+            "operator_approval": {
+                "approved": True,
+                "approved_by": "operator",
+                "approval_ref": approval_ref_placeholder,
+            },
+            "graph_trace_ids": [graph_trace_placeholder],
+            "graph_query_trace_ids": [graph_trace_placeholder],
+        },
+        "artifact_refs": {
+            "allowed_files": allowed_files,
+            "operator_approval_ref": approval_ref_placeholder,
+            "graph_trace_ids": [graph_trace_placeholder],
+            "graph_query_trace_ids": [graph_trace_placeholder],
+        },
+        "route_token_ref": str(route_token_ref or "").strip(),
+    }
+    return {
+        "schema_version": (
+            "onboard_route_guide.parentless_direct_main."
+            "copy_safe_pre_mutation_event.v1"
+        ),
+        "mcp_tool": "task_timeline_append",
+        "copy_safe": True,
+        "raw_route_token_required": False,
+        "identity_ready": all(
+            [
+                arguments_template["project_id"],
+                arguments_template["backlog_id"],
+                arguments_template["task_id"],
+                arguments_template["route_token_ref"],
+                allowed_files,
+            ]
+        ),
+        "executable": False,
+        "replace_before_submit": [
+            "payload.reason",
+            "payload.operator_approval.approval_ref",
+            "payload.graph_trace_ids",
+            "payload.graph_query_trace_ids",
+            "verification.operator_approval.approval_ref",
+            "verification.graph_trace_ids",
+            "verification.graph_query_trace_ids",
+            "artifact_refs.operator_approval_ref",
+            "artifact_refs.graph_trace_ids",
+            "artifact_refs.graph_query_trace_ids",
+        ],
+        "arguments_template": arguments_template,
+        "ordering": "submit after graph_query and before any mutation",
+        "fail_closed_if_omitted": [
+            "payload.reason",
+            "payload.dirty_scope_check",
+            "payload.operator_approval",
+            "payload.graph_trace_ids",
+            "artifact_refs.allowed_files",
+            "route_token_ref",
+        ],
+    }
+
+
 def _onboard_contract_route_guide(
     record: Mapping[str, Any],
     *,
@@ -74630,6 +74743,15 @@ def _onboard_contract_route_guide(
             target_files=direct_main_allowed_files,
         )
     )
+    direct_main_pre_mutation_event_guidance = (
+        _onboard_parentless_direct_main_pre_mutation_event_guidance(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+            route_token_ref=route_token_ref,
+            target_files=direct_main_allowed_files,
+        )
+    )
     direct_main_entry = {
         "schema_version": "onboard_contract.operator_supervised_direct_main.v1",
         "id": "operator_supervised_direct_main",
@@ -74675,6 +74797,7 @@ def _onboard_contract_route_guide(
             "approved row-scoped files"
         ),
         "graph_query_close_authority": direct_main_graph_query_guidance,
+        "copy_safe_pre_mutation_event": direct_main_pre_mutation_event_guidance,
         "full_round_route_issue": {
             "schema_version": (
                 "onboard_contract.operator_supervised_direct_main."
@@ -74795,6 +74918,7 @@ def _onboard_contract_route_guide(
                     "allowed_files",
                     "graph_trace_ids or graph_query_trace_ids",
                 ],
+                "copy_safe_event": direct_main_pre_mutation_event_guidance,
             },
             "ordered_close_path": [
                 {
@@ -76237,15 +76361,25 @@ def _onboard_route_guide_completed_next_action(
             ),
         }
     if selected_work_type == "operator_supervised_direct_main":
+        task_id = str(
+            resume.get("current_contract_execution_id")
+            or resume.get("root_contract_execution_id")
+            or ""
+        )
         graph_query_close_authority = (
             _onboard_parentless_direct_main_graph_query_guidance(
                 project_id=project_id,
                 backlog_id=backlog_id,
-                task_id=str(
-                    resume.get("current_contract_execution_id")
-                    or resume.get("root_contract_execution_id")
-                    or ""
-                ),
+                task_id=task_id,
+                route_token_ref=route_token_ref,
+                target_files=target_files,
+            )
+        )
+        pre_mutation_event = (
+            _onboard_parentless_direct_main_pre_mutation_event_guidance(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
                 route_token_ref=route_token_ref,
                 target_files=target_files,
             )
@@ -76258,6 +76392,7 @@ def _onboard_route_guide_completed_next_action(
             "requires_operator_approval": True,
             "requires_graph_first": True,
             "graph_query_close_authority": graph_query_close_authority,
+            "copy_safe_pre_mutation_event": pre_mutation_event,
             "next_step": (
                 "run graph_query first, record observer_direct_mutation_exception "
                 "with DB-verified graph trace ids, then edit only approved files"

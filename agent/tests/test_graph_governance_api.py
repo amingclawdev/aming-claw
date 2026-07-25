@@ -48575,7 +48575,7 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
                 "backlog_id": backlog_id,
                 "role": "observer",
                 "work_type": "operator_supervised_direct_main",
-                "route_token_ref": f"{route_token_ref}-parent",
+                "route_token_ref": route_token_ref,
             },
         )
     )
@@ -48602,7 +48602,7 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         "args": {"path": "agent/governance/server.py"},
         "query_source": "observer",
         "query_purpose": "gate_validation",
-        "route_token_ref": f"{route_token_ref}-parent",
+        "route_token_ref": route_token_ref,
         "backlog_id": backlog_id,
         "task_id": parent_execution_id,
     }
@@ -48613,6 +48613,32 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     assert graph_query_authority["ordering"][
         "late_or_post_hoc_traces_accepted"
     ] is False
+    copy_safe_event = direct_main["copy_safe_pre_mutation_event"]
+    assert copy_safe_event == template["pre_mutation_event"]["copy_safe_event"]
+    assert copy_safe_event["identity_ready"] is True
+    assert copy_safe_event["executable"] is False
+    assert copy_safe_event["copy_safe"] is True
+    assert copy_safe_event["raw_route_token_required"] is False
+    assert copy_safe_event["ordering"] == (
+        "submit after graph_query and before any mutation"
+    )
+    assert copy_safe_event["arguments_template"]["payload"][
+        "observer_direct_mutation"
+    ] is True
+    assert copy_safe_event["arguments_template"]["payload"][
+        "dirty_scope_check"
+    ] == {
+        "allowed_files": template["allowed_files"],
+        "dirty_files": [],
+        "exact_match": True,
+    }
+    assert copy_safe_event["arguments_template"]["payload"][
+        "operator_approval"
+    ]["approved"] is True
+    next_copy_safe_event = guide["next_legal_action"][
+        "copy_safe_pre_mutation_event"
+    ]
+    assert next_copy_safe_event == copy_safe_event
     assert [step["id"] for step in template["ordered_close_path"]] == [
         "pre_mutation_exception",
         "commit_bound_implementation",
@@ -48700,32 +48726,64 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         "task_id": parent_execution_id,
         "route_token_ref": route_token_ref,
     }
-    server.handle_task_timeline_append(
+    pre_mutation_arguments = copy.deepcopy(
+        copy_safe_event["arguments_template"]
+    )
+    replacement_reason = "operator-supervised guide-shaped direct-main repair"
+    replacement_approval_ref = "operator-message:guide-shape-test"
+    pre_mutation_arguments["payload"]["reason"] = replacement_reason
+    for source in (
+        pre_mutation_arguments["payload"],
+        pre_mutation_arguments["verification"],
+        pre_mutation_arguments["artifact_refs"],
+    ):
+        source["graph_trace_ids"] = [graph_trace_id]
+        source["graph_query_trace_ids"] = [graph_trace_id]
+    pre_mutation_arguments["payload"]["operator_approval"][
+        "approval_ref"
+    ] = replacement_approval_ref
+    pre_mutation_arguments["verification"]["operator_approval"][
+        "approval_ref"
+    ] = replacement_approval_ref
+    pre_mutation_arguments["artifact_refs"][
+        "operator_approval_ref"
+    ] = replacement_approval_ref
+    pre_mutation_result = server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
             method="POST",
-            body={
-                **append_base,
-                "event_type": "mf.observer_direct_implementation_exception",
-                "event_kind": "observer_direct_implementation_exception",
-                "phase": "pre_mutation",
-                "status": "accepted",
-                "actor": "observer",
-                "payload": {
-                    **route_identity,
-                    "reason": "operator-supervised guide-shaped direct-main repair",
-                    "operator_approval": {
-                        "approved": True,
-                        "approved_by": "operator",
-                    },
-                    "dirty_scope_check": {"dirty_files": []},
-                    "allowed_files": template["allowed_files"],
-                    "graph_trace_ids": [graph_trace_id],
-                },
-            },
+            body=pre_mutation_arguments,
         )
     )
+    accepted_exception = task_timeline._observer_direct_exception_event(
+        pre_mutation_result,
+        {
+            "route_ids": [route_identity["route_id"]],
+            "route_context_hashes": [route_identity["route_context_hash"]],
+        },
+    )
+    assert accepted_exception["accepted"] is True
+    alias_only_event = copy.deepcopy(pre_mutation_result)
+    alias_only_event["payload"].pop("reason")
+    alias_only_event["payload"].pop("dirty_scope_check")
+    alias_only_event["payload"]["repair_scope"] = replacement_reason
+    alias_only_event["payload"]["exact_owned_files"] = template[
+        "allowed_files"
+    ]
+    alias_only_event["verification"].pop("dirty_scope")
+    rejected_alias_only = task_timeline._observer_direct_exception_event(
+        alias_only_event,
+        {
+            "route_ids": [route_identity["route_id"]],
+            "route_context_hashes": [route_identity["route_context_hash"]],
+        },
+    )
+    assert rejected_alias_only["accepted"] is False
+    assert rejected_alias_only["missing_fields"] == [
+        "reason",
+        "dirty_scope_or_dirty_scope_check",
+    ]
     server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
