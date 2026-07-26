@@ -1995,6 +1995,46 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
         "qa_contract_runtime_verified": True,
         "qa_acceptance_ref": "contract-runtime-acceptance:qa:1",
     }
+    current_full_reconcile_authority = {
+        "schema_version": (
+            "graph_snapshot_store.current_full_reconcile_state.v1"
+        ),
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "server_derived": True,
+        "db_verified": True,
+        "live_verified": True,
+        "canonical_head_verified": True,
+        "active_snapshot_verified": True,
+        "active_snapshot_matches_canonical_head": True,
+        "graph_reconciled": True,
+        "provenance_verified": True,
+        "provenance_scope_verified": True,
+        "durable_order_verified": True,
+        "reconcile_snapshot_verified": True,
+        "contract_execution_scope_verified": True,
+        "task_scope_verified": True,
+        "runtime_context_scope_verified": True,
+        "parent_task_scope_verified": True,
+        "merge_queue_scope_verified": True,
+        "current_full_reconcile": True,
+        "strategy": "current_full_reconcile",
+        "active_snapshot_status": "active",
+        "active_snapshot_id": "full-aaaaaaaa-current",
+        "active_snapshot_commit": merged_commit,
+        "canonical_head_commit": merged_commit,
+        "current_canonical_commit_sha": merged_commit,
+        "reconciled_commit_sha": merged_commit,
+        "reconcile_provenance_target_commit": merged_commit,
+        "merge_source_ref": "timeline:42",
+        "merged_commit_sha": merged_commit,
+        "reconcile_source_ref": "timeline:43",
+        "project_id": record["project_id"],
+        "backlog_id": record["backlog_id"],
+        "contract_execution_id": record["contract_execution_id"],
+    }
+    current_full_reconcile_authority["authority_hash"] = stable_sha256(
+        current_full_reconcile_authority
+    )
     reconcile_authority = {
         "schema_version": "contract_runtime.observer_reconcile_record_authority.v1",
         "server_derived": True,
@@ -2005,6 +2045,10 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
         "merge_source_ref": "timeline:42",
         "merged_commit_sha": merged_commit,
         "reconcile_source_ref": "timeline:43",
+        "current_full_reconcile_activation_verified": True,
+        "terminal_current_full_reconcile_authority": (
+            current_full_reconcile_authority
+        ),
     }
     reconcile_authority["authority_hash"] = stable_sha256(reconcile_authority)
     terminal_lines = [
@@ -2033,11 +2077,27 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
         },
     ]
     terminal_record = {
+        "project_id": record["project_id"],
         "backlog_id": record["backlog_id"],
         "contract_execution_id": record["contract_execution_id"],
         "contract_id": record["contract_id"],
         "completed_lines": terminal_lines,
     }
+    receipt_only_lines = json.loads(json.dumps(terminal_lines))
+    receipt_only_authority = receipt_only_lines[-1]["payload"][
+        "reconcile_authority"
+    ]
+    receipt_only_authority.pop(
+        "terminal_current_full_reconcile_authority"
+    )
+    receipt_only_authority["current_full_reconcile_activation_verified"] = False
+    receipt_only_authority.pop("authority_hash")
+    receipt_only_authority["authority_hash"] = stable_sha256(
+        receipt_only_authority
+    )
+    assert _audited_bypass_terminal_disposition(
+        {**terminal_record, "completed_lines": receipt_only_lines}
+    ) == {}
     terminal = _audited_bypass_terminal_disposition(terminal_record)
     assert terminal["row_status"] == "WAIVED"
     assert terminal["readiness_state"] == "completed_with_exception"
@@ -2048,6 +2108,14 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
     assert terminal["source_backlog_mutated"] is False
     assert terminal["terminal_barrier"]["bypass_line_index"] == 0
     assert terminal["terminal_barrier"]["reconcile_source_ref"] == "timeline:43"
+    assert terminal["terminal_barrier"]["active_snapshot_id"] == (
+        "full-aaaaaaaa-current"
+    )
+    assert terminal["terminal_barrier"]["active_snapshot_commit"] == merged_commit
+    assert terminal["terminal_barrier"]["canonical_head_commit"] == merged_commit
+    assert terminal["terminal_barrier"][
+        "reconcile_provenance_target_commit"
+    ] == merged_commit
     fallback = terminal["bypass_recovery_fallback"]
     assert fallback["schema_version"] == (
         "contract_runtime.bypass_recovery_fallback.v1"
@@ -2365,6 +2433,10 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
         "merge_line_index": 2,
         "reconcile_line_index": 3,
         "reconcile_source_ref": "timeline:43",
+        "active_snapshot_id": "full-aaaaaaaa-current",
+        "active_snapshot_commit": merged_commit,
+        "canonical_head_commit": merged_commit,
+        "reconcile_provenance_target_commit": merged_commit,
         "ordering_policy": "stage_aware_forward_only",
     }
     assert terminal_after_late_merge_bypass[
@@ -2409,6 +2481,10 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
         "merge_line_index": 1,
         "reconcile_line_index": 3,
         "reconcile_source_ref": "timeline:43",
+        "active_snapshot_id": "full-aaaaaaaa-current",
+        "active_snapshot_commit": merged_commit,
+        "canonical_head_commit": merged_commit,
+        "reconcile_provenance_target_commit": merged_commit,
         "ordering_policy": "stage_aware_forward_only",
     }
     assert terminal_after_late_reconcile_bypass[
@@ -2472,6 +2548,10 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
         "merge_line_index": 1,
         "reconcile_line_index": 2,
         "reconcile_source_ref": "timeline:43",
+        "active_snapshot_id": "full-aaaaaaaa-current",
+        "active_snapshot_commit": merged_commit,
+        "canonical_head_commit": merged_commit,
+        "reconcile_provenance_target_commit": merged_commit,
         "ordering_policy": "stage_aware_forward_only",
     }
     assert terminal_after_late_close_ready_bypass[
@@ -2497,6 +2577,10 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
         "merge_line_index": 2,
         "reconcile_line_index": 4,
         "reconcile_source_ref": "timeline:43",
+        "active_snapshot_id": "full-aaaaaaaa-current",
+        "active_snapshot_commit": merged_commit,
+        "canonical_head_commit": merged_commit,
+        "reconcile_provenance_target_commit": merged_commit,
         "ordering_policy": "stage_aware_forward_only",
     }
 

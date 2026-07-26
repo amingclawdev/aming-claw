@@ -62378,23 +62378,15 @@ def _contract_chain_current_with_terminal_bypass_fallback(
         candidate_execution_ids.append(root_execution_id)
     if not candidate_execution_ids:
         return current
-    try:
-        runtime = _contract_runtime(conn)
-    except (
-        ContractRuntimeError,
-        StalePinnedContractExecutionError,
-        sqlite3.Error,
-    ):
-        return current
     selected_execution_id = ""
     guide: Mapping[str, Any] = {}
     for candidate_execution_id in candidate_execution_ids:
         try:
-            runtime.current_guide(
-                candidate_execution_id,
+            record = _contract_runtime_read(
+                conn,
+                contract_execution_id=candidate_execution_id,
                 actor_role="observer",
             )
-            record = runtime.store.get(candidate_execution_id)
         except (
             ContractRuntimeError,
             StalePinnedContractExecutionError,
@@ -73860,6 +73852,7 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
     authority = {
         **dict(state),
         "source": "graph_snapshot_store.current_full_reconcile_state",
+        "server_derived": True,
         "db_verified": db_verified,
         "live_verified": live_verified,
         "canonical_head_verified": canonical_head_verified,
@@ -73926,6 +73919,68 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
     }
     authority["authority_hash"] = stable_sha256(authority)
     return authority
+
+
+def _contract_runtime_current_full_reconcile_activation_verified(
+    authority: Mapping[str, Any],
+) -> bool:
+    canonical_head = str(
+        authority.get("canonical_head_commit")
+        or authority.get("current_canonical_commit_sha")
+        or ""
+    ).strip().lower()
+    required_true_fields = (
+        "db_verified",
+        "live_verified",
+        "canonical_head_verified",
+        "active_snapshot_verified",
+        "active_snapshot_matches_canonical_head",
+        "graph_reconciled",
+        "provenance_verified",
+        "provenance_scope_verified",
+        "durable_order_verified",
+        "reconcile_snapshot_verified",
+        "contract_execution_scope_verified",
+        "task_scope_verified",
+        "runtime_context_scope_verified",
+        "parent_task_scope_verified",
+        "merge_queue_scope_verified",
+    )
+    return bool(
+        str(authority.get("schema_version") or "")
+        == "graph_snapshot_store.current_full_reconcile_state.v1"
+        and authority.get("server_derived") is True
+        and str(authority.get("source") or "")
+        == "graph_snapshot_store.current_full_reconcile_state"
+        and all(authority.get(field) is True for field in required_true_fields)
+        and authority.get("current_full_reconcile") is True
+        and str(authority.get("strategy") or "") == "current_full_reconcile"
+        and str(authority.get("active_snapshot_status") or "") == "active"
+        and canonical_head
+        and str(authority.get("active_snapshot_commit") or "")
+        .strip()
+        .lower()
+        == canonical_head
+        and str(authority.get("reconciled_commit_sha") or "")
+        .strip()
+        .lower()
+        == canonical_head
+        and str(authority.get("reconcile_provenance_target_commit") or "")
+        .strip()
+        .lower()
+        == canonical_head
+        and str(authority.get("reconcile_source_ref") or "").startswith(
+            "timeline:"
+        )
+        and str(authority.get("authority_hash") or "")
+        == stable_sha256(
+            {
+                key: value
+                for key, value in authority.items()
+                if key != "authority_hash"
+            }
+        )
+    )
 
 
 def _contract_runtime_reconcile_record_authority(
@@ -74049,6 +74104,32 @@ def _contract_runtime_reconcile_record_authority(
             "merge_queue_scope",
         ],
     }
+    current_full_authority = (
+        _contract_runtime_current_full_reconcile_authority_from_merge(
+            conn,
+            project_id=project_id,
+            record=record,
+            merge=merge,
+            reconcile=merge,
+        )
+    )
+    current_full_activation_verified = bool(
+        reconcile_event_recorded
+        and _contract_runtime_current_full_reconcile_activation_verified(
+            current_full_authority
+        )
+        and str(current_full_authority.get("merge_source_ref") or "")
+        == str(authority.get("merge_source_ref") or "")
+        and str(current_full_authority.get("merged_commit_sha") or "")
+        == str(authority.get("merged_commit_sha") or "")
+    )
+    authority["current_full_reconcile_activation_verified"] = (
+        current_full_activation_verified
+    )
+    if current_full_activation_verified:
+        authority["terminal_current_full_reconcile_authority"] = dict(
+            current_full_authority
+        )
     authority["authority_hash"] = stable_sha256(authority)
     return authority
 

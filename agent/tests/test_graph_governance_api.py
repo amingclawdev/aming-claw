@@ -72949,6 +72949,20 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     assert record_authority["merged_commit_sha"] == merged_commit
     assert record_authority["reconcile_event_recorded"] is True
     assert record_authority["reconcile_event_id"] == int(reconcile_event["id"])
+    assert record_authority[
+        "current_full_reconcile_activation_verified"
+    ] is True
+    terminal_full_authority = record_authority[
+        "terminal_current_full_reconcile_authority"
+    ]
+    assert server._contract_runtime_current_full_reconcile_activation_verified(
+        terminal_full_authority
+    )
+    assert terminal_full_authority["active_snapshot_commit"] == merged_commit
+    assert terminal_full_authority["canonical_head_commit"] == merged_commit
+    assert terminal_full_authority[
+        "reconcile_provenance_target_commit"
+    ] == merged_commit
     assert record_authority.get("db_verified") != "forged"
     assert not any(
         "qa" in str(event.get("event_kind") or "").lower()

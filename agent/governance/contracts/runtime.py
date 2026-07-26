@@ -1857,6 +1857,121 @@ def _audited_bypass_recovery_fallback(
     }
 
 
+def _canonical_current_full_reconcile_activation(
+    reconcile_authority: Mapping[str, Any],
+    *,
+    expected_merge_source_ref: str = "",
+    expected_merged_commit: str = "",
+    expected_project_id: str = "",
+    expected_backlog_id: str = "",
+    expected_contract_execution_id: str = "",
+) -> dict[str, Any]:
+    """Return only server-proven current-HEAD full-reconcile authority."""
+
+    candidate = (
+        reconcile_authority.get(
+            "terminal_current_full_reconcile_authority"
+        )
+        if isinstance(
+            reconcile_authority.get(
+                "terminal_current_full_reconcile_authority"
+            ),
+            Mapping,
+        )
+        else reconcile_authority
+    )
+    if not isinstance(candidate, Mapping):
+        return {}
+    canonical_head = str(
+        candidate.get("canonical_head_commit")
+        or candidate.get("current_canonical_commit_sha")
+        or ""
+    ).strip().lower()
+    active_snapshot_commit = str(
+        candidate.get("active_snapshot_commit") or ""
+    ).strip().lower()
+    reconciled_commit = str(
+        candidate.get("reconciled_commit_sha") or ""
+    ).strip().lower()
+    provenance_target = str(
+        candidate.get("reconcile_provenance_target_commit") or ""
+    ).strip().lower()
+    merge_source_ref = str(
+        candidate.get("merge_source_ref") or ""
+    ).strip()
+    merged_commit = str(
+        candidate.get("merged_commit_sha") or ""
+    ).strip().lower()
+    reconcile_source_ref = str(
+        candidate.get("reconcile_source_ref") or ""
+    ).strip()
+    required_true_fields = (
+        "db_verified",
+        "live_verified",
+        "canonical_head_verified",
+        "active_snapshot_verified",
+        "active_snapshot_matches_canonical_head",
+        "graph_reconciled",
+        "provenance_verified",
+        "provenance_scope_verified",
+        "durable_order_verified",
+        "reconcile_snapshot_verified",
+        "contract_execution_scope_verified",
+        "task_scope_verified",
+        "runtime_context_scope_verified",
+        "parent_task_scope_verified",
+        "merge_queue_scope_verified",
+    )
+    if not (
+        str(candidate.get("schema_version") or "")
+        == "graph_snapshot_store.current_full_reconcile_state.v1"
+        and candidate.get("server_derived") is True
+        and str(candidate.get("source") or "")
+        == "graph_snapshot_store.current_full_reconcile_state"
+        and all(candidate.get(field) is True for field in required_true_fields)
+        and candidate.get("current_full_reconcile") is True
+        and str(candidate.get("strategy") or "")
+        == "current_full_reconcile"
+        and str(candidate.get("active_snapshot_status") or "") == "active"
+        and canonical_head
+        and active_snapshot_commit == canonical_head
+        and reconciled_commit == canonical_head
+        and provenance_target == canonical_head
+        and reconcile_source_ref.startswith("timeline:")
+        and (
+            not expected_merge_source_ref
+            or merge_source_ref == expected_merge_source_ref
+        )
+        and (
+            not expected_merged_commit
+            or merged_commit == expected_merged_commit
+        )
+        and (
+            not expected_project_id
+            or str(candidate.get("project_id") or "") == expected_project_id
+        )
+        and (
+            not expected_backlog_id
+            or str(candidate.get("backlog_id") or "") == expected_backlog_id
+        )
+        and (
+            not expected_contract_execution_id
+            or str(candidate.get("contract_execution_id") or "")
+            == expected_contract_execution_id
+        )
+        and str(candidate.get("authority_hash") or "")
+        == stable_sha256(
+            {
+                key: value
+                for key, value in candidate.items()
+                if key != "authority_hash"
+            }
+        )
+    ):
+        return {}
+    return dict(candidate)
+
+
 def _audited_bypass_terminal_disposition(
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -2119,7 +2234,12 @@ def _audited_bypass_terminal_disposition(
             if isinstance(reconcile_payload.get("reconcile_authority"), Mapping)
             else {}
         )
-        if not (
+        authority_schema = str(
+            candidate_reconcile_authority.get("schema_version") or ""
+        )
+        if authority_schema == (
+            "contract_runtime.observer_reconcile_record_authority.v1"
+        ) and not (
             candidate_reconcile_authority.get("server_derived") is True
             and candidate_reconcile_authority.get("record_verified") is True
             and candidate_reconcile_authority.get("merge_projection_verified")
@@ -2130,8 +2250,6 @@ def _audited_bypass_terminal_disposition(
             is True
             and candidate_reconcile_authority.get("reconcile_event_recorded")
             is True
-            and str(candidate_reconcile_authority.get("schema_version") or "")
-            == "contract_runtime.observer_reconcile_record_authority.v1"
             and str(candidate_reconcile_authority.get("merge_source_ref") or "")
             == str(merge_authority.get("merge_event_ref") or "")
             and str(candidate_reconcile_authority.get("merged_commit_sha") or "")
@@ -2149,8 +2267,24 @@ def _audited_bypass_terminal_disposition(
             )
         ):
             continue
+        current_full_authority = _canonical_current_full_reconcile_activation(
+            candidate_reconcile_authority,
+            expected_merge_source_ref=str(
+                merge_authority.get("merge_event_ref") or ""
+            ),
+            expected_merged_commit=str(
+                merge_authority.get("merge_commit") or ""
+            ),
+            expected_project_id=str(record.get("project_id") or ""),
+            expected_backlog_id=str(record.get("backlog_id") or ""),
+            expected_contract_execution_id=str(
+                record.get("contract_execution_id") or ""
+            ),
+        )
+        if not current_full_authority:
+            continue
         reconcile_index = index
-        reconcile_authority = candidate_reconcile_authority
+        reconcile_authority = current_full_authority
 
     if (
         bypass_index >= 0
@@ -2188,6 +2322,25 @@ def _audited_bypass_terminal_disposition(
                 "reconcile_line_index": reconcile_index,
                 "reconcile_source_ref": str(
                     reconcile_authority.get("reconcile_source_ref") or ""
+                ),
+                "active_snapshot_id": str(
+                    reconcile_authority.get("active_snapshot_id") or ""
+                ),
+                "active_snapshot_commit": str(
+                    reconcile_authority.get("active_snapshot_commit") or ""
+                ),
+                "canonical_head_commit": str(
+                    reconcile_authority.get("canonical_head_commit")
+                    or reconcile_authority.get(
+                        "current_canonical_commit_sha"
+                    )
+                    or ""
+                ),
+                "reconcile_provenance_target_commit": str(
+                    reconcile_authority.get(
+                        "reconcile_provenance_target_commit"
+                    )
+                    or ""
                 ),
                 "ordering_policy": "stage_aware_forward_only",
             },
