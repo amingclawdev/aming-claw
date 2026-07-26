@@ -2848,6 +2848,7 @@ def _insert_exact_qa_graph_query_trace(
     task_id: str,
     target_project_root: str,
     canonical_project_root: str = "",
+    comparison_base_commit_sha: str = "",
     actor: str = "qa-principal",
     qa_session_id: str = "ses-qa",
     runtime_context_id: str = "",
@@ -2868,6 +2869,7 @@ def _insert_exact_qa_graph_query_trace(
             project_id=project_id,
             canonical_project_root=canonical_root,
             candidate_commit_sha=candidate_commit_sha,
+            comparison_base_commit_sha=comparison_base_commit_sha,
         )
     else:
         repository_identity_hash = _fake_sha(
@@ -2896,7 +2898,15 @@ def _insert_exact_qa_graph_query_trace(
             "canonical_project_identity_hash": canonical_project_identity_hash,
             "repository_identity_hash": repository_identity_hash,
         }
-    empty_diff_hash = "sha256:" + hashlib.sha256(b"").hexdigest()
+    changed_files = list(root_context.get("changed_files") or [])
+    candidate_diff_hash = str(
+        root_context.get("candidate_diff_hash")
+        or ("sha256:" + hashlib.sha256(b"").hexdigest())
+    ).strip()
+    changed_files_source = str(
+        root_context.get("changed_files_source")
+        or "server_exact_candidate_snapshot"
+    ).strip()
     qa_scope_binding_ref = server._qa_scope_binding_ref(
         project_id=project_id,
         backlog_id=backlog_id,
@@ -2934,9 +2944,9 @@ def _insert_exact_qa_graph_query_trace(
         canonical_base_snapshot_id=snapshot_id,
         base_commit_sha=candidate_commit_sha,
         candidate_commit_sha=candidate_commit_sha,
-        changed_files=[],
-        candidate_diff_hash=empty_diff_hash,
-        changed_files_source="server_exact_candidate_snapshot",
+        changed_files=changed_files,
+        candidate_diff_hash=candidate_diff_hash,
+        changed_files_source=changed_files_source,
         root_identity=root_context["root_identity"],
         root_identity_hash=root_context["root_identity_hash"],
         query_root_identity_hash=root_context["query_root_identity_hash"],
@@ -2982,9 +2992,9 @@ def _insert_exact_qa_graph_query_trace(
         "canonical_base_snapshot_id": snapshot_id,
         "base_commit_sha": candidate_commit_sha,
         "candidate_commit_sha": candidate_commit_sha,
-        "changed_files": [],
-        "candidate_diff_hash": empty_diff_hash,
-        "changed_files_source": "server_exact_candidate_snapshot",
+        "changed_files": changed_files,
+        "candidate_diff_hash": candidate_diff_hash,
+        "changed_files_source": changed_files_source,
         **{
             key: root_context[key]
             for key in (
@@ -3029,6 +3039,7 @@ def _write_exact_runtime_context_qa_graph_line(
         runtime_context_id=runtime_context.runtime_context_id,
         target_project_root=target_project_root,
         canonical_project_root=canonical_project_root,
+        comparison_base_commit_sha=runtime_context.base_commit,
         actor=principal,
         qa_session_id=session["session_id"],
         created_at=created_at,
@@ -78106,6 +78117,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         runtime_context_id=runtime_context.runtime_context_id,
         target_project_root=str(worktree),
         canonical_project_root=str(canonical_root),
+        comparison_base_commit_sha=base_commit,
     )
     lines_before_qa = len(
         server._contract_runtime_store(conn)
