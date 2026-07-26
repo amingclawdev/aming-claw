@@ -8471,18 +8471,64 @@ _QA_REVIEW_AUTHORITY_NAMES = {
     "snapshot_commit_sha",
     "target_project_root",
 }
+_QA_IMMUTABLE_EXTERNAL_AUDIT_PATHS = {
+    ("payload", "live_source_tuple"),
+}
+_QA_IMMUTABLE_EXTERNAL_AUDIT_SCHEMAS = {
+    "contract_runtime.live_source_tuple.v1",
+    "qa.external_source_tuple.v1",
+    "qa.live_source_tuple.v1",
+}
+_QA_IMMUTABLE_EXTERNAL_AUDIT_SCOPES = {
+    "external_audit_only",
+    "immutable_external_audit",
+}
 
 
-def _qa_review_claim_containers(value: Any) -> list[Mapping[str, Any]]:
+def _qa_is_immutable_external_audit_subtree(
+    path: tuple[str, ...],
+    value: Any,
+) -> bool:
+    """Identify the one raw external-source namespace excluded from authority."""
+
+    if path not in _QA_IMMUTABLE_EXTERNAL_AUDIT_PATHS or not isinstance(
+        value,
+        Mapping,
+    ):
+        return False
+    schema_version = str(value.get("schema_version") or "").strip().lower()
+    authority_scope = str(value.get("authority_scope") or "").strip().lower()
+    return bool(
+        (
+            not schema_version
+            or schema_version in _QA_IMMUTABLE_EXTERNAL_AUDIT_SCHEMAS
+        )
+        and (
+            not authority_scope
+            or authority_scope in _QA_IMMUTABLE_EXTERNAL_AUDIT_SCOPES
+        )
+    )
+
+
+def _qa_review_claim_containers(
+    value: Any,
+    *,
+    _path: tuple[str, ...] = (),
+) -> list[Mapping[str, Any]]:
     if isinstance(value, Mapping):
         result: list[Mapping[str, Any]] = [value]
-        for child in value.values():
-            result.extend(_qa_review_claim_containers(child))
+        for key, child in value.items():
+            child_path = (*_path, str(key or "").strip())
+            if _qa_is_immutable_external_audit_subtree(child_path, child):
+                continue
+            result.extend(
+                _qa_review_claim_containers(child, _path=child_path)
+            )
         return result
     if isinstance(value, list):
         result = []
         for child in value:
-            result.extend(_qa_review_claim_containers(child))
+            result.extend(_qa_review_claim_containers(child, _path=_path))
         return result
     return []
 
@@ -73003,7 +73049,7 @@ def _contract_runtime_observer_merge_completed_round(
                 payload,
                 ("commit_sha", "head_commit", *explicit_candidate_keys),
             )
-        for candidate in _contract_runtime_mapping_candidates(line):
+        for candidate in _qa_review_claim_containers(line):
             add_values(candidate, explicit_candidate_keys)
         return canonical
 
