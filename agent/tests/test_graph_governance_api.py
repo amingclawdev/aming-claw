@@ -72959,7 +72959,8 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
     task_id = "worker-latest-authenticated-qa-round"
     runtime_context_id = "mfrctx-latest-authenticated-qa-round"
     old_commit = "c" * 40
-    fresh_commit = "c2956b39d4584c22e0f943c8c02bb70e84091017"
+    fresh_commit = "8b093d2de879edfa04d45398743102ba0f092ea9"
+    external_source_commit = "c2956b39d4584c22e0f943c8c02bb70e84091017"
     comparison_base_commit = "fc1a743e8c84a38d6d096bc260d137742e639477"
     immediate_parent_commit = "72b6e112f93ee4ea9623b162f1d04745eed47aec"
     context = BranchTaskRuntimeContext(
@@ -73079,6 +73080,13 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
         }
     }
     completed_lines[-1]["payload"]["candidate_commit_sha"] = fresh_commit
+    completed_lines[-1]["payload"]["live_source_tuple"] = {
+        "schema_version": "qa.live_source_tuple.v1",
+        "authority_scope": "immutable_external_audit",
+        "candidate_commit_sha": external_source_commit,
+        "merge_queue_item_id": "mqitem-292cb9e3fc6bc3dec0527a0c",
+        "merge_event_ref": "timeline:18257",
+    }
     completed_lines[-1]["payload"]["test_results"] = json.loads(
         json.dumps(completed_lines[-1]["test_results"])
     )
@@ -73121,6 +73129,13 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
     assert completed_lines[-1]["test_results"][
         "immediate_parent_full_file"
     ]["commit_sha"] == immediate_parent_commit
+    assert completed_lines[-1]["payload"]["live_source_tuple"] == {
+        "schema_version": "qa.live_source_tuple.v1",
+        "authority_scope": "immutable_external_audit",
+        "candidate_commit_sha": external_source_commit,
+        "merge_queue_item_id": "mqitem-292cb9e3fc6bc3dec0527a0c",
+        "merge_event_ref": "timeline:18257",
+    }
 
     canonical_candidate_conflict = json.loads(json.dumps(record))
     canonical_candidate_conflict["completed_lines"][6]["payload"][
@@ -73131,6 +73146,36 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
             conn,
             project_id=PID,
             record=canonical_candidate_conflict,
+            context=context,
+            branch_head=fresh_commit,
+        )
+        == {}
+    )
+
+    ordinary_nested_candidate_conflict = json.loads(json.dumps(record))
+    ordinary_nested_candidate_conflict["completed_lines"][6]["payload"][
+        "verification_audit"
+    ] = {"candidate_commit_sha": external_source_commit}
+    assert (
+        server._contract_runtime_observer_merge_completed_round(
+            conn,
+            project_id=PID,
+            record=ordinary_nested_candidate_conflict,
+            context=context,
+            branch_head=fresh_commit,
+        )
+        == {}
+    )
+
+    forged_live_source_scope = json.loads(json.dumps(record))
+    forged_live_source_scope["completed_lines"][6]["payload"][
+        "live_source_tuple"
+    ]["authority_scope"] = "current_candidate"
+    assert (
+        server._contract_runtime_observer_merge_completed_round(
+            conn,
+            project_id=PID,
+            record=forged_live_source_scope,
             context=context,
             branch_head=fresh_commit,
         )
@@ -73150,6 +73195,68 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
             branch_head=fresh_commit,
         )
         == {}
+    )
+
+
+def test_qa_review_claims_ignore_only_payload_live_source_tuple():
+    current_commit = "8b093d2de879edfa04d45398743102ba0f092ea9"
+    external_source_commit = "c2956b39d4584c22e0f943c8c02bb70e84091017"
+    review_context = {
+        "candidate_commit_sha": current_commit,
+        "base_commit_sha": current_commit,
+        "graph_basis": "exact_candidate_snapshot",
+    }
+    failed_qa_audit = {
+        "status": "failed",
+        "payload": {
+            "candidate_commit_sha": current_commit,
+            "live_source_tuple": {
+                "schema_version": "qa.live_source_tuple.v1",
+                "authority_scope": "immutable_external_audit",
+                "candidate_commit_sha": external_source_commit,
+                "base_commit_sha": "f2e31178095eb3d9776e19bc08776677a065f5d4",
+                "merge_queue_item_id": "mqitem-292cb9e3fc6bc3dec0527a0c",
+                "merge_event_ref": "timeline:18257",
+            },
+        },
+    }
+    raw_audit = json.loads(
+        json.dumps(failed_qa_audit["payload"]["live_source_tuple"])
+    )
+
+    server._qa_validate_candidate_review_claims(
+        failed_qa_audit,
+        review_context,
+    )
+    assert failed_qa_audit["payload"]["live_source_tuple"] == raw_audit
+
+    for forged_container in (
+        "candidate_review_context",
+        "verification_audit",
+    ):
+        forged = json.loads(json.dumps(failed_qa_audit))
+        forged["payload"][forged_container] = {
+            "candidate_commit_sha": external_source_commit,
+        }
+        with pytest.raises(GovernanceError) as rejected:
+            server._qa_validate_candidate_review_claims(
+                forged,
+                review_context,
+            )
+        assert rejected.value.code == "qa_graph_review_context_mismatch"
+
+    forged_audit_namespace = json.loads(json.dumps(failed_qa_audit))
+    forged_audit_namespace["payload"]["live_source_tuple"][
+        "authority_scope"
+    ] = "current_candidate"
+    with pytest.raises(GovernanceError) as forged_audit_rejected:
+        server._qa_validate_candidate_review_claims(
+            forged_audit_namespace,
+            review_context,
+        )
+    assert (
+        forged_audit_rejected.value.code
+        == "qa_graph_review_context_mismatch"
     )
 
 
