@@ -20853,11 +20853,13 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
                 "worker_role": "mf_sub",
                 "worker_id": "startup-worker",
                 "agent_id": "startup-agent",
-                "actual_host_worker_id": "host-startup-worker",
-                "worker_session_id": "host-startup-worker",
-                "worker_transcript_ref": "multi_agent:host-startup-worker",
+                "actual_host_worker_id": "observer_merge_root_scope_worker_r1",
+                "worker_session_id": "observer_merge_root_scope_worker_r1",
+                "worker_transcript_ref": (
+                    "multi_agent:observer_merge_root_scope_worker_r1"
+                ),
                 "harness_type": "codex",
-                "filer_principal": "host-startup-worker",
+                "filer_principal": "observer_merge_root_scope_worker_r1",
                 "runtime_context_id": runtime_context_id_for_branch_context(
                     runtime_context
                 ),
@@ -20899,11 +20901,32 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
     assert len(events) == 1
     startup_gate = events[0]["payload"]["mf_subagent_startup_gate"]
     assert startup_gate["worker_role"] == "mf_sub"
-    assert startup_gate["actual_host_worker_id"] == "host-startup-worker"
-    assert startup_gate["worker_session_id"] == "host-startup-worker"
-    assert startup_gate["worker_transcript_ref"] == "multi_agent:host-startup-worker"
+    assert startup_gate["actual_host_worker_id"] == (
+        "observer_merge_root_scope_worker_r1"
+    )
+    assert startup_gate["worker_session_id"] == (
+        "observer_merge_root_scope_worker_r1"
+    )
+    assert startup_gate["worker_transcript_ref"] == (
+        "multi_agent:observer_merge_root_scope_worker_r1"
+    )
     assert startup_gate["harness_type"] == "codex"
-    assert events[0]["actor"] == "host-startup-worker"
+    assert events[0]["actor"] == "mf_sub"
+    persisted_payload = events[0]["payload"]
+    assert persisted_payload["submitted_actor"] == (
+        "observer_merge_root_scope_worker_r1"
+    )
+    assert persisted_payload["authorization_source"] == (
+        "runtime_context_copy_safe_worker_proof"
+    )
+    assert persisted_payload["observer_impersonation"] is False
+    assert persisted_payload["worker_evidence_provenance"]["verified"] is True
+    assert persisted_payload["source_backed_contract_gate_authority"][
+        "source_of_authority"
+    ] == "runtime_context_worker_proof"
+    assert persisted_payload["contract_gate_decision"][
+        "source_of_authority"
+    ] == "runtime_context_worker_proof"
 
 
 def test_parallel_branch_startup_blocks_missing_command_read_receipt_lineage(
@@ -21125,6 +21148,17 @@ def test_parallel_branch_startup_accepts_host_worker_surrogate_for_observer_allo
     assert started["startup_gate"]["host_adapter_startup_token_accepted"] is True
     assert started["startup_gate"]["session_token_evidence_type"] == "surrogate"
     assert started["startup_gate"]["close_satisfying"] is False
+    surrogate_event = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="FEAT-HOST-STARTUP-GATE",
+        event_kind="mf_subagent_startup",
+    )[-1]
+    assert "worker_evidence_provenance" not in surrogate_event["payload"]
+    assert (
+        "source_backed_contract_gate_authority"
+        not in surrogate_event["payload"]
+    )
 
 
 def test_parallel_branch_startup_host_adapter_server_verified_ref_is_close_satisfying(
@@ -70675,7 +70709,12 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
         task_id=worker_task_id,
         event_kind="mf_subagent_startup",
     )[-1]
-    assert startup_event["payload"]["meta_contract_gate"]["role"] == "mf_sub"
+    assert startup_event["payload"]["contract_gate_decision"][
+        "source_of_authority"
+    ] == "runtime_context_worker_proof"
+    assert startup_event["payload"]["contract_gate_decision"][
+        "imported_legacy_checks"
+    ][0]["evidence"]["meta_contract_gate"]["role"] == "mf_sub"
     contract_record = server._contract_runtime_store(conn).get(
         contract_execution_id
     )

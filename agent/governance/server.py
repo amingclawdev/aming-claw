@@ -37419,8 +37419,14 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                     else {}
                 )
                 canonical_contract_line: dict[str, Any] = {}
+                worker_provenance: dict[str, Any] = {}
                 if result.get("ok"):
-                    from .parallel_branch_runtime import get_branch_context
+                    from .parallel_branch_runtime import (
+                        get_branch_context,
+                        runtime_context_secret_hash,
+                        runtime_context_session_token_ref,
+                    )
+                    from .runtime_context import worker_proof_line_provenance
 
                     runtime_context = get_branch_context(
                         conn,
@@ -37442,6 +37448,160 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                         )
                         else {}
                     )
+                    parent_task_id = str(
+                        startup_gate_payload.get("parent_task_id")
+                        or runtime_context.parent_task_id
+                        or runtime_context.root_task_id
+                        or runtime_context.backlog_id
+                        or ""
+                    )
+                    session_token_ref = str(
+                        startup_gate_payload.get("session_token_ref")
+                        or runtime_context_session_token_ref(runtime_context)
+                        or ""
+                    )
+                    fence_token_hash = str(
+                        startup_gate_payload.get("fence_token_hash")
+                        or runtime_context_secret_hash(runtime_context.fence_token)
+                        or ""
+                    )
+                    worker_id = str(runtime_context.worker_id or "")
+                    worker_slot_id = str(
+                        runtime_context.worker_slot_id or worker_id
+                    )
+                    target_project_root = (
+                        _runtime_context_effective_target_project_root(
+                            runtime_context
+                        )
+                    )
+                    worker_provenance = worker_proof_line_provenance(
+                        {
+                            "runtime_context_id": (
+                                runtime_context.runtime_context_id
+                            ),
+                            "task_id": runtime_context.task_id,
+                            "parent_task_id": parent_task_id,
+                            "worker_id": worker_id,
+                            "worker_slot_id": worker_slot_id,
+                            "target_project_root": target_project_root,
+                            "session_token_ref": session_token_ref,
+                            "fence_token_hash": fence_token_hash,
+                        }
+                    )
+                    missing_worker_proof_fields = [
+                        field
+                        for field in (
+                            "runtime_context_id",
+                            "task_id",
+                            "parent_task_id",
+                            "target_project_root",
+                            "session_token_ref",
+                            "fence_token_hash",
+                        )
+                        if not str(worker_provenance.get(field) or "").strip()
+                    ]
+                    if not (
+                        str(
+                            worker_provenance.get("worker_slot_id")
+                            or worker_provenance.get("worker_id")
+                            or ""
+                        ).strip()
+                    ):
+                        missing_worker_proof_fields.append(
+                            "worker_slot_id_or_worker_id"
+                        )
+                    server_verified_worker_proof = bool(
+                        startup_gate_payload.get(
+                            "server_issued_session_token_verified"
+                        )
+                        and str(
+                            startup_gate_payload.get(
+                                "session_token_evidence_type"
+                            )
+                            or ""
+                        )
+                        in {"server_verified", "server_verified_ref"}
+                    )
+                    if missing_worker_proof_fields:
+                        if server_verified_worker_proof:
+                            raise GovernanceError(
+                                "runtime_context_startup_worker_proof_projection_failed",
+                                (
+                                    "validated startup could not project complete "
+                                    "copy-safe worker provenance"
+                                ),
+                                422,
+                                {
+                                    "runtime_context_id": (
+                                        runtime_context.runtime_context_id
+                                    ),
+                                    "task_id": runtime_context.task_id,
+                                    "missing_worker_proof_fields": (
+                                        missing_worker_proof_fields
+                                    ),
+                                    "timeline_evidence_backfill_allowed": False,
+                                },
+                            )
+                        worker_provenance = {}
+                    elif server_verified_worker_proof:
+                        submitted_actor = str(
+                            event.get("actor")
+                            or startup_gate_payload.get("filer_principal")
+                            or startup_gate_payload.get("worker_session_id")
+                            or startup_gate_payload.get(
+                                "actual_host_worker_id"
+                            )
+                            or worker_slot_id
+                        )
+                        worker_authority = (
+                            task_timeline.source_backed_runtime_context_worker_authority(
+                                worker_provenance
+                            )
+                        )
+                        event_payload.update(
+                            {
+                                "runtime_context_id": (
+                                    runtime_context.runtime_context_id
+                                ),
+                                "task_id": runtime_context.task_id,
+                                "parent_task_id": parent_task_id,
+                                "worker_role": "mf_sub",
+                                "worker_id": worker_id,
+                                "worker_slot_id": worker_slot_id,
+                                "target_project_root": target_project_root,
+                                "session_token_ref": session_token_ref,
+                                "session_token_ref_present": bool(
+                                    session_token_ref
+                                ),
+                                "fence_token_hash": fence_token_hash,
+                                "fence_token_redacted": bool(
+                                    fence_token_hash
+                                ),
+                                "authorization_source": (
+                                    "runtime_context_copy_safe_worker_proof"
+                                ),
+                                "actor_session_principal": worker_slot_id,
+                                "evidence_owner_actor": worker_slot_id,
+                                "evidence_owner_role": "mf_sub",
+                                "evidence_owner_session_ref": (
+                                    session_token_ref
+                                ),
+                                "submitter_principal": worker_slot_id,
+                                "submitter_session": session_token_ref,
+                                "submitted_actor": submitted_actor,
+                                "observer_impersonation": False,
+                                "worker_evidence_provenance": (
+                                    worker_provenance
+                                ),
+                                "source_backed_contract_gate_authority": (
+                                    worker_authority
+                                ),
+                                "raw_session_token_persisted": False,
+                                "raw_fence_token_persisted": False,
+                            }
+                        )
+                    else:
+                        worker_provenance = {}
                     canonical_contract_line = (
                         _runtime_context_submit_canonical_contract_line(
                             conn,
@@ -37463,13 +37623,7 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                                     runtime_context.runtime_context_id
                                 ),
                                 "task_id": runtime_context.task_id,
-                                "parent_task_id": str(
-                                    startup_gate_payload.get("parent_task_id")
-                                    or runtime_context.parent_task_id
-                                    or runtime_context.root_task_id
-                                    or runtime_context.backlog_id
-                                    or ""
-                                ),
+                                "parent_task_id": parent_task_id,
                                 "worker_role": "mf_sub",
                             },
                         )
@@ -37490,12 +37644,16 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                     correlation_id=str(event.get("correlation_id") or ""),
                     schema_version=int(event.get("schema_version") or 2),
                     actor=str(
-                        event.get("actor")
-                        or ctx.body.get("filer_principal")
-                        or ctx.body.get("worker_session_id")
-                        or ctx.body.get("agent_id")
-                        or ctx.body.get("worker_id")
-                        or "mf_sub"
+                        "mf_sub"
+                        if worker_provenance
+                        else (
+                            event.get("actor")
+                            or ctx.body.get("filer_principal")
+                            or ctx.body.get("worker_session_id")
+                            or ctx.body.get("agent_id")
+                            or ctx.body.get("worker_id")
+                            or "mf_sub"
+                        )
                     ),
                     status=str(event.get("status") or "passed"),
                     payload=event_payload,
