@@ -15624,32 +15624,71 @@ def test_runtime_context_finish_attestation_accepts_uncommitted_owned_diff(
     graph_query_trace.ensure_schema(conn)
     conn.commit()
 
+    worker_session_id = "observer-runtime-uncommitted-worker-session"
+    finish_body = {
+        "parent_task_id": parent_task_id,
+        "fence_token": "fence-uncommitted",
+        "session_token": "session-uncommitted",
+        "target_project_root": str(worktree),
+        "worker_session_id": worker_session_id,
+        "filer_principal": worker_session_id,
+        "worker_transcript_ref": f"multi_agent:{worker_session_id}",
+        "harness_type": "codex",
+        "graph_trace_ids": [graph_trace_id],
+        "read_receipt_hash": "sha256:read-uncommitted",
+        "read_receipt_event_id": read_receipt["id"],
+        "observer_command_id": "cmd-uncommitted",
+        "changed_files": [changed_path],
+        "owned_files": [changed_path],
+        "test_results": {
+            "status": "passed",
+            "passed": True,
+            "command": "node tests/reminders.test.mjs",
+        },
+    }
+    with pytest.raises(
+        GovernanceError,
+        match="requires an mf_sub session",
+    ):
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "observer",
+                method="POST",
+                body=finish_body,
+            )
+        )
+    with pytest.raises(
+        ValidationError,
+        match="cannot claim observer impersonation",
+    ):
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body={**finish_body, "observer_impersonation": True},
+            )
+        )
+    with pytest.raises(
+        ValidationError,
+        match="cannot be filed on behalf",
+    ):
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body={**finish_body, "on_behalf_of": "observer"},
+            )
+        )
+
     response = server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
         _ctx_with_role(
             {"project_id": PID, "runtime_context_id": context.runtime_context_id},
             "mf_sub",
             method="POST",
-            body={
-                "parent_task_id": parent_task_id,
-                "fence_token": "fence-uncommitted",
-                "session_token": "session-uncommitted",
-                "target_project_root": str(worktree),
-                "worker_session_id": "worker-uncommitted-session",
-                "filer_principal": "worker-uncommitted-session",
-                "worker_transcript_ref": "multi_agent:worker-uncommitted-session",
-                "harness_type": "codex",
-                "graph_trace_ids": [graph_trace_id],
-                "read_receipt_hash": "sha256:read-uncommitted",
-                "read_receipt_event_id": read_receipt["id"],
-                "observer_command_id": "cmd-uncommitted",
-                "changed_files": [changed_path],
-                "owned_files": [changed_path],
-                "test_results": {
-                    "status": "passed",
-                    "passed": True,
-                    "command": "node tests/reminders.test.mjs",
-                },
-            },
+            body=finish_body,
         )
     )
 
@@ -15658,6 +15697,32 @@ def test_runtime_context_finish_attestation_accepts_uncommitted_owned_diff(
         "finish_time_self_attesting"
     ] is True
     assert response["finish_gate_submission"]["changed_files"] == [changed_path]
+    finish_events = [
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            event_kind="worker_progress",
+        )
+        if event["event_type"]
+        == "mf_subagent.finish_time_worker_attestation"
+    ]
+    assert len(finish_events) == 1
+    finish_event = finish_events[0]
+    assert finish_event["actor"] == "mf_sub"
+    finish_payload = finish_event["payload"]
+    assert finish_payload["submitted_actor"] == worker_session_id
+    assert finish_payload["actor_session_principal"] == worker_session_id
+    assert finish_payload["authorization_source"] == (
+        "runtime_context_copy_safe_worker_proof"
+    )
+    assert finish_payload["observer_impersonation"] is False
+    assert finish_payload["worker_evidence_provenance"]["verified"] is True
+    assert finish_payload["meta_contract_gate"]["role"] == "mf_sub"
+    persisted_finish = json.dumps(finish_event, sort_keys=True)
+    assert "session-uncommitted" not in persisted_finish
+    assert '"fence_token": "fence-uncommitted"' not in persisted_finish
 
 
 def test_runtime_context_implementation_evidence_accepts_parent_bound_child_route_token(

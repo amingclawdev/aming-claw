@@ -35279,6 +35279,10 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             raise ValidationError("finish-time worker attestation cannot be filed on behalf")
         if bool(body.get("filed_on_behalf") or body.get("on_behalf")):
             raise ValidationError("finish-time worker attestation cannot be filed on behalf")
+        if bool(body.get("observer_impersonation")):
+            raise ValidationError(
+                "finish-time worker attestation cannot claim observer impersonation"
+            )
         if str(
             body.get("attestation_phase")
             or body.get("worker_attestation_phase")
@@ -35363,6 +35367,71 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         public_attestation = _runtime_context_public_finish_attestation(attestation)
         public_attestation["filer_principal"] = filer_principal
 
+        from .parallel_branch_runtime import runtime_context_session_token_ref
+        from .runtime_context import (
+            RuntimeContextWorkerProofError,
+            validate_contract_runtime_worker_proof,
+            worker_proof_line_provenance,
+        )
+
+        target_project_root = _runtime_context_effective_target_project_root(
+            context
+        )
+        session_token_ref = (
+            _runtime_context_request_value(ctx, "session_token_ref")
+            or _runtime_context_request_value(ctx, "worker_session_token_ref")
+            or runtime_context_session_token_ref(context)
+        )
+        try:
+            worker_proof = validate_contract_runtime_worker_proof(
+                conn,
+                project_id=project_id,
+                runtime_context_id=runtime_context_id,
+                session_token_ref=session_token_ref,
+                parent_task_id=parent_task_id,
+                target_project_root=target_project_root,
+                task_id=context.task_id,
+                worker_role="mf_sub",
+                fence_token=_runtime_context_request_value(ctx, "fence_token"),
+                session_token=_runtime_context_request_value(ctx, "session_token"),
+                governance_project_id=(
+                    str(context.governance_project_id or project_id)
+                ),
+                target_project_id=str(context.target_project_id or project_id),
+                require_fence_token=True,
+                allow_worktree_target_root_alias=True,
+            )
+        except RuntimeContextWorkerProofError as exc:
+            raise PermissionDeniedError(
+                "mf_sub",
+                "graph-governance.runtime-context.finish-time-worker-attestation",
+                {
+                    **dict(exc.details or {}),
+                    "proof_error": exc.code,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "observer_impersonation": False,
+                },
+            ) from exc
+        worker_provenance = worker_proof_line_provenance(worker_proof)
+        if not worker_provenance:
+            raise GovernanceError(
+                "runtime_context_finish_worker_proof_projection_failed",
+                (
+                    "authenticated finish-time worker attestation could not "
+                    "project copy-safe worker provenance"
+                ),
+                422,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "observer_impersonation": False,
+                    "timeline_evidence_backfill_allowed": False,
+                },
+            )
+        evidence_owner = str(
+            context.worker_slot_id or context.worker_id or "mf_sub"
+        ).strip()
         payload = {
             "schema_version": "runtime_context.finish_time_worker_attestation.v1",
             "action": "record_finish_time_worker_attestation",
@@ -35397,6 +35466,25 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "read_receipt_event_id": read_receipt_event_id,
             "test_results": test_results,
             "finish_time_worker_self_attestation": public_attestation,
+            "target_project_root": target_project_root,
+            "session_token_ref": worker_provenance["session_token_ref"],
+            "session_token_ref_present": True,
+            "fence_token_hash": worker_provenance["fence_token_hash"],
+            "fence_token_redacted": True,
+            "authorization_source": "runtime_context_copy_safe_worker_proof",
+            "actor_session_principal": filer_principal,
+            "evidence_owner_actor": evidence_owner,
+            "evidence_owner_role": "mf_sub",
+            "evidence_owner_session_ref": worker_provenance[
+                "session_token_ref"
+            ],
+            "submitter_principal": filer_principal,
+            "submitter_session": worker_provenance["session_token_ref"],
+            "submitted_actor": filer_principal,
+            "observer_impersonation": False,
+            "worker_evidence_provenance": worker_provenance,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
         }
         if _runtime_context_finish_attestation_no_pass_results_accepted(
             test_results
@@ -35437,7 +35525,11 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             event_kind="worker_progress",
             phase="finish_time_worker_attestation",
             status="passed",
-            actor=filer_principal,
+            # The submitted principal remains preserved above.  The canonical
+            # timeline actor is derived only after strict Runtime Context
+            # session/fence proof succeeds, so incidental words in a real host
+            # worker id (for example "observer") cannot change its role.
+            actor="mf_sub",
             payload=payload,
             commit_sha=head_commit,
         )
