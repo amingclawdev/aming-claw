@@ -30234,6 +30234,68 @@ def _runtime_context_persisted_post_qa_conflict_reset_indices(
     return []
 
 
+def _runtime_context_terminal_merged_queue_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+) -> dict[str, Any]:
+    """Resolve an exact terminal durable merge tuple for one runtime lane."""
+
+    if conn is None:
+        return {}
+    project = str(project_id or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    merge_queue_id = str(
+        getattr(context, "merge_queue_id", "") or ""
+    ).strip()
+    if not all((project, task_id, merge_queue_id)):
+        return {}
+
+    from .parallel_branch_runtime import (
+        get_merge_queue_item_for_branch_context,
+    )
+
+    durable_item = get_merge_queue_item_for_branch_context(
+        conn,
+        project,
+        task_id,
+        merge_queue_id=merge_queue_id,
+    )
+    if (
+        durable_item is None
+        or str(durable_item.task_id or "").strip() != task_id
+        or str(durable_item.merge_queue_id or "").strip() != merge_queue_id
+        or str(durable_item.status or "").strip() != "merged"
+    ):
+        return {}
+    merge_commit = str(durable_item.merge_commit or "").strip().lower()
+    target_head_after_merge = str(
+        durable_item.target_head_after_merge or ""
+    ).strip().lower()
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merge_commit)
+        or target_head_after_merge != merge_commit
+    ):
+        return {}
+    return {
+        "schema_version": (
+            "runtime_context.terminal_merged_queue_authority.v1"
+        ),
+        "server_derived": True,
+        "source": "parallel_branch_merge_queue",
+        "terminal_merged": True,
+        "project_id": project,
+        "runtime_context_id": str(
+            getattr(context, "runtime_context_id", "") or ""
+        ).strip(),
+        "task_id": task_id,
+        "merge_queue_id": merge_queue_id,
+        "merge_commit": merge_commit,
+        "target_head_after_merge": target_head_after_merge,
+    }
+
+
 def _runtime_context_same_lane_worker_commit_recovery(
     record: Mapping[str, Any],
     context: Any,
@@ -30277,6 +30339,35 @@ def _runtime_context_same_lane_worker_commit_recovery(
         and not allow_post_qa_merge_conflict_recovery
     ):
         return {}
+    if post_qa_merge_conflict_recovery:
+        terminal_merge = _runtime_context_terminal_merged_queue_authority(
+            conn,
+            project_id=str(
+                project_id or record.get("project_id") or ""
+            ).strip(),
+            context=context,
+        )
+        if terminal_merge:
+            return {
+                "schema_version": (
+                    "runtime_context.same_lane_worker_commit_recovery.v1"
+                ),
+                "status": "not_needed",
+                "blocked": False,
+                "server_derived": True,
+                "source_of_authority": (
+                    "parallel_branch_merge_queue.merged"
+                ),
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ).strip(),
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "terminal_merged": True,
+                "terminal_merge_authority": terminal_merge,
+                "next_legal_action": "observer_merge",
+                "append_only_history_preserved": True,
+            }
     completed_lines = list(record.get("completed_lines") or [])
     latest_commit: Mapping[str, Any] | None = None
     latest_commit_index = -1
@@ -65368,6 +65459,12 @@ def _contract_runtime_projection_post_worker_lines(
         str(record.get("root_contract_execution_id") or "").strip(),
     }
     related_task_ids = {item for item in related_task_ids if item}
+    server_bound_root_task_ids = (
+        _contract_runtime_observer_merge_bound_root_task_ids(
+            record,
+            context,
+        )
+    )
     timeline_events = _contract_runtime_projection_post_worker_timeline_events(
         conn,
         project_id=project_id,
@@ -65522,6 +65619,7 @@ def _contract_runtime_projection_post_worker_lines(
         actor_roles={"observer"},
         related_task_ids=related_task_ids,
         direct_parent_task_id=parent_task_id,
+        server_bound_supplemental_related_task_ids=server_bound_root_task_ids,
     )
     allow_taskless_reconcile = True
     if reconcile_policy:
@@ -65544,6 +65642,7 @@ def _contract_runtime_projection_post_worker_lines(
         allow_taskless=allow_taskless_reconcile,
         related_task_ids=related_task_ids,
         direct_parent_task_id=parent_task_id,
+        server_bound_supplemental_related_task_ids=server_bound_root_task_ids,
     )
     close_ready_event = _contract_runtime_projection_latest_timeline_event(
         timeline_events,
@@ -65555,6 +65654,7 @@ def _contract_runtime_projection_post_worker_lines(
         actor_roles={"observer"},
         related_task_ids=related_task_ids,
         direct_parent_task_id=parent_task_id,
+        server_bound_supplemental_related_task_ids=server_bound_root_task_ids,
     )
     if authoritative_qa_event_id > 0:
         qa_event_id = _contract_runtime_projection_timeline_event_id(qa_event)
@@ -65947,6 +66047,7 @@ def _contract_runtime_projection_latest_timeline_event(
     allow_taskless: bool = False,
     related_task_ids: set[str] | None = None,
     direct_parent_task_id: str = "",
+    server_bound_supplemental_related_task_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     for event in reversed([event for event in timeline_events if isinstance(event, Mapping)]):
         status = str(event.get("status") or event.get("decision") or "").strip().lower()
@@ -65962,6 +66063,9 @@ def _contract_runtime_projection_latest_timeline_event(
             related_task_ids=related_task_ids or set(),
             allow_taskless=allow_taskless,
             direct_parent_task_id=direct_parent_task_id,
+            server_bound_supplemental_related_task_ids=(
+                server_bound_supplemental_related_task_ids or set()
+            ),
         ):
             continue
         event_kind = _contract_runtime_close_normalized(event.get("event_kind"))
@@ -66031,11 +66135,17 @@ def _contract_runtime_projection_timeline_scope_matches(
     related_task_ids: set[str],
     allow_taskless: bool,
     direct_parent_task_id: str = "",
+    server_bound_supplemental_related_task_ids: set[str] | None = None,
 ) -> bool:
     expected_task_id = str(task_id or "").strip()
     expected_direct_parent = str(direct_parent_task_id or "").strip()
     expected_related = {
         str(item or "").strip() for item in related_task_ids if str(item or "").strip()
+    }
+    server_bound_supplemental_related = {
+        str(item or "").strip()
+        for item in (server_bound_supplemental_related_task_ids or set())
+        if str(item or "").strip()
     }
     scope = _contract_runtime_projection_timeline_scope_values(event)
     event_task_values = set(scope["task_ids"])
@@ -66076,6 +66186,23 @@ def _contract_runtime_projection_timeline_scope_matches(
         and (event_task_values - allowed_task_values) == {top_level_task_id}
     )
     if exact_batch_wrapper:
+        return True
+    supplemental_related_values = event_related_values - expected_related
+    exact_server_bound_root_scope = bool(
+        expected_task_id
+        and runtime_context_id
+        and expected_direct_parent
+        and event_child_task_values == {expected_task_id}
+        and event_context_values == {runtime_context_id}
+        and top_level_task_id == expected_task_id
+        and event_task_values == {expected_task_id}
+        and expected_direct_parent in event_related_values
+        and supplemental_related_values
+        and supplemental_related_values.issubset(
+            server_bound_supplemental_related
+        )
+    )
+    if exact_server_bound_root_scope:
         return True
     if expected_related and event_related_values and not (
         event_related_values.issubset(expected_related)
@@ -67229,6 +67356,62 @@ def _contract_runtime_dispatch_line_match(
             ),
         }
     return {}
+
+
+def _contract_runtime_observer_merge_bound_root_task_ids(
+    record: Mapping[str, Any] | None,
+    context,
+) -> set[str]:
+    """Return the server-owned root scope bound before bounded dispatch.
+
+    A merge timeline may legitimately retain the observer/root task in
+    ``related_task_ids`` even though its top-level and child scope is the
+    bounded worker.  Only an already-completed ContractRuntime prefill plus an
+    exact dispatch line may expose that root to projection matching.
+    """
+
+    dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+    if not dispatch_match or not isinstance(record, Mapping):
+        return set()
+    dispatch_index = dispatch_match.get("line_index")
+    if not isinstance(dispatch_index, int):
+        return set()
+    prefill_bound = any(
+        index < dispatch_index
+        and str(line.get("stage_id") or "").strip() == "orchestration"
+        and str(line.get("line_id") or "").strip()
+        == "observer_prefill_child_contracts"
+        and str(line.get("actor_role") or "").strip() == "observer"
+        and str(line.get("evidence_kind") or "").strip()
+        == "contract_binding"
+        for index, line in _contract_runtime_completed_lines(record)
+    )
+    if not prefill_bound:
+        return set()
+
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    root_task_id = str(getattr(context, "root_task_id", "") or "").strip()
+    if (
+        not all((runtime_context_id, task_id, parent_task_id, root_task_id))
+        or root_task_id in {task_id, parent_task_id}
+    ):
+        return set()
+
+    dispatch_bridge = _contract_runtime_dispatch_identity_bridge(
+        record,
+        dispatch_match,
+    )
+    legacy_observer_command_id = str(
+        dispatch_bridge.get("legacy_observer_command_id") or ""
+    ).strip()
+    if (
+        legacy_observer_command_id
+        and legacy_observer_command_id != root_task_id
+    ):
+        return set()
+    return {root_task_id}
 
 
 def _contract_runtime_dispatch_identity_bridge(
@@ -70333,6 +70516,12 @@ def _contract_runtime_completed_merge_reconcile_authority(
         str(record.get("root_contract_execution_id") or "").strip(),
     }
     related_task_ids = {item for item in related_task_ids if item}
+    server_bound_root_task_ids = (
+        _contract_runtime_observer_merge_bound_root_task_ids(
+            record,
+            context,
+        )
+    )
     allow_taskless_reconcile = bool(
         reconcile_policy.get(
             "allow_taskless_reconcile_only_for_explicit_shared_batch"
@@ -70359,6 +70548,7 @@ def _contract_runtime_completed_merge_reconcile_authority(
         allow_taskless=allow_taskless_reconcile,
         related_task_ids=related_task_ids,
         direct_parent_task_id=parent_task_id,
+        server_bound_supplemental_related_task_ids=server_bound_root_task_ids,
     )
     if not reconcile_event:
         return trusted_merge
@@ -71857,6 +72047,12 @@ def _contract_runtime_observer_merge_durable_authority(
                 )
                 if value
             }
+            server_bound_root_task_ids = (
+                _contract_runtime_observer_merge_bound_root_task_ids(
+                    record,
+                    context,
+                )
+            )
             merge_event = _contract_runtime_projection_latest_timeline_event(
                 timeline_events,
                 runtime_context_id=runtime_context_id,
@@ -71867,6 +72063,9 @@ def _contract_runtime_observer_merge_durable_authority(
                 actor_roles={"observer"},
                 related_task_ids=related_task_ids,
                 direct_parent_task_id=parent_task_id,
+                server_bound_supplemental_related_task_ids=(
+                    server_bound_root_task_ids
+                ),
             )
             event_payload = (
                 merge_event.get("payload")
