@@ -72959,7 +72959,9 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
     task_id = "worker-latest-authenticated-qa-round"
     runtime_context_id = "mfrctx-latest-authenticated-qa-round"
     old_commit = "c" * 40
-    fresh_commit = "d" * 40
+    fresh_commit = "c2956b39d4584c22e0f943c8c02bb70e84091017"
+    comparison_base_commit = "fc1a743e8c84a38d6d096bc260d137742e639477"
+    immediate_parent_commit = "72b6e112f93ee4ea9623b162f1d04745eed47aec"
     context = BranchTaskRuntimeContext(
         project_id=PID,
         backlog_id=backlog_id,
@@ -73060,6 +73062,12 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
     completed_lines[-1]["test_results"] = {
         "baseline": {"commit_sha": old_commit},
         "candidate": {"commit_sha": fresh_commit},
+        "comparison_base_reproduction": {
+            "commit_sha": comparison_base_commit,
+        },
+        "immediate_parent_full_file": {
+            "commit_sha": immediate_parent_commit,
+        },
     }
     completed_lines[-1]["artifact_refs"] = {
         "external_no_pass_baseline_ledger": {
@@ -73107,6 +73115,12 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
     assert resolved["qa_graph_completed_line_index"] == 5
     assert resolved["qa_completed_line_index"] == 6
     assert resolved["qa_contract_runtime_verified"] is True
+    assert completed_lines[-1]["test_results"][
+        "comparison_base_reproduction"
+    ]["commit_sha"] == comparison_base_commit
+    assert completed_lines[-1]["test_results"][
+        "immediate_parent_full_file"
+    ]["commit_sha"] == immediate_parent_commit
 
     canonical_candidate_conflict = json.loads(json.dumps(record))
     canonical_candidate_conflict["completed_lines"][6]["payload"][
