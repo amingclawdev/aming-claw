@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+import json
 from types import SimpleNamespace
 
 from agent.governance import parallel_branch_runtime
 from agent.governance import graph_snapshot_store
 from agent.governance import server
+from agent.governance.contracts import ContractDefinitionRegistry, ContractRuntime
 from agent.governance.contracts.write_gate import (
     _validate_worker_receipt_hash_evidence,
 )
@@ -35,6 +37,148 @@ def test_contract_write_gate_rejects_nested_worker_receipt_placeholders():
             "worker-computed non-placeholder sha256: value"
         )
     ]
+
+
+def test_contract_write_gate_rejects_missing_or_empty_read_receipt_hashes():
+    missing_errors: list[str] = []
+    _validate_worker_receipt_hash_evidence(
+        missing_errors,
+        {
+            "evidence_kind": "read_receipt",
+            "payload": {
+                "schema_version": "contract_context_read_receipt.v1",
+            },
+        },
+    )
+    assert missing_errors == [
+        (
+            "read_receipt evidence requires at least one worker-computed "
+            "non-placeholder sha256: value (missing)"
+        )
+    ]
+
+    empty_errors: list[str] = []
+    _validate_worker_receipt_hash_evidence(
+        empty_errors,
+        {
+            "evidence_kind": "read_receipt",
+            "read_receipt_hash": "",
+            "payload": {
+                "contract_context_read_receipt": {
+                    "schema_version": "contract_context_read_receipt.v1",
+                    "receipt_hash": "",
+                },
+            },
+        },
+    )
+    assert empty_errors == [
+        (
+            "read_receipt_hash requires a worker-computed non-placeholder "
+            "sha256: value"
+        ),
+        (
+            "payload.contract_context_read_receipt.receipt_hash requires a "
+            "worker-computed non-placeholder sha256: value"
+        ),
+        (
+            "read_receipt evidence requires at least one worker-computed "
+            "non-placeholder sha256: value (supplied but invalid)"
+        ),
+    ]
+
+
+def test_contract_runtime_rejects_missing_or_empty_receipt_before_persistence(
+    tmp_path,
+):
+    contract_id = "read_receipt_persistence_gate"
+    definition = {
+        "schema_version": "contract_definition.v1",
+        "contract_id": contract_id,
+        "version": "v1",
+        "revision": "rev1",
+        "role": "mf_sub",
+        "contract_type": contract_id,
+        "status": "active",
+        "rule_layer": {
+            "stages": [
+                {
+                    "stage_id": "worker_read",
+                    "lines": [
+                        {
+                            "line_id": "worker_read_runtime_guide",
+                            "owner_role": "mf_sub",
+                            "allowed_writer_roles": ["mf_sub"],
+                            "evidence_kind": "read_receipt",
+                        }
+                    ],
+                }
+            ]
+        },
+        "instruction_layer": {"inline": [], "refs": []},
+    }
+    (tmp_path / f"{contract_id}.v1.rev1.json").write_text(
+        json.dumps(definition),
+        encoding="utf-8",
+    )
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+    )
+    execution_id = "cex-read-receipt-persistence-gate"
+    record = runtime.start_execution(
+        contract_id,
+        project_id="aming-claw",
+        backlog_id="AC-READ-RECEIPT-PERSISTENCE-GATE",
+        contract_execution_id=execution_id,
+        actor_role="observer",
+    )
+    writer_guide = runtime.current_guide(execution_id, actor_role="mf_sub")
+    common = {
+        "project_id": record["project_id"],
+        "backlog_id": record["backlog_id"],
+        "contract_execution_id": execution_id,
+        "definition_hash": record["definition_hash"],
+        "instruction_bundle_hash": record["instruction_bundle_hash"],
+        "stage_id": "worker_read",
+        "line_id": "worker_read_runtime_guide",
+        "actor_role": "mf_sub",
+        "evidence_kind": "read_receipt",
+        "execution_state_revision": record["execution_state_revision"],
+        "runtime_guide_hash": writer_guide["runtime_guide_hash"],
+    }
+
+    for payload in (
+        {},
+        {"read_receipt_hash": ""},
+        {
+            "contract_context_read_receipt": {
+                "schema_version": "contract_context_read_receipt.v1",
+                "receipt_hash": "",
+            }
+        },
+    ):
+        rejected = runtime.submit_line_write(
+            execution_id,
+            {**common, "payload": payload},
+            actor_role="mf_sub",
+        )
+        assert rejected["ok"] is False
+        persisted = runtime.store.get(execution_id)
+        assert persisted["execution_state_revision"] == 1
+        assert persisted["completed_lines"] == []
+
+    accepted = runtime.submit_line_write(
+        execution_id,
+        {
+            **common,
+            "payload": {"read_receipt_hash": "sha256:worker-computed"},
+        },
+        actor_role="mf_sub",
+    )
+    assert accepted["ok"] is True, json.dumps(accepted["decision"], indent=2)
+    persisted = runtime.store.get(execution_id)
+    assert persisted["execution_state_revision"] == 2
+    assert len(persisted["completed_lines"]) == 1
 
 
 def _audit_only_merge_line(*, status: str | None = None):

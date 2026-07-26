@@ -63196,6 +63196,9 @@ def _mf_parallel_worker_proof_payloads(
         "owned_files": owned_files,
         "changed_files": changed_files,
         "graph_trace_ids": [graph_trace_id],
+        "read_receipt_hash": _fake_sha(
+            f"read-receipt:{runtime_context.runtime_context_id}"
+        ),
     }
     implementation = {
         **common,

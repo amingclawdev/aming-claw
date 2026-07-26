@@ -311,7 +311,7 @@ def _validate_worker_receipt_hash_evidence(
     errors: list[str],
     write: Mapping[str, Any],
 ) -> None:
-    """Reject copied guide placeholders before ContractRuntime persistence."""
+    """Reject missing or copied receipt hashes before runtime persistence."""
 
     def _valid(value: Any) -> bool:
         text = str(value or "").strip()
@@ -323,7 +323,29 @@ def _validate_worker_receipt_hash_evidence(
             and len(text) > len("sha256:")
         )
 
-    def _walk(value: Any, path: str) -> None:
+    def _is_read_receipt_mapping(value: Mapping[str, Any]) -> bool:
+        return any(
+            "read_receipt" in str(value.get(key) or "").strip().lower()
+            for key in (
+                "evidence_kind",
+                "event_kind",
+                "canonical_event_kind",
+                "event_type",
+                "schema_version",
+            )
+        )
+
+    read_receipt_write = _is_read_receipt_mapping(write)
+    supplied_hash_field = False
+    valid_hash_field = False
+
+    def _walk(
+        value: Any,
+        path: str,
+        *,
+        read_receipt_context: bool = False,
+    ) -> None:
+        nonlocal read_receipt_write, supplied_hash_field, valid_hash_field
         if isinstance(value, Mapping):
             schema_version = str(value.get("schema_version") or "").strip()
             event_kind = str(
@@ -331,6 +353,10 @@ def _validate_worker_receipt_hash_evidence(
                 or value.get("canonical_event_kind")
                 or ""
             ).strip()
+            mapping_is_read_receipt = (
+                read_receipt_context or _is_read_receipt_mapping(value)
+            )
+            read_receipt_write = read_receipt_write or mapping_is_read_receipt
             for key, child in value.items():
                 child_path = f"{path}.{key}" if path else str(key)
                 if key in {
@@ -338,26 +364,50 @@ def _validate_worker_receipt_hash_evidence(
                     "worker_read_receipt_hash",
                     "launch_text_hash",
                 }:
-                    if str(child or "").strip() and not _valid(child):
+                    supplied_hash_field = True
+                    if _valid(child):
+                        valid_hash_field = True
+                    else:
                         errors.append(
                             f"{child_path} requires a worker-computed "
                             "non-placeholder sha256: value"
                         )
                 elif key == "receipt_hash" and (
-                    "read_receipt" in event_kind
+                    mapping_is_read_receipt
+                    or "read_receipt" in event_kind
                     or schema_version == "contract_context_read_receipt.v1"
                 ):
-                    if str(child or "").strip() and not _valid(child):
+                    supplied_hash_field = True
+                    if _valid(child):
+                        valid_hash_field = True
+                    else:
                         errors.append(
                             f"{child_path} requires a worker-computed "
                             "non-placeholder sha256: value"
                         )
-                _walk(child, child_path)
+                _walk(
+                    child,
+                    child_path,
+                    read_receipt_context=(
+                        mapping_is_read_receipt
+                        or key == "contract_context_read_receipt"
+                    ),
+                )
         elif isinstance(value, (list, tuple)):
             for index, child in enumerate(value):
-                _walk(child, f"{path}[{index}]")
+                _walk(
+                    child,
+                    f"{path}[{index}]",
+                    read_receipt_context=read_receipt_context,
+                )
 
     _walk(write, "")
+    if read_receipt_write and not valid_hash_field:
+        field_state = "supplied but invalid" if supplied_hash_field else "missing"
+        errors.append(
+            "read_receipt evidence requires at least one worker-computed "
+            f"non-placeholder sha256: value ({field_state})"
+        )
 
 
 def _validate_candidate_commit_evidence(
