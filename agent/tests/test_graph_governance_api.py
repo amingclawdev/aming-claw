@@ -20396,6 +20396,160 @@ def test_parallel_branch_finish_gate_accepts_mf_sub_session(conn, worker_status)
     assert finished["context"]["replay_source"] == "mf_sub_finish_gate"
 
 
+@pytest.mark.parametrize(
+    "host_worker_id",
+    [
+        "/root/observer_merge_root_scope_worker_r1",
+        "/root/qa_named_host_worker_r1",
+    ],
+)
+def test_parallel_branch_finish_gate_treats_authenticated_host_id_as_opaque(
+    conn,
+    host_worker_id,
+):
+    suffix = "observer-host" if "observer" in host_worker_id else "qa-host"
+    task_id = f"finish-mf-sub-opaque-{suffix}"
+    backlog_id = f"AC-FINISH-GATE-OPAQUE-{suffix.upper()}"
+    fence_token = f"fence-finish-mf-sub-opaque-{suffix}"
+    worktree_path = f"/tmp/nonexistent-finish-mf-sub-opaque-{suffix}"
+    branch_ref = f"refs/heads/codex/finish-mf-sub-opaque-{suffix}"
+    head_commit = f"head-finish-mf-sub-opaque-{suffix}"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id=f"PB-api-finish-mf-sub-opaque-{suffix}",
+            task_id=task_id,
+            backlog_id=backlog_id,
+            branch_ref=branch_ref,
+            status="worktree_ready",
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit=f"base-finish-mf-sub-opaque-{suffix}",
+            head_commit=f"base-finish-mf-sub-opaque-{suffix}",
+            target_head_commit=f"target-finish-mf-sub-opaque-{suffix}",
+            merge_queue_id=f"mergeq-api-finish-mf-sub-opaque-{suffix}",
+            actual_host_worker_id=host_worker_id,
+        ),
+        now_iso="2026-07-26T10:00:00Z",
+    )
+    evidence = _finish_gate_evidence(
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        head_commit=head_commit,
+    )
+    startup_gate = evidence["startup_evidence"]
+    for projection in (
+        startup_gate,
+        startup_gate["worker_self_attestation"],
+        evidence["finish_time_worker_self_attestation"],
+    ):
+        projection["worker_session_id"] = host_worker_id
+        projection["filer_principal"] = host_worker_id
+        projection["worker_transcript_ref"] = f"multi_agent:{host_worker_id}"
+        projection.pop("worker_transcript_path", None)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        actor="mf_sub",
+        payload={"mf_subagent_startup_gate": startup_gate},
+    )
+    conn.commit()
+
+    request_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "mf_sub",
+        method="POST",
+        body={
+            "project_id": PID,
+            "task_id": task_id,
+            "status": "review_ready",
+            "changed_files": ["agent/governance/server.py"],
+            "test_results": {"status": "passed"},
+            "checkpoint_id": f"ckpt-{task_id}",
+            "fence_token": fence_token,
+            "head_commit": head_commit,
+            "agent_id": host_worker_id,
+            "actual_host_worker_id": host_worker_id,
+            "worker_session_id": host_worker_id,
+            "filer_principal": host_worker_id,
+            "evidence": evidence,
+        },
+    )
+    request_ctx._session["session_id"] = host_worker_id
+    request_ctx._session["principal_id"] = host_worker_id
+
+    finished = server.handle_graph_governance_parallel_branch_finish_gate(
+        request_ctx
+    )
+
+    assert finished["ok"] is True
+    timeline_event = finished["timeline_event_recorded"]
+    assert timeline_event["actor"] == "mf_sub"
+    assert timeline_event["payload"]["worker_role"] == "mf_sub"
+    assert timeline_event["payload"]["actual_host_worker_id"] == host_worker_id
+    assert timeline_event["payload"]["worker_session_id"] == host_worker_id
+    assert timeline_event["payload"]["filer_principal"] == host_worker_id
+    assert timeline_event["payload"]["submitted_actor"] == host_worker_id
+    assert timeline_event["payload"]["actor_session_principal"] == host_worker_id
+
+
+def test_parallel_branch_finish_gate_rejects_genuine_observer_session(conn):
+    task_id = "finish-gate-genuine-observer"
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            backlog_id="AC-FINISH-GATE-GENUINE-OBSERVER",
+            branch_ref="refs/heads/codex/finish-gate-genuine-observer",
+            status="worktree_ready",
+            fence_token="fence-finish-gate-genuine-observer",
+            worktree_path="/tmp/nonexistent-finish-gate-genuine-observer",
+            base_commit="base-finish-gate-genuine-observer",
+            head_commit="base-finish-gate-genuine-observer",
+            target_head_commit="target-finish-gate-genuine-observer",
+            merge_queue_id="mergeq-finish-gate-genuine-observer",
+        ),
+        now_iso="2026-07-26T10:01:00Z",
+    )
+    conn.commit()
+
+    with pytest.raises(PermissionDeniedError):
+        server.handle_graph_governance_parallel_branch_finish_gate(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "project_id": PID,
+                    "runtime_context_id": (
+                        runtime_context_id_for_branch_context(context)
+                    ),
+                    "task_id": task_id,
+                    "fence_token": "fence-finish-gate-genuine-observer",
+                    "worker_session_id": (
+                        "/root/observer_merge_root_scope_worker_r1"
+                    ),
+                },
+            )
+        )
+
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=task_id,
+        event_kind="mf_subagent_finish_gate",
+    ) == []
+
+
 def test_finish_gate_derives_parent_route_lineage_and_reads_worker_progress_attestation(conn):
     task_id = "finish-dogfood-attestation-task"
     parent_task_id = "finish-dogfood-parent"
@@ -20665,9 +20819,8 @@ def test_finish_gate_missing_status_returns_contract_error_repair_payload(conn):
     )
 
     status, payload = server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx_with_role(
+        _ctx(
             {"project_id": PID},
-            "mf_sub",
             method="POST",
             body={
                 "project_id": PID,
@@ -22205,8 +22358,9 @@ def test_parallel_branch_finish_gate_stale_fence_returns_actionable_repair(conn)
     )
 
     status, payload = server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx(
+        _ctx_with_role(
             {"project_id": PID},
+            "mf_sub",
             method="POST",
             body={
                 "task_id": "finish-stale-task",

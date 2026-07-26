@@ -37057,7 +37057,30 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
 
     conn = get_connection(project_id)
     try:
-        _require_graph_governance_mf_subagent(ctx, conn, "graph-governance.parallel-branches.finish-gate")
+        finish_gate_action = "graph-governance.parallel-branches.finish-gate"
+        authenticated_worker_session = _require_graph_governance_mf_subagent(
+            ctx,
+            conn,
+            finish_gate_action,
+        )
+        authenticated_worker_role = str(
+            authenticated_worker_session.get("role") or ""
+        ).strip().lower()
+        if (
+            str(ctx.body.get("runtime_context_id") or "").strip()
+            and authenticated_worker_role != "mf_sub"
+        ):
+            raise PermissionDeniedError(
+                authenticated_worker_role,
+                finish_gate_action,
+                {
+                    "detail": (
+                        "Finish-gate worker evidence requires an authenticated "
+                        "mf_sub session; observer/coordinator overrides cannot "
+                        "author or impersonate worker evidence"
+                    )
+                },
+            )
         with sqlite_write_lock():
             context = get_branch_context(conn, project_id, task_id)
             if context is None:
@@ -37369,6 +37392,18 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             except Exception:
                 pass
             safe_gate_payload = public_contract_revision_payload(gate)
+            verified_worker_identity = (
+                safe_gate_payload.get("worker_identity")
+                if isinstance(safe_gate_payload.get("worker_identity"), Mapping)
+                else {}
+            )
+            verified_worker_session_id = str(
+                verified_worker_identity.get("worker_session_id") or ""
+            ).strip()
+            verified_actual_host_worker_id = str(
+                getattr(saved, "actual_host_worker_id", "")
+                or verified_worker_session_id
+            ).strip()
             finish_event_payload = {
                 "mf_subagent_finish_gate": safe_gate_payload,
                 **safe_gate_payload,
@@ -37384,6 +37419,11 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                 ),
                 "backlog_id": saved.backlog_id,
                 "worker_role": "mf_sub",
+                "actual_host_worker_id": verified_actual_host_worker_id,
+                "worker_session_id": verified_worker_session_id,
+                "filer_principal": verified_worker_session_id,
+                "submitted_actor": verified_worker_session_id,
+                "actor_session_principal": verified_worker_session_id,
             }
             canonical_finish_line: dict[str, Any] = {}
             canonical_handoff_line: dict[str, Any] = {}
@@ -37459,12 +37499,12 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                 event_kind="mf_subagent_finish_gate",
                 phase="finish_gate",
                 status="passed",
-                actor=str(
-                    ctx.body.get("worker_session_id")
-                    or ctx.body.get("agent_id")
-                    or ctx.body.get("actor")
-                    or "mf_subagent"
-                ),
+                # Strict mf_sub authentication and finish-attestation validation
+                # have already succeeded above.  The host/session id is opaque
+                # audit data, not a role-bearing actor label: values such as
+                # ``/root/observer_...`` or ``/root/qa_...`` must not be
+                # reclassified lexically by the timeline meta-contract gate.
+                actor="mf_sub",
                 payload=finish_event_payload,
                 commit_sha=saved.head_commit,
             )
