@@ -76074,6 +76074,206 @@ def _onboard_parentless_direct_main_pre_mutation_event_guidance(
     }
 
 
+def _onboard_parentless_direct_main_post_mutation_event_guidance(
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    route_token_ref: str,
+    target_files: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Return copy-safe canonical implementation and close-ready requests."""
+
+    allowed_files = _runtime_context_service_dedupe(
+        [str(path or "").strip() for path in target_files]
+    )
+    close_commit_placeholder = "<replace with the exact closing HEAD commit>"
+    full_reconcile_snapshot_placeholder = (
+        "<replace with the active current-HEAD full reconcile snapshot id>"
+    )
+    identity_ready = all(
+        [
+            str(project_id or "").strip(),
+            str(backlog_id or "").strip(),
+            str(task_id or "").strip(),
+            str(route_token_ref or "").strip(),
+            allowed_files,
+        ]
+    )
+    implementation_arguments = {
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "event_type": "observer.implementation",
+        "event_kind": "implementation",
+        "phase": "implementation",
+        "status": "passed",
+        "actor": "observer",
+        "commit_sha": close_commit_placeholder,
+        "payload": {
+            "changed_files": allowed_files,
+            "dirty_scope_check": {
+                "allowed_files": allowed_files,
+                "changed_files": allowed_files,
+                "unexpected_files": [],
+                "exact_match": True,
+            },
+            "diff_check": {
+                "changed_files": allowed_files,
+                "unexpected_files": [],
+                "exact_match": True,
+            },
+        },
+        "route_token_ref": str(route_token_ref or "").strip(),
+    }
+    close_ready_arguments = {
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "event_type": "observer.close_ready",
+        "event_kind": "close_ready",
+        "phase": "close_ready",
+        "status": "passed",
+        "actor": "observer",
+        "commit_sha": close_commit_placeholder,
+        "verification": {
+            "runtime_sync": {
+                "status": "passed",
+                "commit_sha": close_commit_placeholder,
+            },
+            "governance_redeploy": {
+                "status": "passed",
+                "commit_sha": close_commit_placeholder,
+            },
+            "live_regression": {
+                "status": "passed",
+                "commit_sha": close_commit_placeholder,
+            },
+            "graph_reconciled": True,
+            "preflight_ok": True,
+            "full_reconcile_snapshot": {
+                "snapshot_id": full_reconcile_snapshot_placeholder,
+                "commit_sha": close_commit_placeholder,
+                "active": True,
+                "snapshot_kind": "full",
+            },
+        },
+        "payload": {
+            "close_commit": close_commit_placeholder,
+            "full_reconcile_snapshot_id": full_reconcile_snapshot_placeholder,
+        },
+        "route_token_ref": str(route_token_ref or "").strip(),
+    }
+    common = {
+        "mcp_tool": "task_timeline_append",
+        "copy_safe": True,
+        "identity_ready": identity_ready,
+        "executable_after_replacements": identity_ready,
+        "raw_route_token_required": False,
+    }
+    return {
+        "schema_version": (
+            "onboard_route_guide.parentless_direct_main."
+            "copy_safe_post_mutation_events.v1"
+        ),
+        "implementation": {
+            **common,
+            "arguments_template": implementation_arguments,
+            "replace_before_submit": ["commit_sha"],
+            "same_value_replacements": {
+                close_commit_placeholder: [
+                    "commit_sha",
+                ]
+            },
+            "required_canonical_fields": [
+                "payload.changed_files",
+                "payload.dirty_scope_check or payload.diff_check",
+            ],
+            "ordering": (
+                "submit after the implementation commit exists and before "
+                "independent QA"
+            ),
+        },
+        "close_ready": {
+            **common,
+            "arguments_template": close_ready_arguments,
+            "replace_before_submit": [
+                "commit_sha",
+                "verification.runtime_sync.commit_sha",
+                "verification.governance_redeploy.commit_sha",
+                "verification.live_regression.commit_sha",
+                "verification.full_reconcile_snapshot.snapshot_id",
+                "verification.full_reconcile_snapshot.commit_sha",
+                "payload.close_commit",
+                "payload.full_reconcile_snapshot_id",
+            ],
+            "same_value_replacements": {
+                close_commit_placeholder: [
+                    "commit_sha",
+                    "verification.runtime_sync.commit_sha",
+                    "verification.governance_redeploy.commit_sha",
+                    "verification.live_regression.commit_sha",
+                    "verification.full_reconcile_snapshot.commit_sha",
+                    "payload.close_commit",
+                ],
+                full_reconcile_snapshot_placeholder: [
+                    "verification.full_reconcile_snapshot.snapshot_id",
+                    "payload.full_reconcile_snapshot_id",
+                ],
+            },
+            "required_canonical_fields": [
+                (
+                    "verification.runtime_sync or "
+                    "verification.governance_redeploy"
+                ),
+                "verification.live_regression",
+                "verification.graph_reconciled=true",
+                "verification.preflight_ok=true",
+            ],
+            "ordering": (
+                "submit only after independent QA and an active current-HEAD "
+                "full reconcile"
+            ),
+        },
+        "canonical_field_policy": {
+            "implementation": {
+                "required": [
+                    "changed_files",
+                    "dirty_scope_check or diff_check",
+                ],
+                "non_satisfying_aliases": ["dirty_scope_exact_match"],
+            },
+            "close_ready": {
+                "required": [
+                    "runtime_sync or governance_redeploy",
+                    "live_regression",
+                    "graph_reconciled=true",
+                    "preflight_ok=true",
+                ],
+                "non_satisfying_aliases": [
+                    "redeploy_runtime_sync",
+                    "active_full_reconcile",
+                ],
+            },
+            "warning": (
+                "dirty_scope_exact_match, redeploy_runtime_sync, and "
+                "active_full_reconcile are descriptive aliases only and do "
+                "not satisfy the parentless direct-main close gate."
+            ),
+        },
+        "authoritative_close_failure_policy": {
+            "post_hoc_backfill_after_first_authoritative_close_failure": False,
+            "historical_missing_line_repair_forbidden": True,
+            "required_recovery": (
+                "Preserve the failed attempt as raw audit, terminalize and "
+                "discard that validation generation, repair the root cause in "
+                "a separate bounded row, complete independent QA plus "
+                "current-HEAD full reconcile, then start a fresh generation."
+            ),
+        },
+    }
+
+
 def _onboard_contract_route_guide(
     record: Mapping[str, Any],
     *,
@@ -76479,6 +76679,15 @@ def _onboard_contract_route_guide(
             target_files=direct_main_allowed_files,
         )
     )
+    direct_main_post_mutation_event_guidance = (
+        _onboard_parentless_direct_main_post_mutation_event_guidance(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+            route_token_ref=route_token_ref,
+            target_files=direct_main_allowed_files,
+        )
+    )
     direct_main_entry = {
         "schema_version": "onboard_contract.operator_supervised_direct_main.v1",
         "id": "operator_supervised_direct_main",
@@ -76525,6 +76734,9 @@ def _onboard_contract_route_guide(
         ),
         "graph_query_close_authority": direct_main_graph_query_guidance,
         "copy_safe_pre_mutation_event": direct_main_pre_mutation_event_guidance,
+        "copy_safe_post_mutation_events": (
+            direct_main_post_mutation_event_guidance
+        ),
         "full_round_route_issue": {
             "schema_version": (
                 "onboard_contract.operator_supervised_direct_main."
@@ -76708,6 +76920,11 @@ def _onboard_contract_route_guide(
                         "changed_files",
                         "diff_check or dirty_scope_check",
                     ],
+                    "copy_safe_event": (
+                        direct_main_post_mutation_event_guidance[
+                            "implementation"
+                        ]
+                    ),
                 },
                 {
                     "event_type": "qa.independent_verification",
@@ -76753,8 +76970,21 @@ def _onboard_contract_route_guide(
                         "graph_reconciled",
                         "preflight_ok",
                     ],
+                    "copy_safe_event": (
+                        direct_main_post_mutation_event_guidance["close_ready"]
+                    ),
                 },
             ],
+            "canonical_field_policy": (
+                direct_main_post_mutation_event_guidance[
+                    "canonical_field_policy"
+                ]
+            ),
+            "authoritative_close_failure_policy": (
+                direct_main_post_mutation_event_guidance[
+                    "authoritative_close_failure_policy"
+                ]
+            ),
             "close_authority": {
                 "mcp_tool": "backlog_close",
                 "requires_contract_execution_id": contract_execution_id,

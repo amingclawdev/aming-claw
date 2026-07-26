@@ -49494,6 +49494,52 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         "live_regression_evidence",
         "live_regression",
     ]
+    post_mutation = direct_main["copy_safe_post_mutation_events"]
+    assert implementation_shape["copy_safe_event"] == post_mutation[
+        "implementation"
+    ]
+    assert close_ready_shape["copy_safe_event"] == post_mutation["close_ready"]
+    for event_template in (
+        post_mutation["implementation"],
+        post_mutation["close_ready"],
+    ):
+        assert event_template["mcp_tool"] == "task_timeline_append"
+        assert event_template["copy_safe"] is True
+        assert event_template["identity_ready"] is True
+        assert event_template["executable_after_replacements"] is True
+        assert event_template["raw_route_token_required"] is False
+    assert post_mutation["canonical_field_policy"] == {
+        "implementation": {
+            "required": [
+                "changed_files",
+                "dirty_scope_check or diff_check",
+            ],
+            "non_satisfying_aliases": ["dirty_scope_exact_match"],
+        },
+        "close_ready": {
+            "required": [
+                "runtime_sync or governance_redeploy",
+                "live_regression",
+                "graph_reconciled=true",
+                "preflight_ok=true",
+            ],
+            "non_satisfying_aliases": [
+                "redeploy_runtime_sync",
+                "active_full_reconcile",
+            ],
+        },
+        "warning": (
+            "dirty_scope_exact_match, redeploy_runtime_sync, and "
+            "active_full_reconcile are descriptive aliases only and do "
+            "not satisfy the parentless direct-main close gate."
+        ),
+    }
+    assert post_mutation["authoritative_close_failure_policy"][
+        "post_hoc_backfill_after_first_authoritative_close_failure"
+    ] is False
+    assert post_mutation["authoritative_close_failure_policy"][
+        "historical_missing_line_repair_forbidden"
+    ] is True
 
     route_identity = {
         "route_id": "route-parentless-direct-main-guide-shapes",
@@ -49597,25 +49643,16 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         "reason",
         "dirty_scope_or_dirty_scope_check",
     ]
+    implementation_arguments = copy.deepcopy(
+        post_mutation["implementation"]["arguments_template"]
+    )
+    implementation_arguments["commit_sha"] = close_commit
     server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
             method="POST",
-            body={
-                **append_base,
-                "event_type": implementation_shape["event_type"],
-                "event_kind": implementation_shape["event_kind"],
-                "phase": implementation_shape["phase"],
-                "status": implementation_shape["status"],
-                "actor": "observer",
-                "commit_sha": close_commit,
-                "payload": {
-                    **route_identity,
-                    "changed_files": template["allowed_files"],
-                    "diff_check": {"unexpected_files": []},
-                },
-            },
+            body=implementation_arguments,
         )
     )
     _append_authenticated_qa_verification(
@@ -49629,28 +49666,35 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
             "diff_check": {"unexpected_files": []},
         },
     )
+    close_ready_arguments = copy.deepcopy(
+        post_mutation["close_ready"]["arguments_template"]
+    )
+    close_ready_arguments["commit_sha"] = close_commit
+    close_ready_arguments["verification"]["runtime_sync"][
+        "commit_sha"
+    ] = close_commit
+    close_ready_arguments["verification"]["governance_redeploy"][
+        "commit_sha"
+    ] = close_commit
+    close_ready_arguments["verification"]["live_regression"][
+        "commit_sha"
+    ] = close_commit
+    close_ready_arguments["verification"]["full_reconcile_snapshot"][
+        "snapshot_id"
+    ] = "full-parentless-direct-main-guide-shapes"
+    close_ready_arguments["verification"]["full_reconcile_snapshot"][
+        "commit_sha"
+    ] = close_commit
+    close_ready_arguments["payload"]["close_commit"] = close_commit
+    close_ready_arguments["payload"][
+        "full_reconcile_snapshot_id"
+    ] = "full-parentless-direct-main-guide-shapes"
     server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
             method="POST",
-            body={
-                **append_base,
-                "event_type": close_ready_shape["event_type"],
-                "event_kind": close_ready_shape["event_kind"],
-                "phase": close_ready_shape["phase"],
-                "status": close_ready_shape["status"],
-                "actor": "observer",
-                "commit_sha": close_commit,
-                "verification": {
-                    "redeployed": True,
-                    "runtime_sync": {"status": "passed"},
-                    "live_regression_evidence": {"status": "passed"},
-                    "graph_reconciled": True,
-                    "preflight_ok": True,
-                },
-                "payload": {**route_identity, "close_commit": close_commit},
-            },
+            body=close_ready_arguments,
         )
     )
 
