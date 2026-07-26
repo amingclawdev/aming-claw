@@ -33684,6 +33684,13 @@ def _runtime_context_submit_canonical_contract_line(
                         "timeline_evidence_backfill_allowed": False,
                     },
                 )
+            _onboard_guide_capsule_invalidate_contract_runtime_transition(
+                project_id=project_id,
+                result={
+                    "ok": True,
+                    "record": runtime.store.get(execution_id),
+                },
+            )
             return replay
         if revision_status == "validated_submission":
             canonical_payload = dict(
@@ -33693,6 +33700,14 @@ def _runtime_context_submit_canonical_contract_line(
             revision_status == "revised"
             or next_line_id != "worker_implementation"
         ):
+            if revision_status == "revised":
+                _onboard_guide_capsule_invalidate_contract_runtime_transition(
+                    project_id=project_id,
+                    result={
+                        "ok": True,
+                        "record": runtime.store.get(execution_id),
+                    },
+                )
             return revision
         if not revision:
             precommit_correction = (
@@ -33706,6 +33721,14 @@ def _runtime_context_submit_canonical_contract_line(
                 )
             )
             if precommit_correction:
+                if str(precommit_correction.get("status") or "") == "revised":
+                    _onboard_guide_capsule_invalidate_contract_runtime_transition(
+                        project_id=project_id,
+                        result={
+                            "ok": True,
+                            "record": runtime.store.get(execution_id),
+                        },
+                    )
                 return precommit_correction
 
     for completed in record.get("completed_lines") or []:
@@ -33829,6 +33852,10 @@ def _runtime_context_submit_canonical_contract_line(
         result.get("record")
         if isinstance(result.get("record"), Mapping)
         else {}
+    )
+    _onboard_guide_capsule_invalidate_contract_runtime_transition(
+        project_id=project_id,
+        result=result,
     )
     current_state = _runtime_current_state_from_record(updated) if updated else {}
     completed_line = next(
@@ -56765,6 +56792,10 @@ def _publish_accepted_contract_runtime_line_write(
     record = result.get("record")
     if not result.get("ok") or not isinstance(record, Mapping):
         return
+    _onboard_guide_capsule_invalidate_contract_runtime_transition(
+        project_id=project_id,
+        result=result,
+    )
     _publish_contract_runtime_current_changed(
         project_id,
         backlog_id=str(record.get("backlog_id") or ""),
@@ -79804,6 +79835,87 @@ def _onboard_guide_capsule_invalidate_scope_locked(
     for key in invalidated:
         _ONBOARD_GUIDE_CAPSULE_CACHE.pop(key, None)
         _ONBOARD_GUIDE_CAPSULE_METRICS["invalidations"] += 1
+
+
+def _onboard_guide_capsule_invalidate_contract_runtime_transition(
+    *,
+    project_id: str,
+    result: Mapping[str, Any],
+) -> int:
+    """Remove only capsules made stale by one accepted runtime transition.
+
+    ContractRuntime line mutations advance the authoritative revision exactly
+    once.  Capsule roles and work types are presentation scopes, so every
+    presentation of the exact prior project/backlog/execution/revision
+    projection must be removed together.  Rejected writes and exact idempotent
+    replays never invalidate.
+    """
+
+    if (
+        result.get("ok") is not True
+        or result.get("idempotent") is True
+        or result.get("contract_runtime_line_mutated") is False
+        or result.get("contract_runtime_mutated") is False
+    ):
+        return 0
+    record = (
+        result.get("record")
+        if isinstance(result.get("record"), Mapping)
+        else {}
+    )
+    resolved_project_id = str(
+        record.get("project_id") or project_id or ""
+    ).strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    contract_execution_id = str(
+        record.get("contract_execution_id")
+        or result.get("contract_execution_id")
+        or ""
+    ).strip()
+    execution_state = (
+        record.get("execution_state")
+        if isinstance(record.get("execution_state"), Mapping)
+        else {}
+    )
+    try:
+        current_revision = int(
+            record.get("execution_state_revision")
+            or execution_state.get("execution_state_revision")
+            or result.get("execution_state_revision")
+            or 0
+        )
+    except (TypeError, ValueError):
+        return 0
+    prior_revision = current_revision - 1
+    if not (
+        resolved_project_id
+        and backlog_id
+        and contract_execution_id
+        and prior_revision > 0
+    ):
+        return 0
+
+    invalidated: list[tuple[str, ...]] = []
+    with _ONBOARD_GUIDE_CAPSULE_LOCK:
+        for key, entry in list(_ONBOARD_GUIDE_CAPSULE_CACHE.items()):
+            identity = (
+                entry.get("identity")
+                if isinstance(entry.get("identity"), Mapping)
+                else {}
+            )
+            if not (
+                key[0] == resolved_project_id
+                and key[1] == backlog_id
+                and key[4] == contract_execution_id
+                and key[5] == str(prior_revision)
+                and key[6] == str(identity.get("projection_hash") or "")
+            ):
+                continue
+            invalidated.append(key)
+        for key in invalidated:
+            _ONBOARD_GUIDE_CAPSULE_CACHE.pop(key, None)
+            _ONBOARD_GUIDE_CAPSULE_METRICS["invalidations"] += 1
+    return len(invalidated)
 
 
 def _onboard_guide_capsule_get_or_create(
@@ -109037,6 +109149,10 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
                 **common,
             ))
 
+    _onboard_guide_capsule_invalidate_contract_runtime_transition(
+        project_id=project_id,
+        result=result,
+    )
     response = {
         "schema_version": "contract_runtime.line_bypass_response.v1",
         "ok": True,

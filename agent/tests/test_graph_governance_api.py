@@ -54464,6 +54464,170 @@ def test_onboard_guide_capsule_single_flight_revision_invalidation_and_eviction(
     assert "wstok-copy-safe" in serialized
 
 
+def test_runtime_context_canonical_write_immediately_invalidates_prior_capsule(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-CAPSULE-CANONICAL-WRITE-INVALIDATION"
+    execution_id = "cex-capsule-canonical-write"
+    runtime_context_id = "mfrctx-capsule-canonical-write"
+    task_id = "capsule-canonical-worker"
+    before = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel",
+        "definition_hash": "sha256:capsule-canonical-definition",
+        "instruction_bundle_hash": "sha256:capsule-canonical-instructions",
+        "execution_state_revision": 3,
+        "execution_state": {
+            "execution_state_revision": 3,
+            "execution_state_hash": "sha256:capsule-canonical-state-3",
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": "sha256:capsule-canonical-guide-3",
+            "next_legal_action": {
+                "stage_id": "worker_context",
+                "line_id": "worker_graph_context",
+                "evidence_kind": "graph_trace",
+            },
+        },
+        "completed_lines": [],
+    }
+    completed_line = {
+        "stage_id": "worker_context",
+        "line_id": "worker_graph_context",
+        "actor_role": "mf_sub",
+        "evidence_kind": "graph_trace",
+        "payload": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+        },
+    }
+    after = {
+        **before,
+        "execution_state_revision": 4,
+        "execution_state": {
+            "execution_state_revision": 4,
+            "execution_state_hash": "sha256:capsule-canonical-state-4",
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": "sha256:capsule-canonical-guide-4",
+            "next_legal_action": {
+                "stage_id": "worker_commit",
+                "line_id": "worker_commit",
+                "evidence_kind": "worker_commit",
+            },
+        },
+        "completed_lines": [completed_line],
+    }
+    current = {"record": before}
+
+    class FakeRuntime:
+        store = SimpleNamespace(get=lambda _execution_id: current["record"])
+
+        @staticmethod
+        def pinned_definition_has_line(_execution_id, _line_id):
+            return True
+
+        @staticmethod
+        def current_guide(_execution_id, actor_role):
+            return current["record"]["runtime_guide"]
+
+        @staticmethod
+        def submit_line_write(*_args, **_kwargs):
+            current["record"] = after
+            return {"ok": True, "record": after}
+
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: FakeRuntime())
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_contract_revision_payload",
+        lambda _conn, _context: {"contract_execution_id": execution_id},
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_resolve_contract_execution_identity",
+        lambda *_args, **_kwargs: (
+            {"contract_execution_id": execution_id},
+            {"status": "resolved"},
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda *_args, **kwargs: (kwargs["record"], {}),
+    )
+    context = SimpleNamespace(
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    capsule_identity = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "selected_role": "worker",
+        "selected_work_type": "parallel_worker",
+        "contract_execution_id": execution_id,
+        "execution_state_revision": 3,
+        "projection_hash": "sha256:capsule-canonical-projection-3",
+        "terminal": False,
+    }
+    stale_capsule, _ = server._onboard_guide_capsule_get_or_create(
+        capsule_identity,
+        lambda: {"next_action": {"action": "record_graph_context"}},
+    )
+
+    written = server._runtime_context_submit_canonical_contract_line(
+        conn,
+        project_id=PID,
+        context=context,
+        contract_execution_id=execution_id,
+        stage_id="worker_context",
+        line_id="worker_graph_context",
+        evidence_kind="graph_trace",
+        payload={
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+        },
+    )
+
+    assert written["accepted"] is True
+    assert written["status"] == "completed"
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        assert not any(
+            entry["guide_capsule_ref"] == stale_capsule["guide_capsule_ref"]
+            for entry in server._ONBOARD_GUIDE_CAPSULE_CACHE.values()
+        )
+
+    current_capsule, _ = server._onboard_guide_capsule_get_or_create(
+        {
+            **capsule_identity,
+            "execution_state_revision": 4,
+            "projection_hash": "sha256:capsule-canonical-projection-4",
+        },
+        lambda: {"next_action": {"action": "record_worker_commit"}},
+    )
+    replay = server._runtime_context_submit_canonical_contract_line(
+        conn,
+        project_id=PID,
+        context=context,
+        contract_execution_id=execution_id,
+        stage_id="worker_context",
+        line_id="worker_graph_context",
+        evidence_kind="graph_trace",
+        payload={
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+        },
+    )
+    assert replay["status"] == "already_completed"
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        assert any(
+            entry["guide_capsule_ref"] == current_capsule["guide_capsule_ref"]
+            for entry in server._ONBOARD_GUIDE_CAPSULE_CACHE.values()
+        )
+
+
 def test_onboard_route_guide_suppresses_direct_fix_for_no_direct_fix_backlog(conn):
     backlog_id = "AC-ONBOARD-NO-DIRECT-FIX-POLICY"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -59945,6 +60109,30 @@ def test_contract_runtime_generic_facade_writes_observer_onboarding_line(conn):
     )
     assert current["contract_id"] == "onboard_contract"
     assert current["next_legal_action"]["id"] == "graph_query_schema_trace"
+    capsule_identity = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "selected_role": "observer",
+        "selected_work_type": "multi_backlog_parallel",
+        "contract_execution_id": record["contract_execution_id"],
+        "execution_state_revision": record["execution_state_revision"],
+        "projection_hash": "sha256:generic-onboard-before-write",
+        "terminal": False,
+    }
+    unrelated_capsule, _ = server._onboard_guide_capsule_get_or_create(
+        {
+            **capsule_identity,
+            "selected_role": "qa",
+            "selected_work_type": "qa_verification",
+            "contract_execution_id": "cex-unrelated-capsule",
+            "projection_hash": "sha256:generic-onboard-unrelated",
+        },
+        lambda: {"next_action": {"action": "run_independent_qa"}},
+    )
+    stale_capsule, _ = server._onboard_guide_capsule_get_or_create(
+        capsule_identity,
+        lambda: {"next_action": {"action": "record_graph_context"}},
+    )
 
     published: list[tuple[str, dict[str, Any]]] = []
 
@@ -59992,6 +60180,46 @@ def test_contract_runtime_generic_facade_writes_observer_onboarding_line(conn):
     )
     assert any(name == "contract_chain.current_changed" for name, _ in published)
     assert any(name == "current_task.changed" for name, _ in published)
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        assert not any(
+            entry["guide_capsule_ref"] == stale_capsule["guide_capsule_ref"]
+            for entry in server._ONBOARD_GUIDE_CAPSULE_CACHE.values()
+        )
+        assert any(
+            entry["guide_capsule_ref"] == unrelated_capsule["guide_capsule_ref"]
+            for entry in server._ONBOARD_GUIDE_CAPSULE_CACHE.values()
+        )
+
+    current_capsule, _ = server._onboard_guide_capsule_get_or_create(
+        {
+            **capsule_identity,
+            "execution_state_revision": accepted["execution_state_revision"],
+            "projection_hash": "sha256:generic-onboard-after-write",
+        },
+        lambda: {"next_action": {"action": "record_related_backlog_review"}},
+    )
+    rejected = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": record["contract_execution_id"],
+            },
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "graph_context",
+                "line_id": "graph_query_schema_trace",
+                "evidence_kind": "graph_query_schema_trace",
+                "payload": {"trace_id": "gqt-generic-onboard-stale"},
+            },
+        )
+    )
+    assert rejected["ok"] is False
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        assert any(
+            entry["guide_capsule_ref"] == current_capsule["guide_capsule_ref"]
+            for entry in server._ONBOARD_GUIDE_CAPSULE_CACHE.values()
+        )
 
 
 def test_contract_runtime_line_bypass_atomically_links_open_diagnostic(conn):
@@ -60025,6 +60253,20 @@ def test_contract_runtime_line_bypass_atomically_links_open_diagnostic(conn):
         method="POST",
         body=payload,
     )
+    capsule_identity = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "selected_role": "observer",
+        "selected_work_type": "operator_supervised_direct_main",
+        "contract_execution_id": record["contract_execution_id"],
+        "execution_state_revision": record["execution_state_revision"],
+        "projection_hash": "sha256:bypass-before-write",
+        "terminal": False,
+    }
+    stale_capsule, _ = server._onboard_guide_capsule_get_or_create(
+        capsule_identity,
+        lambda: {"next_action": {"action": "bypass_current_line"}},
+    )
 
     accepted = server.handle_project_contract_runtime_line_bypass(ctx(body))
 
@@ -60050,11 +60292,29 @@ def test_contract_runtime_line_bypass_atomically_links_open_diagnostic(conn):
         (backlog_id, "contract_line_bypass"),
         (diagnostic_id, "contract_line_bypass_diagnostic_linked"),
     ]
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        assert not any(
+            entry["guide_capsule_ref"] == stale_capsule["guide_capsule_ref"]
+            for entry in server._ONBOARD_GUIDE_CAPSULE_CACHE.values()
+        )
 
+    current_capsule, _ = server._onboard_guide_capsule_get_or_create(
+        {
+            **capsule_identity,
+            "execution_state_revision": accepted["execution_state_revision"],
+            "projection_hash": "sha256:bypass-after-write",
+        },
+        lambda: {"next_action": {"action": "record_post_action_summary"}},
+    )
     retry = server.handle_project_contract_runtime_line_bypass(ctx(body))
     assert retry["ok"] is True
     assert retry["idempotent"] is True
     assert retry["timeline_events"] == []
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        assert any(
+            entry["guide_capsule_ref"] == current_capsule["guide_capsule_ref"]
+            for entry in server._ONBOARD_GUIDE_CAPSULE_CACHE.values()
+        )
     event_count = conn.execute(
         "SELECT COUNT(*) FROM task_timeline_events WHERE correlation_id = ?",
         (f"contract-line-bypass:{body['bypass_identity']}",),
