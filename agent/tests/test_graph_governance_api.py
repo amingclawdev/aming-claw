@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 import copy
@@ -37576,6 +37576,511 @@ def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_with
     second_rotation_audit = json.loads(second_rotation_row["payload_json"])
     assert second_rotation_audit["reopen_for_revision"] is False
     assert second_rotation_audit["timeline_reopen_for_revision"] is False
+
+
+def _setup_validated_missing_finish_rejoin_runtime(conn, tmp_path):
+    backlog_id = "AC-RUNTIME-VALIDATED-MISSING-FINISH-REJOIN"
+    worker_task_id = "validated-missing-finish-rejoin-worker"
+    target_root = tmp_path / worker_task_id
+    head_commit = _init_test_git_repo(target_root)
+    branch_name = f"codex/{worker_task_id}"
+    subprocess.run(
+        ["git", "checkout", "-b", branch_name],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    successor, context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="validated-missing-finish-rejoin-parent",
+        worker_task_id=worker_task_id,
+        fence_token="fence-validated-missing-finish-rejoin",
+        token="lost-validated-missing-finish-rejoin-token",
+        worktree_path=str(target_root),
+        target_project_root=str(target_root),
+        base_commit=head_commit,
+        owned_files=("agent/governance/server.py",),
+    )
+    worker_session_id = f"session-{worker_task_id}"
+    context = upsert_branch_context(
+        conn,
+        replace(
+            context,
+            branch_ref=f"refs/heads/{branch_name}",
+            head_commit=head_commit,
+            target_head_commit=head_commit,
+            actual_host_worker_id=context.worker_id,
+            host_startup_id=f"startup-{worker_task_id}",
+            host_session_id=worker_session_id,
+            attempt=3,
+            retry_round=2,
+        ),
+        now_iso="2026-07-26T02:00:00Z",
+    )
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(successor["contract_execution_id"])
+    dispatch = server._contract_runtime_dispatch_line_match(record, context)
+    route_identity = dict(dispatch["payload"]["route_identity"])
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-validated-missing-finish-rejoin",
+        contract_version="mf_parallel.v2",
+        payload={
+            "contract_execution_id": successor["contract_execution_id"],
+            "route_identity": route_identity,
+        },
+        route_identity=route_identity,
+        route_evidence_type="observer_route_token_ref",
+        actor="observer",
+        now_iso="2026-07-26T02:01:00Z",
+    )
+    worker_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        context,
+        backlog_id=backlog_id,
+        fence_token=context.fence_token,
+        graph_trace_id="gqt-validated-missing-finish-rejoin",
+        head_commit=head_commit,
+        include_finish_evidence=False,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=context,
+        parent_task_id=backlog_id,
+        graph_trace_id="gqt-validated-missing-finish-rejoin",
+        head_commit=head_commit,
+        implementation_event_ref=f"timeline:{worker_events['implementation']}",
+        route_token_ref=route_identity["route_token_ref"],
+    )
+    record = runtime.store.get(successor["contract_execution_id"])
+    for line in record["completed_lines"]:
+        if line.get("line_id") != "worker_commit":
+            continue
+        line["contract_execution_id"] = successor["contract_execution_id"]
+        line.setdefault("payload", {})["contract_execution_id"] = (
+            successor["contract_execution_id"]
+        )
+    runtime.store.update(successor["contract_execution_id"], record)
+    finish_attestation_payload = {
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": backlog_id,
+        "contract_execution_id": successor["contract_execution_id"],
+        "worker_role": "mf_sub",
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+        "worker_session_id": worker_session_id,
+        "filer_principal": worker_session_id,
+        "head_commit": head_commit,
+        "changed_files": ["agent/governance/server.py"],
+        "graph_trace_ids": ["gqt-validated-missing-finish-rejoin"],
+        "read_receipt_event_id": str(worker_events["read_receipt"]),
+        "read_receipt_hash": _fake_sha(
+            f"read-receipt:{context.runtime_context_id}"
+        ),
+        "test_results": {
+            "status": "passed",
+            "passed": True,
+            "commands": [{"command": "pytest -q", "status": "passed"}],
+        },
+        "finish_time_worker_self_attestation": {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "attestation_phase": "finish",
+            "status": "passed",
+            "worker_self_attesting": True,
+            "finish_time_self_attesting": True,
+            "finish_time_blockers": [],
+            "worker_session_id": worker_session_id,
+            "filer_principal": worker_session_id,
+            "worker_transcript_ref": (
+                f"multi_agent:/root/{worker_task_id}"
+            ),
+            "harness_type": "codex",
+        },
+    }
+    attestation = server._runtime_context_submit_canonical_contract_line(
+        conn,
+        project_id=PID,
+        context=context,
+        stage_id="worker_attestation",
+        line_id="worker_finish_time_attestation",
+        evidence_kind="record_finish_time_worker_attestation",
+        payload=finish_attestation_payload,
+        contract_execution_id=successor["contract_execution_id"],
+    )
+    assert attestation["accepted"] is True
+    assert attestation["next_legal_action"]["line_id"] == "worker_finish_gate"
+    context = parallel_branch_runtime.record_branch_finish_gate(
+        conn,
+        project_id=PID,
+        task_id=context.task_id,
+        checkpoint_id="ckpt-validated-missing-finish-rejoin",
+        fence_token=context.fence_token,
+        head_commit=head_commit,
+        replay_source="mf_sub_finish_gate",
+        now_iso="2026-07-26T02:02:00Z",
+    )
+    return {
+        "backlog_id": backlog_id,
+        "successor": successor,
+        "context": context,
+        "target_root": target_root,
+        "head_commit": head_commit,
+        "route_identity": route_identity,
+        "worker_session_id": worker_session_id,
+        "attempt": context.attempt,
+        "retry_round": context.retry_round,
+    }
+
+
+def test_runtime_context_session_token_rejoin_rotates_auth_only_for_validated_missing_finish(
+    conn,
+    tmp_path,
+):
+    fixture = _setup_validated_missing_finish_rejoin_runtime(conn, tmp_path)
+    context = fixture["context"]
+    execution_id = fixture["successor"]["contract_execution_id"]
+    before_record = server._contract_runtime(conn).store.get(execution_id)
+    before_revision = before_record["execution_state_revision"]
+    before_lines = copy.deepcopy(before_record["completed_lines"])
+    before_implementation_refs = [
+        {
+            key: line.get(key)
+            for key in (
+                "source_ref",
+                "implementation_lineage_ref",
+                "commit_sha",
+            )
+        }
+        for line in before_lines
+        if line.get("line_id") == "worker_implementation"
+    ]
+    before_worker_commit_refs = [
+        {
+            key: line.get(key)
+            for key in ("source_ref", "commit_sha", "contract_execution_id")
+        }
+        for line in before_lines
+        if line.get("line_id") == "worker_commit"
+    ]
+    before_route_revisions = conn.execute(
+        """
+        SELECT revision_id, payload_json, route_identity_json
+        FROM parallel_branch_runtime_contract_revisions
+        WHERE project_id = ? AND runtime_context_id = ?
+        ORDER BY created_at ASC, revision_id ASC
+        """,
+        (PID, context.runtime_context_id),
+    ).fetchall()
+    timeline_refs, _startup, _finish, _close = (
+        server._runtime_context_service_timeline_refs(
+            conn,
+            project_id=PID,
+            task_id=context.task_id,
+            backlog_id=context.backlog_id,
+        )
+    )
+    authority = (
+        server._runtime_context_validated_missing_finish_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=context,
+            body={
+                "task_id": context.task_id,
+                "parent_task_id": fixture["backlog_id"],
+                "target_project_root": str(fixture["target_root"]),
+                "worker_id": context.worker_id,
+                "worker_slot_id": context.worker_slot_id,
+                "agent_id": context.actual_host_worker_id,
+                "actual_host_worker_id": context.actual_host_worker_id,
+                "worker_session_id": fixture["worker_session_id"],
+                "host_startup_id": context.host_startup_id,
+                "host_session_id": context.host_session_id,
+            },
+            contract_execution_id=execution_id,
+            route_identity=fixture["route_identity"],
+            timeline_refs=timeline_refs,
+        )
+    )
+    assert authority["errors"] == []
+    assert authority["eligible"] is True
+    eligibility = server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=context,
+    )
+    assert eligibility["mode"] == "validated_missing_finish_auth_only"
+    assert eligibility["authority"] == authority
+    payloads = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        backlog_id=context.backlog_id,
+        parent_task_id=fixture["backlog_id"],
+        worker_id=context.worker_id,
+        worker_slot_id=context.worker_slot_id,
+        target_project_root=str(fixture["target_root"]),
+        actual_host_worker_id=context.actual_host_worker_id,
+        worker_session_id=context.host_session_id,
+        host_startup_id=context.host_startup_id,
+        host_session_id=context.host_session_id,
+        route_identity=fixture["route_identity"],
+        contract_execution_id=execution_id,
+        session_token_rejoin_eligibility=eligibility,
+    )
+    rejoin_body = payloads["session_token_rejoin_submission"][
+        "copy_safe_body"
+    ]
+    assert rejoin_body["actual_host_worker_id"] == (
+        context.actual_host_worker_id
+    )
+    assert rejoin_body["worker_session_id"] == context.host_session_id
+    assert rejoin_body["host_startup_id"] == context.host_startup_id
+
+    result = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "contract_execution_id": execution_id,
+                "task_id": context.task_id,
+                "parent_task_id": fixture["backlog_id"],
+                "target_project_root": str(fixture["target_root"]),
+                "worker_id": context.worker_id,
+                "worker_slot_id": context.worker_slot_id,
+                "agent_id": context.actual_host_worker_id,
+                "actual_host_worker_id": context.actual_host_worker_id,
+                "worker_session_id": fixture["worker_session_id"],
+                "host_startup_id": context.host_startup_id,
+                "host_session_id": context.host_session_id,
+                **fixture["route_identity"],
+                "reason": "same live worker lost raw auth after partial finish",
+                "now_iso": "2026-07-26T02:03:00Z",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["validated_missing_finish_auth_only_rejoin"] is True
+    assert result["validated_missing_finish_rejoin_authority"]["eligible"] is True
+    assert result["route_identity_rebound"] is False
+    assert result["route_identity_verified"] is True
+    assert result["previous_status"] == result["current_status"] == STATE_VALIDATED
+    assert result["attempt"] == fixture["attempt"]
+    assert result["retry_round"] == fixture["retry_round"]
+    saved = get_branch_context(conn, PID, context.task_id)
+    assert saved is not None
+    mutable_auth_fields = {
+        "lease_id",
+        "lease_expires_at",
+        "session_token_hash",
+        "last_recovery_action",
+        "updated_at",
+    }
+    assert {
+        field.name: getattr(saved, field.name)
+        for field in fields(BranchTaskRuntimeContext)
+        if field.name not in mutable_auth_fields
+    } == {
+        field.name: getattr(context, field.name)
+        for field in fields(BranchTaskRuntimeContext)
+        if field.name not in mutable_auth_fields
+    }
+    assert saved.status == STATE_VALIDATED
+    assert saved.checkpoint_id == context.checkpoint_id
+    assert saved.replay_source == "mf_sub_finish_gate"
+    assert saved.head_commit == fixture["head_commit"]
+    assert saved.attempt == context.attempt
+    assert saved.retry_round == context.retry_round
+    after_record = server._contract_runtime(conn).store.get(execution_id)
+    assert after_record["execution_state_revision"] == before_revision
+    assert after_record["completed_lines"] == before_lines
+    assert [
+        {
+            key: line.get(key)
+            for key in (
+                "source_ref",
+                "implementation_lineage_ref",
+                "commit_sha",
+            )
+        }
+        for line in after_record["completed_lines"]
+        if line.get("line_id") == "worker_implementation"
+    ] == before_implementation_refs
+    assert [
+        {
+            key: line.get(key)
+            for key in ("source_ref", "commit_sha", "contract_execution_id")
+        }
+        for line in after_record["completed_lines"]
+        if line.get("line_id") == "worker_commit"
+    ] == before_worker_commit_refs
+    assert after_record["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "worker_finish_gate"
+    )
+    assert conn.execute(
+        """
+        SELECT revision_id, payload_json, route_identity_json
+        FROM parallel_branch_runtime_contract_revisions
+        WHERE project_id = ? AND runtime_context_id = ?
+        ORDER BY created_at ASC, revision_id ASC
+        """,
+        (PID, context.runtime_context_id),
+    ).fetchall() == before_route_revisions
+    authority_json = json.dumps(
+        result["validated_missing_finish_rejoin_authority"],
+        sort_keys=True,
+    )
+    assert result["session_token"] not in authority_json
+    audit_row = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (int(result["audit_event_id"]),),
+    ).fetchone()
+    audit_payload = audit_row["payload_json"]
+    assert result["session_token"] not in audit_payload
+    assert result["fence_token"] not in audit_payload
+
+
+def test_runtime_context_session_token_rejoin_rejects_completed_finish_gate(
+    conn,
+    tmp_path,
+):
+    fixture = _setup_validated_missing_finish_rejoin_runtime(conn, tmp_path)
+    context = fixture["context"]
+    execution_id = fixture["successor"]["contract_execution_id"]
+    finish_payload = {
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": fixture["backlog_id"],
+        "contract_execution_id": execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+        "worker_session_id": fixture["worker_session_id"],
+        "filer_principal": fixture["worker_session_id"],
+        "head_commit": fixture["head_commit"],
+        "checkpoint_id": context.checkpoint_id,
+        "status": "passed",
+    }
+    completed = server._runtime_context_submit_canonical_contract_line(
+        conn,
+        project_id=PID,
+        context=context,
+        stage_id="worker_finish",
+        line_id="worker_finish_gate",
+        evidence_kind="mf_subagent_finish_gate",
+        payload=finish_payload,
+        contract_execution_id=execution_id,
+    )
+    assert completed["accepted"] is True
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=context.task_id,
+        backlog_id=context.backlog_id,
+        event_type="mf_subagent.finish_gate",
+        event_kind="mf_subagent_finish_gate",
+        phase="finish_gate",
+        status="passed",
+        actor="mf_sub",
+        payload=finish_payload,
+        commit_sha=fixture["head_commit"],
+    )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as blocked:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "contract_execution_id": execution_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": fixture["backlog_id"],
+                    "target_project_root": str(fixture["target_root"]),
+                    "worker_id": context.worker_id,
+                    "worker_slot_id": context.worker_slot_id,
+                    "agent_id": context.actual_host_worker_id,
+                    "actual_host_worker_id": context.actual_host_worker_id,
+                    "worker_session_id": fixture["worker_session_id"],
+                    "host_startup_id": context.host_startup_id,
+                    "host_session_id": context.host_session_id,
+                    **fixture["route_identity"],
+                    "reason": "completed finish must stay terminal",
+                },
+            )
+        )
+
+    assert blocked.value.code == "fence_invalidated_or_unknown"
+    authority = blocked.value.details[
+        "validated_missing_finish_rejoin_authority"
+    ]
+    assert authority["eligible"] is False
+    assert "authoritative_finish_gate_timeline_already_exists" in authority[
+        "errors"
+    ]
+    assert "contract_runtime_not_waiting_at_worker_finish_gate" in authority[
+        "errors"
+    ]
+    eligibility = server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=context,
+    )
+    assert eligibility["eligible"] is False
+    payloads = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        backlog_id=context.backlog_id,
+        parent_task_id=fixture["backlog_id"],
+        worker_id=context.worker_id,
+        worker_slot_id=context.worker_slot_id,
+        target_project_root=str(fixture["target_root"]),
+        actual_host_worker_id=context.actual_host_worker_id,
+        worker_session_id=context.host_session_id,
+        host_startup_id=context.host_startup_id,
+        host_session_id=context.host_session_id,
+        route_identity=fixture["route_identity"],
+        contract_execution_id=execution_id,
+        session_token_rejoin_eligibility=eligibility,
+    )
+    assert "session_token_rejoin_submission" not in payloads
+    assert "rejoin" not in payloads["session_renewal_hints"]
+    with pytest.raises(GovernanceError) as guide_blocked:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": fixture["backlog_id"],
+                    "session_token_ref": runtime_context_session_token_ref(
+                        context
+                    ),
+                    "target_project_root": str(fixture["target_root"]),
+                },
+            )
+        )
+    guide_actionable = guide_blocked.value.details.get(
+        "actionable_payloads",
+        {},
+    )
+    assert guide_blocked.value.details.get("next_legal_action") != (
+        "request_runtime_context_rejoin_host_envelope"
+    )
+    assert "session_token_rejoin_submission" not in guide_actionable
 
 
 @pytest.mark.parametrize(
