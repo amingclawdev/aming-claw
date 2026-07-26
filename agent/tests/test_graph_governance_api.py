@@ -71494,10 +71494,14 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     runtime_context_id = "mfrctx-contract-runtime-merge-authority"
     merge_queue_id = "mq-contract-runtime-merge-authority"
     queue_item_id = "mqitem-contract-runtime-merge-authority"
-    canonical_repo_root = Path(__file__).resolve().parents[2]
-    merged_commit = server._git_head_commit(canonical_repo_root)
     target_root = tmp_path / "target-project"
     qa_commit = _init_test_git_repo(target_root)
+    canonical_repo_root = tmp_path / "merged-project"
+    merged_commit = _init_test_git_repo(
+        canonical_repo_root,
+        filename="merged.txt",
+    )
+    assert merged_commit != qa_commit
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
