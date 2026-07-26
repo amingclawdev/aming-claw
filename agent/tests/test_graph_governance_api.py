@@ -71505,10 +71505,14 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     runtime_context_id = "mfrctx-contract-runtime-merge-authority"
     merge_queue_id = "mq-contract-runtime-merge-authority"
     queue_item_id = "mqitem-contract-runtime-merge-authority"
-    canonical_repo_root = Path(__file__).resolve().parents[2]
-    merged_commit = server._git_head_commit(canonical_repo_root)
     target_root = tmp_path / "target-project"
     qa_commit = _init_test_git_repo(target_root)
+    canonical_repo_root = tmp_path / "merged-project"
+    merged_commit = _init_test_git_repo(
+        canonical_repo_root,
+        filename="merged.txt",
+    )
+    assert merged_commit != qa_commit
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -77778,6 +77782,251 @@ def test_live_merge_batch_root_wrapper_projects_exact_child_task():
         allow_taskless=False,
         direct_parent_task_id=child_contract_id,
     ) is True
+
+
+def test_live_merge_non_batch_root_scope_requires_server_bound_dispatch_lineage():
+    root_task_id = "repair-close-evidence-templates"
+    parent_task_id = "cex-live-merge-root-scope"
+    child_task_id = "worker-live-merge-root-scope"
+    runtime_context_id = "mfrctx-live-merge-root-scope"
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-LIVE-MERGE-ROOT-SCOPE",
+        "contract_id": "mf_parallel.v2",
+        "contract_execution_id": parent_task_id,
+        "completed_lines": [
+            {
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "actor_role": "observer",
+                "evidence_kind": "contract_binding",
+                "status": "accepted",
+                "payload": {"status": "prefilled"},
+            },
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "status": "accepted",
+                "runtime_context_id": runtime_context_id,
+                "task_id": child_task_id,
+                "parent_task_id": parent_task_id,
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "worker_task_id": child_task_id,
+                    "parent_task_id": parent_task_id,
+                    "worker_role": "mf_sub",
+                },
+            },
+        ],
+    }
+    context = SimpleNamespace(
+        backlog_id=record["backlog_id"],
+        runtime_context_id=runtime_context_id,
+        task_id=child_task_id,
+        parent_task_id=parent_task_id,
+        root_task_id=root_task_id,
+    )
+    server_bound_root_ids = (
+        server._contract_runtime_observer_merge_bound_root_task_ids(
+            record,
+            context,
+        )
+    )
+    assert server_bound_root_ids == {root_task_id}
+
+    event = {
+        "task_id": child_task_id,
+        "payload": {
+            "child_task_id": child_task_id,
+            "parent_task_id": root_task_id,
+            "runtime_context_id": runtime_context_id,
+            "recorded_merge": {
+                "context": {
+                    "task_id": child_task_id,
+                    "parent_task_id": parent_task_id,
+                    "root_task_id": root_task_id,
+                    "runtime_context_id": runtime_context_id,
+                }
+            },
+        },
+    }
+    assert server._contract_runtime_projection_timeline_scope_matches(
+        event,
+        runtime_context_id=runtime_context_id,
+        task_id=child_task_id,
+        related_task_ids={parent_task_id},
+        server_bound_supplemental_related_task_ids=server_bound_root_ids,
+        allow_taskless=False,
+        direct_parent_task_id=parent_task_id,
+    ) is True
+
+    forged = json.loads(json.dumps(event))
+    forged["payload"]["parent_task_id"] = "unrelated-root-task"
+    assert server._contract_runtime_projection_timeline_scope_matches(
+        forged,
+        runtime_context_id=runtime_context_id,
+        task_id=child_task_id,
+        related_task_ids={parent_task_id},
+        server_bound_supplemental_related_task_ids=server_bound_root_ids,
+        allow_taskless=False,
+        direct_parent_task_id=parent_task_id,
+    ) is False
+
+    no_prefill = json.loads(json.dumps(record))
+    no_prefill["completed_lines"] = no_prefill["completed_lines"][1:]
+    assert (
+        server._contract_runtime_observer_merge_bound_root_task_ids(
+            no_prefill,
+            context,
+        )
+        == set()
+    )
+
+    wrong_parent = json.loads(json.dumps(record))
+    wrong_parent["completed_lines"][1]["parent_task_id"] = "cex-unrelated"
+    wrong_parent["completed_lines"][1]["payload"]["parent_task_id"] = (
+        "cex-unrelated"
+    )
+    assert (
+        server._contract_runtime_observer_merge_bound_root_task_ids(
+            wrong_parent,
+            context,
+        )
+        == set()
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("child_task_id", "worker-unrelated-root-scope"),
+        ("runtime_context_id", "mfrctx-unrelated-root-scope"),
+        ("direct_parent_task_id", "cex-unrelated-root-scope"),
+    ],
+)
+def test_live_merge_server_bound_root_scope_rejects_identity_mismatch(
+    field,
+    value,
+):
+    root_task_id = "repair-close-evidence-templates"
+    parent_task_id = "cex-live-merge-root-scope"
+    child_task_id = "worker-live-merge-root-scope"
+    runtime_context_id = "mfrctx-live-merge-root-scope"
+    event = {
+        "task_id": child_task_id,
+        "payload": {
+            "child_task_id": child_task_id,
+            "parent_task_id": root_task_id,
+            "runtime_context_id": runtime_context_id,
+            "recorded_merge": {
+                "context": {
+                    "task_id": child_task_id,
+                    "parent_task_id": parent_task_id,
+                    "root_task_id": root_task_id,
+                    "runtime_context_id": runtime_context_id,
+                }
+            },
+        },
+    }
+    direct_parent = parent_task_id
+    if field == "direct_parent_task_id":
+        direct_parent = value
+    else:
+        event["payload"][field] = value
+
+    assert server._contract_runtime_projection_timeline_scope_matches(
+        event,
+        runtime_context_id=runtime_context_id,
+        task_id=child_task_id,
+        related_task_ids={parent_task_id},
+        server_bound_supplemental_related_task_ids={root_task_id},
+        allow_taskless=False,
+        direct_parent_task_id=direct_parent,
+    ) is False
+
+
+def test_post_qa_recovery_stops_at_exact_terminal_durable_merge(monkeypatch):
+    runtime_context_id = "mfrctx-terminal-merge-no-recovery"
+    task_id = "worker-terminal-merge-no-recovery"
+    merge_queue_id = "mq-terminal-merge-no-recovery"
+    merged_commit = "a" * 40
+    context = SimpleNamespace(
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        merge_queue_id=merge_queue_id,
+        worktree_path="/missing-terminal-merge-worktree",
+    )
+    record = {
+        "project_id": PID,
+        "contract_execution_id": "cex-terminal-merge-no-recovery",
+        "runtime_guide": {
+            "next_legal_action": {"line_id": "observer_merge"},
+        },
+        "completed_lines": [
+            {
+                "line_id": "worker_commit",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "commit_sha": "b" * 40,
+            }
+        ],
+    }
+    terminal_item = SimpleNamespace(
+        task_id=task_id,
+        merge_queue_id=merge_queue_id,
+        status="merged",
+        merge_commit=merged_commit,
+        target_head_after_merge=merged_commit,
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_merge_queue_item_for_branch_context",
+        lambda *args, **kwargs: terminal_item,
+    )
+
+    terminal_authority = (
+        server._runtime_context_terminal_merged_queue_authority(
+            object(),
+            project_id=PID,
+            context=context,
+        )
+    )
+    assert terminal_authority["terminal_merged"] is True
+    assert terminal_authority["merge_commit"] == merged_commit
+    recovery = server._runtime_context_same_lane_worker_commit_recovery(
+        record,
+        context,
+        conn=object(),
+        project_id=PID,
+        allow_post_qa_merge_conflict_recovery=True,
+    )
+    assert recovery["status"] == "not_needed"
+    assert recovery["blocked"] is False
+    assert recovery["terminal_merged"] is True
+    assert recovery["next_legal_action"] == "observer_merge"
+
+    merge_ready_item = SimpleNamespace(
+        task_id=task_id,
+        merge_queue_id=merge_queue_id,
+        status="merge_ready",
+        merge_commit=merged_commit,
+        target_head_after_merge=merged_commit,
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_merge_queue_item_for_branch_context",
+        lambda *args, **kwargs: merge_ready_item,
+    )
+    assert (
+        server._runtime_context_terminal_merged_queue_authority(
+            object(),
+            project_id=PID,
+            context=context,
+        )
+        == {}
+    )
 
 
 @pytest.mark.parametrize(
