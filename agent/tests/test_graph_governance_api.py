@@ -54628,6 +54628,185 @@ def test_runtime_context_canonical_write_immediately_invalidates_prior_capsule(
         )
 
 
+def _install_close_gate_capsule_runtime(monkeypatch, *, result_mode):
+    backlog_id = f"AC-CAPSULE-CLOSE-GATE-{result_mode.upper()}"
+    execution_id = f"cex-capsule-close-gate-{result_mode}"
+    before = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "observer_hotfix",
+        "definition_hash": "sha256:capsule-close-gate-definition",
+        "instruction_bundle_hash": "sha256:capsule-close-gate-instructions",
+        "execution_state_revision": 3,
+        "execution_state": {
+            "execution_state_revision": 3,
+            "execution_state_hash": "sha256:capsule-close-gate-state-3",
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": "sha256:capsule-close-gate-guide-3",
+            "next_legal_action": {
+                "stage_id": "mutation",
+                "line_id": "hotfix_post_action_summary",
+                "actor_role": "observer",
+                "evidence_kind": "hotfix_under_action",
+            },
+        },
+        "completed_lines": [],
+    }
+    after = {
+        **before,
+        "execution_state_revision": 4,
+        "execution_state": {
+            "execution_state_revision": 4,
+            "execution_state_hash": "sha256:capsule-close-gate-state-4",
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": "sha256:capsule-close-gate-guide-4",
+            "next_legal_action": {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+            },
+        },
+        "completed_lines": [
+            {
+                "stage_id": "mutation",
+                "line_id": "hotfix_post_action_summary",
+                "actor_role": "observer",
+                "evidence_kind": "hotfix_under_action",
+            }
+        ],
+    }
+    current = {"record": before}
+
+    class FakeRuntime:
+        store = SimpleNamespace(get=lambda _execution_id: current["record"])
+
+        @staticmethod
+        def current_guide(_execution_id, actor_role):
+            assert actor_role == "observer"
+            return current["record"]["runtime_guide"]
+
+        @staticmethod
+        def submit_line_write(*_args, **_kwargs):
+            if result_mode == "rejected":
+                return {
+                    "ok": False,
+                    "record": before,
+                    "decision": {"ok": False, "errors": ["rejected for test"]},
+                }
+            if result_mode == "noop":
+                return {
+                    "ok": True,
+                    "idempotent": True,
+                    "contract_runtime_line_mutated": False,
+                    "record": before,
+                    "decision": {"ok": True, "errors": []},
+                }
+            current["record"] = after
+            return {
+                "ok": True,
+                "idempotent": False,
+                "contract_runtime_line_mutated": True,
+                "record": after,
+                "decision": {"ok": True, "errors": []},
+            }
+
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: FakeRuntime())
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda *_args, **kwargs: (kwargs["record"], {}),
+    )
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        server._ONBOARD_GUIDE_CAPSULE_CACHE.clear()
+        server._ONBOARD_GUIDE_CAPSULE_INFLIGHT.clear()
+    capsule, _ = server._onboard_guide_capsule_get_or_create(
+        {
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "selected_role": "observer",
+            "selected_work_type": "operator_supervised_direct_main",
+            "contract_execution_id": execution_id,
+            "execution_state_revision": 3,
+            "projection_hash": "sha256:capsule-close-gate-projection-3",
+            "terminal": False,
+        },
+        lambda: {"next_action": {"action": "record_post_action_summary"}},
+    )
+    return execution_id, capsule
+
+
+def test_contract_runtime_close_gate_immediately_invalidates_prior_capsule(
+    monkeypatch,
+):
+    execution_id, stale_capsule = _install_close_gate_capsule_runtime(
+        monkeypatch,
+        result_mode="accepted",
+    )
+
+    gate = server._contract_runtime_close_gate(
+        None,
+        project_id=PID,
+        body={"contract_execution_id": execution_id},
+        event_kind="implementation",
+        norm_payload={"summary": "accepted close-gate mutation"},
+        trusted_actor_role="observer",
+    )
+
+    assert gate["accepted"] is True
+    assert gate["execution_state_revision"] == 4
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        assert not any(
+            entry["guide_capsule_ref"] == stale_capsule["guide_capsule_ref"]
+            for entry in server._ONBOARD_GUIDE_CAPSULE_CACHE.values()
+        )
+
+
+@pytest.mark.parametrize("result_mode", ["rejected", "noop"])
+def test_contract_runtime_close_gate_preserves_capsule_without_real_mutation(
+    monkeypatch,
+    result_mode,
+):
+    execution_id, current_capsule = _install_close_gate_capsule_runtime(
+        monkeypatch,
+        result_mode=result_mode,
+    )
+
+    if result_mode == "rejected":
+        with pytest.raises(
+            GovernanceError,
+            match="ContractRuntime rejected protected close evidence line write",
+        ):
+            server._contract_runtime_close_gate(
+                None,
+                project_id=PID,
+                body={"contract_execution_id": execution_id},
+                event_kind="implementation",
+                norm_payload={"summary": "rejected close-gate mutation"},
+                trusted_actor_role="observer",
+            )
+    else:
+        gate = server._contract_runtime_close_gate(
+            None,
+            project_id=PID,
+            body={"contract_execution_id": execution_id},
+            event_kind="implementation",
+            norm_payload={"summary": "idempotent close-gate no-op"},
+            trusted_actor_role="observer",
+        )
+        assert gate["accepted"] is True
+        assert gate["execution_state_revision"] == 3
+
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        assert any(
+            entry["guide_capsule_ref"] == current_capsule["guide_capsule_ref"]
+            for entry in server._ONBOARD_GUIDE_CAPSULE_CACHE.values()
+        )
+
+
 def test_onboard_route_guide_suppresses_direct_fix_for_no_direct_fix_backlog(conn):
     backlog_id = "AC-ONBOARD-NO-DIRECT-FIX-POLICY"
     _insert_simple_mf_close_backlog(conn, backlog_id)

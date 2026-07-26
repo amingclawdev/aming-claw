@@ -88193,6 +88193,10 @@ def _contract_runtime_close_gate(
             422,
             diagnostics,
         )
+    _onboard_guide_capsule_invalidate_contract_runtime_transition(
+        project_id=project_id,
+        result=result,
+    )
     updated = result.get("record") if isinstance(result.get("record"), Mapping) else {}
     guide = updated.get("runtime_guide") if isinstance(updated.get("runtime_guide"), Mapping) else {}
     current_state = _runtime_current_state_from_record(updated) if updated else {}
