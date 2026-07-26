@@ -54181,6 +54181,289 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
     assert "system_operation_index" in default_result["onboard_route_guide"]
 
 
+def test_onboard_route_guide_compact_capsule_is_bounded_warm_and_sectioned(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-ONBOARD-COMPACT-CAPSULE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        server._ONBOARD_GUIDE_CAPSULE_CACHE.clear()
+        server._ONBOARD_GUIDE_CAPSULE_INFLIGHT.clear()
+        for key in server._ONBOARD_GUIDE_CAPSULE_METRICS:
+            server._ONBOARD_GUIDE_CAPSULE_METRICS[key] = 0
+
+    def reject_full_guide(*_args, **_kwargs):
+        raise AssertionError("compact response must not build the full guide")
+
+    monkeypatch.setattr(
+        server,
+        "_onboard_contract_agent_guidance",
+        reject_full_guide,
+    )
+    request = _ctx(
+        {"project_id": PID},
+        method="POST",
+        body={
+            "backlog_id": backlog_id,
+            "role": "observer",
+            "work_type": "multi_backlog_parallel",
+            "route_token_ref": "rtok-onboard-compact",
+            "response_view": "compact",
+        },
+    )
+    cold_started = time.perf_counter()
+    cold = server.handle_project_onboard_route_guide(request)
+    cold_elapsed_ms = int((time.perf_counter() - cold_started) * 1000)
+    warm_started = time.perf_counter()
+    warm = server.handle_project_onboard_route_guide(request)
+    warm_elapsed_ms = int((time.perf_counter() - warm_started) * 1000)
+
+    serialized = json.dumps(cold, sort_keys=True)
+    assert cold["ok"] is True
+    assert cold["response_view"] == "compact"
+    assert cold["selected_role"] == "observer"
+    assert cold["selected_work_type"] == "multi_backlog_parallel"
+    assert cold["selected_guidance_json_path"].endswith(
+        "role_entries.observer"
+    )
+    assert cold["guide_capsule_ref"].startswith("gcap-")
+    assert cold["source_of_authority"]
+    assert isinstance(cold["execution_state_revision"], int)
+    assert cold["projection_hash"].startswith("sha256:")
+    assert cold["next_legal_action"].keys() >= {"action"}
+    assert "role_entries" not in cold
+    assert len(serialized.encode("utf-8")) <= 16 * 1024
+    assert "raw-session-secret" not in serialized
+    assert cold["capsule_cache"]["miss"] is True
+    assert warm["guide_capsule_ref"] == cold["guide_capsule_ref"]
+    assert warm["capsule_cache"]["hit"] is True
+    assert cold_elapsed_ms < 1000
+    assert warm_elapsed_ms < 1000
+
+    sections = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": cold["guide_capsule_ref"],
+                "sections": ["next_action", "action_input", "authority"],
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "multi_backlog_parallel",
+            },
+        )
+    )
+    assert sections["ok"] is True
+    assert set(sections["sections"]) == {
+        "next_action",
+        "action_input",
+        "authority",
+    }
+    assert len(json.dumps(sections).encode("utf-8")) <= 16 * 1024
+    assert sections["authorizes_write"] is False
+    assert sections["satisfies_gate"] is False
+
+    wrong_scope = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": cold["guide_capsule_ref"],
+                "sections": ["next_action"],
+                "backlog_id": backlog_id,
+                "role": "qa",
+                "work_type": "multi_backlog_parallel",
+            },
+        )
+    )
+    assert wrong_scope["status"] == "refresh_required"
+    assert wrong_scope["reason"] == "guide_capsule_wrong_scope"
+    assert wrong_scope["mismatched_fields"] == ["selected_role"]
+    assert wrong_scope["refresh"]["response_view"] == "compact"
+    assert "grep" in wrong_scope["safe_next_step"]
+
+    wrong_project = server._onboard_guide_capsule_fetch(
+        project_id="other-project",
+        guide_capsule_ref=cold["guide_capsule_ref"],
+        sections=["next_action"],
+    )
+    assert wrong_project["status"] == "refresh_required"
+    assert wrong_project["mismatched_fields"] == ["project_id"]
+    assert wrong_project["refresh"]["project_id"] == "other-project"
+    assert wrong_project["refresh"]["backlog_id"] == ""
+
+
+def test_onboard_route_guide_compact_is_role_isolated_and_full_is_compatible(conn):
+    backlog_id = "AC-ONBOARD-COMPACT-ROLE-ISOLATION"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    refs = {}
+    for role, work_type in (
+        ("observer", "multi_backlog_parallel"),
+        ("worker", "parallel_worker"),
+        ("qa", "qa_verification"),
+    ):
+        compact = server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "role": role,
+                    "work_type": work_type,
+                    "response_view": "compact",
+                },
+            )
+        )
+        assert compact["selected_role"] == role
+        assert compact["selected_work_type"] == work_type
+        assert compact["advisory_only"] is True
+        assert compact["authorizes_write"] is False
+        refs[role] = compact["guide_capsule_ref"]
+    assert len(set(refs.values())) == 3
+
+    explicit_full = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "qa",
+                "work_type": "qa_verification",
+                "response_view": "full",
+            },
+        )
+    )
+    assert explicit_full["response_view"] == "full"
+    assert "compact_selected_role" not in explicit_full
+    assert "role_entries" in explicit_full["onboard_route_guide"]
+    assert "capability_index" in explicit_full["onboard_route_guide"]
+
+
+def test_onboard_guide_capsule_single_flight_revision_invalidation_and_eviction(
+    monkeypatch,
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, Lock
+
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        server._ONBOARD_GUIDE_CAPSULE_CACHE.clear()
+        server._ONBOARD_GUIDE_CAPSULE_INFLIGHT.clear()
+        for key in server._ONBOARD_GUIDE_CAPSULE_METRICS:
+            server._ONBOARD_GUIDE_CAPSULE_METRICS[key] = 0
+    identity = {
+        "project_id": PID,
+        "backlog_id": "AC-CAPSULE-SINGLE-FLIGHT",
+        "selected_role": "worker",
+        "selected_work_type": "parallel_worker",
+        "contract_execution_id": "cex-capsule",
+        "execution_state_revision": 1,
+        "projection_hash": "sha256:capsule-r1",
+        "terminal": False,
+    }
+    entered = Event()
+    release = Event()
+    calls = 0
+    calls_lock = Lock()
+
+    def builder():
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        entered.set()
+        release.wait(timeout=2)
+        return {"next_action": {"action": "record_worker_commit"}}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            server._onboard_guide_capsule_get_or_create,
+            identity,
+            builder,
+        )
+        assert entered.wait(timeout=2)
+        second = pool.submit(
+            server._onboard_guide_capsule_get_or_create,
+            identity,
+            builder,
+        )
+        release.set()
+        first_entry, _ = first.result(timeout=2)
+        second_entry, second_metrics = second.result(timeout=2)
+    assert calls == 1
+    assert first_entry["guide_capsule_ref"] == second_entry["guide_capsule_ref"]
+    assert second_metrics["single_flight_joins"] >= 1
+
+    revised = {
+        **identity,
+        "execution_state_revision": 2,
+        "projection_hash": "sha256:capsule-r2",
+    }
+    revised_entry, _ = server._onboard_guide_capsule_get_or_create(
+        revised,
+        lambda: {"next_action": {"action": "record_finish_gate"}},
+    )
+    assert revised_entry["guide_capsule_ref"] != first_entry["guide_capsule_ref"]
+    stale = server._onboard_guide_capsule_fetch(
+        project_id=PID,
+        guide_capsule_ref=first_entry["guide_capsule_ref"],
+        sections=["next_action"],
+        backlog_id=identity["backlog_id"],
+        role="worker",
+        work_type="parallel_worker",
+    )
+    assert stale["status"] == "refresh_required"
+
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        server._ONBOARD_GUIDE_CAPSULE_CACHE.clear()
+    after_restart = server._onboard_guide_capsule_fetch(
+        project_id=PID,
+        guide_capsule_ref=revised_entry["guide_capsule_ref"],
+        sections=["next_action"],
+        backlog_id=identity["backlog_id"],
+        role="worker",
+        work_type="parallel_worker",
+    )
+    assert after_restart["status"] == "refresh_required"
+    assert after_restart["reason"] == "guide_capsule_missing_or_expired"
+
+    monkeypatch.setattr(server, "_ONBOARD_GUIDE_CAPSULE_MAX_ENTRIES", 2)
+    for index in range(3):
+        server._onboard_guide_capsule_get_or_create(
+            {
+                **identity,
+                "backlog_id": f"AC-CAPSULE-EVICT-{index}",
+                "contract_execution_id": f"cex-evict-{index}",
+                "projection_hash": f"sha256:evict-{index}",
+            },
+            lambda index=index: {
+                "next_action": {"action": f"action-{index}"}
+            },
+        )
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        assert len(server._ONBOARD_GUIDE_CAPSULE_CACHE) == 2
+    assert server._ONBOARD_GUIDE_CAPSULE_METRICS["evictions"] >= 1
+
+    sanitized = server._onboard_guide_capsule_bounded_section(
+        {
+            "session_token": "raw-session-secret",
+            "fence_token": "raw-fence-secret",
+            "route_token": {"token": "raw-route-secret"},
+            "access_token": "raw-access-secret",
+            "custom_api_key": "raw-api-key-secret",
+            "session_token_ref": "wstok-copy-safe",
+            "fence_token_hash": "sha256:copy-safe",
+        },
+        section_name="secret_probe",
+    )
+    serialized = json.dumps(sanitized, sort_keys=True)
+    assert "raw-session-secret" not in serialized
+    assert "raw-fence-secret" not in serialized
+    assert "raw-route-secret" not in serialized
+    assert "raw-access-secret" not in serialized
+    assert "raw-api-key-secret" not in serialized
+    assert "wstok-copy-safe" in serialized
+
+
 def test_onboard_route_guide_suppresses_direct_fix_for_no_direct_fix_backlog(conn):
     backlog_id = "AC-ONBOARD-NO-DIRECT-FIX-POLICY"
     _insert_simple_mf_close_backlog(conn, backlog_id)

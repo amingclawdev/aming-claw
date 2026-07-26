@@ -78,6 +78,74 @@ def test_mf_timeline_precheck_schema_exposes_repair_view():
     assert "repair" in view["enum"]
 
 
+def test_onboard_mcp_defaults_compact_and_routes_bounded_capsule_sections():
+    onboard_properties = _tool_properties("onboard_route_guide")
+    assert onboard_properties["response_view"]["enum"] == ["compact", "full"]
+    assert onboard_properties["response_view"]["default"] == "compact"
+    assert "onboard_route_guide_section_fetch" in _tool_names()
+    section_properties = _tool_properties(
+        "onboard_route_guide_section_fetch"
+    )
+    assert section_properties["sections"]["maxItems"] == 3
+
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    dispatcher.dispatch(
+        "onboard_route_guide",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-CAPSULE-MCP",
+            "role": "worker",
+            "work_type": "parallel_worker",
+        },
+    )
+    assert recorder.calls[-1] == (
+        "POST",
+        "/api/projects/aming-claw/onboard-route-guide",
+        {
+            "backlog_id": "AC-CAPSULE-MCP",
+            "role": "worker",
+            "work_type": "parallel_worker",
+            "response_view": "compact",
+        },
+    )
+
+    dispatcher.dispatch(
+        "onboard_route_guide",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-CAPSULE-MCP",
+            "role": "worker",
+            "work_type": "parallel_worker",
+            "response_view": "full",
+        },
+    )
+    assert recorder.calls[-1][2]["response_view"] == "full"
+
+    dispatcher.dispatch(
+        "onboard_route_guide_section_fetch",
+        {
+            "project_id": "aming-claw",
+            "guide_capsule_ref": "gcap-copy-safe",
+            "sections": ["next_action", "action_input"],
+            "backlog_id": "AC-CAPSULE-MCP",
+            "role": "worker",
+            "work_type": "parallel_worker",
+        },
+    )
+    assert recorder.calls[-1] == (
+        "POST",
+        "/api/projects/aming-claw/onboard-route-guide/capsule",
+        {
+            "guide_capsule_ref": "gcap-copy-safe",
+            "sections": ["next_action", "action_input"],
+            "backlog_id": "AC-CAPSULE-MCP",
+            "role": "worker",
+            "work_type": "parallel_worker",
+        },
+    )
+
+
 def test_task_timeline_append_schema_separates_qa_audit_from_close_statuses():
     properties = _tool_properties("task_timeline_append")
     description = properties["status"]["description"]

@@ -631,11 +631,13 @@ def _runtime_context_write_body(args: dict) -> dict:
 
 
 def _onboard_route_guide_body(args: dict) -> dict:
-    return {
+    body = {
         key: value
         for key, value in args.items()
         if key != "project_id" and value not in (None, "", [], {})
     }
+    body.setdefault("response_view", "compact")
+    return body
 
 
 def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
@@ -2095,8 +2097,54 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
                 },
+                "response_view": {
+                    "type": "string",
+                    "enum": ["compact", "full"],
+                    "default": "compact",
+                    "description": (
+                        "Agent-facing MCP defaults to compact. Use full only "
+                        "for explicit audit/debug compatibility."
+                    ),
+                },
             },
             "required": ["project_id"],
+        },
+    },
+    {
+        "name": "onboard_route_guide_section_fetch",
+        "description": (
+            "Fetch one to three named bounded advisory sections from an opaque "
+            "onboard guide capsule. Missing, stale, or wrong-scope refs return "
+            "deterministic compact-guide refresh instructions."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "guide_capsule_ref": {"type": "string"},
+                "sections": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "next_action",
+                            "authority",
+                            "action_input",
+                            "role_guidance",
+                            "runtime_identity",
+                            "blockers",
+                        ],
+                    },
+                    "maxItems": 3,
+                },
+                "backlog_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "role": {"type": "string"},
+                "actor_role": {"type": "string"},
+                "work_type": {"type": "string"},
+                "requested_work_type": {"type": "string"},
+            },
+            "required": ["project_id", "guide_capsule_ref", "sections"],
         },
     },
     {
@@ -4549,6 +4597,19 @@ class ToolDispatcher:
                 "POST",
                 f"/api/projects/{pid}/onboard-route-guide",
                 _onboard_route_guide_body(args),
+            )
+
+        if name == "onboard_route_guide_section_fetch":
+            pid = args["project_id"]
+            return self._api(
+                "POST",
+                f"/api/projects/{pid}/onboard-route-guide/capsule",
+                {
+                    key: value
+                    for key, value in args.items()
+                    if key != "project_id"
+                    and value not in (None, "", [], {})
+                },
             )
 
         if name == "observer_hotfix_enter":
