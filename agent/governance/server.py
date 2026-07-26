@@ -72965,53 +72965,47 @@ def _contract_runtime_observer_merge_completed_round(
             if str(candidate.get(key) or "").strip()
         }
 
-    def candidate_authority_mappings(
-        value: Any,
-        *,
-        depth: int = 0,
-    ) -> list[Mapping[str, Any]]:
-        """Return candidate evidence without treating baseline audit as identity."""
-
-        if depth > 6:
-            return []
-        if isinstance(value, Mapping):
-            candidates: list[Mapping[str, Any]] = [value]
-            for key, child in value.items():
-                if str(key or "").strip() in {
-                    "baseline",
-                    "external_no_pass_baseline_ledger",
-                }:
-                    continue
-                candidates.extend(
-                    candidate_authority_mappings(child, depth=depth + 1)
-                )
-            return candidates
-        if isinstance(value, list):
-            candidates = []
-            for child in value:
-                candidates.extend(
-                    candidate_authority_mappings(child, depth=depth + 1)
-                )
-            return candidates
-        return []
-
     def commit_values(line: Mapping[str, Any]) -> set[str]:
-        return {
-            str(candidate.get(key) or "").strip().lower()
-            for candidate in candidate_authority_mappings(line)
-            for key in (
-                "commit_sha",
-                "worker_commit_sha",
-                "candidate_commit_sha",
-                "head_commit",
-                "validated_head_commit",
-                "immutable_head_commit",
+        """Return canonical candidate identity, not nested QA comparison commits.
+
+        ``commit_sha`` and ``head_commit`` are authoritative only on the
+        completed line or its direct payload transport.  Nested QA test/audit
+        mappings retain those generic fields for playback (comparison base,
+        baseline reproduction, immediate parent), but they do not identify the
+        candidate.  Explicit candidate fields remain conflict-sensitive at any
+        supported nesting depth.
+        """
+
+        canonical: set[str] = set()
+
+        def add_values(
+            candidate: Mapping[str, Any],
+            keys: tuple[str, ...],
+        ) -> None:
+            for key in keys:
+                value = str(candidate.get(key) or "").strip()
+                if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value):
+                    canonical.add(value.lower())
+
+        explicit_candidate_keys = (
+            "worker_commit_sha",
+            "candidate_commit_sha",
+            "validated_head_commit",
+            "immutable_head_commit",
+        )
+        add_values(
+            line,
+            ("commit_sha", "head_commit", *explicit_candidate_keys),
+        )
+        payload = line.get("payload")
+        if isinstance(payload, Mapping):
+            add_values(
+                payload,
+                ("commit_sha", "head_commit", *explicit_candidate_keys),
             )
-            if re.fullmatch(
-                r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}",
-                str(candidate.get(key) or "").strip(),
-            )
-        }
+        for candidate in _contract_runtime_mapping_candidates(line):
+            add_values(candidate, explicit_candidate_keys)
+        return canonical
 
     def has_no_identity_conflict(
         line: Mapping[str, Any],
