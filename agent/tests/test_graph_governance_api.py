@@ -43776,6 +43776,165 @@ def _insert_simple_mf_close_backlog(conn, backlog_id: str) -> None:
     conn.commit()
 
 
+def _canonical_parentless_direct_main_pre_mutation_body(
+    *,
+    append_base: dict[str, Any],
+    route_identity: dict[str, Any],
+    allowed_files: list[str],
+    graph_trace_ids: list[str],
+    approval_ref: str = "operator-parentless-direct-main-test",
+) -> dict[str, Any]:
+    return {
+        **append_base,
+        "event_type": "mf.observer_direct_implementation_exception",
+        "event_kind": "observer_direct_implementation_exception",
+        "phase": "pre_mutation",
+        "status": "accepted",
+        "decision": "operator_supervised_direct_main_approved",
+        "actor": "observer",
+        "payload": {
+            **route_identity,
+            "reason": "operator-supervised parentless direct-main repair",
+            "observer_direct_mutation": True,
+            "tiny_deterministic_scope": True,
+            "operator_approval": {
+                "approved": True,
+                "approved_by": "operator",
+                "approval_ref": approval_ref,
+            },
+            "dirty_scope_check": {
+                "allowed_files": allowed_files,
+                "dirty_files": [],
+                "exact_match": True,
+            },
+            "allowed_files": allowed_files,
+            "graph_trace_ids": graph_trace_ids,
+        },
+        "artifact_refs": {
+            "allowed_files": allowed_files,
+            "operator_approval_ref": approval_ref,
+            "graph_trace_ids": graph_trace_ids,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("missing_case", "missing_requirement_id"),
+    [
+        ("source_backed_route_gate", "source_backed_server_route_gate_shape"),
+        ("reason", "explicit_reason"),
+        ("observer_direct_mutation", "observer_direct_mutation=true"),
+        ("tiny_deterministic_scope", "tiny_deterministic_scope=true"),
+        ("dirty_scope_exact_match", "dirty_scope.exact_match=true"),
+        (
+            "operator_approval",
+            "operator_approval.close_satisfying_shape",
+        ),
+        ("operator_approval_ref", "operator_approval_ref"),
+        ("allowed_files", "allowed_files_exact_row_scope"),
+    ],
+)
+def test_parentless_direct_main_pre_mutation_authority_schema_rejects_each_missing_field(
+    missing_case,
+    missing_requirement_id,
+):
+    project_id = "parentless-direct-main-schema"
+    backlog_id = "AC-PARENTLESS-DIRECT-MAIN-SCHEMA"
+    task_id = "onboard-service-parentless-direct-main-schema"
+    route_id = "route-parentless-direct-main-schema"
+    route_context_hash = _fake_sha("route-parentless-direct-main-schema")
+    allowed_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    route_gate = {
+        "schema_version": "route_token_gate.v1",
+        "allowed": True,
+        "status": "accepted",
+        "action": "task_timeline_append",
+        "route_id": route_id,
+        "route_context_hash": route_context_hash,
+        "resolved_from_ref": True,
+        "server_projected": True,
+        "projection_source": "server_route_token_mutation_gate",
+        "scope": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        },
+    }
+    authority = task_timeline.source_backed_route_gate_authority(route_gate)
+    event = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_type": "mf.observer_direct_implementation_exception",
+        "event_kind": "observer_direct_implementation_exception",
+        "phase": "pre_mutation",
+        "status": "accepted",
+        "decision": "operator_supervised_direct_main_approved",
+        "actor": "observer",
+        "payload": {
+            "route_id": route_id,
+            "route_context_hash": route_context_hash,
+            "reason": "bounded operator-approved direct-main repair",
+            "observer_direct_mutation": True,
+            "tiny_deterministic_scope": True,
+            "operator_approval": {
+                "approved": True,
+                "approved_by": "operator",
+                "approval_ref": "operator-schema-test",
+            },
+            "dirty_scope_check": {
+                "allowed_files": allowed_files,
+                "dirty_files": [],
+                "exact_match": True,
+            },
+            "allowed_files": allowed_files,
+            "source_backed_contract_gate_authority": authority,
+        },
+        "artifact_refs": {
+            "allowed_files": allowed_files,
+            "operator_approval_ref": "operator-schema-test",
+        },
+        "verification": {},
+    }
+
+    if missing_case == "source_backed_route_gate":
+        event["payload"].pop("source_backed_contract_gate_authority")
+    elif missing_case == "reason":
+        event["payload"].pop("reason")
+    elif missing_case == "observer_direct_mutation":
+        event["payload"].pop("observer_direct_mutation")
+    elif missing_case == "tiny_deterministic_scope":
+        event["payload"].pop("tiny_deterministic_scope")
+    elif missing_case == "dirty_scope_exact_match":
+        event["payload"]["dirty_scope_check"]["exact_match"] = False
+    elif missing_case == "operator_approval":
+        event["payload"]["operator_approval"] = {
+            "approval_ref": "operator-schema-test"
+        }
+    elif missing_case == "operator_approval_ref":
+        event["payload"]["operator_approval"].pop("approval_ref")
+        event["artifact_refs"].pop("operator_approval_ref")
+    elif missing_case == "allowed_files":
+        event["payload"]["allowed_files"] = ["outside.py"]
+        event["artifact_refs"]["allowed_files"] = ["outside.py"]
+
+    gate = task_timeline.observer_direct_pre_mutation_authority_gate(
+        event,
+        {
+            "route_ids": [route_id],
+            "route_context_hashes": [route_context_hash],
+        },
+        row_declared_files=allowed_files,
+    )
+
+    assert gate["accepted"] is False
+    assert missing_requirement_id in gate["missing_requirement_ids"]
+    assert gate["historical_backfill_allowed"] is False
+
+
 def _insert_source_backed_onboarding_backlog(conn, backlog_id: str) -> None:
     _insert_simple_mf_close_backlog(conn, backlog_id)
     conn.execute(
@@ -48910,7 +49069,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         "task_id": parent_execution_id,
         "route_token_ref": close_route_token_ref,
     }
-    server.handle_task_timeline_append(
+    accepted_pre_mutation = server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -48921,21 +49080,55 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 "event_kind": "observer_direct_implementation_exception",
                 "phase": "pre_mutation",
                 "status": "accepted",
+                "decision": "operator_supervised_direct_main_approved",
                 "actor": "observer",
                 "payload": {
                     **route_identity,
                     "reason": "operator-supervised parentless direct-main repair",
+                    "observer_direct_mutation": True,
+                    "tiny_deterministic_scope": True,
                     "operator_approval": {
                         "approved": True,
                         "approved_by": "operator",
+                        "approval_ref": "operator-parentless-direct-main",
                     },
-                    "dirty_scope_check": {"dirty_files": []},
-                    "allowed_files": ["agent/governance/server.py"],
+                    "dirty_scope_check": {
+                        "allowed_files": [
+                            "agent/governance/server.py",
+                            "agent/tests/test_graph_governance_api.py",
+                        ],
+                        "dirty_files": [],
+                        "exact_match": True,
+                    },
+                    "allowed_files": [
+                        "agent/governance/server.py",
+                        "agent/tests/test_graph_governance_api.py",
+                    ],
+                    "graph_trace_ids": [graph_trace_id],
+                },
+                "artifact_refs": {
+                    "allowed_files": [
+                        "agent/governance/server.py",
+                        "agent/tests/test_graph_governance_api.py",
+                    ],
+                    "operator_approval_ref": (
+                        "operator-parentless-direct-main"
+                    ),
                     "graph_trace_ids": [graph_trace_id],
                 },
             },
         )
     )
+    append_authority = accepted_pre_mutation["payload"][
+        "observer_direct_pre_mutation_authority"
+    ]
+    assert append_authority["accepted"] is True
+    assert append_authority["server_projected"] is True
+    assert append_authority["missing_requirement_ids"] == []
+    assert append_authority["row_declared_files"] == [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
     server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
@@ -49676,17 +49869,20 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         "allowed_files"
     ]
     alias_only_event["verification"].pop("dirty_scope")
-    rejected_alias_only = task_timeline._observer_direct_exception_event(
-        alias_only_event,
-        {
-            "route_ids": [route_identity["route_id"]],
-            "route_context_hashes": [route_identity["route_context_hash"]],
-        },
+    rejected_alias_only = (
+        task_timeline.observer_direct_pre_mutation_authority_gate(
+            alias_only_event,
+            {
+                "route_ids": [route_identity["route_id"]],
+                "route_context_hashes": [route_identity["route_context_hash"]],
+            },
+            row_declared_files=template["allowed_files"],
+        )
     )
     assert rejected_alias_only["accepted"] is False
-    assert rejected_alias_only["missing_fields"] == [
-        "reason",
-        "dirty_scope_or_dirty_scope_check",
+    assert rejected_alias_only["missing_requirement_ids"] == [
+        "explicit_reason",
+        "dirty_scope.exact_match=true",
     ]
     implementation_arguments = copy.deepcopy(
         post_mutation["implementation"]["arguments_template"]
@@ -49864,127 +50060,83 @@ def test_parentless_direct_main_rejects_loose_operator_approval_shape(
         "task_id": parent_execution_id,
         "route_token_ref": close_route_token_ref,
     }
-    server.handle_task_timeline_append(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                **append_base,
-                "event_type": "mf.observer_direct_implementation_exception",
-                "event_kind": "observer_direct_implementation_exception",
-                "phase": "pre_mutation",
-                "status": "accepted",
-                "actor": "observer",
-                "payload": {
-                    **route_identity,
-                    "reason": "operator-supervised parentless direct-main repair",
-                    "operator_approval": {
-                        "approved_work_type": "observer_direct",
-                        "ref": "operator-note-1",
-                        "source": "operator",
+    with pytest.raises(GovernanceError) as rejected_append:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    **append_base,
+                    "event_type": "mf.observer_direct_implementation_exception",
+                    "event_kind": "observer_direct_implementation_exception",
+                    "phase": "pre_mutation",
+                    "status": "accepted",
+                    "decision": "operator_supervised_direct_main_approved",
+                    "actor": "observer",
+                    "payload": {
+                        **route_identity,
+                        "reason": (
+                            "operator-supervised parentless direct-main repair"
+                        ),
+                        "observer_direct_mutation": True,
+                        "tiny_deterministic_scope": True,
+                        "operator_approval": {
+                            "approved_work_type": "observer_direct",
+                            "ref": "operator-note-1",
+                            "source": "operator",
+                        },
+                        "dirty_scope_check": {
+                            "allowed_files": [
+                                "agent/governance/server.py",
+                                "agent/tests/test_graph_governance_api.py",
+                            ],
+                            "dirty_files": [],
+                            "exact_match": True,
+                        },
+                        "allowed_files": [
+                            "agent/governance/server.py",
+                            "agent/tests/test_graph_governance_api.py",
+                        ],
+                        "graph_trace_ids": [graph_trace_id],
                     },
-                    "dirty_scope_check": {"dirty_files": []},
-                    "allowed_files": ["agent/governance/server.py"],
-                    "graph_trace_ids": [graph_trace_id],
+                    "artifact_refs": {
+                        "allowed_files": [
+                            "agent/governance/server.py",
+                            "agent/tests/test_graph_governance_api.py",
+                        ],
+                        "operator_approval_ref": "operator-note-1",
+                        "graph_trace_ids": [graph_trace_id],
+                    },
                 },
-            },
+            )
         )
-    )
-    server.handle_task_timeline_append(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                **append_base,
-                "event_type": "observer.implementation",
-                "event_kind": "implementation",
-                "phase": "implementation",
-                "status": "passed",
-                "actor": "observer",
-                "commit_sha": close_commit,
-                "payload": {
-                    **route_identity,
-                    "changed_files": [
-                        "agent/governance/server.py",
-                        "agent/tests/test_graph_governance_api.py",
-                    ],
-                    "dirty_scope_check": {"unexpected_files": []},
-                },
-            },
-        )
-    )
-    _append_authenticated_qa_verification(
-        conn,
-        backlog_id=backlog_id,
-        task_id=parent_execution_id,
-        commit_sha=close_commit,
-        snapshot_id="full-parentless-direct-main-loose-approval",
-    )
-    server.handle_task_timeline_append(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                **append_base,
-                "event_type": "observer.close_ready",
-                "event_kind": "close_ready",
-                "phase": "close_ready",
-                "status": "passed",
-                "actor": "observer",
-                "commit_sha": close_commit,
-                "verification": {
-                    "governance_redeploy": {"status": "passed"},
-                    "runtime_version_sync": True,
-                    "graph_reconciled": True,
-                    "preflight_ok": True,
-                    "live_regression": {"status": "passed"},
-                },
-                "payload": {**route_identity, "close_commit": close_commit},
-            },
-        )
-    )
 
-    monkeypatch.setattr(
-        server,
-        "_runtime_context_child_lane_close_authority_projection",
-        lambda **_kwargs: {
-            **server._contract_runtime_close_authority_payload_fields(),
-            "schema_version": server._CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
-            "accepted": False,
-            "status": "incomplete",
-            "source_of_authority": "contract_runtime",
-            "authority_decision_source": "contract_runtime_close_authority_projection",
-            "contract_execution_id": parent_execution_id,
-            "missing_requirement_ids": ["runtime_context.child_lane_incomplete"],
-        },
+    assert rejected_append.value.code == (
+        "parentless_direct_main_pre_mutation_authority_incomplete"
     )
-
-    precheck = server.handle_backlog_timeline_gate(
-        _ctx(
-            {"project_id": PID, "bug_id": backlog_id},
-            query={"close_commit": close_commit},
-        )
-    )
-
-    projection = precheck["timeline_gate"]["contract_runtime_close_authority_projection"]
-    assert projection["accepted"] is False
-    direct_gate = projection["parentless_direct_main_close_authority_gate"]
-    assert direct_gate["passed"] is False
+    assert rejected_append.value.details["persisted_as_accepted"] is False
     assert (
         "operator_approval.close_satisfying_shape"
-        in direct_gate["missing_requirement_ids"]
+        in rejected_append.value.details["missing_requirement_ids"]
     )
-    rejected = direct_gate["checks"]["rejected_observer_direct_exceptions"][0]
-    approval_shape = rejected["operator_approval_shape"]
+    approval_shape = rejected_append.value.details["operator_approval_shape"]
     assert approval_shape["status"] == "legacy_loose_rejected"
     assert approval_shape["legacy_loose_shape_detected"] is True
-    assert direct_gate["checks"]["operator_approval_shapes"][0]["rejected_shapes"][0][
-        "present_fields"
-    ] == ["approved_work_type", "ref", "source"]
-    assert precheck["can_close"] is False
+    assert approval_shape["rejected_shapes"][0]["present_fields"] == [
+        "approved_work_type",
+        "ref",
+        "source",
+    ]
+    direct_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        event_kind="observer_direct_implementation_exception",
+        limit=10,
+    )
+    assert direct_events == []
 
 
 def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_gate(
@@ -50076,25 +50228,16 @@ def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_ga
             {"project_id": PID},
             "observer",
             method="POST",
-            body={
-                **append_base,
-                "event_type": "mf.observer_direct_implementation_exception",
-                "event_kind": "observer_direct_implementation_exception",
-                "phase": "pre_mutation",
-                "status": "accepted",
-                "actor": "observer",
-                "payload": {
-                    **route_identity,
-                    "reason": "operator-supervised parentless direct-main repair",
-                    "operator_approval": {
-                        "approved": True,
-                        "approved_by": "operator",
-                    },
-                    "dirty_scope_check": {"dirty_files": []},
-                    "allowed_files": ["agent/governance/server.py"],
-                    "graph_trace_ids": [graph_trace_id],
-                },
-            },
+            body=_canonical_parentless_direct_main_pre_mutation_body(
+                append_base=append_base,
+                route_identity=route_identity,
+                allowed_files=[
+                    "agent/governance/server.py",
+                    "agent/tests/test_graph_governance_api.py",
+                ],
+                graph_trace_ids=[graph_trace_id],
+                approval_ref="operator-active-child-direct-main",
+            ),
         )
     )
     server.handle_task_timeline_append(
@@ -50483,6 +50626,11 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
         close_commit = hashlib.sha1(suffix.encode("utf-8")).hexdigest()
         route_token_ref = f"rtok-parentless-direct-main-graph-{suffix.lower()}"
         _insert_simple_mf_close_backlog(conn, backlog_id)
+        conn.execute(
+            "UPDATE backlog_bugs SET target_files = ? WHERE bug_id = ?",
+            (json.dumps(["agent/governance/server.py"]), backlog_id),
+        )
+        conn.commit()
         guide = server.handle_project_onboard_route_guide(
             _ctx_with_role(
                 {"project_id": PID},
@@ -50559,25 +50707,13 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
                 {"project_id": PID},
                 "observer",
                 method="POST",
-                body={
-                    **append_base,
-                    "event_type": "mf.observer_direct_implementation_exception",
-                    "event_kind": "observer_direct_implementation_exception",
-                    "phase": "pre_mutation",
-                    "status": "accepted",
-                    "actor": "observer",
-                    "payload": {
-                        **route_identity,
-                        "reason": "operator-supervised parentless direct-main repair",
-                        "operator_approval": {
-                            "approved": True,
-                            "approved_by": "operator",
-                        },
-                        "dirty_scope_check": {"dirty_files": []},
-                        "allowed_files": ["agent/governance/server.py"],
-                        "graph_trace_ids": graph_trace_ids,
-                    },
-                },
+                body=_canonical_parentless_direct_main_pre_mutation_body(
+                    append_base=append_base,
+                    route_identity=route_identity,
+                    allowed_files=["agent/governance/server.py"],
+                    graph_trace_ids=graph_trace_ids,
+                    approval_ref=f"operator-graph-{suffix.lower()}",
+                ),
             )
         )
         server.handle_task_timeline_append(
@@ -50845,142 +50981,49 @@ def test_parentless_direct_main_rejects_event_allowed_files_outside_row_scope(
         "task_id": parent_execution_id,
         "route_token_ref": route_token_ref,
     }
-    server.handle_task_timeline_append(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                **append_base,
-                "event_type": "mf.observer_direct_implementation_exception",
-                "event_kind": "observer_direct_implementation_exception",
-                "phase": "pre_mutation",
-                "status": "accepted",
-                "actor": "observer",
-                "payload": {
-                    **route_identity,
-                    "reason": "operator-supervised parentless direct-main repair",
-                    "operator_approval": {
-                        "approved": True,
-                        "approved_by": "operator",
-                    },
-                    "dirty_scope_check": {"dirty_files": []},
-                    "allowed_files": [
+    with pytest.raises(GovernanceError) as rejected_append:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=_canonical_parentless_direct_main_pre_mutation_body(
+                    append_base=append_base,
+                    route_identity=route_identity,
+                    allowed_files=[
                         "agent/governance/server.py",
                         "outside.py",
                     ],
-                    "graph_trace_ids": [graph_trace_id],
-                },
-            },
+                    graph_trace_ids=[graph_trace_id],
+                    approval_ref="operator-outside-scope-direct-main",
+                ),
+            )
         )
-    )
-    server.handle_task_timeline_append(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                **append_base,
-                "event_type": "observer.implementation",
-                "event_kind": "implementation",
-                "phase": "implementation",
-                "status": "passed",
-                "actor": "observer",
-                "commit_sha": close_commit,
-                "payload": {
-                    **route_identity,
-                    "changed_files": ["outside.py"],
-                    "dirty_scope_check": {"unexpected_files": []},
-                },
-            },
-        )
-    )
-    server.handle_task_timeline_append(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                **append_base,
-                "event_type": "qa.independent_verification",
-                "event_kind": "independent_verification",
-                "phase": "verification",
-                "status": "passed",
-                "actor": "qa:direct-main",
-                "commit_sha": close_commit,
-                "verification": {
-                    "tests_run": ["pytest -q agent/tests/test_graph_governance_api.py"],
-                    "diff_check": {"unexpected_files": []},
-                    "live_regression": {"status": "passed"},
-                },
-                "payload": {**route_identity, "independent": True},
-            },
-        )
-    )
-    server.handle_task_timeline_append(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                **append_base,
-                "event_type": "observer.close_ready",
-                "event_kind": "close_ready",
-                "phase": "close_ready",
-                "status": "passed",
-                "actor": "observer",
-                "commit_sha": close_commit,
-                "verification": {
-                    "governance_redeploy": {"status": "passed"},
-                    "runtime_version_sync": True,
-                    "graph_reconciled": True,
-                    "preflight_ok": True,
-                    "live_regression": {"status": "passed"},
-                },
-                "payload": {**route_identity, "close_commit": close_commit},
-            },
-        )
-    )
 
-    monkeypatch.setattr(
-        server,
-        "_runtime_context_child_lane_close_authority_projection",
-        lambda **_kwargs: {
-            **server._contract_runtime_close_authority_payload_fields(),
-            "schema_version": server._CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
-            "accepted": False,
-            "status": "incomplete",
-            "source_of_authority": "contract_runtime",
-            "authority_decision_source": "contract_runtime_close_authority_projection",
-            "contract_execution_id": parent_execution_id,
-            "missing_requirement_ids": ["runtime_context.child_lane_incomplete"],
-        },
+    assert rejected_append.value.code == (
+        "parentless_direct_main_pre_mutation_authority_incomplete"
     )
-
-    precheck = server.handle_backlog_timeline_gate(
-        _ctx(
-            {"project_id": PID, "bug_id": backlog_id},
-            query={"close_commit": close_commit},
-        )
-    )
-    projection = precheck["timeline_gate"]["contract_runtime_close_authority_projection"]
-    direct_gate = projection["parentless_direct_main_close_authority_gate"]
-    assert projection["accepted"] is False
-    assert direct_gate["passed"] is False
-    assert direct_gate["missing_requirement_ids"] == [
-        "event_allowed_files_within_row_scope"
+    assert rejected_append.value.details["missing_requirement_ids"] == [
+        "dirty_scope.exact_match=true",
+        "allowed_files_exact_row_scope"
     ]
-    assert direct_gate["checks"]["scope_source"] == (
-        "backlog.target_files + backlog.test_files"
-    )
-    assert direct_gate["checks"]["row_declared_file_scope"] == [
+    assert rejected_append.value.details["persisted_as_accepted"] is False
+    assert rejected_append.value.details["row_declared_files"] == [
         "agent/governance/server.py",
         "agent/tests/test_graph_governance_api.py",
     ]
-    assert direct_gate["checks"]["event_allowed_files_outside_row_scope"] == [
-        "outside.py"
+    assert rejected_append.value.details["event_allowed_files"] == [
+        "agent/governance/server.py",
+        "outside.py",
     ]
-    assert precheck["can_close"] is False
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        event_kind="observer_direct_implementation_exception",
+        limit=10,
+    ) == []
 
 
 def test_parentless_direct_main_requires_independent_qa_verification(
@@ -50991,6 +51034,11 @@ def test_parentless_direct_main_requires_independent_qa_verification(
     close_commit = "a16275118745006c8324dfcbeecea62c39e91936"
     route_token_ref = "rtok-parentless-direct-main-self-verify"
     _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ? WHERE bug_id = ?",
+        (json.dumps(["agent/governance/server.py"]), backlog_id),
+    )
+    conn.commit()
     guide = server.handle_project_onboard_route_guide(
         _ctx_with_role(
             {"project_id": PID},
@@ -51050,25 +51098,13 @@ def test_parentless_direct_main_requires_independent_qa_verification(
             {"project_id": PID},
             "observer",
             method="POST",
-            body={
-                **append_base,
-                "event_type": "mf.observer_direct_implementation_exception",
-                "event_kind": "observer_direct_implementation_exception",
-                "phase": "pre_mutation",
-                "status": "accepted",
-                "actor": "observer",
-                "payload": {
-                    **route_identity,
-                    "reason": "operator-supervised parentless direct-main repair",
-                    "operator_approval": {
-                        "approved": True,
-                        "approved_by": "operator",
-                    },
-                    "dirty_scope_check": {"dirty_files": []},
-                    "allowed_files": ["agent/governance/server.py"],
-                    "graph_trace_ids": [graph_trace_id],
-                },
-            },
+            body=_canonical_parentless_direct_main_pre_mutation_body(
+                append_base=append_base,
+                route_identity=route_identity,
+                allowed_files=["agent/governance/server.py"],
+                graph_trace_ids=[graph_trace_id],
+                approval_ref="operator-self-verify-direct-main",
+            ),
         )
     )
     server.handle_task_timeline_append(

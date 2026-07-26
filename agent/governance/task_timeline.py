@@ -9245,6 +9245,7 @@ def _observer_direct_server_gate_shape(event: dict[str, Any]) -> dict[str, Any]:
         in {
             "observer_direct_mutation_exception",
             "mf_observer_direct_implementation_exception",
+            "mf.observer_direct_implementation_exception",
         },
         "pre_mutation_phase": phase in {"pre_implementation", "pre_mutation"},
         "operator_supervised_decision": (
@@ -9348,6 +9349,162 @@ def _observer_direct_exception_event(
             else str(server_gate_shape.get("reason_source") or "")
         ),
         "server_gate_shape": server_gate_shape,
+    }
+
+
+def observer_direct_pre_mutation_authority_schema() -> dict[str, Any]:
+    """Return the canonical append-time/close-time direct-main authority schema."""
+
+    return {
+        "schema_version": "observer_direct_pre_mutation_authority_schema.v1",
+        "canonical_timeline_event": {
+            "schema_version": "observer_direct_mutation_exception.canonical_event.v1",
+            "top_level": {
+                "event_type": "mf.observer_direct_implementation_exception",
+                "event_kind": "observer_direct_implementation_exception",
+                "phase": "pre_mutation",
+                "status": "accepted",
+                "decision": "operator_supervised_direct_main_approved",
+            },
+            "payload_fields": [
+                "reason",
+                "observer_direct_mutation=true",
+                "tiny_deterministic_scope=true",
+            ],
+            "verification_fields": [
+                "operator_approval.approved=true",
+                "operator_approval.approval_ref",
+                "dirty_scope.exact_match=true",
+                "db_verified_pre_implementation_graph_trace=true",
+            ],
+            "artifact_ref_fields": [
+                "allowed_files",
+                "graph_trace_ids",
+                "operator_approval_ref",
+            ],
+            "ordering": "append_before_any_mutation",
+            "authority": "server_route_token_gate",
+        },
+        "required_requirement_ids": [
+            "source_backed_server_route_gate_shape",
+            "explicit_reason",
+            "observer_direct_mutation=true",
+            "tiny_deterministic_scope=true",
+            "dirty_scope.exact_match=true",
+            "operator_approval.close_satisfying_shape",
+            "operator_approval_ref",
+            "allowed_files_exact_row_scope",
+        ],
+        "historical_compatibility": {
+            "raw_historical_events_rewritten": False,
+            "post_hoc_backfill_allowed": False,
+            "strict_close_revalidation_marker": (
+                "observer_direct_pre_mutation_authority"
+            ),
+        },
+    }
+
+
+def observer_direct_pre_mutation_authority_gate(
+    event: dict[str, Any],
+    route_identity: dict[str, list[str]],
+    *,
+    row_declared_files: list[str] | None = None,
+) -> dict[str, Any]:
+    """Validate one new direct-main authority event before it becomes immutable."""
+
+    schema = observer_direct_pre_mutation_authority_schema()
+    exception = _observer_direct_exception_event(event, route_identity)
+    server_gate_shape = _observer_direct_server_gate_shape(event)
+    reason = _first_event_string(
+        event,
+        {"reason", "exception_reason", "waiver_reason"},
+    )
+    direct_mutation_declared = _event_deep_truthy(
+        event,
+        {"observer_direct_mutation"},
+    )
+    tiny_deterministic_scope = _event_deep_truthy(
+        event,
+        {"tiny_deterministic_scope"},
+    )
+    dirty_scope_shapes = [
+        dict(value)
+        for value in _event_field_values(
+            event,
+            {"dirty_scope", "dirty_scope_check"},
+        )
+        if isinstance(value, Mapping)
+    ]
+    operator_approval_shape = _operator_approval_shape(event)
+    operator_approval_ref = _first_event_string(
+        event,
+        {"approval_ref", "operator_approval_ref"},
+    )
+    event_allowed_files = _normalised_file_set(
+        _event_deep_string_list(
+            event,
+            {
+                "allowed_files",
+                "target_files",
+                "owned_files",
+                "allowed_changed_files",
+            },
+        )
+    )
+    row_scope = _normalised_file_set(list(row_declared_files or []))
+    exact_dirty_scope_shapes = [
+        value
+        for value in dirty_scope_shapes
+        if _truthy(value.get("exact_match"))
+        and _normalised_file_set(
+            _event_deep_string_list(
+                dict(value),
+                {"allowed_files", "target_files", "owned_files"},
+            )
+        )
+        == row_scope
+    ]
+    allowed_files_exact_row_scope = bool(
+        row_scope and event_allowed_files == row_scope
+    )
+
+    checks = {
+        "source_backed_server_route_gate_shape": bool(
+            server_gate_shape.get("accepted")
+        ),
+        "explicit_reason": bool(reason),
+        "observer_direct_mutation=true": direct_mutation_declared,
+        "tiny_deterministic_scope=true": tiny_deterministic_scope,
+        "dirty_scope.exact_match=true": bool(exact_dirty_scope_shapes),
+        "operator_approval.close_satisfying_shape": bool(
+            operator_approval_shape.get("accepted")
+        ),
+        "operator_approval_ref": bool(operator_approval_ref),
+        "allowed_files_exact_row_scope": allowed_files_exact_row_scope,
+    }
+    missing_requirement_ids = [
+        requirement_id
+        for requirement_id in schema["required_requirement_ids"]
+        if not checks.get(requirement_id)
+    ]
+    accepted = bool(exception.get("accepted")) and not missing_requirement_ids
+    return {
+        "schema_version": "observer_direct_pre_mutation_authority_gate.v1",
+        "accepted": accepted,
+        "passed": accepted,
+        "status": "accepted" if accepted else "rejected",
+        "missing_requirement_ids": missing_requirement_ids,
+        "event": exception.get("event"),
+        "checks": checks,
+        "exception_projection": exception,
+        "server_gate_shape": server_gate_shape,
+        "operator_approval_shape": operator_approval_shape,
+        "dirty_scope_shapes": dirty_scope_shapes,
+        "row_declared_files": sorted(row_scope),
+        "event_allowed_files": sorted(event_allowed_files),
+        "schema": schema,
+        "historical_backfill_allowed": False,
     }
 
 

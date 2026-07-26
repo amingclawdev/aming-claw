@@ -56857,6 +56857,7 @@ _SERVER_PROJECTED_TIMELINE_KEYS = frozenset(
     {
         "contract_gate_decision",
         "meta_contract_gate",
+        "observer_direct_pre_mutation_authority",
         "source_backed_contract_gate_authority",
         *_ROUTE_ACTION_SCOPE_LINEAGE_KEYS,
     }
@@ -76556,6 +76557,12 @@ def _onboard_parentless_direct_main_pre_mutation_event_guidance(
 ) -> dict[str, Any]:
     """Return one compact, copy-safe canonical direct-main event template."""
 
+    from . import task_timeline
+
+    authority_schema = (
+        task_timeline.observer_direct_pre_mutation_authority_schema()
+    )
+    canonical_event = authority_schema["canonical_timeline_event"]
     allowed_files = _runtime_context_service_dedupe(
         [str(path or "").strip() for path in target_files]
     )
@@ -76569,11 +76576,7 @@ def _onboard_parentless_direct_main_pre_mutation_event_guidance(
         "project_id": str(project_id or "").strip(),
         "backlog_id": str(backlog_id or "").strip(),
         "task_id": str(task_id or "").strip(),
-        "event_type": "mf.observer_direct_implementation_exception",
-        "event_kind": "observer_direct_implementation_exception",
-        "phase": "pre_mutation",
-        "status": "accepted",
-        "decision": "operator_supervised_direct_main_approved",
+        **dict(canonical_event["top_level"]),
         "actor": "observer",
         "payload": {
             "reason": reason_placeholder,
@@ -76621,6 +76624,7 @@ def _onboard_parentless_direct_main_pre_mutation_event_guidance(
             "onboard_route_guide.parentless_direct_main."
             "copy_safe_pre_mutation_event.v1"
         ),
+        "authority_schema_version": authority_schema["schema_version"],
         "mcp_tool": "task_timeline_append",
         "copy_safe": True,
         "raw_route_token_required": False,
@@ -76649,14 +76653,23 @@ def _onboard_parentless_direct_main_pre_mutation_event_guidance(
         "arguments_template": arguments_template,
         "ordering": "submit after graph_query and before any mutation",
         "fail_closed_if_omitted": [
-            "payload.reason",
-            "payload.dirty_scope_check",
-            "payload.operator_approval",
+            *authority_schema["required_requirement_ids"],
             "payload.graph_trace_ids",
-            "artifact_refs.allowed_files",
             "route_token_ref",
         ],
     }
+
+
+def _onboard_parentless_direct_main_canonical_timeline_event() -> dict[str, Any]:
+    """Read the canonical guide shape from the shared authority schema."""
+
+    from . import task_timeline
+
+    return dict(
+        task_timeline.observer_direct_pre_mutation_authority_schema()[
+            "canonical_timeline_event"
+        ]
+    )
 
 
 def _onboard_parentless_direct_main_post_mutation_event_guidance(
@@ -77123,34 +77136,9 @@ def _onboard_contract_route_guide(
             "path": "/api/task/{project_id}/timeline",
             "event_type": "mf.observer_direct_implementation_exception",
             "event_kind": "observer_direct_implementation_exception",
-            "canonical_timeline_event": {
-                "schema_version": "observer_direct_mutation_exception.canonical_event.v1",
-                "top_level": {
-                    "event_type": "mf.observer_direct_implementation_exception",
-                    "event_kind": "observer_direct_implementation_exception",
-                    "phase": "pre_mutation",
-                    "status": "accepted",
-                    "decision": "operator_supervised_direct_main_approved",
-                },
-                "payload_fields": [
-                    "reason",
-                    "observer_direct_mutation=true",
-                    "tiny_deterministic_scope=true",
-                ],
-                "verification_fields": [
-                    "operator_approval.approved=true",
-                    "operator_approval.approval_ref",
-                    "dirty_scope.exact_match=true",
-                    "db_verified_pre_implementation_graph_trace=true",
-                ],
-                "artifact_ref_fields": [
-                    "allowed_files",
-                    "graph_trace_ids",
-                    "operator_approval_ref",
-                ],
-                "ordering": "append_before_any_mutation",
-                "authority": "server_route_token_gate",
-            },
+            "canonical_timeline_event": (
+                _onboard_parentless_direct_main_canonical_timeline_event()
+            ),
         },
         "graph_query": {
             "kind": "mcp_or_http",
@@ -91900,10 +91888,42 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             if identity.get("route_context_hash")
             else [],
         }
-        exception = task_timeline._observer_direct_exception_event(
-            dict(event),
-            route_identity,
+        event_payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
         )
+        append_time_authority = (
+            event_payload.get("observer_direct_pre_mutation_authority")
+            if isinstance(
+                event_payload.get("observer_direct_pre_mutation_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        if (
+            append_time_authority.get("accepted") is True
+            and append_time_authority.get("server_projected") is True
+            and str(
+                append_time_authority.get("projection_source") or ""
+            ).strip()
+            == "task_timeline_append_pre_persistence_gate"
+        ):
+            exception = (
+                task_timeline.observer_direct_pre_mutation_authority_gate(
+                    dict(event),
+                    route_identity,
+                    row_declared_files=list(row_declared_files or []),
+                )
+            )
+            exception["missing_fields"] = list(
+                exception.get("missing_requirement_ids") or []
+            )
+        else:
+            exception = task_timeline._observer_direct_exception_event(
+                dict(event),
+                route_identity,
+            )
         if not bool(exception.get("accepted")):
             if exception.get("missing_fields") != ["observer_direct_exception_event"]:
                 rejected_direct_exceptions.append(exception)
@@ -94220,6 +94240,100 @@ def handle_task_timeline_append(ctx: RequestContext):
             ctx.body.get("artifact_refs") or {},
             conn=conn,
         )
+        direct_event_tokens = {
+            str(ctx.body.get("event_type") or "")
+            .strip()
+            .lower()
+            .replace(".", "_")
+            .replace("-", "_"),
+            str(norm_event_kind or "")
+            .strip()
+            .lower()
+            .replace(".", "_")
+            .replace("-", "_"),
+        }
+        if direct_event_tokens.intersection(
+            {
+                "mf_observer_direct_implementation_exception",
+                "observer_direct_implementation_exception",
+            }
+        ):
+            provisional_event = {
+                "project_id": project_id,
+                "backlog_id": str(ctx.body.get("backlog_id") or "").strip(),
+                "task_id": str(ctx.body.get("task_id") or "").strip(),
+                "event_type": ctx.body.get("event_type", ""),
+                "event_kind": norm_event_kind,
+                "phase": ctx.body.get("phase", ""),
+                "status": norm_status,
+                "decision": ctx.body.get("decision", ""),
+                "actor": ctx.body.get("actor", ""),
+                "payload": norm_payload,
+                "verification": ctx.body.get("verification") or {},
+                "artifact_refs": ctx.body.get("artifact_refs") or {},
+            }
+            direct_identity = _observer_root_route_identity_from_event(
+                provisional_event
+            )
+            direct_authority_gate = (
+                task_timeline.observer_direct_pre_mutation_authority_gate(
+                    provisional_event,
+                    {
+                        "route_ids": [direct_identity.get("route_id", "")]
+                        if direct_identity.get("route_id")
+                        else [],
+                        "route_context_hashes": [
+                            direct_identity.get("route_context_hash", "")
+                        ]
+                        if direct_identity.get("route_context_hash")
+                        else [],
+                    },
+                    row_declared_files=_backlog_declared_direct_file_scope(
+                        conn,
+                        str(ctx.body.get("backlog_id") or "").strip(),
+                    ),
+                )
+            )
+            if not direct_authority_gate.get("accepted"):
+                raise GovernanceError(
+                    "parentless_direct_main_pre_mutation_authority_incomplete",
+                    (
+                        "observer direct-main pre-mutation authority is "
+                        "incomplete and was not persisted"
+                    ),
+                    422,
+                    {
+                        **direct_authority_gate,
+                        "persisted_as_accepted": False,
+                        "historical_backfill_allowed": False,
+                    },
+                )
+            norm_payload["observer_direct_pre_mutation_authority"] = {
+                "schema_version": (
+                    "observer_direct_pre_mutation_authority_projection.v1"
+                ),
+                "accepted": True,
+                "server_projected": True,
+                "projection_source": (
+                    "task_timeline_append_pre_persistence_gate"
+                ),
+                "validator_schema_version": (
+                    direct_authority_gate.get("schema", {}).get(
+                        "schema_version",
+                        "",
+                    )
+                ),
+                "row_declared_files": direct_authority_gate.get(
+                    "row_declared_files",
+                    [],
+                ),
+                "event_allowed_files": direct_authority_gate.get(
+                    "event_allowed_files",
+                    [],
+                ),
+                "missing_requirement_ids": [],
+                "historical_backfill_allowed": False,
+            }
         if source_authority:
             norm_payload.pop("meta_contract_gate", None)
             norm_payload["contract_gate_decision"] = (
