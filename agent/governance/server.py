@@ -34465,6 +34465,13 @@ def _runtime_context_submit_canonical_contract_line(
                         "timeline_evidence_backfill_allowed": False,
                     },
                 )
+            _onboard_guide_capsule_invalidate_contract_runtime_transition(
+                project_id=project_id,
+                result={
+                    "ok": True,
+                    "record": runtime.store.get(execution_id),
+                },
+            )
             return replay
         if revision_status == "validated_submission":
             canonical_payload = dict(
@@ -34474,6 +34481,14 @@ def _runtime_context_submit_canonical_contract_line(
             revision_status == "revised"
             or next_line_id != "worker_implementation"
         ):
+            if revision_status == "revised":
+                _onboard_guide_capsule_invalidate_contract_runtime_transition(
+                    project_id=project_id,
+                    result={
+                        "ok": True,
+                        "record": runtime.store.get(execution_id),
+                    },
+                )
             return revision
         if not revision:
             precommit_correction = (
@@ -34487,6 +34502,14 @@ def _runtime_context_submit_canonical_contract_line(
                 )
             )
             if precommit_correction:
+                if str(precommit_correction.get("status") or "") == "revised":
+                    _onboard_guide_capsule_invalidate_contract_runtime_transition(
+                        project_id=project_id,
+                        result={
+                            "ok": True,
+                            "record": runtime.store.get(execution_id),
+                        },
+                    )
                 return precommit_correction
 
     for completed in record.get("completed_lines") or []:
@@ -34610,6 +34633,10 @@ def _runtime_context_submit_canonical_contract_line(
         result.get("record")
         if isinstance(result.get("record"), Mapping)
         else {}
+    )
+    _onboard_guide_capsule_invalidate_contract_runtime_transition(
+        project_id=project_id,
+        result=result,
     )
     current_state = _runtime_current_state_from_record(updated) if updated else {}
     completed_line = next(
@@ -57583,6 +57610,10 @@ def _publish_accepted_contract_runtime_line_write(
     record = result.get("record")
     if not result.get("ok") or not isinstance(record, Mapping):
         return
+    _onboard_guide_capsule_invalidate_contract_runtime_transition(
+        project_id=project_id,
+        result=result,
+    )
     _publish_contract_runtime_current_changed(
         project_id,
         backlog_id=str(record.get("backlog_id") or ""),
@@ -80271,6 +80302,1100 @@ def _onboard_blocked_contract_resume_projection(
     return {}
 
 
+_ONBOARD_GUIDE_CAPSULE_SCHEMA_VERSION = "onboard_route_guide.capsule.v1"
+_ONBOARD_GUIDE_COMPACT_SCHEMA_VERSION = "onboard_route_guide.compact_response.v1"
+_ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES = 16 * 1024
+_ONBOARD_GUIDE_CAPSULE_SECTION_MAX_SERIALIZED_BYTES = 6 * 1024
+_ONBOARD_GUIDE_CAPSULE_MAX_FETCH_SECTIONS = 3
+_ONBOARD_GUIDE_CAPSULE_TTL_SECONDS = 300.0
+_ONBOARD_GUIDE_CAPSULE_MAX_ENTRIES = 128
+_ONBOARD_GUIDE_CAPSULE_SINGLE_FLIGHT_WAIT_SECONDS = 5.0
+_ONBOARD_GUIDE_CAPSULE_LOCK = RLock()
+_ONBOARD_GUIDE_CAPSULE_CACHE: OrderedDict[tuple[str, ...], dict[str, Any]] = (
+    OrderedDict()
+)
+_ONBOARD_GUIDE_CAPSULE_INFLIGHT: dict[tuple[str, ...], Event] = {}
+_ONBOARD_GUIDE_CAPSULE_METRICS = {
+    "hits": 0,
+    "misses": 0,
+    "fetch_hits": 0,
+    "fetch_misses": 0,
+    "evictions": 0,
+    "expirations": 0,
+    "invalidations": 0,
+    "single_flight_joins": 0,
+}
+
+
+def _onboard_guide_capsule_serialized_bytes(value: Any) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _onboard_guide_capsule_key_is_raw_auth(key: Any) -> bool:
+    normalized = str(key or "").strip().lower()
+    if not normalized:
+        return False
+    safe_suffixes = (
+        "_ref",
+        "_hash",
+        "_env",
+        "_present",
+        "_required",
+        "_exposed",
+        "_persisted",
+        "_redacted",
+    )
+    if normalized.endswith(safe_suffixes):
+        return False
+    if normalized in {
+        "token",
+        "session_token",
+        "worker_session_token",
+        "fence_token",
+        "route_token",
+        "observer_route_token",
+        "qa_session_token",
+        "access_token",
+        "refresh_token",
+        "api_key",
+        "authorization",
+        "x-gov-token",
+        "password",
+        "secret",
+    }:
+        return True
+    return normalized.endswith(
+        ("_token", "_secret", "_password", "_api_key")
+    )
+
+
+def _onboard_guide_capsule_bounded_copy(
+    value: Any,
+    *,
+    max_depth: int = 5,
+    max_mapping_items: int = 64,
+    max_sequence_items: int = 32,
+    max_string_chars: int = 1200,
+) -> Any:
+    """Build a bounded public-safe value without copying the full guide tree."""
+
+    def project(item: Any, depth: int) -> Any:
+        if depth > max_depth:
+            return {"truncated": True, "reason": "max_depth"}
+        if isinstance(item, Mapping):
+            projected: dict[str, Any] = {}
+            for index, (raw_key, child) in enumerate(item.items()):
+                if index >= max_mapping_items:
+                    projected["truncated"] = True
+                    projected["truncated_reason"] = "max_mapping_items"
+                    break
+                key = str(raw_key)
+                if _onboard_guide_capsule_key_is_raw_auth(key):
+                    continue
+                projected[key] = project(child, depth + 1)
+            return projected
+        if isinstance(item, (list, tuple)):
+            projected_list = [
+                project(child, depth + 1)
+                for child in list(item)[:max_sequence_items]
+            ]
+            if len(item) > max_sequence_items:
+                projected_list.append(
+                    {
+                        "truncated": True,
+                        "reason": "max_sequence_items",
+                        "omitted_count": len(item) - max_sequence_items,
+                    }
+                )
+            return projected_list
+        if isinstance(item, str):
+            if len(item) <= max_string_chars:
+                return item
+            return item[:max_string_chars] + "…"
+        if item is None or isinstance(item, (bool, int, float)):
+            return item
+        return str(item)[:max_string_chars]
+
+    return project(value, 0)
+
+
+def _onboard_guide_capsule_bounded_section(
+    value: Any,
+    *,
+    section_name: str,
+) -> dict[str, Any]:
+    projected = _onboard_guide_capsule_bounded_copy(value)
+    if not isinstance(projected, Mapping):
+        projected = {"value": projected}
+    projected = dict(projected)
+    measured = _onboard_guide_capsule_serialized_bytes(projected)
+    if measured <= _ONBOARD_GUIDE_CAPSULE_SECTION_MAX_SERIALIZED_BYTES:
+        return projected
+    return {
+        "schema_version": "onboard_route_guide.capsule_section_truncated.v1",
+        "section": section_name,
+        "truncated": True,
+        "reason": "section_size_limit",
+        "measured_bytes": measured,
+        "max_serialized_bytes": (
+            _ONBOARD_GUIDE_CAPSULE_SECTION_MAX_SERIALIZED_BYTES
+        ),
+        "available_keys": sorted(str(key) for key in projected)[:64],
+    }
+
+
+def _onboard_guide_capsule_find_action_input(
+    next_action: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    candidate_keys = (
+        "action_input",
+        "copy_safe_body",
+        "body",
+        "request_body",
+        "payload_shape",
+        "precheck_payload",
+        "payload",
+    )
+    queue: list[tuple[Mapping[str, Any], str, int]] = [(next_action, "", 0)]
+    seen: set[int] = set()
+    while queue:
+        node, path, depth = queue.pop(0)
+        marker = id(node)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        for key in candidate_keys:
+            candidate = node.get(key)
+            if isinstance(candidate, Mapping) and candidate:
+                projected = _onboard_guide_capsule_bounded_section(
+                    candidate,
+                    section_name="action_input",
+                )
+                return projected, ".".join(item for item in (path, key) if item)
+        if depth >= 3:
+            continue
+        for key, child in node.items():
+            if isinstance(child, Mapping):
+                queue.append(
+                    (
+                        child,
+                        ".".join(item for item in (path, str(key)) if item),
+                        depth + 1,
+                    )
+                )
+    return {}, ""
+
+
+def _onboard_guide_capsule_blocker_ids(
+    next_action: Mapping[str, Any],
+) -> list[str]:
+    found: list[str] = []
+
+    def collect(value: Any, depth: int = 0) -> None:
+        if depth > 4:
+            return
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                normalized = str(key or "").lower()
+                if normalized in {"blocker_id", "blocker"} and isinstance(
+                    child, str
+                ):
+                    if child and child not in found:
+                        found.append(child)
+                elif normalized == "blocker_ids" and isinstance(child, list):
+                    for item in child:
+                        text = str(item or "").strip()
+                        if text and text not in found:
+                            found.append(text)
+                elif normalized == "blockers" and isinstance(child, list):
+                    for item in child:
+                        if isinstance(item, Mapping):
+                            text = str(
+                                item.get("blocker_id")
+                                or item.get("id")
+                                or item.get("code")
+                                or ""
+                            ).strip()
+                            if text and text not in found:
+                                found.append(text)
+                collect(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child, depth + 1)
+
+    collect(next_action)
+    return found[:32]
+
+
+def _onboard_guide_capsule_scope_identity(
+    *,
+    project_id: str,
+    backlog_id: str,
+    role: str,
+    work_type: str,
+    record: Mapping[str, Any],
+    next_action: Mapping[str, Any],
+    current_projection: Mapping[str, Any],
+    runtime_resume: Mapping[str, Any],
+) -> dict[str, Any]:
+    contract_execution_id = str(
+        next_action.get("contract_execution_id")
+        or next_action.get("current_contract_execution_id")
+        or runtime_resume.get("contract_execution_id")
+        or runtime_resume.get("current_contract_execution_id")
+        or current_projection.get("current_contract_execution_id")
+        or current_projection.get("contract_execution_id")
+        or record.get("contract_execution_id")
+        or ""
+    ).strip()
+    revision = (
+        next_action.get("execution_state_revision")
+        or runtime_resume.get("execution_state_revision")
+        or current_projection.get("execution_state_revision")
+        or 0
+    )
+    try:
+        revision = int(revision)
+    except (TypeError, ValueError):
+        revision = 0
+    projection_hash = str(
+        next_action.get("projection_hash")
+        or runtime_resume.get("projection_hash")
+        or current_projection.get("projection_hash")
+        or current_projection.get("execution_state_hash")
+        or ""
+    ).strip()
+    if not projection_hash:
+        projection_hash = "sha256:" + hashlib.sha256(
+            json.dumps(
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "execution_state_revision": revision,
+                    "line_id": str(next_action.get("line_id") or ""),
+                    "action": str(
+                        next_action.get("action")
+                        or next_action.get("id")
+                        or ""
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    terminal = bool(
+        current_projection.get("terminal") is True
+        or runtime_resume.get("terminal") is True
+        or next_action.get("terminal") is True
+    )
+    return {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "selected_role": str(role or "").strip() or "observer",
+        "selected_work_type": str(work_type or "").strip(),
+        "contract_execution_id": contract_execution_id,
+        "execution_state_revision": revision,
+        "projection_hash": projection_hash,
+        "terminal": terminal,
+    }
+
+
+def _onboard_guide_capsule_cache_key(
+    identity: Mapping[str, Any],
+) -> tuple[str, ...]:
+    return (
+        str(identity.get("project_id") or ""),
+        str(identity.get("backlog_id") or ""),
+        str(identity.get("selected_role") or ""),
+        str(identity.get("selected_work_type") or ""),
+        str(identity.get("contract_execution_id") or ""),
+        str(identity.get("execution_state_revision") or 0),
+        str(identity.get("projection_hash") or ""),
+    )
+
+
+def _onboard_guide_capsule_purge_locked(now: float) -> None:
+    expired: list[tuple[str, ...]] = []
+    for key, entry in _ONBOARD_GUIDE_CAPSULE_CACHE.items():
+        if now - float(entry.get("created_monotonic") or 0.0) >= float(
+            entry.get("ttl_seconds") or _ONBOARD_GUIDE_CAPSULE_TTL_SECONDS
+        ):
+            expired.append(key)
+    for key in expired:
+        _ONBOARD_GUIDE_CAPSULE_CACHE.pop(key, None)
+        _ONBOARD_GUIDE_CAPSULE_METRICS["expirations"] += 1
+
+
+def _onboard_guide_capsule_invalidate_scope_locked(
+    identity: Mapping[str, Any],
+    current_key: tuple[str, ...],
+) -> None:
+    scope = current_key[:4]
+    invalidated = [
+        key
+        for key in _ONBOARD_GUIDE_CAPSULE_CACHE
+        if key[:4] == scope and key != current_key
+    ]
+    if identity.get("terminal") is True:
+        invalidated.extend(
+            key
+            for key in _ONBOARD_GUIDE_CAPSULE_CACHE
+            if key[:2] == current_key[:2]
+            and key != current_key
+            and key not in invalidated
+        )
+    for key in invalidated:
+        _ONBOARD_GUIDE_CAPSULE_CACHE.pop(key, None)
+        _ONBOARD_GUIDE_CAPSULE_METRICS["invalidations"] += 1
+
+
+def _onboard_guide_capsule_invalidate_contract_runtime_transition(
+    *,
+    project_id: str,
+    result: Mapping[str, Any],
+) -> int:
+    """Remove only capsules made stale by one accepted runtime transition.
+
+    ContractRuntime line mutations advance the authoritative revision exactly
+    once.  Capsule roles and work types are presentation scopes, so every
+    presentation of the exact prior project/backlog/execution/revision
+    projection must be removed together.  Rejected writes and exact idempotent
+    replays never invalidate.
+    """
+
+    if (
+        result.get("ok") is not True
+        or result.get("idempotent") is True
+        or result.get("contract_runtime_line_mutated") is False
+        or result.get("contract_runtime_mutated") is False
+    ):
+        return 0
+    record = (
+        result.get("record")
+        if isinstance(result.get("record"), Mapping)
+        else {}
+    )
+    resolved_project_id = str(
+        record.get("project_id") or project_id or ""
+    ).strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    contract_execution_id = str(
+        record.get("contract_execution_id")
+        or result.get("contract_execution_id")
+        or ""
+    ).strip()
+    execution_state = (
+        record.get("execution_state")
+        if isinstance(record.get("execution_state"), Mapping)
+        else {}
+    )
+    try:
+        current_revision = int(
+            record.get("execution_state_revision")
+            or execution_state.get("execution_state_revision")
+            or result.get("execution_state_revision")
+            or 0
+        )
+    except (TypeError, ValueError):
+        return 0
+    prior_revision = current_revision - 1
+    if not (
+        resolved_project_id
+        and backlog_id
+        and contract_execution_id
+        and prior_revision > 0
+    ):
+        return 0
+
+    invalidated: list[tuple[str, ...]] = []
+    with _ONBOARD_GUIDE_CAPSULE_LOCK:
+        for key, entry in list(_ONBOARD_GUIDE_CAPSULE_CACHE.items()):
+            identity = (
+                entry.get("identity")
+                if isinstance(entry.get("identity"), Mapping)
+                else {}
+            )
+            if not (
+                key[0] == resolved_project_id
+                and key[1] == backlog_id
+                and key[4] == contract_execution_id
+                and key[5] == str(prior_revision)
+                and key[6] == str(identity.get("projection_hash") or "")
+            ):
+                continue
+            invalidated.append(key)
+        for key in invalidated:
+            _ONBOARD_GUIDE_CAPSULE_CACHE.pop(key, None)
+            _ONBOARD_GUIDE_CAPSULE_METRICS["invalidations"] += 1
+    return len(invalidated)
+
+
+def _onboard_guide_capsule_get_or_create(
+    identity: Mapping[str, Any],
+    builder,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    key = _onboard_guide_capsule_cache_key(identity)
+    now = time.monotonic()
+    leader = False
+    with _ONBOARD_GUIDE_CAPSULE_LOCK:
+        _onboard_guide_capsule_purge_locked(now)
+        _onboard_guide_capsule_invalidate_scope_locked(identity, key)
+        cached = _ONBOARD_GUIDE_CAPSULE_CACHE.get(key)
+        if cached is not None:
+            _ONBOARD_GUIDE_CAPSULE_CACHE.move_to_end(key)
+            _ONBOARD_GUIDE_CAPSULE_METRICS["hits"] += 1
+            return cached, {
+                "status": "hit",
+                "hit": True,
+                "miss": False,
+                "age_ms": max(
+                    0,
+                    int(
+                        (now - float(cached.get("created_monotonic") or now))
+                        * 1000
+                    ),
+                ),
+                **dict(_ONBOARD_GUIDE_CAPSULE_METRICS),
+            }
+        event = _ONBOARD_GUIDE_CAPSULE_INFLIGHT.get(key)
+        if event is None:
+            event = Event()
+            _ONBOARD_GUIDE_CAPSULE_INFLIGHT[key] = event
+            _ONBOARD_GUIDE_CAPSULE_METRICS["misses"] += 1
+            leader = True
+        else:
+            _ONBOARD_GUIDE_CAPSULE_METRICS["single_flight_joins"] += 1
+    if not leader:
+        event.wait(_ONBOARD_GUIDE_CAPSULE_SINGLE_FLIGHT_WAIT_SECONDS)
+        now = time.monotonic()
+        with _ONBOARD_GUIDE_CAPSULE_LOCK:
+            cached = _ONBOARD_GUIDE_CAPSULE_CACHE.get(key)
+            if cached is not None:
+                _ONBOARD_GUIDE_CAPSULE_CACHE.move_to_end(key)
+                _ONBOARD_GUIDE_CAPSULE_METRICS["hits"] += 1
+                return cached, {
+                    "status": "single_flight_join",
+                    "hit": True,
+                    "miss": False,
+                    "age_ms": max(
+                        0,
+                        int(
+                            (
+                                now
+                                - float(cached.get("created_monotonic") or now)
+                            )
+                            * 1000
+                        ),
+                    ),
+                    **dict(_ONBOARD_GUIDE_CAPSULE_METRICS),
+                }
+        return _onboard_guide_capsule_get_or_create(identity, builder)
+    try:
+        sections = builder()
+        created = time.monotonic()
+        entry = {
+            "schema_version": _ONBOARD_GUIDE_CAPSULE_SCHEMA_VERSION,
+            "guide_capsule_ref": "gcap-" + uuid.uuid4().hex,
+            "identity": dict(identity),
+            "sections": sections,
+            "created_monotonic": created,
+            "created_at": _utc_now(),
+            "ttl_seconds": _ONBOARD_GUIDE_CAPSULE_TTL_SECONDS,
+        }
+        with _ONBOARD_GUIDE_CAPSULE_LOCK:
+            _ONBOARD_GUIDE_CAPSULE_CACHE[key] = entry
+            _ONBOARD_GUIDE_CAPSULE_CACHE.move_to_end(key)
+            while (
+                len(_ONBOARD_GUIDE_CAPSULE_CACHE)
+                > _ONBOARD_GUIDE_CAPSULE_MAX_ENTRIES
+            ):
+                _ONBOARD_GUIDE_CAPSULE_CACHE.popitem(last=False)
+                _ONBOARD_GUIDE_CAPSULE_METRICS["evictions"] += 1
+            return entry, {
+                "status": "miss",
+                "hit": False,
+                "miss": True,
+                "age_ms": 0,
+                **dict(_ONBOARD_GUIDE_CAPSULE_METRICS),
+            }
+    finally:
+        with _ONBOARD_GUIDE_CAPSULE_LOCK:
+            signal = _ONBOARD_GUIDE_CAPSULE_INFLIGHT.pop(key, None)
+            if signal is not None:
+                signal.set()
+
+
+def _onboard_guide_capsule_refresh_response(
+    *,
+    project_id: str,
+    reason: str,
+    entry: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    identity = (
+        entry.get("identity")
+        if isinstance(entry, Mapping)
+        and isinstance(entry.get("identity"), Mapping)
+        else {}
+    )
+    return {
+        "schema_version": "onboard_route_guide.capsule_refresh.v1",
+        "ok": False,
+        "status": "refresh_required",
+        "reason": reason,
+        "project_id": project_id,
+        "refresh": {
+            "action": "onboard_route_guide",
+            "response_view": "compact",
+            "project_id": project_id,
+            "backlog_id": str(identity.get("backlog_id") or ""),
+            "role": str(identity.get("selected_role") or ""),
+            "work_type": str(identity.get("selected_work_type") or ""),
+        },
+        "safe_next_step": (
+            "call compact onboard_route_guide for the same project, backlog, "
+            "role, and work_type; do not grep guide text or read implementation "
+            "source to reconstruct the action"
+        ),
+        "capsule_cache": {
+            "hit": False,
+            "miss": True,
+            "age_ms": None,
+            **dict(_ONBOARD_GUIDE_CAPSULE_METRICS),
+        },
+        "authorizes_write": False,
+        "satisfies_gate": False,
+        "synthesizes_pass": False,
+    }
+
+
+def _onboard_guide_capsule_fetch(
+    *,
+    project_id: str,
+    guide_capsule_ref: str,
+    sections: Sequence[str],
+    backlog_id: str = "",
+    role: str = "",
+    work_type: str = "",
+) -> dict[str, Any]:
+    now = time.monotonic()
+    with _ONBOARD_GUIDE_CAPSULE_LOCK:
+        _onboard_guide_capsule_purge_locked(now)
+        entry = next(
+            (
+                candidate
+                for candidate in _ONBOARD_GUIDE_CAPSULE_CACHE.values()
+                if str(candidate.get("guide_capsule_ref") or "")
+                == guide_capsule_ref
+            ),
+            None,
+        )
+        if entry is None:
+            _ONBOARD_GUIDE_CAPSULE_METRICS["fetch_misses"] += 1
+            return _onboard_guide_capsule_refresh_response(
+                project_id=project_id,
+                reason="guide_capsule_missing_or_expired",
+            )
+        identity = (
+            entry.get("identity")
+            if isinstance(entry.get("identity"), Mapping)
+            else {}
+        )
+        mismatches = []
+        expected = {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "selected_role": role,
+            "selected_work_type": work_type,
+        }
+        for field, value in expected.items():
+            if value and str(identity.get(field) or "") != str(value):
+                mismatches.append(field)
+        if mismatches:
+            _ONBOARD_GUIDE_CAPSULE_METRICS["fetch_misses"] += 1
+            return {
+                **_onboard_guide_capsule_refresh_response(
+                    project_id=project_id,
+                    reason="guide_capsule_wrong_scope",
+                    entry=(
+                        None
+                        if "project_id" in mismatches
+                        else entry
+                    ),
+                ),
+                "mismatched_fields": mismatches,
+            }
+        _ONBOARD_GUIDE_CAPSULE_METRICS["fetch_hits"] += 1
+        available = sorted(
+            str(name)
+            for name in (
+                entry.get("sections")
+                if isinstance(entry.get("sections"), Mapping)
+                else {}
+            )
+        )
+        requested: list[str] = []
+        for section in sections:
+            name = str(section or "").strip()
+            if name and name not in requested:
+                requested.append(name)
+        if not requested:
+            return {
+                "schema_version": "onboard_route_guide.capsule_sections.v1",
+                "ok": True,
+                "project_id": project_id,
+                "guide_capsule_ref": guide_capsule_ref,
+                "available_sections": available,
+                "max_sections_per_fetch": (
+                    _ONBOARD_GUIDE_CAPSULE_MAX_FETCH_SECTIONS
+                ),
+                "max_serialized_bytes": (
+                    _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+                ),
+                "capsule_cache": {
+                    "hit": True,
+                    "miss": False,
+                    "age_ms": max(
+                        0,
+                        int(
+                            (
+                                now
+                                - float(
+                                    entry.get("created_monotonic") or now
+                                )
+                            )
+                            * 1000
+                        ),
+                    ),
+                    **dict(_ONBOARD_GUIDE_CAPSULE_METRICS),
+                },
+                "authorizes_write": False,
+                "satisfies_gate": False,
+            }
+        if (
+            len(requested) > _ONBOARD_GUIDE_CAPSULE_MAX_FETCH_SECTIONS
+            or any(name not in available for name in requested)
+        ):
+            return {
+                "schema_version": "onboard_route_guide.capsule_sections.v1",
+                "ok": False,
+                "status": "bounded_section_request_rejected",
+                "project_id": project_id,
+                "guide_capsule_ref": guide_capsule_ref,
+                "requested_sections": requested,
+                "available_sections": available,
+                "max_sections_per_fetch": (
+                    _ONBOARD_GUIDE_CAPSULE_MAX_FETCH_SECTIONS
+                ),
+                "authorizes_write": False,
+                "satisfies_gate": False,
+            }
+        stored_sections = entry.get("sections")
+        response = {
+            "schema_version": "onboard_route_guide.capsule_sections.v1",
+            "ok": True,
+            "project_id": project_id,
+            "backlog_id": str(identity.get("backlog_id") or ""),
+            "selected_role": str(identity.get("selected_role") or ""),
+            "selected_work_type": str(
+                identity.get("selected_work_type") or ""
+            ),
+            "guide_capsule_ref": guide_capsule_ref,
+            "sections": {
+                name: stored_sections[name]
+                for name in requested
+            },
+            "available_sections": available,
+            "age_ms": max(
+                0,
+                int(
+                    (
+                        now
+                        - float(entry.get("created_monotonic") or now)
+                    )
+                    * 1000
+                ),
+            ),
+            "capsule_cache": {
+                "hit": True,
+                "miss": False,
+                "age_ms": max(
+                    0,
+                    int(
+                        (
+                            now
+                            - float(entry.get("created_monotonic") or now)
+                        )
+                        * 1000
+                    ),
+                ),
+                **dict(_ONBOARD_GUIDE_CAPSULE_METRICS),
+            },
+            "authorizes_write": False,
+            "satisfies_gate": False,
+            "synthesizes_pass": False,
+        }
+        if (
+            _onboard_guide_capsule_serialized_bytes(response)
+            > _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+        ):
+            return {
+                "schema_version": "onboard_route_guide.capsule_sections.v1",
+                "ok": False,
+                "status": "bounded_section_response_too_large",
+                "project_id": project_id,
+                "guide_capsule_ref": guide_capsule_ref,
+                "requested_sections": requested,
+                "max_serialized_bytes": (
+                    _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+                ),
+                "authorizes_write": False,
+                "satisfies_gate": False,
+            }
+        return response
+
+
+def _onboard_guide_capsule_validate_current_projection(
+    conn,
+    *,
+    project_id: str,
+    guide_capsule_ref: str,
+) -> dict[str, Any] | None:
+    """Lazily enforce exact transition/terminal invalidation on section fetch."""
+
+    with _ONBOARD_GUIDE_CAPSULE_LOCK:
+        matched = next(
+            (
+                (key, entry)
+                for key, entry in _ONBOARD_GUIDE_CAPSULE_CACHE.items()
+                if str(entry.get("guide_capsule_ref") or "")
+                == guide_capsule_ref
+            ),
+            None,
+        )
+        if matched is None:
+            return None
+        key, entry = matched
+        identity = (
+            entry.get("identity")
+            if isinstance(entry.get("identity"), Mapping)
+            else {}
+        )
+        if str(identity.get("project_id") or "") != project_id:
+            return None
+        backlog_id = str(identity.get("backlog_id") or "")
+    if not backlog_id:
+        return None
+    current = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+        route_token_ref="",
+    )
+    if not current:
+        return None
+    mismatches: list[str] = []
+    current_projection_hash = str(current.get("projection_hash") or "").strip()
+    if (
+        current_projection_hash
+        and current_projection_hash
+        != str(identity.get("projection_hash") or "")
+    ):
+        mismatches.append("projection_hash")
+    current_execution_id = str(
+        current.get("current_contract_execution_id")
+        or current.get("contract_execution_id")
+        or ""
+    ).strip()
+    if (
+        current_execution_id
+        and str(identity.get("contract_execution_id") or "")
+        and current_execution_id
+        != str(identity.get("contract_execution_id") or "")
+    ):
+        mismatches.append("contract_execution_id")
+    current_revision = current.get("execution_state_revision")
+    if current_revision not in (None, ""):
+        try:
+            revision_mismatch = int(current_revision) != int(
+                identity.get("execution_state_revision") or 0
+            )
+        except (TypeError, ValueError):
+            revision_mismatch = True
+        if revision_mismatch:
+            mismatches.append("execution_state_revision")
+    if bool(current.get("terminal") is True) != bool(
+        identity.get("terminal") is True
+    ):
+        mismatches.append("terminal")
+    if not mismatches:
+        return None
+    with _ONBOARD_GUIDE_CAPSULE_LOCK:
+        if _ONBOARD_GUIDE_CAPSULE_CACHE.pop(key, None) is not None:
+            _ONBOARD_GUIDE_CAPSULE_METRICS["invalidations"] += 1
+            _ONBOARD_GUIDE_CAPSULE_METRICS["fetch_misses"] += 1
+    return {
+        **_onboard_guide_capsule_refresh_response(
+            project_id=project_id,
+            reason="guide_capsule_stale_runtime_transition",
+            entry=entry,
+        ),
+        "mismatched_fields": mismatches,
+    }
+
+
+def _onboard_route_guide_compact_service_response(
+    *,
+    project_id: str,
+    backlog_id: str,
+    role: str,
+    work_type: str,
+    record: Mapping[str, Any],
+    next_action: Mapping[str, Any],
+    current_projection: Mapping[str, Any],
+    runtime_resume: Mapping[str, Any],
+    target_files: Sequence[str],
+    projection_degraded: bool,
+) -> dict[str, Any]:
+    selected_role = str(role or "").strip() or "observer"
+    selected_work_type = str(work_type or "").strip()
+    selected_role_key = (
+        "worker" if selected_role in {"mf_sub", "worker"} else selected_role
+    )
+    selected_guidance_path = (
+        "agent_onboard_guidance.onboard_route_guide.role_entries."
+        + selected_role_key
+    )
+    identity = _onboard_guide_capsule_scope_identity(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        role=selected_role,
+        work_type=selected_work_type,
+        record=record,
+        next_action=next_action,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+    )
+    action_input, action_input_path = (
+        _onboard_guide_capsule_find_action_input(next_action)
+    )
+    action = str(
+        next_action.get("action")
+        or next_action.get("id")
+        or next_action.get("line_id")
+        or ""
+    ).strip()
+    blocker_ids = _onboard_guide_capsule_blocker_ids(next_action)
+    source_of_authority = str(
+        next_action.get("source_of_authority")
+        or next_action.get("authority_decision_source")
+        or runtime_resume.get("source_of_authority")
+        or current_projection.get("source_of_authority")
+        or next_action.get("source")
+        or ""
+    ).strip()
+    allowed_actions = [
+        str(item)
+        for item in (
+            next_action.get("allowed_actions")
+            if isinstance(next_action.get("allowed_actions"), list)
+            else [action] if action else []
+        )
+        if str(item or "").strip()
+    ][:32]
+    next_action_projection = {
+        key: value
+        for key, value in {
+            "id": str(next_action.get("id") or ""),
+            "action": action,
+            "line_id": str(next_action.get("line_id") or ""),
+            "stage_id": str(next_action.get("stage_id") or ""),
+            "description": str(
+                next_action.get("description")
+                or next_action.get("guide")
+                or next_action.get("reason")
+                or ""
+            )[:1200],
+            "method": str(next_action.get("method") or ""),
+            "path": str(next_action.get("path") or ""),
+            "owner_role": str(
+                next_action.get("owner_role")
+                or next_action.get("required_owner_role")
+                or ""
+            ),
+            "blocker_ids": blocker_ids,
+        }.items()
+        if value not in ("", [], {})
+    }
+    authority = {
+        "source_of_authority": source_of_authority,
+        "contract_execution_id": identity["contract_execution_id"],
+        "execution_state_revision": identity["execution_state_revision"],
+        "projection_hash": identity["projection_hash"],
+        "advisory_only": True,
+        "authorizes_write": False,
+        "satisfies_gate": False,
+        "synthesizes_pass": False,
+    }
+    action_summary = {
+        "action": action,
+        "allowed_actions": allowed_actions,
+        "action_input_path": action_input_path,
+        "action_input_available": bool(action_input),
+        "action_input_keys": sorted(action_input) if action_input else [],
+        "target_files": [str(item) for item in target_files[:64]],
+    }
+
+    def build_sections() -> dict[str, Any]:
+        sections = {
+            "next_action": _onboard_guide_capsule_bounded_section(
+                next_action_projection,
+                section_name="next_action",
+            ),
+            "authority": _onboard_guide_capsule_bounded_section(
+                authority,
+                section_name="authority",
+            ),
+            "action_input": _onboard_guide_capsule_bounded_section(
+                {
+                    "source_path": action_input_path,
+                    "body": action_input,
+                    "allowed_action_summary": action_summary,
+                },
+                section_name="action_input",
+            ),
+            "role_guidance": _onboard_guide_capsule_bounded_section(
+                {
+                    "selected_role": selected_role,
+                    "selected_work_type": selected_work_type,
+                    "selected_guidance_json_path": selected_guidance_path,
+                    "required_sequence": [
+                        "read_compact_onboard_route_guide",
+                        "fetch_only_named_bounded_sections_when_needed",
+                        "execute_only_the_current_source_backed_next_action",
+                        "refresh_after_every_runtime_transition",
+                    ],
+                    "source_fallback": (
+                        "refresh compact onboard_route_guide; do not grep guide "
+                        "text or read implementation source to reconstruct inputs"
+                    ),
+                },
+                section_name="role_guidance",
+            ),
+            "runtime_identity": _onboard_guide_capsule_bounded_section(
+                identity,
+                section_name="runtime_identity",
+            ),
+            "blockers": _onboard_guide_capsule_bounded_section(
+                {"blocker_ids": blocker_ids},
+                section_name="blockers",
+            ),
+        }
+        return sections
+
+    entry, cache_metrics = _onboard_guide_capsule_get_or_create(
+        identity,
+        build_sections,
+    )
+    response = {
+        "schema_version": _ONBOARD_GUIDE_COMPACT_SCHEMA_VERSION,
+        "ok": True,
+        "response_view": "compact",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "selected_role": selected_role,
+        "selected_work_type": selected_work_type,
+        "selected_guidance_json_path": selected_guidance_path,
+        "next_legal_action": next_action_projection,
+        "source_of_authority": source_of_authority,
+        "contract_execution_id": identity["contract_execution_id"],
+        "execution_state_revision": identity["execution_state_revision"],
+        "projection_hash": identity["projection_hash"],
+        "action_input": action_input,
+        "action_input_path": action_input_path,
+        "allowed_action_summary": action_summary,
+        "guide_capsule_ref": entry["guide_capsule_ref"],
+        "guide_capsule": {
+            "schema_version": _ONBOARD_GUIDE_CAPSULE_SCHEMA_VERSION,
+            "guide_capsule_ref": entry["guide_capsule_ref"],
+            "available_sections": sorted(entry["sections"]),
+            "section_fetch": {
+                "http_method": "POST",
+                "http_path": (
+                    "/api/projects/{project_id}/onboard-route-guide/capsule"
+                ),
+                "mcp_tool": "onboard_route_guide_section_fetch",
+                "required_fields": ["project_id", "guide_capsule_ref", "sections"],
+                "max_sections_per_fetch": (
+                    _ONBOARD_GUIDE_CAPSULE_MAX_FETCH_SECTIONS
+                ),
+                "max_serialized_bytes": (
+                    _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+                ),
+            },
+            "advisory_only": True,
+            "authorizes_write": False,
+            "satisfies_gate": False,
+            "synthesizes_pass": False,
+        },
+        "capsule_cache": {
+            **cache_metrics,
+            "scope_isolated_by": [
+                "project_id",
+                "backlog_id",
+                "selected_role",
+                "selected_work_type",
+                "contract_execution_id",
+                "execution_state_revision",
+                "projection_hash",
+            ],
+            "ttl_seconds": _ONBOARD_GUIDE_CAPSULE_TTL_SECONDS,
+            "max_entries": _ONBOARD_GUIDE_CAPSULE_MAX_ENTRIES,
+            "single_flight": True,
+        },
+        "projection_degraded": projection_degraded,
+        "max_serialized_bytes": (
+            _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+        ),
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "advisory_only": True,
+        "authorizes_write": False,
+        "satisfies_gate": False,
+        "synthesizes_pass": False,
+    }
+    measured = _onboard_guide_capsule_serialized_bytes(response)
+    response["serialized_bytes"] = measured
+    if (
+        _onboard_guide_capsule_serialized_bytes(response)
+        <= _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+    ):
+        return response
+    return {
+        "schema_version": _ONBOARD_GUIDE_COMPACT_SCHEMA_VERSION,
+        "ok": False,
+        "response_view": "compact",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "selected_role": selected_role,
+        "selected_work_type": selected_work_type,
+        "guide_capsule_ref": entry["guide_capsule_ref"],
+        "status": "compact_response_size_exceeded",
+        "max_serialized_bytes": _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES,
+        "advisory_only": True,
+        "authorizes_write": False,
+        "satisfies_gate": False,
+        "synthesizes_pass": False,
+    }
+
+
 def _qa_onboard_compact_selected_role_response(
     response: dict[str, Any],
 ) -> dict[str, Any]:
@@ -80541,6 +81666,7 @@ def _onboard_route_guide_service_response(
     route_token_ref: str = "",
     role: str = "",
     work_type: str = "",
+    response_view: str = "",
 ) -> dict[str, Any]:
     from .parallel_branch_runtime import (
         get_active_integration_epoch,
@@ -80556,6 +81682,23 @@ def _onboard_route_guide_service_response(
             or active_epoch.coordination_backlog_id
             or backlog_id
         ).strip()
+        if response_view == "compact":
+            return _onboard_route_guide_compact_service_response(
+                project_id=project_id,
+                backlog_id=canonical_backlog_id,
+                role=role,
+                work_type=work_type,
+                record={
+                    "contract_execution_id": str(
+                        resume.get("contract_execution_id") or ""
+                    )
+                },
+                next_action=resume,
+                current_projection={},
+                runtime_resume=resume,
+                target_files=[],
+                projection_degraded=False,
+            )
         return {
             "schema_version": "onboard_route_guide.integration_epoch_resume.v1",
             "ok": True,
@@ -80844,6 +81987,19 @@ def _onboard_route_guide_service_response(
             and not _onboard_service_record(candidate)
         ):
             qa_runtime_record = candidate
+    if response_view == "compact":
+        return _onboard_route_guide_compact_service_response(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            role=role,
+            work_type=work_type,
+            record=record,
+            next_action=next_action,
+            current_projection=current_projection,
+            runtime_resume=runtime_resume,
+            target_files=target_files,
+            projection_degraded=projection_degraded,
+        )
     guidance = _onboard_contract_agent_guidance(
         record,
         next_legal_action=next_action,
@@ -80941,6 +82097,9 @@ def _onboard_route_guide_service_response(
         response["bypass_recovery_fallback"] = dict(
             bypass_recovery_fallback
         )
+    if response_view == "full":
+        response["response_view"] = "full"
+        return response
     return _qa_onboard_compact_selected_role_response(response)
 
 
@@ -87852,6 +89011,10 @@ def _contract_runtime_close_gate(
             422,
             diagnostics,
         )
+    _onboard_guide_capsule_invalidate_contract_runtime_transition(
+        project_id=project_id,
+        result=result,
+    )
     updated = result.get("record") if isinstance(result.get("record"), Mapping) else {}
     guide = updated.get("runtime_guide") if isinstance(updated.get("runtime_guide"), Mapping) else {}
     current_state = _runtime_current_state_from_record(updated) if updated else {}
@@ -107074,6 +108237,19 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
     """Return the role/work-type onboard guide service without starting legacy root contract."""
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    response_view = str(
+        body.get("response_view")
+        or _first_query_value(ctx.query, "response_view")
+        or ""
+    ).strip().lower()
+    if response_view not in {"", "compact", "full"}:
+        raise ValidationError(
+            "onboard route guide response_view must be compact or full",
+            {
+                "response_view": response_view,
+                "allowed_response_views": ["compact", "full"],
+            },
+        )
     role = str(
         body.get("role")
         or body.get("actor_role")
@@ -107114,14 +108290,37 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
                 route_token_ref=route_token_ref,
                 role=role,
                 work_type=work_type,
+                response_view=response_view,
             )
         if not backlog_id and work_type and work_type in _ONBOARD_NO_BACKLOG_WORK_TYPES:
-            return _onboard_no_backlog_service_response(
+            response = _onboard_no_backlog_service_response(
                 project_id=project_id,
                 role=role,
                 work_type=work_type,
                 route_token_ref=route_token_ref,
             )
+            if response_view == "compact":
+                return _onboard_route_guide_compact_service_response(
+                    project_id=project_id,
+                    backlog_id="",
+                    role=role,
+                    work_type=work_type,
+                    record={},
+                    next_action=(
+                        response.get("next_legal_action")
+                        if isinstance(
+                            response.get("next_legal_action"), Mapping
+                        )
+                        else {}
+                    ),
+                    current_projection={},
+                    runtime_resume={},
+                    target_files=[],
+                    projection_degraded=False,
+                )
+            if response_view == "full":
+                response["response_view"] = "full"
+            return response
         if not backlog_id:
             queue_view = _release_operator_head_queue_view(conn, project_id)
             backlog_id = str(
@@ -107153,15 +108352,86 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
             route_token_ref=route_token_ref,
             role=role,
             work_type=work_type,
+            response_view=response_view,
         )
     if queue_view:
         selection = dict(queue_view.get("selection") or {})
-        response["release_operator_head_queue_selection"] = selection
+        response["release_operator_head_queue_selection"] = (
+            {
+                "selected_backlog_id": str(
+                    selection.get("selected_backlog_id") or ""
+                ),
+                "selection_source": str(
+                    selection.get("selection_source") or ""
+                ),
+            }
+            if response_view == "compact"
+            else selection
+        )
         response["selected_backlog_source"] = selection.get("selection_source")
         route_guide = response.get("onboard_route_guide")
         if isinstance(route_guide, dict):
             route_guide["release_operator_head_queue_selection"] = selection
     return response
+
+
+@route("GET", "/api/projects/{project_id}/onboard-route-guide/capsule")
+@route("POST", "/api/projects/{project_id}/onboard-route-guide/capsule")
+def handle_project_onboard_route_guide_capsule(ctx: RequestContext):
+    """Fetch named bounded sections from an advisory guide capsule."""
+
+    project_id = ctx.get_project_id()
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    guide_capsule_ref = str(
+        body.get("guide_capsule_ref")
+        or _first_query_value(ctx.query, "guide_capsule_ref")
+        or ""
+    ).strip()
+    if not guide_capsule_ref:
+        raise ValidationError("guide_capsule_ref is required")
+    raw_sections = body.get("sections")
+    if not isinstance(raw_sections, list):
+        raw_sections = [
+            item
+            for item in str(
+                _first_query_value(ctx.query, "sections") or ""
+            ).split(",")
+            if item
+        ]
+    with DBContext(project_id) as conn:
+        stale = _onboard_guide_capsule_validate_current_projection(
+            conn,
+            project_id=project_id,
+            guide_capsule_ref=guide_capsule_ref,
+        )
+    if stale is not None:
+        return stale
+    return _onboard_guide_capsule_fetch(
+        project_id=project_id,
+        guide_capsule_ref=guide_capsule_ref,
+        sections=[str(item) for item in raw_sections],
+        backlog_id=str(
+            body.get("backlog_id")
+            or body.get("bug_id")
+            or _first_query_value(ctx.query, "backlog_id")
+            or _first_query_value(ctx.query, "bug_id")
+            or ""
+        ).strip(),
+        role=str(
+            body.get("role")
+            or body.get("actor_role")
+            or _first_query_value(ctx.query, "role")
+            or _first_query_value(ctx.query, "actor_role")
+            or ""
+        ).strip(),
+        work_type=str(
+            body.get("work_type")
+            or body.get("requested_work_type")
+            or _first_query_value(ctx.query, "work_type")
+            or _first_query_value(ctx.query, "requested_work_type")
+            or ""
+        ).strip(),
+    )
 
 
 @route("GET", "/api/projects/{project_id}/contract-chain-current")
@@ -108701,6 +109971,10 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
                 **common,
             ))
 
+    _onboard_guide_capsule_invalidate_contract_runtime_transition(
+        project_id=project_id,
+        result=result,
+    )
     response = {
         "schema_version": "contract_runtime.line_bypass_response.v1",
         "ok": True,

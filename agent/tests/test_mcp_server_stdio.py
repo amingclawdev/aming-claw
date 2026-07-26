@@ -12,6 +12,7 @@ import pytest
 
 from agent.governance import mcp_server as governance_mcp_server
 from agent.mcp import server as plugin_mcp_server
+from agent.mcp import tools as runtime_mcp_tool_module
 from agent.mcp.server import AmingClawMCP
 from agent.mcp.schema_contract import MCP_TOOL_SCHEMA_VERSION
 from agent.mcp.tools import TOOLS as runtime_mcp_tools
@@ -170,6 +171,41 @@ def test_mcp_stdio_serializes_qa_onboard_compact_selected_role_under_limit(
     content_text = messages[0]["result"]["content"][0]["text"]
     assert json.loads(content_text) == compact_payload
     assert len(content_text) <= 64000
+
+
+def test_both_mcp_adapters_expose_compact_onboard_capsule_contract():
+    adapters = (
+        (governance_mcp_server.TOOLS, governance_mcp_server._onboard_route_guide_body),
+        (runtime_mcp_tools, runtime_mcp_tool_module._onboard_route_guide_body),
+    )
+    for tools, body_builder in adapters:
+        onboard = next(
+            tool for tool in tools if tool.get("name") == "onboard_route_guide"
+        )
+        response_view = onboard["inputSchema"]["properties"]["response_view"]
+        assert response_view["enum"] == ["compact", "full"]
+        assert response_view["default"] == "compact"
+        assert body_builder(
+            {
+                "project_id": "aming-claw",
+                "backlog_id": "AC-MCP-CAPSULE",
+            }
+        ) == {
+            "backlog_id": "AC-MCP-CAPSULE",
+            "response_view": "compact",
+        }
+        section = next(
+            tool
+            for tool in tools
+            if tool.get("name") == "onboard_route_guide_section_fetch"
+        )
+        section_schema = section["inputSchema"]
+        assert section_schema["properties"]["sections"]["maxItems"] == 3
+        assert {
+            "project_id",
+            "guide_capsule_ref",
+            "sections",
+        } == set(section_schema["required"])
 
 
 def test_worker_mcp_hides_and_rejects_host_only_auth_tools():
