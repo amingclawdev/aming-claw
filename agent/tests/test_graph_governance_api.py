@@ -20188,8 +20188,9 @@ def test_parallel_branch_finish_gate_records_validated_checkpoint(conn):
     )
 
     finished = server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx(
+        _ctx_with_role(
             {"project_id": PID},
+            "mf_sub",
             method="POST",
             body={
                 "project_id": PID,
@@ -20550,6 +20551,64 @@ def test_parallel_branch_finish_gate_rejects_genuine_observer_session(conn):
     ) == []
 
 
+def test_parallel_branch_finish_gate_rejects_observer_without_runtime_context_id(
+    conn,
+):
+    task_id = "finish-gate-observer-omits-runtime-context"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            backlog_id="AC-FINISH-GATE-OBSERVER-OMITS-RUNTIME-CONTEXT",
+            branch_ref=(
+                "refs/heads/codex/finish-gate-observer-omits-runtime-context"
+            ),
+            status="worktree_ready",
+            fence_token="fence-finish-gate-observer-omits-runtime-context",
+            worktree_path=(
+                "/tmp/nonexistent-finish-gate-observer-omits-runtime-context"
+            ),
+            base_commit="base-finish-gate-observer-omits-runtime-context",
+            head_commit="base-finish-gate-observer-omits-runtime-context",
+            target_head_commit=(
+                "target-finish-gate-observer-omits-runtime-context"
+            ),
+            merge_queue_id=(
+                "mergeq-finish-gate-observer-omits-runtime-context"
+            ),
+        ),
+        now_iso="2026-07-26T10:02:00Z",
+    )
+    conn.commit()
+
+    with pytest.raises(PermissionDeniedError):
+        server.handle_graph_governance_parallel_branch_finish_gate(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "project_id": PID,
+                    "task_id": task_id,
+                    "fence_token": (
+                        "fence-finish-gate-observer-omits-runtime-context"
+                    ),
+                    "worker_session_id": (
+                        "/root/observer_merge_root_scope_worker_r1"
+                    ),
+                },
+            )
+        )
+
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=task_id,
+        event_kind="mf_subagent_finish_gate",
+    ) == []
+
+
 def test_finish_gate_derives_parent_route_lineage_and_reads_worker_progress_attestation(conn):
     task_id = "finish-dogfood-attestation-task"
     parent_task_id = "finish-dogfood-parent"
@@ -20819,8 +20878,9 @@ def test_finish_gate_missing_status_returns_contract_error_repair_payload(conn):
     )
 
     status, payload = server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx(
+        _ctx_with_role(
             {"project_id": PID},
+            "mf_sub",
             method="POST",
             body={
                 "project_id": PID,
@@ -22438,8 +22498,9 @@ def test_parallel_branch_finish_gate_validates_worktree_changed_files(conn, tmp_
 
     with pytest.raises(ValidationError, match="changed_files do not match assigned worktree diff"):
         server.handle_graph_governance_parallel_branch_finish_gate(
-            _ctx(
+            _ctx_with_role(
                 {"project_id": PID},
+                "mf_sub",
                 method="POST",
                 body={
                     "task_id": "finish-diff-task",
@@ -22461,8 +22522,9 @@ def test_parallel_branch_finish_gate_validates_worktree_changed_files(conn, tmp_
         )
 
     finished = server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx(
+        _ctx_with_role(
             {"project_id": PID},
+            "mf_sub",
             method="POST",
             body={
                 "task_id": "finish-diff-task",
@@ -22533,8 +22595,9 @@ def test_mf_sub_merge_queue_requires_finish_gate_checkpoint(conn):
         )
 
     server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx(
+        _ctx_with_role(
             {"project_id": PID},
+            "mf_sub",
             method="POST",
             body={
                 "task_id": "mf-sub-queue-task",
@@ -22605,8 +22668,9 @@ def test_mf_sub_merge_queue_accepts_route_gate_finish_checkpoint_without_raw_fen
     )
 
     server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx(
+        _ctx_with_role(
             {"project_id": PID},
+            "mf_sub",
             method="POST",
             body={
                 "task_id": "mf-sub-route-checkpoint-task",
@@ -22701,8 +22765,9 @@ def test_mf_sub_merge_queue_normalizes_ready_for_merge_alias_after_finish_checkp
     )
 
     server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx(
+        _ctx_with_role(
             {"project_id": PID},
+            "mf_sub",
             method="POST",
             body={
                 "task_id": task_id,
@@ -83579,7 +83644,7 @@ def test_finish_gate_server_ignores_caller_supplied_real_startup_events(conn):
 
     # Must be refused because DB has no real startup; caller-supplied events ignored.
     status, payload = server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx({"project_id": PID}, method="POST", body=body)
+        _ctx_with_role({"project_id": PID}, "mf_sub", method="POST", body=body)
     )
     assert status == 422
     assert payload["ok"] is False
@@ -83656,7 +83721,7 @@ def test_finish_gate_server_accepts_db_sourced_real_startup_events(conn):
     )
 
     result = server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx({"project_id": PID}, method="POST", body=body)
+        _ctx_with_role({"project_id": PID}, "mf_sub", method="POST", body=body)
     )
     assert result["ok"] is True, f"Expected ok=True but got: {result}"
     # The gate should not flag caller-supplied events ignored (none were supplied).
@@ -84017,7 +84082,7 @@ def test_finish_gate_db_graph_trace_evidence_carries_fence_token(conn):
     )
 
     result = server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx({"project_id": PID}, method="POST", body=body)
+        _ctx_with_role({"project_id": PID}, "mf_sub", method="POST", body=body)
     )
 
     graph_trace = result["gate"]["graph_trace_evidence"]
@@ -84125,7 +84190,7 @@ def test_finish_gate_explicit_worker_trace_ignores_same_task_qa_trace(conn):
     )
 
     result = server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx({"project_id": PID}, method="POST", body=body)
+        _ctx_with_role({"project_id": PID}, "mf_sub", method="POST", body=body)
     )
 
     graph_trace = result["gate"]["graph_trace_evidence"]
@@ -84265,7 +84330,7 @@ def test_finish_gate_derives_parent_lineage_from_runtime_contract_route_ref(conn
     assert "parent_route_lineage" not in body
 
     result = server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx({"project_id": PID}, method="POST", body=body)
+        _ctx_with_role({"project_id": PID}, "mf_sub", method="POST", body=body)
     )
 
     assert result["ok"] is True
@@ -84314,7 +84379,7 @@ def test_finish_gate_missing_parent_lineage_returns_actionable_repair(conn):
     body["parent_route_required"] = True
 
     status, payload = server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx({"project_id": PID}, method="POST", body=body)
+        _ctx_with_role({"project_id": PID}, "mf_sub", method="POST", body=body)
     )
 
     assert status == 422
@@ -84392,7 +84457,7 @@ def test_finish_gate_server_flags_caller_supplied_ignored(conn):
     )
 
     result = server.handle_graph_governance_parallel_branch_finish_gate(
-        _ctx({"project_id": PID}, method="POST", body=body)
+        _ctx_with_role({"project_id": PID}, "mf_sub", method="POST", body=body)
     )
     assert result["ok"] is True
     # Transparency flag must be present since caller did supply the key.

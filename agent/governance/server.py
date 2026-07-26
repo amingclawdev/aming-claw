@@ -37066,10 +37066,7 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
         authenticated_worker_role = str(
             authenticated_worker_session.get("role") or ""
         ).strip().lower()
-        if (
-            str(ctx.body.get("runtime_context_id") or "").strip()
-            and authenticated_worker_role != "mf_sub"
-        ):
+        if authenticated_worker_role != "mf_sub":
             raise PermissionDeniedError(
                 authenticated_worker_role,
                 finish_gate_action,
