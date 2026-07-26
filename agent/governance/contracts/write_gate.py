@@ -567,6 +567,12 @@ def _validate_bounded_qa_graph_context(
         evidence.get("candidate_diff_hash") or ""
     ).strip().lower()
     changed_files_source = str(evidence.get("changed_files_source") or "").strip()
+    comparison_base_commit_sha = str(
+        evidence.get("comparison_base_commit_sha") or ""
+    ).strip().lower()
+    comparison_base_commit_source = str(
+        evidence.get("comparison_base_commit_source") or ""
+    ).strip()
 
     errors.extend(
         bounded_qa_graph_decision_errors(
@@ -601,14 +607,53 @@ def _validate_bounded_qa_graph_context(
             errors.append(
                 f"{line_id} exact candidate basis requires matching commits"
             )
-        if isinstance(changed_files, list) and changed_files:
-            errors.append(
-                f"{line_id} exact candidate basis requires empty changed_files"
-            )
-        if candidate_diff_hash != empty_diff_hash:
-            errors.append(
-                f"{line_id} exact candidate basis requires the empty diff hash"
-            )
+        comparison_diff_source = (
+            "server_runtime_context_base_to_exact_candidate_diff"
+        )
+        comparison_base_source = (
+            "ContractRuntime.completed_lines.worker_commit+"
+            "parallel_branch_runtime_context.base_commit"
+        )
+        comparison_authority_present = bool(
+            comparison_base_commit_sha
+            or comparison_base_commit_source
+            or changed_files_source == comparison_diff_source
+        )
+        if comparison_authority_present:
+            if not _is_full_commit(comparison_base_commit_sha):
+                errors.append(
+                    f"{line_id} exact candidate comparison basis requires full "
+                    "comparison_base_commit_sha"
+                )
+            elif comparison_base_commit_sha == candidate_commit_sha:
+                errors.append(
+                    f"{line_id} exact candidate comparison basis requires "
+                    "distinct comparison base and candidate commits"
+                )
+            if comparison_base_commit_source != comparison_base_source:
+                errors.append(
+                    f"{line_id} exact candidate comparison basis requires "
+                    f"comparison_base_commit_source={comparison_base_source}"
+                )
+            if changed_files_source != comparison_diff_source:
+                errors.append(
+                    f"{line_id} exact candidate comparison basis requires "
+                    f"changed_files_source={comparison_diff_source}"
+                )
+        else:
+            if changed_files_source != "server_exact_candidate_snapshot":
+                errors.append(
+                    f"{line_id} exact candidate basis requires "
+                    "changed_files_source=server_exact_candidate_snapshot"
+                )
+            if isinstance(changed_files, list) and changed_files:
+                errors.append(
+                    f"{line_id} exact candidate basis requires empty changed_files"
+                )
+            if candidate_diff_hash != empty_diff_hash:
+                errors.append(
+                    f"{line_id} exact candidate basis requires the empty diff hash"
+                )
         for field in policy.get("exact_candidate_required_hash_fields") or ():
             value = str(evidence.get(field) or "").strip().lower()
             if not _is_sha256(value):

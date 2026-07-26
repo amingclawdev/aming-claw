@@ -1509,6 +1509,149 @@ def test_mf_parallel_v2_graph_context_gates_worker_and_qa(tmp_path):
     runtime.current_guide(record["contract_execution_id"], actor_role="qa")
     qa_record = runtime.store.get(record["contract_execution_id"])
 
+    forged_exact_source_payload = _direct_fix_graph_payload(
+        actor_role="qa",
+        trace_id="gqt-mf-parallel-v2-qa-forged-exact-source",
+        backlog_id="AC-MF-PARALLEL-V2-GRAPH-GATE",
+        task_id="mf-parallel-v2-worker",
+    )
+    forged_exact_source_payload["graph_trace_evidence"][
+        "changed_files_source"
+    ] = "server_forged_exact_candidate_snapshot"
+    forged_exact_source = runtime.submit_line_write(
+        record["contract_execution_id"],
+        {
+            **_write_from(
+                qa_record,
+                actor_role="qa",
+                stage_id="qa_graph_context",
+                line_id="qa_graph_context",
+                evidence_kind="graph_trace",
+            ),
+            "payload": forged_exact_source_payload,
+        },
+        actor_role="qa",
+    )
+    assert forged_exact_source["ok"] is False
+    assert any(
+        "requires changed_files_source=server_exact_candidate_snapshot" in error
+        for error in forged_exact_source["decision"]["errors"]
+    )
+    runtime.current_guide(record["contract_execution_id"], actor_role="qa")
+    qa_record = runtime.store.get(record["contract_execution_id"])
+
+    comparison_qa_payload = _direct_fix_graph_payload(
+        actor_role="qa",
+        trace_id="gqt-mf-parallel-v2-qa-comparison",
+        backlog_id="AC-MF-PARALLEL-V2-GRAPH-GATE",
+        task_id="mf-parallel-v2-worker",
+    )
+    comparison_authority = comparison_qa_payload["graph_trace_evidence"]
+    comparison_authority.update(
+        {
+            "changed_files": ["agent/governance/contracts/write_gate.py"],
+            "candidate_diff_hash": (
+                "sha256:" + hashlib.sha256(b"canonical-comparison-diff").hexdigest()
+            ),
+            "changed_files_source": (
+                "server_runtime_context_base_to_exact_candidate_diff"
+            ),
+            "comparison_base_commit_sha": "b" * 40,
+            "comparison_base_commit_source": (
+                "ContractRuntime.completed_lines.worker_commit+"
+                "parallel_branch_runtime_context.base_commit"
+            ),
+        }
+    )
+
+    incomplete_comparison_payload = json.loads(
+        json.dumps(comparison_qa_payload)
+    )
+    incomplete_comparison_payload["graph_trace_evidence"].pop(
+        "comparison_base_commit_source"
+    )
+    incomplete_comparison = runtime.submit_line_write(
+        record["contract_execution_id"],
+        {
+            **_write_from(
+                qa_record,
+                actor_role="qa",
+                stage_id="qa_graph_context",
+                line_id="qa_graph_context",
+                evidence_kind="graph_trace",
+            ),
+            "payload": incomplete_comparison_payload,
+        },
+        actor_role="qa",
+    )
+    assert incomplete_comparison["ok"] is False
+    assert any(
+        "requires comparison_base_commit_source=" in error
+        for error in incomplete_comparison["decision"]["errors"]
+    )
+    runtime.current_guide(record["contract_execution_id"], actor_role="qa")
+    qa_record = runtime.store.get(record["contract_execution_id"])
+
+    same_commit_comparison_payload = json.loads(
+        json.dumps(comparison_qa_payload)
+    )
+    same_commit_authority = same_commit_comparison_payload[
+        "graph_trace_evidence"
+    ]
+    same_commit_authority["comparison_base_commit_sha"] = (
+        same_commit_authority["candidate_commit_sha"]
+    )
+    same_commit_comparison = runtime.submit_line_write(
+        record["contract_execution_id"],
+        {
+            **_write_from(
+                qa_record,
+                actor_role="qa",
+                stage_id="qa_graph_context",
+                line_id="qa_graph_context",
+                evidence_kind="graph_trace",
+            ),
+            "payload": same_commit_comparison_payload,
+        },
+        actor_role="qa",
+    )
+    assert same_commit_comparison["ok"] is False
+    assert any(
+        "requires distinct comparison base and candidate commits" in error
+        for error in same_commit_comparison["decision"]["errors"]
+    )
+    runtime.current_guide(record["contract_execution_id"], actor_role="qa")
+    qa_record = runtime.store.get(record["contract_execution_id"])
+
+    forged_source_comparison_payload = json.loads(
+        json.dumps(comparison_qa_payload)
+    )
+    forged_source_comparison_payload["graph_trace_evidence"][
+        "changed_files_source"
+    ] = "server_forged_comparison_diff"
+    forged_source_comparison = runtime.submit_line_write(
+        record["contract_execution_id"],
+        {
+            **_write_from(
+                qa_record,
+                actor_role="qa",
+                stage_id="qa_graph_context",
+                line_id="qa_graph_context",
+                evidence_kind="graph_trace",
+            ),
+            "payload": forged_source_comparison_payload,
+        },
+        actor_role="qa",
+    )
+    assert forged_source_comparison["ok"] is False
+    assert any(
+        "requires changed_files_source="
+        "server_runtime_context_base_to_exact_candidate_diff" in error
+        for error in forged_source_comparison["decision"]["errors"]
+    )
+    runtime.current_guide(record["contract_execution_id"], actor_role="qa")
+    qa_record = runtime.store.get(record["contract_execution_id"])
+
     qa_graph = runtime.submit_line_write(
         record["contract_execution_id"],
         {
@@ -1519,12 +1662,7 @@ def test_mf_parallel_v2_graph_context_gates_worker_and_qa(tmp_path):
                 line_id="qa_graph_context",
                 evidence_kind="graph_trace",
             ),
-            "payload": _direct_fix_graph_payload(
-                actor_role="qa",
-                trace_id="gqt-mf-parallel-v2-qa",
-                backlog_id="AC-MF-PARALLEL-V2-GRAPH-GATE",
-                task_id="mf-parallel-v2-worker",
-            ),
+            "payload": comparison_qa_payload,
         },
         actor_role="qa",
     )
