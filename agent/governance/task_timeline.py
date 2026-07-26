@@ -9236,11 +9236,47 @@ def _observer_direct_server_gate_shape(event: dict[str, Any]) -> dict[str, Any]:
         == str(event.get(field) or "").strip()
         for field in scope_fields
     )
+    server_route_id = str(route_gate.get("route_id") or "").strip()
+    server_route_context_hash = str(
+        route_gate.get("route_context_hash") or ""
+    ).strip()
+    direct_event_containers = (
+        _mapping(event),
+        _mapping(event.get("payload")),
+        _mapping(event.get("verification")),
+        _mapping(event.get("artifact_refs")),
+    )
+    declared_route_ids = _dedupe_nonempty(
+        [
+            str(container.get("route_id") or "").strip()
+            for container in direct_event_containers
+        ]
+    )
+    declared_route_context_hashes = _dedupe_nonempty(
+        [
+            str(container.get("route_context_hash") or "").strip()
+            for container in direct_event_containers
+        ]
+    )
+    declared_route_identity_matches_server = bool(
+        server_route_id and server_route_context_hash
+    ) and all(
+        route_id == server_route_id for route_id in declared_route_ids
+    ) and all(
+        route_context_hash == server_route_context_hash
+        for route_context_hash in declared_route_context_hashes
+    )
     checks = {
         "source_backed_authority": bool(authority),
         "route_gate_accepted": _source_backed_route_gate_accepted(route_gate),
         "route_gate_action": str(route_gate.get("action") or "").strip()
         == "task_timeline_append",
+        "server_route_identity": bool(
+            server_route_id and server_route_context_hash
+        ),
+        "declared_route_identity_matches_server": (
+            declared_route_identity_matches_server
+        ),
         "event_type": event_type
         in {
             "observer_direct_mutation_exception",
@@ -9262,6 +9298,16 @@ def _observer_direct_server_gate_shape(event: dict[str, Any]) -> dict[str, Any]:
         "status": "accepted" if accepted else "rejected",
         "checks": checks,
         "scope_mismatches": scope_mismatches,
+        "route_identity": {
+            "server": {
+                "route_id": server_route_id,
+                "route_context_hash": server_route_context_hash,
+            },
+            "declared": {
+                "route_ids": declared_route_ids,
+                "route_context_hashes": declared_route_context_hashes,
+            },
+        },
         "reason_source": (
             "server_accepted_operator_supervised_direct_main_decision"
             if accepted

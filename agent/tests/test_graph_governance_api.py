@@ -43822,6 +43822,7 @@ def _canonical_parentless_direct_main_pre_mutation_body(
     ("missing_case", "missing_requirement_id"),
     [
         ("source_backed_route_gate", "source_backed_server_route_gate_shape"),
+        ("route_identity_mismatch", "source_backed_server_route_gate_shape"),
         ("reason", "explicit_reason"),
         ("observer_direct_mutation", "observer_direct_mutation=true"),
         ("tiny_deterministic_scope", "tiny_deterministic_scope=true"),
@@ -43902,6 +43903,9 @@ def test_parentless_direct_main_pre_mutation_authority_schema_rejects_each_missi
 
     if missing_case == "source_backed_route_gate":
         event["payload"].pop("source_backed_contract_gate_authority")
+    elif missing_case == "route_identity_mismatch":
+        event["payload"]["route_id"] = "route-forged"
+        event["payload"]["route_context_hash"] = _fake_sha("route-forged")
     elif missing_case == "reason":
         event["payload"].pop("reason")
     elif missing_case == "observer_direct_mutation":
@@ -43933,6 +43937,22 @@ def test_parentless_direct_main_pre_mutation_authority_schema_rejects_each_missi
     assert gate["accepted"] is False
     assert missing_requirement_id in gate["missing_requirement_ids"]
     assert gate["historical_backfill_allowed"] is False
+    if missing_case == "route_identity_mismatch":
+        server_shape = gate["server_gate_shape"]
+        assert (
+            server_shape["checks"][
+                "declared_route_identity_matches_server"
+            ]
+            is False
+        )
+        assert server_shape["route_identity"]["server"] == {
+            "route_id": route_id,
+            "route_context_hash": route_context_hash,
+        }
+        assert server_shape["route_identity"]["declared"] == {
+            "route_ids": ["route-forged"],
+            "route_context_hashes": [_fake_sha("route-forged")],
+        }
 
 
 def _insert_source_backed_onboarding_backlog(conn, backlog_id: str) -> None:
@@ -49852,6 +49872,35 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
             method="POST",
             body=pre_mutation_arguments,
         )
+    )
+    forged_close_event = copy.deepcopy(pre_mutation_result)
+    forged_close_event["payload"]["route_id"] = "route-forged-after-append"
+    forged_close_event["payload"]["route_context_hash"] = _fake_sha(
+        "route-forged-after-append"
+    )
+    forged_close_gate = (
+        server._contract_runtime_parentless_direct_main_close_authority_gate(
+            conn=conn,
+            project_id=PID,
+            bug_id=backlog_id,
+            requested_execution_id=parent_execution_id,
+            close_commit=close_commit,
+            timeline_events=[forged_close_event],
+            row_declared_files=template["allowed_files"],
+        )
+    )
+    assert forged_close_gate["accepted"] is False
+    assert forged_close_gate["missing_requirement_ids"] == [
+        "source_backed_server_route_gate_shape"
+    ]
+    rejected_route_shape = forged_close_gate["checks"][
+        "rejected_observer_direct_exceptions"
+    ][0]["server_gate_shape"]
+    assert (
+        rejected_route_shape["checks"][
+            "declared_route_identity_matches_server"
+        ]
+        is False
     )
     accepted_exception = task_timeline._observer_direct_exception_event(
         pre_mutation_result,
