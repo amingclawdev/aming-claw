@@ -7571,18 +7571,52 @@ def _qa_demo_control_marker_is_server_generated(
     }
     if set(payload) != expected_keys:
         return False
+    reviewed_project_id = str(project_id or "").strip()
+    owner_project_id = str(payload.get("owner_project_id") or "").strip()
+    if (
+        not reviewed_project_id
+        or not owner_project_id
+        or str(payload.get("project_id") or "").strip() != reviewed_project_id
+        or not project_service.project_exists(owner_project_id)
+    ):
+        return False
     expected = {
         "schema_version": "demo_environment_marker.v1",
         "managed_by": DEMO_ENVIRONMENT_MANAGED_BY,
-        "owner_project_id": project_id,
+        "project_id": reviewed_project_id,
         "fixture_root": str(query_root.resolve()),
     }
     if any(str(payload.get(key) or "") != value for key, value in expected.items()):
         return False
-    return all(
+    if not all(
         str(payload.get(key) or "").strip()
         for key in ("environment_id", "template_id", "project_id", "created_at")
-    )
+    ):
+        return False
+    marker_registry_identity = {
+        "id": str(payload.get("environment_id") or ""),
+        "template_id": str(payload.get("template_id") or ""),
+        "project_id": reviewed_project_id,
+        "fixture_root": str(query_root.resolve()),
+        "created_at": str(payload.get("created_at") or ""),
+    }
+    try:
+        registry_rows = _read_demo_environment_registry(owner_project_id)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    for row in registry_rows:
+        if any(
+            str(row.get(key) or "") != value
+            for key, value in marker_registry_identity.items()
+        ):
+            continue
+        valid, fixture_root, _ = _validate_managed_demo_environment(
+            row,
+            owner_project_id,
+        )
+        if valid and fixture_root.resolve() == query_root.resolve():
+            return True
+    return False
 
 
 def _qa_checkout_root_identity(

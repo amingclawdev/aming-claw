@@ -31105,29 +31105,36 @@ def test_exact_candidate_trace_remains_verified_after_scoped_durable_live_merge(
     assert unrelated_head["db_verified"] is False
 
 
-def _write_test_demo_environment_marker(project_root: Path) -> None:
-    server._write_demo_environment_marker(
-        {
-            "id": "demo-exact-candidate",
-            "template_id": "daily-planner-lite",
-            "project_id": "demo-exact-candidate-project",
-            "fixture_root": str(project_root),
-            "created_at": "2026-07-16T06:00:00Z",
-        },
-        PID,
-    )
+def _write_test_demo_environment_marker(project_root: Path) -> dict[str, Any]:
+    environment = {
+        "id": "demo-exact-candidate",
+        "template_id": "daily-planner-lite",
+        "project_id": "demo-exact-candidate-project",
+        "fixture_root": str(project_root),
+        "created_at": "2026-07-16T06:00:00Z",
+    }
+    server._write_demo_environment_marker(environment, PID)
+    return environment
 
 
 def test_exact_candidate_context_ignores_server_generated_demo_control_marker(
     tmp_path,
+    monkeypatch,
 ):
-    project_root = tmp_path / "qa-exact-demo-control-marker"
+    demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
+    project_root = demo_root / "qa-exact-demo-control-marker"
     candidate_commit = _init_test_git_repo(project_root)
-    _write_test_demo_environment_marker(project_root)
+    environment = _write_test_demo_environment_marker(project_root)
+    server._write_demo_environment_registry(PID, [environment])
+    monkeypatch.setattr(
+        server.project_service,
+        "project_exists",
+        lambda project_id: project_id == PID,
+    )
 
     context = server._qa_exact_candidate_context(
         project_root,
-        project_id=PID,
+        project_id=environment["project_id"],
         canonical_project_root=project_root,
         candidate_commit_sha=candidate_commit,
     )
@@ -31137,6 +31144,131 @@ def test_exact_candidate_context_ignores_server_generated_demo_control_marker(
     assert identity["query_root_ignored_demo_control_metadata_paths"] == [
         server.DEMO_ENVIRONMENT_MARKER
     ]
+
+
+def test_bounded_qa_graph_query_accepts_owner_registered_cross_project_demo_marker(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
+    project_root = demo_root / "qa-cross-project-demo-marker"
+    candidate_commit = _init_test_git_repo(project_root)
+    environment = _write_test_demo_environment_marker(project_root)
+    reviewed_project_id = environment["project_id"]
+    backlog_id = "AC-QA-CROSS-PROJECT-DEMO-MARKER"
+    task_id = "qa-cross-project-demo-marker"
+    server._write_demo_environment_registry(PID, [environment])
+    monkeypatch.setattr(
+        server.project_service,
+        "project_exists",
+        lambda project_id: project_id in {PID, reviewed_project_id},
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, raw=None, **_kwargs: (
+            Path(raw).resolve() if raw else project_root
+        ),
+    )
+    _activate_basic_graph(
+        conn,
+        "full-query-cross-project-demo-marker",
+        project_id=reviewed_project_id,
+        commit_sha=candidate_commit,
+    )
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=reviewed_project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=candidate_commit,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{candidate_commit}",
+        qa_scope_binding_ref,
+    ]
+    registered = server.role_service.register(
+        conn,
+        "qa:cross-project-demo-marker",
+        reviewed_project_id,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    qa_ctx = _ctx_with_role(
+        {"project_id": reviewed_project_id},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": "active",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "commit_sha": candidate_commit,
+            "project_root": str(project_root),
+        },
+    )
+    qa_ctx._session.update(
+        {
+            "session_id": registered["session_id"],
+            "principal_id": "qa:cross-project-demo-marker",
+            "project_id": reviewed_project_id,
+            "scope": qa_scope,
+        }
+    )
+
+    queried = server.handle_graph_governance_query(qa_ctx)
+
+    assert queried["ok"] is True
+    trace = server.handle_graph_governance_query_trace_get(
+        _ctx(
+            {
+                "project_id": reviewed_project_id,
+                "trace_id": queried["trace_id"],
+            }
+        )
+    )["trace"]
+    assert trace["query_source"] == "qa"
+    assert trace["query_purpose"] == "independent_verification"
+    assert trace["backlog_id"] == backlog_id
+    assert trace["task_id"] == task_id
+    assert trace["commit_sha"] == candidate_commit
+    assert trace["qa_session_id"] == registered["session_id"]
+    assert trace["qa_scope_binding_ref"] == qa_scope_binding_ref
+    assert trace["root_identity"]["query_root_clean"] is True
+    assert trace["root_identity"][
+        "query_root_ignored_demo_control_metadata_paths"
+    ] == [server.DEMO_ENVIRONMENT_MARKER]
+
+
+def test_exact_candidate_context_rejects_demo_marker_without_owner_registry_binding(
+    tmp_path,
+    monkeypatch,
+):
+    demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
+    project_root = demo_root / "qa-exact-demo-control-unregistered"
+    candidate_commit = _init_test_git_repo(project_root)
+    environment = _write_test_demo_environment_marker(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "project_exists",
+        lambda project_id: project_id == PID,
+    )
+
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_exact_candidate_context(
+            project_root,
+            project_id=environment["project_id"],
+            canonical_project_root=project_root,
+            candidate_commit_sha=candidate_commit,
+        )
+
+    assert exc.value.reason == "exact_candidate_query_root_dirty"
+    assert exc.value.details["ignored_demo_control_metadata_entry_count"] == 0
 
 
 def test_exact_candidate_context_rejects_demo_marker_lookalike_path(tmp_path):
@@ -31179,16 +31311,24 @@ def test_exact_candidate_context_rejects_malformed_demo_control_marker(tmp_path)
 
 def test_exact_candidate_context_still_rejects_other_dirty_file_with_demo_marker(
     tmp_path,
+    monkeypatch,
 ):
-    project_root = tmp_path / "qa-exact-demo-control-plus-dirty"
+    demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
+    project_root = demo_root / "qa-exact-demo-control-plus-dirty"
     candidate_commit = _init_test_git_repo(project_root)
-    _write_test_demo_environment_marker(project_root)
+    environment = _write_test_demo_environment_marker(project_root)
+    server._write_demo_environment_registry(PID, [environment])
+    monkeypatch.setattr(
+        server.project_service,
+        "project_exists",
+        lambda project_id: project_id == PID,
+    )
     (project_root / "untracked.txt").write_text("dirty\n", encoding="utf-8")
 
     with pytest.raises(server._QACandidateOverlayError) as exc:
         server._qa_exact_candidate_context(
             project_root,
-            project_id=PID,
+            project_id=environment["project_id"],
             canonical_project_root=project_root,
             candidate_commit_sha=candidate_commit,
         )
@@ -31198,10 +31338,20 @@ def test_exact_candidate_context_still_rejects_other_dirty_file_with_demo_marker
     assert exc.value.details["ignored_demo_control_metadata_entry_count"] == 1
 
 
-def test_exact_candidate_context_rejects_tracked_modified_demo_marker(tmp_path):
-    project_root = tmp_path / "qa-exact-tracked-demo-control"
+def test_exact_candidate_context_rejects_tracked_modified_demo_marker(
+    tmp_path,
+    monkeypatch,
+):
+    demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
+    project_root = demo_root / "qa-exact-tracked-demo-control"
     _init_test_git_repo(project_root)
-    _write_test_demo_environment_marker(project_root)
+    environment = _write_test_demo_environment_marker(project_root)
+    server._write_demo_environment_registry(PID, [environment])
+    monkeypatch.setattr(
+        server.project_service,
+        "project_exists",
+        lambda project_id: project_id == PID,
+    )
     subprocess.run(
         ["git", "add", server.DEMO_ENVIRONMENT_MARKER],
         cwd=project_root,
@@ -31223,7 +31373,7 @@ def test_exact_candidate_context_rejects_tracked_modified_demo_marker(tmp_path):
     with pytest.raises(server._QACandidateOverlayError) as exc:
         server._qa_exact_candidate_context(
             project_root,
-            project_id=PID,
+            project_id=environment["project_id"],
             canonical_project_root=project_root,
             candidate_commit_sha=candidate_commit,
         )
