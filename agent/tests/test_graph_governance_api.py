@@ -20551,32 +20551,27 @@ def test_parallel_branch_finish_gate_rejects_genuine_observer_session(conn):
     ) == []
 
 
-def test_parallel_branch_finish_gate_rejects_observer_without_runtime_context_id(
+@pytest.mark.parametrize("authenticated_role", ["observer", "qa"])
+def test_parallel_branch_finish_gate_rejects_non_mf_sub_without_runtime_context_id(
     conn,
+    authenticated_role,
 ):
-    task_id = "finish-gate-observer-omits-runtime-context"
+    task_id = f"finish-gate-{authenticated_role}-omits-runtime-context"
+    fence_token = f"fence-{task_id}"
     upsert_branch_context(
         conn,
         BranchTaskRuntimeContext(
             project_id=PID,
             task_id=task_id,
-            backlog_id="AC-FINISH-GATE-OBSERVER-OMITS-RUNTIME-CONTEXT",
-            branch_ref=(
-                "refs/heads/codex/finish-gate-observer-omits-runtime-context"
-            ),
+            backlog_id="AC-FINISH-GATE-NON-MF-SUB-OMITS-RUNTIME-CONTEXT",
+            branch_ref=f"refs/heads/codex/{task_id}",
             status="worktree_ready",
-            fence_token="fence-finish-gate-observer-omits-runtime-context",
-            worktree_path=(
-                "/tmp/nonexistent-finish-gate-observer-omits-runtime-context"
-            ),
-            base_commit="base-finish-gate-observer-omits-runtime-context",
-            head_commit="base-finish-gate-observer-omits-runtime-context",
-            target_head_commit=(
-                "target-finish-gate-observer-omits-runtime-context"
-            ),
-            merge_queue_id=(
-                "mergeq-finish-gate-observer-omits-runtime-context"
-            ),
+            fence_token=fence_token,
+            worktree_path=f"/tmp/nonexistent-{task_id}",
+            base_commit=f"base-{task_id}",
+            head_commit=f"base-{task_id}",
+            target_head_commit=f"target-{task_id}",
+            merge_queue_id=f"mergeq-{task_id}",
         ),
         now_iso="2026-07-26T10:02:00Z",
     )
@@ -20586,17 +20581,13 @@ def test_parallel_branch_finish_gate_rejects_observer_without_runtime_context_id
         server.handle_graph_governance_parallel_branch_finish_gate(
             _ctx_with_role(
                 {"project_id": PID},
-                "observer",
+                authenticated_role,
                 method="POST",
                 body={
                     "project_id": PID,
                     "task_id": task_id,
-                    "fence_token": (
-                        "fence-finish-gate-observer-omits-runtime-context"
-                    ),
-                    "worker_session_id": (
-                        "/root/observer_merge_root_scope_worker_r1"
-                    ),
+                    "fence_token": fence_token,
+                    "worker_session_id": f"/root/{authenticated_role}_host_worker_r1",
                 },
             )
         )
