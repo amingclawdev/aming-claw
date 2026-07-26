@@ -3385,6 +3385,24 @@ def _direct_fix_topology_guidance() -> dict[str, Any]:
                 "retry_source_backlog_close_after_repair",
                 "retry_historical_source_backlog_close",
             ],
+            "recovery_navigation": {
+                "schema_version": (
+                    "contract_runtime.bypass_recovery_fallback.v1"
+                ),
+                "mode": "one_unified_advisory_fallback",
+                "per_gate_checklist_mapping": False,
+                "advisory_only": True,
+                "satisfies_gate": False,
+                "authorizes_write": False,
+                "unknown_repair_target_requires_observer_confirmation": True,
+                "required_sequence": [
+                    "independent_root_repair",
+                    "independent_qa",
+                    "ordered_batch_merge",
+                    "current_head_full_reconcile",
+                    "fresh_generation_from_scenario_1",
+                ],
+            },
         },
         "progress_audit_before_stopping_or_replacing_worker": {
             "required": True,
@@ -62197,6 +62215,13 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
         else {}
     )
     if terminal:
+        recovery_fallback = (
+            guide.get("bypass_recovery_fallback")
+            if isinstance(guide.get("bypass_recovery_fallback"), Mapping)
+            else terminal.get("bypass_recovery_fallback")
+            if isinstance(terminal.get("bypass_recovery_fallback"), Mapping)
+            else {}
+        )
         current_state.update(
             {
                 "row_status": "WAIVED",
@@ -62213,6 +62238,10 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
                 "terminal_disposition": dict(terminal),
             }
         )
+        if recovery_fallback:
+            current_state["bypass_recovery_fallback"] = dict(
+                recovery_fallback
+            )
     barrier_pending = (
         guide.get("bypass_barrier_pending")
         if isinstance(guide.get("bypass_barrier_pending"), Mapping)
@@ -62316,11 +62345,117 @@ def _merge_contract_chain_next_action_context(
     return merged
 
 
+def _contract_chain_current_with_terminal_bypass_fallback(
+    conn,
+    current_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Hydrate old terminal projections from their durable runtime record."""
+
+    current = dict(current_projection or {})
+    if not (
+        current
+        and not bool(current.get("degraded"))
+        and str(current.get("readiness_state") or "")
+        == "completed_with_exception"
+        and current.get("terminal") is True
+        and not isinstance(current.get("bypass_recovery_fallback"), Mapping)
+    ):
+        return current
+    active_chain = (
+        current.get("active_chain")
+        if isinstance(current.get("active_chain"), Mapping)
+        else {}
+    )
+    candidate_execution_ids = [
+        str(item or "").strip()
+        for item in reversed(list(active_chain.get("execution_ids") or []))
+        if str(item or "").strip()
+    ]
+    root_execution_id = str(
+        current.get("root_contract_execution_id") or ""
+    ).strip()
+    if root_execution_id and root_execution_id not in candidate_execution_ids:
+        candidate_execution_ids.append(root_execution_id)
+    if not candidate_execution_ids:
+        return current
+    try:
+        runtime = _contract_runtime(conn)
+    except (
+        ContractRuntimeError,
+        StalePinnedContractExecutionError,
+        sqlite3.Error,
+    ):
+        return current
+    selected_execution_id = ""
+    guide: Mapping[str, Any] = {}
+    for candidate_execution_id in candidate_execution_ids:
+        try:
+            runtime.current_guide(
+                candidate_execution_id,
+                actor_role="observer",
+            )
+            record = runtime.store.get(candidate_execution_id)
+        except (
+            ContractRuntimeError,
+            StalePinnedContractExecutionError,
+            sqlite3.Error,
+        ):
+            continue
+        if str(record.get("project_id") or "") != str(
+            current.get("project_id") or ""
+        ):
+            continue
+        if str(record.get("backlog_id") or "") != str(
+            current.get("backlog_id") or ""
+        ):
+            continue
+        candidate_guide = (
+            record.get("runtime_guide")
+            if isinstance(record.get("runtime_guide"), Mapping)
+            else {}
+        )
+        candidate_fallback = candidate_guide.get(
+            "bypass_recovery_fallback"
+        )
+        if isinstance(candidate_fallback, Mapping) and candidate_fallback:
+            selected_execution_id = candidate_execution_id
+            guide = candidate_guide
+            break
+    recovery_fallback = guide.get("bypass_recovery_fallback")
+    if not selected_execution_id or not isinstance(
+        recovery_fallback, Mapping
+    ):
+        return current
+    terminal_disposition = guide.get("terminal_disposition")
+    if isinstance(terminal_disposition, Mapping) and terminal_disposition:
+        current["terminal_disposition"] = dict(terminal_disposition)
+    current["bypass_recovery_fallback"] = dict(recovery_fallback)
+    current["terminal_projection_hydration"] = {
+        "schema_version": (
+            "backlog_contract_chain_current.terminal_bypass_hydration.v1"
+        ),
+        "status": "hydrated_from_durable_contract_runtime",
+        "contract_execution_id": selected_execution_id,
+        "source_of_proof": "contract_runtime_executions.completed_lines",
+    }
+    current["projection_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in current.items()
+            if key != "projection_hash"
+        }
+    )
+    return current
+
+
 def _contract_chain_current_with_runtime_freshness(
     conn,
     current_projection: Mapping[str, Any],
 ) -> dict[str, Any]:
-    current = dict(current_projection or {})
+    current = _contract_chain_current_with_terminal_bypass_fallback(
+        conn,
+        current_projection,
+    )
     if not current or bool(current.get("degraded")):
         return current
 
@@ -62879,6 +63014,11 @@ def _contract_chain_current_runtime_authority_projection(
         "semantic_blocker_reason": semantic_blocker_reason,
         "legacy_route_action_precheck": legacy_advisory,
     }
+    recovery_fallback = current_projection.get(
+        "bypass_recovery_fallback"
+    )
+    if isinstance(recovery_fallback, Mapping) and recovery_fallback:
+        authority["bypass_recovery_fallback"] = dict(recovery_fallback)
     if next_action:
         authority["next_legal_action"] = next_action
     source_refs = current_projection.get("source_refs")
@@ -63022,6 +63162,11 @@ def _onboard_runtime_resume_from_current_projection(
         ),
         "projection_hash": str(current_projection.get("projection_hash") or ""),
     }
+    recovery_fallback = current_projection.get(
+        "bypass_recovery_fallback"
+    )
+    if isinstance(recovery_fallback, Mapping) and recovery_fallback:
+        resume["bypass_recovery_fallback"] = dict(recovery_fallback)
     if current_projection.get("terminal") is True:
         resume.update(
             {
@@ -63640,7 +63785,9 @@ def _contract_runtime_response(
                     "resume_eligible",
                     "resumable",
                     "terminal_disposition",
+                    "bypass_recovery_fallback",
                 )
+                if key in current_state
             }
         )
     if response_view not in {"cli_current", "cli_guide"}:
@@ -79749,6 +79896,24 @@ def _onboard_route_guide_service_response(
             )
             if isinstance(observer_entry, dict):
                 observer_entry["runtime_resume"] = runtime_resume
+    bypass_recovery_fallback = (
+        runtime_resume.get("bypass_recovery_fallback")
+        if isinstance(runtime_resume.get("bypass_recovery_fallback"), Mapping)
+        else current_projection.get("bypass_recovery_fallback")
+        if isinstance(
+            current_projection.get("bypass_recovery_fallback"), Mapping
+        )
+        else {}
+    )
+    if bypass_recovery_fallback:
+        guidance["bypass_recovery_fallback"] = dict(
+            bypass_recovery_fallback
+        )
+        route_guide = guidance.get("onboard_route_guide")
+        if isinstance(route_guide, dict):
+            route_guide["bypass_recovery_fallback"] = dict(
+                bypass_recovery_fallback
+            )
     _onboard_route_guide_apply_runtime_route_token_scope(
         conn,
         record=record,
@@ -79793,6 +79958,10 @@ def _onboard_route_guide_service_response(
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
+    if bypass_recovery_fallback:
+        response["bypass_recovery_fallback"] = dict(
+            bypass_recovery_fallback
+        )
     return _qa_onboard_compact_selected_role_response(response)
 
 
@@ -80343,7 +80512,9 @@ def _contract_update_response(record: Mapping[str, Any]) -> dict[str, Any]:
                     "resume_eligible",
                     "resumable",
                     "terminal_disposition",
+                    "bypass_recovery_fallback",
                 )
+                if key in current_state
             }
         )
     elif current_state.get("bypass_barrier_pending"):

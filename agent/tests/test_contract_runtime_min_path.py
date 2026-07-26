@@ -10,6 +10,7 @@ import pytest
 from agent.governance.contracts import ContractDefinitionRegistry, ContractRuntime
 from agent.governance.contracts.hash import file_sha256, stable_sha256
 from agent.governance.contracts.runtime import (
+    _audited_bypass_recovery_fallback,
     _audited_bypass_terminal_disposition,
     _contract_completion_satisfying_lines,
     _project_record_state,
@@ -1981,6 +1982,7 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
         "qa_verdict"
     )
     assert "terminal_disposition" not in result["record"]["runtime_guide"]
+    assert "bypass_recovery_fallback" not in result["record"]["runtime_guide"]
 
     merged_commit = "a" * 40
     durable_merge_authority = {
@@ -2030,9 +2032,13 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
             "payload": {"reconcile_authority": reconcile_authority},
         },
     ]
-    terminal = _audited_bypass_terminal_disposition(
-        {"completed_lines": terminal_lines}
-    )
+    terminal_record = {
+        "backlog_id": record["backlog_id"],
+        "contract_execution_id": record["contract_execution_id"],
+        "contract_id": record["contract_id"],
+        "completed_lines": terminal_lines,
+    }
+    terminal = _audited_bypass_terminal_disposition(terminal_record)
     assert terminal["row_status"] == "WAIVED"
     assert terminal["readiness_state"] == "completed_with_exception"
     assert terminal["scheduler_eligible"] is False
@@ -2042,6 +2048,54 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
     assert terminal["source_backlog_mutated"] is False
     assert terminal["terminal_barrier"]["bypass_line_index"] == 0
     assert terminal["terminal_barrier"]["reconcile_source_ref"] == "timeline:43"
+    fallback = terminal["bypass_recovery_fallback"]
+    assert fallback["schema_version"] == (
+        "contract_runtime.bypass_recovery_fallback.v1"
+    )
+    assert fallback["authority"] == "advisory_navigation"
+    assert fallback["navigation_model"] == "single_unified_fallback"
+    assert fallback["per_gate_checklist_mapping"] is False
+    assert fallback["advisory_only"] is True
+    assert fallback["authorizes_write"] is False
+    assert fallback["authorizes_pass"] is False
+    assert fallback["satisfies_gate"] is False
+    assert fallback["source_terminal_disposition"] == (
+        "WAIVED/completed_with_exception"
+    )
+    assert fallback["source_scheduler_eligible"] is False
+    assert fallback["source_resume_eligible"] is False
+    assert fallback["source_status_may_become_fixed"] is False
+    assert fallback["generation_disposition"] == "discarded"
+    assert fallback["current_generation_must_not_resume"] is True
+    assert fallback["downstream_missing_evidence_repair_forbidden"] is True
+    assert fallback["demo_validation_bypass_allowed"] is False
+    assert fallback["zero_bypass_happy_path_unchanged"] is True
+    assert fallback["repair_target"] == {
+        "status": "known",
+        "backlog_id": "AC-BYPASS-DIAGNOSTIC",
+        "source": "canonical_contract_line_bypass_payload",
+        "observer_confirmation_required": False,
+    }
+    assert fallback["required_sequence"] == [
+        "independent_root_repair",
+        "independent_qa",
+        "ordered_batch_merge",
+        "current_head_full_reconcile",
+        "fresh_generation_from_scenario_1",
+    ]
+    assert fallback["durable_evidence"][
+        "current_head_full_reconcile_ref"
+    ] == "timeline:43"
+    for forbidden in (
+        "resume_original_contract",
+        "return_to_parent",
+        "parent_to_resume",
+        "retry_source_backlog_close_after_repair",
+        "retry_historical_source_backlog_close",
+        "repair_downstream_missing_evidence",
+        "mark_bypass_source_fixed",
+    ):
+        assert forbidden in fallback["forbidden_actions"]
     accepted_without_explicit_status = json.loads(json.dumps(terminal_lines))
     accepted_without_explicit_status[-2].pop("status")
     accepted_without_explicit_status[-1].pop("status")
@@ -2067,17 +2121,36 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
     ) == {}
     projected_terminal = _project_record_state(
         {
+            "backlog_id": record["backlog_id"],
             "contract_execution_id": record["contract_execution_id"],
-            "contract_id": "bypass_min_path",
+            "contract_id": record["contract_id"],
             "execution_state_revision": 4,
             "completed_lines": terminal_lines,
             "runtime_guide": {"next_legal_action": None},
         }
     )
-    serialized_terminal = json.dumps(projected_terminal, sort_keys=True)
-    assert "parent_to_resume" not in serialized_terminal
+    assert "parent_to_resume_contract_execution_id" not in projected_terminal
+    assert "return_to_parent" not in projected_terminal
     assert projected_terminal["next_legal_action"] == {}
+    assert projected_terminal["bypass_recovery_fallback"] == fallback
     from agent.governance import server
+
+    runtime_resume = server._onboard_runtime_resume_from_current_projection(
+        {
+            "schema_version": "backlog_contract_chain_current.v1",
+            "project_id": record["project_id"],
+            "backlog_id": record["backlog_id"],
+            "contract_chain_id": "cchain-bypass-min-path",
+            "root_contract_execution_id": record[
+                "contract_execution_id"
+            ],
+            "projection_source": "backlog_contract_chain_current",
+            **projected_terminal,
+        }
+    )
+    assert runtime_resume["terminal"] is True
+    assert runtime_resume["next_legal_action"] == {}
+    assert runtime_resume["bypass_recovery_fallback"] == fallback
 
     server_terminal = server._runtime_current_state_from_record(
         {
@@ -2102,6 +2175,7 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
     assert server_terminal["resume_eligible"] is False
     assert server_terminal["next_legal_action"] == {}
     assert server_terminal["terminal_disposition"] == terminal
+    assert server_terminal["bypass_recovery_fallback"] == fallback
     forged_lines = json.loads(json.dumps(terminal_lines))
     forged_lines[-1]["payload"]["reconcile_authority"]["record_verified"] = False
     assert _audited_bypass_terminal_disposition(
@@ -2293,6 +2367,9 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
         "reconcile_source_ref": "timeline:43",
         "ordering_policy": "stage_aware_forward_only",
     }
+    assert terminal_after_late_merge_bypass[
+        "bypass_recovery_fallback"
+    ]["required_sequence"] == fallback["required_sequence"]
 
     late_reconcile_bypass = json.loads(json.dumps(result["written_line"]))
     late_reconcile_bypass["stage_id"] = "observer_integration"
@@ -2334,6 +2411,9 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
         "reconcile_source_ref": "timeline:43",
         "ordering_policy": "stage_aware_forward_only",
     }
+    assert terminal_after_late_reconcile_bypass[
+        "bypass_recovery_fallback"
+    ]["required_sequence"] == fallback["required_sequence"]
     assert _audited_bypass_terminal_disposition(
         {
             "completed_lines": [
@@ -2394,6 +2474,9 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
         "reconcile_source_ref": "timeline:43",
         "ordering_policy": "stage_aware_forward_only",
     }
+    assert terminal_after_late_close_ready_bypass[
+        "bypass_recovery_fallback"
+    ]["required_sequence"] == fallback["required_sequence"]
     terminal_after_multiple_late_bypasses = (
         _audited_bypass_terminal_disposition(
             {
@@ -2469,6 +2552,76 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
     )
     assert stale["ok"] is False
     assert stale["decision"]["errors"] == ["execution_state_revision mismatch"]
+
+
+@pytest.mark.parametrize(
+    "contract_id",
+    [
+        "direct_main.v1",
+        "mf_parallel.v2",
+        "mf_batch_parallel.v1",
+        "mf_batch_parallel.restart.v1",
+    ],
+)
+def test_terminal_bypass_recovery_fallback_is_lane_neutral_and_fail_closed(
+    contract_id,
+):
+    terminal = {
+        "schema_version": "contract_runtime.audited_bypass_terminal.v1",
+        "status": "WAIVED",
+        "readiness_state": "completed_with_exception",
+        "terminal": True,
+        "scheduler_eligible": False,
+        "resume_eligible": False,
+        "no_pass_claim": True,
+        "diagnostic_backlog_id": "",
+        "terminal_barrier": {
+            "bypass_line_index": 1,
+            "qa_line_index": 2,
+            "merge_line_index": 3,
+            "reconcile_line_index": 4,
+            "reconcile_source_ref": "timeline:44",
+        },
+    }
+    fallback = _audited_bypass_recovery_fallback(
+        {
+            "backlog_id": "AC-BYPASS-SOURCE",
+            "contract_execution_id": "cex-bypass-source",
+            "contract_id": contract_id,
+        },
+        terminal,
+    )
+
+    assert fallback["status"] == "unknown"
+    assert fallback["source_contract_id"] == contract_id
+    assert fallback["repair_target"] == {
+        "status": "unknown",
+        "backlog_id": "",
+        "source": "durable_server_evidence_insufficient",
+        "observer_confirmation_required": True,
+    }
+    assert fallback["observer_confirmation_required"] is True
+    assert fallback["required_sequence"] == [
+        "independent_root_repair",
+        "independent_qa",
+        "ordered_batch_merge",
+        "current_head_full_reconcile",
+        "fresh_generation_from_scenario_1",
+    ]
+    invalid_barrier = json.loads(json.dumps(terminal))
+    invalid_barrier["terminal_barrier"]["reconcile_source_ref"] = ""
+    assert _audited_bypass_recovery_fallback(
+        {"contract_id": contract_id},
+        invalid_barrier,
+    ) == {}
+    historical_terminal = json.loads(json.dumps(terminal))
+    historical_terminal["schema_version"] = (
+        "contract_runtime.historical_audited_bypass_supersession.v1"
+    )
+    assert _audited_bypass_recovery_fallback(
+        {"contract_id": contract_id},
+        historical_terminal,
+    ) == {}
 
 
 @pytest.mark.parametrize(

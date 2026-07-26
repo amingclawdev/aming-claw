@@ -54140,6 +54140,25 @@ def test_direct_fix_topology_guidance_terminalizes_bypass_without_source_backedg
         "retry_source_backlog_close_after_repair",
         "retry_historical_source_backlog_close",
     ]
+    recovery_navigation = bypass_policy["recovery_navigation"]
+    assert recovery_navigation["schema_version"] == (
+        "contract_runtime.bypass_recovery_fallback.v1"
+    )
+    assert recovery_navigation["mode"] == "one_unified_advisory_fallback"
+    assert recovery_navigation["per_gate_checklist_mapping"] is False
+    assert recovery_navigation["advisory_only"] is True
+    assert recovery_navigation["satisfies_gate"] is False
+    assert recovery_navigation["authorizes_write"] is False
+    assert recovery_navigation[
+        "unknown_repair_target_requires_observer_confirmation"
+    ] is True
+    assert recovery_navigation["required_sequence"] == [
+        "independent_root_repair",
+        "independent_qa",
+        "ordered_batch_merge",
+        "current_head_full_reconcile",
+        "fresh_generation_from_scenario_1",
+    ]
 
     projection = dict(guidance)
     projection["audited_bypass_policy"] = dict(bypass_policy)

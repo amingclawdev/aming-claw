@@ -194,6 +194,23 @@ _HISTORICAL_BYPASS_OPERATOR_SUPERSESSION_BINDINGS = {
     },
 }
 
+_BYPASS_RECOVERY_FALLBACK_REQUIRED_SEQUENCE = (
+    "independent_root_repair",
+    "independent_qa",
+    "ordered_batch_merge",
+    "current_head_full_reconcile",
+    "fresh_generation_from_scenario_1",
+)
+_BYPASS_RECOVERY_FALLBACK_FORBIDDEN_ACTIONS = (
+    "resume_original_contract",
+    "return_to_parent",
+    "parent_to_resume",
+    "retry_source_backlog_close_after_repair",
+    "retry_historical_source_backlog_close",
+    "repair_downstream_missing_evidence",
+    "mark_bypass_source_fixed",
+)
+
 
 def normalize_contract_route_token(value: Any) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(".", "_")
@@ -742,6 +759,13 @@ def rebuild_backlog_contract_chain_projection(
             if str(record.get("contract_execution_id") or "")
         ],
     }
+    if current.get("terminal") is True:
+        terminal_disposition = current.get("terminal_disposition")
+        if isinstance(terminal_disposition, Mapping):
+            active_chain["terminal_disposition"] = dict(terminal_disposition)
+        recovery_fallback = current.get("bypass_recovery_fallback")
+        if isinstance(recovery_fallback, Mapping) and recovery_fallback:
+            active_chain["bypass_recovery_fallback"] = dict(recovery_fallback)
     source_refs = _projection_source_refs(chain_records)
     projection_row = {
         "schema_version": "backlog_contract_chain_current.v1",
@@ -1271,7 +1295,7 @@ def _project_record_state(record: Mapping[str, Any]) -> dict[str, Any]:
     current_contract_id = _record_contract_id(record)
     terminal = _audited_bypass_terminal_disposition(record)
     if terminal:
-        return {
+        projected = {
             "current_contract_execution_id": "",
             "current_contract_id": "",
             "active_child_contract_execution_id": "",
@@ -1291,6 +1315,10 @@ def _project_record_state(record: Mapping[str, Any]) -> dict[str, Any]:
             "next_legal_action": {},
             "terminal_disposition": terminal,
         }
+        recovery_fallback = terminal.get("bypass_recovery_fallback")
+        if isinstance(recovery_fallback, Mapping) and recovery_fallback:
+            projected["bypass_recovery_fallback"] = dict(recovery_fallback)
+        return projected
     next_action = _next_action_from_record(record)
     readiness = "contract_complete" if _record_is_complete(record) else "contract_active"
     return {
@@ -1711,6 +1739,124 @@ def _historical_audited_bypass_supersession_disposition(
     }
 
 
+def _audited_bypass_recovery_fallback(
+    record: Mapping[str, Any],
+    terminal_disposition: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one advisory recovery envelope from a proven terminal bypass."""
+
+    if not (
+        str(terminal_disposition.get("schema_version") or "")
+        == "contract_runtime.audited_bypass_terminal.v1"
+        and terminal_disposition.get("terminal") is True
+        and terminal_disposition.get("no_pass_claim") is True
+        and str(terminal_disposition.get("status") or "").upper() == "WAIVED"
+        and str(terminal_disposition.get("readiness_state") or "")
+        == "completed_with_exception"
+        and terminal_disposition.get("scheduler_eligible") is False
+        and terminal_disposition.get("resume_eligible") is False
+    ):
+        return {}
+    barrier = (
+        terminal_disposition.get("terminal_barrier")
+        if isinstance(terminal_disposition.get("terminal_barrier"), Mapping)
+        else {}
+    )
+    try:
+        bypass_index = int(barrier.get("bypass_line_index"))
+        qa_index = int(barrier.get("qa_line_index"))
+        merge_index = int(barrier.get("merge_line_index"))
+        reconcile_index = int(barrier.get("reconcile_line_index"))
+    except (TypeError, ValueError):
+        return {}
+    reconcile_source_ref = str(
+        barrier.get("reconcile_source_ref") or ""
+    ).strip()
+    if not (
+        bypass_index >= 0
+        and qa_index >= 0
+        and merge_index > qa_index
+        and reconcile_index > merge_index
+        and reconcile_source_ref.startswith("timeline:")
+    ):
+        return {}
+
+    diagnostic_backlog_id = str(
+        terminal_disposition.get("diagnostic_backlog_id") or ""
+    ).strip()
+    repair_target_known = bool(diagnostic_backlog_id)
+    return {
+        "schema_version": "contract_runtime.bypass_recovery_fallback.v1",
+        "status": "ready" if repair_target_known else "unknown",
+        "mode": "upstream_audited_bypass_recovery",
+        "navigation_model": "single_unified_fallback",
+        "per_gate_checklist_mapping": False,
+        "authority": "advisory_navigation",
+        "advisory_only": True,
+        "authorizes_write": False,
+        "authorizes_pass": False,
+        "satisfies_gate": False,
+        "mutates_runtime_state": False,
+        "detected_from_durable_server_evidence": True,
+        "source_backlog_id": str(record.get("backlog_id") or ""),
+        "source_contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ),
+        "source_contract_id": str(record.get("contract_id") or ""),
+        "source_terminal_disposition": "WAIVED/completed_with_exception",
+        "source_scheduler_eligible": False,
+        "source_resume_eligible": False,
+        "source_status_may_become_fixed": False,
+        "diagnostic_backlog_id": diagnostic_backlog_id,
+        "repair_target": {
+            "status": "known" if repair_target_known else "unknown",
+            "backlog_id": diagnostic_backlog_id,
+            "source": (
+                "canonical_contract_line_bypass_payload"
+                if repair_target_known
+                else "durable_server_evidence_insufficient"
+            ),
+            "observer_confirmation_required": not repair_target_known,
+        },
+        "observer_confirmation_required": not repair_target_known,
+        "generation_disposition": "discarded",
+        "current_generation_must_not_resume": True,
+        "downstream_missing_evidence_repair_forbidden": True,
+        "demo_validation_bypass_allowed": False,
+        "zero_bypass_happy_path_unchanged": True,
+        "required_sequence": list(
+            _BYPASS_RECOVERY_FALLBACK_REQUIRED_SEQUENCE
+        ),
+        "forbidden_actions": list(
+            _BYPASS_RECOVERY_FALLBACK_FORBIDDEN_ACTIONS
+        ),
+        "durable_evidence": {
+            "source": "contract_runtime_executions.completed_lines",
+            "bypass_identity": str(
+                terminal_disposition.get("bypass_identity") or ""
+            ),
+            "bypassed_stage_id": str(
+                terminal_disposition.get("stage_id") or ""
+            ),
+            "bypassed_line_id": str(
+                terminal_disposition.get("line_id") or ""
+            ),
+            "qa_line_index": qa_index,
+            "merge_line_index": merge_index,
+            "reconcile_line_index": reconcile_index,
+            "current_head_full_reconcile_ref": reconcile_source_ref,
+            "no_pass_claim": True,
+        },
+        "prompt": (
+            "The upstream audited bypass source is terminal. Do not return to "
+            "the historical source or repair downstream missing evidence. "
+            "Continue only with an independently bounded root repair row, "
+            "independent QA, ordered batch merge, current-HEAD full reconcile, "
+            "then a fresh validation generation from scenario 1."
+        ),
+    }
+
+
 def _audited_bypass_terminal_disposition(
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -2012,7 +2158,7 @@ def _audited_bypass_terminal_disposition(
         and reconcile_barrier_ready()
     ):
         bypass_payload = _canonical_audited_bypass_payload(bypass_line)
-        return {
+        terminal = {
             "schema_version": "contract_runtime.audited_bypass_terminal.v1",
             "status": "WAIVED",
             "row_status": "WAIVED",
@@ -2048,6 +2194,10 @@ def _audited_bypass_terminal_disposition(
             "repair_requires_separate_backlog_row": True,
             "fresh_generation_requires_accepted_repair_merge_and_current_head_reconcile": True,
         }
+        recovery_fallback = _audited_bypass_recovery_fallback(record, terminal)
+        if recovery_fallback:
+            terminal["bypass_recovery_fallback"] = recovery_fallback
+        return terminal
     return _historical_audited_bypass_supersession_disposition(
         record,
         canonical_bypasses,
@@ -4638,6 +4788,11 @@ def _current_projection_from_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str
         "source_of_proof": "contract_runtime_executions.completed_lines",
     }
     if projection["readiness_state"] == "completed_with_exception":
+        stored_terminal = (
+            active_chain.get("terminal_disposition")
+            if isinstance(active_chain.get("terminal_disposition"), Mapping)
+            else {}
+        )
         projection.update(
             {
                 "row_status": "WAIVED",
@@ -4651,17 +4806,26 @@ def _current_projection_from_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str
                 "closeable": False,
                 "resume_eligible": False,
                 "resumable": False,
-                "terminal_disposition": {
-                    "schema_version": (
-                        "contract_runtime.audited_bypass_terminal.v1"
-                    ),
-                    "status": "WAIVED",
-                    "readiness_state": "completed_with_exception",
-                    "source": "backlog_contract_chain_current",
-                    "no_pass_claim": True,
-                },
+                "terminal_disposition": (
+                    dict(stored_terminal)
+                    if stored_terminal
+                    else {
+                        "schema_version": (
+                            "contract_runtime.audited_bypass_terminal.v1"
+                        ),
+                        "status": "WAIVED",
+                        "readiness_state": "completed_with_exception",
+                        "source": "backlog_contract_chain_current",
+                        "no_pass_claim": True,
+                    }
+                ),
             }
         )
+        recovery_fallback = active_chain.get("bypass_recovery_fallback")
+        if isinstance(recovery_fallback, Mapping) and recovery_fallback:
+            projection["bypass_recovery_fallback"] = dict(
+                recovery_fallback
+            )
         projection.pop("parent_to_resume_contract_execution_id", None)
     return projection
 
@@ -5140,6 +5304,13 @@ class ContractRuntime:
         if terminal_disposition:
             guide["next_legal_action"] = None
             guide["terminal_disposition"] = terminal_disposition
+            recovery_fallback = terminal_disposition.get(
+                "bypass_recovery_fallback"
+            )
+            if isinstance(recovery_fallback, Mapping) and recovery_fallback:
+                guide["bypass_recovery_fallback"] = dict(
+                    recovery_fallback
+                )
             guide["readiness_state"] = "completed_with_exception"
             guide["disposition"] = "completed_with_exception"
             state["readiness_state"] = "completed_with_exception"
@@ -5149,6 +5320,10 @@ class ContractRuntime:
             state["current_eligible"] = False
             state["close_eligible"] = False
             state["resume_eligible"] = False
+            if isinstance(recovery_fallback, Mapping) and recovery_fallback:
+                state["bypass_recovery_fallback"] = dict(
+                    recovery_fallback
+                )
         _attach_failed_qa_rework_guidance(
             guide,
             line_items=line_items,
