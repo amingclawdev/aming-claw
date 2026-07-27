@@ -9440,6 +9440,7 @@ def observer_direct_pre_mutation_authority_schema() -> dict[str, Any]:
             "operator_approval.close_satisfying_shape",
             "operator_approval_ref",
             "allowed_files_exact_row_scope",
+            "db_verified_pre_implementation_graph_trace=true",
         ],
         "historical_compatibility": {
             "raw_historical_events_rewritten": False,
@@ -9456,6 +9457,7 @@ def observer_direct_pre_mutation_authority_gate(
     route_identity: dict[str, list[str]],
     *,
     row_declared_files: list[str] | None = None,
+    pre_mutation_graph_trace_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate one new direct-main authority event before it becomes immutable."""
 
@@ -9514,6 +9516,47 @@ def observer_direct_pre_mutation_authority_gate(
     allowed_files_exact_row_scope = bool(
         row_scope and event_allowed_files == row_scope
     )
+    graph_trace_gate = (
+        dict(pre_mutation_graph_trace_gate)
+        if isinstance(pre_mutation_graph_trace_gate, Mapping)
+        else {}
+    )
+    if not graph_trace_gate:
+        for projection in _event_field_values(
+            event,
+            {"observer_direct_pre_mutation_authority"},
+        ):
+            if not isinstance(projection, Mapping):
+                continue
+            candidate = projection.get("pre_implementation_graph_trace_gate")
+            if (
+                projection.get("server_projected") is True
+                and isinstance(candidate, Mapping)
+            ):
+                graph_trace_gate = dict(candidate)
+                break
+    graph_trace_db_evidence = (
+        graph_trace_gate.get("db_evidence")
+        if isinstance(graph_trace_gate.get("db_evidence"), Mapping)
+        else {}
+    )
+    graph_trace_identity_mismatches = [
+        dict(item)
+        for item in graph_trace_gate.get("identity_mismatches") or []
+        if isinstance(item, Mapping)
+    ]
+    if not graph_trace_identity_mismatches:
+        graph_trace_identity_mismatches = [
+            dict(item)
+            for item in graph_trace_db_evidence.get("identity_mismatches") or []
+            if isinstance(item, Mapping)
+        ]
+    db_verified_pre_implementation_graph_trace = bool(
+        graph_trace_gate.get("passed") is True
+        and graph_trace_db_evidence.get("db_verified") is True
+        and not graph_trace_identity_mismatches
+        and not graph_trace_db_evidence.get("identity_mismatches")
+    )
 
     checks = {
         "source_backed_server_route_gate_shape": bool(
@@ -9528,6 +9571,9 @@ def observer_direct_pre_mutation_authority_gate(
         ),
         "operator_approval_ref": bool(operator_approval_ref),
         "allowed_files_exact_row_scope": allowed_files_exact_row_scope,
+        "db_verified_pre_implementation_graph_trace=true": (
+            db_verified_pre_implementation_graph_trace
+        ),
     }
     missing_requirement_ids = [
         requirement_id
@@ -9549,6 +9595,9 @@ def observer_direct_pre_mutation_authority_gate(
         "dirty_scope_shapes": dirty_scope_shapes,
         "row_declared_files": sorted(row_scope),
         "event_allowed_files": sorted(event_allowed_files),
+        "pre_implementation_graph_trace_gate": graph_trace_gate,
+        "graph_trace_db_evidence": dict(graph_trace_db_evidence),
+        "identity_mismatches": graph_trace_identity_mismatches,
         "schema": schema,
         "historical_backfill_allowed": False,
     }

@@ -95136,12 +95136,25 @@ def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
     conn,
     *,
     project_id: str,
+    backlog_id: str = "",
     task_id: str,
     trace_ids: Sequence[str],
+    route_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     requested = _runtime_context_service_dedupe(
         [str(trace_id or "").strip() for trace_id in trace_ids]
     )
+    expected_route_identity = {
+        field: str((route_identity or {}).get(field) or "").strip()
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+            "route_token_ref",
+        )
+    }
     rows = []
     if requested:
         try:
@@ -95151,13 +95164,16 @@ def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
             placeholders = ",".join("?" for _ in requested)
             rows = conn.execute(
                 f"""
-                SELECT trace_id, query_source, query_purpose, actor, status, task_id
+                SELECT trace_id, project_id, backlog_id, task_id,
+                       query_source, query_purpose, actor, status,
+                       route_id, route_context_hash, prompt_contract_id,
+                       prompt_contract_hash, visible_injection_manifest_hash,
+                       route_token_ref
                 FROM graph_query_traces
-                WHERE project_id = ?
-                  AND trace_id IN ({placeholders})
+                WHERE trace_id IN ({placeholders})
                 ORDER BY created_at DESC, trace_id DESC
                 """,
-                (project_id, *tuple(requested)),
+                tuple(requested),
             ).fetchall()
         except Exception:
             rows = []
@@ -95168,22 +95184,54 @@ def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
     for row in rows:
         if isinstance(row, sqlite3.Row):
             trace_id = str(row["trace_id"] or "").strip()
+            row_project_id = str(row["project_id"] or "").strip()
+            row_backlog_id = str(row["backlog_id"] or "").strip()
+            row_task_id = str(row["task_id"] or "").strip()
             query_source = str(row["query_source"] or "").strip()
             query_purpose = str(row["query_purpose"] or "").strip()
             actor = str(row["actor"] or "").strip()
             status = str(row["status"] or "").strip().lower()
-            row_task_id = str(row["task_id"] or "").strip()
+            row_route_identity = {
+                field: str(row[field] or "").strip()
+                for field in expected_route_identity
+            }
         else:
             trace_id = str(row[0] or "").strip()
-            query_source = str(row[1] or "").strip()
-            query_purpose = str(row[2] or "").strip()
-            actor = str(row[3] or "").strip()
-            status = str(row[4] or "").strip().lower()
-            row_task_id = str(row[5] or "").strip()
+            row_project_id = str(row[1] or "").strip()
+            row_backlog_id = str(row[2] or "").strip()
+            row_task_id = str(row[3] or "").strip()
+            query_source = str(row[4] or "").strip()
+            query_purpose = str(row[5] or "").strip()
+            actor = str(row[6] or "").strip()
+            status = str(row[7] or "").strip().lower()
+            row_route_identity = {
+                field: str(row[index] or "").strip()
+                for index, field in enumerate(expected_route_identity, start=8)
+            }
         if not trace_id:
             continue
         row_trace_ids.add(trace_id)
         mismatches: list[dict[str, str]] = []
+        expected_project_id = str(project_id or "").strip()
+        if expected_project_id and row_project_id != expected_project_id:
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "project_id",
+                    "expected": expected_project_id,
+                    "actual": row_project_id,
+                }
+            )
+        expected_backlog_id = str(backlog_id or "").strip()
+        if expected_backlog_id and row_backlog_id != expected_backlog_id:
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "backlog_id",
+                    "expected": expected_backlog_id,
+                    "actual": row_backlog_id,
+                }
+            )
         if query_source not in _PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_SOURCES:
             mismatches.append(
                 {
@@ -95227,6 +95275,17 @@ def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
                     "actual": row_task_id,
                 }
             )
+        for field, expected in expected_route_identity.items():
+            actual = row_route_identity.get(field, "")
+            if expected and actual != expected:
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": field,
+                        "expected": expected,
+                        "actual": actual,
+                    }
+                )
         if mismatches:
             identity_mismatches.extend(mismatches)
             continue
@@ -95253,10 +95312,184 @@ def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
         "accepted_query_sources": sorted(_PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_SOURCES),
         "accepted_query_purposes": sorted(_PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_PURPOSES),
         "accepted_task_id": str(task_id or "").strip(),
+        "accepted_project_id": str(project_id or "").strip(),
+        "accepted_backlog_id": str(backlog_id or "").strip(),
+        "accepted_route_identity": expected_route_identity,
         "source_details": {
             "graph_query_traces": bool(rows),
-            "project_id": project_id,
+            "lookup": "trace_id",
         },
+    }
+
+
+def _contract_runtime_parentless_direct_main_selected_scope(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=True,
+        route_token_ref=route_token_ref,
+    )
+    active_chain = (
+        projection.get("active_chain")
+        if isinstance(projection.get("active_chain"), Mapping)
+        else {}
+    )
+    candidates = _runtime_context_service_dedupe(
+        [
+            str(projection.get("root_contract_execution_id") or "").strip(),
+            str(projection.get("current_contract_execution_id") or "").strip(),
+            *[
+                str(item or "").strip()
+                for item in active_chain.get("execution_ids") or []
+            ],
+        ]
+    )
+    runtime = _contract_runtime(conn)
+    selected_execution_id = ""
+    for execution_id in candidates:
+        if not execution_id.startswith("onboard-service-"):
+            continue
+        try:
+            record = runtime.store.get(execution_id)
+        except ContractRuntimeError:
+            continue
+        if (
+            _onboard_service_record(record)
+            and str(record.get("project_id") or "").strip() == project_id
+            and str(record.get("backlog_id") or "").strip() == backlog_id
+        ):
+            selected_execution_id = execution_id
+            break
+    return {
+        "schema_version": "parentless_direct_main_selected_scope.v1",
+        "resolved": bool(selected_execution_id),
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": selected_execution_id,
+        "selection_source": "backlog_contract_chain_current",
+        "candidate_execution_ids": candidates,
+        "projection_source": str(projection.get("projection_source") or ""),
+    }
+
+
+def _contract_runtime_parentless_direct_main_append_graph_trace_gate(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    caller_task_id: str,
+    route_gate: Mapping[str, Any],
+    route_identity: Mapping[str, Any],
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Re-derive direct-main graph authority before appending immutable evidence."""
+
+    from . import task_timeline
+
+    trace_ids = _runtime_context_service_dedupe(
+        [
+            str(trace_id or "").strip()
+            for trace_id in task_timeline._event_deep_string_list(
+                event,
+                _PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_KEYS,
+            )
+        ]
+    )
+    valid_trace_ids = [
+        trace_id
+        for trace_id in trace_ids
+        if _is_plausible_graph_trace_id(trace_id)
+    ]
+    invalid_trace_ids = [
+        trace_id
+        for trace_id in trace_ids
+        if not _is_plausible_graph_trace_id(trace_id)
+    ]
+    selected_scope = _contract_runtime_parentless_direct_main_selected_scope(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=str(route_identity.get("route_token_ref") or ""),
+    )
+    expected_task_id = str(
+        selected_scope.get("contract_execution_id") or ""
+    ).strip()
+    db_evidence = _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=expected_task_id,
+        trace_ids=valid_trace_ids,
+        route_identity=route_identity,
+    )
+    identity_mismatches: list[dict[str, str]] = []
+    supplied_task_id = str(caller_task_id or "").strip()
+    if expected_task_id and supplied_task_id != expected_task_id:
+        identity_mismatches.append(
+            {
+                "field": "task_id",
+                "source": "task_timeline_append",
+                "expected": expected_task_id,
+                "actual": supplied_task_id,
+            }
+        )
+    route_scope = (
+        route_gate.get("scope")
+        if isinstance(route_gate.get("scope"), Mapping)
+        else {}
+    )
+    route_scope_task_id = str(route_scope.get("task_id") or "").strip()
+    if expected_task_id and route_scope_task_id != expected_task_id:
+        identity_mismatches.append(
+            {
+                "field": "task_id",
+                "source": "route_token_scope",
+                "expected": expected_task_id,
+                "actual": route_scope_task_id,
+            }
+        )
+    identity_mismatches.extend(
+        dict(item)
+        for item in db_evidence.get("identity_mismatches") or []
+        if isinstance(item, Mapping)
+    )
+    missing: list[str] = []
+    if not selected_scope.get("resolved"):
+        missing.append("parentless_direct_main_contract_runtime_scope")
+    if not trace_ids:
+        missing.append("graph_trace_ids_nonempty")
+    if invalid_trace_ids:
+        missing.append("graph_trace_ids_plausible")
+    if valid_trace_ids and not db_evidence.get("db_verified"):
+        missing.append("graph_trace_ids_db_verified")
+    if identity_mismatches:
+        missing.append("graph_trace_identity_matches_parentless_scope")
+        if any(item.get("field") == "task_id" for item in identity_mismatches):
+            missing.append("graph_trace_task_id_db_verified")
+    missing = list(dict.fromkeys(missing))
+    passed = bool(valid_trace_ids and expected_task_id) and not missing
+    return {
+        "schema_version": (
+            "parentless_direct_main_append_graph_trace_gate.v1"
+        ),
+        "required": True,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "missing_requirement_ids": missing,
+        "trace_ids": valid_trace_ids,
+        "invalid_trace_ids": invalid_trace_ids,
+        "identity_mismatches": identity_mismatches,
+        "db_evidence": db_evidence,
+        "selected_scope": selected_scope,
+        "persisted_as_accepted": False,
+        "historical_backfill_allowed": False,
     }
 
 
@@ -95264,6 +95497,7 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
     conn,
     *,
     project_id: str,
+    backlog_id: str,
     task_id: str,
     timeline_events: list[dict[str, Any]],
     direct_event: Mapping[str, Any],
@@ -95410,8 +95644,10 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
     db_evidence = _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
         conn,
         project_id=project_id,
+        backlog_id=backlog_id,
         task_id=task_id,
         trace_ids=trace_ids,
+        route_identity=direct_identity,
     )
     missing: list[str] = []
     if not candidate_events:
@@ -95683,6 +95919,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
     graph_trace_gate = _contract_runtime_parentless_direct_main_graph_trace_gate(
         conn,
         project_id=project_id,
+        backlog_id=bug_id,
         task_id=requested_execution_id,
         timeline_events=events,
         direct_event=direct_event,
@@ -97881,6 +98118,21 @@ def handle_task_timeline_append(ctx: RequestContext):
             direct_identity = _observer_root_route_identity_from_event(
                 provisional_event
             )
+            pre_mutation_graph_trace_gate = (
+                _contract_runtime_parentless_direct_main_append_graph_trace_gate(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=str(
+                        ctx.body.get("backlog_id") or ""
+                    ).strip(),
+                    caller_task_id=str(
+                        ctx.body.get("task_id") or ""
+                    ).strip(),
+                    route_gate=route_gate,
+                    route_identity=direct_identity,
+                    event=provisional_event,
+                )
+            )
             direct_authority_gate = (
                 task_timeline.observer_direct_pre_mutation_authority_gate(
                     provisional_event,
@@ -97897,6 +98149,9 @@ def handle_task_timeline_append(ctx: RequestContext):
                     row_declared_files=_backlog_declared_direct_file_scope(
                         conn,
                         str(ctx.body.get("backlog_id") or "").strip(),
+                    ),
+                    pre_mutation_graph_trace_gate=(
+                        pre_mutation_graph_trace_gate
                     ),
                 )
             )
@@ -97936,6 +98191,12 @@ def handle_task_timeline_append(ctx: RequestContext):
                 "event_allowed_files": direct_authority_gate.get(
                     "event_allowed_files",
                     [],
+                ),
+                "pre_implementation_graph_trace_gate": (
+                    pre_mutation_graph_trace_gate
+                ),
+                "graph_trace_db_evidence": (
+                    pre_mutation_graph_trace_gate.get("db_evidence") or {}
                 ),
                 "missing_requirement_ids": [],
                 "historical_backfill_allowed": False,
