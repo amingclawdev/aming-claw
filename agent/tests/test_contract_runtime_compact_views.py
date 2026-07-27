@@ -297,6 +297,326 @@ def test_visualization_builder_is_public_safe_and_keeps_authority_axes_separate(
         assert forbidden_key not in encoded
 
 
+def _lane_visualization_fixture(lane):
+    from agent.governance.contract_runtime_visualization import (
+        build_contract_runtime_visualization,
+    )
+
+    lane_contract_ids = {
+        "direct_main": "direct_main.v1",
+        "mf_parallel": "mf_parallel.v2",
+        "mf_batch_parallel": "mf_batch_parallel.v1",
+    }
+    root_execution_id = f"cex-{lane}-root"
+    current_execution_id = (
+        root_execution_id
+        if lane == "direct_main"
+        else f"cex-{lane}-worker-current"
+    )
+
+    def runtime_record(
+        execution_id,
+        *,
+        parent_execution_id="",
+        current=False,
+    ):
+        completed_lines = []
+        next_legal_action = None
+        if current:
+            completed_lines = [
+                {
+                    "stage_id": "implementation",
+                    "line_id": "worker_implementation",
+                    "evidence_kind": "implementation",
+                    "owner_role": "worker",
+                    "status": "accepted",
+                    "source_ref": "timeline:41",
+                },
+                {
+                    "stage_id": "recovery",
+                    "line_id": "audited_bypass_waiver",
+                    "evidence_kind": "audited_bypass",
+                    "owner_role": "observer",
+                    "status": "PASSED",
+                    "decision": "waive",
+                    "classification": "system_block",
+                    "diagnostic_backlog_id": "AC-LANE-DIAGNOSTIC",
+                    "payload": {
+                        "session_token": f"session-secret-{lane}",
+                        "raw_evidence": f"line-secret-{lane}",
+                    },
+                    "source_ref": "timeline:42",
+                },
+            ]
+            next_legal_action = {
+                "id": "runtime-stale-action",
+                "action": "runtime_stale_action",
+                "stage_id": "stale",
+                "line_id": "runtime_stale_line",
+                "owner_role": "worker",
+                "allowed_writer_roles": ["worker"],
+            }
+        return {
+            "project_id": "proj",
+            "backlog_id": "AC-VISUAL-LANE",
+            "contract_execution_id": execution_id,
+            "parent_contract_execution_id": parent_execution_id,
+            "root_contract_execution_id": root_execution_id,
+            "contract_chain_id": f"cchain-{lane}",
+            "contract_id": lane_contract_ids[lane],
+            "revision": "rev1",
+            "definition_hash": "sha256:" + "1" * 64,
+            "execution_state_revision": 4,
+            "execution_state": {
+                "execution_state_hash": "sha256:" + "2" * 64,
+            },
+            "route_token_ref": f"rtok-secret-{lane}",
+            "session_token_ref": f"sesref-secret-{lane}",
+            "worktree_path": f"/private/.worktrees/{lane}",
+            "runtime_guide": {
+                "runtime_guide_hash": "sha256:" + "3" * 64,
+                "next_legal_action": next_legal_action,
+            },
+            "completed_lines": completed_lines,
+        }
+
+    records = []
+    chain_edges = []
+    if lane == "direct_main":
+        records.append(runtime_record(root_execution_id, current=True))
+    else:
+        records.append(runtime_record(root_execution_id))
+        records.append(
+            runtime_record(
+                current_execution_id,
+                parent_execution_id=root_execution_id,
+                current=True,
+            )
+        )
+        chain_edges.append(
+            {
+                "parent_contract_execution_id": root_execution_id,
+                "child_contract_execution_id": current_execution_id,
+                "edge_kind": "worker_dispatch",
+                "source_ref": "timeline:40",
+            }
+        )
+        if lane == "mf_batch_parallel":
+            sibling_execution_id = f"cex-{lane}-worker-sibling"
+            records.append(
+                runtime_record(
+                    sibling_execution_id,
+                    parent_execution_id=root_execution_id,
+                )
+            )
+            chain_edges.append(
+                {
+                    "parent_contract_execution_id": root_execution_id,
+                    "child_contract_execution_id": sibling_execution_id,
+                    "edge_kind": "batch_candidate",
+                    "source_ref": "timeline:39",
+                }
+            )
+
+    chain_action = {
+        "id": "chain-current-action",
+        "action": "observer_merge_candidate",
+        "stage_id": "merge",
+        "line_id": "observer_merge_candidate",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "contract_execution_id": current_execution_id,
+        "execution_state_revision": 5,
+    }
+    return build_contract_runtime_visualization(
+        project_id="proj",
+        backlog={
+            "bug_id": "AC-VISUAL-LANE",
+            "title": "Lane-independent visual read model",
+            "status": "OPEN",
+            "priority": "P0",
+        },
+        runtime_records=records,
+        chain_current={
+            "contract_chain_id": f"cchain-{lane}",
+            "root_contract_execution_id": root_execution_id,
+            "current_contract_execution_id": current_execution_id,
+            "current_contract_id": lane_contract_ids[lane],
+            "readiness_state": "contract_active",
+            "generation": 5,
+            "projection_watermark": 42,
+            "projection_hash": "sha256:" + "4" * 64,
+            "next_legal_action": chain_action,
+            "source_refs": ["timeline:42"],
+        },
+        chain_edges=chain_edges,
+        timeline_events=[
+            {
+                "id": 42,
+                "backlog_id": "AC-VISUAL-LANE",
+                "task_id": f"task-{lane}",
+                "event_type": "contract_runtime.line_accepted",
+                "event_kind": "contract_runtime_line_accepted",
+                "phase": "recovery",
+                "actor": "observer",
+                "status": "accepted",
+                "payload": {
+                    "route_token_ref": f"rtok-event-secret-{lane}",
+                    "raw_secret": f"event-secret-{lane}",
+                },
+                "payload_ref": {
+                    "event_id": 42,
+                    "payload_sha256": "sha256:" + "5" * 64,
+                    "payload_bytes": 2048,
+                },
+            }
+        ],
+        legacy_compatibility_sources=[
+            {
+                "id": 38,
+                "event_kind": "legacy_gate",
+                "status": "blocked",
+                "payload": {
+                    "blocker": "legacy route disagrees with current authority",
+                    "diagnostic_backlog_id": "AC-LANE-DIAGNOSTIC",
+                    "route_token_ref": f"rtok-legacy-secret-{lane}",
+                },
+            }
+        ],
+        compact_ledger_row={
+            "backlog_id": "AC-VISUAL-LANE",
+            "contract_execution_id": current_execution_id,
+            "readiness_state": "contract_active",
+            "projection_generation": 5,
+            "projection_watermark": 42,
+            "projection_hash": "sha256:" + "4" * 64,
+        },
+        timeline_total=1,
+        generated_at="2026-07-27T00:00:00Z",
+    )
+
+
+@pytest.mark.parametrize(
+    "lane",
+    ["direct_main", "mf_parallel", "mf_batch_parallel"],
+)
+def test_visualization_lane_fixtures_share_ai_consumable_authority_contract(lane):
+    result = _lane_visualization_fixture(lane)
+    encoded = json.dumps(result, sort_keys=True)
+
+    assert result["schema_version"] == "contract_runtime.visualization.v1"
+    assert result["public_safe"] is True
+    assert result["read_only"] is True
+    assert result["authority"] == {
+        "schema_version": "contract_runtime.visualization.authority.v1",
+        "source_order": [
+            "contract_runtime_current",
+            "backlog_contract_chain_current",
+            "task_timeline_compact_ledger",
+            "legacy_diagnostics",
+        ],
+        "source_of_authority": "contract_runtime",
+        "authority_decision_source": "backlog_contract_chain_current",
+        "axes": [
+            "contract_execution_progress",
+            "backlog_close_readiness",
+            "historical_diagnostics",
+        ],
+        "legacy_sources_advisory_only": True,
+    }
+
+    expected_action = {
+        "id": "chain-current-action",
+        "action": "observer_merge_candidate",
+        "stage_id": "merge",
+        "line_id": "observer_merge_candidate",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "contract_execution_id": result["contract_chain"][
+            "current_contract_execution_id"
+        ],
+        "execution_state_revision": 5,
+    }
+    assert result["contract_execution_progress"]["next_legal_action"] == (
+        expected_action
+    )
+    assert result["contract_chain"]["next_legal_action"] == expected_action
+    assert "runtime_stale_action" not in encoded
+    assert result["backlog_close_readiness"]["state"] == "open"
+    assert result["backlog_close_readiness"][
+        "contract_complete_implies_backlog_close"
+    ] is False
+
+    bypass_line = next(
+        line
+        for line in result["contract_execution_progress"]["line_states"]
+        if line["bypassed"]
+    )
+    assert bypass_line["status"] == "bypassed"
+    assert bypass_line["bypass"]["no_pass_claim"] is True
+    assert result["bypass_records"] == [
+        {
+            **bypass_line["bypass"],
+            "contract_execution_id": bypass_line["contract_execution_id"],
+            "stage_id": "recovery",
+            "line_id": "audited_bypass_waiver",
+            "status": "bypassed",
+            "source_ref": "timeline:42",
+        }
+    ]
+    bypass_node = next(
+        node
+        for node in result["dag"]["nodes"]
+        if node["id"] == bypass_line["id"]
+    )
+    assert bypass_node["status"] == "bypassed"
+    assert bypass_node["bypassed"] is True
+
+    assert result["dag"]["schema_version"] == (
+        "contract_runtime.visualization.dag.v1"
+    )
+    assert result["dag"]["typed_edges"] is True
+    assert all(
+        edge["source"] and edge["target"] and edge["relationship"]
+        for edge in result["dag"]["edges"]
+    )
+    assert {
+        "contract_execution_progress",
+        "backlog_close_readiness",
+        "contract_chain",
+        "timeline",
+        "dag",
+        "bypass_records",
+        "raw_compatibility",
+        "repair_targets",
+        "projection_freshness",
+    } <= set(result)
+    assert result["raw_compatibility"]["advisory_only"] is True
+    assert result["raw_compatibility"]["overrides_current_authority"] is False
+    assert result["projection_conflict_count"] == 0
+
+    for secret in (
+        f"rtok-secret-{lane}",
+        f"sesref-secret-{lane}",
+        f"/private/.worktrees/{lane}",
+        f"session-secret-{lane}",
+        f"line-secret-{lane}",
+        f"rtok-event-secret-{lane}",
+        f"event-secret-{lane}",
+        f"rtok-legacy-secret-{lane}",
+    ):
+        assert secret not in encoded
+    for private_key in (
+        "route_token_ref",
+        "session_token_ref",
+        "worktree_path",
+        "session_token",
+        "raw_secret",
+        "raw_evidence",
+    ):
+        assert private_key not in encoded
+
+
 @pytest.mark.parametrize("blocked_value", [False, 0, ""])
 def test_visualization_legacy_blocked_false_values_are_non_blocking(blocked_value):
     from agent.governance.contract_runtime_visualization import (
