@@ -92135,6 +92135,8 @@ def _contract_runtime_mf_parallel_close_authority_gate(
     close_commit: str,
     conn=None,
     project_id: str = "",
+    backlog_id: str = "",
+    requested_contract_execution_id: str = "",
 ) -> dict[str, Any]:
     if not _contract_runtime_server_derived_close_authority(chain_projection):
         return {}
@@ -92181,18 +92183,156 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         for item in records
         if str(item.get("contract_execution_id") or "").strip()
     }
+    requested_execution_id = str(
+        requested_contract_execution_id or ""
+    ).strip()
+    requested_selector_diagnostics: list[dict[str, Any]] = []
+    if requested_execution_id:
+        selected_contract_execution_id = requested_execution_id
+        record_selection_source = "requested_contract_execution_id"
+        requested_record = all_records_by_execution_id.get(
+            requested_execution_id
+        )
+        if not requested_execution_id.startswith("cex-"):
+            requested_selector_diagnostics.append(
+                {
+                    "field": "requested_contract_execution_id",
+                    "expected": "cex-*",
+                    "actual": requested_execution_id,
+                    "reason": "invalid_execution_id",
+                }
+            )
+        elif requested_record is None:
+            requested_selector_diagnostics.append(
+                {
+                    "field": "requested_contract_execution_id",
+                    "expected": sorted(records_by_execution_id),
+                    "actual": requested_execution_id,
+                    "reason": "execution_not_in_close_authority_chain",
+                }
+            )
+        else:
+            requested_project_id = str(
+                requested_record.get("project_id") or ""
+            ).strip()
+            requested_backlog_id = str(
+                requested_record.get("backlog_id") or ""
+            ).strip()
+            active_chain = (
+                chain_projection.get("active_chain")
+                if isinstance(
+                    chain_projection.get("active_chain"),
+                    Mapping,
+                )
+                else {}
+            )
+            active_chain_execution_ids = {
+                str(item or "").strip()
+                for item in active_chain.get("execution_ids") or []
+                if str(item or "").strip()
+            }
+            if not _is_mf_parallel_record_contract_id(
+                str(requested_record.get("contract_id") or "")
+            ):
+                requested_selector_diagnostics.append(
+                    {
+                        "field": "contract_id",
+                        "expected": "mf_parallel",
+                        "actual": str(
+                            requested_record.get("contract_id") or ""
+                        ),
+                        "reason": "requested_execution_not_mf_parallel",
+                    }
+                )
+            if project_id and requested_project_id != project_id:
+                requested_selector_diagnostics.append(
+                    {
+                        "field": "project_id",
+                        "expected": project_id,
+                        "actual": requested_project_id,
+                        "reason": "requested_execution_project_mismatch",
+                    }
+                )
+            if backlog_id and requested_backlog_id != backlog_id:
+                requested_selector_diagnostics.append(
+                    {
+                        "field": "backlog_id",
+                        "expected": backlog_id,
+                        "actual": requested_backlog_id,
+                        "reason": "requested_execution_backlog_mismatch",
+                    }
+                )
+            if (
+                active_chain_execution_ids
+                and requested_execution_id
+                not in active_chain_execution_ids
+            ):
+                requested_selector_diagnostics.append(
+                    {
+                        "field": "active_chain.execution_ids",
+                        "expected": sorted(active_chain_execution_ids),
+                        "actual": requested_execution_id,
+                        "reason": (
+                            "requested_execution_not_in_active_chain"
+                        ),
+                    }
+                )
+            requested_close_ready = any(
+                (
+                    str(line.get("line_id") or "").strip()
+                    == "observer_close_ready"
+                    and str(line.get("evidence_kind") or "").strip()
+                    == "close_ready"
+                    and str(line.get("actor_role") or "").strip()
+                    == "observer"
+                    and _contract_runtime_line_status_passes(line)
+                )
+                for line in _contract_runtime_completed_line_items(
+                    requested_record
+                )
+            )
+            if not (
+                _runtime_record_is_complete(requested_record)
+                and requested_close_ready
+            ):
+                requested_selector_diagnostics.append(
+                    {
+                        "field": "runtime_guide.next_legal_action",
+                        "expected": None,
+                        "actual": (
+                            requested_record.get("runtime_guide", {}).get(
+                                "next_legal_action"
+                            )
+                            if isinstance(
+                                requested_record.get("runtime_guide"),
+                                Mapping,
+                            )
+                            else "missing_runtime_guide"
+                        ),
+                        "reason": (
+                            "requested_mf_parallel_execution_incomplete"
+                        ),
+                    }
+                )
+        if not requested_selector_diagnostics:
+            record = requested_record
+
     skipped_non_mf_selector = False
-    for candidate_id, candidate_source in selector_candidates:
-        candidate_record = all_records_by_execution_id.get(candidate_id)
-        if candidate_record is not None and not _is_mf_parallel_record_contract_id(
-            str(candidate_record.get("contract_id") or "")
-        ):
-            skipped_non_mf_selector = True
-            continue
-        selected_contract_execution_id = candidate_id
-        record_selection_source = candidate_source
-        record = records_by_execution_id.get(candidate_id)
-        break
+    if not requested_execution_id:
+        for candidate_id, candidate_source in selector_candidates:
+            candidate_record = all_records_by_execution_id.get(candidate_id)
+            if (
+                candidate_record is not None
+                and not _is_mf_parallel_record_contract_id(
+                    str(candidate_record.get("contract_id") or "")
+                )
+            ):
+                skipped_non_mf_selector = True
+                continue
+            selected_contract_execution_id = candidate_id
+            record_selection_source = candidate_source
+            record = records_by_execution_id.get(candidate_id)
+            break
     if (
         record is None
         and not selected_contract_execution_id
@@ -92205,7 +92345,9 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         ).strip()
         record_selection_source = "unique_mf_parallel_child_of_selected_parent"
 
-    if record is None and selector_candidates:
+    if record is None and (
+        requested_execution_id or selector_candidates
+    ):
         return {
             "schema_version": "contract_runtime_mf_parallel_close_authority_gate.v1",
             "accepted": False,
@@ -92218,11 +92360,19 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             "close_commit": close_commit,
             "record_selection_source": record_selection_source,
             "authoritative_selector_present": True,
+            "requested_contract_execution_id": requested_execution_id,
+            "requested_selector_diagnostics": (
+                requested_selector_diagnostics
+            ),
             "available_mf_parallel_contract_execution_ids": sorted(
                 records_by_execution_id
             ),
             "missing_requirement_ids": [
-                "contract_runtime.current_mf_parallel_execution"
+                (
+                    "contract_runtime.requested_mf_parallel_execution"
+                    if requested_execution_id
+                    else "contract_runtime.current_mf_parallel_execution"
+                )
             ],
             "source_refs": [],
             "line_sources": {},
@@ -92868,7 +93018,11 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         "contract_execution_id": contract_execution_id,
         "close_commit": close_commit,
         "record_selection_source": record_selection_source,
-        "authoritative_selector_present": bool(selector_candidates),
+        "authoritative_selector_present": bool(
+            requested_execution_id or selector_candidates
+        ),
+        "requested_contract_execution_id": requested_execution_id,
+        "requested_selector_diagnostics": requested_selector_diagnostics,
         "available_mf_parallel_contract_execution_ids": sorted(
             records_by_execution_id
         ),
@@ -95459,6 +95613,8 @@ def _contract_runtime_close_authority_projection(
         close_commit=close_commit,
         conn=conn,
         project_id=project_id,
+        backlog_id=bug_id,
+        requested_contract_execution_id=contract_execution_id,
     )
 
     projected_events = _contract_runtime_close_authority_seed_events(
