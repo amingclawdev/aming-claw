@@ -70182,7 +70182,6 @@ def _contract_runtime_server_line_identity(
             source_line_id == "observer_close_ready"
             and str(source.get("actor_role") or "").strip() == "observer"
             and str(source.get("evidence_kind") or "").strip() == "close_ready"
-            and durable_merge_identity["identity_status"] == "resolved"
         ):
             payload = (
                 source.get("payload")
@@ -70198,37 +70197,34 @@ def _contract_runtime_server_line_identity(
             payload_worker_task_id = _contract_runtime_mapping_value(
                 payload, "worker_task_id"
             )
-            if (
-                contract_execution_id
+            runtime_context_id = durable_merge_identity["runtime_context_id"]
+            task_id = durable_merge_identity["task_id"]
+            parent_task_id = durable_merge_identity["parent_task_id"]
+            retained_contract_envelope = bool(
+                durable_merge_identity["identity_status"] == "resolved"
+                and contract_execution_id
                 and _contract_runtime_mapping_value(source, "task_id")
                 == contract_execution_id
-                and payload_runtime_context_id
-                and payload_worker_task_id
-            ):
-                runtime_context_id = durable_merge_identity["runtime_context_id"]
-                task_id = durable_merge_identity["task_id"]
-                parent_task_id = durable_merge_identity["parent_task_id"]
-                mismatched = bool(
-                    payload_runtime_context_id != runtime_context_id
-                    or payload_worker_task_id != task_id
-                    or _contract_runtime_mapping_value(
-                        source, "runtime_context_id"
-                    )
-                    not in {"", runtime_context_id}
-                    or _contract_runtime_mapping_value(source, "worker_task_id")
-                    not in {"", task_id}
-                    or _contract_runtime_mapping_value(payload, "task_id")
-                    not in {"", task_id, contract_execution_id}
-                    or _contract_runtime_mapping_value(payload, "parent_task_id")
-                    not in {"", parent_task_id}
+                and payload_runtime_context_id == runtime_context_id
+                and payload_worker_task_id == task_id
+                and _contract_runtime_mapping_value(
+                    source, "runtime_context_id"
                 )
-                if mismatched:
-                    return {
-                        **empty,
-                        "identity_status": "ambiguous",
-                        "identity_source_line_id": source_line_id,
-                    }
+                in {"", runtime_context_id}
+                and _contract_runtime_mapping_value(source, "worker_task_id")
+                in {"", task_id}
+                and _contract_runtime_mapping_value(payload, "task_id")
+                in {"", task_id, contract_execution_id}
+                and _contract_runtime_mapping_value(payload, "parent_task_id")
+                in {"", parent_task_id}
+            )
+            if retained_contract_envelope:
                 return durable_merge_identity
+            return {
+                **empty,
+                "identity_status": "ambiguous",
+                "identity_source_line_id": source_line_id,
+            }
         if source_line_id == "observer_merge":
             merge_identity = _contract_runtime_durable_merge_identity(source)
             if merge_identity.get("identity_status") != "missing":
