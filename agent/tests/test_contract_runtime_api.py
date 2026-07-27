@@ -462,6 +462,7 @@ def test_trusted_merge_uses_one_coherent_worker_identity_after_close_ready(
     contract_execution_id = "cex-f711"
     runtime_context_id = "mfrctx-f711"
     task_id = "worker-f711"
+    root_task_id = "onboard-root-f711"
     context = SimpleNamespace(
         runtime_context_id=runtime_context_id,
         task_id=task_id,
@@ -487,9 +488,24 @@ def test_trusted_merge_uses_one_coherent_worker_identity_after_close_ready(
             },
             {
                 "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge",
                 "runtime_context_id": runtime_context_id,
                 "task_id": task_id,
                 "parent_task_id": contract_execution_id,
+                "payload": {
+                    "durable_merge_authority": {
+                        "schema_version": (
+                            "contract_runtime."
+                            "observer_merge_durable_authority.v1"
+                        ),
+                        "server_derived": True,
+                        "db_verified": True,
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": task_id,
+                        "parent_task_id": contract_execution_id,
+                    }
+                },
             },
             {
                 "line_id": "observer_reconcile",
@@ -500,8 +516,16 @@ def test_trusted_merge_uses_one_coherent_worker_identity_after_close_ready(
             },
             {
                 "line_id": "observer_close_ready",
+                "actor_role": "observer",
+                "evidence_kind": "close_ready",
+                "runtime_context_id": runtime_context_id,
                 "task_id": contract_execution_id,
-                "payload": {"status": "passed"},
+                "parent_task_id": root_task_id,
+                "payload": {
+                    "status": "passed",
+                    "runtime_context_id": runtime_context_id,
+                    "worker_task_id": task_id,
+                },
             },
         ],
     }
@@ -552,6 +576,85 @@ def test_trusted_merge_uses_one_coherent_worker_identity_after_close_ready(
     assert projection["authority_verified"] is True
     assert projection["runtime_context_id"] == runtime_context_id
     assert projection["task_id"] == task_id
+
+    conflicting_close_ready = copy.deepcopy(record)
+    conflicting_close_ready["completed_lines"][-1]["payload"][
+        "worker_task_id"
+    ] = "worker-f711-conflict"
+    conflicting_identity = server._contract_runtime_server_line_identity(
+        conflicting_close_ready
+    )
+    assert conflicting_identity == {
+        "runtime_context_id": "",
+        "task_id": "",
+        "parent_task_id": "",
+        "identity_status": "ambiguous",
+        "identity_source_line_id": "observer_close_ready",
+    }
+    conflicting_projection = server._contract_runtime_trusted_merge_projection(
+        object(),
+        project_id=project_id,
+        record=conflicting_close_ready,
+    )
+    assert conflicting_projection["timeline_verified"] is False
+    assert conflicting_projection["identity_mismatches"] == [
+        {
+            "field": "server_line_identity",
+            "expected": "one coherent runtime_context_id/task_id tuple",
+            "actual": "ambiguous",
+            "source_line_id": "observer_close_ready",
+        }
+    ]
+
+
+def test_server_line_identity_rejects_direct_worker_shaped_close_ready():
+    runtime_context_id = "mfrctx-f711"
+    task_id = "worker-f711"
+    contract_execution_id = "cex-f711"
+    record = {
+        "contract_execution_id": contract_execution_id,
+        "completed_lines": [
+            {
+                "line_id": "observer_merge",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": contract_execution_id,
+                "payload": {
+                    "durable_merge_authority": {
+                        "schema_version": (
+                            "contract_runtime."
+                            "observer_merge_durable_authority.v1"
+                        ),
+                        "server_derived": True,
+                        "db_verified": True,
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": task_id,
+                        "parent_task_id": contract_execution_id,
+                    }
+                },
+            },
+            {
+                "line_id": "observer_close_ready",
+                "actor_role": "observer",
+                "evidence_kind": "close_ready",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": contract_execution_id,
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "worker_task_id": task_id,
+                },
+            },
+        ],
+    }
+
+    assert server._contract_runtime_server_line_identity(record) == {
+        "runtime_context_id": "",
+        "task_id": "",
+        "parent_task_id": "",
+        "identity_status": "ambiguous",
+        "identity_source_line_id": "observer_close_ready",
+    }
 
 
 def test_server_line_identity_rejects_ambiguous_single_line_scope(

@@ -70087,6 +70087,63 @@ def _contract_runtime_requested_trace_ids(
     return _runtime_context_service_dedupe(values)
 
 
+def _contract_runtime_durable_merge_identity(
+    line: Mapping[str, Any],
+) -> dict[str, str]:
+    empty = {
+        "runtime_context_id": "",
+        "task_id": "",
+        "parent_task_id": "",
+        "identity_status": "missing",
+        "identity_source_line_id": "",
+    }
+    if str(line.get("line_id") or "").strip() != "observer_merge":
+        return empty
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    durable = (
+        payload.get("durable_merge_authority")
+        if isinstance(payload.get("durable_merge_authority"), Mapping)
+        else {}
+    )
+    if not durable:
+        return empty
+    identity = {
+        key: _contract_runtime_mapping_value(durable, key)
+        for key in ("runtime_context_id", "task_id", "parent_task_id")
+    }
+    top_level_identity = {
+        "runtime_context_id": _contract_runtime_mapping_value(
+            line, "runtime_context_id"
+        ),
+        "task_id": _contract_runtime_mapping_value(line, "task_id", "worker_task_id"),
+        "parent_task_id": _contract_runtime_mapping_value(
+            line, "parent_task_id", "root_task_id"
+        ),
+    }
+    valid = bool(
+        str(durable.get("schema_version") or "")
+        == _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
+        and durable.get("server_derived") is True
+        and durable.get("db_verified") is True
+        and all(identity.values())
+        and all(
+            not value or value == identity[field]
+            for field, value in top_level_identity.items()
+        )
+    )
+    if not valid:
+        return {
+            **empty,
+            "identity_status": "ambiguous",
+            "identity_source_line_id": "observer_merge",
+        }
+    return {
+        **identity,
+        "identity_status": "resolved",
+        "identity_source_line_id": "observer_merge",
+    }
+
+
 def _contract_runtime_server_line_identity(
     record: Mapping[str, Any],
 ) -> dict[str, str]:
@@ -70110,80 +70167,74 @@ def _contract_runtime_server_line_identity(
             )
         ],
     ]
+    latest_merge = next(
+        (
+            line
+            for line in reversed(record.get("completed_lines") or [])
+            if isinstance(line, Mapping)
+            and str(line.get("line_id") or "").strip() == "observer_merge"
+        ),
+        {},
+    )
+    durable_merge_identity = _contract_runtime_durable_merge_identity(latest_merge)
     for source_line_id, source in sources:
-        if source_line_id == "observer_merge":
+        if (
+            source_line_id == "observer_close_ready"
+            and str(source.get("actor_role") or "").strip() == "observer"
+            and str(source.get("evidence_kind") or "").strip() == "close_ready"
+        ):
             payload = (
                 source.get("payload")
                 if isinstance(source.get("payload"), Mapping)
                 else {}
             )
-            durable = (
-                payload.get("durable_merge_authority")
-                if isinstance(payload.get("durable_merge_authority"), Mapping)
-                else {}
+            contract_execution_id = str(
+                record.get("contract_execution_id") or ""
+            ).strip()
+            payload_runtime_context_id = _contract_runtime_mapping_value(
+                payload, "runtime_context_id"
             )
-            if durable:
-                durable_identity = {
-                    "runtime_context_id": _contract_runtime_mapping_value(
-                        durable,
-                        "runtime_context_id",
-                    ),
-                    "task_id": _contract_runtime_mapping_value(
-                        durable,
-                        "task_id",
-                    ),
-                    "parent_task_id": _contract_runtime_mapping_value(
-                        durable,
-                        "parent_task_id",
-                    ),
-                }
-                top_level_identity = {
-                    "runtime_context_id": _contract_runtime_mapping_value(
-                        source,
-                        "runtime_context_id",
-                    ),
-                    "task_id": _contract_runtime_mapping_value(
-                        source,
-                        "task_id",
-                        "worker_task_id",
-                    ),
-                    "parent_task_id": _contract_runtime_mapping_value(
-                        source,
-                        "parent_task_id",
-                        "root_task_id",
-                    ),
-                }
-                durable_is_server_authority = bool(
-                    str(durable.get("schema_version") or "")
-                    == _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
-                    and durable.get("server_derived") is True
-                    and durable.get("db_verified") is True
-                    and durable_identity["runtime_context_id"]
-                    and durable_identity["task_id"]
-                    and durable_identity["parent_task_id"]
+            payload_worker_task_id = _contract_runtime_mapping_value(
+                payload, "worker_task_id"
+            )
+            runtime_context_id = durable_merge_identity["runtime_context_id"]
+            task_id = durable_merge_identity["task_id"]
+            parent_task_id = durable_merge_identity["parent_task_id"]
+            retained_contract_envelope = bool(
+                durable_merge_identity["identity_status"] == "resolved"
+                and contract_execution_id
+                and _contract_runtime_mapping_value(source, "task_id")
+                == contract_execution_id
+                and payload_runtime_context_id == runtime_context_id
+                and payload_worker_task_id == task_id
+                and _contract_runtime_mapping_value(
+                    source, "runtime_context_id"
                 )
-                top_level_mismatches = [
-                    field
-                    for field, value in top_level_identity.items()
-                    if value and value != durable_identity[field]
-                ]
-                if not durable_is_server_authority or top_level_mismatches:
-                    return {
-                        **empty,
-                        "identity_status": "ambiguous",
-                        "identity_source_line_id": source_line_id,
-                    }
+                in {"", runtime_context_id}
+                and _contract_runtime_mapping_value(source, "worker_task_id")
+                in {"", task_id}
+                and _contract_runtime_mapping_value(payload, "task_id")
+                in {"", task_id, contract_execution_id}
+                and _contract_runtime_mapping_value(payload, "parent_task_id")
+                in {"", parent_task_id}
+            )
+            if retained_contract_envelope:
+                return durable_merge_identity
+            return {
+                **empty,
+                "identity_status": "ambiguous",
+                "identity_source_line_id": source_line_id,
+            }
+        if source_line_id == "observer_merge":
+            merge_identity = _contract_runtime_durable_merge_identity(source)
+            if merge_identity.get("identity_status") != "missing":
                 # Accepted observer_merge lines retain their immutable raw
                 # caller payload for audit/playback.  Identity projection,
                 # however, is owned by the durable server authority.  Ignore
                 # conflicting caller-shaped duplicate fields inside payload;
                 # the canonical top level and durable authority still have to
                 # agree, and all later queue/timeline joins remain mandatory.
-                return {
-                    **durable_identity,
-                    "identity_status": "resolved",
-                    "identity_source_line_id": source_line_id,
-                }
+                return merge_identity
         identities: dict[tuple[str, str, str], dict[str, str]] = {}
         for candidate in _contract_runtime_mapping_candidates(source):
             runtime_context_id = _contract_runtime_mapping_value(
