@@ -56924,6 +56924,233 @@ def test_onboard_route_guide_compact_is_role_isolated_and_full_is_compatible(con
     assert "capability_index" in explicit_full["onboard_route_guide"]
 
 
+def _assert_compact_capsule_fetches_every_advertised_section(
+    compact: dict[str, Any],
+) -> None:
+    available = compact["guide_capsule"]["available_sections"]
+    assert compact["contract_execution_id"]
+    assert compact["projection_hash"].startswith("sha256:")
+    authority = compact["evidence_shape_authority"]
+    assert authority["source_of_authority"] == "ContractRuntime"
+    assert authority["read_interfaces"] == [
+        "contract_runtime_current",
+        "runtime_context_worker_guide",
+    ]
+    assert authority["infer_evidence_shape_from_capsule"] is False
+    fetched: set[str] = set()
+    for offset in range(0, len(available), 3):
+        response = server.handle_project_onboard_route_guide_capsule(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "guide_capsule_ref": compact["guide_capsule_ref"],
+                    "sections": available[offset : offset + 3],
+                    "backlog_id": compact["backlog_id"],
+                    "role": compact["selected_role"],
+                    "work_type": compact["selected_work_type"],
+                },
+            )
+        )
+        assert response["ok"] is True, response
+        fetched.update(response["sections"])
+    assert fetched == set(available)
+
+
+def test_contract_bound_direct_main_capsule_mint_validate_hash_and_refresh_terminate(
+    conn,
+):
+    backlog_id = "AC-CAPSULE-CONTRACT-BOUND-DIRECT-MAIN"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    request = _ctx_with_role(
+        {"project_id": PID},
+        "observer",
+        method="POST",
+        body={
+            "backlog_id": backlog_id,
+            "role": "observer",
+            "work_type": "operator_supervised_direct_main",
+            "route_token_ref": "rtok-capsule-direct-main",
+            "response_view": "compact",
+        },
+    )
+
+    for _ in range(3):
+        compact = server.handle_project_onboard_route_guide(request)
+        current = server._onboard_guide_capsule_current_projection(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            route_token_ref="rtok-capsule-direct-main",
+        )
+        assert server._onboard_guide_capsule_projection_identity(current)[
+            "projection_hash"
+        ] == compact["projection_hash"]
+        assert (
+            server._onboard_guide_capsule_validate_current_projection(
+                conn,
+                project_id=PID,
+                guide_capsule_ref=compact["guide_capsule_ref"],
+            )
+            is None
+        )
+        _assert_compact_capsule_fetches_every_advertised_section(compact)
+
+def test_ordinary_mf_parallel_capsule_fetches_all_sections(conn):
+    backlog_id = "AC-CAPSULE-ORDINARY-MF-PARALLEL"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    route_ref = "rtok-capsule-mf-parallel"
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": route_ref,
+            },
+        )
+    )
+    _complete_source_backed_onboarding(
+        conn,
+        started["contract_execution_id"],
+    )
+    entered = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "exercise ordinary mf_parallel capsule projection",
+                "backlog_id": backlog_id,
+                "task_id": "capsule-ordinary-mf-parallel",
+                "route_token_ref": route_ref,
+                "worker_fence": {
+                    "fence_token": "fence-capsule-ordinary-mf-parallel",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    assert entered["ok"] is True
+
+    compact = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "parallel_worker",
+                "route_token_ref": route_ref,
+                "response_view": "compact",
+            },
+        )
+    )
+    assert compact["contract_execution_id"] == entered[
+        "contract_execution_id"
+    ]
+    _assert_compact_capsule_fetches_every_advertised_section(compact)
+
+
+def test_active_mf_batch_epoch_compact_hydrates_projection_and_fetches_all_sections(
+    conn,
+):
+    queue_id = "mq-capsule-active-epoch"
+    backlog_id = "AC-CAPSULE-ACTIVE-EPOCH"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    baseline = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "multi_backlog_parallel",
+                "route_token_ref": "rtok-capsule-active-epoch",
+                "response_view": "compact",
+            },
+        )
+    )
+    task_id = "capsule-active-epoch-task"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="batch-capsule-active-epoch",
+            task_id=task_id,
+            backlog_id=backlog_id,
+            branch_ref="refs/heads/codex/capsule-active-epoch",
+            status="merge_ready",
+            checkpoint_id="checkpoint-capsule-active-epoch",
+            merge_queue_id=queue_id,
+        ),
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-capsule-active-epoch",
+                task_id=task_id,
+                backlog_id=backlog_id,
+                branch_ref="refs/heads/codex/capsule-active-epoch",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="refs/heads/main",
+            )
+        ],
+    )
+    upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id="batch-capsule-active-epoch",
+            epoch_id="integration-epoch-capsule-active",
+            coordination_backlog_id="AC-CAPSULE-BATCH-PARENT",
+            target_ref="refs/heads/main",
+            base_head="base-head",
+            current_head="partial-head",
+            merge_queue_id=queue_id,
+            merge_cursor=0,
+            remaining_queue_item_ids=("item-capsule-active-epoch",),
+            status="merge_in_doubt",
+            active_queue_item_id="item-capsule-active-epoch",
+            active_task_id=task_id,
+            active_backlog_id=backlog_id,
+            active_checkpoint_id="checkpoint-capsule-active-epoch",
+        ),
+    )
+    conn.commit()
+
+    compact = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": "AC-UNRELATED-ACTIVE-EPOCH-REQUEST",
+                "role": "observer",
+                "work_type": "multi_backlog_parallel",
+                "response_view": "compact",
+            },
+        )
+    )
+    assert compact["backlog_id"] == backlog_id
+    assert compact["contract_execution_id"] == baseline[
+        "contract_execution_id"
+    ]
+    assert compact["projection_hash"] != baseline["projection_hash"]
+    assert compact["guide_capsule_ref"] != baseline["guide_capsule_ref"]
+    assert compact["next_legal_action"]["id"] == "resume_batch_merge"
+    _assert_compact_capsule_fetches_every_advertised_section(compact)
+
+
 def test_onboard_guide_capsule_single_flight_revision_invalidation_and_eviction(
     monkeypatch,
 ):

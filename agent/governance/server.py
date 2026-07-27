@@ -70,6 +70,7 @@ from .contracts.runtime import (
     _worker_commit_text,
     _worker_fence_containment,
     _worker_implementation_lineage,
+    contract_chain_projection_hash,
     is_legacy_primary_contract_route,
     read_backlog_contract_chain_current,
     rebuild_backlog_contract_chain_projection,
@@ -63418,13 +63419,7 @@ def _contract_chain_current_with_terminal_bypass_fallback(
         "contract_execution_id": selected_execution_id,
         "source_of_proof": "contract_runtime_executions.completed_lines",
     }
-    current["projection_hash"] = stable_sha256(
-        {
-            key: value
-            for key, value in current.items()
-            if key != "projection_hash"
-        }
-    )
+    current["projection_hash"] = contract_chain_projection_hash(current)
     return current
 
 
@@ -63569,9 +63564,7 @@ def _contract_chain_current_with_runtime_freshness(
     if source_ref not in source_refs:
         source_refs.append(source_ref)
     overlay["source_refs"] = source_refs
-    overlay["projection_hash"] = stable_sha256(
-        {key: value for key, value in overlay.items() if key != "projection_hash"}
-    )
+    overlay["projection_hash"] = contract_chain_projection_hash(overlay)
     return overlay
 
 
@@ -63835,13 +63828,7 @@ def _contract_chain_current_with_backlog_close_blocker(
         # child, downgrade contract_complete, or create a resumable parent.
         overlay = dict(current)
         overlay["historical_backlog_close_blocker_audit"] = dict(action)
-        overlay["projection_hash"] = stable_sha256(
-            {
-                key: value
-                for key, value in overlay.items()
-                if key != "projection_hash"
-            }
-        )
+        overlay["projection_hash"] = contract_chain_projection_hash(overlay)
         return overlay
     overlay = dict(current)
     overlay.update(
@@ -63911,9 +63898,7 @@ def _contract_chain_current_with_backlog_close_blocker(
         }
     )
     overlay.pop("parent_to_resume_contract_execution_id", None)
-    overlay["projection_hash"] = stable_sha256(
-        {key: value for key, value in overlay.items() if key != "projection_hash"}
-    )
+    overlay["projection_hash"] = contract_chain_projection_hash(overlay)
     return overlay
 
 
@@ -80695,20 +80680,22 @@ def _onboard_guide_capsule_scope_identity(
     current_projection: Mapping[str, Any],
     runtime_resume: Mapping[str, Any],
 ) -> dict[str, Any]:
+    current_identity = _onboard_guide_capsule_projection_identity(
+        current_projection
+    )
     contract_execution_id = str(
-        next_action.get("contract_execution_id")
+        current_identity.get("contract_execution_id")
+        or next_action.get("contract_execution_id")
         or next_action.get("current_contract_execution_id")
         or runtime_resume.get("contract_execution_id")
         or runtime_resume.get("current_contract_execution_id")
-        or current_projection.get("current_contract_execution_id")
-        or current_projection.get("contract_execution_id")
         or record.get("contract_execution_id")
         or ""
     ).strip()
     revision = (
-        next_action.get("execution_state_revision")
+        current_identity.get("execution_state_revision")
+        or next_action.get("execution_state_revision")
         or runtime_resume.get("execution_state_revision")
-        or current_projection.get("execution_state_revision")
         or 0
     )
     try:
@@ -80716,31 +80703,26 @@ def _onboard_guide_capsule_scope_identity(
     except (TypeError, ValueError):
         revision = 0
     projection_hash = str(
-        next_action.get("projection_hash")
+        current_identity.get("projection_hash")
+        or next_action.get("projection_hash")
         or runtime_resume.get("projection_hash")
-        or current_projection.get("projection_hash")
-        or current_projection.get("execution_state_hash")
         or ""
     ).strip()
     if not projection_hash:
-        projection_hash = "sha256:" + hashlib.sha256(
-            json.dumps(
-                {
-                    "contract_execution_id": contract_execution_id,
-                    "execution_state_revision": revision,
-                    "line_id": str(next_action.get("line_id") or ""),
-                    "action": str(
-                        next_action.get("action")
-                        or next_action.get("id")
-                        or ""
-                    ),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        projection_hash = contract_chain_projection_hash(
+            {
+                "contract_execution_id": contract_execution_id,
+                "execution_state_revision": revision,
+                "line_id": str(next_action.get("line_id") or ""),
+                "action": str(
+                    next_action.get("action")
+                    or next_action.get("id")
+                    or ""
+                ),
+            }
+        )
     terminal = bool(
-        current_projection.get("terminal") is True
+        current_identity.get("terminal") is True
         or runtime_resume.get("terminal") is True
         or next_action.get("terminal") is True
     )
@@ -80753,6 +80735,46 @@ def _onboard_guide_capsule_scope_identity(
         "execution_state_revision": revision,
         "projection_hash": projection_hash,
         "terminal": terminal,
+    }
+
+
+def _onboard_guide_capsule_projection_identity(
+    projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the exact runtime identity used by capsule mint and fetch."""
+
+    if not projection:
+        return {}
+    current_state = (
+        projection.get("contract_runtime_current_state")
+        if isinstance(
+            projection.get("contract_runtime_current_state"), Mapping
+        )
+        else {}
+    )
+    revision = (
+        projection.get("execution_state_revision")
+        or current_state.get("execution_state_revision")
+        or projection.get("generation")
+        or 0
+    )
+    try:
+        revision = int(revision)
+    except (TypeError, ValueError):
+        revision = 0
+    return {
+        "contract_execution_id": str(
+            projection.get("current_contract_execution_id")
+            or projection.get("contract_execution_id")
+            or ""
+        ).strip(),
+        "execution_state_revision": revision,
+        "projection_hash": str(
+            projection.get("projection_hash")
+            or projection.get("execution_state_hash")
+            or contract_chain_projection_hash(projection)
+        ).strip(),
+        "terminal": bool(projection.get("terminal") is True),
     }
 
 
@@ -81210,6 +81232,62 @@ def _onboard_guide_capsule_fetch(
         return response
 
 
+def _onboard_guide_capsule_current_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    """Build the projection identity shared by capsule mint and validation."""
+
+    current = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+        route_token_ref=route_token_ref,
+    )
+    current = _contract_chain_current_with_backlog_close_blocker(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        current_projection=current,
+        route_token_ref=route_token_ref,
+    )
+
+    from .parallel_branch_runtime import (
+        get_active_integration_epoch,
+        integration_epoch_resume_payload,
+    )
+
+    active_epoch = get_active_integration_epoch(conn, project_id)
+    if active_epoch is None:
+        return current
+    resume = integration_epoch_resume_payload(conn, active_epoch)
+    canonical_backlog_id = str(
+        resume.get("backlog_id")
+        or active_epoch.coordination_backlog_id
+        or ""
+    ).strip()
+    if canonical_backlog_id != backlog_id:
+        return current
+    overlay = dict(current)
+    overlay.update(
+        {
+            "schema_version": str(
+                current.get("schema_version")
+                or "backlog_contract_chain_current.v1"
+            ),
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "active_integration_epoch_resume": dict(resume),
+        }
+    )
+    overlay["projection_hash"] = contract_chain_projection_hash(overlay)
+    return overlay
+
+
 def _onboard_guide_capsule_validate_current_projection(
     conn,
     *,
@@ -81241,17 +81319,19 @@ def _onboard_guide_capsule_validate_current_projection(
         backlog_id = str(identity.get("backlog_id") or "")
     if not backlog_id:
         return None
-    current = _contract_chain_current_projection(
+    current = _onboard_guide_capsule_current_projection(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
-        rebuild_if_missing=False,
         route_token_ref="",
     )
     if not current:
         return None
+    current_identity = _onboard_guide_capsule_projection_identity(current)
     mismatches: list[str] = []
-    current_projection_hash = str(current.get("projection_hash") or "").strip()
+    current_projection_hash = str(
+        current_identity.get("projection_hash") or ""
+    ).strip()
     if (
         current_projection_hash
         and current_projection_hash
@@ -81259,9 +81339,7 @@ def _onboard_guide_capsule_validate_current_projection(
     ):
         mismatches.append("projection_hash")
     current_execution_id = str(
-        current.get("current_contract_execution_id")
-        or current.get("contract_execution_id")
-        or ""
+        current_identity.get("contract_execution_id") or ""
     ).strip()
     if (
         current_execution_id
@@ -81270,7 +81348,7 @@ def _onboard_guide_capsule_validate_current_projection(
         != str(identity.get("contract_execution_id") or "")
     ):
         mismatches.append("contract_execution_id")
-    current_revision = current.get("execution_state_revision")
+    current_revision = current_identity.get("execution_state_revision")
     if current_revision not in (None, ""):
         try:
             revision_mismatch = int(current_revision) != int(
@@ -81388,6 +81466,15 @@ def _onboard_route_guide_compact_service_response(
         "contract_execution_id": identity["contract_execution_id"],
         "execution_state_revision": identity["execution_state_revision"],
         "projection_hash": identity["projection_hash"],
+        "evidence_shape_authority": {
+            "source_of_authority": "ContractRuntime",
+            "read_interfaces": [
+                "contract_runtime_current",
+                "runtime_context_worker_guide",
+            ],
+            "onboard_capsule_is_advisory": True,
+            "infer_evidence_shape_from_capsule": False,
+        },
         "advisory_only": True,
         "authorizes_write": False,
         "satisfies_gate": False,
@@ -81494,6 +81581,15 @@ def _onboard_route_guide_compact_service_response(
         "action_input": action_input,
         "action_input_path": action_input_path,
         "allowed_action_summary": action_summary,
+        "evidence_shape_authority": {
+            "source_of_authority": "ContractRuntime",
+            "read_interfaces": [
+                "contract_runtime_current",
+                "runtime_context_worker_guide",
+            ],
+            "onboard_capsule_is_advisory": True,
+            "infer_evidence_shape_from_capsule": False,
+        },
         "guide_capsule_ref": entry["guide_capsule_ref"],
         "guide_capsule": {
             "schema_version": _ONBOARD_GUIDE_CAPSULE_SCHEMA_VERSION,
@@ -81864,6 +81960,12 @@ def _onboard_route_guide_service_response(
             or backlog_id
         ).strip()
         if response_view == "compact":
+            current_projection = _onboard_guide_capsule_current_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=canonical_backlog_id,
+                route_token_ref=route_token_ref,
+            )
             return _onboard_route_guide_compact_service_response(
                 project_id=project_id,
                 backlog_id=canonical_backlog_id,
@@ -81875,7 +81977,7 @@ def _onboard_route_guide_service_response(
                     )
                 },
                 next_action=resume,
-                current_projection={},
+                current_projection=current_projection,
                 runtime_resume=resume,
                 target_files=[],
                 projection_degraded=False,

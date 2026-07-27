@@ -797,7 +797,7 @@ def rebuild_backlog_contract_chain_projection(
         "source_refs": source_refs,
         "source_of_proof": "contract_runtime_executions.completed_lines",
     }
-    projection_hash = stable_sha256(_projection_hash_payload(projection_row))
+    projection_hash = contract_chain_projection_hash(projection_row)
     projection_row["projection_hash"] = projection_hash
     conn.execute(
         """
@@ -1294,8 +1294,30 @@ def _projection_hash_payload(projection_row: Mapping[str, Any]) -> dict[str, Any
     return {
         str(key): value
         for key, value in projection_row.items()
-        if str(key) not in {"projection_hash", "projection_watermark", "updated_at"}
+        if str(key)
+        not in {
+            "projection_hash",
+            "projection_watermark",
+            "updated_at",
+            # These are read-side diagnostics projected from durable fields.
+            # They are not part of the persisted projection identity.
+            "degraded",
+            "projection_source",
+        }
     }
+
+
+def contract_chain_projection_hash(
+    projection_row: Mapping[str, Any],
+) -> str:
+    """Return the canonical hash for a contract-chain projection.
+
+    Minting, server-side overlays, and capsule validation must all use this
+    helper.  Keeping the exclusions here prevents read-only projection
+    diagnostics from changing the identity of the durable source row.
+    """
+
+    return stable_sha256(_projection_hash_payload(projection_row))
 
 
 def _select_active_chain_id(
