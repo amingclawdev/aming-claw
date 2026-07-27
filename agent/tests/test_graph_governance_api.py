@@ -47881,6 +47881,11 @@ def test_close_bridge_preserves_source_reconcile_and_binds_live_active_full(
         "line_id": "observer_reconcile",
         "commit_sha": reconciled_commit,
         "_source_ref": f"timeline:{source['reconcile_event_id']}",
+        "artifact_refs": {
+            "reconcile_event_ref": (
+                f"timeline:{source['reconcile_event_id']}"
+            ),
+        },
         "payload": {
             "reconcile_authority": authority,
             "close_authority_binding": {
@@ -47925,6 +47930,9 @@ def test_close_bridge_preserves_source_reconcile_and_binds_live_active_full(
     assert immutable_bridge["reconcile_line_commit_role"] == (
         "durable_merge_anchor"
     )
+    assert immutable_bridge["reconcile_line_event_ref"] == (
+        f"timeline:{source['reconcile_event_id']}"
+    )
     assert immutable_bridge["durable_merge_commit"] == merged_commit
     assert immutable_bridge["reconciled_commit"] == reconciled_commit
     assert immutable_bridge["closing_head_commit"] == closing_head
@@ -47935,6 +47943,22 @@ def test_close_bridge_preserves_source_reconcile_and_binds_live_active_full(
         "reconciled_commit_is_ancestor_of_closing_head"
     ] is True
     assert immutable_bridge["active_full_snapshot_matches_closing_head"] is True
+
+    mismatched_reconcile_event_line = json.loads(
+        json.dumps(immutable_reconcile_line)
+    )
+    mismatched_reconcile_event_line["artifact_refs"][
+        "reconcile_event_ref"
+    ] = "timeline:99999"
+    assert (
+        server._contract_runtime_mf_parallel_descendant_close_head_bridge(
+            close_commit=closing_head,
+            merge_line=merge_line,
+            reconcile_line=mismatched_reconcile_event_line,
+            server_post_qa_lineage_passed=True,
+        )
+        == {}
+    )
 
     unrelated_reconcile_line = json.loads(json.dumps(reconcile_line))
     unrelated_reconcile_line["commit_sha"] = "d" * 40

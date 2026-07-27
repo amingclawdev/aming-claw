@@ -90509,6 +90509,17 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
         )
         else {}
     )
+    reconcile_artifact_refs = (
+        reconcile_line.get("artifact_refs")
+        if isinstance(reconcile_line.get("artifact_refs"), Mapping)
+        else {}
+    )
+    reconcile_line_event_ref = str(
+        reconcile_artifact_refs.get("reconcile_event_ref") or ""
+    ).strip()
+    reconcile_source_ref = str(
+        authority.get("reconcile_source_ref") or ""
+    ).strip()
     if not (
         binding.get("server_derived") is True
         and binding.get("persisted_to_completed_line") is False
@@ -90517,6 +90528,11 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
         and str(authority.get("source") or "")
         == "graph_snapshot_store.current_full_reconcile_state"
         and _contract_runtime_close_authority_hash_matches(authority)
+        and reconcile_source_ref.startswith("timeline:")
+        and (
+            not reconcile_line_event_ref
+            or reconcile_line_event_ref == reconcile_source_ref
+        )
     ):
         return {}
 
@@ -90730,9 +90746,8 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
             authority.get("active_snapshot_id") or ""
         ),
         "active_snapshot_commit": active_snapshot_commit,
-        "reconcile_source_ref": str(
-            authority.get("reconcile_source_ref") or ""
-        ),
+        "reconcile_source_ref": reconcile_source_ref,
+        "reconcile_line_event_ref": reconcile_line_event_ref,
         "merge_source_ref": str(merge_line.get("_source_ref") or ""),
         "reconcile_line_source_ref": str(
             reconcile_line.get("_source_ref") or ""
