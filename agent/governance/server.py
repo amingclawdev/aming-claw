@@ -92123,6 +92123,484 @@ def _contract_runtime_mf_parallel_ordering_diagnostic(
     }
 
 
+def _contract_runtime_later_durable_reconcile_supplement(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    merge: Mapping[str, Any],
+    source_line: Mapping[str, Any],
+    source_authority: Mapping[str, Any],
+    source_line_index: int,
+) -> dict[str, Any]:
+    """Bind one later current-full completion to an incomplete immutable line.
+
+    The historical ``observer_reconcile`` line remains an append-only progress
+    receipt.  This helper only returns a transient close-authority projection,
+    and only when one later protected current-full reconcile proves the exact
+    runtime/dispatch tuple and a legal merge-to-closing-HEAD relationship.
+    """
+
+    expected_scope = {
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(record.get("backlog_id") or "").strip(),
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": str(
+            merge.get("runtime_context_id") or ""
+        ).strip(),
+        "task_id": str(merge.get("task_id") or "").strip(),
+        "parent_task_id": str(
+            merge.get("parent_task_id") or ""
+        ).strip(),
+        "merge_queue_id": str(
+            merge.get("merge_queue_id") or ""
+        ).strip(),
+    }
+    if not all(expected_scope.values()):
+        return {}
+    merged_commit = str(
+        merge.get("merged_commit_sha") or ""
+    ).strip().lower()
+    merge_event_id = _contract_runtime_close_authority_positive_int(
+        merge.get("merge_event_id")
+    )
+    merge_event_created_at = str(
+        merge.get("merge_event_created_at") or ""
+    ).strip()
+    merge_time = _contract_runtime_close_authority_time_order_value(
+        merge_event_created_at
+    )
+    qa_source_ref = str(merge.get("qa_source_ref") or "").strip()
+    canonical_qa_verified = bool(
+        qa_source_ref.startswith("contract_runtime:")
+        and merge.get("qa_contract_runtime_verified") is True
+        and _contract_runtime_close_authority_positive_int(
+            merge.get("qa_acceptance_revision")
+        )
+        > 0
+        and _contract_runtime_close_authority_time_order_value(
+            merge.get("qa_acceptance_created_at")
+        )
+        is not None
+    )
+    timeline_qa_verified = bool(
+        qa_source_ref.startswith("timeline:")
+        and _contract_runtime_close_authority_positive_int(
+            merge.get("qa_event_id")
+        )
+        > 0
+        and _contract_runtime_close_authority_time_order_value(
+            merge.get("qa_event_created_at")
+        )
+        is not None
+    )
+    if not (
+        merge.get("timeline_verified") is True
+        and merge.get("dispatch_lineage_verified") is True
+        and str(
+            merge.get("contract_runtime_dispatch_source_ref") or ""
+        )
+        .strip()
+        .startswith("contract_runtime:")
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit)
+        and merge_event_id > 0
+        and merge_time is not None
+        and (canonical_qa_verified or timeline_qa_verified)
+    ):
+        return {}
+
+    root = project_service.resolve_project_root(
+        project_id,
+        None,
+        fallback_self=True,
+    )
+    canonical_head_commit = (
+        _git_head_commit(Path(root)).strip().lower() if root else ""
+    )
+    if not (
+        root
+        and re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            canonical_head_commit,
+        )
+    ):
+        return {}
+
+    def exact_scope(scope: Mapping[str, Any]) -> bool:
+        return bool(
+            isinstance(scope, Mapping)
+            and all(
+                str(scope.get(field) or "").strip() == expected
+                for field, expected in expected_scope.items()
+            )
+        )
+
+    try:
+        provenance_rows = conn.execute(
+            """
+            SELECT *
+            FROM graph_current_full_reconcile_provenance
+            WHERE project_id = ? AND reconcile_event_id > ?
+            ORDER BY reconcile_event_id ASC, created_at ASC,
+                     provenance_id ASC
+            """,
+            (project_id, merge_event_id),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+
+    candidates: list[dict[str, Any]] = []
+    for raw_row in provenance_rows:
+        provenance = dict(raw_row)
+        target_commit = str(
+            provenance.get("target_commit_sha") or ""
+        ).strip().lower()
+        reconcile_event_id = (
+            _contract_runtime_close_authority_positive_int(
+                provenance.get("reconcile_event_id")
+            )
+        )
+        reconcile_event_created_at = str(
+            provenance.get("reconcile_event_created_at") or ""
+        ).strip()
+        reconcile_time = _contract_runtime_close_authority_time_order_value(
+            reconcile_event_created_at
+        )
+        if not (
+            reconcile_event_id > merge_event_id
+            and reconcile_time is not None
+            and reconcile_time >= merge_time
+            and re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                target_commit,
+            )
+            and str(provenance.get("protected_action") or "").strip()
+            == "graph_current_full_reconcile"
+            and str(
+                provenance.get("protected_entrypoint") or ""
+            ).strip()
+            == (
+                "POST /api/graph-governance/{project_id}/"
+                "reconcile/current-full"
+            )
+        ):
+            continue
+        if not (
+            target_commit == merged_commit
+            or _git_commit_is_ancestor(
+                Path(root),
+                merged_commit,
+                target_commit,
+            )
+        ):
+            continue
+        if not (
+            target_commit == canonical_head_commit
+            or _git_commit_is_ancestor(
+                Path(root),
+                target_commit,
+                canonical_head_commit,
+            )
+        ):
+            continue
+        route_evidence = _json_loads(
+            provenance.get("route_evidence_json"),
+            {},
+        )
+        marker = _json_loads(provenance.get("marker_json"), {})
+        if not (
+            isinstance(route_evidence, Mapping)
+            and isinstance(marker, Mapping)
+            and route_evidence.get("schema_version")
+            == "graph_current_full_reconcile.route_evidence.v1"
+            and str(
+                route_evidence.get("protected_action") or ""
+            ).strip()
+            == "graph_current_full_reconcile"
+            and str(
+                route_evidence.get("authenticated_role") or ""
+            ).strip()
+            in {"observer", "coordinator"}
+            and bool(
+                str(
+                    route_evidence.get("authentication_source") or ""
+                ).strip()
+            )
+            and route_evidence.get("raw_route_token_persisted") is False
+        ):
+            continue
+        route_runtime_scope = (
+            route_evidence.get("runtime_context_scope")
+            if isinstance(
+                route_evidence.get("runtime_context_scope"),
+                Mapping,
+            )
+            else {}
+        )
+        marker_runtime_scope = (
+            marker.get("runtime_context_scope")
+            if isinstance(marker.get("runtime_context_scope"), Mapping)
+            else {}
+        )
+        if not (
+            exact_scope(route_runtime_scope)
+            and exact_scope(marker_runtime_scope)
+            and route_runtime_scope.get("source")
+            == "parallel_branch_runtime_context"
+            and route_runtime_scope.get("server_derived") is True
+            and marker_runtime_scope.get("source")
+            == "parallel_branch_runtime_context"
+            and marker_runtime_scope.get("server_derived") is True
+        ):
+            continue
+        event_row = conn.execute(
+            """
+            SELECT *
+            FROM task_timeline_events
+            WHERE project_id = ? AND id = ?
+            LIMIT 2
+            """,
+            (project_id, reconcile_event_id),
+        ).fetchall()
+        if len(event_row) != 1:
+            continue
+        event = dict(event_row[0])
+        event_payload = _json_loads(event.get("payload_json"), {})
+        if not isinstance(event_payload, Mapping):
+            continue
+        event_runtime_scope = (
+            event_payload.get("runtime_context_scope")
+            if isinstance(
+                event_payload.get("runtime_context_scope"),
+                Mapping,
+            )
+            else {}
+        )
+        if not (
+            str(event.get("backlog_id") or "").strip()
+            == expected_scope["backlog_id"]
+            and str(event.get("task_id") or "").strip()
+            == expected_scope["task_id"]
+            and str(event.get("event_type") or "").strip()
+            == "graph.reconcile"
+            and str(event.get("event_kind") or "").strip()
+            == "reconcile"
+            and str(event.get("phase") or "").strip() == "reconcile"
+            and str(event.get("status") or "").strip() == "passed"
+            and str(event.get("commit_sha") or "").strip().lower()
+            == target_commit
+            and str(event.get("created_at") or "").strip()
+            == reconcile_event_created_at
+            and exact_scope(event_runtime_scope)
+            and event_runtime_scope.get("source")
+            == "parallel_branch_runtime_context"
+            and event_runtime_scope.get("server_derived") is True
+            and all(
+                str(event_payload.get(field) or "").strip() == expected
+                for field, expected in expected_scope.items()
+                if field != "project_id"
+            )
+            and event_payload.get("current_full_reconcile") is True
+            and str(event_payload.get("reconcile_mode") or "").strip()
+            == "current_full"
+            and event_payload.get("canonical_head_verified") is True
+            and event_payload.get("active_snapshot_verified") is True
+            and event_payload.get("graph_reconciled") is True
+        ):
+            continue
+        candidates.append(
+            {
+                "timeline_verified": True,
+                "reconcile_source_ref": f"timeline:{reconcile_event_id}",
+                "reconcile_event_id": reconcile_event_id,
+                "reconcile_event_created_at": (
+                    reconcile_event_created_at
+                ),
+                "reconcile_task_id": expected_scope["task_id"],
+                "reconcile_runtime_context_id": (
+                    expected_scope["runtime_context_id"]
+                ),
+                "target_commit_sha": target_commit,
+                "provenance": provenance,
+                "route_evidence": dict(route_evidence),
+                "marker": dict(marker),
+            }
+        )
+
+    # Multiple exact rows are not ranked.  A client timeout/retry must resolve
+    # through idempotency before close authority; close itself never guesses.
+    if len(candidates) != 1:
+        return {}
+    candidate = candidates[0]
+    reconcile = {
+        key: candidate[key]
+        for key in (
+            "timeline_verified",
+            "reconcile_source_ref",
+            "reconcile_event_id",
+            "reconcile_event_created_at",
+            "reconcile_task_id",
+            "reconcile_runtime_context_id",
+        )
+    }
+    authority = _contract_runtime_current_full_reconcile_authority_from_merge(
+        conn,
+        project_id=project_id,
+        record=record,
+        merge=merge,
+        reconcile=reconcile,
+    )
+    required_true_fields = (
+        "db_verified",
+        "live_verified",
+        "canonical_head_verified",
+        "active_snapshot_verified",
+        "active_snapshot_current_full_reconcile_verified",
+        "active_snapshot_matches_canonical_head",
+        "graph_reconciled",
+        "provenance_verified",
+        "provenance_scope_verified",
+        "durable_order_verified",
+        "reconcile_snapshot_verified",
+        "contract_execution_scope_verified",
+        "task_scope_verified",
+        "runtime_context_scope_verified",
+        "parent_task_scope_verified",
+        "merge_queue_scope_verified",
+        "dispatch_lineage_verified",
+    )
+    candidate_target = str(
+        candidate.get("target_commit_sha") or ""
+    ).strip().lower()
+    reconcile_snapshot_status = str(
+        authority.get("reconcile_snapshot_status") or ""
+    ).strip()
+    exact_closing_head = candidate_target == canonical_head_commit
+    activated_snapshot_status_verified = bool(
+        (
+            exact_closing_head
+            and reconcile_snapshot_status == "active"
+            and str(authority.get("reconcile_snapshot_id") or "")
+            == str(authority.get("active_snapshot_id") or "")
+        )
+        or (
+            not exact_closing_head
+            and reconcile_snapshot_status == "superseded"
+        )
+    )
+    if not (
+        all(authority.get(field) is True for field in required_true_fields)
+        and authority.get("current_full_reconcile") is True
+        and str(authority.get("strategy") or "")
+        == "current_full_reconcile"
+        and activated_snapshot_status_verified
+        and str(authority.get("reconciled_commit_sha") or "")
+        .strip()
+        .lower()
+        == candidate_target
+        and str(authority.get("reconcile_provenance_target_commit") or "")
+        .strip()
+        .lower()
+        == candidate_target
+        and str(authority.get("canonical_head_commit") or "")
+        .strip()
+        .lower()
+        == canonical_head_commit
+        and int(authority.get("reconcile_event_id") or 0)
+        == int(candidate["reconcile_event_id"])
+        and str(authority.get("reconcile_source_ref") or "")
+        == str(candidate["reconcile_source_ref"])
+        and (
+            authority.get("canonical_qa_acceptance_verified") is True
+            or authority.get("timeline_qa_acceptance_verified") is True
+        )
+        and _contract_runtime_close_authority_hash_matches(authority)
+    ):
+        return {}
+
+    provenance = candidate["provenance"]
+    projected = {
+        key: value
+        for key, value in authority.items()
+        if key != "authority_hash"
+    }
+    projected.update(
+        {
+            "incomplete_reconcile_projection_supplemented": True,
+            "incomplete_reconcile_projection": {
+                "schema_version": (
+                    "contract_runtime.incomplete_observer_reconcile."
+                    "immutable_projection.v1"
+                ),
+                "source": "contract_runtime.completed_lines",
+                "immutable_line_preserved": True,
+                "source_line_id": "observer_reconcile",
+                "source_line_index": source_line_index,
+                "source_line_ref": str(
+                    source_line.get("_source_ref") or ""
+                ).strip(),
+                "source_line_commit_sha": str(
+                    source_line.get("commit_sha") or ""
+                ).strip().lower(),
+                "source_authority_hash": str(
+                    source_authority.get("authority_hash") or ""
+                ).strip(),
+                "reconcile_event_recorded": False,
+                "close_grade_authority_deferred": True,
+            },
+            "later_durable_reconcile": {
+                "schema_version": (
+                    "contract_runtime.later_durable_current_full_"
+                    "reconcile_supplement.v1"
+                ),
+                "source": (
+                    "graph_current_full_reconcile_provenance+"
+                    "task_timeline_events"
+                ),
+                "server_authored": True,
+                "unique_candidate_verified": True,
+                "exact_runtime_scope_verified": True,
+                "qa_before_merge_before_reconcile_verified": True,
+                "activated_snapshot_status_verified": True,
+                "exact_closing_head": exact_closing_head,
+                "descendant_closing_head_bridge_required": (
+                    not exact_closing_head
+                ),
+                "reconcile_event_id": int(
+                    candidate["reconcile_event_id"]
+                ),
+                "reconcile_source_ref": str(
+                    candidate["reconcile_source_ref"]
+                ),
+                "reconcile_event_created_at": str(
+                    candidate["reconcile_event_created_at"]
+                ),
+                "provenance_id": str(
+                    provenance.get("provenance_id") or ""
+                ).strip(),
+                "provenance_hash": str(
+                    provenance.get("provenance_hash") or ""
+                ).strip(),
+                "snapshot_id": str(
+                    provenance.get("snapshot_id") or ""
+                ).strip(),
+                "target_commit_sha": candidate_target,
+                "runtime_scope": dict(expected_scope),
+                "contract_runtime_dispatch_source_ref": str(
+                    merge.get(
+                        "contract_runtime_dispatch_source_ref"
+                    )
+                    or ""
+                ).strip(),
+            },
+        }
+    )
+    projected["authority_hash"] = stable_sha256(projected)
+    return projected
+
+
 def _contract_runtime_bind_close_reconcile_authority(
     conn,
     *,
@@ -92153,8 +92631,19 @@ def _contract_runtime_bind_close_reconcile_authority(
         and str(line.get("evidence_kind") or "").strip() == "reconcile"
     ]
     reconcile: dict[str, Any] = {}
+    incomplete_supplement: dict[str, Any] = {}
     if len(reconcile_lines) == 1:
         source_line = reconcile_lines[0]
+        source_line_index = next(
+            (
+                index
+                for index, line in enumerate(
+                    projected.get("completed_lines") or []
+                )
+                if line is source_line
+            ),
+            int(source_line.get("_completed_line_index", -1) or -1),
+        )
         source_payload = (
             source_line.get("payload")
             if isinstance(source_line.get("payload"), Mapping)
@@ -92226,7 +92715,6 @@ def _contract_runtime_bind_close_reconcile_authority(
             == "contract_runtime.server_reconcile_record_projection"
             and source_authority.get("server_derived") is True
             and source_authority.get("record_verified") is True
-            and source_authority.get("reconcile_event_recorded") is True
             and source_authority.get("merge_projection_verified") is True
             and source_authority.get("dispatch_lineage_verified") is True
             and _contract_runtime_close_authority_hash_matches(
@@ -92242,26 +92730,64 @@ def _contract_runtime_bind_close_reconcile_authority(
                 not source_artifact_ref
                 or source_artifact_ref == expected_source_ref
             )
-            and str(
-                source_authority.get("reconcile_event_created_at") or ""
-            ).strip()
         ):
-            reconcile = {
-                "reconcile_event_id": source_event_id,
-                "reconcile_event_created_at": str(
-                    source_authority.get("reconcile_event_created_at") or ""
-                ).strip(),
-                "reconcile_source_ref": source_event_ref,
-                "reconcile_task_id": str(
-                    source_authority.get("reconcile_task_id") or ""
-                ).strip(),
-                "reconcile_runtime_context_id": str(
-                    source_authority.get("reconcile_runtime_context_id") or ""
-                ).strip(),
-                "allow_taskless_reconcile": bool(
-                    merge.get("allow_taskless_reconcile")
-                ),
-            }
+            if (
+                source_authority.get("reconcile_event_recorded") is True
+                and source_event_id > 0
+                and source_event_ref == expected_source_ref
+                and str(
+                    source_authority.get(
+                        "reconcile_event_created_at"
+                    )
+                    or ""
+                ).strip()
+            ):
+                reconcile = {
+                    "reconcile_event_id": source_event_id,
+                    "reconcile_event_created_at": str(
+                        source_authority.get(
+                            "reconcile_event_created_at"
+                        )
+                        or ""
+                    ).strip(),
+                    "reconcile_source_ref": source_event_ref,
+                    "reconcile_task_id": str(
+                        source_authority.get("reconcile_task_id")
+                        or ""
+                    ).strip(),
+                    "reconcile_runtime_context_id": str(
+                        source_authority.get(
+                            "reconcile_runtime_context_id"
+                        )
+                        or ""
+                    ).strip(),
+                    "allow_taskless_reconcile": bool(
+                        merge.get("allow_taskless_reconcile")
+                    ),
+                }
+            elif (
+                source_authority.get("reconcile_event_recorded") is False
+                and source_event_id == 0
+                and not source_event_ref
+                and not source_artifact_ref
+                and not str(
+                    source_authority.get(
+                        "reconcile_event_created_at"
+                    )
+                    or ""
+                ).strip()
+            ):
+                incomplete_supplement = (
+                    _contract_runtime_later_durable_reconcile_supplement(
+                        conn,
+                        project_id=project_id,
+                        record=projected,
+                        merge=merge,
+                        source_line=source_line,
+                        source_authority=source_authority,
+                        source_line_index=source_line_index,
+                    )
+                )
     if reconcile_lines:
         authority = (
             _contract_runtime_current_full_reconcile_authority_from_merge(
@@ -92272,7 +92798,7 @@ def _contract_runtime_bind_close_reconcile_authority(
                 reconcile=reconcile,
             )
             if reconcile
-            else {}
+            else incomplete_supplement
         )
     else:
         # Formal no-PASS reconcile exceptions intentionally have no persisted
