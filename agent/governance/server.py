@@ -92476,22 +92476,38 @@ def _contract_runtime_later_durable_reconcile_supplement(
     if not candidates:
         return {}
     # A later exact closing-HEAD reconcile is stronger than an otherwise valid
-    # historical ancestor.  This is the only deterministic preference: two
-    # candidates at the strongest rank remain ambiguous and fail closed.
-    def candidate_rank(candidate: Mapping[str, Any]) -> int:
-        target_commit = str(
+    # historical ancestor.  Without an exact target, select only one maximal
+    # historical descendant under Git ancestry.  Duplicate strongest targets
+    # and incomparable maximal heads remain ambiguous and fail closed.
+    def candidate_target(candidate: Mapping[str, Any]) -> str:
+        return str(
             candidate.get("target_commit_sha") or ""
         ).strip().lower()
-        return 0 if target_commit == canonical_head_commit else 1
 
-    strongest_rank = min(
-        candidate_rank(candidate) for candidate in candidates
-    )
-    strongest_candidates = [
+    exact_head_candidates = [
         candidate
         for candidate in candidates
-        if candidate_rank(candidate) == strongest_rank
+        if candidate_target(candidate) == canonical_head_commit
     ]
+    if exact_head_candidates:
+        strongest_rank = "exact_canonical_closing_head"
+        strongest_candidates = exact_head_candidates
+    else:
+        strongest_rank = "unique_maximal_historical_descendant"
+        strongest_candidates = []
+        for candidate in candidates:
+            target_commit = candidate_target(candidate)
+            dominated = any(
+                target_commit != candidate_target(other)
+                and _git_commit_is_ancestor(
+                    Path(root),
+                    target_commit,
+                    candidate_target(other),
+                )
+                for other in candidates
+            )
+            if not dominated:
+                strongest_candidates.append(candidate)
     if len(strongest_candidates) != 1:
         return {}
     candidate = strongest_candidates[0]
@@ -92622,11 +92638,7 @@ def _contract_runtime_later_durable_reconcile_supplement(
                 ),
                 "server_authored": True,
                 "unique_candidate_verified": True,
-                "candidate_rank": (
-                    "exact_canonical_closing_head"
-                    if strongest_rank == 0
-                    else "historical_ancestor"
-                ),
+                "candidate_rank": strongest_rank,
                 "strongest_rank_unique": True,
                 "weaker_candidate_count": (
                     len(candidates) - len(strongest_candidates)
