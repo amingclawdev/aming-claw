@@ -3776,6 +3776,48 @@ def test_completed_recovery_terminalizes_history_and_requires_fresh_generation(
         "fresh_generation_required"
     ] is True
 
+    child_active_chain = json.loads(
+        conn.execute(
+            """
+            SELECT active_chain_json
+              FROM backlog_contract_chain_current
+             WHERE project_id = ? AND backlog_id = ?
+            """,
+            (project_id, backlog_id),
+        ).fetchone()[0]
+    )
+    child_active_chain.pop(
+        "completed_repair_fresh_generation_barrier",
+        None,
+    )
+    conn.execute(
+        """
+        UPDATE backlog_contract_chain_current
+           SET active_chain_json = ?
+         WHERE project_id = ? AND backlog_id = ?
+        """,
+        (
+            json.dumps(
+                child_active_chain,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            project_id,
+            backlog_id,
+        ),
+    )
+    migrated_child_without_barrier = read_backlog_contract_chain_current(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    assert migrated_child_without_barrier["current_contract_execution_id"] == child_id
+    assert migrated_child_without_barrier["readiness_state"] == "contract_complete"
+    assert migrated_child_without_barrier["next_legal_action"] == {}
+    assert migrated_child_without_barrier[
+        "completed_repair_fresh_generation_barrier"
+    ]["fresh_generation_required"] is True
+
     migrated_active_chain = json.loads(
         conn.execute(
             """
@@ -3835,6 +3877,92 @@ def test_completed_recovery_terminalizes_history_and_requires_fresh_generation(
     assert migrated_cursor["completed_repair_fresh_generation_barrier"][
         "fresh_generation_required"
     ] is True
+
+    false_positive_active_chain = json.loads(
+        conn.execute(
+            """
+            SELECT active_chain_json
+              FROM backlog_contract_chain_current
+             WHERE project_id = ? AND backlog_id = ?
+            """,
+            (project_id, backlog_id),
+        ).fetchone()[0]
+    )
+    false_positive_active_chain.pop(
+        "completed_repair_fresh_generation_barrier",
+        None,
+    )
+    conn.execute(
+        """
+        UPDATE backlog_contract_chain_current
+           SET current_contract_execution_id = ?,
+               current_contract_id = ?,
+               active_child_contract_execution_id = ?,
+               readiness_state = ?,
+               active_chain_json = ?,
+               next_legal_action_json = ?
+         WHERE project_id = ? AND backlog_id = ?
+        """,
+        (
+            parent_id,
+            "mf_parallel.v2",
+            parent_id,
+            "contract_complete",
+            json.dumps(
+                false_positive_active_chain,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "{}",
+            project_id,
+            backlog_id,
+        ),
+    )
+    unrelated_contract_complete = read_backlog_contract_chain_current(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    assert unrelated_contract_complete["current_contract_execution_id"] == parent_id
+    assert not unrelated_contract_complete.get(
+        "completed_repair_fresh_generation_barrier"
+    )
+
+    conn.execute(
+        """
+        UPDATE backlog_contract_chain_current
+           SET active_child_contract_execution_id = ?,
+               readiness_state = ?,
+               next_legal_action_json = ?
+         WHERE project_id = ? AND backlog_id = ?
+        """,
+        (
+            "",
+            "contract_active",
+            json.dumps(
+                {
+                    "id": "observer_merge",
+                    "stage_id": "observer_integration",
+                    "line_id": "observer_merge",
+                    "source": "backlog_contract_chain_current",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            project_id,
+            backlog_id,
+        ),
+    )
+    source_without_active_child = read_backlog_contract_chain_current(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    assert source_without_active_child["current_contract_execution_id"] == parent_id
+    assert source_without_active_child["active_child_contract_execution_id"] == ""
+    assert not source_without_active_child.get(
+        "completed_repair_fresh_generation_barrier"
+    )
 
 
 def test_incomplete_recovery_remains_current_and_fail_closed(tmp_path):

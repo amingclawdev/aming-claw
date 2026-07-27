@@ -963,13 +963,31 @@ def _persisted_projection_misses_completed_same_row_recovery(
     active_child_execution_id = str(
         current_projection.get("active_child_contract_execution_id") or ""
     ).strip()
+    readiness_state = str(
+        current_projection.get("readiness_state") or ""
+    ).strip()
+    next_action = (
+        current_projection.get("next_legal_action")
+        if isinstance(current_projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    next_action_id = str(
+        next_action.get("id") or next_action.get("line_id") or ""
+    ).strip()
+    legacy_source_shape = bool(
+        readiness_state == "contract_active"
+        and next_action_id == "observer_merge"
+        and active_child_execution_id
+        and active_child_execution_id == current_execution_id
+    )
+    completed_child_shape = bool(
+        readiness_state == "contract_complete"
+        and not next_action
+    )
     if (
         not current_execution_id
-        or (
-            active_child_execution_id
-            and active_child_execution_id != current_execution_id
-        )
         or len(execution_ids) < 3
+        or not (legacy_source_shape or completed_child_shape)
     ):
         return False
     try:
@@ -1012,7 +1030,10 @@ def _persisted_projection_misses_completed_same_row_recovery(
         isinstance(recovered_barrier, Mapping)
         and recovered_barrier
         and recovered_execution_id
-        and recovered_execution_id != current_execution_id
+        and (
+            recovered_execution_id == current_execution_id
+            or legacy_source_shape
+        )
     )
 
 
