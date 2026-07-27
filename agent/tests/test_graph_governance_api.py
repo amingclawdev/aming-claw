@@ -47519,6 +47519,24 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
     assert same_head_gate["passed"] is True, same_head_gate
     assert same_head_gate["descendant_close_head_bridge"] == {}
 
+    (worktree / "immutable-close-ready.txt").write_text(
+        "immutable passing close-ready head\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "immutable-close-ready.txt"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "immutable passing close-ready head"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    immutable_close_ready_commit = batch_jobs.git_commit(worktree)
+
     (worktree / "closing-head.txt").write_text(
         "later reconciled closing head\n",
         encoding="utf-8",
@@ -47594,7 +47612,7 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
         )
     )
     current_head_record["completed_lines"].append(
-        close_ready_write(descendant_head)
+        close_ready_write(immutable_close_ready_commit)
     )
     current_head_record["runtime_guide"]["completed_lines"] = json.loads(
         json.dumps(current_head_record["completed_lines"])
@@ -47631,7 +47649,105 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
         "durable_merge_commit_is_ancestor_of_reconciled_commit"
     ] is True
     assert current_head_bridge["current_head_full_reconcile_verified"] is True
+    close_ready_bridge = current_head_bridge[
+        "close_ready_lineage_bridge"
+    ]
+    assert close_ready_bridge["passed"] is True
+    assert close_ready_bridge["close_ready_line_commit"] == (
+        immutable_close_ready_commit
+    )
+    assert close_ready_bridge["closing_head_commit"] == descendant_head
+    assert close_ready_bridge[
+        "reconciled_commit_is_ancestor_of_close_ready_commit"
+    ] is True
+    assert close_ready_bridge[
+        "close_ready_commit_is_ancestor_of_closing_head"
+    ] is True
+    assert close_ready_bridge["raw_close_ready_commit_preserved"] is True
+    assert {
+        item["requirement_id"]
+        for item in current_head_gate["commit_bridge_diagnostics"]
+    } == {
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
+    }
+    assert current_head_gate["checks"][
+        "observer_close_ready_descendant_close_head_bridged"
+    ] is True
     assert current_head_gate["commit_mismatches"] == []
+
+    def mutate_close_ready_line(mutator) -> dict:
+        mutated = json.loads(json.dumps(current_head_record))
+        for lines in (
+            mutated["completed_lines"],
+            mutated["runtime_guide"]["completed_lines"],
+        ):
+            close_ready_line = next(
+                line
+                for line in lines
+                if line["line_id"] == "observer_close_ready"
+            )
+            mutator(close_ready_line)
+        return mutated
+
+    close_ready_bridge_rejections = (
+        (
+            "nonpassing",
+            lambda line: line.update({"status": "failed"}),
+            "contract_runtime.observer_close_ready",
+        ),
+        (
+            "wrong_execution",
+            lambda line: line.update(
+                {
+                    "_source_ref": (
+                        "contract_runtime:cex-wrong:"
+                        "completed_lines:999"
+                    )
+                }
+            ),
+            "contract_runtime.observer_close_ready_close_commit",
+        ),
+        (
+            "wrong_identity",
+            lambda line: line["payload"].update(
+                {"contract_execution_id": "cex-wrong"}
+            ),
+            "contract_runtime.observer_close_ready_close_commit",
+        ),
+        (
+            "nonancestor",
+            lambda line: line.update({"commit_sha": "d" * 40}),
+            "contract_runtime.observer_close_ready_close_commit",
+        ),
+    )
+    for label, mutator, expected_missing in close_ready_bridge_rejections:
+        rejected_close_ready = mutate_close_ready_line(mutator)
+        rejected_close_ready_gate = (
+            server._contract_runtime_mf_parallel_close_authority_gate(
+                [rejected_close_ready],
+                chain_projection=(
+                    _mf_parallel_close_authority_chain_projection(
+                        record["contract_execution_id"]
+                    )
+                ),
+                close_commit=descendant_head,
+                conn=conn,
+                project_id=PID,
+            )
+        )
+        assert rejected_close_ready_gate["passed"] is False, label
+        assert expected_missing in rejected_close_ready_gate[
+            "missing_requirement_ids"
+        ], label
+        assert not rejected_close_ready_gate["checks"][
+            "observer_close_ready_descendant_close_head_bridged"
+        ], label
+        if rejected_close_ready_gate["descendant_close_head_bridge"]:
+            assert rejected_close_ready_gate[
+                "descendant_close_head_bridge"
+            ]["close_ready_lineage_bridge"] == {}, label
 
     for field, rejected_value in (
         (

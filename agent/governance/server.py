@@ -90484,6 +90484,7 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
     close_commit: str,
     merge_line: Mapping[str, Any],
     reconcile_line: Mapping[str, Any],
+    close_ready_line: Mapping[str, Any] | None = None,
     server_post_qa_lineage_passed: bool,
 ) -> dict[str, Any]:
     """Bridge durable merge/reconcile commits to a reconciled descendant HEAD."""
@@ -90716,6 +90717,163 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
         )
     ):
         return {}
+
+    close_ready_lineage_bridge: dict[str, Any] = {}
+    if close_ready_line:
+        close_ready_payload = _contract_runtime_close_authority_line_payload(
+            close_ready_line
+        )
+        close_ready_artifact_refs = (
+            close_ready_line.get("artifact_refs")
+            if isinstance(close_ready_line.get("artifact_refs"), Mapping)
+            else {}
+        )
+        close_ready_commit = (
+            _contract_runtime_close_authority_explicit_commit(
+                close_ready_line
+            ).lower()
+        )
+        close_ready_source_ref = str(
+            close_ready_line.get("_source_ref") or ""
+        ).strip()
+        reconcile_line_source_ref = str(
+            reconcile_line.get("_source_ref") or ""
+        ).strip()
+
+        def completed_line_execution_id(source_ref: str) -> str:
+            match = re.fullmatch(
+                r"contract_runtime:([^:]+):completed_lines:\d+",
+                source_ref,
+            )
+            return str(match.group(1) if match else "").strip()
+
+        reconcile_source_execution_id = completed_line_execution_id(
+            reconcile_line_source_ref
+        )
+        close_ready_source_execution_id = completed_line_execution_id(
+            close_ready_source_ref
+        )
+        authority_execution_id = str(
+            authority.get("contract_execution_id") or ""
+        ).strip()
+        source_execution_matches = bool(
+            reconcile_source_execution_id
+            and close_ready_source_execution_id
+            and reconcile_source_execution_id
+            == close_ready_source_execution_id
+            and (
+                not authority_execution_id
+                or authority_execution_id
+                == close_ready_source_execution_id
+            )
+        )
+
+        identity_mismatches: list[dict[str, str]] = []
+        for field in (
+            "project_id",
+            "backlog_id",
+            "contract_execution_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "merge_queue_id",
+            "target_project_root",
+        ):
+            expected = str(authority.get(field) or "").strip()
+            actual_values = {
+                value
+                for value in (
+                    _contract_runtime_mapping_value(
+                        close_ready_line,
+                        field,
+                    ),
+                    _contract_runtime_mapping_value(
+                        close_ready_payload,
+                        field,
+                    ),
+                    _contract_runtime_mapping_value(
+                        close_ready_artifact_refs,
+                        field,
+                    ),
+                )
+                if value
+            }
+            for actual in sorted(actual_values):
+                if actual != expected:
+                    identity_mismatches.append(
+                        {
+                            "field": field,
+                            "expected": expected,
+                            "actual": actual,
+                        }
+                    )
+
+        reconcile_line_index = _contract_runtime_close_authority_line_index(
+            reconcile_line.get("_completed_line_index", -1)
+        )
+        close_ready_line_index = (
+            _contract_runtime_close_authority_line_index(
+                close_ready_line.get("_completed_line_index", -1)
+            )
+        )
+        close_ready_line_is_passing = bool(
+            str(close_ready_line.get("line_id") or "").strip()
+            == "observer_close_ready"
+            and str(close_ready_line.get("evidence_kind") or "").strip()
+            == "close_ready"
+            and str(close_ready_line.get("actor_role") or "").strip()
+            == "observer"
+            and _contract_runtime_line_status_passes(close_ready_line)
+        )
+        if (
+            close_ready_line_is_passing
+            and close_ready_commit
+            and not _contract_runtime_authority_commit_matches(
+                close_ready_commit,
+                close_commit,
+            )
+            and source_execution_matches
+            and not identity_mismatches
+            and reconcile_line_index >= 0
+            and close_ready_line_index > reconcile_line_index
+            and _git_commit_is_ancestor(
+                Path(target_project_root),
+                reconciled_commit,
+                close_ready_commit,
+            )
+            and _git_commit_is_ancestor(
+                Path(target_project_root),
+                close_ready_commit,
+                canonical_head,
+            )
+        ):
+            close_ready_lineage_bridge = {
+                "schema_version": (
+                    "contract_runtime."
+                    "mf_parallel_observer_close_ready_descendant_head_bridge.v1"
+                ),
+                "passed": True,
+                "server_derived": True,
+                "bridge": (
+                    "immutable_observer_close_ready_to_active_"
+                    "descendant_close_head"
+                ),
+                "close_ready_line_commit": close_ready_commit,
+                "closing_head_commit": canonical_head,
+                "reconciled_commit": reconciled_commit,
+                "reconcile_line_index": reconcile_line_index,
+                "close_ready_line_index": close_ready_line_index,
+                "contract_execution_id": (
+                    close_ready_source_execution_id
+                ),
+                "close_ready_source_ref": close_ready_source_ref,
+                "reconcile_line_source_ref": reconcile_line_source_ref,
+                "close_ready_identity_verified": True,
+                "close_ready_line_passed": True,
+                "reconciled_commit_is_ancestor_of_close_ready_commit": True,
+                "close_ready_commit_is_ancestor_of_closing_head": True,
+                "raw_close_ready_commit_preserved": True,
+            }
     return {
         "schema_version": (
             "contract_runtime.mf_parallel_descendant_close_head_bridge.v1"
@@ -90761,6 +90919,10 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
                 "active_snapshot_current_full_reconcile_verified"
             )
             is True
+        ),
+        "close_ready_lineage_bridge": close_ready_lineage_bridge,
+        "observer_close_ready_descendant_head_bridged": bool(
+            close_ready_lineage_bridge
         ),
         "raw_merge_reconcile_commits_preserved": True,
     }
@@ -92685,6 +92847,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             close_commit=close_commit,
             merge_line=found["observer_merge"],
             reconcile_line=found["observer_reconcile"],
+            close_ready_line=found.get("observer_close_ready"),
             server_post_qa_lineage_passed=server_post_qa_lineage_passed,
         )
         if (
@@ -92750,17 +92913,36 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                     if bridge:
                         commit_bridge_diagnostics.append(bridge)
                         continue
-                if requirement_id in {
-                    "observer_merge",
-                    "observer_reconcile",
-                } and descendant_close_head_bridge:
-                    commit_bridge_diagnostics.append({
+                bridgeable_descendant_requirement = bool(
+                    requirement_id in {
+                        "observer_merge",
+                        "observer_reconcile",
+                    }
+                    or (
+                        requirement_id == "observer_close_ready"
+                        and descendant_close_head_bridge.get(
+                            "close_ready_lineage_bridge"
+                        )
+                    )
+                )
+                if (
+                    bridgeable_descendant_requirement
+                    and descendant_close_head_bridge
+                ):
+                    bridge_diagnostic = {
                         **descendant_close_head_bridge,
                         "requirement_id": requirement_id,
                         "line_id": str(line.get("line_id") or ""),
                         "actual_commit": actual_commit,
                         "expected_close_commit": close_commit,
-                    })
+                    }
+                    if requirement_id == "observer_close_ready":
+                        bridge_diagnostic.update(
+                            descendant_close_head_bridge[
+                                "close_ready_lineage_bridge"
+                            ]
+                        )
+                    commit_bridge_diagnostics.append(bridge_diagnostic)
                     continue
                 missing.append(close_commit_id)
                 commit_mismatches.append({
@@ -93089,6 +93271,18 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                     item.get("requirement_id") == "observer_reconcile"
                     and item.get("bridge")
                     == "durable_reconcile_to_active_descendant_close_head"
+                    for item in commit_bridge_diagnostics
+                )
+            ),
+            "observer_close_ready_descendant_close_head_bridged": bool(
+                any(
+                    item.get("requirement_id")
+                    == "observer_close_ready"
+                    and item.get("bridge")
+                    == (
+                        "immutable_observer_close_ready_to_active_"
+                        "descendant_close_head"
+                    )
                     for item in commit_bridge_diagnostics
                 )
             ),
