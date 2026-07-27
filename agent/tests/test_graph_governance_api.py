@@ -6994,12 +6994,17 @@ def _record_test_current_full_reconcile_authority(
     qa_graph_trace_id: str,
     qa_commit_sha: str,
     merged_commit_sha: str = "",
+    parent_task_id: str = "",
+    merge_queue_id: str = "",
 ) -> dict[str, Any]:
     merged_commit_sha = str(merged_commit_sha or commit_sha).strip().lower()
     common_payload = {
+        "backlog_id": backlog_id,
         "contract_execution_id": contract_execution_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "merge_queue_id": merge_queue_id,
     }
     runtime_scope = {
         "project_id": PID,
@@ -7007,6 +7012,8 @@ def _record_test_current_full_reconcile_authority(
         "contract_execution_id": contract_execution_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "merge_queue_id": merge_queue_id,
     }
     qa_event = task_timeline.record_event(
         conn,
@@ -7051,7 +7058,19 @@ def _record_test_current_full_reconcile_authority(
         actor="observer:current-full-fixture",
         status="passed",
         commit_sha=commit_sha,
-        payload={**common_payload, "reconcile_mode": "current_full"},
+        payload={
+            **common_payload,
+            "runtime_context_scope": {
+                **runtime_scope,
+                "source": "parallel_branch_runtime_context",
+                "server_derived": True,
+            },
+            "current_full_reconcile": True,
+            "reconcile_mode": "current_full",
+            "canonical_head_verified": True,
+            "active_snapshot_verified": True,
+            "graph_reconciled": True,
+        },
     )
     event_times = (
         (qa_event, "2026-07-11T01:00:00Z"),
@@ -7080,6 +7099,8 @@ def _record_test_current_full_reconcile_authority(
             "contract_execution_id": contract_execution_id,
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "merge_queue_id": merge_queue_id,
             "route_token_scope": {
                 "project_id": PID,
                 "backlog_id": backlog_id,
@@ -7110,6 +7131,12 @@ def _record_test_current_full_reconcile_authority(
         reconcile_event_created_at=str(reconcile_event["created_at"]),
         expected_task_id=task_id,
         expected_runtime_context_id=runtime_context_id,
+        expected_parent_task_id=parent_task_id,
+        expected_merge_queue_id=merge_queue_id,
+        expected_contract_execution_id=contract_execution_id,
+        trusted_contract_execution_lineage_verified=bool(
+            parent_task_id and merge_queue_id
+        ),
         reconcile_task_id=task_id,
         reconcile_runtime_context_id=runtime_context_id,
         allow_taskless=True,
@@ -48619,6 +48646,388 @@ def test_close_binder_keeps_exact_playback_source_reconcile_after_later_same_lan
         line["payload"]["reconcile_authority"] == {}
         for line in ambiguous_projection["completed_lines"]
         if line["line_id"] == "observer_reconcile"
+    )
+
+
+def _incomplete_reconcile_supplement_fixture(
+    conn,
+    tmp_path,
+    monkeypatch,
+    *,
+    rejection: str = "",
+) -> dict[str, Any]:
+    merged_commit = "19aa482714a8b41275aa7a26f3afef1a1e6be2f0"
+    closing_head = "7df814d08e01a74e4a99912f178aa79a56191293"
+    backlog_id = (
+        "AC-CONTRACT-RUNTIME-INCOMPLETE-PROJECTED-"
+        "RECONCILE-LATER-DURABLE-AUTHORITY-R1-20260727"
+    )
+    execution_id = "cex-mf-parallel-incomplete-reconcile-fixture"
+    runtime_context_id = "mfrctx-incomplete-reconcile-fixture"
+    task_id = "incomplete-reconcile-fixture-worker-1"
+    parent_task_id = execution_id
+    merge_queue_id = "mq-incomplete-reconcile-fixture"
+    project_root = tmp_path / f"incomplete-reconcile-{rejection or 'happy'}"
+    project_root.mkdir()
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_head_commit",
+        lambda _root: closing_head,
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_commit_is_ancestor",
+        lambda _root, ancestor, descendant: (
+            ancestor == descendant
+            or (
+                rejection != "non_descendant"
+                and (ancestor, descendant)
+                == (merged_commit, closing_head)
+            )
+        ),
+    )
+
+    snapshot_id = "full-7df814d-incomplete-reconcile"
+    _activate_basic_graph(
+        conn,
+        snapshot_id,
+        commit_sha=closing_head,
+    )
+    durable = _record_test_current_full_reconcile_authority(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        contract_execution_id=execution_id,
+        runtime_context_id=runtime_context_id,
+        target_project_root=str(project_root),
+        snapshot_id=snapshot_id,
+        commit_sha=closing_head,
+        qa_graph_trace_id="gqt-incomplete-reconcile-fixture",
+        qa_commit_sha=merged_commit,
+        merged_commit_sha=merged_commit,
+        parent_task_id=parent_task_id,
+        merge_queue_id=merge_queue_id,
+    )
+    merge = {
+        "timeline_verified": True,
+        "merged_commit_sha": merged_commit,
+        "qa_event_id": int(durable["qa_event_id"]),
+        "qa_event_created_at": durable["qa_event_created_at"],
+        "qa_source_ref": f"timeline:{durable['qa_event_id']}",
+        "merge_event_id": int(durable["merge_event_id"]),
+        "merge_event_created_at": durable["merge_event_created_at"],
+        "merge_source_ref": f"timeline:{durable['merge_event_id']}",
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "merge_queue_id": merge_queue_id,
+        "dispatch_lineage_verified": True,
+        "contract_runtime_dispatch_source_ref": (
+            f"contract_runtime:{execution_id}:completed_lines:0"
+        ),
+        "allow_taskless_reconcile": False,
+    }
+    if rejection == "scope_mismatch":
+        merge["parent_task_id"] = "cex-unrelated-parent"
+    elif rejection == "ordering":
+        merge["merge_event_created_at"] = "2026-07-11T01:05:00Z"
+
+    provenance = conn.execute(
+        """
+        SELECT *
+        FROM graph_current_full_reconcile_provenance
+        WHERE project_id = ? AND snapshot_id = ?
+        """,
+        (PID, snapshot_id),
+    ).fetchone()
+    assert provenance is not None
+    if rejection == "tampered_provenance":
+        conn.execute(
+            """
+            UPDATE graph_current_full_reconcile_provenance
+            SET provenance_hash = ?
+            WHERE provenance_id = ?
+            """,
+            ("sha256:" + "0" * 64, provenance["provenance_id"]),
+        )
+        conn.commit()
+    elif rejection == "candidate_only":
+        conn.execute(
+            """
+            UPDATE graph_snapshots
+            SET status = 'candidate'
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (PID, snapshot_id),
+        )
+        conn.commit()
+    elif rejection == "client_authored_only":
+        conn.execute(
+            """
+            UPDATE task_timeline_events
+            SET actor = 'client:untrusted'
+            WHERE project_id = ? AND id = ?
+            """,
+            (PID, int(durable["reconcile_event_id"])),
+        )
+        conn.execute(
+            """
+            DELETE FROM graph_current_full_reconcile_provenance
+            WHERE provenance_id = ?
+            """,
+            (provenance["provenance_id"],),
+        )
+        conn.commit()
+    elif rejection == "ambiguous":
+        duplicate = dict(provenance)
+        duplicate["provenance_id"] = "cfrp-ambiguous-incomplete-reconcile"
+        duplicate["request_id"] = (
+            "req-ambiguous-incomplete-reconcile"
+        )
+        conn.execute(
+            """
+            INSERT INTO graph_current_full_reconcile_provenance (
+              provenance_id, project_id, snapshot_id, target_commit_sha,
+              protected_action, protected_entrypoint, request_id,
+              request_started_at, marker_created_at, reconcile_event_id,
+              reconcile_event_created_at, route_evidence_json, marker_json,
+              provenance_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(
+                duplicate[field]
+                for field in (
+                    "provenance_id",
+                    "project_id",
+                    "snapshot_id",
+                    "target_commit_sha",
+                    "protected_action",
+                    "protected_entrypoint",
+                    "request_id",
+                    "request_started_at",
+                    "marker_created_at",
+                    "reconcile_event_id",
+                    "reconcile_event_created_at",
+                    "route_evidence_json",
+                    "marker_json",
+                    "provenance_hash",
+                    "created_at",
+                )
+            ),
+        )
+        conn.commit()
+
+    source_authority = {
+        "schema_version": (
+            "contract_runtime.observer_reconcile_record_authority.v1"
+        ),
+        "source": "contract_runtime.server_reconcile_record_projection",
+        "server_derived": True,
+        "record_verified": True,
+        "merge_projection_verified": True,
+        "dispatch_lineage_verified": True,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": merge["parent_task_id"],
+        "merge_queue_id": merge_queue_id,
+        "merged_commit_sha": merged_commit,
+        "merge_source_ref": merge["merge_source_ref"],
+        "merge_event_id": int(merge["merge_event_id"]),
+        "merge_event_created_at": merge["merge_event_created_at"],
+        "contract_runtime_dispatch_source_ref": merge[
+            "contract_runtime_dispatch_source_ref"
+        ],
+        "reconcile_event_recorded": False,
+        "reconcile_source_ref": "",
+        "reconcile_event_id": 0,
+        "reconcile_event_created_at": "",
+        "reconcile_task_id": "",
+        "reconcile_runtime_context_id": "",
+        "close_grade_authority_deferred": True,
+    }
+    source_authority["authority_hash"] = server.stable_sha256(
+        source_authority
+    )
+    merge_line = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "evidence_kind": "merge",
+        "status": "passed",
+        "commit_sha": merged_commit,
+        "_source_ref": merge["merge_source_ref"],
+        "payload": {},
+    }
+    reconcile_line = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_reconcile",
+        "actor_role": "observer",
+        "evidence_kind": "reconcile",
+        "status": "passed",
+        "commit_sha": merged_commit,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": merge["parent_task_id"],
+        "merge_queue_id": merge_queue_id,
+        "_source_ref": (
+            f"contract_runtime:{execution_id}:completed_lines:1"
+        ),
+        "artifact_refs": {},
+        "payload": {"reconcile_authority": source_authority},
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": server.MF_PARALLEL_RECORD_CONTRACT_ID,
+        "completed_lines": [merge_line, reconcile_line],
+        "runtime_guide": {
+            "completed_lines": [merge_line, reconcile_line],
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_trusted_merge_projection",
+        lambda *_args, **_kwargs: dict(merge),
+    )
+    return {
+        "record": record,
+        "source_authority": source_authority,
+        "merged_commit": merged_commit,
+        "closing_head": closing_head,
+        "snapshot_id": snapshot_id,
+        "durable": durable,
+    }
+
+
+def test_close_binder_supplements_incomplete_line_from_later_durable_reconcile(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _incomplete_reconcile_supplement_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+    )
+    record = fixture["record"]
+    immutable_record_hash = server.stable_sha256(record)
+    immutable_authority_hash = fixture["source_authority"][
+        "authority_hash"
+    ]
+
+    projected = server._contract_runtime_bind_close_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+
+    assert server.stable_sha256(record) == immutable_record_hash
+    assert (
+        record["completed_lines"][1]["payload"]["reconcile_authority"][
+            "authority_hash"
+        ]
+        == immutable_authority_hash
+    )
+    rebound_line = projected["completed_lines"][1]
+    authority = rebound_line["payload"]["reconcile_authority"]
+    assert authority["graph_reconciled"] is True
+    assert authority["reconciled_commit_sha"] == fixture["closing_head"]
+    assert authority["incomplete_reconcile_projection_supplemented"] is True
+    assert authority["incomplete_reconcile_projection"] == {
+        "schema_version": (
+            "contract_runtime.incomplete_observer_reconcile."
+            "immutable_projection.v1"
+        ),
+        "source": "contract_runtime.completed_lines",
+        "immutable_line_preserved": True,
+        "source_line_id": "observer_reconcile",
+        "source_line_index": 1,
+        "source_line_ref": (
+            "contract_runtime:"
+            "cex-mf-parallel-incomplete-reconcile-fixture:"
+            "completed_lines:1"
+        ),
+        "source_line_commit_sha": fixture["merged_commit"],
+        "source_authority_hash": immutable_authority_hash,
+        "reconcile_event_recorded": False,
+        "close_grade_authority_deferred": True,
+    }
+    later = authority["later_durable_reconcile"]
+    assert later["server_authored"] is True
+    assert later["unique_candidate_verified"] is True
+    assert later["exact_runtime_scope_verified"] is True
+    assert later["activated_snapshot_status_verified"] is True
+    assert later["exact_closing_head"] is True
+    assert later["descendant_closing_head_bridge_required"] is False
+    assert later["reconcile_event_id"] == int(
+        fixture["durable"]["reconcile_event_id"]
+    )
+    assert later["provenance_hash"]
+    diagnostic = (
+        server._contract_runtime_mf_parallel_reconcile_close_diagnostic(
+            projected,
+            rebound_line,
+        )
+    )
+    assert diagnostic["passed"] is True, diagnostic
+
+
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        "client_authored_only",
+        "scope_mismatch",
+        "ordering",
+        "tampered_provenance",
+        "candidate_only",
+        "ambiguous",
+        "non_descendant",
+    ],
+)
+def test_close_binder_rejects_invalid_later_reconcile_supplement(
+    conn,
+    tmp_path,
+    monkeypatch,
+    rejection,
+):
+    fixture = _incomplete_reconcile_supplement_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        rejection=rejection,
+    )
+    record = fixture["record"]
+    immutable_record_hash = server.stable_sha256(record)
+
+    projected = server._contract_runtime_bind_close_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+
+    assert server.stable_sha256(record) == immutable_record_hash
+    rebound_line = projected["completed_lines"][1]
+    assert rebound_line["payload"]["reconcile_authority"] == {}, rejection
+    diagnostic = (
+        server._contract_runtime_mf_parallel_reconcile_close_diagnostic(
+            projected,
+            rebound_line,
+        )
+    )
+    assert diagnostic["passed"] is False, rejection
+    assert (
+        "contract_runtime.reconcile_event_missing"
+        in diagnostic["missing_requirement_ids"]
     )
 
 
