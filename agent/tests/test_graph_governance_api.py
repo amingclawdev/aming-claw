@@ -47906,6 +47906,48 @@ def test_close_bridge_preserves_source_reconcile_and_binds_live_active_full(
     assert bridge["current_head_full_reconcile_verified"] is True
     assert bridge["raw_merge_reconcile_commits_preserved"] is True
 
+    # The persisted reconcile line is immutable and may retain the integration
+    # anchor M.  The server-derived authority still proves the actual
+    # reconciled commit R and the active current-full closing head C.
+    immutable_reconcile_line = json.loads(json.dumps(reconcile_line))
+    immutable_reconcile_line["commit_sha"] = merged_commit
+    immutable_bridge = (
+        server._contract_runtime_mf_parallel_descendant_close_head_bridge(
+            close_commit=closing_head,
+            merge_line=merge_line,
+            reconcile_line=immutable_reconcile_line,
+            server_post_qa_lineage_passed=True,
+        )
+    )
+    assert immutable_bridge["passed"] is True
+    assert immutable_bridge["merge_line_commit"] == merged_commit
+    assert immutable_bridge["reconcile_line_commit"] == merged_commit
+    assert immutable_bridge["reconcile_line_commit_role"] == (
+        "durable_merge_anchor"
+    )
+    assert immutable_bridge["durable_merge_commit"] == merged_commit
+    assert immutable_bridge["reconciled_commit"] == reconciled_commit
+    assert immutable_bridge["closing_head_commit"] == closing_head
+    assert immutable_bridge[
+        "durable_merge_commit_is_ancestor_of_reconciled_commit"
+    ] is True
+    assert immutable_bridge[
+        "reconciled_commit_is_ancestor_of_closing_head"
+    ] is True
+    assert immutable_bridge["active_full_snapshot_matches_closing_head"] is True
+
+    unrelated_reconcile_line = json.loads(json.dumps(reconcile_line))
+    unrelated_reconcile_line["commit_sha"] = "d" * 40
+    assert (
+        server._contract_runtime_mf_parallel_descendant_close_head_bridge(
+            close_commit=closing_head,
+            merge_line=merge_line,
+            reconcile_line=unrelated_reconcile_line,
+            server_post_qa_lineage_passed=True,
+        )
+        == {}
+    )
+
     # Strict negatives mutate only persisted graph authority, then recompute
     # the complete server projection.  No caller-shaped authority is patched.
     live_snapshot_row = store.get_graph_snapshot(

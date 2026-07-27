@@ -90573,6 +90573,16 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
             reconciled_commit,
         )
     )
+    reconcile_line_matches_durable_merge = (
+        _contract_runtime_authority_commit_matches(
+            reconcile_commit,
+            durable_merge_commit,
+        )
+    )
+    reconcile_line_matches_trusted_anchor = bool(
+        reconcile_line_matches_reconciled
+        or reconcile_line_matches_durable_merge
+    )
     if (
         _contract_runtime_authority_commit_matches(
             merge_commit,
@@ -90585,7 +90595,7 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
     ):
         return {}
     source_reconcile_with_live_current_full_mode = bool(
-        reconcile_line_matches_reconciled
+        reconcile_line_matches_trusted_anchor
         and _contract_runtime_authority_commit_matches(
             reconcile_provenance_target_commit,
             reconciled_commit,
@@ -90598,7 +90608,7 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
     )
     current_head_full_reconcile_mode = bool(
         reconciled_matches_closing_head
-        and reconcile_line_matches_reconciled
+        and reconcile_line_matches_trusted_anchor
         and _contract_runtime_authority_commit_matches(
             reconcile_provenance_target_commit,
             reconciled_commit,
@@ -90704,6 +90714,11 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
         ),
         "merge_line_commit": merge_commit,
         "reconcile_line_commit": reconcile_commit,
+        "reconcile_line_commit_role": (
+            "reconciled_commit"
+            if reconcile_line_matches_reconciled
+            else "durable_merge_anchor"
+        ),
         "durable_merge_commit": durable_merge_commit,
         "reconciled_commit": reconciled_commit,
         "reconcile_provenance_target_commit": (
