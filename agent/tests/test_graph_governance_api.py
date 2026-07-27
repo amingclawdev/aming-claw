@@ -55179,7 +55179,9 @@ def test_onboard_guide_capsule_single_flight_revision_invalidation_and_eviction(
     assert "wstok-copy-safe" in serialized
 
 
-def test_completed_repair_barrier_is_non_schedulable_and_compact_visible():
+def test_completed_repair_barrier_is_non_schedulable_and_compact_visible(
+    monkeypatch,
+):
     barrier = {
         "schema_version": (
             "contract_runtime.completed_repair_fresh_generation_barrier.v1"
@@ -55235,6 +55237,55 @@ def test_completed_repair_barrier_is_non_schedulable_and_compact_visible():
     )
     assert authority["required_next_action_id"] == ""
     assert authority["completed_repair_fresh_generation_barrier"] == barrier
+
+    historical_close_event = {
+        "id": 867,
+        "event_kind": "backlog_close_blocked",
+        "payload": {
+            "source": "authoritative_backlog_close",
+            "contract_execution_id": "cex-historical-source",
+            "blocked_gate": "historical_close_gate",
+            "close_commit": "a" * 40,
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_latest_source_backed_backlog_close_blocker_event",
+        lambda *_args, **_kwargs: historical_close_event,
+    )
+    monkeypatch.setattr(
+        server,
+        "_backlog_close_audited_bypass_next_action",
+        lambda **_kwargs: {
+            "id": "backlog_close_blocker_audit",
+            "legacy_raw_audit": {
+                "parent_contract_execution_id": "cex-historical-source",
+                "blocker_event_ref": "timeline:867",
+            },
+        },
+    )
+    with_historical_close_audit = (
+        server._contract_chain_current_with_backlog_close_blocker(
+            object(),
+            project_id=PID,
+            backlog_id=current["backlog_id"],
+            current_projection=current,
+        )
+    )
+    assert with_historical_close_audit["current_contract_execution_id"] == (
+        "cex-repair-complete"
+    )
+    assert with_historical_close_audit["readiness_state"] == "contract_complete"
+    assert with_historical_close_audit["next_legal_action"] == {}
+    assert with_historical_close_audit["scheduler_eligible"] is False
+    assert with_historical_close_audit["resume_eligible"] is False
+    assert "blocked_parent_state" not in with_historical_close_audit
+    assert "backlog_close_blocker_audit" not in with_historical_close_audit
+    assert with_historical_close_audit[
+        "historical_backlog_close_blocker_audit"
+    ]["legacy_raw_audit"]["parent_contract_execution_id"] == (
+        "cex-historical-source"
+    )
 
     compact = server._onboard_route_guide_compact_service_response(
         project_id=PID,

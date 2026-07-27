@@ -63825,6 +63825,24 @@ def _contract_chain_current_with_backlog_close_blocker(
     )
     if not action:
         return current
+    completed_repair_barrier = current.get(
+        "completed_repair_fresh_generation_barrier"
+    )
+    if isinstance(completed_repair_barrier, Mapping) and completed_repair_barrier:
+        # A completed repair child is the canonical current identity.  Older
+        # close-blocker events belong to the immutable historical source and
+        # remain visible only as raw audit; they must not replace the repair
+        # child, downgrade contract_complete, or create a resumable parent.
+        overlay = dict(current)
+        overlay["historical_backlog_close_blocker_audit"] = dict(action)
+        overlay["projection_hash"] = stable_sha256(
+            {
+                key: value
+                for key, value in overlay.items()
+                if key != "projection_hash"
+            }
+        )
+        return overlay
     overlay = dict(current)
     overlay.update(
         {
