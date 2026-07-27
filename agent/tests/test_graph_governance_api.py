@@ -30393,9 +30393,8 @@ def test_strict_qa_trace_refs_require_matching_pinned_candidate_and_root(
         "task_id",
         "qa_session_id",
         "status",
-        "qa_scope_binding_ref",
-        "target_project_root",
     }.issubset(aggregate_fields)
+    assert "exact_candidate_upgrade_ref" in aggregate_fields
     assert all(
         {"trace_id", "field", "expected", "actual"}.issubset(item)
         for item in aggregate["identity_mismatches"]
@@ -30448,6 +30447,57 @@ def test_strict_qa_trace_refs_require_matching_pinned_candidate_and_root(
         item["field"] in {"root_identity", "root_identity_hash"}
         for item in rootless["identity_mismatches"]
     )
+
+
+def test_strict_qa_trace_refs_return_poison_context_mismatch_without_throwing(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-QA-TRACE-POISON-CONTEXT"
+    task_id = "qa-trace-poison-context-task"
+    project_root = tmp_path / "qa-trace-poison-context"
+    candidate_commit = _init_test_git_repo(project_root)
+    trace_id = "gqt-qa-trace-poison-context"
+    _insert_exact_qa_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        snapshot_id="full-qa-trace-poison-context",
+        candidate_commit_sha=candidate_commit,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_project_root=str(project_root),
+    )
+    poison_mismatch = {
+        "trace_id": trace_id,
+        "field": "candidate_review_context",
+        "expected": "complete server-derived review context",
+        "actual": "poisoned persisted tuple",
+    }
+    monkeypatch.setattr(
+        server,
+        "_qa_reverify_candidate_trace_context",
+        lambda *_args, **_kwargs: ({}, [poison_mismatch]),
+    )
+
+    evidence = server._runtime_context_service_qa_graph_trace_refs(
+        conn,
+        project_id=PID,
+        explicit_trace_ids=[trace_id],
+        target_project_root=str(project_root),
+        expected_backlog_id=backlog_id,
+        expected_task_id=task_id,
+        expected_candidate_commit_sha=candidate_commit,
+        expected_qa_principal="qa-principal",
+        expected_qa_session_id="ses-qa",
+        require_complete_authority=True,
+        strict_bounded_qa=True,
+    )
+
+    assert evidence["db_verified"] is False
+    assert evidence["verified_trace_ids"] == []
+    assert evidence["missing_trace_ids"] == []
+    assert evidence["identity_mismatches"] == [poison_mismatch]
 
 
 def test_bounded_qa_base_graph_candidate_diff_rejects_forged_tuple(

@@ -13635,6 +13635,8 @@ def _runtime_context_service_qa_graph_trace_refs(
                 successful_reverification_contexts[reverify_key] = review_context
         if context_errors:
             row_mismatches.extend(context_errors)
+            identity_mismatches.extend(row_mismatches)
+            continue
         if require_complete_authority:
             canonical_scope_ref = _qa_scope_binding_ref(
                 project_id=row_project_id,
@@ -13685,7 +13687,7 @@ def _runtime_context_service_qa_graph_trace_refs(
                     }
                 )
         identity_mismatches.extend(row_mismatches)
-        if row_mismatches or context_errors:
+        if row_mismatches:
             continue
         bounded_review_contexts.append(review_context)
         bounded_qa_authorities.append(
