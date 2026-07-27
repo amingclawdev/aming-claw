@@ -13511,6 +13511,7 @@ def _runtime_context_service_qa_graph_trace_refs(
         "independent_verification",
     }
     for row in rows:
+        row_mismatches: list[dict[str, Any]] = []
         trace_id = (
             str(row["trace_id"] or "").strip()
             if isinstance(row, sqlite3.Row)
@@ -13530,7 +13531,7 @@ def _runtime_context_service_qa_graph_trace_refs(
             else str(row[3] or "").strip()
         )
         if query_source != "qa":
-            identity_mismatches.append(
+            row_mismatches.append(
                 {
                     "trace_id": trace_id,
                     "field": "query_source",
@@ -13538,9 +13539,8 @@ def _runtime_context_service_qa_graph_trace_refs(
                     "actual": query_source,
                 }
             )
-            continue
         if query_purpose not in allowed_purposes:
-            identity_mismatches.append(
+            row_mismatches.append(
                 {
                     "trace_id": trace_id,
                     "field": "query_purpose",
@@ -13548,15 +13548,15 @@ def _runtime_context_service_qa_graph_trace_refs(
                     "actual": query_purpose,
                 }
             )
-            continue
         if not strict_bounded_qa:
-            if trace_id not in verified:
+            identity_mismatches.extend(row_mismatches)
+            if not row_mismatches and trace_id not in verified:
                 verified.append(trace_id)
             continue
         qa_session_id = str(row["qa_session_id"] or "").strip()
         qa_principal = str(row["actor"] or "").strip()
         if not qa_session_id:
-            identity_mismatches.append(
+            row_mismatches.append(
                 {
                     "trace_id": trace_id,
                     "field": "qa_session_id",
@@ -13564,9 +13564,8 @@ def _runtime_context_service_qa_graph_trace_refs(
                     "actual": "",
                 }
             )
-            continue
         if not qa_principal:
-            identity_mismatches.append(
+            row_mismatches.append(
                 {
                     "trace_id": trace_id,
                     "field": "qa_principal",
@@ -13574,7 +13573,6 @@ def _runtime_context_service_qa_graph_trace_refs(
                     "actual": "",
                 }
             )
-            continue
         row_project_id = str(row["project_id"] or "").strip()
         row_backlog_id = str(row["backlog_id"] or "").strip()
         row_task_id = str(row["task_id"] or "").strip()
@@ -13605,7 +13603,7 @@ def _runtime_context_service_qa_graph_trace_refs(
             for field, expected in expected_fields.items():
                 actual = actual_fields[field]
                 if not actual or (expected and actual != expected):
-                    identity_mismatches.append(
+                    row_mismatches.append(
                         {
                             "trace_id": trace_id,
                             "field": field,
@@ -13614,7 +13612,7 @@ def _runtime_context_service_qa_graph_trace_refs(
                         }
                     )
             if row_status != "complete":
-                identity_mismatches.append(
+                row_mismatches.append(
                     {
                         "trace_id": trace_id,
                         "field": "status",
@@ -13636,8 +13634,7 @@ def _runtime_context_service_qa_graph_trace_refs(
             if reverify_key and not context_errors:
                 successful_reverification_contexts[reverify_key] = review_context
         if context_errors:
-            identity_mismatches.extend(context_errors)
-            continue
+            row_mismatches.extend(context_errors)
         if require_complete_authority:
             canonical_scope_ref = _qa_scope_binding_ref(
                 project_id=row_project_id,
@@ -13646,7 +13643,7 @@ def _runtime_context_service_qa_graph_trace_refs(
                 commit_sha=review_context["candidate_commit_sha"],
             )
             if qa_scope_binding_ref != canonical_scope_ref:
-                identity_mismatches.append(
+                row_mismatches.append(
                     {
                         "trace_id": trace_id,
                         "field": "qa_scope_binding_ref",
@@ -13654,7 +13651,42 @@ def _runtime_context_service_qa_graph_trace_refs(
                         "actual": qa_scope_binding_ref,
                     }
                 )
-                continue
+        assigned_target_root = str(target_project_root or "").strip()
+        persisted_query_root = str(
+            review_context.get("query_root") or ""
+        ).strip()
+        if not persisted_query_root:
+            resolved_root = project_service.resolve_project_root(
+                project_id,
+                None,
+                fallback_self=True,
+            )
+            persisted_query_root = str(resolved_root or "").strip()
+        if persisted_query_root:
+            if require_complete_authority and not assigned_target_root:
+                row_mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "target_project_root",
+                        "expected": persisted_query_root,
+                        "actual": "missing assigned target root",
+                    }
+                )
+            elif assigned_target_root and (
+                Path(assigned_target_root).resolve()
+                != Path(persisted_query_root).resolve()
+            ):
+                row_mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "target_project_root",
+                        "expected": assigned_target_root,
+                        "actual": persisted_query_root,
+                    }
+                )
+        identity_mismatches.extend(row_mismatches)
+        if row_mismatches or context_errors:
+            continue
         bounded_review_contexts.append(review_context)
         bounded_qa_authorities.append(
             {
@@ -13763,30 +13795,6 @@ def _runtime_context_service_qa_graph_trace_refs(
             result["target_project_root"] = persisted_query_root
         result["requested_target_project_root"] = assigned_target_root
         result["assigned_target_project_root"] = assigned_target_root
-        if persisted_query_root:
-            if require_complete_authority and not assigned_target_root:
-                result["identity_mismatches"].append(
-                    {
-                        "trace_id": "|".join(requested_trace_ids),
-                        "field": "target_project_root",
-                        "expected": persisted_query_root,
-                        "actual": "missing assigned target root",
-                    }
-                )
-                result["db_verified"] = False
-            elif assigned_target_root and (
-                Path(assigned_target_root).resolve()
-                != Path(persisted_query_root).resolve()
-            ):
-                result["identity_mismatches"].append(
-                    {
-                        "trace_id": "|".join(requested_trace_ids),
-                        "field": "target_project_root",
-                        "expected": assigned_target_root,
-                        "actual": persisted_query_root,
-                    }
-                )
-                result["db_verified"] = False
         result["candidate_review_context"] = {
             key: result[key]
             for key in (
@@ -16490,6 +16498,52 @@ def _runtime_context_qa_scoped_verification_plan(
     }
 
 
+def _governed_evidence_binding_guide(
+    *,
+    onboard_contract_execution_id: str = "",
+    assigned_worker_worktree: str = "",
+) -> dict[str, Any]:
+    """Expose the four fail-closed evidence bindings in one copy-safe shape."""
+
+    from . import task_timeline
+
+    onboard_execution_id = str(onboard_contract_execution_id or "").strip()
+    worker_worktree = str(assigned_worker_worktree or "").strip()
+    return {
+        "schema_version": "governed_evidence_bindings.v1",
+        "direct_main_observer_route": {
+            "task_id_source": "onboard_contract_execution_id",
+            "task_id": (
+                onboard_execution_id
+                or "<onboard-contract-execution-id>"
+            ),
+            "equality_required": True,
+        },
+        "submitted_graph_query_trace": {
+            "db_status_required": True,
+            "qa_graph_context_required_status": "complete",
+            "parentless_direct_main_accepted_statuses": sorted(
+                _PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_STATUSES
+            ),
+        },
+        "independent_verification_test_evidence": {
+            "accepted_keys": task_timeline.accepted_test_evidence_keys(),
+            "authority": "_event_has_test_evidence",
+        },
+        "mf_parallel_qa_graph_context": {
+            "target_project_root_source": "assigned_worker_worktree",
+            "target_project_root": (
+                worker_worktree or "<assigned-worker-worktree>"
+            ),
+            "canonical_project_root_is_not_the_query_target": True,
+            "equality_required": True,
+        },
+        "copy_safe": True,
+        "authorizes_write": False,
+        "satisfies_gate": False,
+    }
+
+
 def _runtime_context_qa_verification_guide(
     *,
     project_id: str,
@@ -16642,6 +16696,14 @@ def _runtime_context_qa_verification_guide(
         if isinstance(contract_runtime_state, Mapping)
         else {}
     )
+    legitimate_evidence_bindings = _governed_evidence_binding_guide(
+        onboard_contract_execution_id=str(
+            runtime_state.get("root_contract_execution_id")
+            or runtime_state.get("onboard_contract_execution_id")
+            or ""
+        ),
+        assigned_worker_worktree=target_project_root,
+    )
     linked_bypass_diagnostics = [
         dict(item)
         for item in runtime_state.get("active_linked_bypass_diagnostics") or []
@@ -16713,6 +16775,7 @@ def _runtime_context_qa_verification_guide(
         "purpose": "independent_verification",
         "observer_or_hotfix_actor_must_not_author_evidence": True,
         "raw_route_token_required": False,
+        "legitimate_evidence_bindings": legitimate_evidence_bindings,
         "qa_session": {
             "register_tool": "qa_session_register",
             "register_body": {
@@ -71584,6 +71647,26 @@ def _contract_runtime_bind_qa_graph_authority(
         container_names=_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS,
     )
     evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
+    identity_mismatches = [
+        dict(item)
+        for item in evidence.get("identity_mismatches") or []
+        if isinstance(item, Mapping)
+    ]
+    if identity_mismatches:
+        raise GovernanceError(
+            "contract_runtime_qa_graph_trace_identity_mismatch",
+            "bounded QA graph trace identity does not match trusted runtime authority",
+            409,
+            {
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "line_id": str(write.get("line_id") or ""),
+                "identity_mismatches": identity_mismatches,
+                "qa_graph_trace_db_evidence": evidence,
+                "fail_closed": True,
+            },
+        )
     if evidence.get("graph_basis"):
         _qa_validate_candidate_review_claims(body, evidence)
     if (
@@ -77578,10 +77661,21 @@ def _onboard_selected_qa_contract_runtime_guidance(
                 "unresolved_placeholders": sorted(unresolved_placeholders),
             },
         }
+    onboard_execution_id = str(
+        record.get("root_contract_execution_id") or ""
+    ).strip()
+    if isinstance(qa_runtime_record, Mapping):
+        onboard_execution_id = str(
+            record.get("contract_execution_id") or onboard_execution_id
+        ).strip()
     return {
         **base_guidance,
         "ordered_steps": steps,
         "canonical_dispatch_identity": canonical_dispatch_identity,
+        "legitimate_evidence_bindings": _governed_evidence_binding_guide(
+            onboard_contract_execution_id=onboard_execution_id,
+            assigned_worker_worktree=repo_root,
+        ),
         "machine_contract": {
             "token_transport": deepcopy(token_transport),
             "line_contract": deepcopy(line_contract),
@@ -79511,12 +79605,28 @@ def _onboard_contract_agent_guidance(
     route_token_ref_guidance.setdefault("renewal", renewal_guidance)
     route_token_ref_guidance.setdefault("route_token_ref_renewal", renewal_guidance)
     route_token_issue.setdefault("renewal", renewal_guidance)
+    selected_bindings = (
+        selected_role_guidance.get("legitimate_evidence_bindings")
+        if isinstance(
+            selected_role_guidance.get("legitimate_evidence_bindings"),
+            Mapping,
+        )
+        else {}
+    )
+    legitimate_evidence_bindings = (
+        dict(selected_bindings)
+        if selected_bindings
+        else _governed_evidence_binding_guide(
+            onboard_contract_execution_id=contract_execution_id,
+        )
+    )
     guidance = {
         "schema_version": "onboard_contract.agent_onboard_guidance.v1",
         "role": requested_role,
         "actor_role": requested_role,
         "required_identity": required_identity,
         "selected_role_guidance": selected_role_guidance,
+        "legitimate_evidence_bindings": legitimate_evidence_bindings,
         "route_token_ref_guidance": route_token_ref_guidance,
         "route_token_issue": route_token_issue,
         "observer_session_route_token_checklist": observer_route_checklist,
@@ -81441,6 +81551,7 @@ def _onboard_route_guide_compact_service_response(
     runtime_resume: Mapping[str, Any],
     target_files: Sequence[str],
     projection_degraded: bool,
+    qa_runtime_record: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     selected_role = str(role or "").strip() or "observer"
     selected_work_type = str(work_type or "").strip()
@@ -81556,6 +81667,32 @@ def _onboard_route_guide_compact_service_response(
         "action_input_keys": sorted(action_input) if action_input else [],
         "target_files": [str(item) for item in target_files[:64]],
     }
+    selected_qa_guidance = (
+        _onboard_selected_qa_contract_runtime_guidance(
+            record,
+            next_legal_action=next_action,
+            qa_runtime_record=qa_runtime_record,
+        )
+        if selected_role_key == "qa"
+        else {}
+    )
+    selected_bindings = (
+        selected_qa_guidance.get("legitimate_evidence_bindings")
+        if isinstance(
+            selected_qa_guidance.get("legitimate_evidence_bindings"),
+            Mapping,
+        )
+        else {}
+    )
+    legitimate_evidence_bindings = (
+        dict(selected_bindings)
+        if selected_bindings
+        else _governed_evidence_binding_guide(
+            onboard_contract_execution_id=str(
+                record.get("contract_execution_id") or ""
+            ),
+        )
+    )
 
     def build_sections() -> dict[str, Any]:
         sections = {
@@ -81580,6 +81717,9 @@ def _onboard_route_guide_compact_service_response(
                     "selected_role": selected_role,
                     "selected_work_type": selected_work_type,
                     "selected_guidance_json_path": selected_guidance_path,
+                    "legitimate_evidence_bindings": (
+                        legitimate_evidence_bindings
+                    ),
                     "required_sequence": [
                         "read_compact_onboard_route_guide",
                         "fetch_only_named_bounded_sections_when_needed",
@@ -81632,6 +81772,7 @@ def _onboard_route_guide_compact_service_response(
         "action_input": action_input,
         "action_input_path": action_input_path,
         "allowed_action_summary": action_summary,
+        "legitimate_evidence_bindings": legitimate_evidence_bindings,
         "evidence_shape_authority": {
             "source_of_authority": "ContractRuntime",
             "read_interfaces": [
@@ -81881,6 +82022,9 @@ def _qa_onboard_compact_selected_role_response(
             cli_agent_qa_onboard_guidance_binding()
         ),
     }
+    legitimate_evidence_bindings = deepcopy(
+        selected_guidance.get("legitimate_evidence_bindings") or {}
+    )
     compact_guidance = {
         "schema_version": str(guidance.get("schema_version") or ""),
         "projection_schema_version": projection_schema,
@@ -81889,6 +82033,7 @@ def _qa_onboard_compact_selected_role_response(
         "actor_role": "qa",
         "required_identity": deepcopy(guidance.get("required_identity") or {}),
         "selected_role_guidance": selected_guidance,
+        "legitimate_evidence_bindings": legitimate_evidence_bindings,
         "canonical_dispatch_identity": canonical_dispatch_identity,
         "contract_runtime_authority": contract_runtime_authority,
         "token_descriptor": {
@@ -81931,6 +82076,7 @@ def _qa_onboard_compact_selected_role_response(
         "qa_onboard_guidance_contract": (
             cli_agent_qa_onboard_guidance_binding()
         ),
+        "legitimate_evidence_bindings": legitimate_evidence_bindings,
         "agent_onboard_guidance": compact_guidance,
         "onboard_route_guide": {
             "schema_version": projection_schema,
@@ -82333,6 +82479,7 @@ def _onboard_route_guide_service_response(
             runtime_resume=runtime_resume,
             target_files=target_files,
             projection_degraded=projection_degraded,
+            qa_runtime_record=qa_runtime_record,
         )
     guidance = _onboard_contract_agent_guidance(
         record,
