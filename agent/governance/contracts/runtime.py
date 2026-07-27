@@ -900,12 +900,27 @@ def read_backlog_contract_chain_current(
         if isinstance(projection.get("next_legal_action"), Mapping)
         else {}
     )
+    completed_repair_barrier = projection.get(
+        "completed_repair_fresh_generation_barrier"
+    )
     if (
         str(projection.get("readiness_state") or "")
         == "same_row_recovery_target_ready"
         or str(next_action.get("source") or "")
         == "backlog_contract_chain_current.same_row_recovery_cursor"
         or isinstance(next_action.get("same_row_recovery_cursor"), Mapping)
+        or (
+            not (
+                isinstance(completed_repair_barrier, Mapping)
+                and completed_repair_barrier
+            )
+            and _persisted_projection_misses_completed_same_row_recovery(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                current_projection=projection,
+            )
+        )
     ):
         return rebuild_backlog_contract_chain_projection(
             conn,
@@ -913,6 +928,92 @@ def read_backlog_contract_chain_current(
             backlog_id=backlog_id,
         )
     return projection
+
+
+def _persisted_projection_misses_completed_same_row_recovery(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+    current_projection: Mapping[str, Any],
+) -> bool:
+    """Detect a pre-supersession persisted source projection once.
+
+    Older projections can contain the full source/repair execution set while
+    still naming the historical source as current.  Some of those rows use an
+    ordinary ``contract_active``/``observer_merge`` shape rather than the
+    short-lived recovery-cursor marker, so marker-only migration misses them.
+    Recompute only when the durable records independently prove the completed
+    same-row repair barrier; ordinary active chains remain read-only.
+    """
+
+    current_execution_id = str(
+        current_projection.get("current_contract_execution_id") or ""
+    ).strip()
+    active_chain = (
+        current_projection.get("active_chain")
+        if isinstance(current_projection.get("active_chain"), Mapping)
+        else {}
+    )
+    execution_ids = {
+        str(item or "").strip()
+        for item in (active_chain.get("execution_ids") or [])
+        if str(item or "").strip()
+    }
+    active_child_execution_id = str(
+        current_projection.get("active_child_contract_execution_id") or ""
+    ).strip()
+    if (
+        not current_execution_id
+        or (
+            active_child_execution_id
+            and active_child_execution_id != current_execution_id
+        )
+        or len(execution_ids) < 3
+    ):
+        return False
+    try:
+        rows = conn.execute(
+            """
+            SELECT record_json, updated_at
+            FROM contract_runtime_executions
+            WHERE project_id = ? AND backlog_id = ?
+            ORDER BY created_at ASC, updated_at ASC, contract_execution_id ASC
+            """,
+            (project_id, backlog_id),
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    records: list[dict[str, Any]] = []
+    row_times: dict[str, str] = {}
+    for row in rows:
+        raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[0]
+        record = _decode_record(raw)
+        execution_id = str(
+            record.get("contract_execution_id") or ""
+        ).strip()
+        if not execution_id:
+            continue
+        records.append(record)
+        row_times[execution_id] = str(
+            row["updated_at"] if isinstance(row, sqlite3.Row) else row[1]
+        )
+    recovered = _project_same_row_recovery_state(
+        records,
+        row_times=row_times,
+    )
+    recovered_barrier = recovered.get(
+        "completed_repair_fresh_generation_barrier"
+    )
+    recovered_execution_id = str(
+        recovered.get("current_contract_execution_id") or ""
+    ).strip()
+    return bool(
+        isinstance(recovered_barrier, Mapping)
+        and recovered_barrier
+        and recovered_execution_id
+        and recovered_execution_id != current_execution_id
+    )
 
 
 def _upsert_contract_chain_binding(

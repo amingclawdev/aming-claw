@@ -3738,6 +3738,7 @@ def test_completed_recovery_terminalizes_history_and_requires_fresh_generation(
         UPDATE backlog_contract_chain_current
            SET current_contract_execution_id = ?,
                current_contract_id = ?,
+               active_child_contract_execution_id = ?,
                readiness_state = ?,
                active_chain_json = ?,
                next_legal_action_json = ?
@@ -3746,15 +3747,15 @@ def test_completed_recovery_terminalizes_history_and_requires_fresh_generation(
         (
             parent_id,
             "mf_parallel.v2",
-            "same_row_recovery_target_ready",
+            parent_id,
+            "contract_active",
             json.dumps(legacy_active_chain, sort_keys=True, separators=(",", ":")),
             json.dumps(
                 {
+                    "id": "observer_merge",
+                    "stage_id": "observer_integration",
                     "line_id": "observer_merge",
-                    "source": (
-                        "backlog_contract_chain_current.same_row_recovery_cursor"
-                    ),
-                    "same_row_recovery_cursor": {"legacy": True},
+                    "source": "backlog_contract_chain_current",
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -3772,6 +3773,66 @@ def test_completed_recovery_terminalizes_history_and_requires_fresh_generation(
     assert migrated["readiness_state"] == "contract_complete"
     assert migrated["next_legal_action"] == {}
     assert migrated["completed_repair_fresh_generation_barrier"][
+        "fresh_generation_required"
+    ] is True
+
+    migrated_active_chain = json.loads(
+        conn.execute(
+            """
+            SELECT active_chain_json
+              FROM backlog_contract_chain_current
+             WHERE project_id = ? AND backlog_id = ?
+            """,
+            (project_id, backlog_id),
+        ).fetchone()[0]
+    )
+    migrated_active_chain.pop(
+        "completed_repair_fresh_generation_barrier",
+        None,
+    )
+    conn.execute(
+        """
+        UPDATE backlog_contract_chain_current
+           SET current_contract_execution_id = ?,
+               current_contract_id = ?,
+               readiness_state = ?,
+               active_chain_json = ?,
+               next_legal_action_json = ?
+         WHERE project_id = ? AND backlog_id = ?
+        """,
+        (
+            parent_id,
+            "mf_parallel.v2",
+            "same_row_recovery_target_ready",
+            json.dumps(
+                migrated_active_chain,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            json.dumps(
+                {
+                    "line_id": "observer_merge",
+                    "source": (
+                        "backlog_contract_chain_current.same_row_recovery_cursor"
+                    ),
+                    "same_row_recovery_cursor": {"legacy": True},
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            project_id,
+            backlog_id,
+        ),
+    )
+    migrated_cursor = read_backlog_contract_chain_current(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    assert migrated_cursor["current_contract_execution_id"] == child_id
+    assert migrated_cursor["readiness_state"] == "contract_complete"
+    assert migrated_cursor["next_legal_action"] == {}
+    assert migrated_cursor["completed_repair_fresh_generation_barrier"][
         "fresh_generation_required"
     ] is True
 
