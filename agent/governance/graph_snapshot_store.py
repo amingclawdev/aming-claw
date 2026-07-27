@@ -2398,12 +2398,221 @@ def record_current_full_reconcile_provenance(
     }
 
 
+def _current_full_snapshot_provenance_binding(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify one snapshot's own durable current-full provenance.
+
+    This deliberately does not compare task/runtime scope with another
+    ContractRuntime.  A later active current-full snapshot may belong to a
+    different bounded task; its job here is only to prove that the live
+    canonical snapshot was produced and activated through the protected
+    current-full path.
+    """
+
+    snapshot = dict(snapshot or {})
+    snapshot_id = str(snapshot.get("snapshot_id") or "").strip()
+    snapshot_commit = str(snapshot.get("commit_sha") or "").strip().lower()
+    snapshot_status = str(snapshot.get("status") or "").strip()
+    snapshot_kind = str(snapshot.get("snapshot_kind") or "").strip()
+    marker = _snapshot_notes(snapshot).get("current_full_reconcile")
+    marker = dict(marker) if isinstance(marker, Mapping) else {}
+    provenance_id = str(marker.get("provenance_id") or "").strip()
+    provenance_row = None
+    if provenance_id and snapshot_id and snapshot_commit:
+        provenance_rows = conn.execute(
+            """
+            SELECT *
+            FROM graph_current_full_reconcile_provenance
+            WHERE provenance_id = ? AND project_id = ?
+              AND snapshot_id = ? AND target_commit_sha = ?
+            LIMIT 2
+            """,
+            (
+                provenance_id,
+                project_id,
+                snapshot_id,
+                snapshot_commit,
+            ),
+        ).fetchall()
+        if len(provenance_rows) == 1:
+            provenance_row = provenance_rows[0]
+    provenance = dict(provenance_row) if provenance_row else {}
+    try:
+        stored_marker = json.loads(
+            str(provenance.get("marker_json") or "{}")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        stored_marker = {}
+    try:
+        route_evidence = json.loads(
+            str(provenance.get("route_evidence_json") or "{}")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        route_evidence = {}
+    marker_core = dict(marker)
+    marker_hash = str(marker_core.pop("provenance_hash", "") or "").strip()
+    provenance_hash = str(
+        provenance.get("provenance_hash") or ""
+    ).strip()
+    marker_runtime_scope = (
+        marker.get("runtime_context_scope")
+        if isinstance(marker.get("runtime_context_scope"), Mapping)
+        else {}
+    )
+    route_runtime_scope = (
+        route_evidence.get("runtime_context_scope")
+        if isinstance(route_evidence.get("runtime_context_scope"), Mapping)
+        else {}
+    )
+    scope_fields = (
+        "project_id",
+        "backlog_id",
+        "task_id",
+        "parent_task_id",
+        "runtime_context_id",
+        "merge_queue_id",
+        "contract_execution_id",
+    )
+
+    def comparable_scope(scope: Mapping[str, Any]) -> dict[str, str]:
+        return {
+            key: str(scope.get(key) or "").strip()
+            for key in scope_fields
+            if str(scope.get(key) or "").strip()
+        }
+
+    runtime_context_scope_link_verified = bool(
+        (
+            not marker_runtime_scope
+            and not route_runtime_scope
+        )
+        or (
+            marker_runtime_scope
+            and route_runtime_scope
+            and comparable_scope(marker_runtime_scope)
+            == comparable_scope(route_runtime_scope)
+            and marker_runtime_scope.get("server_derived") is True
+            and route_runtime_scope.get("server_derived") is True
+            and marker_runtime_scope.get("source")
+            == "parallel_branch_runtime_context"
+            and route_runtime_scope.get("source")
+            == "parallel_branch_runtime_context"
+        )
+    )
+    try:
+        marker_reconcile_event_id = int(
+            marker.get("reconcile_event_id") or 0
+        )
+        provenance_reconcile_event_id = int(
+            provenance.get("reconcile_event_id") or 0
+        )
+    except (TypeError, ValueError):
+        marker_reconcile_event_id = 0
+        provenance_reconcile_event_id = 0
+    verified = bool(
+        project_id
+        and snapshot_id
+        and snapshot_commit
+        and snapshot_status == SNAPSHOT_STATUS_ACTIVE
+        and snapshot_kind == "full"
+        and marker
+        and provenance
+        and marker == stored_marker
+        and marker_hash
+        and marker_hash == provenance_hash
+        and _stable_sha256(marker_core) == marker_hash
+        and str(marker.get("schema_version") or "").strip()
+        == "current_full_reconcile.provenance.v2"
+        and marker.get("normal_update_path") is True
+        and marker.get("activate") is True
+        and str(marker.get("target_commit_sha") or "").strip().lower()
+        == snapshot_commit
+        and str(marker.get("snapshot_id") or "").strip() == snapshot_id
+        and str(marker.get("provenance_id") or "").strip()
+        == str(provenance.get("provenance_id") or "").strip()
+        and str(marker.get("protected_action") or "").strip()
+        == "graph_current_full_reconcile"
+        and str(marker.get("protected_entrypoint") or "").strip()
+        == "POST /api/graph-governance/{project_id}/reconcile/current-full"
+        and str(provenance.get("protected_action") or "").strip()
+        == str(marker.get("protected_action") or "").strip()
+        and str(provenance.get("protected_entrypoint") or "").strip()
+        == str(marker.get("protected_entrypoint") or "").strip()
+        and str(provenance.get("request_id") or "").strip()
+        == str(marker.get("request_id") or "").strip()
+        and bool(str(marker.get("request_id") or "").strip())
+        and str(provenance.get("request_started_at") or "").strip()
+        == str(marker.get("request_started_at") or "").strip()
+        and _timestamp_value(marker.get("request_started_at")) is not None
+        and str(provenance.get("marker_created_at") or "").strip()
+        == str(marker.get("marker_created_at") or "").strip()
+        and _timestamp_value(marker.get("marker_created_at")) is not None
+        and provenance_reconcile_event_id > 0
+        and provenance_reconcile_event_id == marker_reconcile_event_id
+        and str(
+            provenance.get("reconcile_event_created_at") or ""
+        ).strip()
+        == str(marker.get("reconcile_event_created_at") or "").strip()
+        and _timestamp_value(
+            marker.get("reconcile_event_created_at")
+        )
+        is not None
+        and isinstance(route_evidence, Mapping)
+        and route_evidence == marker.get("route_evidence")
+        and route_evidence.get("schema_version")
+        == "graph_current_full_reconcile.route_evidence.v1"
+        and bool(
+            str(route_evidence.get("authenticated_role") or "").strip()
+        )
+        and bool(
+            str(route_evidence.get("authentication_source") or "").strip()
+        )
+        and route_evidence.get("raw_route_token_persisted") is False
+        and route_evidence.get("protected_action")
+        == "graph_current_full_reconcile"
+        and runtime_context_scope_link_verified
+    )
+    return {
+        "verified": verified,
+        "snapshot_id": snapshot_id,
+        "snapshot_commit": snapshot_commit,
+        "snapshot_status": snapshot_status,
+        "snapshot_kind": snapshot_kind,
+        "provenance_id": str(
+            provenance.get("provenance_id") or ""
+        ).strip(),
+        "provenance_target_commit": str(
+            provenance.get("target_commit_sha") or ""
+        ).strip().lower(),
+        "provenance_hash": provenance_hash,
+        "reconcile_event_id": provenance_reconcile_event_id,
+        "reconcile_event_created_at": str(
+            provenance.get("reconcile_event_created_at") or ""
+        ).strip(),
+        "task_id": str(route_evidence.get("task_id") or "").strip(),
+        "runtime_context_id": str(
+            route_evidence.get("runtime_context_id") or ""
+        ).strip(),
+        "contract_execution_id": str(
+            route_evidence.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_scope_link_verified": (
+            runtime_context_scope_link_verified
+        ),
+        "marker": marker,
+    }
+
+
 def current_full_reconcile_state(
     conn: sqlite3.Connection,
     project_id: str,
     merged_commit_sha: str,
     *,
     current_canonical_commit_sha: str = "",
+    reconcile_target_commit_sha: str = "",
     qa_event_id: int = 0,
     qa_event_created_at: str = "",
     qa_source_ref: str = "",
@@ -2441,6 +2650,9 @@ def current_full_reconcile_state(
     current_canonical_commit_sha = str(
         current_canonical_commit_sha or merged_commit_sha
     ).strip().lower()
+    reconcile_target_commit_sha = str(
+        reconcile_target_commit_sha or ""
+    ).strip().lower()
     active = get_active_graph_snapshot(conn, project_id) or {}
     active_snapshot_id = str(active.get("snapshot_id") or "").strip()
     active_snapshot_commit = str(active.get("commit_sha") or "").strip().lower()
@@ -2452,6 +2664,11 @@ def current_full_reconcile_state(
     active_marker = _snapshot_notes(active).get("current_full_reconcile")
     active_marker = (
         dict(active_marker) if isinstance(active_marker, Mapping) else {}
+    )
+    active_current_full = _current_full_snapshot_provenance_binding(
+        conn,
+        project_id,
+        active,
     )
     pending_count = int(
         conn.execute(
@@ -2481,7 +2698,7 @@ def current_full_reconcile_state(
         else ""
     )
     provenance_row = None
-    if provenance_id:
+    if provenance_id and not reconcile_target_commit_sha:
         provenance_row = conn.execute(
             """
             SELECT *
@@ -2497,6 +2714,9 @@ def current_full_reconcile_state(
             ),
         ).fetchone()
     if provenance_row is None and requested_reconcile_event_id > 0:
+        target_commit = (
+            reconcile_target_commit_sha or current_canonical_commit_sha
+        )
         provenance_rows = conn.execute(
             """
             SELECT *
@@ -2508,7 +2728,7 @@ def current_full_reconcile_state(
             """,
             (
                 project_id,
-                current_canonical_commit_sha,
+                target_commit,
                 requested_reconcile_event_id,
             ),
         ).fetchall()
@@ -2517,6 +2737,7 @@ def current_full_reconcile_state(
     if (
         provenance_row is None
         and requested_reconcile_event_id > 0
+        and not reconcile_target_commit_sha
         and active_snapshot_matches_current_canonical
     ):
         # A canonically completed reconcile remains durable after a later
@@ -2538,6 +2759,9 @@ def current_full_reconcile_state(
         if len(provenance_rows) == 1:
             provenance_row = provenance_rows[0]
     if provenance_row is None and requested_reconcile_event_id <= 0:
+        target_commit = (
+            reconcile_target_commit_sha or current_canonical_commit_sha
+        )
         provenance_rows = conn.execute(
             """
             SELECT *
@@ -2546,7 +2770,7 @@ def current_full_reconcile_state(
             ORDER BY created_at DESC, provenance_id DESC
             LIMIT 2
             """,
-            (project_id, current_canonical_commit_sha),
+            (project_id, target_commit),
         ).fetchall()
         if len(provenance_rows) == 1:
             provenance_row = provenance_rows[0]
@@ -2959,6 +3183,7 @@ def current_full_reconcile_state(
         active_snapshot_id
         and str(active.get("status") or "").strip() == SNAPSHOT_STATUS_ACTIVE
         and active_snapshot_commit == current_canonical_commit_sha
+        and active_current_full.get("verified") is True
     )
     db_verified = bool(
         project_id
@@ -2983,6 +3208,38 @@ def current_full_reconcile_state(
         "active_snapshot_commit": active_snapshot_commit,
         "active_snapshot_status": str(active.get("status") or "").strip(),
         "active_snapshot_verified": active_snapshot_verified,
+        "active_snapshot_current_full_reconcile_verified": bool(
+            active_current_full.get("verified")
+        ),
+        "active_snapshot_current_full_provenance_id": str(
+            active_current_full.get("provenance_id") or ""
+        ),
+        "active_snapshot_current_full_provenance_target_commit": str(
+            active_current_full.get("provenance_target_commit") or ""
+        ),
+        "active_snapshot_current_full_provenance_hash": str(
+            active_current_full.get("provenance_hash") or ""
+        ),
+        "active_snapshot_current_full_reconcile_event_id": int(
+            active_current_full.get("reconcile_event_id") or 0
+        ),
+        "active_snapshot_current_full_reconcile_event_created_at": str(
+            active_current_full.get("reconcile_event_created_at") or ""
+        ),
+        "active_snapshot_current_full_task_id": str(
+            active_current_full.get("task_id") or ""
+        ),
+        "active_snapshot_current_full_runtime_context_id": str(
+            active_current_full.get("runtime_context_id") or ""
+        ),
+        "active_snapshot_current_full_contract_execution_id": str(
+            active_current_full.get("contract_execution_id") or ""
+        ),
+        "active_snapshot_current_full_runtime_scope_verified": bool(
+            active_current_full.get(
+                "runtime_context_scope_link_verified"
+            )
+        ),
         "reconcile_snapshot_id": reconcile_snapshot_id,
         "reconcile_snapshot_commit": reconcile_snapshot_commit,
         "reconcile_snapshot_status": reconcile_snapshot_status,

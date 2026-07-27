@@ -6993,7 +6993,9 @@ def _record_test_current_full_reconcile_authority(
     commit_sha: str,
     qa_graph_trace_id: str,
     qa_commit_sha: str,
+    merged_commit_sha: str = "",
 ) -> dict[str, Any]:
+    merged_commit_sha = str(merged_commit_sha or commit_sha).strip().lower()
     common_payload = {
         "contract_execution_id": contract_execution_id,
         "runtime_context_id": runtime_context_id,
@@ -7035,8 +7037,8 @@ def _record_test_current_full_reconcile_authority(
         phase="merge",
         actor="observer:current-full-fixture",
         status="passed",
-        commit_sha=commit_sha,
-        payload={**common_payload, "merge_commit": commit_sha},
+        commit_sha=merged_commit_sha,
+        payload={**common_payload, "merge_commit": merged_commit_sha},
     )
     reconcile_event = task_timeline.record_event(
         conn,
@@ -7097,7 +7099,9 @@ def _record_test_current_full_reconcile_authority(
     state = store.current_full_reconcile_state(
         conn,
         PID,
-        commit_sha,
+        merged_commit_sha,
+        current_canonical_commit_sha=commit_sha,
+        reconcile_target_commit_sha=commit_sha,
         qa_event_id=int(qa_event["id"]),
         qa_event_created_at=str(qa_event["created_at"]),
         merge_event_id=int(merge_event["id"]),
@@ -47338,32 +47342,29 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
     assert raw_merge_commit == row_merge_commit
     assert raw_reconcile_commit == row_merge_commit
 
-    def activate_current_full(snapshot_id: str, commit_sha: str) -> None:
+    def activate_live_current_full(
+        snapshot_id: str,
+        commit_sha: str,
+        *,
+        suffix: str,
+    ) -> dict[str, Any]:
         _activate_basic_graph(
             conn,
             snapshot_id,
             commit_sha=commit_sha,
         )
-        conn.execute(
-            "UPDATE graph_snapshots SET notes = ? "
-            "WHERE project_id = ? AND snapshot_id = ?",
-            (
-                json.dumps(
-                    {
-                        "current_full_reconcile": {
-                            "schema_version": "current_full_reconcile.v1",
-                            "source": "graph_governance_api",
-                            "normal_update_path": True,
-                            "target_commit_sha": commit_sha,
-                            "activate": True,
-                        }
-                    }
-                ),
-                PID,
-                snapshot_id,
-            ),
+        return _record_test_current_full_reconcile_authority(
+            conn,
+            backlog_id=f"AC-LIVE-CURRENT-FULL-{suffix}",
+            task_id=f"live-current-full-{suffix}-worker",
+            contract_execution_id=f"cex-live-current-full-{suffix}",
+            runtime_context_id=f"mfrctx-live-current-full-{suffix}",
+            target_project_root=str(worktree),
+            snapshot_id=snapshot_id,
+            commit_sha=commit_sha,
+            qa_graph_trace_id=f"gqt-live-current-full-{suffix}",
+            qa_commit_sha=commit_sha,
         )
-        conn.commit()
 
     def close_ready_write(close_commit: str) -> dict:
         write = server._contract_runtime_write_from_record(
@@ -47383,10 +47384,6 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
         }
         return write
 
-    activate_current_full(
-        "full-descendant-close-head-same",
-        row_merge_commit,
-    )
     same_head_gate = server._contract_runtime_mf_parallel_close_ready_precheck(
         record,
         close_ready_write(row_merge_commit),
@@ -47413,10 +47410,12 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
         text=True,
     )
     descendant_head = batch_jobs.git_commit(worktree)
-    activate_current_full(
+    live_head_authority = activate_live_current_full(
         "full-descendant-close-head-current",
         descendant_head,
+        suffix="descendant",
     )
+    assert live_head_authority["task_scope_verified"] is True
     record_before = server.stable_sha256(record)
     descendant_gate = (
         server._contract_runtime_mf_parallel_close_ready_precheck(
@@ -47447,9 +47446,9 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
     assert bridge["closing_head_commit"] == descendant_head
     assert bridge["active_snapshot_commit"] == descendant_head
     assert bridge["bridge_mode"] == (
-        "historical_reconcile_with_active_descendant_snapshot"
+        "source_reconcile_with_live_current_full_snapshot"
     )
-    assert bridge["current_head_full_reconcile_verified"] is False
+    assert bridge["current_head_full_reconcile_verified"] is True
     assert bridge["raw_merge_reconcile_commits_preserved"] is True
     assert descendant_gate["checks"][
         "descendant_close_head_bridge_verified"
@@ -47458,9 +47457,9 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
         "observer_reconcile_descendant_close_head_bridged"
     ] is True
 
-    # A later real current-HEAD full reconcile must also bridge the immutable
-    # row merge/reconcile receipts.  The receipts remain at row_merge_commit;
-    # only the server-derived, in-memory reconcile authority advances.
+    # The later current-HEAD full reconcile belongs to another bounded task.
+    # The source receipts and source reconcile authority remain immutable at
+    # row_merge_commit; the server independently binds the live full snapshot.
     current_head_record = (
         server._contract_runtime_bind_close_reconcile_authority(
             conn,
@@ -47474,34 +47473,6 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
     current_head_record["runtime_guide"]["completed_lines"] = json.loads(
         json.dumps(current_head_record["completed_lines"])
     )
-    for current_head_lines in (
-        current_head_record["completed_lines"],
-        current_head_record["runtime_guide"]["completed_lines"],
-    ):
-        current_head_reconcile = next(
-            line
-            for line in current_head_lines
-            if line["line_id"] == "observer_reconcile"
-        )
-        current_head_authority = current_head_reconcile["payload"][
-            "reconcile_authority"
-        ]
-        current_head_authority.update(
-            {
-                "reconciled_commit_sha": descendant_head,
-                "reconcile_provenance_target_commit": descendant_head,
-                "reconcile_snapshot_commit": descendant_head,
-                "canonical_head_equals_reconciled_commit": True,
-                "reconciled_commit_is_ancestor_of_canonical_head": True,
-            }
-        )
-        current_head_authority["authority_hash"] = server.stable_sha256(
-            {
-                key: value
-                for key, value in current_head_authority.items()
-                if key != "authority_hash"
-            }
-        )
     current_head_before = server.stable_sha256(current_head_record)
     current_head_gate = (
         server._contract_runtime_mf_parallel_close_authority_gate(
@@ -47523,12 +47494,12 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
     assert server.stable_sha256(current_head_record) == current_head_before
     current_head_bridge = current_head_gate["descendant_close_head_bridge"]
     assert current_head_bridge["bridge_mode"] == (
-        "current_head_full_reconcile_after_durable_merge"
+        "source_reconcile_with_live_current_full_snapshot"
     )
     assert current_head_bridge["durable_merge_commit"] == row_merge_commit
-    assert current_head_bridge["reconciled_commit"] == descendant_head
+    assert current_head_bridge["reconciled_commit"] == row_merge_commit
     assert current_head_bridge["reconcile_snapshot_commit"] == (
-        descendant_head
+        row_merge_commit
     )
     assert current_head_bridge[
         "durable_merge_commit_is_ancestor_of_reconciled_commit"
@@ -47537,8 +47508,11 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
     assert current_head_gate["commit_mismatches"] == []
 
     for field, rejected_value in (
-        ("reconcile_provenance_target_commit", row_merge_commit),
-        ("reconcile_snapshot_commit", row_merge_commit),
+        (
+            "active_snapshot_current_full_provenance_target_commit",
+            row_merge_commit,
+        ),
+        ("active_snapshot_current_full_provenance_id", ""),
         ("active_snapshot_commit", row_merge_commit),
         ("task_scope_verified", False),
     ):
@@ -47585,9 +47559,10 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
             "contract_runtime.observer_reconcile_close_commit",
         }.issubset(rejected_gate["missing_requirement_ids"]), field
 
-    activate_current_full(
+    _activate_basic_graph(
+        conn,
         "full-descendant-close-head-stale",
-        row_merge_commit,
+        commit_sha=row_merge_commit,
     )
     stale_snapshot_gate = (
         server._contract_runtime_mf_parallel_close_ready_precheck(
@@ -47604,9 +47579,10 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
         "contract_runtime.observer_reconcile_close_commit",
     }.issubset(stale_snapshot_gate["missing_requirement_ids"])
 
-    activate_current_full(
+    activate_live_current_full(
         "full-descendant-close-head-authority",
         descendant_head,
+        suffix="authority",
     )
     prospective = server._contract_runtime_bind_close_reconcile_authority(
         conn,
@@ -47719,9 +47695,10 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
         )
         == {}
     )
-    activate_current_full(
+    activate_live_current_full(
         "full-descendant-close-head-sibling",
         sibling_head,
+        suffix="sibling",
     )
     non_descendant_gate = (
         server._contract_runtime_mf_parallel_close_ready_precheck(
@@ -47737,6 +47714,273 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
         "contract_runtime.observer_merge_close_commit",
         "contract_runtime.observer_reconcile_close_commit",
     }.issubset(non_descendant_gate["missing_requirement_ids"])
+
+
+def test_close_bridge_preserves_source_reconcile_and_binds_live_active_full(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    merged_commit = "f2e31178095eb3d9776e19bc08776677a065f5d4"
+    reconciled_commit = "22c47c8082f83e8e7e26f679b9e7fc7091459443"
+    closing_head = "1c2fd6dccb1129da630587ba90cda5493c055f11"
+    source_backlog_id = "AC-CLOSE-BRIDGE-SOURCE"
+    source_task_id = "close-bridge-source-worker"
+    source_execution_id = "cex-close-bridge-source"
+    source_runtime_context_id = "mfrctx-close-bridge-source"
+    live_task_id = "close-bridge-live-worker"
+    live_execution_id = "cex-close-bridge-live"
+    live_runtime_context_id = "mfrctx-close-bridge-live"
+    project_root = tmp_path / "close-bridge-live-active-root"
+    project_root.mkdir()
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_head_commit",
+        lambda _root: closing_head,
+    )
+    valid_ancestry = {
+        (merged_commit, reconciled_commit),
+        (reconciled_commit, closing_head),
+        (merged_commit, closing_head),
+    }
+    monkeypatch.setattr(
+        server,
+        "_git_commit_is_ancestor",
+        lambda _root, ancestor, descendant: (
+            ancestor == descendant
+            or (ancestor, descendant) in valid_ancestry
+        ),
+    )
+
+    source_snapshot_id = "full-close-bridge-source-reconcile"
+    _activate_basic_graph(
+        conn,
+        source_snapshot_id,
+        commit_sha=reconciled_commit,
+    )
+    source = _record_test_current_full_reconcile_authority(
+        conn,
+        backlog_id=source_backlog_id,
+        task_id=source_task_id,
+        contract_execution_id=source_execution_id,
+        runtime_context_id=source_runtime_context_id,
+        target_project_root=str(project_root),
+        snapshot_id=source_snapshot_id,
+        commit_sha=reconciled_commit,
+        merged_commit_sha=merged_commit,
+        qa_graph_trace_id="gqt-close-bridge-source",
+        qa_commit_sha=merged_commit,
+    )
+    live_snapshot_id = "full-close-bridge-live-head"
+    _activate_basic_graph(
+        conn,
+        live_snapshot_id,
+        commit_sha=closing_head,
+    )
+    live = _record_test_current_full_reconcile_authority(
+        conn,
+        backlog_id="AC-CLOSE-BRIDGE-LIVE",
+        task_id=live_task_id,
+        contract_execution_id=live_execution_id,
+        runtime_context_id=live_runtime_context_id,
+        target_project_root=str(project_root),
+        snapshot_id=live_snapshot_id,
+        commit_sha=closing_head,
+        qa_graph_trace_id="gqt-close-bridge-live",
+        qa_commit_sha=closing_head,
+    )
+    assert source_task_id != live_task_id
+
+    record = {
+        "project_id": PID,
+        "backlog_id": source_backlog_id,
+        "contract_execution_id": source_execution_id,
+    }
+    merge = {
+        "timeline_verified": True,
+        "merged_commit_sha": merged_commit,
+        "qa_event_id": int(source["qa_event_id"]),
+        "qa_event_created_at": source["qa_event_created_at"],
+        "qa_source_ref": f"timeline:{source['qa_event_id']}",
+        "merge_event_id": int(source["merge_event_id"]),
+        "merge_event_created_at": source["merge_event_created_at"],
+        "merge_source_ref": f"timeline:{source['merge_event_id']}",
+        "contract_execution_id": source_execution_id,
+        "runtime_context_id": source_runtime_context_id,
+        "task_id": source_task_id,
+        "parent_task_id": "",
+        "merge_queue_id": "",
+        "dispatch_lineage_verified": True,
+        "contract_runtime_dispatch_source_ref": (
+            f"contract_runtime:{source_execution_id}:dispatch"
+        ),
+        "allow_taskless_reconcile": True,
+    }
+    reconcile = {
+        "reconcile_event_id": int(source["reconcile_event_id"]),
+        "reconcile_event_created_at": source[
+            "reconcile_event_created_at"
+        ],
+        "reconcile_source_ref": (
+            f"timeline:{source['reconcile_event_id']}"
+        ),
+        "reconcile_task_id": source_task_id,
+        "reconcile_runtime_context_id": source_runtime_context_id,
+        "allow_taskless_reconcile": True,
+    }
+
+    def build_authority() -> dict[str, Any]:
+        return server._contract_runtime_current_full_reconcile_authority_from_merge(
+            conn,
+            project_id=PID,
+            record=record,
+            merge=merge,
+            reconcile=reconcile,
+        )
+
+    authority = build_authority()
+    assert authority["db_verified"] is True
+    assert authority["graph_reconciled"] is True
+    assert authority["merged_commit_sha"] == merged_commit
+    assert authority["reconciled_commit_sha"] == reconciled_commit
+    assert authority["reconcile_provenance_target_commit"] == (
+        reconciled_commit
+    )
+    assert authority["reconcile_snapshot_id"] == source_snapshot_id
+    assert authority["reconcile_snapshot_commit"] == reconciled_commit
+    assert authority["task_id"] == source_task_id
+    assert authority["runtime_context_id"] == source_runtime_context_id
+    assert authority["active_snapshot_id"] == live_snapshot_id
+    assert authority["active_snapshot_commit"] == closing_head
+    assert authority[
+        "active_snapshot_current_full_reconcile_verified"
+    ] is True
+    assert authority["active_snapshot_current_full_task_id"] == live_task_id
+    assert authority[
+        "active_snapshot_current_full_runtime_context_id"
+    ] == live_runtime_context_id
+    assert authority[
+        "active_snapshot_current_full_contract_execution_id"
+    ] == live_execution_id
+    assert authority[
+        "active_snapshot_current_full_reconcile_event_id"
+    ] == int(live["reconcile_event_id"])
+
+    merge_line = {
+        "line_id": "observer_merge",
+        "commit_sha": merged_commit,
+        "_source_ref": f"timeline:{source['merge_event_id']}",
+        "payload": {},
+    }
+    reconcile_line = {
+        "line_id": "observer_reconcile",
+        "commit_sha": reconciled_commit,
+        "_source_ref": f"timeline:{source['reconcile_event_id']}",
+        "payload": {
+            "reconcile_authority": authority,
+            "close_authority_binding": {
+                "source": "server_close_authority_projection",
+                "server_derived": True,
+                "persisted_to_completed_line": False,
+            },
+        },
+    }
+    bridge = server._contract_runtime_mf_parallel_descendant_close_head_bridge(
+        close_commit=closing_head,
+        merge_line=merge_line,
+        reconcile_line=reconcile_line,
+        server_post_qa_lineage_passed=True,
+    )
+    assert bridge["passed"] is True
+    assert bridge["durable_merge_commit"] == merged_commit
+    assert bridge["reconciled_commit"] == reconciled_commit
+    assert bridge["closing_head_commit"] == closing_head
+    assert bridge["bridge_mode"] == (
+        "source_reconcile_with_live_current_full_snapshot"
+    )
+    assert bridge["current_head_full_reconcile_verified"] is True
+    assert bridge["raw_merge_reconcile_commits_preserved"] is True
+
+    # Strict negatives mutate only persisted graph authority, then recompute
+    # the complete server projection.  No caller-shaped authority is patched.
+    live_snapshot_row = store.get_graph_snapshot(
+        conn,
+        PID,
+        live_snapshot_id,
+    )
+    live_provenance_row = conn.execute(
+        "SELECT * FROM graph_current_full_reconcile_provenance "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (PID, live_snapshot_id),
+    ).fetchone()
+    assert live_snapshot_row is not None
+    assert live_provenance_row is not None
+    for sql, params, restore_sql, restore_params in (
+        (
+            "UPDATE graph_snapshots SET snapshot_kind = 'scope' "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (PID, live_snapshot_id),
+            "UPDATE graph_snapshots SET snapshot_kind = ? "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (
+                live_snapshot_row["snapshot_kind"],
+                PID,
+                live_snapshot_id,
+            ),
+        ),
+        (
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET provenance_hash = 'sha256:deadbeef' "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (PID, live_snapshot_id),
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET provenance_hash = ? "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (
+                live_provenance_row["provenance_hash"],
+                PID,
+                live_snapshot_id,
+            ),
+        ),
+        (
+            "UPDATE graph_snapshots SET notes = '{}' "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (PID, live_snapshot_id),
+            "UPDATE graph_snapshots SET notes = ? "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (live_snapshot_row["notes"], PID, live_snapshot_id),
+        ),
+    ):
+        conn.execute(sql, params)
+        conn.commit()
+        rejected = build_authority()
+        assert rejected["active_snapshot_verified"] is False
+        assert rejected[
+            "active_snapshot_current_full_reconcile_verified"
+        ] is False
+        assert rejected["graph_reconciled"] is False
+        conn.execute(restore_sql, restore_params)
+        conn.commit()
+
+    wrong_source_scope = dict(merge)
+    wrong_source_scope["task_id"] = "unrelated-source-task"
+    rejected_scope = (
+        server._contract_runtime_current_full_reconcile_authority_from_merge(
+            conn,
+            project_id=PID,
+            record=record,
+            merge=wrong_source_scope,
+            reconcile=reconcile,
+        )
+    )
+    assert rejected_scope["task_scope_verified"] is False
+    assert rejected_scope["db_verified"] is False
+    assert rejected_scope["graph_reconciled"] is False
 
 
 def test_mf_parallel_close_authority_rejects_wrong_batch_final_commit_bridge():
