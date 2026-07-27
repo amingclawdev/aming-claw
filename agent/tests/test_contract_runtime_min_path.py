@@ -13,6 +13,7 @@ from agent.governance.contracts.runtime import (
     _audited_bypass_recovery_fallback,
     _audited_bypass_terminal_disposition,
     _contract_completion_satisfying_lines,
+    _project_current_contract_state,
     _project_record_state,
     _worker_implementation_lineage,
     ContractRuntimeError,
@@ -3294,6 +3295,412 @@ def test_completed_recovery_supersedes_only_named_stale_predecessor(tmp_path):
         "contract_execution_id"
     ]
     assert current_with_unrelated["readiness_state"] == "contract_active"
+
+
+@pytest.mark.parametrize(
+    "recovery_lineage_shape",
+    ("frozen_target", "legacy_live_source"),
+)
+def test_completed_recovery_projects_exact_parent_observer_merge_cursor(
+    recovery_lineage_shape,
+):
+    project_id = "aming-claw"
+    backlog_id = (
+        "AC-CONTRACT-RUNTIME-OBSERVER-MERGE-QA-BASELINE-COMMIT-IDENTITY-"
+        "R1-20260726"
+    )
+    root_id = "onboard-service-60d12cacdde638db2df5"
+    parent_id = "cex-mf-parallel-2f6f70dc03fb507fdf52"
+    child_id = "cex-repair-567f422fe80f9072"
+    chain_id = "cchain-60d12cacdde638db2df5"
+    candidate_commit = "439710a9a9ae47f09ec2be0e3f1dac38308b477b"
+    merged_commit = "488700771df207eb346229a9fe61dde1876f634f"
+    source_guide_hash = (
+        "sha256:736098d20d764c20f317e9e790659ea0bd2db2475a762567a759c78449732de1"
+    )
+    target = {
+        "schema_version": "contract_runtime.same_row_recovery_target.v1",
+        "source_of_authority": (
+            "stale_contract_runtime.runtime_guide.next_legal_action"
+        ),
+        "source_contract_execution_id": parent_id,
+        "source_execution_state_revision": 12,
+        "source_runtime_guide_hash": source_guide_hash,
+        "stage_id": "observer_integration",
+        "line_id": "observer_merge",
+        "action": "record_merge",
+        "evidence_kind": "merge",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "historical_parent_immutable": True,
+        "authoritative_pass_synthesized": False,
+    }
+    target["target_hash"] = stable_sha256(target)
+    parent = {
+        "schema_version": "contract_runtime_execution_record.v1",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": parent_id,
+        "parent_contract_execution_id": root_id,
+        "root_contract_execution_id": root_id,
+        "contract_chain_id": chain_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev5",
+        "execution_state_revision": 12,
+        "completed_lines": [
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "status": "passed",
+                "commit_sha": candidate_commit,
+            }
+        ],
+        "runtime_guide": {
+            "runtime_guide_hash": source_guide_hash,
+            "next_legal_action": {
+                "stage_id": "observer_integration",
+                "line_id": "observer_merge",
+                "evidence_kind": "merge",
+                "owner_role": "observer",
+                "allowed_writer_roles": ["observer"],
+            },
+        },
+    }
+    qa_provenance = {
+        "schema_version": "qa_evidence_provenance.v1",
+        "server_derived": True,
+        "evidence_owner_role": "qa",
+        "observer_impersonation": False,
+        "authenticated_qa_binding": {
+            "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+            "server_derived": True,
+            "qa_principal": "qa:merge-scope-qa-r3-20260726",
+            "qa_session_id": "ses-1785106230998-979251",
+            "independent_verification_session_matched": True,
+        },
+        "completion_status_gate": {
+            "schema_version": "contract_runtime.qa_completion_status_gate.v1",
+            "server_derived": True,
+            "normalized_status": "passed",
+            "top_level_status_present": True,
+            "top_level_status_passing": True,
+        },
+    }
+    durable_merge = {
+        "schema_version": "contract_runtime.observer_merge_durable_authority.v1",
+        "source": "parallel_branch_merge_queue+task_timeline_merge",
+        "server_derived": True,
+        "db_verified": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "runtime_context_id": "mfrctx-3c4480963474f205",
+        "task_id": "observer-merge-authority-repair-worker-3",
+        "parent_task_id": child_id,
+        "branch_head": candidate_commit,
+        "merge_commit": merged_commit,
+        "target_head_after_merge": merged_commit,
+        "merge_gate_passed": True,
+        "merge_queue_id": "mq-f1a3902f300f821cb131",
+        "queue_item_id": (
+            "mq-f1a3902f300f821cb131:"
+            "observer-merge-authority-repair-worker-3"
+        ),
+        "queue_item_status": "merged",
+        "qa_completed_line_index": 0,
+        "qa_acceptance_ref": f"contract_runtime:{child_id}:revision:12",
+        "qa_contract_runtime_verified": True,
+        "no_pass_claim": False,
+        "overall_release_pass_claimed": False,
+        "authoritative_pass_synthesized": False,
+        "close_satisfying": True,
+        "timeline_event_refs": ["timeline:18299"],
+        "merge_event_ref": "timeline:18299",
+        "merge_event_id": 18299,
+        "merge_event_created_at": "2026-07-26T23:11:33Z",
+    }
+    current_full = {
+        "schema_version": "graph_snapshot_store.current_full_reconcile_state.v1",
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "server_derived": True,
+        "db_verified": True,
+        "live_verified": True,
+        "canonical_head_verified": True,
+        "active_snapshot_verified": True,
+        "active_snapshot_matches_canonical_head": True,
+        "graph_reconciled": True,
+        "provenance_verified": True,
+        "provenance_scope_verified": True,
+        "durable_order_verified": True,
+        "reconcile_snapshot_verified": True,
+        "contract_execution_scope_verified": True,
+        "task_scope_verified": True,
+        "runtime_context_scope_verified": True,
+        "parent_task_scope_verified": True,
+        "merge_queue_scope_verified": True,
+        "current_full_reconcile": True,
+        "strategy": "current_full_reconcile",
+        "active_snapshot_status": "active",
+        "active_snapshot_id": (
+            "full-4887007-observer-merge-external-tuple-postmerge"
+        ),
+        "active_snapshot_commit": merged_commit,
+        "canonical_head_commit": merged_commit,
+        "current_canonical_commit_sha": merged_commit,
+        "reconciled_commit_sha": merged_commit,
+        "reconcile_provenance_target_commit": merged_commit,
+        "merge_source_ref": "timeline:18299",
+        "merged_commit_sha": merged_commit,
+        "reconcile_source_ref": "timeline:18300",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": child_id,
+    }
+    current_full["authority_hash"] = stable_sha256(current_full)
+    reconcile = {
+        "schema_version": "contract_runtime.observer_reconcile_record_authority.v1",
+        "server_derived": True,
+        "record_verified": True,
+        "merge_projection_verified": True,
+        "dispatch_lineage_verified": True,
+        "reconcile_event_recorded": True,
+        "merge_source_ref": "timeline:18299",
+        "merged_commit_sha": merged_commit,
+        "reconcile_source_ref": "timeline:18300",
+        "current_full_reconcile_activation_verified": True,
+        "terminal_current_full_reconcile_authority": current_full,
+    }
+    reconcile["authority_hash"] = stable_sha256(reconcile)
+    recovery_metadata = {
+        "facade": "contract_runtime_recovery",
+        "recovery_policy": "start_new_execution",
+        "stale_contract_execution_id": parent_id,
+        "recovery_contract_execution_id": child_id,
+        "historical_evidence_replayed": False,
+        "authoritative_pass_synthesized": False,
+        "current_repair_target": target,
+    }
+    recovery_backlog_lineage = {
+        "recovery_policy": "start_new_execution",
+        "stale_contract_execution_id": parent_id,
+        "recovery_contract_execution_id": child_id,
+        "current_repair_target": target,
+    }
+    if recovery_lineage_shape == "legacy_live_source":
+        recovery_metadata = {
+            "facade": "mf_parallel",
+            "source_contract_execution_id": parent_id,
+            "source_failed_qa_event_ref": "timeline:18278",
+            "repair_run_id": "repair-567f422fe80f9072",
+            "immutable_checkpoint_commit": (
+                "9e07577946d46b4bd9c1285227b8dc09b8f11fe3"
+            ),
+            "immutable_checkpoint_reconcile_ref": "timeline:18277",
+            "historical_evidence_replayed": False,
+            "authoritative_pass_synthesized": False,
+        }
+        recovery_backlog_lineage = {}
+        durable_merge["parent_task_id"] = "repair-567f422fe80f9072"
+    child = {
+        **parent,
+        "contract_execution_id": child_id,
+        "execution_state_revision": 15,
+        "completed_lines": [
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "status": "passed",
+                "commit_sha": candidate_commit,
+                "qa_evidence_provenance": qa_provenance,
+                "payload": {"status": "passed", "verdict": "passed"},
+            },
+            {
+                "stage_id": "observer_integration",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge",
+                "status": "passed",
+                "commit_sha": merged_commit,
+                "payload": {"durable_merge_authority": durable_merge},
+            },
+            {
+                "stage_id": "observer_integration",
+                "line_id": "observer_reconcile",
+                "actor_role": "observer",
+                "evidence_kind": "reconcile",
+                "status": "passed",
+                "commit_sha": merged_commit,
+                "payload": {"reconcile_authority": reconcile},
+            },
+            {
+                "stage_id": "observer_integration",
+                "line_id": "observer_close_ready",
+                "actor_role": "observer",
+                "evidence_kind": "close_ready",
+                "status": "passed",
+                "commit_sha": merged_commit,
+            },
+        ],
+        "runtime_guide": {
+            "runtime_guide_hash": (
+                "sha256:d4f992200764092cba3ad6a4d4d5a2dd1dcbca836b39ad44712e4d72ea9cf96b"
+            ),
+            "next_legal_action": None,
+        },
+        "metadata": recovery_metadata,
+        "backlog_lineage": recovery_backlog_lineage,
+    }
+    immutable_parent_lines = json.loads(json.dumps(parent["completed_lines"]))
+
+    projected = _project_current_contract_state(
+        [parent, child],
+        root_record=parent,
+        row_times={parent_id: "2026-07-27T00:00:00Z", child_id: "2026-07-27T00:02:00Z"},
+    )
+
+    assert projected["current_contract_execution_id"] == parent_id
+    assert projected["active_child_contract_execution_id"] == ""
+    assert projected["readiness_state"] == "same_row_recovery_target_ready"
+    assert projected["next_legal_action"]["line_id"] == "observer_merge"
+    assert projected["next_legal_action"]["source"] == (
+        "backlog_contract_chain_current.same_row_recovery_cursor"
+    )
+    assert projected["next_legal_action"]["repair_child_contract_execution_id"] == (
+        child_id
+    )
+    assert projected["same_row_recovery_cursor"]["reconcile_source_ref"] == (
+        "timeline:18300"
+    )
+    assert projected["same_row_recovery_cursor"]["historical_parent_mutated"] is False
+    assert projected["same_row_recovery_cursor"][
+        "authoritative_pass_synthesized"
+    ] is False
+    assert projected["same_row_recovery_cursor"]["target_source"] == (
+        "frozen_recovery_target"
+        if recovery_lineage_shape == "frozen_target"
+        else "legacy_persisted_parent_guide"
+    )
+    assert parent["completed_lines"] == immutable_parent_lines
+    assert not any(
+        line.get("line_id") == "qa_graph_context"
+        for line in parent["completed_lines"]
+    )
+
+    invalid_children = []
+    failed_qa = json.loads(json.dumps(child))
+    failed_qa["completed_lines"][0]["status"] = "failed"
+    invalid_children.append(failed_qa)
+    wrong_chain = json.loads(json.dumps(child))
+    wrong_chain["contract_chain_id"] = "cchain-unrelated"
+    invalid_children.append(wrong_chain)
+    missing_merge_proof = json.loads(json.dumps(child))
+    missing_merge_proof["completed_lines"][1]["payload"][
+        "durable_merge_authority"
+    ]["db_verified"] = False
+    invalid_children.append(missing_merge_proof)
+    stale_reconcile = json.loads(json.dumps(child))
+    stale_reconcile["completed_lines"][2]["payload"]["reconcile_authority"][
+        "terminal_current_full_reconcile_authority"
+    ]["active_snapshot_commit"] = "d" * 40
+    invalid_children.append(stale_reconcile)
+    for invalid_child in invalid_children:
+        invalid_projection = _project_current_contract_state(
+            [parent, invalid_child],
+            root_record=parent,
+            row_times={
+                parent_id: "2026-07-27T00:00:00Z",
+                child_id: "2026-07-27T00:02:00Z",
+            },
+        )
+        assert invalid_projection.get("readiness_state") != (
+            "same_row_recovery_target_ready"
+        )
+
+    drifted_parent = json.loads(json.dumps(parent))
+    drifted_parent["runtime_guide"]["next_legal_action"]["line_id"] = (
+        "observer_reconcile"
+    )
+    drift_projection = _project_current_contract_state(
+        [drifted_parent, child],
+        root_record=drifted_parent,
+        row_times={
+            parent_id: "2026-07-27T00:00:00Z",
+            child_id: "2026-07-27T00:02:00Z",
+        },
+    )
+    assert drift_projection.get("readiness_state") != (
+        "same_row_recovery_target_ready"
+    )
+
+    unrelated_incomplete = {
+        **parent,
+        "contract_execution_id": "cex-unrelated-incomplete",
+        "completed_lines": [],
+        "runtime_guide": {
+            "runtime_guide_hash": "sha256:unrelated-incomplete",
+            "next_legal_action": {
+                "stage_id": "worker",
+                "line_id": "worker_implementation",
+            },
+        },
+    }
+    unrelated_projection = _project_current_contract_state(
+        [parent, child, unrelated_incomplete],
+        root_record=parent,
+        row_times={
+            parent_id: "2026-07-27T00:00:00Z",
+            child_id: "2026-07-27T00:02:00Z",
+            "cex-unrelated-incomplete": "2026-07-27T00:03:00Z",
+        },
+    )
+    assert unrelated_projection.get("readiness_state") != (
+        "same_row_recovery_target_ready"
+    )
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    store = SQLiteContractExecutionStore(conn)
+    root = {
+        **parent,
+        "contract_execution_id": root_id,
+        "parent_contract_execution_id": "",
+        "root_contract_execution_id": root_id,
+        "contract_id": "onboard_route_guide",
+        "version": "v1",
+        "revision": "rev1",
+        "execution_state_revision": 3,
+        "completed_lines": [],
+        "runtime_guide": {
+            "runtime_guide_hash": "sha256:completed-onboard-root",
+            "next_legal_action": None,
+        },
+        "metadata": {},
+        "backlog_lineage": {},
+    }
+    store.create(root)
+    store.create(parent)
+    store.create(child)
+    rebuilt = rebuild_backlog_contract_chain_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    rebuilt_again = rebuild_backlog_contract_chain_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    assert rebuilt["current_contract_execution_id"] == parent_id
+    assert rebuilt["readiness_state"] == "same_row_recovery_target_ready"
+    assert rebuilt["next_legal_action"]["line_id"] == "observer_merge"
+    assert rebuilt_again["projection_hash"] == rebuilt["projection_hash"]
+    assert rebuilt_again["same_row_recovery_cursor"]["cursor_hash"] == (
+        rebuilt["same_row_recovery_cursor"]["cursor_hash"]
+    )
 
 
 def test_incomplete_recovery_remains_current_and_fail_closed(tmp_path):

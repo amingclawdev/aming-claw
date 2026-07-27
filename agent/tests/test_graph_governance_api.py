@@ -61533,6 +61533,18 @@ def test_generic_contract_runtime_recovery_preserves_stale_evidence_without_repl
     stale = runtime.store.get(execution_id)
     original_completed_lines = list(stale["completed_lines"])
     stale["definition_hash"] = "sha256:stale-mf-parallel-definition"
+    stale["execution_state_revision"] = 12
+    stale["runtime_guide"] = {
+        "runtime_guide_hash": "sha256:historical-observer-merge-guide",
+        "next_legal_action": {
+            "stage_id": "observer_integration",
+            "line_id": "observer_merge",
+            "action": "record_merge",
+            "evidence_kind": "merge",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+        },
+    }
     runtime.store.update(execution_id, stale)
     conn.commit()
 
@@ -61587,9 +61599,29 @@ def test_generic_contract_runtime_recovery_preserves_stale_evidence_without_repl
     assert runtime.store.get(execution_id)["completed_lines"] == (
         original_completed_lines
     )
+    assert runtime.store.get(execution_id)["runtime_guide"] == (
+        stale["runtime_guide"]
+    )
     recovery_record = runtime.store.get(recovery_id)
     assert recovery_record["completed_lines"] == []
     assert recovery_record["metadata"]["historical_evidence_replayed"] is False
+    target = recovery_record["metadata"]["current_repair_target"]
+    assert target == recovery_record["backlog_lineage"]["current_repair_target"]
+    assert target == recovered["current_repair_target"]
+    assert target["schema_version"] == (
+        "contract_runtime.same_row_recovery_target.v1"
+    )
+    assert target["source_contract_execution_id"] == execution_id
+    assert target["source_execution_state_revision"] == 12
+    assert target["source_runtime_guide_hash"] == (
+        "sha256:historical-observer-merge-guide"
+    )
+    assert target["line_id"] == "observer_merge"
+    assert target["historical_parent_immutable"] is True
+    assert target["authoritative_pass_synthesized"] is False
+    assert target["target_hash"] == server.stable_sha256(
+        {key: value for key, value in target.items() if key != "target_hash"}
+    )
 
     replay = server.handle_project_contract_runtime_recover(
         _ctx_with_role(

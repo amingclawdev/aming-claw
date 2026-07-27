@@ -64406,6 +64406,67 @@ def _contract_runtime_stale_record_evidence_projection(
     }
 
 
+def _contract_runtime_current_repair_target(
+    stale_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Freeze an exact historical observer-merge cursor without mutating it."""
+
+    runtime_guide = (
+        stale_record.get("runtime_guide")
+        if isinstance(stale_record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_action = (
+        runtime_guide.get("next_legal_action")
+        if isinstance(runtime_guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    allowed_writer_roles = list(next_action.get("allowed_writer_roles") or [])
+    source_execution_id = str(
+        stale_record.get("contract_execution_id") or ""
+    ).strip()
+    try:
+        source_revision = int(
+            stale_record.get("execution_state_revision") or 0
+        )
+    except (TypeError, ValueError):
+        return {}
+    source_guide_hash = str(
+        runtime_guide.get("runtime_guide_hash") or ""
+    ).strip()
+    if not (
+        source_execution_id
+        and source_revision > 0
+        and source_guide_hash
+        and str(next_action.get("stage_id") or "") == "observer_integration"
+        and str(next_action.get("line_id") or "") == "observer_merge"
+        and str(next_action.get("evidence_kind") or "") == "merge"
+        and str(next_action.get("owner_role") or "") == "observer"
+        and "observer" in allowed_writer_roles
+    ):
+        return {}
+    target = {
+        "schema_version": "contract_runtime.same_row_recovery_target.v1",
+        "source_of_authority": (
+            "stale_contract_runtime.runtime_guide.next_legal_action"
+        ),
+        "source_contract_execution_id": source_execution_id,
+        "source_execution_state_revision": source_revision,
+        "source_runtime_guide_hash": source_guide_hash,
+        "stage_id": "observer_integration",
+        "line_id": "observer_merge",
+        "action": str(next_action.get("action") or "").strip()
+        or "record_merge",
+        "evidence_kind": "merge",
+        "owner_role": "observer",
+        "allowed_writer_roles": allowed_writer_roles,
+        "historical_parent_immutable": True,
+        "authoritative_pass_synthesized": False,
+    }
+    target["target_hash"] = stable_sha256(target)
+    return target
+
+
 def _contract_runtime_recovery_requested(value: Any) -> bool:
     normalized = str(value or "").strip().lower().replace("-", "_")
     return normalized in {
@@ -109301,6 +109362,9 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
         historical_evidence = (
             _contract_runtime_stale_record_evidence_projection(stale_record)
         )
+        current_repair_target = _contract_runtime_current_repair_target(
+            stale_record
+        )
         idempotent = False
         try:
             recovery_record = runtime.store.get(recovery_execution_id)
@@ -109322,6 +109386,21 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
                         "stale_contract_execution_id": stale_execution_id,
                     },
                 )
+            persisted_target = recovery_metadata.get("current_repair_target")
+            if (
+                isinstance(persisted_target, Mapping)
+                and persisted_target
+                and dict(persisted_target) != current_repair_target
+            ):
+                raise ValidationError(
+                    "recovery execution frozen repair target does not match "
+                    "immutable stale history",
+                    {
+                        "recovery_contract_execution_id": recovery_execution_id,
+                        "stale_contract_execution_id": stale_execution_id,
+                        "fail_closed": True,
+                    },
+                )
             runtime.current_guide(
                 recovery_execution_id,
                 actor_role=actor_role,
@@ -109341,6 +109420,29 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
                     "recovery_policy": "start_new_execution",
                 }
             )
+            if current_repair_target:
+                backlog_lineage["current_repair_target"] = (
+                    current_repair_target
+                )
+            recovery_metadata = {
+                "facade": "contract_runtime_recovery",
+                "generic_crud_exposed": False,
+                "recovery_policy": "start_new_execution",
+                "recovery_reason": "stale_pinned_execution",
+                "stale_contract_execution_id": stale_execution_id,
+                "stale_completed_line_count": historical_evidence[
+                    "completed_line_count"
+                ],
+                "stale_evidence_refs": historical_evidence[
+                    "completed_line_refs"
+                ],
+                "historical_evidence_replayed": False,
+                "authoritative_pass_synthesized": False,
+            }
+            if current_repair_target:
+                recovery_metadata["current_repair_target"] = (
+                    current_repair_target
+                )
             recovery_record = runtime.start_execution(
                 str(stale_record.get("contract_id") or ""),
                 project_id=project_id,
@@ -109365,21 +109467,7 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
                     else {}
                 ),
                 backlog_lineage=backlog_lineage,
-                metadata={
-                    "facade": "contract_runtime_recovery",
-                    "generic_crud_exposed": False,
-                    "recovery_policy": "start_new_execution",
-                    "recovery_reason": "stale_pinned_execution",
-                    "stale_contract_execution_id": stale_execution_id,
-                    "stale_completed_line_count": historical_evidence[
-                        "completed_line_count"
-                    ],
-                    "stale_evidence_refs": historical_evidence[
-                        "completed_line_refs"
-                    ],
-                    "historical_evidence_replayed": False,
-                    "authoritative_pass_synthesized": False,
-                },
+                metadata=recovery_metadata,
             )
         guide = runtime.current_guide(
             recovery_execution_id,
@@ -109411,6 +109499,8 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
             ),
         }
     )
+    if current_repair_target:
+        response["current_repair_target"] = current_repair_target
     return response
 
 

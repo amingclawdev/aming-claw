@@ -1235,6 +1235,12 @@ def _project_current_contract_state(
                         return returned_state
                 return _project_record_state(root_record)
             return direct_state
+    same_row_recovery = _project_same_row_recovery_state(
+        records,
+        row_times=row_times,
+    )
+    if same_row_recovery:
+        return same_row_recovery
     superseded_execution_ids = _recovery_superseded_execution_ids(records)
     selectable_records = [
         record
@@ -1259,6 +1265,501 @@ def _project_current_contract_state(
     if not current_record:
         return _empty_projected_state("missing_contract_runtime_execution")
     return _project_record_state(current_record)
+
+
+def _same_row_recovery_source_execution_id(
+    record: Mapping[str, Any],
+) -> str:
+    values: set[str] = set()
+    for lineage_field in ("metadata", "backlog_lineage"):
+        lineage = record.get(lineage_field)
+        if not isinstance(lineage, Mapping):
+            continue
+        for field in (
+            "stale_contract_execution_id",
+            "source_contract_execution_id",
+        ):
+            value = str(lineage.get(field) or "").strip()
+            if value:
+                values.add(value)
+    return next(iter(values)) if len(values) == 1 else ""
+
+
+def _same_row_recovery_target(
+    parent: Mapping[str, Any],
+    child: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Resolve only an immutable observer-merge target for one exact parent."""
+
+    parent_id = str(parent.get("contract_execution_id") or "").strip()
+    child_id = str(child.get("contract_execution_id") or "").strip()
+    runtime_guide = (
+        parent.get("runtime_guide")
+        if isinstance(parent.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_action = (
+        runtime_guide.get("next_legal_action")
+        if isinstance(runtime_guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    allowed_writer_roles = list(next_action.get("allowed_writer_roles") or [])
+    try:
+        source_revision = int(parent.get("execution_state_revision") or 0)
+    except (TypeError, ValueError):
+        return {}, ""
+    source_guide_hash = str(
+        runtime_guide.get("runtime_guide_hash") or ""
+    ).strip()
+    if not (
+        parent_id
+        and child_id
+        and child_id != parent_id
+        and source_revision > 0
+        and source_guide_hash
+        and str(next_action.get("stage_id") or "") == "observer_integration"
+        and str(next_action.get("line_id") or "") == "observer_merge"
+        and str(next_action.get("evidence_kind") or "") == "merge"
+        and str(next_action.get("owner_role") or "") == "observer"
+        and "observer" in allowed_writer_roles
+    ):
+        return {}, ""
+
+    canonical_target = {
+        "schema_version": "contract_runtime.same_row_recovery_target.v1",
+        "source_of_authority": (
+            "stale_contract_runtime.runtime_guide.next_legal_action"
+        ),
+        "source_contract_execution_id": parent_id,
+        "source_execution_state_revision": source_revision,
+        "source_runtime_guide_hash": source_guide_hash,
+        "stage_id": "observer_integration",
+        "line_id": "observer_merge",
+        "action": str(next_action.get("action") or "").strip()
+        or "record_merge",
+        "evidence_kind": "merge",
+        "owner_role": "observer",
+        "allowed_writer_roles": allowed_writer_roles,
+        "historical_parent_immutable": True,
+        "authoritative_pass_synthesized": False,
+    }
+    canonical_target["target_hash"] = stable_sha256(canonical_target)
+
+    frozen_targets: list[dict[str, Any]] = []
+    for lineage_field in ("metadata", "backlog_lineage"):
+        lineage = child.get(lineage_field)
+        if not isinstance(lineage, Mapping):
+            continue
+        target = lineage.get("current_repair_target")
+        if isinstance(target, Mapping):
+            frozen_targets.append(dict(target))
+    if frozen_targets:
+        if (
+            len(frozen_targets) != 2
+            or stable_sha256(frozen_targets[0])
+            != stable_sha256(frozen_targets[1])
+            or frozen_targets[0] != canonical_target
+        ):
+            return {}, ""
+        return canonical_target, "frozen_recovery_target"
+
+    metadata = (
+        child.get("metadata")
+        if isinstance(child.get("metadata"), Mapping)
+        else {}
+    )
+    if not (
+        str(metadata.get("source_contract_execution_id") or "").strip()
+        == parent_id
+        and str(metadata.get("source_failed_qa_event_ref") or "").startswith(
+            "timeline:"
+        )
+        and str(metadata.get("repair_run_id") or "").strip()
+        and re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            str(metadata.get("immutable_checkpoint_commit") or "")
+            .strip()
+            .lower(),
+        )
+        and re.fullmatch(
+            r"timeline:\d+",
+            str(metadata.get("immutable_checkpoint_reconcile_ref") or "")
+            .strip(),
+        )
+        and metadata.get("authoritative_pass_synthesized") is False
+    ):
+        return {}, ""
+    return canonical_target, "legacy_persisted_parent_guide"
+
+
+def _same_row_recovery_lineage_matches(
+    parent: Mapping[str, Any],
+    child: Mapping[str, Any],
+) -> bool:
+    parent_id = str(parent.get("contract_execution_id") or "").strip()
+    child_id = str(child.get("contract_execution_id") or "").strip()
+    if _same_row_recovery_source_execution_id(child) != parent_id:
+        return False
+    recovery_ids = {
+        str(lineage.get("recovery_contract_execution_id") or "").strip()
+        for lineage_field in ("metadata", "backlog_lineage")
+        if isinstance((lineage := child.get(lineage_field)), Mapping)
+        and str(lineage.get("recovery_contract_execution_id") or "").strip()
+    }
+    if recovery_ids and recovery_ids != {child_id}:
+        return False
+    metadata = (
+        child.get("metadata")
+        if isinstance(child.get("metadata"), Mapping)
+        else {}
+    )
+    if not (
+        metadata.get("historical_evidence_replayed") is False
+        and metadata.get("authoritative_pass_synthesized") is False
+    ):
+        return False
+    for field in (
+        "project_id",
+        "backlog_id",
+        "parent_contract_execution_id",
+        "root_contract_execution_id",
+        "contract_chain_id",
+    ):
+        if str(child.get(field) or "").strip() != str(
+            parent.get(field) or ""
+        ).strip():
+            return False
+    return _record_contract_id(child) == _record_contract_id(parent)
+
+
+def _same_row_recovery_completion_authority(
+    child: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not _record_is_complete(child):
+        return {}
+    project_id = str(child.get("project_id") or "").strip()
+    backlog_id = str(child.get("backlog_id") or "").strip()
+    child_id = str(child.get("contract_execution_id") or "").strip()
+    child_metadata = (
+        child.get("metadata")
+        if isinstance(child.get("metadata"), Mapping)
+        else {}
+    )
+    expected_merge_parent_task_ids = {
+        value
+        for value in (
+            child_id,
+            str(child_metadata.get("repair_run_id") or "").strip(),
+        )
+        if value
+    }
+    lines = (
+        child.get("completed_lines")
+        if isinstance(child.get("completed_lines"), list)
+        else []
+    )
+    qa_index = -1
+    merge_index = -1
+    reconcile_index = -1
+    close_index = -1
+    merge_authority: Mapping[str, Any] = {}
+    reconcile_authority: Mapping[str, Any] = {}
+    current_full: Mapping[str, Any] = {}
+    for index, line in enumerate(lines):
+        if not isinstance(line, Mapping):
+            continue
+        line_id = str(line.get("line_id") or "").strip()
+        if line_id == "qa_independent_verification":
+            provenance = (
+                line.get("qa_evidence_provenance")
+                if isinstance(line.get("qa_evidence_provenance"), Mapping)
+                else {}
+            )
+            binding = (
+                provenance.get("authenticated_qa_binding")
+                if isinstance(
+                    provenance.get("authenticated_qa_binding"), Mapping
+                )
+                else {}
+            )
+            status_gate = (
+                provenance.get("completion_status_gate")
+                if isinstance(provenance.get("completion_status_gate"), Mapping)
+                else {}
+            )
+            if (
+                str(line.get("actor_role") or "") == "qa"
+                and str(line.get("evidence_kind") or "")
+                == "independent_verification"
+                and _line_status_allows_contract_completion(
+                    line,
+                    source_record=child,
+                    source_line_index=index,
+                )
+                and str(provenance.get("schema_version") or "")
+                == "qa_evidence_provenance.v1"
+                and provenance.get("server_derived") is True
+                and str(provenance.get("evidence_owner_role") or "") == "qa"
+                and provenance.get("observer_impersonation") is False
+                and str(binding.get("schema_version") or "")
+                == "contract_runtime.authenticated_qa_binding.v1"
+                and binding.get("server_derived") is True
+                and binding.get("independent_verification_session_matched")
+                is True
+                and str(binding.get("qa_principal") or "").strip()
+                and str(binding.get("qa_session_id") or "").strip()
+                and str(status_gate.get("schema_version") or "")
+                == "contract_runtime.qa_completion_status_gate.v1"
+                and status_gate.get("server_derived") is True
+                and status_gate.get("top_level_status_present") is True
+                and status_gate.get("top_level_status_passing") is True
+            ):
+                qa_index = index
+            continue
+        if line_id == "observer_merge" and qa_index >= 0 and index > qa_index:
+            payload = (
+                line.get("payload")
+                if isinstance(line.get("payload"), Mapping)
+                else {}
+            )
+            durable = (
+                payload.get("durable_merge_authority")
+                if isinstance(payload.get("durable_merge_authority"), Mapping)
+                else {}
+            )
+            branch_head = str(durable.get("branch_head") or "").strip().lower()
+            merge_commit = str(durable.get("merge_commit") or "").strip().lower()
+            try:
+                authority_qa_index = int(
+                    durable.get("qa_completed_line_index", -1)
+                )
+            except (TypeError, ValueError):
+                authority_qa_index = -1
+            if (
+                str(line.get("actor_role") or "") == "observer"
+                and str(line.get("evidence_kind") or "") == "merge"
+                and _line_status_allows_contract_completion(line)
+                and str(durable.get("schema_version") or "")
+                == "contract_runtime.observer_merge_durable_authority.v1"
+                and durable.get("server_derived") is True
+                and durable.get("db_verified") is True
+                and durable.get("merge_gate_passed") is True
+                and durable.get("qa_contract_runtime_verified") is True
+                and durable.get("no_pass_claim") is False
+                and durable.get("authoritative_pass_synthesized") is False
+                and durable.get("close_satisfying") is True
+                and str(durable.get("project_id") or "") == project_id
+                and str(durable.get("backlog_id") or "") == backlog_id
+                and str(durable.get("parent_task_id") or "")
+                in expected_merge_parent_task_ids
+                and authority_qa_index == qa_index
+                and str(durable.get("qa_acceptance_ref") or "").strip()
+                and str(durable.get("queue_item_status") or "") == "merged"
+                and str(durable.get("merge_event_ref") or "").startswith(
+                    "timeline:"
+                )
+                and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", branch_head)
+                and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merge_commit)
+                and str(durable.get("target_head_after_merge") or "")
+                .strip()
+                .lower()
+                == merge_commit
+                and str(line.get("commit_sha") or "").strip().lower()
+                == merge_commit
+            ):
+                merge_index = index
+                merge_authority = durable
+            continue
+        if (
+            line_id == "observer_reconcile"
+            and merge_index >= 0
+            and index > merge_index
+        ):
+            payload = (
+                line.get("payload")
+                if isinstance(line.get("payload"), Mapping)
+                else {}
+            )
+            wrapper = (
+                payload.get("reconcile_authority")
+                if isinstance(payload.get("reconcile_authority"), Mapping)
+                else {}
+            )
+            canonical = _canonical_current_full_reconcile_activation(
+                wrapper,
+                expected_merge_source_ref=str(
+                    merge_authority.get("merge_event_ref") or ""
+                ),
+                expected_merged_commit=str(
+                    merge_authority.get("merge_commit") or ""
+                ),
+                expected_project_id=project_id,
+                expected_backlog_id=backlog_id,
+                expected_contract_execution_id=child_id,
+            )
+            if (
+                str(line.get("actor_role") or "") == "observer"
+                and str(line.get("evidence_kind") or "") == "reconcile"
+                and _line_status_allows_contract_completion(line)
+                and str(wrapper.get("schema_version") or "")
+                == "contract_runtime.observer_reconcile_record_authority.v1"
+                and wrapper.get("server_derived") is True
+                and wrapper.get("record_verified") is True
+                and wrapper.get("merge_projection_verified") is True
+                and wrapper.get("dispatch_lineage_verified") is True
+                and wrapper.get("reconcile_event_recorded") is True
+                and wrapper.get(
+                    "current_full_reconcile_activation_verified"
+                )
+                is True
+                and str(wrapper.get("merge_source_ref") or "")
+                == str(merge_authority.get("merge_event_ref") or "")
+                and str(wrapper.get("merged_commit_sha") or "").lower()
+                == str(merge_authority.get("merge_commit") or "").lower()
+                and str(wrapper.get("authority_hash") or "")
+                == stable_sha256(
+                    {
+                        key: value
+                        for key, value in wrapper.items()
+                        if key != "authority_hash"
+                    }
+                )
+                and canonical
+            ):
+                reconcile_index = index
+                reconcile_authority = wrapper
+                current_full = canonical
+            continue
+        if (
+            line_id == "observer_close_ready"
+            and reconcile_index >= 0
+            and index > reconcile_index
+            and str(line.get("actor_role") or "") == "observer"
+            and str(line.get("evidence_kind") or "") == "close_ready"
+            and _line_status_allows_contract_completion(line)
+            and str(line.get("commit_sha") or "").strip().lower()
+            == str(merge_authority.get("merge_commit") or "").strip().lower()
+        ):
+            close_index = index
+
+    merge_event_ref = str(merge_authority.get("merge_event_ref") or "")
+    reconcile_source_ref = str(
+        reconcile_authority.get("reconcile_source_ref")
+        or current_full.get("reconcile_source_ref")
+        or ""
+    )
+    merge_match = re.fullmatch(r"timeline:(\d+)", merge_event_ref)
+    reconcile_match = re.fullmatch(r"timeline:(\d+)", reconcile_source_ref)
+    if not (
+        0 <= qa_index < merge_index < reconcile_index < close_index
+        and merge_match
+        and reconcile_match
+        and int(merge_match.group(1)) < int(reconcile_match.group(1))
+    ):
+        return {}
+    return {
+        "qa_completed_line_index": qa_index,
+        "merge_completed_line_index": merge_index,
+        "reconcile_completed_line_index": reconcile_index,
+        "close_completed_line_index": close_index,
+        "merge_event_ref": merge_event_ref,
+        "reconcile_source_ref": reconcile_source_ref,
+        "merged_commit_sha": str(merge_authority.get("merge_commit") or ""),
+        "active_snapshot_id": str(current_full.get("active_snapshot_id") or ""),
+    }
+
+
+def _project_same_row_recovery_state(
+    records: list[dict[str, Any]],
+    *,
+    row_times: Mapping[str, str],
+) -> dict[str, Any]:
+    records_by_id = {
+        str(record.get("contract_execution_id") or "").strip(): record
+        for record in records
+        if str(record.get("contract_execution_id") or "").strip()
+    }
+    candidates: list[
+        tuple[
+            dict[str, Any],
+            dict[str, Any],
+            dict[str, Any],
+            dict[str, Any],
+            str,
+        ]
+    ] = []
+    for child in records:
+        source_id = _same_row_recovery_source_execution_id(child)
+        parent = records_by_id.get(source_id)
+        if not parent or not _same_row_recovery_lineage_matches(parent, child):
+            continue
+        target, target_source = _same_row_recovery_target(parent, child)
+        completion = _same_row_recovery_completion_authority(child)
+        if not target or not completion:
+            continue
+        candidates.append(
+            (parent, child, target, completion, target_source)
+        )
+    if not candidates:
+        return {}
+    candidates.sort(
+        key=lambda item: _record_order_key(item[1], row_times=row_times)
+    )
+    parent, child, target, completion, target_source = candidates[-1]
+    parent_id = str(parent.get("contract_execution_id") or "")
+    child_id = str(child.get("contract_execution_id") or "")
+    if any(
+        not _record_is_complete(record)
+        and str(record.get("contract_execution_id") or "") != parent_id
+        and str(record.get("parent_contract_execution_id") or "").strip()
+        for record in records
+    ):
+        return {}
+
+    next_action = _next_action_from_record(parent)
+    next_action.update(
+        {
+            "source": (
+                "backlog_contract_chain_current.same_row_recovery_cursor"
+            ),
+            "precedence": "completed_recovery_exact_parent_target",
+            "repair_child_contract_execution_id": child_id,
+            "repair_target_hash": str(target.get("target_hash") or ""),
+            "historical_parent_immutable": True,
+            "authoritative_pass_synthesized": False,
+        }
+    )
+    cursor = {
+        "schema_version": "contract_runtime.same_row_recovery_cursor.v1",
+        "source": "completed_recovery_child_authority",
+        "target_source": target_source,
+        "source_contract_execution_id": parent_id,
+        "repair_child_contract_execution_id": child_id,
+        "repair_target_hash": str(target.get("target_hash") or ""),
+        "source_execution_state_revision": int(
+            target.get("source_execution_state_revision") or 0
+        ),
+        "source_runtime_guide_hash": str(
+            target.get("source_runtime_guide_hash") or ""
+        ),
+        **completion,
+        "historical_parent_mutated": False,
+        "historical_completed_lines_mutated": False,
+        "historical_missing_evidence_backfilled": False,
+        "authoritative_pass_synthesized": False,
+    }
+    cursor["cursor_hash"] = stable_sha256(cursor)
+    next_action["same_row_recovery_cursor"] = cursor
+    return {
+        "current_contract_execution_id": parent_id,
+        "current_contract_id": _record_contract_id(parent),
+        "parent_to_resume_contract_execution_id": "",
+        "active_child_contract_execution_id": "",
+        "readiness_state": "same_row_recovery_target_ready",
+        "generation": int(child.get("execution_state_revision") or 0),
+        "next_legal_action": next_action,
+        "same_row_recovery_cursor": cursor,
+    }
 
 
 def _recovery_superseded_execution_ids(
@@ -4940,6 +5441,18 @@ def _current_projection_from_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str
         "projection_source": "backlog_contract_chain_current",
         "source_of_proof": "contract_runtime_executions.completed_lines",
     }
+    same_row_recovery_cursor = (
+        next_legal_action.get("same_row_recovery_cursor")
+        if isinstance(next_legal_action, Mapping)
+        and isinstance(
+            next_legal_action.get("same_row_recovery_cursor"), Mapping
+        )
+        else {}
+    )
+    if same_row_recovery_cursor:
+        projection["same_row_recovery_cursor"] = dict(
+            same_row_recovery_cursor
+        )
     if projection["readiness_state"] == "completed_with_exception":
         stored_terminal = (
             active_chain.get("terminal_disposition")
