@@ -47446,6 +47446,10 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
     assert bridge["reconciled_commit"] == row_merge_commit
     assert bridge["closing_head_commit"] == descendant_head
     assert bridge["active_snapshot_commit"] == descendant_head
+    assert bridge["bridge_mode"] == (
+        "historical_reconcile_with_active_descendant_snapshot"
+    )
+    assert bridge["current_head_full_reconcile_verified"] is False
     assert bridge["raw_merge_reconcile_commits_preserved"] is True
     assert descendant_gate["checks"][
         "descendant_close_head_bridge_verified"
@@ -47453,6 +47457,133 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
     assert descendant_gate["checks"][
         "observer_reconcile_descendant_close_head_bridged"
     ] is True
+
+    # A later real current-HEAD full reconcile must also bridge the immutable
+    # row merge/reconcile receipts.  The receipts remain at row_merge_commit;
+    # only the server-derived, in-memory reconcile authority advances.
+    current_head_record = (
+        server._contract_runtime_bind_close_reconcile_authority(
+            conn,
+            project_id=PID,
+            record=record,
+        )
+    )
+    current_head_record["completed_lines"].append(
+        close_ready_write(descendant_head)
+    )
+    current_head_record["runtime_guide"]["completed_lines"] = json.loads(
+        json.dumps(current_head_record["completed_lines"])
+    )
+    for current_head_lines in (
+        current_head_record["completed_lines"],
+        current_head_record["runtime_guide"]["completed_lines"],
+    ):
+        current_head_reconcile = next(
+            line
+            for line in current_head_lines
+            if line["line_id"] == "observer_reconcile"
+        )
+        current_head_authority = current_head_reconcile["payload"][
+            "reconcile_authority"
+        ]
+        current_head_authority.update(
+            {
+                "reconciled_commit_sha": descendant_head,
+                "reconcile_provenance_target_commit": descendant_head,
+                "reconcile_snapshot_commit": descendant_head,
+                "canonical_head_equals_reconciled_commit": True,
+                "reconciled_commit_is_ancestor_of_canonical_head": True,
+            }
+        )
+        current_head_authority["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in current_head_authority.items()
+                if key != "authority_hash"
+            }
+        )
+    current_head_before = server.stable_sha256(current_head_record)
+    current_head_gate = (
+        server._contract_runtime_mf_parallel_close_authority_gate(
+            [current_head_record],
+            chain_projection=_mf_parallel_close_authority_chain_projection(
+                record["contract_execution_id"]
+            ),
+            close_commit=descendant_head,
+            conn=conn,
+            project_id=PID,
+        )
+    )
+    assert current_head_gate["passed"] is True, {
+        "missing": current_head_gate["missing_requirement_ids"],
+        "mismatches": current_head_gate["commit_mismatches"],
+        "bridge": current_head_gate["descendant_close_head_bridge"],
+        "reconcile": current_head_gate["reconcile_close_diagnostic"],
+    }
+    assert server.stable_sha256(current_head_record) == current_head_before
+    current_head_bridge = current_head_gate["descendant_close_head_bridge"]
+    assert current_head_bridge["bridge_mode"] == (
+        "current_head_full_reconcile_after_durable_merge"
+    )
+    assert current_head_bridge["durable_merge_commit"] == row_merge_commit
+    assert current_head_bridge["reconciled_commit"] == descendant_head
+    assert current_head_bridge["reconcile_snapshot_commit"] == (
+        descendant_head
+    )
+    assert current_head_bridge[
+        "durable_merge_commit_is_ancestor_of_reconciled_commit"
+    ] is True
+    assert current_head_bridge["current_head_full_reconcile_verified"] is True
+    assert current_head_gate["commit_mismatches"] == []
+
+    for field, rejected_value in (
+        ("reconcile_provenance_target_commit", row_merge_commit),
+        ("reconcile_snapshot_commit", row_merge_commit),
+        ("active_snapshot_commit", row_merge_commit),
+        ("task_scope_verified", False),
+    ):
+        rejected_current_head = json.loads(
+            json.dumps(current_head_record)
+        )
+        for rejected_lines in (
+            rejected_current_head["completed_lines"],
+            rejected_current_head["runtime_guide"]["completed_lines"],
+        ):
+            rejected_reconcile = next(
+                line
+                for line in rejected_lines
+                if line["line_id"] == "observer_reconcile"
+            )
+            rejected_authority = rejected_reconcile["payload"][
+                "reconcile_authority"
+            ]
+            rejected_authority[field] = rejected_value
+            rejected_authority["authority_hash"] = server.stable_sha256(
+                {
+                    key: value
+                    for key, value in rejected_authority.items()
+                    if key != "authority_hash"
+                }
+            )
+        rejected_gate = (
+            server._contract_runtime_mf_parallel_close_authority_gate(
+                [rejected_current_head],
+                chain_projection=(
+                    _mf_parallel_close_authority_chain_projection(
+                        record["contract_execution_id"]
+                    )
+                ),
+                close_commit=descendant_head,
+                conn=conn,
+                project_id=PID,
+            )
+        )
+        assert rejected_gate["passed"] is False, field
+        assert rejected_gate["descendant_close_head_bridge"] == {}, field
+        assert {
+            "contract_runtime.observer_merge_close_commit",
+            "contract_runtime.observer_reconcile_close_commit",
+        }.issubset(rejected_gate["missing_requirement_ids"]), field
 
     activate_current_full(
         "full-descendant-close-head-stale",
@@ -47539,6 +47670,55 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
         text=True,
     )
     sibling_head = batch_jobs.git_commit(worktree)
+    non_ancestor_current_head = json.loads(
+        json.dumps(current_head_record)
+    )
+    for non_ancestor_lines in (
+        non_ancestor_current_head["completed_lines"],
+        non_ancestor_current_head["runtime_guide"]["completed_lines"],
+    ):
+        non_ancestor_merge = next(
+            line
+            for line in non_ancestor_lines
+            if line["line_id"] == "observer_merge"
+        )
+        non_ancestor_reconcile = next(
+            line
+            for line in non_ancestor_lines
+            if line["line_id"] == "observer_reconcile"
+        )
+        non_ancestor_merge["commit_sha"] = sibling_head
+        non_ancestor_reconcile["commit_sha"] = sibling_head
+        non_ancestor_authority = non_ancestor_reconcile["payload"][
+            "reconcile_authority"
+        ]
+        non_ancestor_authority["merged_commit_sha"] = sibling_head
+        non_ancestor_authority["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in non_ancestor_authority.items()
+                if key != "authority_hash"
+            }
+        )
+    non_ancestor_merge_line = next(
+        line
+        for line in non_ancestor_current_head["completed_lines"]
+        if line["line_id"] == "observer_merge"
+    )
+    non_ancestor_reconcile_line = next(
+        line
+        for line in non_ancestor_current_head["completed_lines"]
+        if line["line_id"] == "observer_reconcile"
+    )
+    assert (
+        server._contract_runtime_mf_parallel_descendant_close_head_bridge(
+            close_commit=descendant_head,
+            merge_line=non_ancestor_merge_line,
+            reconcile_line=non_ancestor_reconcile_line,
+            server_post_qa_lineage_passed=True,
+        )
+        == {}
+    )
     activate_current_full(
         "full-descendant-close-head-sibling",
         sibling_head,
