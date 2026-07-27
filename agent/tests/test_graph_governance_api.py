@@ -48291,6 +48291,337 @@ def test_close_bridge_preserves_source_reconcile_and_binds_live_active_full(
     assert rejected_scope["graph_reconciled"] is False
 
 
+def test_close_binder_keeps_exact_playback_source_reconcile_after_later_same_lane_full(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    source_commit = "8e2bbc0054c38783e843c911408ce0aa98a5d9f6"
+    closing_head = "4cac9b132f4af09f2a5d31a3e4c03214f27d0dcc"
+    backlog_id = (
+        "AC-PLAYBACK-PARTIAL-CURRENT-HOT-TRACE-"
+        "SUPPRESSES-FULL-HISTORY-R1-20260727"
+    )
+    task_id = "playback-partial-current-hot-trace-worker-1"
+    execution_id = "cex-onboard-e5d4b020d7d3e5ad5902"
+    runtime_context_id = "mfrctx-2760b497e144cdf2"
+    project_root = tmp_path / "exact-playback-descendant-close"
+    project_root.mkdir()
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_head_commit",
+        lambda _root: closing_head,
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_commit_is_ancestor",
+        lambda _root, ancestor, descendant: (
+            ancestor == descendant
+            or (ancestor, descendant) == (source_commit, closing_head)
+        ),
+    )
+
+    source_snapshot_id = "full-8e2bbc0-exact-playback-source"
+    _activate_basic_graph(
+        conn,
+        source_snapshot_id,
+        commit_sha=source_commit,
+    )
+    source = _record_test_current_full_reconcile_authority(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        contract_execution_id=execution_id,
+        runtime_context_id=runtime_context_id,
+        target_project_root=str(project_root),
+        snapshot_id=source_snapshot_id,
+        commit_sha=source_commit,
+        qa_graph_trace_id="gqt-exact-playback-source",
+        qa_commit_sha=source_commit,
+    )
+
+    live_snapshot_id = "full-4cac9b1-exact-playback-live"
+    _activate_basic_graph(
+        conn,
+        live_snapshot_id,
+        commit_sha=closing_head,
+    )
+    live_reconcile = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="graph.reconcile",
+        event_kind="reconcile",
+        phase="reconcile",
+        actor="observer:current-full-fixture",
+        status="passed",
+        commit_sha=closing_head,
+        payload={
+            "contract_execution_id": execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "reconcile_mode": "current_full",
+        },
+    )
+    live_created_at = "2026-07-11T01:03:00Z"
+    conn.execute(
+        "UPDATE task_timeline_events SET created_at = ? WHERE id = ?",
+        (live_created_at, int(live_reconcile["id"])),
+    )
+    runtime_scope = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+    }
+    store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=PID,
+        snapshot_id=live_snapshot_id,
+        target_commit_sha=closing_head,
+        request_id="req-exact-playback-live",
+        request_started_at="2026-07-11T01:02:30Z",
+        route_evidence={
+            "schema_version": (
+                "graph_current_full_reconcile.route_evidence.v1"
+            ),
+            "authenticated_role": "observer",
+            "authentication_source": "test_protected_entrypoint",
+            "raw_route_token_persisted": False,
+            "protected_action": "graph_current_full_reconcile",
+            "contract_execution_id": execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "route_token_scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "runtime_context_id": runtime_context_id,
+            },
+            "runtime_context_scope": {
+                **runtime_scope,
+                "source": "parallel_branch_runtime_context",
+                "server_derived": True,
+            },
+        },
+        runtime_context_scope=runtime_scope,
+        reconcile_event_id=int(live_reconcile["id"]),
+        reconcile_event_created_at=live_created_at,
+    )
+
+    merge = {
+        "timeline_verified": True,
+        "merged_commit_sha": source_commit,
+        "qa_event_id": int(source["qa_event_id"]),
+        "qa_event_created_at": source["qa_event_created_at"],
+        "qa_source_ref": f"timeline:{source['qa_event_id']}",
+        "merge_event_id": int(source["merge_event_id"]),
+        "merge_event_created_at": source["merge_event_created_at"],
+        "merge_source_ref": f"timeline:{source['merge_event_id']}",
+        # Exact regression: latest-by-lane observes the later closing-HEAD
+        # reconcile, while the immutable line remains bound to source R.
+        "reconcile_event_id": int(live_reconcile["id"]),
+        "reconcile_event_created_at": live_created_at,
+        "reconcile_source_ref": f"timeline:{live_reconcile['id']}",
+        "reconcile_task_id": task_id,
+        "reconcile_runtime_context_id": runtime_context_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": "",
+        "merge_queue_id": "",
+        "dispatch_lineage_verified": True,
+        "contract_runtime_dispatch_source_ref": (
+            f"contract_runtime:{execution_id}:completed_lines:1"
+        ),
+        "allow_taskless_reconcile": True,
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_trusted_merge_projection",
+        lambda *_args, **_kwargs: dict(merge),
+    )
+    source_record_authority = {
+        "schema_version": (
+            "contract_runtime.observer_reconcile_record_authority.v1"
+        ),
+        "source": "contract_runtime.server_reconcile_record_projection",
+        "server_derived": True,
+        "record_verified": True,
+        "merge_projection_verified": True,
+        "dispatch_lineage_verified": True,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": "",
+        "merge_queue_id": "",
+        "merged_commit_sha": source_commit,
+        "merge_source_ref": f"timeline:{source['merge_event_id']}",
+        "merge_event_id": int(source["merge_event_id"]),
+        "merge_event_created_at": source["merge_event_created_at"],
+        "reconcile_event_recorded": True,
+        "reconcile_source_ref": f"timeline:{source['reconcile_event_id']}",
+        "reconcile_event_id": int(source["reconcile_event_id"]),
+        "reconcile_event_created_at": source[
+            "reconcile_event_created_at"
+        ],
+        "reconcile_task_id": task_id,
+        "reconcile_runtime_context_id": runtime_context_id,
+        "close_grade_authority_deferred": True,
+    }
+    source_record_authority["authority_hash"] = server.stable_sha256(
+        source_record_authority
+    )
+    merge_line = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "evidence_kind": "merge",
+        "status": "passed",
+        "commit_sha": source_commit,
+        "_source_ref": f"timeline:{source['merge_event_id']}",
+        "payload": {},
+    }
+    reconcile_line = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_reconcile",
+        "actor_role": "observer",
+        "evidence_kind": "reconcile",
+        "status": "passed",
+        "commit_sha": source_commit,
+        "_source_ref": (
+            f"contract_runtime:{execution_id}:completed_lines:1"
+        ),
+        "artifact_refs": {
+            "reconcile_event_ref": (
+                f"timeline:{source['reconcile_event_id']}"
+            ),
+        },
+        "payload": {"reconcile_authority": source_record_authority},
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": server.MF_PARALLEL_RECORD_CONTRACT_ID,
+        "completed_lines": [merge_line, reconcile_line],
+        "runtime_guide": {
+            "completed_lines": [merge_line, reconcile_line],
+        },
+    }
+    before = server.stable_sha256(record)
+    projected = server._contract_runtime_bind_close_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    assert server.stable_sha256(record) == before
+    rebound_line = next(
+        line
+        for line in projected["completed_lines"]
+        if line["line_id"] == "observer_reconcile"
+    )
+    authority = rebound_line["payload"]["reconcile_authority"]
+    assert authority["merged_commit_sha"] == source_commit
+    assert authority["reconciled_commit_sha"] == source_commit
+    assert authority["reconcile_event_id"] == int(
+        source["reconcile_event_id"]
+    )
+    assert authority["reconcile_source_ref"] == (
+        f"timeline:{source['reconcile_event_id']}"
+    )
+    assert authority["reconcile_provenance_target_commit"] == source_commit
+    assert authority["reconcile_snapshot_commit"] == source_commit
+    assert authority["canonical_head_commit"] == closing_head
+    assert authority["active_snapshot_commit"] == closing_head
+    assert authority["active_snapshot_id"] == live_snapshot_id
+    assert authority["graph_reconciled"] is True
+
+    bridge = server._contract_runtime_mf_parallel_descendant_close_head_bridge(
+        close_commit=closing_head,
+        merge_line=projected["completed_lines"][0],
+        reconcile_line=rebound_line,
+        server_post_qa_lineage_passed=True,
+    )
+    assert bridge["passed"] is True
+    assert bridge["bridge_mode"] == (
+        "source_reconcile_with_live_current_full_snapshot"
+    )
+    assert bridge["durable_merge_commit"] == source_commit
+    assert bridge["reconciled_commit"] == source_commit
+    assert bridge["closing_head_commit"] == closing_head
+    assert bridge["reconcile_line_event_ref"] == (
+        f"timeline:{source['reconcile_event_id']}"
+    )
+
+    for label, mutator in (
+        (
+            "tampered_artifact_ref",
+            lambda line: line["artifact_refs"].update(
+                {"reconcile_event_ref": f"timeline:{live_reconcile['id']}"}
+            ),
+        ),
+        (
+            "tampered_authority_hash",
+            lambda line: line["payload"]["reconcile_authority"].update(
+                {"authority_hash": "sha256:" + "0" * 64}
+            ),
+        ),
+    ):
+        rejected = json.loads(json.dumps(record))
+        rejected_line = next(
+            line
+            for line in rejected["completed_lines"]
+            if line["line_id"] == "observer_reconcile"
+        )
+        mutator(rejected_line)
+        rejected["runtime_guide"]["completed_lines"] = json.loads(
+            json.dumps(rejected["completed_lines"])
+        )
+        rejected_projection = (
+            server._contract_runtime_bind_close_reconcile_authority(
+                conn,
+                project_id=PID,
+                record=rejected,
+            )
+        )
+        rejected_reconcile = next(
+            line
+            for line in rejected_projection["completed_lines"]
+            if line["line_id"] == "observer_reconcile"
+        )
+        assert rejected_reconcile["payload"]["reconcile_authority"] == {}, label
+
+    ambiguous = json.loads(json.dumps(record))
+    ambiguous["completed_lines"].append(
+        json.loads(json.dumps(reconcile_line))
+    )
+    ambiguous["runtime_guide"]["completed_lines"] = json.loads(
+        json.dumps(ambiguous["completed_lines"])
+    )
+    ambiguous_projection = (
+        server._contract_runtime_bind_close_reconcile_authority(
+            conn,
+            project_id=PID,
+            record=ambiguous,
+        )
+    )
+    assert all(
+        line["payload"]["reconcile_authority"] == {}
+        for line in ambiguous_projection["completed_lines"]
+        if line["line_id"] == "observer_reconcile"
+    )
+
+
 def test_mf_parallel_close_authority_rejects_wrong_batch_final_commit_bridge():
     contract_execution_id = "cex-mf-parallel-batch-final-bridge-fail"
     close_commit = "ef11752d00c30b2212ff357bb7ade4ebce6acdca"
