@@ -46137,6 +46137,26 @@ def test_mf_parallel_close_authority_honors_missing_finish_and_reconcile_bypasse
     prospective_record["runtime_guide"]["completed_lines"] = json.loads(
         json.dumps(prospective_record["completed_lines"])
     )
+    prospective_identity = server._contract_runtime_server_line_identity(
+        prospective_record
+    )
+    prospective_close_ready.update(
+        {
+            "runtime_context_id": prospective_identity[
+                "runtime_context_id"
+            ],
+            "task_id": prospective_record["contract_execution_id"],
+        }
+    )
+    prospective_close_ready["payload"].update(
+        {
+            "runtime_context_id": prospective_identity[
+                "runtime_context_id"
+            ],
+            "worker_task_id": prospective_identity["task_id"],
+            "parent_task_id": prospective_identity["parent_task_id"],
+        }
+    )
     prospective_before = server.stable_sha256(prospective_record)
     prospective_gate = server._contract_runtime_mf_parallel_close_ready_precheck(
         prospective_record,
@@ -47723,6 +47743,8 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
             qa_commit_sha=commit_sha,
         )
 
+    retained_identity = server._contract_runtime_server_line_identity(record)
+
     def close_ready_write(close_commit: str) -> dict:
         write = server._contract_runtime_write_from_record(
             record,
@@ -47731,8 +47753,21 @@ def test_mf_parallel_close_ready_bridges_durable_reconcile_to_descendant_head(
             line_id="observer_close_ready",
             evidence_kind="close_ready",
         )
+        write.update(
+            {
+                "runtime_context_id": retained_identity[
+                    "runtime_context_id"
+                ],
+                "task_id": record["contract_execution_id"],
+            }
+        )
         write["commit_sha"] = close_commit
         write["payload"] = {
+            "runtime_context_id": retained_identity[
+                "runtime_context_id"
+            ],
+            "worker_task_id": retained_identity["task_id"],
+            "parent_task_id": retained_identity["parent_task_id"],
             "close_readiness": {
                 "qa_independent_verification": True,
                 "governance_redeploy": True,
@@ -77237,8 +77272,24 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         line_id=close_action["line_id"],
         evidence_kind=close_action["evidence_kind"],
     )
+    retained_identity = server._contract_runtime_server_line_identity(
+        submitted["record"]
+    )
+    close_write.update(
+        {
+            "runtime_context_id": retained_identity[
+                "runtime_context_id"
+            ],
+            "task_id": contract_execution_id,
+        }
+    )
     close_write["commit_sha"] = merged_commit
-    close_write["payload"] = {"merge_commit": merged_commit}
+    close_write["payload"] = {
+        "merge_commit": merged_commit,
+        "runtime_context_id": retained_identity["runtime_context_id"],
+        "worker_task_id": retained_identity["task_id"],
+        "parent_task_id": retained_identity["parent_task_id"],
+    }
     close_gate = server._contract_runtime_mf_parallel_close_ready_precheck(
         submitted["record"],
         close_write,
