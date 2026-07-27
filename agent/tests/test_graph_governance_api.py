@@ -6996,25 +6996,28 @@ def _record_test_current_full_reconcile_authority(
     merged_commit_sha: str = "",
     parent_task_id: str = "",
     merge_queue_id: str = "",
+    include_contract_execution_id: bool = True,
 ) -> dict[str, Any]:
     merged_commit_sha = str(merged_commit_sha or commit_sha).strip().lower()
     common_payload = {
         "backlog_id": backlog_id,
-        "contract_execution_id": contract_execution_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "merge_queue_id": merge_queue_id,
     }
+    if include_contract_execution_id:
+        common_payload["contract_execution_id"] = contract_execution_id
     runtime_scope = {
         "project_id": PID,
         "backlog_id": backlog_id,
-        "contract_execution_id": contract_execution_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "merge_queue_id": merge_queue_id,
     }
+    if include_contract_execution_id:
+        runtime_scope["contract_execution_id"] = contract_execution_id
     qa_event = task_timeline.record_event(
         conn,
         project_id=PID,
@@ -7096,7 +7099,6 @@ def _record_test_current_full_reconcile_authority(
             "authentication_source": "test_protected_entrypoint",
             "raw_route_token_persisted": False,
             "protected_action": "graph_current_full_reconcile",
-            "contract_execution_id": contract_execution_id,
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
@@ -7112,6 +7114,11 @@ def _record_test_current_full_reconcile_authority(
                 "source": "parallel_branch_runtime_context",
                 "server_derived": True,
             },
+            **(
+                {"contract_execution_id": contract_execution_id}
+                if include_contract_execution_id
+                else {}
+            ),
         },
         runtime_context_scope=runtime_scope,
         reconcile_event_id=int(reconcile_event["id"]),
@@ -48655,9 +48662,28 @@ def _incomplete_reconcile_supplement_fixture(
     monkeypatch,
     *,
     rejection: str = "",
+    durable_target: str = "closing",
 ) -> dict[str, Any]:
-    merged_commit = "19aa482714a8b41275aa7a26f3afef1a1e6be2f0"
+    merged_commit = "14fb34e07479ddd0239ec822032860cffed883f4"
+    older_reconcile_commit = (
+        "0267ed9ee1cda675720277f36526eab0f5b39c1e"
+    )
+    newer_reconcile_commit = (
+        "b7928c763284dbc9595600ca0f64efcb44081e2d"
+    )
     closing_head = "7df814d08e01a74e4a99912f178aa79a56191293"
+    commit_order = {
+        merged_commit: 0,
+        older_reconcile_commit: 1,
+        newer_reconcile_commit: 2,
+        closing_head: 3,
+    }
+    durable_commits = {
+        "older": older_reconcile_commit,
+        "newer": newer_reconcile_commit,
+        "closing": closing_head,
+    }
+    durable_commit = durable_commits[durable_target]
     backlog_id = (
         "AC-CONTRACT-RUNTIME-INCOMPLETE-PROJECTED-"
         "RECONCILE-LATER-DURABLE-AUTHORITY-R1-20260727"
@@ -48686,17 +48712,20 @@ def _incomplete_reconcile_supplement_fixture(
             ancestor == descendant
             or (
                 rejection != "non_descendant"
-                and (ancestor, descendant)
-                == (merged_commit, closing_head)
+                and ancestor in commit_order
+                and descendant in commit_order
+                and commit_order[ancestor] < commit_order[descendant]
             )
         ),
     )
 
-    snapshot_id = "full-7df814d-incomplete-reconcile"
+    snapshot_id = (
+        f"full-{durable_commit[:7]}-incomplete-reconcile"
+    )
     _activate_basic_graph(
         conn,
         snapshot_id,
-        commit_sha=closing_head,
+        commit_sha=durable_commit,
     )
     durable = _record_test_current_full_reconcile_authority(
         conn,
@@ -48706,12 +48735,13 @@ def _incomplete_reconcile_supplement_fixture(
         runtime_context_id=runtime_context_id,
         target_project_root=str(project_root),
         snapshot_id=snapshot_id,
-        commit_sha=closing_head,
+        commit_sha=durable_commit,
         qa_graph_trace_id="gqt-incomplete-reconcile-fixture",
         qa_commit_sha=merged_commit,
         merged_commit_sha=merged_commit,
         parent_task_id=parent_task_id,
         merge_queue_id=merge_queue_id,
+        include_contract_execution_id=False,
     )
     merge = {
         "timeline_verified": True,
@@ -48733,8 +48763,16 @@ def _incomplete_reconcile_supplement_fixture(
         ),
         "allow_taskless_reconcile": False,
     }
-    if rejection == "scope_mismatch":
+    if rejection == "parent_mismatch":
         merge["parent_task_id"] = "cex-unrelated-parent"
+    elif rejection == "parent_missing":
+        merge["parent_task_id"] = ""
+    elif rejection == "task_mismatch":
+        merge["task_id"] = "unrelated-worker-task"
+    elif rejection == "runtime_mismatch":
+        merge["runtime_context_id"] = "mfrctx-unrelated"
+    elif rejection == "queue_mismatch":
+        merge["merge_queue_id"] = "mq-unrelated"
     elif rejection == "ordering":
         merge["merge_event_created_at"] = "2026-07-11T01:05:00Z"
 
@@ -48757,6 +48795,16 @@ def _incomplete_reconcile_supplement_fixture(
             ("sha256:" + "0" * 64, provenance["provenance_id"]),
         )
         conn.commit()
+    elif rejection == "unprotected_provenance":
+        conn.execute(
+            """
+            UPDATE graph_current_full_reconcile_provenance
+            SET protected_action = 'unprotected_reconcile'
+            WHERE provenance_id = ?
+            """,
+            (provenance["provenance_id"],),
+        )
+        conn.commit()
     elif rejection == "candidate_only":
         conn.execute(
             """
@@ -48765,6 +48813,46 @@ def _incomplete_reconcile_supplement_fixture(
             WHERE project_id = ? AND snapshot_id = ?
             """,
             (PID, snapshot_id),
+        )
+        conn.commit()
+    elif rejection in {
+        "event_tampered",
+        "project_mismatch",
+        "explicit_contract_mismatch",
+    }:
+        event_row = conn.execute(
+            """
+            SELECT payload_json
+            FROM task_timeline_events
+            WHERE project_id = ? AND id = ?
+            """,
+            (PID, int(durable["reconcile_event_id"])),
+        ).fetchone()
+        assert event_row is not None
+        event_payload = json.loads(event_row["payload_json"])
+        if rejection == "event_tampered":
+            event_payload["runtime_context_scope"][
+                "runtime_context_id"
+            ] = "mfrctx-event-tampered"
+        elif rejection == "project_mismatch":
+            event_payload["runtime_context_scope"][
+                "project_id"
+            ] = "unrelated-project"
+        else:
+            event_payload["contract_execution_id"] = (
+                "cex-explicit-contract-mismatch"
+            )
+        conn.execute(
+            """
+            UPDATE task_timeline_events
+            SET payload_json = ?
+            WHERE project_id = ? AND id = ?
+            """,
+            (
+                json.dumps(event_payload, sort_keys=True),
+                PID,
+                int(durable["reconcile_event_id"]),
+            ),
         )
         conn.commit()
     elif rejection == "client_authored_only":
@@ -48894,6 +48982,8 @@ def _incomplete_reconcile_supplement_fixture(
             "completed_lines": [merge_line, reconcile_line],
         },
     }
+    if rejection == "backlog_mismatch":
+        record["backlog_id"] = "AC-UNRELATED-BACKLOG"
     monkeypatch.setattr(
         server,
         "_contract_runtime_trusted_merge_projection",
@@ -48903,10 +48993,64 @@ def _incomplete_reconcile_supplement_fixture(
         "record": record,
         "source_authority": source_authority,
         "merged_commit": merged_commit,
+        "older_reconcile_commit": older_reconcile_commit,
+        "newer_reconcile_commit": newer_reconcile_commit,
         "closing_head": closing_head,
         "snapshot_id": snapshot_id,
         "durable": durable,
+        "scope": {
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "merge_queue_id": merge_queue_id,
+        },
     }
+
+
+def _record_production_shaped_reconcile_candidate(
+    conn,
+    fixture,
+    tmp_path,
+    *,
+    commit_sha: str,
+    label: str,
+    same_scope: bool = True,
+) -> dict[str, Any]:
+    if same_scope:
+        scope = dict(fixture["scope"])
+    else:
+        scope = {
+            "backlog_id": f"AC-OTHER-CURRENT-FULL-{label.upper()}",
+            "contract_execution_id": f"cex-other-{label}",
+            "runtime_context_id": f"mfrctx-other-{label}",
+            "task_id": f"other-{label}-worker-1",
+            "parent_task_id": f"cex-other-{label}",
+            "merge_queue_id": f"mq-other-{label}",
+        }
+    snapshot_id = f"full-{commit_sha[:7]}-{label}"
+    _activate_basic_graph(
+        conn,
+        snapshot_id,
+        commit_sha=commit_sha,
+    )
+    return _record_test_current_full_reconcile_authority(
+        conn,
+        backlog_id=scope["backlog_id"],
+        task_id=scope["task_id"],
+        contract_execution_id=scope["contract_execution_id"],
+        runtime_context_id=scope["runtime_context_id"],
+        target_project_root=str(tmp_path),
+        snapshot_id=snapshot_id,
+        commit_sha=commit_sha,
+        qa_graph_trace_id=f"gqt-incomplete-reconcile-{label}",
+        qa_commit_sha=fixture["merged_commit"],
+        merged_commit_sha=fixture["merged_commit"],
+        parent_task_id=scope["parent_task_id"],
+        merge_queue_id=scope["merge_queue_id"],
+        include_contract_execution_id=False,
+    )
 
 
 def test_close_binder_supplements_incomplete_line_from_later_durable_reconcile(
@@ -48924,6 +49068,40 @@ def test_close_binder_supplements_incomplete_line_from_later_durable_reconcile(
     immutable_authority_hash = fixture["source_authority"][
         "authority_hash"
     ]
+    provenance_row = conn.execute(
+        """
+        SELECT route_evidence_json, marker_json
+        FROM graph_current_full_reconcile_provenance
+        WHERE project_id = ? AND reconcile_event_id = ?
+        """,
+        (PID, int(fixture["durable"]["reconcile_event_id"])),
+    ).fetchone()
+    assert provenance_row is not None
+    route_evidence = json.loads(provenance_row["route_evidence_json"])
+    marker = json.loads(provenance_row["marker_json"])
+    reconcile_event = conn.execute(
+        """
+        SELECT payload_json
+        FROM task_timeline_events
+        WHERE project_id = ? AND id = ?
+        """,
+        (PID, int(fixture["durable"]["reconcile_event_id"])),
+    ).fetchone()
+    assert reconcile_event is not None
+    event_payload = json.loads(reconcile_event["payload_json"])
+    production_scopes = [
+        route_evidence["runtime_context_scope"],
+        marker["runtime_context_scope"],
+        event_payload["runtime_context_scope"],
+    ]
+    assert all(
+        "contract_execution_id" not in scope
+        for scope in production_scopes
+    )
+    assert "contract_execution_id" not in event_payload
+    assert {
+        scope["parent_task_id"] for scope in production_scopes
+    } == {record["contract_execution_id"]}
 
     projected = server._contract_runtime_bind_close_reconcile_authority(
         conn,
@@ -48965,7 +49143,16 @@ def test_close_binder_supplements_incomplete_line_from_later_durable_reconcile(
     later = authority["later_durable_reconcile"]
     assert later["server_authored"] is True
     assert later["unique_candidate_verified"] is True
+    assert later["candidate_rank"] == "exact_canonical_closing_head"
+    assert later["strongest_rank_unique"] is True
+    assert later["weaker_candidate_count"] == 0
     assert later["exact_runtime_scope_verified"] is True
+    assert (
+        "contract_execution_id"
+        not in later["runtime_scope"]
+        or later["runtime_scope"]["contract_execution_id"]
+        == later["runtime_scope"]["parent_task_id"]
+    )
     assert later["activated_snapshot_status_verified"] is True
     assert later["exact_closing_head"] is True
     assert later["descendant_closing_head_bridge_required"] is False
@@ -48982,13 +49169,223 @@ def test_close_binder_supplements_incomplete_line_from_later_durable_reconcile(
     assert diagnostic["passed"] is True, diagnostic
 
 
+def test_close_binder_prefers_unique_exact_head_over_valid_ancestor(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _incomplete_reconcile_supplement_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+    )
+    record = fixture["record"]
+    exact_event_id = int(fixture["durable"]["reconcile_event_id"])
+    older = _record_production_shaped_reconcile_candidate(
+        conn,
+        fixture,
+        tmp_path,
+        commit_sha=fixture["older_reconcile_commit"],
+        label="older-reconcile",
+    )
+    newer = _record_production_shaped_reconcile_candidate(
+        conn,
+        fixture,
+        tmp_path,
+        commit_sha=fixture["newer_reconcile_commit"],
+        label="newer-reconcile",
+    )
+    assert int(older["reconcile_event_id"]) > exact_event_id
+    assert int(newer["reconcile_event_id"]) > int(
+        older["reconcile_event_id"]
+    )
+    store.activate_graph_snapshot(
+        conn,
+        PID,
+        fixture["snapshot_id"],
+    )
+    conn.commit()
+
+    projected = server._contract_runtime_bind_close_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+
+    authority = projected["completed_lines"][1]["payload"][
+        "reconcile_authority"
+    ]
+    later = authority["later_durable_reconcile"]
+    assert later["reconcile_event_id"] == exact_event_id
+    assert later["candidate_rank"] == "exact_canonical_closing_head"
+    assert later["strongest_rank_unique"] is True
+    assert later["weaker_candidate_count"] == 2
+    assert authority["graph_reconciled"] is True
+
+
+def test_close_binder_prefers_unique_maximal_historical_descendant(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _incomplete_reconcile_supplement_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        durable_target="older",
+    )
+    older_event_id = int(fixture["durable"]["reconcile_event_id"])
+    newer = _record_production_shaped_reconcile_candidate(
+        conn,
+        fixture,
+        tmp_path,
+        commit_sha=fixture["newer_reconcile_commit"],
+        label="maximal-newer",
+    )
+    _record_production_shaped_reconcile_candidate(
+        conn,
+        fixture,
+        tmp_path,
+        commit_sha=fixture["closing_head"],
+        label="unrelated-current-head",
+        same_scope=False,
+    )
+
+    projected = server._contract_runtime_bind_close_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+    )
+
+    authority = projected["completed_lines"][1]["payload"][
+        "reconcile_authority"
+    ]
+    later = authority["later_durable_reconcile"]
+    assert int(newer["reconcile_event_id"]) > older_event_id
+    assert later["reconcile_event_id"] == int(
+        newer["reconcile_event_id"]
+    )
+    assert (
+        later["candidate_rank"]
+        == "unique_maximal_historical_descendant"
+    )
+    assert later["target_commit_sha"] == fixture[
+        "newer_reconcile_commit"
+    ]
+    assert later["strongest_rank_unique"] is True
+    assert later["weaker_candidate_count"] == 1
+    assert later["exact_closing_head"] is False
+    assert later["descendant_closing_head_bridge_required"] is True
+    assert authority["graph_reconciled"] is True
+
+
+def test_close_binder_rejects_same_target_maximal_ambiguity(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _incomplete_reconcile_supplement_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        rejection="ambiguous",
+        durable_target="newer",
+    )
+    _record_production_shaped_reconcile_candidate(
+        conn,
+        fixture,
+        tmp_path,
+        commit_sha=fixture["closing_head"],
+        label="same-target-unrelated-current",
+        same_scope=False,
+    )
+
+    projected = server._contract_runtime_bind_close_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+    )
+
+    authority = projected["completed_lines"][1]["payload"][
+        "reconcile_authority"
+    ]
+    assert authority == {}
+
+
+def test_close_binder_rejects_incomparable_maximal_historical_heads(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _incomplete_reconcile_supplement_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        durable_target="older",
+    )
+    _record_production_shaped_reconcile_candidate(
+        conn,
+        fixture,
+        tmp_path,
+        commit_sha=fixture["newer_reconcile_commit"],
+        label="incomparable-newer",
+    )
+    _record_production_shaped_reconcile_candidate(
+        conn,
+        fixture,
+        tmp_path,
+        commit_sha=fixture["closing_head"],
+        label="incomparable-unrelated-current",
+        same_scope=False,
+    )
+    merged_commit = fixture["merged_commit"]
+    older_commit = fixture["older_reconcile_commit"]
+    newer_commit = fixture["newer_reconcile_commit"]
+    closing_head = fixture["closing_head"]
+    ancestor_edges = {
+        (merged_commit, older_commit),
+        (merged_commit, newer_commit),
+        (merged_commit, closing_head),
+        (older_commit, closing_head),
+        (newer_commit, closing_head),
+    }
+    monkeypatch.setattr(
+        server,
+        "_git_commit_is_ancestor",
+        lambda _root, ancestor, descendant: (
+            ancestor == descendant
+            or (ancestor, descendant) in ancestor_edges
+        ),
+    )
+
+    projected = server._contract_runtime_bind_close_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+    )
+
+    authority = projected["completed_lines"][1]["payload"][
+        "reconcile_authority"
+    ]
+    assert authority == {}
+
+
 @pytest.mark.parametrize(
     "rejection",
     [
         "client_authored_only",
-        "scope_mismatch",
+        "parent_mismatch",
+        "parent_missing",
+        "backlog_mismatch",
+        "project_mismatch",
+        "task_mismatch",
+        "runtime_mismatch",
+        "queue_mismatch",
         "ordering",
         "tampered_provenance",
+        "unprotected_provenance",
+        "event_tampered",
+        "explicit_contract_mismatch",
         "candidate_only",
         "ambiguous",
         "non_descendant",

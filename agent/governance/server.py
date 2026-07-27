@@ -92160,6 +92160,24 @@ def _contract_runtime_later_durable_reconcile_supplement(
     }
     if not all(expected_scope.values()):
         return {}
+    # Production current-full provenance is worker-task scoped.  Its sealed
+    # branch runtime parent binds the worker back to ContractRuntime, while an
+    # explicit contract_execution_id is optional.  Never accept a parent that
+    # does not identify this exact execution, and treat any explicit execution
+    # claim as an additional consistency check rather than a required field.
+    expected_contract_execution_id = expected_scope[
+        "contract_execution_id"
+    ]
+    if (
+        expected_scope["parent_task_id"]
+        != expected_contract_execution_id
+    ):
+        return {}
+    required_runtime_scope = {
+        field: value
+        for field, value in expected_scope.items()
+        if field != "contract_execution_id"
+    }
     merged_commit = str(
         merge.get("merged_commit_sha") or ""
     ).strip().lower()
@@ -92229,12 +92247,35 @@ def _contract_runtime_later_durable_reconcile_supplement(
         return {}
 
     def exact_scope(scope: Mapping[str, Any]) -> bool:
+        if not isinstance(scope, Mapping):
+            return False
+        explicit_contract_execution_id = str(
+            scope.get("contract_execution_id") or ""
+        ).strip()
         return bool(
-            isinstance(scope, Mapping)
-            and all(
+            all(
                 str(scope.get(field) or "").strip() == expected
-                for field, expected in expected_scope.items()
+                for field, expected in required_runtime_scope.items()
             )
+            and (
+                not explicit_contract_execution_id
+                or explicit_contract_execution_id
+                == expected_contract_execution_id
+            )
+        )
+
+    def optional_contract_execution_matches(
+        payload: Mapping[str, Any],
+    ) -> bool:
+        if not isinstance(payload, Mapping):
+            return False
+        explicit_contract_execution_id = str(
+            payload.get("contract_execution_id") or ""
+        ).strip()
+        return bool(
+            not explicit_contract_execution_id
+            or explicit_contract_execution_id
+            == expected_contract_execution_id
         )
 
     try:
@@ -92313,6 +92354,8 @@ def _contract_runtime_later_durable_reconcile_supplement(
         if not (
             isinstance(route_evidence, Mapping)
             and isinstance(marker, Mapping)
+            and optional_contract_execution_matches(route_evidence)
+            and optional_contract_execution_matches(marker)
             and route_evidence.get("schema_version")
             == "graph_current_full_reconcile.route_evidence.v1"
             and str(
@@ -92394,12 +92437,13 @@ def _contract_runtime_later_durable_reconcile_supplement(
             and str(event.get("created_at") or "").strip()
             == reconcile_event_created_at
             and exact_scope(event_runtime_scope)
+            and optional_contract_execution_matches(event_payload)
             and event_runtime_scope.get("source")
             == "parallel_branch_runtime_context"
             and event_runtime_scope.get("server_derived") is True
             and all(
                 str(event_payload.get(field) or "").strip() == expected
-                for field, expected in expected_scope.items()
+                for field, expected in required_runtime_scope.items()
                 if field != "project_id"
             )
             and event_payload.get("current_full_reconcile") is True
@@ -92429,11 +92473,44 @@ def _contract_runtime_later_durable_reconcile_supplement(
             }
         )
 
-    # Multiple exact rows are not ranked.  A client timeout/retry must resolve
-    # through idempotency before close authority; close itself never guesses.
-    if len(candidates) != 1:
+    if not candidates:
         return {}
-    candidate = candidates[0]
+    # A later exact closing-HEAD reconcile is stronger than an otherwise valid
+    # historical ancestor.  Without an exact target, select only one maximal
+    # historical descendant under Git ancestry.  Duplicate strongest targets
+    # and incomparable maximal heads remain ambiguous and fail closed.
+    def candidate_target(candidate: Mapping[str, Any]) -> str:
+        return str(
+            candidate.get("target_commit_sha") or ""
+        ).strip().lower()
+
+    exact_head_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate_target(candidate) == canonical_head_commit
+    ]
+    if exact_head_candidates:
+        strongest_rank = "exact_canonical_closing_head"
+        strongest_candidates = exact_head_candidates
+    else:
+        strongest_rank = "unique_maximal_historical_descendant"
+        strongest_candidates = []
+        for candidate in candidates:
+            target_commit = candidate_target(candidate)
+            dominated = any(
+                target_commit != candidate_target(other)
+                and _git_commit_is_ancestor(
+                    Path(root),
+                    target_commit,
+                    candidate_target(other),
+                )
+                for other in candidates
+            )
+            if not dominated:
+                strongest_candidates.append(candidate)
+    if len(strongest_candidates) != 1:
+        return {}
+    candidate = strongest_candidates[0]
     reconcile = {
         key: candidate[key]
         for key in (
@@ -92561,6 +92638,11 @@ def _contract_runtime_later_durable_reconcile_supplement(
                 ),
                 "server_authored": True,
                 "unique_candidate_verified": True,
+                "candidate_rank": strongest_rank,
+                "strongest_rank_unique": True,
+                "weaker_candidate_count": (
+                    len(candidates) - len(strongest_candidates)
+                ),
                 "exact_runtime_scope_verified": True,
                 "qa_before_merge_before_reconcile_verified": True,
                 "activated_snapshot_status_verified": True,
