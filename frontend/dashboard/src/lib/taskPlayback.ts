@@ -1505,6 +1505,12 @@ export const TASK_PLAYBACK_BACKLOG_HOT_WINDOW_LIMIT = 250;
 export const TASK_PLAYBACK_MEMORY_PROJECT_LIMIT = 32;
 export const TASK_PLAYBACK_MEMORY_PLAYBACK_LIMIT = 128;
 export type TaskPlaybackSurfaceMode = "activity" | "history";
+export type TaskPlaybackCacheCompleteness = "partial" | "complete";
+export type TaskPlaybackCacheOrigin =
+  | "current_recent"
+  | "current_projection"
+  | "playback_hydration"
+  | "backlog_listing";
 
 export interface TaskPlaybackMemoryWindow<T> {
   key: string;
@@ -1512,18 +1518,24 @@ export interface TaskPlaybackMemoryWindow<T> {
   backlog_id: string;
   values: T[];
   updated_at: string;
+  completeness: TaskPlaybackCacheCompleteness;
+  origin: TaskPlaybackCacheOrigin;
 }
 
 const currentTimelineHotWindows = new Map<string, TaskPlaybackMemoryWindow<TaskTimelineEvent>>();
 const playbackTraceHotWindows = new Map<string, TaskPlaybackMemoryWindow<TaskPlaybackTrace>>();
 const backlogHotWindows = new Map<string, TaskPlaybackMemoryWindow<BacklogBug>>();
 
-export function shouldRunPlaybackColdFullLoader(
+export function shouldHydratePlaybackHistory(
   mode: TaskPlaybackSurfaceMode,
-  state: { loaded?: boolean; loading?: boolean; inFlight?: boolean } | null | undefined,
+  state: {
+    completeness?: "missing" | TaskPlaybackCacheCompleteness;
+    loading?: boolean;
+    inFlight?: boolean;
+  } | null | undefined,
 ): boolean {
   return mode === "history"
-    && !state?.loaded
+    && state?.completeness !== "complete"
     && !state?.loading
     && !state?.inFlight;
 }
@@ -1667,6 +1679,8 @@ export function rememberProjectCurrentTimelineHotWindow(
     backlog_id: "",
     values: mergeRecentTimelineEvents(events, TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT),
     updated_at: new Date().toISOString(),
+    completeness: "complete" as const,
+    origin: "current_recent" as const,
   };
   return rememberBoundedMemoryWindow(
     currentTimelineHotWindows,
@@ -1686,10 +1700,21 @@ export function rememberProjectPlaybackHotWindow(
   projectId: string,
   backlogId: string,
   trace: TaskPlaybackTrace,
+  cache: {
+    completeness: TaskPlaybackCacheCompleteness;
+    origin: Extract<TaskPlaybackCacheOrigin, "current_projection" | "playback_hydration">;
+  } = {
+    completeness: trace.source === "governed" ? "complete" : "partial",
+    origin: trace.source === "governed" ? "playback_hydration" : "current_projection",
+  },
 ): TaskPlaybackMemoryWindow<TaskPlaybackTrace> {
   const project = projectId.trim();
   const backlog = backlogId.trim();
   const key = `${project}:${backlog}`;
+  const existing = playbackTraceHotWindows.get(key);
+  if (cache.completeness === "partial" && existing?.completeness === "complete") {
+    return readBoundedMemoryWindow(playbackTraceHotWindows, key) ?? existing;
+  }
   const hotTrace = projectPlaybackHotWindowTrace(trace);
   const entry = {
     key,
@@ -1697,6 +1722,8 @@ export function rememberProjectPlaybackHotWindow(
     backlog_id: backlog,
     values: [hotTrace],
     updated_at: new Date().toISOString(),
+    completeness: cache.completeness,
+    origin: cache.origin,
   };
   return rememberBoundedMemoryWindow(
     playbackTraceHotWindows,
@@ -1733,6 +1760,8 @@ export function rememberProjectBacklogHotWindow(
     backlog_id: "",
     values: bugs.slice(0, TASK_PLAYBACK_BACKLOG_HOT_WINDOW_LIMIT),
     updated_at: new Date().toISOString(),
+    completeness: "complete" as const,
+    origin: "backlog_listing" as const,
   };
   return rememberBoundedMemoryWindow(backlogHotWindows, key, entry, TASK_PLAYBACK_MEMORY_PROJECT_LIMIT);
 }

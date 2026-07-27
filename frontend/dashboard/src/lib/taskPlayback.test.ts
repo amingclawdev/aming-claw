@@ -20,7 +20,7 @@ import {
   rememberProjectCurrentTimelineHotWindow,
   rememberProjectPlaybackHotWindow,
   resetTaskPlaybackMemoryHotWindowsForTests,
-  shouldRunPlaybackColdFullLoader,
+  shouldHydratePlaybackHistory,
   TASK_PLAYBACK_BACKLOG_HOT_WINDOW_LIMIT,
   TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT,
   typedDagRawSecretPath,
@@ -5319,6 +5319,89 @@ function taskPlaybackMemoryHotWindowAssertions(): string[] {
     },
     commit_sha: `commit-${index + 1}`,
   } as TaskTimelineEvent));
+  const partialBacklog = backlogRows[1];
+  const partialTrace = normalizeTaskPlaybackTrace({
+    projectId: "project-a",
+    backlog: partialBacklog,
+    taskTimeline: {
+      project_id: "project-a",
+      backlog_id: partialBacklog.bug_id,
+      events: playbackEvents.slice(0, 1),
+      count: 1,
+    },
+    gateResponse: null,
+    source: "governed_partial",
+  });
+  rememberProjectPlaybackHotWindow("project-a", partialBacklog.bug_id, partialTrace, {
+    completeness: "partial",
+    origin: "current_projection",
+  });
+  const partialPlaybackWindow = projectPlaybackHotWindow("project-a", partialBacklog.bug_id);
+  assertFixture(
+    partialPlaybackWindow?.values[0]?.frames.length === 1
+      && partialPlaybackWindow.completeness === "partial"
+      && partialPlaybackWindow.origin === "current_projection",
+    "Current governed_partial may seed one visible Playback frame but must remain explicitly partial",
+  );
+  const hydrationCalls = { timeline: 0, gate: 0 };
+  const enterSurface = (
+    mode: "activity" | "history",
+    completeness: "missing" | "partial" | "complete",
+    inFlight = false,
+  ) => {
+    if (!shouldHydratePlaybackHistory(mode, {
+      completeness,
+      loading: false,
+      inFlight,
+    })) return;
+    hydrationCalls.timeline += 1;
+    hydrationCalls.gate += 1;
+  };
+  enterSurface("activity", "partial");
+  enterSurface("history", "partial");
+  enterSurface("history", "partial", true);
+  assertFixture(
+    hydrationCalls.timeline === 1 && hydrationCalls.gate === 1,
+    "first Playback entry on a partial Current seed should trigger exactly one single-flight bounded hydration",
+  );
+  const authoritative21Trace = normalizeTaskPlaybackTrace({
+    projectId: "project-a",
+    backlog: partialBacklog,
+    taskTimeline: {
+      project_id: "project-a",
+      backlog_id: partialBacklog.bug_id,
+      events: playbackEvents.slice(0, 21),
+      count: 21,
+    },
+    gateResponse: null,
+    source: "governed",
+  });
+  rememberProjectPlaybackHotWindow("project-a", partialBacklog.bug_id, authoritative21Trace, {
+    completeness: "complete",
+    origin: "playback_hydration",
+  });
+  const hydrated21Window = projectPlaybackHotWindow("project-a", partialBacklog.bug_id);
+  assertFixture(
+    hydrated21Window?.values[0]?.frames.length === 21
+      && hydrated21Window.completeness === "complete"
+      && hydrated21Window.origin === "playback_hydration",
+    "bounded per-backlog hydration should replace the one-frame seed with all 21 authoritative events",
+  );
+  enterSurface("history", hydrated21Window?.completeness ?? "missing");
+  assertFixture(
+    hydrationCalls.timeline === 1 && hydrationCalls.gate === 1,
+    "warm complete Playback re-entry must not call the bounded hydration loader again",
+  );
+  rememberProjectPlaybackHotWindow("project-a", partialBacklog.bug_id, partialTrace, {
+    completeness: "partial",
+    origin: "current_projection",
+  });
+  const reseededCompleteWindow = projectPlaybackHotWindow("project-a", partialBacklog.bug_id);
+  assertFixture(
+    reseededCompleteWindow?.completeness === "complete"
+      && reseededCompleteWindow.values[0]?.frames.length === 21,
+    "later Current partial projections must not downgrade a complete Playback hydration cache",
+  );
   const trace = normalizeTaskPlaybackTrace({
     projectId: "project-a",
     backlog: backlogRows[0],
@@ -5387,6 +5470,9 @@ function taskPlaybackMemoryHotWindowAssertions(): string[] {
     viewSource.includes("data-current-cache-source")
       && viewSource.includes("data-current-memory-first")
       && viewSource.includes("data-playback-cache-source")
+      && viewSource.includes("data-playback-cache-completeness")
+      && viewSource.includes("data-playback-cache-origin")
+      && viewSource.includes("data-playback-hydration-in-flight")
       && viewSource.includes("data-playback-cold-load-count"),
     "Current and Playback should expose memory-first/SWR telemetry for real E2E assertions",
   );
@@ -5397,34 +5483,18 @@ function taskPlaybackMemoryHotWindowAssertions(): string[] {
   assertFixture(
     !viewSource.includes("refreshActivityTimeline")
       && !viewSource.includes("ACTIVITY_TIMELINE_LIMIT")
-      && viewSource.includes("shouldRunPlaybackColdFullLoader(mode"),
+      && viewSource.includes("shouldHydratePlaybackHistory(mode"),
     "Current must not own a full timeline/gate poller and the Playback full loader must be mode-gated",
   );
-  const coldLoaderCalls = { timeline: 0, gate: 0 };
-  const enterSurface = (mode: "activity" | "history", memoryAvailable: boolean) => {
-    if (!shouldRunPlaybackColdFullLoader(mode, {
-      loaded: memoryAvailable,
-      loading: false,
-      inFlight: false,
-    })) return;
-    coldLoaderCalls.timeline += 1;
-    coldLoaderCalls.gate += 1;
-  };
-  enterSurface("activity", false);
-  enterSurface("activity", true);
-  enterSurface("history", true);
   assertFixture(
-    coldLoaderCalls.timeline === 0 && coldLoaderCalls.gate === 0,
-    "Current second entry and warm Playback entry must not call the full timeline/gate loaders",
-  );
-  enterSurface("history", false);
-  assertFixture(
-    coldLoaderCalls.timeline === 1 && coldLoaderCalls.gate === 1,
-    "a genuinely cold Playback history entry should remain eligible for one full timeline/gate load",
+    !viewSource.includes("loaded: memoryAvailable")
+      && !viewSource.includes("loaded: currentState?.loaded"),
+    "Playback hydration eligibility must use explicit completeness instead of loaded/memoryAvailable booleans",
   );
   return [
     "Current: project-isolated newest-first 50-event memory window",
-    "Playback: project+backlog-isolated newest 50-frame reference-closed memory window",
+    "Playback: partial one-frame Current seed hydrates to 21 authoritative events, then stays warm-complete",
+    "Playback: project+backlog-isolated newest 50-frame reference-closed complete window",
     "Backlog: project-isolated 250-row local-facet window",
     "Current/Playback: observable memory-first telemetry with Current excluded from full loaders",
   ];

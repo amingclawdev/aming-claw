@@ -28,9 +28,11 @@ import {
   rememberProjectBacklogHotWindow,
   rememberProjectCurrentTimelineHotWindow,
   rememberProjectPlaybackHotWindow,
-  shouldRunPlaybackColdFullLoader,
+  shouldHydratePlaybackHistory,
   TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT,
   PLAYBACK_URL_PARAMS,
+  type TaskPlaybackCacheCompleteness,
+  type TaskPlaybackCacheOrigin,
   type TaskPlaybackTrace,
   type ActivityEventCard,
 } from "../lib/taskPlayback";
@@ -49,7 +51,7 @@ type ActivityMode = "activity" | "history";
 
 const PLAYBACK_BACKLOG_PARAM = PLAYBACK_URL_PARAMS.playback_backlog;
 const ACTIVITY_TAB_PARAM = PLAYBACK_URL_PARAMS.activity_tab;
-const PLAYBACK_TIMELINE_LIMIT = 250;
+const PLAYBACK_TIMELINE_LIMIT = TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT;
 /** Initial + max limit for the project-wide recent events stream in the Current tab. */
 const RECENT_EVENTS_LIMIT = TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT;
 const PLAYBACK_SEARCH_DEBOUNCE_MS = 300;
@@ -63,9 +65,10 @@ const AUDIT_ARCHIVED_RUNTIME_STATES = new Set(["audit_archived"]);
 
 interface PlaybackLoadState {
   loading: boolean;
-  loaded: boolean;
   error: string;
   trace: TaskPlaybackTrace;
+  completeness: "missing" | TaskPlaybackCacheCompleteness;
+  cacheOrigin: "none" | TaskPlaybackCacheOrigin;
   authorityCacheKey?: string;
   cacheSource?: "cold" | "memory" | "network";
 }
@@ -111,9 +114,10 @@ function playbackStatesFromMemory(projectId: string): Record<string, PlaybackLoa
     return trace
       ? [[entry.backlog_id, {
         loading: false,
-        loaded: true,
         error: "",
         trace,
+        completeness: entry.completeness,
+        cacheOrigin: entry.origin,
         authorityCacheKey: trace.authority_view?.cache_identity.key,
         cacheSource: "memory" as const,
       }]]
@@ -585,12 +589,17 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
         gateResponse: null,
         source: "governed_partial",
       });
-      const hotTrace = rememberProjectPlaybackHotWindow(projectId, backlogId, trace).values[0] ?? trace;
+      const hotWindow = rememberProjectPlaybackHotWindow(projectId, backlogId, trace, {
+        completeness: "partial",
+        origin: "current_projection",
+      });
+      const hotTrace = hotWindow.values[0] ?? trace;
       const memoryState: PlaybackLoadState = {
         loading: false,
-        loaded: true,
         error: "",
         trace: hotTrace,
+        completeness: hotWindow.completeness,
+        cacheOrigin: hotWindow.origin,
         authorityCacheKey: hotTrace.authority_view?.cache_identity.key,
         cacheSource: "memory",
       };
@@ -612,7 +621,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   useEffect(() => {
     if (!activityBug) return;
     const state = activityByBug[activityBug.bug_id];
-    if (!state?.loaded || state.loading) return;
+    if (!state || state.completeness === "missing" || state.loading) return;
     const currentFrameExists = Boolean(selectedActivityFrameId && state.trace.frames.some((frame) => frame.id === selectedActivityFrameId));
     if (!selectedActivityFrameId || currentFrameExists) return;
     // QA #3636 F2: use newest frame (last in newest-first array) for stale-frame fallback.
@@ -625,8 +634,8 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     const bugId = selectedLoadBugId;
     const requestKey = `${projectId}:${bugId}`;
     const currentState = playbackByBugRef.current[bugId];
-    if (!shouldRunPlaybackColdFullLoader(mode, {
-      loaded: currentState?.loaded,
+    if (!shouldHydratePlaybackHistory(mode, {
+      completeness: currentState?.completeness ?? "missing",
       loading: currentState?.loading,
       inFlight: inFlightPlaybackKeysRef.current.has(requestKey),
     })) return;
@@ -639,10 +648,11 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       ...states,
       [bugId]: {
         loading: true,
-        loaded: false,
         error: "",
-        trace: emptyTaskPlaybackTrace(projectId, bug),
-        cacheSource: "cold",
+        trace: states[bugId]?.trace ?? currentState?.trace ?? emptyTaskPlaybackTrace(projectId, bug),
+        completeness: states[bugId]?.completeness ?? currentState?.completeness ?? "missing",
+        cacheOrigin: states[bugId]?.cacheOrigin ?? currentState?.cacheOrigin ?? "none",
+        cacheSource: states[bugId]?.trace || currentState?.trace ? "memory" : "cold",
       },
     }));
 
@@ -665,15 +675,23 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
           gateResponse: gate,
           source: taskTimeline && gate ? "governed" : "governed_partial",
         });
+        const completeness: TaskPlaybackCacheCompleteness = timelineResult.status === "fulfilled"
+          ? "complete"
+          : "partial";
         const authorityCacheKey = trace.authority_view?.cache_identity.key;
-        const hotTrace = rememberProjectPlaybackHotWindow(projectId, bugId, trace).values[0] ?? trace;
+        const hotWindow = rememberProjectPlaybackHotWindow(projectId, bugId, trace, {
+          completeness,
+          origin: "playback_hydration",
+        });
+        const hotTrace = hotWindow.values[0] ?? trace;
         setPlaybackByBug((states) => ({
           ...states,
           [bugId]: {
             loading: false,
-            loaded: true,
             error: errors.join(" | "),
             trace: hotTrace,
+            completeness: hotWindow.completeness,
+            cacheOrigin: hotWindow.origin,
             authorityCacheKey,
             cacheSource: "network",
           },
@@ -690,14 +708,15 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       })
       .catch((error: unknown) => {
         if (controller.signal.aborted || !mountedRef.current || activeProjectIdRef.current !== projectId) return;
-        const trace = emptyTaskPlaybackTrace(projectId, bug);
         setPlaybackByBug((states) => ({
           ...states,
           [bugId]: {
             loading: false,
-            loaded: true,
             error: errorMessage(error),
-            trace,
+            trace: states[bugId]?.trace ?? currentState?.trace ?? emptyTaskPlaybackTrace(projectId, bug),
+            completeness: states[bugId]?.completeness ?? currentState?.completeness ?? "missing",
+            cacheOrigin: states[bugId]?.cacheOrigin ?? currentState?.cacheOrigin ?? "none",
+            cacheSource: states[bugId]?.cacheSource ?? currentState?.cacheSource ?? "cold",
           },
         }));
       })
@@ -1071,7 +1090,10 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
           <div
             className="task-playback-main"
             data-playback-cache-source={selectedState?.cacheSource ?? "cold"}
-            data-playback-memory-first={selectedState?.loaded ? "true" : "false"}
+            data-playback-cache-completeness={selectedState?.completeness ?? "missing"}
+            data-playback-cache-origin={selectedState?.cacheOrigin ?? "none"}
+            data-playback-hydration-in-flight={selectedState?.loading ? "true" : "false"}
+            data-playback-memory-first={selectedState?.trace.frames.length ? "true" : "false"}
             data-playback-cold-load-count={
               selectedBugId ? playbackColdLoadCountRef.current[`${projectId}:${selectedBugId}`] ?? 0 : 0
             }
@@ -1382,9 +1404,9 @@ function matchesGateFilter(filter: GateFilter, bug: BacklogBug, state?: Playback
     const text = [bug.runtime_state, bug.chain_stage, bug.mf_type, bug.contract_summary?.template_id].join(" ").toLowerCase();
     return Boolean(bug.contract_summary?.has_contract || /manual|mf|worker|gate|parallel|review/.test(text));
   }
-  if (filter === "timeline_loaded") return Boolean(state?.loaded && state.trace.frames.length > 0);
+  if (filter === "timeline_loaded") return Boolean(state && state.trace.frames.length > 0);
   if (filter === "blocked_gate") return Boolean(state?.trace.close_gate_summary.blocked);
-  if (filter === "no_timeline") return Boolean(state?.loaded && state.trace.frames.length === 0);
+  if (filter === "no_timeline") return Boolean(state?.completeness === "complete" && state.trace.frames.length === 0);
   return true;
 }
 
@@ -1404,7 +1426,10 @@ function isPrivatePlaybackBacklog(bug: BacklogBug): boolean {
 function playbackRowMeta(bug: BacklogBug, state?: PlaybackLoadState): string {
   if (state?.loading) return "loading timeline";
   if (state?.trace.close_gate_summary.blocked) return "blocked gate";
-  if (state?.loaded) return `${state.trace.frames.length} frame${state.trace.frames.length === 1 ? "" : "s"}`;
+  if (state && state.completeness !== "missing") {
+    const suffix = state.completeness === "partial" ? " (hydrating)" : "";
+    return `${state.trace.frames.length} frame${state.trace.frames.length === 1 ? "" : "s"}${suffix}`;
+  }
   if (bug.contract_summary?.has_contract) return "gate candidate";
   return bug.runtime_state || bug.chain_stage || "not loaded";
 }

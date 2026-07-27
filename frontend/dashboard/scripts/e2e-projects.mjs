@@ -1216,6 +1216,9 @@ function verifyActivityPlaybackViewportWarmCacheContract() {
   assert(
     playbackSource.includes("TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT = 50")
       && playbackSource.includes("TASK_PLAYBACK_BACKLOG_HOT_WINDOW_LIMIT = 250")
+      && playbackSource.includes('TaskPlaybackCacheCompleteness = "partial" | "complete"')
+      && playbackSource.includes('"current_projection"')
+      && playbackSource.includes('"playback_hydration"')
       && playbackSource.includes("projectPlaybackHotWindows")
       && playbackSource.includes("rememberBoundedMemoryWindow")
       && playbackSource.includes("projectPlaybackHotWindowTrace")
@@ -1230,8 +1233,20 @@ function verifyActivityPlaybackViewportWarmCacheContract() {
       && playbackViewSource.includes("data-current-cache-source")
       && playbackViewSource.includes("data-current-memory-first")
       && playbackViewSource.includes("data-playback-cache-source")
+      && playbackViewSource.includes("data-playback-cache-completeness")
+      && playbackViewSource.includes("data-playback-cache-origin")
+      && playbackViewSource.includes("data-playback-hydration-in-flight")
       && playbackViewSource.includes("data-playback-cold-load-count"),
-    "Browser E2E should have observable Current/Playback second-entry memory-hit and cold-load-count assertions",
+    "Browser E2E should observe partial/complete cache state, origin, single-flight hydration, and warm-entry load counts",
+  );
+  assert(
+    playbackViewSource.includes("const PLAYBACK_TIMELINE_LIMIT = TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT")
+      && playbackViewSource.includes("shouldHydratePlaybackHistory(mode")
+      && playbackViewSource.includes('completeness: "partial"')
+      && playbackViewSource.includes('origin: "current_projection"')
+      && playbackViewSource.includes('origin: "playback_hydration"')
+      && !playbackViewSource.includes("loaded: currentState?.loaded"),
+    "Playback should keep a governed_partial Current seed visible while running one bounded newest-50 per-backlog hydration",
   );
   assert(
     playbackViewSource.includes('data-backlog-local-facets="status,priority,timeline-state"')
@@ -1248,13 +1263,16 @@ function verifyActivityPlaybackViewportWarmCacheContract() {
       && playbackTestSource.includes("Current reconnect should preserve useful memory content while revalidating")
       && playbackTestSource.includes("status totals must be rebuilt from the retained 50 frames")
       && playbackTestSource.includes("DAG must be bounded and reference-closed")
-      && playbackTestSource.includes("Current second entry and warm Playback entry must not call the full timeline/gate loaders"),
-    "Focused fixtures should prove multi-project isolation, reference-closed playback windows, and memory-first loader exclusion",
+      && playbackTestSource.includes("all 21 authoritative events")
+      && playbackTestSource.includes("exactly one single-flight bounded hydration")
+      && playbackTestSource.includes("warm complete Playback re-entry")
+      && playbackTestSource.includes("must not downgrade a complete Playback hydration cache"),
+    "Focused fixtures should prove 1→21 hydration, single-flight, warm no-reload, cache isolation, and reference-closed windows",
   );
   assert(
     !playbackViewSource.includes("refreshActivityTimeline")
       && !playbackViewSource.includes("ACTIVITY_TIMELINE_LIMIT")
-      && playbackViewSource.includes("shouldRunPlaybackColdFullLoader(mode")
+      && playbackViewSource.includes("shouldHydratePlaybackHistory(mode")
       && playbackViewSource.includes('if (mode !== "activity") return undefined;'),
     "Current SWR must use bounded resource refreshes while full timeline/gate loading remains Playback-only",
   );
