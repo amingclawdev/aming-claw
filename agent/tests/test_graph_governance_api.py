@@ -46690,6 +46690,132 @@ def test_mf_parallel_close_authority_selects_current_recovery_before_stale_last_
     assert gate["authoritative_selector_present"] is True
 
 
+def test_mf_parallel_close_authority_explicit_complete_execution_overrides_stale_active_child(
+):
+    backlog_id = "AC-MF-PARALLEL-EXPLICIT-CLOSE-SELECTOR"
+    close_commit = "a249e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "b249e8bdf9b100f28fb5843f61ef83ed82618f18"
+    stale_execution_id = "cex-mf-parallel-historical-active-incomplete"
+    requested_execution_id = "cex-mf-parallel-explicit-newer-complete"
+    stale = _mf_parallel_close_authority_v2_record(
+        stale_execution_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=False,
+        backlog_id=backlog_id,
+    )
+    requested = _mf_parallel_close_authority_v2_record(
+        requested_execution_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=True,
+        backlog_id=backlog_id,
+    )
+    projection = _mf_parallel_close_authority_chain_projection(
+        stale_execution_id
+    )
+    projection["active_chain"]["execution_ids"] = [
+        stale_execution_id,
+        requested_execution_id,
+    ]
+    projection["active_child_contract_execution_id"] = stale_execution_id
+    projection["current_contract_execution_id"] = stale_execution_id
+
+    gate = server._contract_runtime_mf_parallel_close_authority_gate(
+        [requested, stale],
+        chain_projection=projection,
+        close_commit=close_commit,
+        project_id=PID,
+        backlog_id=backlog_id,
+        requested_contract_execution_id=requested_execution_id,
+    )
+
+    assert gate["passed"] is True, json.dumps(
+        gate, indent=2, sort_keys=True
+    )
+    assert gate["contract_execution_id"] == requested_execution_id
+    assert gate["record_selection_source"] == (
+        "requested_contract_execution_id"
+    )
+    assert gate["requested_contract_execution_id"] == (
+        requested_execution_id
+    )
+    assert gate["requested_selector_diagnostics"] == []
+
+
+def test_mf_parallel_close_authority_rejects_unrelated_or_scope_mismatched_explicit_execution(
+):
+    backlog_id = "AC-MF-PARALLEL-EXPLICIT-CLOSE-SELECTOR-NEGATIVE"
+    close_commit = "c249e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "d249e8bdf9b100f28fb5843f61ef83ed82618f18"
+    active_execution_id = "cex-mf-parallel-explicit-selector-active"
+    active = _mf_parallel_close_authority_v2_record(
+        active_execution_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=True,
+        backlog_id=backlog_id,
+    )
+    projection = _mf_parallel_close_authority_chain_projection(
+        active_execution_id
+    )
+
+    unrelated_id = "cex-mf-parallel-unrelated-not-in-chain"
+    unrelated_gate = (
+        server._contract_runtime_mf_parallel_close_authority_gate(
+            [active],
+            chain_projection=projection,
+            close_commit=close_commit,
+            project_id=PID,
+            backlog_id=backlog_id,
+            requested_contract_execution_id=unrelated_id,
+        )
+    )
+    assert unrelated_gate["passed"] is False
+    assert unrelated_gate["contract_execution_id"] == unrelated_id
+    assert unrelated_gate["missing_requirement_ids"] == [
+        "contract_runtime.requested_mf_parallel_execution"
+    ]
+    assert unrelated_gate["requested_selector_diagnostics"][0][
+        "reason"
+    ] == "execution_not_in_close_authority_chain"
+
+    mismatched_execution_id = (
+        "cex-mf-parallel-explicit-selector-wrong-backlog"
+    )
+    mismatched = _mf_parallel_close_authority_v2_record(
+        mismatched_execution_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=True,
+        backlog_id="AC-UNRELATED-BACKLOG",
+    )
+    mismatched_projection = _mf_parallel_close_authority_chain_projection(
+        active_execution_id
+    )
+    mismatched_projection["active_chain"]["execution_ids"].append(
+        mismatched_execution_id
+    )
+    mismatched_gate = (
+        server._contract_runtime_mf_parallel_close_authority_gate(
+            [active, mismatched],
+            chain_projection=mismatched_projection,
+            close_commit=close_commit,
+            project_id=PID,
+            backlog_id=backlog_id,
+            requested_contract_execution_id=mismatched_execution_id,
+        )
+    )
+    assert mismatched_gate["passed"] is False
+    assert mismatched_gate["contract_execution_id"] == (
+        mismatched_execution_id
+    )
+    assert any(
+        item["reason"] == "requested_execution_backlog_mismatch"
+        for item in mismatched_gate["requested_selector_diagnostics"]
+    )
+
+
 def test_mf_parallel_close_authority_uses_projected_completed_recovery_over_named_stale(
     conn,
 ):
