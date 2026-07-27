@@ -90526,6 +90526,12 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
     reconciled_commit = str(
         authority.get("reconciled_commit_sha") or ""
     ).strip().lower()
+    reconcile_provenance_target_commit = str(
+        authority.get("reconcile_provenance_target_commit") or ""
+    ).strip().lower()
+    reconcile_snapshot_commit = str(
+        authority.get("reconcile_snapshot_commit") or ""
+    ).strip().lower()
     canonical_head = str(
         authority.get("canonical_head_commit")
         or authority.get("current_canonical_commit_sha")
@@ -90537,11 +90543,41 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
     target_project_root = str(
         authority.get("target_project_root") or ""
     ).strip()
+    durable_merge_matches_reconciled = (
+        _contract_runtime_authority_commit_matches(
+            durable_merge_commit,
+            reconciled_commit,
+        )
+    )
+    reconciled_matches_closing_head = (
+        _contract_runtime_authority_commit_matches(
+            reconciled_commit,
+            close_commit,
+        )
+    )
+    historical_descendant_snapshot_mode = bool(
+        durable_merge_matches_reconciled
+        and not reconciled_matches_closing_head
+    )
+    current_head_full_reconcile_mode = bool(
+        reconciled_matches_closing_head
+        and not durable_merge_matches_reconciled
+        and _contract_runtime_authority_commit_matches(
+            reconcile_provenance_target_commit,
+            reconciled_commit,
+        )
+        and _contract_runtime_authority_commit_matches(
+            reconcile_snapshot_commit,
+            reconciled_commit,
+        )
+    )
     if not (
         merge_commit
         and reconcile_commit
         and durable_merge_commit
         and reconciled_commit
+        and reconcile_provenance_target_commit
+        and reconcile_snapshot_commit
         and canonical_head
         and active_snapshot_commit
         and target_project_root
@@ -90551,15 +90587,11 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
         )
         and _contract_runtime_authority_commit_matches(
             reconcile_commit,
-            reconciled_commit,
-        )
-        and _contract_runtime_authority_commit_matches(
             durable_merge_commit,
-            reconciled_commit,
         )
-        and not _contract_runtime_authority_commit_matches(
-            reconciled_commit,
-            close_commit,
+        and (
+            historical_descendant_snapshot_mode
+            or current_head_full_reconcile_mode
         )
         and _contract_runtime_authority_commit_matches(
             canonical_head,
@@ -90604,6 +90636,11 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
         == "active"
         and _git_commit_is_ancestor(
             Path(target_project_root),
+            durable_merge_commit,
+            reconciled_commit,
+        )
+        and _git_commit_is_ancestor(
+            Path(target_project_root),
             reconciled_commit,
             canonical_head,
         )
@@ -90616,10 +90653,19 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
         "passed": True,
         "server_derived": True,
         "bridge": "durable_reconcile_to_active_descendant_close_head",
+        "bridge_mode": (
+            "current_head_full_reconcile_after_durable_merge"
+            if current_head_full_reconcile_mode
+            else "historical_reconcile_with_active_descendant_snapshot"
+        ),
         "merge_line_commit": merge_commit,
         "reconcile_line_commit": reconcile_commit,
         "durable_merge_commit": durable_merge_commit,
         "reconciled_commit": reconciled_commit,
+        "reconcile_provenance_target_commit": (
+            reconcile_provenance_target_commit
+        ),
+        "reconcile_snapshot_commit": reconcile_snapshot_commit,
         "closing_head_commit": canonical_head,
         "active_snapshot_id": str(
             authority.get("active_snapshot_id") or ""
@@ -90633,8 +90679,12 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
             reconcile_line.get("_source_ref") or ""
         ),
         "durable_lineage_verified": True,
+        "durable_merge_commit_is_ancestor_of_reconciled_commit": True,
         "reconciled_commit_is_ancestor_of_closing_head": True,
         "active_full_snapshot_matches_closing_head": True,
+        "current_head_full_reconcile_verified": (
+            current_head_full_reconcile_mode
+        ),
         "raw_merge_reconcile_commits_preserved": True,
     }
 
