@@ -759,6 +759,13 @@ def rebuild_backlog_contract_chain_projection(
             if str(record.get("contract_execution_id") or "")
         ],
     }
+    completed_repair_barrier = current.get(
+        "completed_repair_fresh_generation_barrier"
+    )
+    if isinstance(completed_repair_barrier, Mapping) and completed_repair_barrier:
+        active_chain["completed_repair_fresh_generation_barrier"] = dict(
+            completed_repair_barrier
+        )
     if current.get("terminal") is True:
         terminal_disposition = current.get("terminal_disposition")
         if isinstance(terminal_disposition, Mapping):
@@ -887,7 +894,25 @@ def read_backlog_contract_chain_current(
         )
     if row is None:
         return {}
-    return _current_projection_from_row(row)
+    projection = _current_projection_from_row(row)
+    next_action = (
+        projection.get("next_legal_action")
+        if isinstance(projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if (
+        str(projection.get("readiness_state") or "")
+        == "same_row_recovery_target_ready"
+        or str(next_action.get("source") or "")
+        == "backlog_contract_chain_current.same_row_recovery_cursor"
+        or isinstance(next_action.get("same_row_recovery_cursor"), Mapping)
+    ):
+        return rebuild_backlog_contract_chain_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    return projection
 
 
 def _upsert_contract_chain_binding(
@@ -1716,25 +1741,15 @@ def _project_same_row_recovery_state(
     ):
         return {}
 
-    next_action = _next_action_from_record(parent)
-    next_action.update(
-        {
-            "source": (
-                "backlog_contract_chain_current.same_row_recovery_cursor"
-            ),
-            "precedence": "completed_recovery_exact_parent_target",
-            "repair_child_contract_execution_id": child_id,
-            "repair_target_hash": str(target.get("target_hash") or ""),
-            "historical_parent_immutable": True,
-            "authoritative_pass_synthesized": False,
-        }
-    )
-    cursor = {
-        "schema_version": "contract_runtime.same_row_recovery_cursor.v1",
+    barrier = {
+        "schema_version": (
+            "contract_runtime.completed_repair_fresh_generation_barrier.v1"
+        ),
+        "status": "repair_complete_fresh_generation_required",
         "source": "completed_recovery_child_authority",
         "target_source": target_source,
-        "source_contract_execution_id": parent_id,
         "repair_child_contract_execution_id": child_id,
+        "historical_source_contract_execution_id": parent_id,
         "repair_target_hash": str(target.get("target_hash") or ""),
         "source_execution_state_revision": int(
             target.get("source_execution_state_revision") or 0
@@ -1746,19 +1761,43 @@ def _project_same_row_recovery_state(
         "historical_parent_mutated": False,
         "historical_completed_lines_mutated": False,
         "historical_missing_evidence_backfilled": False,
+        "historical_source_scheduler_eligible": False,
+        "historical_source_resume_eligible": False,
         "authoritative_pass_synthesized": False,
+        "current_generation_disposition": "discarded",
+        "fresh_generation_required": True,
+        "fresh_generation_start": "scenario_1",
+        "diagnostic_fixed_eligible": False,
+        "advisory_only": True,
+        "authorizes_write": False,
+        "authorizes_pass": False,
+        "satisfies_gate": False,
+        "mutates_runtime_state": False,
+        "required_sequence": ["fresh_generation_from_scenario_1"],
+        "forbidden_actions": list(
+            _BYPASS_RECOVERY_FALLBACK_FORBIDDEN_ACTIONS
+        ),
+        "prompt": (
+            "The bounded repair completed independent QA, ordered merge, and "
+            "current-HEAD full reconcile. Do not return to the historical "
+            "source or fill any historical missing line. Start a fresh "
+            "validation generation from scenario 1."
+        ),
     }
-    cursor["cursor_hash"] = stable_sha256(cursor)
-    next_action["same_row_recovery_cursor"] = cursor
+    barrier["barrier_hash"] = stable_sha256(barrier)
     return {
-        "current_contract_execution_id": parent_id,
-        "current_contract_id": _record_contract_id(parent),
+        "current_contract_execution_id": child_id,
+        "current_contract_id": _record_contract_id(child),
         "parent_to_resume_contract_execution_id": "",
         "active_child_contract_execution_id": "",
-        "readiness_state": "same_row_recovery_target_ready",
+        "readiness_state": "contract_complete",
         "generation": int(child.get("execution_state_revision") or 0),
-        "next_legal_action": next_action,
-        "same_row_recovery_cursor": cursor,
+        "next_legal_action": {},
+        "scheduler_eligible": False,
+        "schedulable": False,
+        "resume_eligible": False,
+        "resumable": False,
+        "completed_repair_fresh_generation_barrier": barrier,
     }
 
 
@@ -5453,6 +5492,28 @@ def _current_projection_from_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str
         projection["same_row_recovery_cursor"] = dict(
             same_row_recovery_cursor
         )
+    completed_repair_barrier = (
+        active_chain.get("completed_repair_fresh_generation_barrier")
+        if isinstance(
+            active_chain.get("completed_repair_fresh_generation_barrier"),
+            Mapping,
+        )
+        else {}
+    )
+    if completed_repair_barrier:
+        projection.update(
+            {
+                "completed_repair_fresh_generation_barrier": dict(
+                    completed_repair_barrier
+                ),
+                "scheduler_eligible": False,
+                "schedulable": False,
+                "resume_eligible": False,
+                "resumable": False,
+                "next_legal_action": {},
+            }
+        )
+        projection.pop("parent_to_resume_contract_execution_id", None)
     if projection["readiness_state"] == "completed_with_exception":
         stored_terminal = (
             active_chain.get("terminal_disposition")

@@ -55179,6 +55179,88 @@ def test_onboard_guide_capsule_single_flight_revision_invalidation_and_eviction(
     assert "wstok-copy-safe" in serialized
 
 
+def test_completed_repair_barrier_is_non_schedulable_and_compact_visible():
+    barrier = {
+        "schema_version": (
+            "contract_runtime.completed_repair_fresh_generation_barrier.v1"
+        ),
+        "status": "repair_complete_fresh_generation_required",
+        "repair_child_contract_execution_id": "cex-repair-complete",
+        "historical_source_contract_execution_id": "cex-historical-source",
+        "historical_parent_mutated": False,
+        "historical_missing_evidence_backfilled": False,
+        "historical_source_scheduler_eligible": False,
+        "historical_source_resume_eligible": False,
+        "fresh_generation_required": True,
+        "fresh_generation_start": "scenario_1",
+        "advisory_only": True,
+        "authorizes_write": False,
+        "satisfies_gate": False,
+        "forbidden_actions": [
+            "resume_original_contract",
+            "return_to_parent",
+            "parent_to_resume",
+            "retry_source_backlog_close_after_repair",
+        ],
+    }
+    current = {
+        "schema_version": "backlog_contract_chain_current.v1",
+        "project_id": PID,
+        "backlog_id": "AC-COMPLETED-REPAIR-FRESH-GENERATION",
+        "contract_chain_id": "cchain-completed-repair",
+        "root_contract_execution_id": "onboard-service-completed-repair",
+        "current_contract_execution_id": "cex-repair-complete",
+        "current_contract_id": "mf_parallel.v2",
+        "active_child_contract_execution_id": "",
+        "readiness_state": "contract_complete",
+        "next_legal_action": {},
+        "projection_source": "backlog_contract_chain_current",
+        "projection_hash": "sha256:completed-repair-current",
+        "scheduler_eligible": False,
+        "resume_eligible": False,
+        "completed_repair_fresh_generation_barrier": barrier,
+    }
+
+    resume = server._onboard_runtime_resume_from_current_projection(current)
+
+    assert resume["status"] == "repair_complete_fresh_generation_required"
+    assert resume["next_legal_action"] == {}
+    assert resume["scheduler_eligible"] is False
+    assert resume["resume_eligible"] is False
+    assert "parent_to_resume_contract_execution_id" not in resume
+    assert resume["current_contract_execution_id"] == "cex-repair-complete"
+    assert resume["completed_repair_fresh_generation_barrier"] == barrier
+    authority = server._contract_chain_current_runtime_authority_projection(
+        current
+    )
+    assert authority["required_next_action_id"] == ""
+    assert authority["completed_repair_fresh_generation_barrier"] == barrier
+
+    compact = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=current["backlog_id"],
+        role="observer",
+        work_type="operator_supervised_direct_main",
+        record={"contract_execution_id": "cex-repair-complete"},
+        next_action={},
+        current_projection=current,
+        runtime_resume=resume,
+        target_files=[],
+        projection_degraded=False,
+    )
+
+    assert compact["ok"] is True
+    assert compact["next_legal_action"] == {}
+    assert compact["completed_repair_fresh_generation_barrier"][
+        "fresh_generation_required"
+    ] is True
+    assert "fresh_generation_barrier" in compact["guide_capsule"][
+        "available_sections"
+    ]
+    assert compact["authorizes_write"] is False
+    assert compact["satisfies_gate"] is False
+
+
 def test_runtime_context_canonical_write_immediately_invalidates_prior_capsule(
     conn,
     monkeypatch,

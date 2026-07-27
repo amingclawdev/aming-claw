@@ -63999,6 +63999,13 @@ def _contract_chain_current_runtime_authority_projection(
     )
     if isinstance(recovery_fallback, Mapping) and recovery_fallback:
         authority["bypass_recovery_fallback"] = dict(recovery_fallback)
+    completed_repair_barrier = current_projection.get(
+        "completed_repair_fresh_generation_barrier"
+    )
+    if isinstance(completed_repair_barrier, Mapping) and completed_repair_barrier:
+        authority["completed_repair_fresh_generation_barrier"] = dict(
+            completed_repair_barrier
+        )
     if next_action:
         authority["next_legal_action"] = next_action
     source_refs = current_projection.get("source_refs")
@@ -64147,6 +64154,24 @@ def _onboard_runtime_resume_from_current_projection(
     )
     if isinstance(recovery_fallback, Mapping) and recovery_fallback:
         resume["bypass_recovery_fallback"] = dict(recovery_fallback)
+    completed_repair_barrier = current_projection.get(
+        "completed_repair_fresh_generation_barrier"
+    )
+    if isinstance(completed_repair_barrier, Mapping) and completed_repair_barrier:
+        resume.update(
+            {
+                "status": "repair_complete_fresh_generation_required",
+                "scheduler_eligible": False,
+                "schedulable": False,
+                "resume_eligible": False,
+                "resumable": False,
+                "next_legal_action": {},
+                "completed_repair_fresh_generation_barrier": dict(
+                    completed_repair_barrier
+                ),
+            }
+        )
+        resume.pop("parent_to_resume_contract_execution_id", None)
     if current_projection.get("terminal") is True:
         resume.update(
             {
@@ -81344,6 +81369,23 @@ def _onboard_route_guide_compact_service_response(
         "satisfies_gate": False,
         "synthesizes_pass": False,
     }
+    completed_repair_barrier = (
+        runtime_resume.get("completed_repair_fresh_generation_barrier")
+        if isinstance(
+            runtime_resume.get("completed_repair_fresh_generation_barrier"),
+            Mapping,
+        )
+        else current_projection.get(
+            "completed_repair_fresh_generation_barrier"
+        )
+        if isinstance(
+            current_projection.get(
+                "completed_repair_fresh_generation_barrier"
+            ),
+            Mapping,
+        )
+        else {}
+    )
     action_summary = {
         "action": action,
         "allowed_actions": allowed_actions,
@@ -81398,6 +81440,13 @@ def _onboard_route_guide_compact_service_response(
                 section_name="blockers",
             ),
         }
+        if completed_repair_barrier:
+            sections["fresh_generation_barrier"] = (
+                _onboard_guide_capsule_bounded_section(
+                    completed_repair_barrier,
+                    section_name="fresh_generation_barrier",
+                )
+            )
         return sections
 
     entry, cache_metrics = _onboard_guide_capsule_get_or_create(
@@ -81472,6 +81521,13 @@ def _onboard_route_guide_compact_service_response(
         "satisfies_gate": False,
         "synthesizes_pass": False,
     }
+    if completed_repair_barrier:
+        response["completed_repair_fresh_generation_barrier"] = (
+            _onboard_guide_capsule_bounded_section(
+                completed_repair_barrier,
+                section_name="fresh_generation_barrier",
+            )
+        )
     measured = _onboard_guide_capsule_serialized_bytes(response)
     response["serialized_bytes"] = measured
     if (
@@ -82150,6 +82206,32 @@ def _onboard_route_guide_service_response(
             route_guide["bypass_recovery_fallback"] = dict(
                 bypass_recovery_fallback
             )
+    completed_repair_barrier = (
+        runtime_resume.get("completed_repair_fresh_generation_barrier")
+        if isinstance(
+            runtime_resume.get("completed_repair_fresh_generation_barrier"),
+            Mapping,
+        )
+        else current_projection.get(
+            "completed_repair_fresh_generation_barrier"
+        )
+        if isinstance(
+            current_projection.get(
+                "completed_repair_fresh_generation_barrier"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    if completed_repair_barrier:
+        guidance["completed_repair_fresh_generation_barrier"] = dict(
+            completed_repair_barrier
+        )
+        route_guide = guidance.get("onboard_route_guide")
+        if isinstance(route_guide, dict):
+            route_guide["completed_repair_fresh_generation_barrier"] = dict(
+                completed_repair_barrier
+            )
     _onboard_route_guide_apply_runtime_route_token_scope(
         conn,
         record=record,
@@ -82197,6 +82279,10 @@ def _onboard_route_guide_service_response(
     if bypass_recovery_fallback:
         response["bypass_recovery_fallback"] = dict(
             bypass_recovery_fallback
+        )
+    if completed_repair_barrier:
+        response["completed_repair_fresh_generation_barrier"] = dict(
+            completed_repair_barrier
         )
     if response_view == "full":
         response["response_view"] = "full"

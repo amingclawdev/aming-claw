@@ -3301,7 +3301,7 @@ def test_completed_recovery_supersedes_only_named_stale_predecessor(tmp_path):
     "recovery_lineage_shape",
     ("frozen_target", "legacy_live_source"),
 )
-def test_completed_recovery_projects_exact_parent_observer_merge_cursor(
+def test_completed_recovery_terminalizes_history_and_requires_fresh_generation(
     recovery_lineage_shape,
 ):
     project_id = "aming-claw"
@@ -3562,24 +3562,38 @@ def test_completed_recovery_projects_exact_parent_observer_merge_cursor(
         row_times={parent_id: "2026-07-27T00:00:00Z", child_id: "2026-07-27T00:02:00Z"},
     )
 
-    assert projected["current_contract_execution_id"] == parent_id
+    assert projected["current_contract_execution_id"] == child_id
     assert projected["active_child_contract_execution_id"] == ""
-    assert projected["readiness_state"] == "same_row_recovery_target_ready"
-    assert projected["next_legal_action"]["line_id"] == "observer_merge"
-    assert projected["next_legal_action"]["source"] == (
-        "backlog_contract_chain_current.same_row_recovery_cursor"
-    )
-    assert projected["next_legal_action"]["repair_child_contract_execution_id"] == (
-        child_id
-    )
-    assert projected["same_row_recovery_cursor"]["reconcile_source_ref"] == (
-        "timeline:18300"
-    )
-    assert projected["same_row_recovery_cursor"]["historical_parent_mutated"] is False
-    assert projected["same_row_recovery_cursor"][
-        "authoritative_pass_synthesized"
-    ] is False
-    assert projected["same_row_recovery_cursor"]["target_source"] == (
+    assert projected["readiness_state"] == "contract_complete"
+    assert projected["next_legal_action"] == {}
+    assert projected["scheduler_eligible"] is False
+    assert projected["resume_eligible"] is False
+    barrier = projected["completed_repair_fresh_generation_barrier"]
+    assert barrier["status"] == "repair_complete_fresh_generation_required"
+    assert barrier["repair_child_contract_execution_id"] == child_id
+    assert barrier["historical_source_contract_execution_id"] == parent_id
+    assert barrier["reconcile_source_ref"] == "timeline:18300"
+    assert barrier["historical_parent_mutated"] is False
+    assert barrier["historical_missing_evidence_backfilled"] is False
+    assert barrier["historical_source_scheduler_eligible"] is False
+    assert barrier["historical_source_resume_eligible"] is False
+    assert barrier["authoritative_pass_synthesized"] is False
+    assert barrier["fresh_generation_required"] is True
+    assert barrier["fresh_generation_start"] == "scenario_1"
+    assert barrier["diagnostic_fixed_eligible"] is False
+    assert barrier["advisory_only"] is True
+    assert barrier["authorizes_write"] is False
+    assert barrier["satisfies_gate"] is False
+    assert barrier["required_sequence"] == [
+        "fresh_generation_from_scenario_1"
+    ]
+    assert {
+        "resume_original_contract",
+        "return_to_parent",
+        "parent_to_resume",
+        "retry_source_backlog_close_after_repair",
+    }.issubset(set(barrier["forbidden_actions"]))
+    assert barrier["target_source"] == (
         "frozen_recovery_target"
         if recovery_lineage_shape == "frozen_target"
         else "legacy_persisted_parent_guide"
@@ -3616,8 +3630,8 @@ def test_completed_recovery_projects_exact_parent_observer_merge_cursor(
                 child_id: "2026-07-27T00:02:00Z",
             },
         )
-        assert invalid_projection.get("readiness_state") != (
-            "same_row_recovery_target_ready"
+        assert not invalid_projection.get(
+            "completed_repair_fresh_generation_barrier"
         )
 
     drifted_parent = json.loads(json.dumps(parent))
@@ -3632,8 +3646,8 @@ def test_completed_recovery_projects_exact_parent_observer_merge_cursor(
             child_id: "2026-07-27T00:02:00Z",
         },
     )
-    assert drift_projection.get("readiness_state") != (
-        "same_row_recovery_target_ready"
+    assert not drift_projection.get(
+        "completed_repair_fresh_generation_barrier"
     )
 
     unrelated_incomplete = {
@@ -3657,8 +3671,8 @@ def test_completed_recovery_projects_exact_parent_observer_merge_cursor(
             "cex-unrelated-incomplete": "2026-07-27T00:03:00Z",
         },
     )
-    assert unrelated_projection.get("readiness_state") != (
-        "same_row_recovery_target_ready"
+    assert not unrelated_projection.get(
+        "completed_repair_fresh_generation_barrier"
     )
 
     conn = sqlite3.connect(":memory:")
@@ -3694,13 +3708,72 @@ def test_completed_recovery_projects_exact_parent_observer_merge_cursor(
         project_id=project_id,
         backlog_id=backlog_id,
     )
-    assert rebuilt["current_contract_execution_id"] == parent_id
-    assert rebuilt["readiness_state"] == "same_row_recovery_target_ready"
-    assert rebuilt["next_legal_action"]["line_id"] == "observer_merge"
+    assert rebuilt["current_contract_execution_id"] == child_id
+    assert rebuilt["readiness_state"] == "contract_complete"
+    assert rebuilt["next_legal_action"] == {}
+    assert rebuilt["scheduler_eligible"] is False
+    assert rebuilt["resume_eligible"] is False
     assert rebuilt_again["projection_hash"] == rebuilt["projection_hash"]
-    assert rebuilt_again["same_row_recovery_cursor"]["cursor_hash"] == (
-        rebuilt["same_row_recovery_cursor"]["cursor_hash"]
+    assert rebuilt_again["completed_repair_fresh_generation_barrier"][
+        "barrier_hash"
+    ] == rebuilt["completed_repair_fresh_generation_barrier"][
+        "barrier_hash"
+    ]
+
+    active_chain_json = conn.execute(
+        """
+        SELECT active_chain_json
+          FROM backlog_contract_chain_current
+         WHERE project_id = ? AND backlog_id = ?
+        """,
+        (project_id, backlog_id),
+    ).fetchone()[0]
+    legacy_active_chain = json.loads(active_chain_json)
+    legacy_active_chain.pop(
+        "completed_repair_fresh_generation_barrier",
+        None,
     )
+    conn.execute(
+        """
+        UPDATE backlog_contract_chain_current
+           SET current_contract_execution_id = ?,
+               current_contract_id = ?,
+               readiness_state = ?,
+               active_chain_json = ?,
+               next_legal_action_json = ?
+         WHERE project_id = ? AND backlog_id = ?
+        """,
+        (
+            parent_id,
+            "mf_parallel.v2",
+            "same_row_recovery_target_ready",
+            json.dumps(legacy_active_chain, sort_keys=True, separators=(",", ":")),
+            json.dumps(
+                {
+                    "line_id": "observer_merge",
+                    "source": (
+                        "backlog_contract_chain_current.same_row_recovery_cursor"
+                    ),
+                    "same_row_recovery_cursor": {"legacy": True},
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            project_id,
+            backlog_id,
+        ),
+    )
+    migrated = read_backlog_contract_chain_current(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    assert migrated["current_contract_execution_id"] == child_id
+    assert migrated["readiness_state"] == "contract_complete"
+    assert migrated["next_legal_action"] == {}
+    assert migrated["completed_repair_fresh_generation_barrier"][
+        "fresh_generation_required"
+    ] is True
 
 
 def test_incomplete_recovery_remains_current_and_fail_closed(tmp_path):
