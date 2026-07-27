@@ -92140,11 +92140,152 @@ def _contract_runtime_bind_close_reconcile_authority(
         str(projected.get("contract_id") or "")
     ):
         return projected
-    authority = _contract_runtime_current_full_reconcile_authority(
+    merge = _contract_runtime_trusted_merge_projection(
         conn,
         project_id=project_id,
         record=projected,
     )
+    reconcile_lines = [
+        line
+        for line in projected.get("completed_lines") or []
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "observer_reconcile"
+        and str(line.get("evidence_kind") or "").strip() == "reconcile"
+    ]
+    reconcile: dict[str, Any] = {}
+    if len(reconcile_lines) == 1:
+        source_line = reconcile_lines[0]
+        source_payload = (
+            source_line.get("payload")
+            if isinstance(source_line.get("payload"), Mapping)
+            else {}
+        )
+        source_authority = (
+            source_payload.get("reconcile_authority")
+            if isinstance(
+                source_payload.get("reconcile_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        artifact_refs = (
+            source_line.get("artifact_refs")
+            if isinstance(source_line.get("artifact_refs"), Mapping)
+            else {}
+        )
+        source_event_id = _contract_runtime_close_authority_positive_int(
+            source_authority.get("reconcile_event_id")
+        )
+        source_event_ref = str(
+            source_authority.get("reconcile_source_ref") or ""
+        ).strip()
+        source_artifact_ref = str(
+            artifact_refs.get("reconcile_event_ref") or ""
+        ).strip()
+        expected_source_ref = (
+            f"timeline:{source_event_id}" if source_event_id > 0 else ""
+        )
+        identity_matches = all(
+            str(source_authority.get(field) or "").strip()
+            == str(expected or "").strip()
+            for field, expected in (
+                ("project_id", project_id),
+                ("backlog_id", projected.get("backlog_id")),
+                (
+                    "contract_execution_id",
+                    projected.get("contract_execution_id"),
+                ),
+                ("runtime_context_id", merge.get("runtime_context_id")),
+                ("task_id", merge.get("task_id")),
+                ("parent_task_id", merge.get("parent_task_id")),
+                ("merge_queue_id", merge.get("merge_queue_id")),
+            )
+        )
+        merge_matches = bool(
+            str(source_authority.get("merged_commit_sha") or "")
+            .strip()
+            .lower()
+            == str(merge.get("merged_commit_sha") or "").strip().lower()
+            and _contract_runtime_close_authority_positive_int(
+                source_authority.get("merge_event_id")
+            )
+            == _contract_runtime_close_authority_positive_int(
+                merge.get("merge_event_id")
+            )
+            and str(source_authority.get("merge_source_ref") or "").strip()
+            == str(merge.get("merge_source_ref") or "").strip()
+            and str(
+                source_authority.get("merge_event_created_at") or ""
+            ).strip()
+            == str(merge.get("merge_event_created_at") or "").strip()
+        )
+        if (
+            str(source_authority.get("schema_version") or "")
+            == "contract_runtime.observer_reconcile_record_authority.v1"
+            and str(source_authority.get("source") or "")
+            == "contract_runtime.server_reconcile_record_projection"
+            and source_authority.get("server_derived") is True
+            and source_authority.get("record_verified") is True
+            and source_authority.get("reconcile_event_recorded") is True
+            and source_authority.get("merge_projection_verified") is True
+            and source_authority.get("dispatch_lineage_verified") is True
+            and _contract_runtime_close_authority_hash_matches(
+                source_authority
+            )
+            and _contract_runtime_line_status_passes(source_line)
+            and str(source_line.get("actor_role") or "").strip()
+            == "observer"
+            and identity_matches
+            and merge_matches
+            and source_event_ref == expected_source_ref
+            and (
+                not source_artifact_ref
+                or source_artifact_ref == expected_source_ref
+            )
+            and str(
+                source_authority.get("reconcile_event_created_at") or ""
+            ).strip()
+        ):
+            reconcile = {
+                "reconcile_event_id": source_event_id,
+                "reconcile_event_created_at": str(
+                    source_authority.get("reconcile_event_created_at") or ""
+                ).strip(),
+                "reconcile_source_ref": source_event_ref,
+                "reconcile_task_id": str(
+                    source_authority.get("reconcile_task_id") or ""
+                ).strip(),
+                "reconcile_runtime_context_id": str(
+                    source_authority.get("reconcile_runtime_context_id") or ""
+                ).strip(),
+                "allow_taskless_reconcile": bool(
+                    merge.get("allow_taskless_reconcile")
+                ),
+            }
+    if reconcile_lines:
+        authority = (
+            _contract_runtime_current_full_reconcile_authority_from_merge(
+                conn,
+                project_id=project_id,
+                record=projected,
+                merge=merge,
+                reconcile=reconcile,
+            )
+            if reconcile
+            else {}
+        )
+    else:
+        # Formal no-PASS reconcile exceptions intentionally have no persisted
+        # business reconcile line.  Preserve their existing server-only close
+        # projection; they are validated independently by the exact bypass
+        # authority path.
+        authority = _contract_runtime_current_full_reconcile_authority_from_merge(
+            conn,
+            project_id=project_id,
+            record=projected,
+            merge=merge,
+            reconcile=merge,
+        )
     completed = [
         deepcopy(dict(line))
         for line in projected.get("completed_lines") or []
