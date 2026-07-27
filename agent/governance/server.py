@@ -90909,6 +90909,51 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
         authority_execution_id = str(
             authority.get("contract_execution_id") or ""
         ).strip()
+        retained_contract_envelope = bool(
+            authority_execution_id
+            and _contract_runtime_mapping_value(
+                close_ready_line,
+                "task_id",
+            )
+            == authority_execution_id
+            and _contract_runtime_mapping_value(
+                close_ready_payload,
+                "runtime_context_id",
+            )
+            == str(authority.get("runtime_context_id") or "").strip()
+            and _contract_runtime_mapping_value(
+                close_ready_payload,
+                "worker_task_id",
+            )
+            == str(authority.get("task_id") or "").strip()
+            and _contract_runtime_mapping_value(
+                close_ready_line,
+                "runtime_context_id",
+            )
+            in {
+                "",
+                str(authority.get("runtime_context_id") or "").strip(),
+            }
+            and _contract_runtime_mapping_value(
+                close_ready_line,
+                "worker_task_id",
+            )
+            in {"", str(authority.get("task_id") or "").strip()}
+            and _contract_runtime_mapping_value(
+                close_ready_payload,
+                "task_id",
+            )
+            in {
+                "",
+                str(authority.get("task_id") or "").strip(),
+                authority_execution_id,
+            }
+            and _contract_runtime_mapping_value(
+                close_ready_payload,
+                "parent_task_id",
+            )
+            in {"", str(authority.get("parent_task_id") or "").strip()}
+        )
         source_execution_matches = bool(
             reconcile_source_execution_id
             and close_ready_source_execution_id
@@ -90933,9 +90978,34 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
             "target_project_root",
         ):
             expected = str(authority.get(field) or "").strip()
-            actual_values = {
-                value
-                for value in (
+            if retained_contract_envelope and field == "task_id":
+                candidates = (
+                    _contract_runtime_mapping_value(
+                        close_ready_payload,
+                        "worker_task_id",
+                    ),
+                    _contract_runtime_mapping_value(
+                        close_ready_line,
+                        "worker_task_id",
+                    ),
+                    _contract_runtime_mapping_value(
+                        close_ready_artifact_refs,
+                        "worker_task_id",
+                    ),
+                )
+            elif retained_contract_envelope and field == "parent_task_id":
+                candidates = (
+                    _contract_runtime_mapping_value(
+                        close_ready_payload,
+                        "parent_task_id",
+                    ),
+                    _contract_runtime_mapping_value(
+                        close_ready_artifact_refs,
+                        "parent_task_id",
+                    ),
+                )
+            else:
+                candidates = (
                     _contract_runtime_mapping_value(
                         close_ready_line,
                         field,
@@ -90949,8 +91019,7 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
                         field,
                     ),
                 )
-                if value
-            }
+            actual_values = {value for value in candidates if value}
             for actual in sorted(actual_values):
                 if actual != expected:
                     identity_mismatches.append(
@@ -94241,7 +94310,7 @@ def _contract_runtime_mf_parallel_close_ready_precheck(
     prospective["runtime_guide"] = runtime_guide
     execution_id = str(record.get("contract_execution_id") or "").strip()
     close_commit = _contract_runtime_close_authority_explicit_commit(write)
-    return _contract_runtime_mf_parallel_close_authority_gate(
+    gate = _contract_runtime_mf_parallel_close_authority_gate(
         [prospective],
         chain_projection={
             "projection_source": "backlog_contract_chain_current",
@@ -94252,6 +94321,37 @@ def _contract_runtime_mf_parallel_close_ready_precheck(
         conn=conn,
         project_id=project_id,
     )
+    prospective_identity = _contract_runtime_server_line_identity(prospective)
+    if prospective_identity["identity_status"] != "ambiguous":
+        return gate
+
+    identity_mismatches = [
+        {
+            "field": "server_line_identity",
+            "expected": "one coherent runtime_context_id/task_id tuple",
+            "actual": prospective_identity["identity_status"],
+            "source_line_id": "observer_close_ready",
+        }
+    ]
+    missing_id = (
+        "contract_runtime.observer_close_ready_retained_contract_envelope"
+    )
+    missing = list(gate.get("missing_requirement_ids") or [])
+    if missing_id not in missing:
+        missing.append(missing_id)
+    return {
+        **gate,
+        "accepted": False,
+        "passed": False,
+        "status": "failed",
+        "primary_decision_source": False,
+        "missing_requirement_ids": missing,
+        "identity_status": prospective_identity["identity_status"],
+        "identity_source_line_id": prospective_identity[
+            "identity_source_line_id"
+        ],
+        "identity_mismatches": identity_mismatches,
+    }
 
 
 def _contract_runtime_direct_fix_close_authority_gate(

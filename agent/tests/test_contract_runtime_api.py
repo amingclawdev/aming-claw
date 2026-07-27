@@ -657,6 +657,331 @@ def test_server_line_identity_rejects_direct_worker_shaped_close_ready():
     }
 
 
+def test_close_ready_submit_precheck_rejects_direct_worker_before_revision(
+    monkeypatch,
+):
+    project_id = "contract-runtime-api-test"
+    contract_execution_id = "cex-close-ready-precheck"
+    runtime_context_id = "mfrctx-close-ready-precheck"
+    worker_task_id = "worker-close-ready-precheck"
+    root_task_id = "onboard-root-close-ready-precheck"
+    initial_revision = 7
+    record = {
+        "project_id": project_id,
+        "backlog_id": "AC-CLOSE-READY-PRECHECK",
+        "contract_id": "mf_parallel.v2",
+        "contract_execution_id": contract_execution_id,
+        "definition_hash": "sha256:definition",
+        "instruction_bundle_hash": "sha256:instructions",
+        "execution_state_revision": initial_revision,
+        "execution_state": {
+            "execution_state_revision": initial_revision,
+            "execution_state_hash": "sha256:state",
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": "sha256:guide",
+            "next_legal_action": {
+                "stage_id": "observer_integration",
+                "line_id": "observer_close_ready",
+                "evidence_kind": "close_ready",
+            },
+        },
+        "completed_lines": [
+            {
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge",
+                "runtime_context_id": runtime_context_id,
+                "task_id": worker_task_id,
+                "parent_task_id": contract_execution_id,
+                "payload": {
+                    "durable_merge_authority": {
+                        "schema_version": (
+                            "contract_runtime."
+                            "observer_merge_durable_authority.v1"
+                        ),
+                        "server_derived": True,
+                        "db_verified": True,
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": worker_task_id,
+                        "parent_task_id": contract_execution_id,
+                    }
+                },
+            }
+        ],
+    }
+
+    class FakeConnection:
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+    class FakeDBContext:
+        def __init__(self, _project_id):
+            self.conn = FakeConnection()
+
+        def __enter__(self):
+            return self.conn
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeStore:
+        def get(self, _execution_id):
+            return record
+
+    class FakeRuntime:
+        def __init__(self):
+            self.store = FakeStore()
+            self.submit_calls = 0
+
+        def current_guide(self, _execution_id, *, actor_role):
+            assert actor_role == "observer"
+            return record["runtime_guide"]
+
+        def precheck_line_write(self, _execution_id, write, **_kwargs):
+            return {
+                "ok": True,
+                "record": copy.deepcopy(record),
+                "write": dict(write),
+                "decision": {"ok": True, "errors": []},
+                "completed_lines_count": len(record["completed_lines"]),
+                "execution_state_revision": record[
+                    "execution_state_revision"
+                ],
+                "runtime_guide_hash": record["runtime_guide"][
+                    "runtime_guide_hash"
+                ],
+            }
+
+        def submit_line_write(self, _execution_id, write, **_kwargs):
+            self.submit_calls += 1
+            record["completed_lines"].append(copy.deepcopy(write))
+            record["execution_state_revision"] += 1
+            record["execution_state"]["execution_state_revision"] = record[
+                "execution_state_revision"
+            ]
+            return {
+                "ok": True,
+                "record": copy.deepcopy(record),
+                "decision": {"ok": True, "errors": []},
+            }
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(server, "DBContext", FakeDBContext)
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: runtime)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_effective_actor_role",
+        lambda *_args, **_kwargs: "observer",
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda _conn, **kwargs: (
+            copy.deepcopy(kwargs["record"]),
+            {"projected_completed_lines": []},
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_bind_server_line_authority",
+        lambda *_args, **kwargs: dict(kwargs["write"]),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_bind_mf_parallel_dispatch_authority",
+        lambda _conn, **kwargs: (dict(kwargs["write"]), []),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_bind_close_reconcile_authority",
+        lambda _conn, **kwargs: dict(kwargs["record"]),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_close_authority_gate",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "passed": True,
+            "status": "passed",
+            "primary_decision_source": True,
+            "missing_requirement_ids": [],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_observer_reconcile_idempotency",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_direct_fix_materialize_dispatch_runtime_context",
+        lambda _conn, **kwargs: dict(kwargs["write"]),
+    )
+    monkeypatch.setattr(
+        server,
+        "_record_contract_runtime_mf_parallel_dispatch_event",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_publish_accepted_contract_runtime_line_write",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_response",
+        lambda current, **_kwargs: {
+            "execution_state_revision": current[
+                "execution_state_revision"
+            ],
+        },
+    )
+
+    def request(body):
+        return server.RequestContext(
+            None,
+            "POST",
+            {
+                "project_id": project_id,
+                "contract_execution_id": contract_execution_id,
+            },
+            {},
+            body,
+            "req-close-ready-precheck",
+            "",
+            "",
+        )
+
+    retained_envelope = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_close_ready",
+        "evidence_kind": "close_ready",
+        "runtime_context_id": runtime_context_id,
+        "task_id": contract_execution_id,
+        "parent_task_id": root_task_id,
+        "payload": {
+            "runtime_context_id": runtime_context_id,
+            "worker_task_id": worker_task_id,
+            "parent_task_id": contract_execution_id,
+        },
+    }
+    poison_shapes = {
+        "direct_worker_task": {
+            **retained_envelope,
+            "task_id": worker_task_id,
+        },
+        "missing_contract_task": {
+            key: value
+            for key, value in retained_envelope.items()
+            if key != "task_id"
+        },
+        "top_level_runtime_conflict": {
+            **retained_envelope,
+            "runtime_context_id": "mfrctx-conflict",
+        },
+        "payload_runtime_conflict": {
+            **retained_envelope,
+            "payload": {
+                **retained_envelope["payload"],
+                "runtime_context_id": "mfrctx-conflict",
+            },
+        },
+        "payload_worker_conflict": {
+            **retained_envelope,
+            "payload": {
+                **retained_envelope["payload"],
+                "worker_task_id": "worker-conflict",
+            },
+        },
+        "payload_task_conflict": {
+            **retained_envelope,
+            "payload": {
+                **retained_envelope["payload"],
+                "task_id": "worker-conflict",
+            },
+        },
+        "payload_parent_conflict": {
+            **retained_envelope,
+            "payload": {
+                **retained_envelope["payload"],
+                "parent_task_id": "cex-conflict",
+            },
+        },
+    }
+    expected_identity_mismatch = [
+        {
+            "field": "server_line_identity",
+            "expected": "one coherent runtime_context_id/task_id tuple",
+            "actual": "ambiguous",
+            "source_line_id": "observer_close_ready",
+        }
+    ]
+    for shape, body in poison_shapes.items():
+        rejected_precheck = (
+            server.handle_project_contract_runtime_line_write_precheck(
+                request(body)
+            )
+        )
+        assert rejected_precheck["ok"] is False, shape
+        assert rejected_precheck["execution_state_revision"] == (
+            initial_revision
+        ), shape
+        assert record["execution_state_revision"] == initial_revision, shape
+        assert rejected_precheck["close_authority_precheck"][
+            "identity_mismatches"
+        ] == expected_identity_mismatch, shape
+
+        rejected_submit = server.handle_project_contract_runtime_line_write(
+            request(body)
+        )
+        assert rejected_submit["ok"] is False, shape
+        assert record["execution_state_revision"] == initial_revision, shape
+        assert runtime.submit_calls == 0, shape
+
+    top_level_worker_conflict = {
+        **server._contract_runtime_line_write_body(
+            record,
+            actor_role="observer",
+            body=retained_envelope,
+        ),
+        "worker_task_id": "worker-conflict",
+    }
+    direct_gate = server._contract_runtime_mf_parallel_close_ready_precheck(
+        record,
+        top_level_worker_conflict,
+        conn=FakeConnection(),
+        project_id=project_id,
+    )
+    assert direct_gate["passed"] is False
+    assert direct_gate["identity_mismatches"] == expected_identity_mismatch
+
+    accepted_precheck = (
+        server.handle_project_contract_runtime_line_write_precheck(
+            request(retained_envelope)
+        )
+    )
+    assert accepted_precheck["ok"] is True
+    assert record["execution_state_revision"] == initial_revision
+
+    accepted_submit = server.handle_project_contract_runtime_line_write(
+        request(retained_envelope)
+    )
+    assert accepted_submit["ok"] is True
+    assert record["execution_state_revision"] == initial_revision + 1
+    assert runtime.submit_calls == 1
+    assert server._contract_runtime_server_line_identity(record) == {
+        "runtime_context_id": runtime_context_id,
+        "task_id": worker_task_id,
+        "parent_task_id": contract_execution_id,
+        "identity_status": "resolved",
+        "identity_source_line_id": "observer_merge",
+    }
+
+
 def test_server_line_identity_rejects_ambiguous_single_line_scope(
     monkeypatch,
 ):
