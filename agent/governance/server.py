@@ -74830,18 +74830,18 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
                 provenance_rows[0]["target_commit_sha"] or ""
             ).strip().lower()
             if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", exact_target):
-                # Resolve the immutable provenance selected by the trusted
-                # reconcile timeline event.  current_full_reconcile_state
-                # still returns the live active snapshot independently, so
-                # the checks below bind both the historical reconcile target
-                # and today's canonical HEAD without borrowing the latest
-                # active marker for an older ContractRuntime.
+                # Resolve the immutable source-row reconcile provenance
+                # independently from the live canonical HEAD.  The source
+                # event keeps its own QA/merge/order/scope authority at this
+                # target while current_full_reconcile_state separately proves
+                # the active current-full snapshot at canonical HEAD.
                 reconcile_target_commit = exact_target
     state = graph_snapshot_store.current_full_reconcile_state(
         conn,
         project_id,
         merged_commit,
-        current_canonical_commit_sha=reconcile_target_commit,
+        current_canonical_commit_sha=canonical_head_commit,
+        reconcile_target_commit_sha=reconcile_target_commit,
         qa_event_id=int(merge.get("qa_event_id") or 0),
         qa_event_created_at=str(merge.get("qa_event_created_at") or ""),
         qa_source_ref=str(merge.get("qa_source_ref") or ""),
@@ -74932,6 +74932,11 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
     )
     active_snapshot_verified = bool(
         live_verified
+        and state.get("active_snapshot_verified") is True
+        and state.get(
+            "active_snapshot_current_full_reconcile_verified"
+        )
+        is True
         and state.get("reconcile_snapshot_verified") is True
     )
     graph_reconciled = bool(db_verified and live_verified and active_snapshot_verified)
@@ -75020,6 +75025,7 @@ def _contract_runtime_current_full_reconcile_activation_verified(
         "live_verified",
         "canonical_head_verified",
         "active_snapshot_verified",
+        "active_snapshot_current_full_reconcile_verified",
         "active_snapshot_matches_canonical_head",
         "graph_reconciled",
         "provenance_verified",
@@ -90540,28 +90546,59 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
     active_snapshot_commit = str(
         authority.get("active_snapshot_commit") or ""
     ).strip().lower()
+    active_current_full_target = str(
+        authority.get(
+            "active_snapshot_current_full_provenance_target_commit"
+        )
+        or ""
+    ).strip().lower()
+    active_current_full_provenance_id = str(
+        authority.get("active_snapshot_current_full_provenance_id") or ""
+    ).strip()
+    active_current_full_provenance_hash = str(
+        authority.get("active_snapshot_current_full_provenance_hash") or ""
+    ).strip()
     target_project_root = str(
         authority.get("target_project_root") or ""
     ).strip()
-    durable_merge_matches_reconciled = (
-        _contract_runtime_authority_commit_matches(
-            durable_merge_commit,
-            reconciled_commit,
-        )
-    )
     reconciled_matches_closing_head = (
         _contract_runtime_authority_commit_matches(
             reconciled_commit,
             close_commit,
         )
     )
-    historical_descendant_snapshot_mode = bool(
-        durable_merge_matches_reconciled
+    reconcile_line_matches_reconciled = (
+        _contract_runtime_authority_commit_matches(
+            reconcile_commit,
+            reconciled_commit,
+        )
+    )
+    if (
+        _contract_runtime_authority_commit_matches(
+            merge_commit,
+            close_commit,
+        )
+        and _contract_runtime_authority_commit_matches(
+            reconcile_commit,
+            close_commit,
+        )
+    ):
+        return {}
+    source_reconcile_with_live_current_full_mode = bool(
+        reconcile_line_matches_reconciled
+        and _contract_runtime_authority_commit_matches(
+            reconcile_provenance_target_commit,
+            reconciled_commit,
+        )
+        and _contract_runtime_authority_commit_matches(
+            reconcile_snapshot_commit,
+            reconciled_commit,
+        )
         and not reconciled_matches_closing_head
     )
     current_head_full_reconcile_mode = bool(
         reconciled_matches_closing_head
-        and not durable_merge_matches_reconciled
+        and reconcile_line_matches_reconciled
         and _contract_runtime_authority_commit_matches(
             reconcile_provenance_target_commit,
             reconciled_commit,
@@ -90580,25 +90617,30 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
         and reconcile_snapshot_commit
         and canonical_head
         and active_snapshot_commit
+        and active_current_full_provenance_id
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}|[0-9a-f]{64}",
+            active_current_full_provenance_hash,
+        )
         and target_project_root
         and _contract_runtime_authority_commit_matches(
             merge_commit,
             durable_merge_commit,
         )
         and _contract_runtime_authority_commit_matches(
-            reconcile_commit,
-            durable_merge_commit,
+            active_snapshot_commit,
+            close_commit,
+        )
+        and _contract_runtime_authority_commit_matches(
+            active_current_full_target,
+            close_commit,
         )
         and (
-            historical_descendant_snapshot_mode
+            source_reconcile_with_live_current_full_mode
             or current_head_full_reconcile_mode
         )
         and _contract_runtime_authority_commit_matches(
             canonical_head,
-            close_commit,
-        )
-        and _contract_runtime_authority_commit_matches(
-            active_snapshot_commit,
             close_commit,
         )
     ):
@@ -90609,6 +90651,8 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
         "live_verified",
         "canonical_head_verified",
         "active_snapshot_verified",
+        "active_snapshot_current_full_reconcile_verified",
+        "active_snapshot_current_full_runtime_scope_verified",
         "active_snapshot_matches_canonical_head",
         "graph_reconciled",
         "provenance_verified",
@@ -90656,7 +90700,7 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
         "bridge_mode": (
             "current_head_full_reconcile_after_durable_merge"
             if current_head_full_reconcile_mode
-            else "historical_reconcile_with_active_descendant_snapshot"
+            else "source_reconcile_with_live_current_full_snapshot"
         ),
         "merge_line_commit": merge_commit,
         "reconcile_line_commit": reconcile_commit,
@@ -90683,7 +90727,10 @@ def _contract_runtime_mf_parallel_descendant_close_head_bridge(
         "reconciled_commit_is_ancestor_of_closing_head": True,
         "active_full_snapshot_matches_closing_head": True,
         "current_head_full_reconcile_verified": (
-            current_head_full_reconcile_mode
+            authority.get(
+                "active_snapshot_current_full_reconcile_verified"
+            )
+            is True
         ),
         "raw_merge_reconcile_commits_preserved": True,
     }
