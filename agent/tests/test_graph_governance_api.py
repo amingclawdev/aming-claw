@@ -1204,6 +1204,94 @@ def test_materialized_authority_revision_separates_inherited_and_authored_files(
     assert authority["worker_authored_files"] == ["worker.py"]
 
 
+def test_materialized_authority_revision_omitted_fence_preserves_identity() -> None:
+    existing = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id="scope-omitted-fence",
+        runtime_context_id="mfrctx-scope-omitted-fence",
+        branch_ref="refs/heads/codex/scope-omitted-fence",
+        status=STATE_WORKTREE_READY,
+        worktree_path="/repo/.worktrees/scope-omitted-fence",
+        base_commit="a" * 40,
+        head_commit="a" * 40,
+        target_head_commit="a" * 40,
+        merge_queue_id="mq-scope-omitted-fence",
+        fence_token="persisted-fence",
+    )
+    planned = replace(existing, fence_token="newly-generated-request-fence")
+    shared_body = {
+        "worktree_path": existing.worktree_path,
+        "base_commit": existing.base_commit,
+        "target_head_commit": existing.target_head_commit,
+        "merge_queue_id": existing.merge_queue_id,
+    }
+
+    assert server._parallel_branch_allocate_identity_mismatches(
+        existing,
+        planned,
+        shared_body,
+    ) == []
+
+    mismatches = server._parallel_branch_allocate_identity_mismatches(
+        existing,
+        planned,
+        {**shared_body, "fence_token": "explicit-conflicting-fence"},
+    )
+    assert mismatches == [
+        {
+            "field": "fence_token",
+            "requested": "explicit-conflicting-fence",
+            "persisted": "persisted-fence",
+        }
+    ]
+
+
+def test_materialized_authority_revision_rejects_explicit_identity_conflicts() -> None:
+    existing = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id="scope-explicit-conflicts",
+        runtime_context_id="mfrctx-scope-explicit-conflicts",
+        branch_ref="refs/heads/codex/scope-explicit-conflicts",
+        status=STATE_WORKTREE_READY,
+        worktree_path="/repo/.worktrees/scope-explicit-conflicts",
+        base_commit="a" * 40,
+        head_commit="b" * 40,
+        target_head_commit="c" * 40,
+        merge_queue_id="mq-scope-explicit-conflicts",
+        fence_token="persisted-fence",
+    )
+    planned = replace(
+        existing,
+        worktree_path="/repo/.worktrees/other",
+        base_commit="d" * 40,
+        target_head_commit="e" * 40,
+        merge_queue_id="mq-other",
+        fence_token="other-fence",
+    )
+
+    mismatches = server._parallel_branch_allocate_identity_mismatches(
+        existing,
+        planned,
+        {
+            "fence_token": "other-fence",
+            "worktree_path": planned.worktree_path,
+            "base_commit": planned.base_commit,
+            "head_commit": "f" * 40,
+            "target_head_commit": planned.target_head_commit,
+            "merge_queue_id": planned.merge_queue_id,
+        },
+    )
+
+    assert {item["field"] for item in mismatches} == {
+        "fence_token",
+        "worktree_path",
+        "base_commit",
+        "head_commit",
+        "target_head_commit",
+        "merge_queue_id",
+    }
+
+
 def test_materialized_scope_revision_blocks_silent_expansion_after_implementation(
     conn,
 ):
@@ -33227,6 +33315,18 @@ def test_runtime_context_qa_guide_scopes_verification_and_full_suite_caveat() ->
         "passing_status_required_for_close": True,
     }
     assert append_evidence["failed_audit_body"]["status"] == "failed"
+    scope_finding = append_evidence["failed_audit_body"]["payload"][
+        "scope_insufficiency_finding"
+    ]
+    assert scope_finding["finding_author_role"] == "qa"
+    assert scope_finding["qa_verdict"] == "NO-PASS"
+    assert scope_finding["request_grants_authority"] is False
+    scope_policy = append_evidence["scope_insufficiency_finding_policy"]
+    assert scope_policy["qa_remains_sole_verdict_author"] is True
+    assert scope_policy["observer_may_author_or_rewrite_qa_verdict"] is False
+    assert scope_policy["observer_dispositions"][
+        "browser_or_late_discovery_after_qa"
+    ] == "file_bounded_linked_backlog_row_preserving_source_lane_evidence"
     assert append_evidence["safe_retry"] == {
         "scope": "authenticated_qa_exact_authority",
         "same_authority_returns_existing_event": True,
@@ -39313,6 +39413,9 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
     ]
     copied_body = dict(receipt_skeleton["copy_safe_body"])
 
+    assert copied_body["project_id"] == PID
+    assert copied_body["payload"]["project_id"] == PID
+    assert copied_body["contract_context_read_receipt"]["project_id"] == PID
     assert copied_body["target_project_root"] == str(target_root)
     assert receipt_skeleton["placeholder_submission_forbidden"] is True
     assert (
@@ -39327,6 +39430,15 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
     ]
     for field, value in route_identity.items():
         assert copied_body[field] == value
+    scope_skeleton = guide["worker_guide"][
+        "scope_insufficiency_request_facade_payload_skeleton"
+    ]
+    assert scope_skeleton["mcp_tool"] == (
+        "runtime_context_scope_insufficiency_request"
+    )
+    assert scope_skeleton["copy_safe_body"]["project_id"] == PID
+    assert scope_skeleton["request_mutates_owned_files"] is False
+    assert scope_skeleton["request_grants_authority"] is False
 
     with pytest.raises(GovernanceError) as unchanged_template:
         server.handle_graph_governance_runtime_context_read_receipt(
@@ -39415,6 +39527,252 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
     assert persisted_payload["fence_token_hash"] == _fake_sha(
         "fence-copy-safe-receipt"
     )
+
+
+def test_scope_insufficiency_request_is_append_only_and_returns_disposition(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "scope-insufficiency-worker"
+    target_root.mkdir()
+    route_identity = {
+        "route_id": "route-scope-insufficiency",
+        "route_context_hash": "sha256:route-scope-insufficiency",
+        "prompt_contract_id": "rprompt-scope-insufficiency",
+        "prompt_contract_hash": "sha256:prompt-scope-insufficiency",
+        "route_token_ref": "rtok-scope-insufficiency",
+        "visible_injection_manifest_hash": "sha256:visible-scope-insufficiency",
+    }
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-scope-insufficiency",
+            root_task_id="parent-scope-insufficiency",
+            backlog_id="AC-SCOPE-INSUFFICIENCY",
+            stage_task_id="worker-scope-insufficiency",
+            worker_id="worker-scope-insufficiency",
+            worker_slot_id="slot-scope-insufficiency",
+            branch_ref="refs/heads/codex/worker-scope-insufficiency",
+            worktree_path=str(target_root),
+            base_commit="a" * 40,
+            target_head_commit="a" * 40,
+            merge_queue_id="mq-scope-insufficiency",
+            target_files=("owned.py",),
+            owned_files=("owned.py",),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-scope-insufficiency",
+            session_token_hash=mf_subagent_session_token_hash(
+                "scope-insufficiency-session"
+            ),
+            lease_id="lease-scope-insufficiency",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-scope-insufficiency",
+        payload={"target_files": ["owned.py"], "owned_files": ["owned.py"]},
+        route_identity=route_identity,
+    )
+    conn.commit()
+    original_owned_files = tuple(context.owned_files)
+
+    incomplete_identity_body = {
+        "project_id": PID,
+        "runtime_context_id": context.runtime_context_id,
+        "backlog_id": context.backlog_id,
+        "task_id": context.task_id,
+        "target_project_root": str(target_root),
+        "session_token": "scope-insufficiency-session",
+        "fence_token": "fence-scope-insufficiency",
+        "missing_files": ["missing.py"],
+        "requested_files": ["owned.py", "missing.py"],
+        "blocked_acceptance_ids": ["AC-1"],
+        "reason": "missing.py is required by AC-1",
+        "graph_refs": ["graph-query:gqt-scope-insufficiency"],
+    }
+    with pytest.raises(GovernanceError) as incomplete_identity:
+        server.handle_graph_governance_runtime_context_scope_insufficiency_request(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                method="POST",
+                body=incomplete_identity_body,
+            )
+        )
+    assert incomplete_identity.value.code == (
+        "scope_insufficiency_identity_mismatch"
+    )
+    assert incomplete_identity.value.details["identity_mismatches"] == [
+        {
+            "field": "parent_task_id",
+            "supplied": "",
+            "expected": context.root_task_id,
+        }
+    ]
+
+    response = (
+        server.handle_graph_governance_runtime_context_scope_insufficiency_request(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                method="POST",
+                body={
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                    "backlog_id": context.backlog_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "target_project_root": str(target_root),
+                    "session_token": "scope-insufficiency-session",
+                    "fence_token": "fence-scope-insufficiency",
+                    "missing_files": ["missing.py"],
+                    "requested_files": ["owned.py", "missing.py"],
+                    "blocked_acceptance_ids": ["AC-1"],
+                    "reason": "missing.py is required by AC-1",
+                    "graph_refs": ["graph-query:gqt-scope-insufficiency"],
+                },
+            )
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["status"] == "scope_insufficiency_requested"
+    assert response["scope_insufficiency_request"]["authority_mutated"] is False
+    assert response["scope_insufficiency_request"]["owned_files_mutated"] is False
+    disposition = response["observer_disposition"]
+    assert disposition["status"] == "same_runtime_revision_available"
+    assert disposition["action"] == "retry_explicit_runtime_authority_revision"
+    assert disposition["copy_safe_next_request"][
+        "persisted_fence_preserved_when_omitted"
+    ] is True
+    saved = get_branch_context(conn, PID, context.task_id)
+    assert saved is not None
+    assert tuple(saved.owned_files) == original_owned_files
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=context.task_id,
+        event_kind="record_blocker",
+    )
+    assert len(events) == 1
+    assert events[0]["event_type"] == (
+        "runtime_context.scope_insufficiency_requested"
+    )
+    assert events[0]["payload"]["qa_verdict_authored"] is False
+    assert events[0]["payload"]["outside_active_fence"] == ["missing.py"]
+
+
+def test_scope_insufficiency_after_implementation_requires_fresh_runtime(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "scope-insufficiency-post-implementation"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-scope-insufficiency-post-implementation",
+            root_task_id="parent-scope-insufficiency-post-implementation",
+            backlog_id="AC-SCOPE-INSUFFICIENCY-POST-IMPLEMENTATION",
+            worker_id="worker-scope-insufficiency-post-implementation",
+            worker_slot_id="slot-scope-insufficiency-post-implementation",
+            branch_ref=(
+                "refs/heads/codex/"
+                "worker-scope-insufficiency-post-implementation"
+            ),
+            worktree_path=str(target_root),
+            base_commit="b" * 40,
+            target_head_commit="b" * 40,
+            merge_queue_id="mq-scope-insufficiency-post-implementation",
+            target_files=("owned.py",),
+            owned_files=("owned.py",),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-scope-insufficiency-post-implementation",
+            session_token_hash=mf_subagent_session_token_hash(
+                "scope-insufficiency-post-implementation-session"
+            ),
+            lease_id="lease-scope-insufficiency-post-implementation",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        payload={"target_files": ["owned.py"], "owned_files": ["owned.py"]},
+        route_identity={
+            "route_id": "route-scope-post-implementation",
+            "route_context_hash": "sha256:route-scope-post-implementation",
+            "prompt_contract_id": "rprompt-scope-post-implementation",
+            "prompt_contract_hash": "sha256:prompt-scope-post-implementation",
+            "route_token_ref": "rtok-scope-post-implementation",
+            "visible_injection_manifest_hash": (
+                "sha256:visible-scope-post-implementation"
+            ),
+        },
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="accepted",
+        payload={"runtime_context_id": context.runtime_context_id},
+    )
+    conn.commit()
+
+    response = (
+        server.handle_graph_governance_runtime_context_scope_insufficiency_request(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                method="POST",
+                body={
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                    "backlog_id": context.backlog_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "target_project_root": str(target_root),
+                    "session_token": (
+                        "scope-insufficiency-post-implementation-session"
+                    ),
+                    "fence_token": (
+                        "fence-scope-insufficiency-post-implementation"
+                    ),
+                    "missing_files": ["late.py"],
+                    "requested_files": ["owned.py", "late.py"],
+                    "blocked_acceptance_ids": ["AC-2"],
+                    "reason": "late.py is required after implementation began",
+                    "graph_refs": ["graph-query:gqt-scope-post-implementation"],
+                },
+            )
+        )
+    )
+
+    disposition = response["observer_disposition"]
+    assert disposition["status"] == "fresh_or_rework_runtime_required"
+    assert disposition["action"] == "start_fresh_or_rework_runtime_context"
+    assert disposition["in_place_revision_allowed"] is False
 
 
 def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(

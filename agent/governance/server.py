@@ -11186,8 +11186,14 @@ def _parallel_branch_allocate_identity_mismatches(
         or body.get("worker_worktree_path")
         or body.get("assigned_worktree")
     )
+    explicit_fence = _text(body.get("fence_token"))
     requested = {
-        "fence_token": _text(body.get("fence_token") or getattr(planned, "fence_token", "")),
+        # A materialized same-runtime authority revision may omit the secret
+        # fence from the copy-safe request.  In that case the persisted fence
+        # remains authoritative; only an explicitly supplied conflict is a
+        # mismatch.  Other identity fields retain their existing comparison
+        # semantics.
+        "fence_token": explicit_fence,
         "worktree_path": _path_text(
             explicit_worktree or getattr(planned, "worktree_path", "")
         ),
@@ -16833,6 +16839,34 @@ def _runtime_context_qa_verification_guide(
         "payload": {
             **dict(base_append_body["payload"]),
             "verification_outcome": "candidate_failed_independent_verification",
+            "scope_insufficiency_finding": {
+                "schema_version": (
+                    "runtime_context.qa_scope_insufficiency_finding.v1"
+                ),
+                "optional": True,
+                "runtime_context_id": runtime_context_id,
+                "project_id": project_id,
+                "backlog_id": backlog_id or parent_task_id,
+                "task_id": task_id,
+                "candidate_commit_sha": "<full-candidate-commit>",
+                "missing_files": [
+                    "<candidate-relevant file outside the verified fence>"
+                ],
+                "requested_files": [
+                    "<complete bounded follow-up file fence>"
+                ],
+                "blocked_acceptance_ids": [
+                    "<blocked acceptance criterion id>"
+                ],
+                "reason": "<why QA cannot verify acceptance inside current scope>",
+                "graph_refs": [
+                    "graph-query:<db-verified QA graph trace id>"
+                ],
+                "finding_author_role": "qa",
+                "qa_verdict": "NO-PASS",
+                "request_grants_authority": False,
+                "request_mutates_owned_files": False,
+            },
         },
     }
     qa_graph_context_shape = _qa_graph_context_evidence_shape(
@@ -17120,6 +17154,35 @@ def _runtime_context_qa_verification_guide(
                 focused_pass_with_full_suite_caveat_body
             ),
             "failed_audit_body": failed_audit_body,
+            "scope_insufficiency_finding_policy": {
+                "schema_version": (
+                    "runtime_context.qa_scope_insufficiency_finding_policy.v1"
+                ),
+                "optional_path": (
+                    "failed_audit_body.payload.scope_insufficiency_finding"
+                ),
+                "required_author_role": "qa",
+                "qa_remains_sole_verdict_author": True,
+                "observer_may_author_or_rewrite_qa_verdict": False,
+                "observer_dispositions": {
+                    "candidate_rework_inside_acceptance": (
+                        "start_fresh_or_rework_runtime_context"
+                    ),
+                    "new_or_out_of_acceptance_product_finding": (
+                        "file_bounded_linked_backlog_row"
+                    ),
+                    "browser_or_late_discovery_after_qa": (
+                        "file_bounded_linked_backlog_row_preserving_source_lane_evidence"
+                    ),
+                },
+                "source_lane_evidence_must_be_preserved": True,
+                "forbidden_observer_actions": [
+                    "author_qa_verdict",
+                    "convert_qa_no_pass_to_pass",
+                    "erase_qa_verdict",
+                    "supersede_qa_verdict_with_observer_observation",
+                ],
+            },
             "status_policy": {
                 "close_satisfying": sorted(_QA_TIMELINE_CLOSE_STATUSES),
                 "persisted_audit_only": sorted(_QA_TIMELINE_AUDIT_STATUSES),
@@ -19092,6 +19155,10 @@ def _runtime_context_worker_guide_response(
             "implementation_evidence_facade_payload_skeleton",
             {},
         ),
+        "scope_insufficiency_request_facade_payload_skeleton": actionable_payloads.get(
+            "scope_insufficiency_request_facade_payload_skeleton",
+            {},
+        ),
         "finish_time_transcript_readiness": actionable_payloads.get(
             "finish_time_transcript_readiness",
             {},
@@ -19194,6 +19261,12 @@ def _runtime_context_worker_guide_response(
             "implementation_evidence_facade_payload_skeleton": actionable_payloads.get(
                 "implementation_evidence_facade_payload_skeleton",
                 {},
+            ),
+            "scope_insufficiency_request_facade_payload_skeleton": (
+                actionable_payloads.get(
+                    "scope_insufficiency_request_facade_payload_skeleton",
+                    {},
+                )
             ),
             "finish_time_transcript_readiness": actionable_payloads.get(
                 "finish_time_transcript_readiness",
@@ -20196,6 +20269,7 @@ def _runtime_context_worker_recovery_payloads(
         "schema_version": "contract_context_read_receipt.v1",
         "event_kind": "contract_context_read_receipt",
         "legacy_event_kind": "mf_subagent_read_receipt",
+        "project_id": project_id,
         "actor_role": "mf_sub",
         "actor_session_principal": "<server-verified worker session principal>",
         "contract_execution_id": (
@@ -20249,6 +20323,7 @@ def _runtime_context_worker_recovery_payloads(
             canonical_body_fields[key] = value
     read_receipt_payload = {
         "schema_version": "contract_context_read_receipt.v1",
+        "project_id": project_id,
         **canonical_body_fields,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
@@ -20273,6 +20348,7 @@ def _runtime_context_worker_recovery_payloads(
         **safe_route_identity,
     }
     read_receipt_body = {
+        "project_id": project_id,
         **canonical_body_fields,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
@@ -20484,6 +20560,30 @@ def _runtime_context_worker_recovery_payloads(
         "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
         "write_authorization_policy": dict(write_authorization_policy),
         "payload": implementation_evidence_payload,
+        **implementation_route_reference,
+    }
+    scope_insufficiency_path = (
+        f"/api/graph-governance/{project_id}/runtime-contexts/"
+        f"{runtime_context_id}/scope-insufficiency-requests"
+    )
+    scope_insufficiency_body = {
+        "project_id": project_id,
+        "runtime_context_id": runtime_context_id,
+        "backlog_id": normalized_backlog_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "session_token": session_token_placeholder,
+        "session_token_ref": session_token_ref_placeholder,
+        "fence_token": fence_token_placeholder,
+        "missing_files": ["<required file outside active owned_files>"],
+        "requested_files": ["<complete requested file fence>"],
+        "blocked_acceptance_ids": ["<blocked acceptance criterion id>"],
+        "reason": "<why the active file fence cannot satisfy acceptance>",
+        "graph_refs": ["graph-query:<worker-owned graph trace id>"],
         **implementation_route_reference,
     }
     implementation_evidence_field_pointers = {
@@ -20931,6 +21031,17 @@ def _runtime_context_worker_recovery_payloads(
                     "implementation_evidence_facade_payload_skeleton.copy_safe_body"
                 ),
             },
+            "runtime_context_scope_insufficiency_request": {
+                "method": "POST",
+                "path": scope_insufficiency_path,
+                "tool": "runtime_context_scope_insufficiency_request",
+                "mcp_tool": "runtime_context_scope_insufficiency_request",
+                "facade": "runtime_context.scope_insufficiency_request",
+                "body_source": (
+                    "scope_insufficiency_request_facade_payload_skeleton."
+                    "copy_safe_body"
+                ),
+            },
             "runtime_context_worker_commit": {
                 "method": "POST",
                 "path": worker_commit_path,
@@ -21157,6 +21268,50 @@ def _runtime_context_worker_recovery_payloads(
                     "current_worker_route_token_ref for the happy path."
                 ),
             },
+        },
+        "scope_insufficiency_request_facade_payload_skeleton": {
+            "schema_version": (
+                "runtime_context.scope_insufficiency_request_submission.v1"
+            ),
+            "method": "POST",
+            "path": scope_insufficiency_path,
+            "facade": "runtime_context.scope_insufficiency_request",
+            "mcp_tool": "runtime_context_scope_insufficiency_request",
+            "body_source": "copy_safe_body",
+            "required_fields": [
+                "project_id",
+                "runtime_context_id",
+                "backlog_id",
+                "task_id",
+                "parent_task_id",
+                "worker_role",
+                "session_token or session_token_ref",
+                "fence_token",
+                "target_project_root",
+                "missing_files",
+                "requested_files",
+                "blocked_acceptance_ids",
+                "reason",
+                "graph_refs",
+            ],
+            "copy_safe_body": dict(scope_insufficiency_body),
+            "request_is_append_only": True,
+            "request_mutates_owned_files": False,
+            "request_grants_authority": False,
+            "observer_disposition": {
+                "preimplementation": (
+                    "explicit_same_runtime_allocation_authority_revision"
+                ),
+                "postimplementation": "fresh_or_rework_runtime_context",
+                "new_or_out_of_acceptance": "file_bounded_linked_backlog_row",
+                "qa_verdict_authority": "authenticated_independent_qa_only",
+            },
+            "forbidden_shortcuts": [
+                "worker_self_widens_owned_files",
+                "observer_converts_scope_request_to_qa_verdict",
+                "in_place_scope_expansion_after_implementation",
+                "erase_or_supersede_authenticated_qa_verdict",
+            ],
         },
         "worker_commit_facade_payload_skeleton": {
             "method": "POST",
@@ -30057,6 +30212,411 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         return result
     finally:
         conn.close()
+
+
+def _runtime_context_scope_insufficiency_observer_disposition(
+    *,
+    project_id: str,
+    context: Any,
+    runtime_context_id: str,
+    requested_files: Sequence[str],
+    route_identity: Mapping[str, Any],
+    implementation_started: bool,
+) -> dict[str, Any]:
+    """Return the only observer-owned disposition for a scope request."""
+
+    active_owned_files = _runtime_context_public_file_values(
+        list(getattr(context, "owned_files", ()) or ())
+        or list(getattr(context, "target_files", ()) or ())
+    )
+    complete_requested_fence = _runtime_context_public_file_values(
+        [*active_owned_files, *requested_files]
+    )
+    common = {
+        "project_id": project_id,
+        "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+        "runtime_context_id": runtime_context_id,
+        "source_task_id": str(getattr(context, "task_id", "") or ""),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "target_project_root": _runtime_context_effective_target_project_root(
+            context
+        ),
+        "active_owned_files": active_owned_files,
+        "requested_owned_files": complete_requested_fence,
+        "authority_owner_role": "observer",
+        "qa_verdict_authority": "authenticated_independent_qa_only",
+        "scope_request_grants_authority": False,
+        "scope_request_mutates_owned_files": False,
+        "route_identity": {
+            field: str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            if str(route_identity.get(field) or "").strip()
+        },
+    }
+    if implementation_started:
+        return {
+            "schema_version": (
+                "runtime_context.scope_insufficiency_observer_disposition.v1"
+            ),
+            "status": "fresh_or_rework_runtime_required",
+            "action": "start_fresh_or_rework_runtime_context",
+            "in_place_revision_allowed": False,
+            "reason": "implementation_evidence_already_exists",
+            **common,
+            "copy_safe_next_request": {
+                "mcp_tool": "parallel_branch_allocate",
+                "body": {
+                    "project_id": project_id,
+                    "backlog_id": common["backlog_id"],
+                    "task_id": "<new bounded rework task_id>",
+                    "parent_task_id": common["parent_task_id"],
+                    "target_project_root": common["target_project_root"],
+                    "owned_files": complete_requested_fence,
+                    "target_files": complete_requested_fence,
+                    "base_commit": str(
+                        getattr(context, "target_head_commit", "") or ""
+                    ),
+                    "target_head_commit": str(
+                        getattr(context, "target_head_commit", "") or ""
+                    ),
+                    "merge_queue_id": str(
+                        getattr(context, "merge_queue_id", "") or ""
+                    ),
+                    **common["route_identity"],
+                },
+                "template_requires_observer_selected_new_task_id": True,
+            },
+        }
+    return {
+        "schema_version": (
+            "runtime_context.scope_insufficiency_observer_disposition.v1"
+        ),
+        "status": "same_runtime_revision_available",
+        "action": "retry_explicit_runtime_authority_revision",
+        "in_place_revision_allowed": True,
+        "requires_clean_worktree": True,
+        "requires_no_implementation_evidence": True,
+        **common,
+        "copy_safe_next_request": {
+            "mcp_tool": "parallel_branch_allocate",
+            "body": {
+                "project_id": project_id,
+                "backlog_id": common["backlog_id"],
+                "task_id": common["source_task_id"],
+                "parent_task_id": common["parent_task_id"],
+                "target_project_root": common["target_project_root"],
+                "worktree_path": str(
+                    getattr(context, "worktree_path", "") or ""
+                ),
+                "owned_files": complete_requested_fence,
+                "target_files": complete_requested_fence,
+                "base_commit": str(getattr(context, "base_commit", "") or ""),
+                "target_head_commit": str(
+                    getattr(context, "target_head_commit", "") or ""
+                ),
+                "merge_queue_id": str(
+                    getattr(context, "merge_queue_id", "") or ""
+                ),
+                **common["route_identity"],
+            },
+            "persisted_fence_preserved_when_omitted": True,
+            "explicit_conflicting_fence_rejected": True,
+        },
+    }
+
+
+@route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/scope-insufficiency-requests")
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/scope-insufficiency-requests")
+def handle_graph_governance_runtime_context_scope_insufficiency_request(
+    ctx: RequestContext,
+):
+    """Append a worker-owned scope blocker without widening runtime authority."""
+
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    conn = get_connection(project_id)
+    try:
+        context, runtime_context_id, _session = _runtime_context_mf_sub_write_context(
+            ctx,
+            conn,
+            action=(
+                "graph-governance.runtime-context."
+                "scope-insufficiency-request"
+            ),
+            allow_validated=True,
+        )
+        expected_identity = {
+            "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+            "task_id": str(getattr(context, "task_id", "") or ""),
+            "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+            "target_project_root": (
+                _runtime_context_effective_target_project_root(context)
+            ),
+        }
+        supplied_project_id = str(body.get("project_id") or "").strip()
+        identity_mismatches = []
+        if supplied_project_id and supplied_project_id != project_id:
+            identity_mismatches.append(
+                {
+                    "field": "project_id",
+                    "supplied": supplied_project_id,
+                    "expected": project_id,
+                }
+            )
+        for field, expected_value in expected_identity.items():
+            supplied_value = str(body.get(field) or "").strip()
+            if not supplied_value or supplied_value != expected_value:
+                identity_mismatches.append(
+                    {
+                        "field": field,
+                        "supplied": supplied_value,
+                        "expected": expected_value,
+                    }
+                )
+        if identity_mismatches:
+            raise GovernanceError(
+                "scope_insufficiency_identity_mismatch",
+                (
+                    "scope-insufficiency request must carry the exact bounded "
+                    "runtime identity"
+                ),
+                422,
+                {"identity_mismatches": identity_mismatches},
+            )
+
+        missing_files = _runtime_context_public_file_values(
+            _runtime_context_service_query_values(body, "missing_files")
+        )
+        requested_files = _runtime_context_public_file_values(
+            _runtime_context_service_query_values(body, "requested_files")
+            or missing_files
+        )
+        blocked_acceptance_ids = _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(
+                body,
+                "blocked_acceptance_ids",
+                "blocked_acceptance_criteria_ids",
+            )
+        )
+        reason = str(body.get("reason") or "").strip()
+        graph_refs = _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(
+                body,
+                "graph_refs",
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+            )
+        )
+        missing_required = [
+            key
+            for key, value in (
+                ("missing_files", missing_files),
+                ("requested_files", requested_files),
+                ("blocked_acceptance_ids", blocked_acceptance_ids),
+                ("reason", reason),
+                ("graph_refs", graph_refs),
+            )
+            if not value
+        ]
+        if missing_required:
+            raise GovernanceError(
+                "scope_insufficiency_request_incomplete",
+                "scope-insufficiency request requires bounded files, acceptance ids, reason, and graph refs",
+                422,
+                {"missing_fields": missing_required},
+            )
+
+        active_owned_files = _runtime_context_public_file_values(
+            list(getattr(context, "owned_files", ()) or ())
+            or list(getattr(context, "target_files", ()) or ())
+        )
+        missing_not_requested = sorted(set(missing_files) - set(requested_files))
+        missing_inside_active_fence = sorted(
+            set(missing_files).intersection(active_owned_files)
+        )
+        active_fence_omissions = sorted(
+            set(active_owned_files) - set(requested_files)
+        )
+        if (
+            missing_not_requested
+            or missing_inside_active_fence
+            or active_fence_omissions
+        ):
+            raise GovernanceError(
+                "scope_insufficiency_file_fence_invalid",
+                (
+                    "requested_files must be the complete bounded follow-up "
+                    "fence and missing_files must identify its out-of-fence delta"
+                ),
+                422,
+                {
+                    "active_owned_files": active_owned_files,
+                    "missing_files": missing_files,
+                    "requested_files": requested_files,
+                    "missing_not_requested": missing_not_requested,
+                    "missing_inside_active_fence": missing_inside_active_fence,
+                    "active_fence_omissions": active_fence_omissions,
+                },
+            )
+        outside_active_fence = sorted(
+            set(requested_files) - set(active_owned_files)
+        )
+        if not outside_active_fence:
+            raise GovernanceError(
+                "scope_insufficiency_not_outside_active_fence",
+                "requested files are already inside the active runtime authority",
+                422,
+                {
+                    "active_owned_files": active_owned_files,
+                    "requested_files": requested_files,
+                },
+            )
+
+        route_identity = _runtime_context_latest_route_identity(conn, context)
+        timeline_events = _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id=str(getattr(context, "task_id", "") or ""),
+            backlog_id=str(getattr(context, "backlog_id", "") or ""),
+        )
+        implementation_events = [
+            event
+            for event in timeline_events
+            if _timeline_first_deep_text(event, "runtime_context_id")
+            in {"", runtime_context_id}
+            and str(
+                event.get("event_kind") or event.get("event_type") or ""
+            ).strip().lower()
+            in {
+                "implementation",
+                "mf_subagent.implementation",
+                "worker_implementation",
+                "mf_subagent.worker_commit",
+                "worker_commit",
+            }
+        ]
+        disposition = _runtime_context_scope_insufficiency_observer_disposition(
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            requested_files=requested_files,
+            route_identity=route_identity,
+            implementation_started=bool(implementation_events),
+        )
+
+        from .db import sqlite_write_lock
+        from .parallel_branch_runtime import (
+            runtime_context_secret_hash,
+            runtime_context_session_token_ref,
+        )
+        from . import task_timeline
+
+        fence_token_hash = runtime_context_secret_hash(
+            _runtime_context_request_value(ctx, "fence_token")
+            or getattr(context, "fence_token", "")
+        )
+        session_token_ref = (
+            _runtime_context_request_value(ctx, "session_token_ref")
+            or _runtime_context_request_value(ctx, "worker_session_token_ref")
+            or runtime_context_session_token_ref(context)
+        )
+        event_payload = {
+            "schema_version": (
+                "runtime_context.scope_insufficiency_request.v1"
+            ),
+            "project_id": project_id,
+            "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+            "task_id": str(getattr(context, "task_id", "") or ""),
+            "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+            "runtime_context_id": runtime_context_id,
+            "worker_role": "mf_sub",
+            "worker_id": str(getattr(context, "worker_id", "") or ""),
+            "worker_slot_id": str(
+                getattr(context, "worker_slot_id", "")
+                or getattr(context, "worker_id", "")
+                or ""
+            ),
+            "target_project_root": (
+                _runtime_context_effective_target_project_root(context)
+            ),
+            "active_owned_files": active_owned_files,
+            "missing_files": missing_files,
+            "requested_files": requested_files,
+            "outside_active_fence": outside_active_fence,
+            "blocked_acceptance_ids": blocked_acceptance_ids,
+            "reason": reason,
+            "graph_refs": graph_refs,
+            "fence_token_hash": fence_token_hash,
+            "fence_token_redacted": bool(fence_token_hash),
+            "session_token_ref": session_token_ref,
+            "raw_fence_token_persisted": False,
+            "raw_session_token_persisted": False,
+            "authority_mutated": False,
+            "owned_files_mutated": False,
+            "qa_verdict_authored": False,
+            "observer_disposition": disposition,
+            "route_identity": {
+                field: str(route_identity.get(field) or "").strip()
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                if str(route_identity.get(field) or "").strip()
+            },
+        }
+        with sqlite_write_lock():
+            event = task_timeline.record_event(
+                conn,
+                project_id=project_id,
+                backlog_id=event_payload["backlog_id"],
+                task_id=event_payload["task_id"],
+                event_type="runtime_context.scope_insufficiency_requested",
+                event_kind="record_blocker",
+                phase="scope_insufficiency_request",
+                actor="mf_sub",
+                status="blocked",
+                payload=event_payload,
+                verification={
+                    "authenticated_runtime_context_worker": True,
+                    "append_only": True,
+                    "authority_mutated": False,
+                    "qa_verdict_authored": False,
+                },
+                artifact_refs={"graph_refs": graph_refs},
+                trace_id=next(
+                    (
+                        ref.split(":", 1)[-1]
+                        for ref in graph_refs
+                        if ref.startswith(("graph-query:", "graph_trace:"))
+                    ),
+                    "",
+                ),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    response = _runtime_context_write_response(
+        action="scope_insufficiency_request",
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        legacy_endpoint=(
+            "/api/graph-governance/{project_id}/runtime-contexts/"
+            "{runtime_context_id}/scope-insufficiency-requests"
+        ),
+        result={"ok": True, "status": "scope_insufficiency_requested"},
+        event=event,
+    )
+    response["scope_insufficiency_request"] = {
+        "event_ref": f"timeline:{event.get('id', '')}",
+        "missing_files": missing_files,
+        "requested_files": requested_files,
+        "blocked_acceptance_ids": blocked_acceptance_ids,
+        "graph_refs": graph_refs,
+        "authority_mutated": False,
+        "owned_files_mutated": False,
+        "qa_verdict_authored": False,
+    }
+    response["observer_disposition"] = disposition
+    return response
 
 
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/read-receipts")

@@ -279,6 +279,31 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                         "payload": {
                             "tests": "<exact pytest node ids and outcomes>",
                             "summary": "<clear PASS or FAIL summary>",
+                            "scope_insufficiency_finding": {
+                                "optional": True,
+                                "schema_version": (
+                                    "runtime_context."
+                                    "qa_scope_insufficiency_finding.v1"
+                                ),
+                                "missing_files": [
+                                    "<candidate-relevant file outside verified fence>"
+                                ],
+                                "requested_files": [
+                                    "<complete bounded follow-up file fence>"
+                                ],
+                                "blocked_acceptance_ids": [
+                                    "<blocked acceptance criterion id>"
+                                ],
+                                "reason": (
+                                    "<why QA cannot verify acceptance in scope>"
+                                ),
+                                "graph_refs": [
+                                    "graph-query:<QA-owned trace id>"
+                                ],
+                                "finding_author_role": "qa",
+                                "qa_verdict": "NO-PASS",
+                                "request_grants_authority": False,
+                            },
                         },
                     },
                 },
@@ -302,6 +327,22 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                 },
             ],
             "redundant_graph_query_required": False,
+            "scope_insufficiency_boundary": {
+                "schema_version": (
+                    "mf_parallel.scope_insufficiency_sideband.v1"
+                ),
+                "linear_contract_line": False,
+                "qa_is_sole_verdict_author": True,
+                "observer_may_author_qa_verdict": False,
+                "observer_dispositions": [
+                    "start_fresh_or_rework_runtime_context",
+                    "file_bounded_linked_backlog_row",
+                ],
+                "browser_or_late_discovery": (
+                    "file_bounded_linked_backlog_row_preserving_source_lane_evidence"
+                ),
+                "request_grants_authority": False,
+            },
         },
     },
     "raw_qa_session_token_public": False,

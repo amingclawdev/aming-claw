@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.governance import contract_state_runtime
 from agent.governance.contracts import ContractDefinitionRegistry, ContractRuntime
 from agent.governance.contracts.hash import file_sha256, stable_sha256
 from agent.governance.contracts.runtime import (
@@ -184,6 +185,44 @@ def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
     assert qa_checkpoint["packet"]["graph_basis_policy"][
         "exact_candidate_query_root_clean_required"
     ] is True
+
+
+def test_mf_parallel_rev7_adds_scope_sideband_without_linear_line():
+    governance_root = Path(__file__).resolve().parents[1] / "governance"
+    template = json.loads(
+        (governance_root / "contract_templates" / "mf_parallel.v2.json").read_text()
+    )
+    definition = ContractDefinitionRegistry(
+        governance_root / "contract_definitions"
+    ).get("mf_parallel.v2", version="v2", revision="rev7")
+
+    assert template["runtime_contract_hints"][
+        "contract_definition_revision"
+    ] == "rev7"
+    policy = definition["system_layer"]["scope_insufficiency_sideband_policy"]
+    assert policy["linear_contract_line"] is False
+    assert policy["worker_facade"] == (
+        "runtime_context_scope_insufficiency_request"
+    )
+    assert policy["request_grants_authority"] is False
+    assert policy["request_mutates_owned_files"] is False
+    assert policy["qa_verdict_policy"]["sole_author_role"] == "qa"
+    line_ids = {
+        line["line_id"]
+        for stage in definition["rule_layer"]["stages"]
+        for line in stage["lines"]
+    }
+    assert "scope_insufficiency_request" not in line_ids
+
+    machine_contract = (
+        contract_state_runtime.cli_agent_qa_onboard_guidance_contract()
+    )
+    boundary = machine_contract["line_contracts"][
+        "qa_independent_verification"
+    ]["scope_insufficiency_boundary"]
+    assert boundary["linear_contract_line"] is False
+    assert boundary["qa_is_sole_verdict_author"] is True
+    assert boundary["observer_may_author_qa_verdict"] is False
 
 
 def test_projected_record_cannot_override_canonical_worker_commit_lineage(

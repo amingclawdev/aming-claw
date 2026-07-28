@@ -198,3 +198,30 @@ Contact Coordinator to expand scope or reassign the node.
 | verify-update | Block and wait (max 120s) — do NOT mark status manually |
 | mem/write | Cache locally, push when service recovers |
 | mem/query | Return empty, do not block work |
+
+---
+
+## Runtime-context scope insufficiency
+
+An `mf_sub` worker must not edit outside the active persisted `owned_files`
+fence. When an acceptance criterion requires additional files, stop before the
+first out-of-fence edit and submit
+`runtime_context_scope_insufficiency_request` using the worker guide's
+`scope_insufficiency_request_facade_payload_skeleton.copy_safe_body`.
+
+The request must name `missing_files`, the complete `requested_files` fence,
+`blocked_acceptance_ids`, a bounded `reason`, and supporting `graph_refs`.
+It is an append-only `record_blocker` event: it does not mutate `owned_files`
+and does not grant authority.
+
+- Before implementation, only the observer may perform one explicit
+  same-runtime allocation authority revision with a clean worktree and complete
+  owned/base/target identity. If the secret fence is omitted, the persisted
+  fence remains authoritative; an explicitly conflicting fence still fails.
+- After implementation evidence exists, in-place expansion is forbidden.
+  The observer must allocate a fresh/rework runtime.
+- A new or out-of-acceptance product discovery gets a bounded linked backlog
+  row. Do not silently absorb it into the active row.
+
+Boundary reference:
+`AC-CONTRACT-RUNTIME-SCOPE-INSUFFICIENCY-HANDOFF-VERDICT-BOUNDARY-R1-20260728`.

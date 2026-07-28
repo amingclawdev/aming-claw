@@ -184,3 +184,24 @@ Body: {"project_id": "<pid>", "status": "idle"}
 |-----------|----------|
 | verify-update | Block and wait (max 120s) — do NOT mark status manually |
 | mem/query | Return empty, do not block work |
+
+## QA scope-insufficiency findings
+
+Authenticated independent QA is the sole author of candidate PASS/NO-PASS.
+When verification cannot satisfy an acceptance criterion inside the candidate's
+bounded file fence, keep the verdict explicit (normally NO-PASS) and add the
+optional structured
+`failed_audit_body.payload.scope_insufficiency_finding` from the live guide.
+Record the candidate/runtime identity, missing and requested files, blocked
+acceptance ids, reason, and QA-owned graph refs.
+
+The finding is not an authority grant. The observer may only:
+
+- route a fresh/rework runtime for a finding inside the source acceptance;
+- file a bounded linked backlog row for a new/out-of-acceptance finding; or
+- after Browser or other late discovery, file a linked row that preserves the
+  source lane's QA and graph evidence.
+
+The observer must not author, convert, erase, or supersede the QA verdict.
+Reference:
+`AC-CONTRACT-RUNTIME-SCOPE-INSUFFICIENCY-HANDOFF-VERDICT-BOUNDARY-R1-20260728`.

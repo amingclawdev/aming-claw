@@ -582,6 +582,13 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
             "owned_changed_files": {"type": "array", "items": {"type": "string"}},
             "worker_changed_files": {"type": "array", "items": {"type": "string"}},
             "owned_files": {"type": "array", "items": {"type": "string"}},
+            "missing_files": {"type": "array", "items": {"type": "string"}},
+            "requested_files": {"type": "array", "items": {"type": "string"}},
+            "blocked_acceptance_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "graph_refs": {"type": "array", "items": {"type": "string"}},
             "graph_trace_ids": {"type": "array", "items": {"type": "string"}},
             "graph_query_trace_ids": {"type": "array", "items": {"type": "string"}},
             "read_receipt_event_id": {"type": "string"},
@@ -2346,6 +2353,31 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "runtime_context_scope_insufficiency_request",
+        "description": (
+            "Worker-authored append-only scope-insufficiency blocker. "
+            "Records missing/requested files and blocked acceptance criteria "
+            "without widening owned_files or granting authority."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": _runtime_context_write_schema_properties(),
+            "required": [
+                "project_id",
+                "runtime_context_id",
+                "backlog_id",
+                "task_id",
+                "parent_task_id",
+                "target_project_root",
+                "missing_files",
+                "requested_files",
+                "blocked_acceptance_ids",
+                "reason",
+                "graph_refs",
+            ],
+        },
+    },
+    {
         "name": "runtime_context_worker_commit",
         "description": "Worker-authored canonical Runtime Context commit facade. Records the exact clean immutable HEAD in source-backed ContractRuntime after implementation evidence and before finish attestation.",
         "inputSchema": {
@@ -3259,6 +3291,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
     if name in {
         "runtime_context_read_receipt",
         "runtime_context_implementation_evidence",
+        "runtime_context_scope_insufficiency_request",
         "runtime_context_worker_commit",
         "runtime_context_finish_time_worker_attestation",
         "runtime_context_finish_gate",
@@ -3271,6 +3304,9 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         suffix_by_name = {
             "runtime_context_read_receipt": "read-receipts",
             "runtime_context_implementation_evidence": "implementation-evidence",
+            "runtime_context_scope_insufficiency_request": (
+                "scope-insufficiency-requests"
+            ),
             "runtime_context_worker_commit": "worker-commit",
             "runtime_context_finish_time_worker_attestation": (
                 "finish-time-worker-attestation"

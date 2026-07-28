@@ -1707,6 +1707,61 @@ def test_worker_auth_env_is_added_only_at_runtime_mcp_http_boundary(monkeypatch)
     assert fence_token not in json.dumps(result)
 
 
+def test_scope_insufficiency_mcp_routes_to_append_only_facade(monkeypatch):
+    calls = []
+
+    def fake_http(method: str, path: str, body: dict | None = None):
+        calls.append((method, path, body))
+        return {"ok": True, "status": "scope_insufficiency_requested"}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "scope-session-secret")
+    monkeypatch.setenv("AMING_WORKER_FENCE_TOKEN", "scope-fence-secret")
+    arguments = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-scope-request",
+        "backlog_id": "AC-SCOPE-REQUEST",
+        "task_id": "scope-request-worker",
+        "parent_task_id": "cex-scope-request",
+        "target_project_root": "/repo",
+        "missing_files": ["missing.py"],
+        "requested_files": ["owned.py", "missing.py"],
+        "blocked_acceptance_ids": ["AC-1"],
+        "reason": "missing.py is required",
+        "graph_refs": ["graph-query:gqt-scope-request"],
+    }
+
+    result = governance_mcp_server._dispatch_tool(
+        "runtime_context_scope_insufficiency_request",
+        arguments,
+    )
+
+    assert result == {
+        "ok": True,
+        "status": "scope_insufficiency_requested",
+    }
+    assert calls == [
+        (
+            "POST",
+            (
+                "/api/graph-governance/aming-claw/runtime-contexts/"
+                "mfrctx-scope-request/scope-insufficiency-requests"
+            ),
+            {
+                key: value
+                for key, value in {
+                    **arguments,
+                    "session_token": "scope-session-secret",
+                    "fence_token": "scope-fence-secret",
+                }.items()
+                if key != "project_id"
+            },
+        )
+    ]
+    assert "session_token" not in arguments
+    assert "fence_token" not in arguments
+
+
 def test_worker_auth_env_reaches_standalone_worker_guide_without_mutating_args(
     monkeypatch,
 ):
