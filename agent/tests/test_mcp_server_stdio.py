@@ -1029,6 +1029,84 @@ def test_mcp_stdio_release_operator_head_queue_schema_is_listed():
     ]
 
 
+def test_both_mcp_adapters_route_release_queue_read_and_historical_remove(
+    monkeypatch,
+):
+    governance_schema = next(
+        tool["inputSchema"]
+        for tool in governance_mcp_server.TOOLS
+        if tool["name"] == "release_operator_head_queue"
+    )
+    runtime_schema = next(
+        tool["inputSchema"]
+        for tool in runtime_mcp_tools
+        if tool["name"] == "release_operator_head_queue"
+    )
+    for field in (
+        "action",
+        "backlog_id",
+        "backlog_ids",
+        "position",
+        "pinned",
+        "reason",
+        "historical_non_schedulable",
+        "historical_execution_resume_allowed",
+        "evidence_refs",
+    ):
+        assert governance_schema["properties"][field] == (
+            runtime_schema["properties"][field]
+        )
+
+    calls: list[tuple[str, str, dict | None]] = []
+
+    def fake_http(method, path, body=None, **_kwargs):
+        calls.append((method, path, body))
+        return {"ok": True}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    assert governance_mcp_server._dispatch_tool(
+        "release_operator_head_queue",
+        {"project_id": "aming-claw"},
+    ) == {"ok": True}
+    assert calls[-1] == (
+        "GET",
+        "/api/projects/aming-claw/release-operator-head-queue",
+        None,
+    )
+
+    remove = {
+        "project_id": "aming-claw",
+        "action": "remove",
+        "backlog_id": "AC-HISTORICAL",
+        "reason": "terminal audit-only source",
+        "historical_non_schedulable": True,
+        "historical_execution_resume_allowed": False,
+        "evidence_refs": [
+            "backlog:AC-HISTORICAL",
+            "contract-runtime:cex-historical",
+        ],
+    }
+    assert governance_mcp_server._dispatch_tool(
+        "release_operator_head_queue",
+        remove,
+    ) == {"ok": True}
+    assert calls[-1] == (
+        "POST",
+        "/api/projects/aming-claw/release-operator-head-queue",
+        {
+            "action": "remove",
+            "backlog_id": "AC-HISTORICAL",
+            "reason": "terminal audit-only source",
+            "historical_non_schedulable": True,
+            "historical_execution_resume_allowed": False,
+            "evidence_refs": [
+                "backlog:AC-HISTORICAL",
+                "contract-runtime:cex-historical",
+            ],
+        },
+    )
+
+
 def test_mcp_stdio_public_safe_batch_close_blocker_schema_guidance():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
