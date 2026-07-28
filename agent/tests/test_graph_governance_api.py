@@ -8751,6 +8751,7 @@ def test_parallel_branch_allocate_omitted_root_uses_registered_project(
             method="POST",
             body={
                 "task_id": "registered-root-allocation",
+                "parent_task_id": "AC-REGISTERED-ROOT-ALLOCATION",
                 "backlog_id": "AC-REGISTERED-ROOT-ALLOCATION",
                 "worker_id": "registered-root-worker",
                 "merge_queue_id": "mergeq-registered-root",
@@ -8776,6 +8777,85 @@ def test_parallel_branch_allocate_omitted_root_uses_registered_project(
     assert context["worktree_path"] == str(expected_worktree)
     assert context["target_project_root"] == str(expected_worktree)
     assert created["worktree"]["created"] is True
+    assert created["commit_verification"] == {
+        "schema_version": "parallel_branch_allocate.commit_verification.v1",
+        "verified": True,
+        "verified_commits": {
+            "base_commit": base_commit,
+            "target_head_commit": base_commit,
+        },
+        "server_selected_repository": {
+            "project_id": PID,
+            "workspace_root": str(repo),
+            "workspace_root_source": "registered_project",
+            "repository_root": str(repo),
+        },
+    }
+
+    guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context["runtime_context_id"],
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": "AC-REGISTERED-ROOT-ALLOCATION",
+                    "fence_token": context["fence_token"],
+                },
+            )
+        )
+    )
+    assert guide["target_project_root"] == str(expected_worktree)
+    assert guide["worker_guide"]["target_project_root"] == str(expected_worktree)
+
+
+def test_parallel_branch_allocate_invalid_registered_commit_reports_repository(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    repo = _git_repo(tmp_path)
+    base_commit = batch_jobs.git_commit(repo)
+    missing_commit = "f" * 40
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda project_id, explicit_root=None, *, fallback_self=True: repo,
+    )
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": "registered-root-invalid-commit",
+                    "backlog_id": "AC-REGISTERED-ROOT-INVALID-COMMIT",
+                    "worker_id": "registered-root-invalid-worker",
+                    "merge_queue_id": "mergeq-registered-root-invalid",
+                    "base_commit": base_commit,
+                    "target_head_commit": missing_commit,
+                    "create_worktree": True,
+                },
+            )
+        )
+
+    assert rejected.value.code == "parallel_branch_allocate_commit_unavailable"
+    assert rejected.value.details["field"] == "target_head_commit"
+    assert rejected.value.details["commit_sha"] == missing_commit
+    assert rejected.value.details["server_selected_repository"] == {
+        "project_id": PID,
+        "workspace_root": str(repo),
+        "workspace_root_source": "registered_project",
+        "repository_root": str(repo),
+    }
+    assert parallel_branch_runtime.get_branch_context(
+        conn,
+        PID,
+        "registered-root-invalid-commit",
+    ) is None
 
 
 def test_parallel_branch_allocate_projects_missing_target_root_to_nested_worktree(

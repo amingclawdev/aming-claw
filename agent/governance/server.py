@@ -11035,16 +11035,13 @@ def _parallel_branch_allocate_normalize_worktree_path(
 def _parallel_branch_allocate_workspace_root(
     project_id: str,
     body: Mapping[str, Any],
-) -> str:
+) -> tuple[str, str]:
     """Resolve an omitted allocation root from the governed project registry."""
 
-    explicit_root = str(
-        body.get("workspace_root")
-        or body.get("repo_root_path")
-        or ""
-    ).strip()
-    if explicit_root:
-        return explicit_root
+    for field in ("workspace_root", "repo_root_path"):
+        explicit_root = str(body.get(field) or "").strip()
+        if explicit_root:
+            return explicit_root, f"request.{field}"
 
     registered_root = project_service.resolve_project_root(
         project_id,
@@ -11052,8 +11049,97 @@ def _parallel_branch_allocate_workspace_root(
         fallback_self=True,
     )
     if registered_root is not None:
-        return str(registered_root)
-    return os.getcwd()
+        return str(registered_root), "registered_project"
+    return os.getcwd(), "process_cwd_fallback"
+
+
+def _parallel_branch_allocate_verify_commits(
+    project_id: str,
+    *,
+    workspace_root: str,
+    workspace_root_source: str,
+    base_commit: str,
+    target_head_commit: str,
+) -> dict[str, Any]:
+    """Verify allocation commits in the server-selected repository before writes."""
+
+    from . import batch_jobs
+
+    selected_root = Path(workspace_root).expanduser().resolve()
+    try:
+        repository_root = batch_jobs.repo_root(selected_root)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GovernanceError(
+            "parallel_branch_allocate_repository_unavailable",
+            "parallel allocation could not open the server-selected repository",
+            422,
+            {
+                "project_id": project_id,
+                "server_selected_repository": {
+                    "workspace_root": str(selected_root),
+                    "workspace_root_source": workspace_root_source,
+                },
+                "reason": str(exc),
+            },
+        ) from exc
+
+    repository_identity = {
+        "project_id": project_id,
+        "workspace_root": str(selected_root),
+        "workspace_root_source": workspace_root_source,
+        "repository_root": str(repository_root),
+    }
+    verified: dict[str, str] = {}
+    for field, commit_sha in (
+        ("base_commit", base_commit),
+        ("target_head_commit", target_head_commit),
+    ):
+        normalized = str(commit_sha or "").strip().lower()
+        if not normalized:
+            continue
+        try:
+            resolved = batch_jobs.git_commit(
+                repository_root,
+                f"{normalized}^{{commit}}",
+            ).strip().lower()
+        except (batch_jobs.BatchJobError, OSError, subprocess.SubprocessError) as exc:
+            raise GovernanceError(
+                "parallel_branch_allocate_commit_unavailable",
+                (
+                    f"{field} is not a commit in the server-selected "
+                    "allocation repository"
+                ),
+                422,
+                {
+                    "field": field,
+                    "commit_sha": normalized,
+                    "server_selected_repository": repository_identity,
+                    "reason": str(exc),
+                },
+            ) from exc
+        if resolved != normalized:
+            raise GovernanceError(
+                "parallel_branch_allocate_commit_identity_mismatch",
+                (
+                    f"{field} did not resolve to the exact requested commit "
+                    "in the server-selected allocation repository"
+                ),
+                422,
+                {
+                    "field": field,
+                    "commit_sha": normalized,
+                    "resolved_commit_sha": resolved,
+                    "server_selected_repository": repository_identity,
+                },
+            )
+        verified[field] = resolved
+
+    return {
+        "schema_version": "parallel_branch_allocate.commit_verification.v1",
+        "verified": True,
+        "verified_commits": verified,
+        "server_selected_repository": repository_identity,
+    }
 
 
 def _parallel_branch_allocate_materialized_target_project_root(context: Any) -> Any:
@@ -12141,7 +12227,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     if not task_id:
         raise ValidationError("task_id is required")
 
-    workspace_root = _parallel_branch_allocate_workspace_root(
+    workspace_root, workspace_root_source = _parallel_branch_allocate_workspace_root(
         project_id,
         ctx.body,
     )
@@ -12151,6 +12237,11 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         base_commit = batch_jobs.git_commit(workspace_root)
     if not target_head_commit:
         target_head_commit = base_commit
+    commit_verification: dict[str, Any] = {
+        "schema_version": "parallel_branch_allocate.commit_verification.v1",
+        "verified": False,
+        "reason": "worktree_materialization_not_requested",
+    }
 
     allocation_fence_token = str(ctx.body.get("fence_token") or f"fence-{uuid.uuid4().hex[:12]}")
     allocation_owner = str(
@@ -12289,6 +12380,14 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             project_id=project_id,
             body=ctx.body or {},
         )
+        if create_worktree:
+            commit_verification = _parallel_branch_allocate_verify_commits(
+                project_id,
+                workspace_root=workspace_root,
+                workspace_root_source=workspace_root_source,
+                base_commit=base_commit,
+                target_head_commit=target_head_commit,
+            )
         allocation_target_ref = str(
             ctx.body.get("target_ref")
             or (
@@ -12550,6 +12649,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             ),
             "worktree": worktree_result["worktree"] if worktree_result else None,
             "branch_strategy": worktree_result["branch_strategy"] if worktree_result else None,
+            "commit_verification": commit_verification,
         }
         if runtime_contract_revision:
             response["runtime_contract_revision"] = runtime_contract_revision
