@@ -16,7 +16,7 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 from urllib.parse import quote, urlencode
 
 from .contracts.runtime import (
@@ -6701,7 +6701,10 @@ def _is_mf_subagent_finish_gate_event(event: dict[str, Any]) -> bool:
     )
 
 
-def _event_deep_string_list(event: dict[str, Any], keys: set[str]) -> list[str]:
+def _event_deep_string_list(
+    event: dict[str, Any],
+    keys: Collection[str],
+) -> list[str]:
     values: list[str] = []
     for value in _event_field_values(event, keys):
         if isinstance(value, list):
@@ -6726,7 +6729,10 @@ def _event_deep_string_list(event: dict[str, Any], keys: set[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
 
-def _event_deep_truthy(event: dict[str, Any], keys: set[str]) -> bool:
+def _event_deep_truthy(
+    event: dict[str, Any],
+    keys: Collection[str],
+) -> bool:
     return any(_truthy(value) for value in _event_field_values(event, keys))
 
 
@@ -9712,7 +9718,10 @@ def _latest_passing_close_event(
     return selected
 
 
-def _event_has_evidence(event: dict[str, Any], keys: set[str]) -> bool:
+def _event_has_evidence(
+    event: dict[str, Any],
+    keys: Collection[str],
+) -> bool:
     return bool(_event_deep_string_list(event, keys)) or _event_deep_truthy(event, keys)
 
 
@@ -9755,17 +9764,28 @@ def _event_has_test_command_evidence(event: dict[str, Any]) -> bool:
     return False
 
 
+_TEST_EVIDENCE_KEYS = frozenset(
+    {
+        "tests",
+        "tests_run",
+        "test_results",
+        "test_commands",
+        "focused_tests",
+        "pytest",
+    }
+)
+
+
+def accepted_test_evidence_keys() -> list[str]:
+    """Return the copy-safe keys accepted as independent test evidence."""
+
+    return sorted(_TEST_EVIDENCE_KEYS)
+
+
 def _event_has_test_evidence(event: dict[str, Any]) -> bool:
     return _event_has_evidence(
         event,
-        {
-            "tests",
-            "tests_run",
-            "test_results",
-            "test_commands",
-            "focused_tests",
-            "pytest",
-        },
+        _TEST_EVIDENCE_KEYS,
     ) or _event_has_test_command_evidence(event)
 
 

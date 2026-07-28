@@ -2803,6 +2803,7 @@ def _insert_observer_graph_query_trace(
     query_purpose: str = "global_architecture_review",
     backlog_id: str = "",
     task_id: str = "",
+    status: str = "complete",
     route_identity: Mapping[str, Any] | None = None,
     created_at: str = "2026-07-04T10:00:00Z",
 ) -> None:
@@ -2840,7 +2841,7 @@ def _insert_observer_graph_query_trace(
             str(route_identity.get("route_token_ref") or ""),
             "",
             "",
-            "complete",
+            status,
             "{}",
             "{}",
             "",
@@ -30369,6 +30370,60 @@ def test_strict_qa_trace_refs_require_matching_pinned_candidate_and_root(
         for item in wrong_assigned_root["identity_mismatches"]
     )
 
+    conn.execute(
+        """
+        UPDATE graph_query_traces
+        SET query_source = 'observer',
+            query_purpose = 'inspect_node',
+            task_id = 'wrong-task',
+            qa_session_id = 'wrong-session',
+            status = 'failed'
+        WHERE project_id = ? AND trace_id = ?
+        """,
+        (PID, trace_id),
+    )
+    conn.commit()
+    aggregate = refs(candidate_commit, other_worktree)
+    aggregate_fields = {
+        item["field"] for item in aggregate["identity_mismatches"]
+    }
+    assert {
+        "query_source",
+        "query_purpose",
+        "task_id",
+        "qa_session_id",
+        "status",
+    }.issubset(aggregate_fields)
+    assert "exact_candidate_upgrade_ref" in aggregate_fields
+    assert all(
+        {"trace_id", "field", "expected", "actual"}.issubset(item)
+        for item in aggregate["identity_mismatches"]
+    )
+    conn.execute(
+        """
+        UPDATE graph_query_traces
+        SET query_source = 'qa',
+            query_purpose = 'independent_verification',
+            task_id = ?,
+            qa_session_id = 'ses-qa',
+            status = 'complete',
+            qa_scope_binding_ref = ?
+        WHERE project_id = ? AND trace_id = ?
+        """,
+        (
+            task_id,
+            server._qa_scope_binding_ref(
+                project_id=PID,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                commit_sha=candidate_commit,
+            ),
+            PID,
+            trace_id,
+        ),
+    )
+    conn.commit()
+
     dirty_path = project_root / "untracked-after-trace.txt"
     dirty_path.write_text("dirty exact candidate\n", encoding="utf-8")
     dirty = refs(candidate_commit)
@@ -30392,6 +30447,57 @@ def test_strict_qa_trace_refs_require_matching_pinned_candidate_and_root(
         item["field"] in {"root_identity", "root_identity_hash"}
         for item in rootless["identity_mismatches"]
     )
+
+
+def test_strict_qa_trace_refs_return_poison_context_mismatch_without_throwing(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-QA-TRACE-POISON-CONTEXT"
+    task_id = "qa-trace-poison-context-task"
+    project_root = tmp_path / "qa-trace-poison-context"
+    candidate_commit = _init_test_git_repo(project_root)
+    trace_id = "gqt-qa-trace-poison-context"
+    _insert_exact_qa_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        snapshot_id="full-qa-trace-poison-context",
+        candidate_commit_sha=candidate_commit,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_project_root=str(project_root),
+    )
+    poison_mismatch = {
+        "trace_id": trace_id,
+        "field": "candidate_review_context",
+        "expected": "complete server-derived review context",
+        "actual": "poisoned persisted tuple",
+    }
+    monkeypatch.setattr(
+        server,
+        "_qa_reverify_candidate_trace_context",
+        lambda *_args, **_kwargs: ({}, [poison_mismatch]),
+    )
+
+    evidence = server._runtime_context_service_qa_graph_trace_refs(
+        conn,
+        project_id=PID,
+        explicit_trace_ids=[trace_id],
+        target_project_root=str(project_root),
+        expected_backlog_id=backlog_id,
+        expected_task_id=task_id,
+        expected_candidate_commit_sha=candidate_commit,
+        expected_qa_principal="qa-principal",
+        expected_qa_session_id="ses-qa",
+        require_complete_authority=True,
+        strict_bounded_qa=True,
+    )
+
+    assert evidence["db_verified"] is False
+    assert evidence["verified_trace_ids"] == []
+    assert evidence["missing_trace_ids"] == []
+    assert evidence["identity_mismatches"] == [poison_mismatch]
 
 
 def test_bounded_qa_base_graph_candidate_diff_rejects_forged_tuple(
@@ -32917,6 +33023,30 @@ def test_runtime_context_qa_guide_scopes_verification_and_full_suite_caveat() ->
         },
         target_files=target_files,
     )
+
+    bindings = guide["legitimate_evidence_bindings"]
+    assert bindings["direct_main_observer_route"]["task_id_source"] == (
+        "onboard_contract_execution_id"
+    )
+    assert bindings["submitted_graph_query_trace"][
+        "qa_graph_context_required_status"
+    ] == "complete"
+    assert bindings["independent_verification_test_evidence"][
+        "accepted_keys"
+    ] == [
+        "focused_tests",
+        "pytest",
+        "test_commands",
+        "test_results",
+        "tests",
+        "tests_run",
+    ]
+    assert bindings["mf_parallel_qa_graph_context"][
+        "target_project_root"
+    ] == "/tmp/qa-scoped"
+    assert bindings["mf_parallel_qa_graph_context"][
+        "target_project_root_source"
+    ] == "assigned_worker_worktree"
 
     plan = guide["verification_plan"]
     assert plan["schema_version"] == "runtime_context.qa_scoped_verification_plan.v1"
@@ -38611,6 +38741,96 @@ def test_qa_worker_identity_binding_rejects_wrong_runtime_or_task(
 
     assert blocked.value.code == "contract_runtime_qa_worker_identity_mismatch"
     assert blocked.value.details["identity_mismatches"][0]["field"] == field
+    assert blocked.value.details["fail_closed"] is True
+
+
+def test_qa_graph_authority_returns_all_identity_mismatches(monkeypatch):
+    mismatches = [
+        {
+            "trace_id": "gqt-multi-mismatch",
+            "field": "task_id",
+            "expected": "worker-task",
+            "actual": "wrong-task",
+        },
+        {
+            "trace_id": "gqt-multi-mismatch",
+            "field": "status",
+            "expected": "complete",
+            "actual": "failed",
+        },
+        {
+            "trace_id": "gqt-multi-mismatch",
+            "field": "target_project_root",
+            "expected": "/tmp/assigned-worker",
+            "actual": "/tmp/canonical-root",
+        },
+    ]
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_line_identity",
+        lambda _record: {
+            "runtime_context_id": "mfrctx-multi-mismatch",
+            "task_id": "worker-task",
+            "parent_task_id": "parent-task",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_assigned_target_project_root",
+        lambda *_args, **_kwargs: {
+            "status": "resolved",
+            "target_project_root": "/tmp/assigned-worker",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_candidate_commit",
+        lambda *_args, **_kwargs: "a" * 40,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_qa_graph_trace_refs",
+        lambda *_args, **_kwargs: {
+            "schema_version": "qa_graph_trace_db_evidence.v1",
+            "db_verified": False,
+            "identity_mismatches": mismatches,
+            "requested_trace_ids": ["gqt-multi-mismatch"],
+        },
+    )
+
+    class QAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:multi-mismatch",
+                "session_id": "ses-multi-mismatch",
+            }
+
+    with pytest.raises(GovernanceError) as blocked:
+        server._contract_runtime_bind_qa_graph_authority(
+            QAContext(),
+            object(),
+            project_id=PID,
+            record={
+                "contract_execution_id": "cex-multi-mismatch",
+                "backlog_id": "AC-MULTI-MISMATCH",
+            },
+            write={"line_id": "qa_graph_context"},
+            body={"graph_trace_ids": ["gqt-multi-mismatch"]},
+            policy={
+                "lookup_key_fields": ["graph_trace_ids"],
+                "authority_object_path": "payload.graph_trace_evidence",
+            },
+        )
+
+    assert blocked.value.code == (
+        "contract_runtime_qa_graph_trace_identity_mismatch"
+    )
+    assert blocked.value.details["identity_mismatches"] == mismatches
+    assert blocked.value.details["qa_graph_trace_db_evidence"][
+        "identity_mismatches"
+    ] == mismatches
     assert blocked.value.details["fail_closed"] is True
 
 
@@ -53559,6 +53779,7 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
         *,
         insert_trace_task_id: str | None = None,
         insert_trace_query_purpose: str | None = None,
+        insert_trace_status: str | None = None,
     ) -> dict:
         backlog_id = f"AC-BACKLOG-CLOSE-PARENTLESS-DIRECT-MAIN-GRAPH-{suffix}"
         close_commit = hashlib.sha1(suffix.encode("utf-8")).hexdigest()
@@ -53621,6 +53842,7 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
         if (
             insert_trace_task_id is not None
             or insert_trace_query_purpose is not None
+            or insert_trace_status is not None
         ):
             for trace_id in graph_trace_ids:
                 _insert_observer_graph_query_trace(
@@ -53635,6 +53857,7 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
                         if insert_trace_query_purpose is not None
                         else str(insert_trace_task_id or "")
                     ),
+                    status=insert_trace_status or "complete",
                     route_identity=route_identity,
                 )
         append_base = {
@@ -53867,6 +54090,24 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
             "actual": "other-contract",
         }
     ]
+
+    wrong_task_and_status_trace_id = "gqt-20260704-bad7a513"
+    wrong_task_and_status = build_precheck(
+        "WRONGTASKSTATUS",
+        [wrong_task_and_status_trace_id],
+        insert_trace_task_id="other-contract",
+        insert_trace_status="failed",
+    )
+    graph_gate = assert_close_blocked_by_graph_gate(
+        wrong_task_and_status,
+        "graph_trace_task_id_db_verified",
+    )
+    mismatches = graph_gate["db_evidence"]["identity_mismatches"]
+    assert {item["field"] for item in mismatches} == {"task_id", "status"}
+    assert all(
+        {"trace_id", "field", "expected", "actual"}.issubset(item)
+        for item in mismatches
+    )
 
     inspect_trace_id = "gqt-20260719-1a5ec701"
     inspect_precheck = build_precheck(
@@ -58409,6 +58650,13 @@ def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe
         "graph_query_trace_ids": ["<graph_query.trace_id>"],
     }
     assert "raw-qa-secret" not in json.dumps(guidance)
+    bindings = guidance["legitimate_evidence_bindings"]
+    assert bindings["mf_parallel_qa_graph_context"][
+        "target_project_root"
+    ] == "/tmp/assigned-qa-worktree"
+    assert bindings["direct_main_observer_route"]["task_id"] == (
+        "<onboard-contract-execution-id>"
+    )
 
     blocked = _selected_qa_runtime_guidance(
         "qa_graph_context", "record_graph_trace", include_dispatch=False
@@ -58619,11 +58867,47 @@ def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(
             f"sha256:visible-{worker_task_id}"
         ),
     }
+    bindings = guidance["legitimate_evidence_bindings"]
+    assert bindings["direct_main_observer_route"]["task_id"] == (
+        server._onboard_service_execution_id(PID, backlog_id)
+    )
+    assert bindings["mf_parallel_qa_graph_context"][
+        "target_project_root"
+    ] == runtime_context.worktree_path
+    assert bindings["submitted_graph_query_trace"]["db_status_required"] is True
+    assert bindings["independent_verification_test_evidence"][
+        "accepted_keys"
+    ] == task_timeline.accepted_test_evidence_keys()
     compact_guidance = response["agent_onboard_guidance"]
     assert compact_guidance["selected_role_guidance"] == guidance
     assert compact_guidance["canonical_dispatch_identity"] == (
         canonical_identity
     )
+    assert response["legitimate_evidence_bindings"] == bindings
+    assert compact_guidance["legitimate_evidence_bindings"] == bindings
+    capsule_response = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="qa",
+        work_type="qa_verification",
+        record={
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "contract_execution_id": (
+                server._onboard_service_execution_id(PID, backlog_id)
+            ),
+        },
+        next_action=response["next_legal_action"],
+        current_projection=projected_before_service,
+        runtime_resume={},
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+        qa_runtime_record=server._contract_runtime_store(conn).get(
+            successor["contract_execution_id"]
+        ),
+    )
+    assert capsule_response["response_view"] == "compact"
+    assert capsule_response["legitimate_evidence_bindings"] == bindings
     assert compact_guidance["contract_runtime_authority"] == {
         "source_of_authority": "contract_runtime",
         "authority_decision_source": "contract_runtime_current_state",
