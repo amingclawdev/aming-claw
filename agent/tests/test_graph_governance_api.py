@@ -57006,6 +57006,246 @@ def test_release_operator_head_queue_mutation_is_operator_only(conn):
         )
 
 
+def test_release_operator_head_queue_route_ref_uses_separate_authorization_scope(
+    conn,
+    monkeypatch,
+):
+    authorization_backlog_id = "AC-RELEASE-QUEUE-ROUTE-AUTH"
+    queue_backlog_id = "AC-RELEASE-QUEUE-ROUTE-TARGET"
+    authorization_task_id = "task-release-queue-route-auth"
+    _insert_release_queue_backlog(conn, authorization_backlog_id)
+    _insert_release_queue_backlog(conn, queue_backlog_id)
+    calls: list[dict[str, str]] = []
+
+    def fake_route_gate(
+        _ctx,
+        *,
+        action,
+        project_id,
+        backlog_id,
+        task_id,
+        **_kwargs,
+    ):
+        calls.append(
+            {
+                "action": action,
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            }
+        )
+        return {
+            "schema_version": "route_token_mutation_gate.v1",
+            "allowed": True,
+            "status": "accepted",
+            "decision": "route_token_ref_resolved",
+            "action": action,
+            "caller_role": "observer",
+            "route_token_ref": "rtok-release-queue",
+            "server_issued_binding": True,
+            "registry_verified": True,
+            "resolved_from_ref": True,
+            "scope": {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_require_route_token_mutation_gate",
+        fake_route_gate,
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args: pytest.fail("route-ref path must not require operator token"),
+    )
+
+    inserted = server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "action": "insert",
+                "backlog_id": queue_backlog_id,
+                "route_token_ref": "rtok-release-queue",
+                "authorization_backlog_id": authorization_backlog_id,
+                "authorization_task_id": authorization_task_id,
+            },
+        )
+    )
+
+    assert calls == [
+        {
+            "action": "release_operator_head_queue_insert",
+            "project_id": PID,
+            "backlog_id": authorization_backlog_id,
+            "task_id": authorization_task_id,
+        }
+    ]
+    assert inserted["authorization"]["mode"] == (
+        "server_registered_route_token_ref"
+    )
+    assert inserted["authorization"]["raw_credentials_exposed"] is False
+    assert inserted["release_operator_head_queue"]["head"]["backlog_id"] == (
+        queue_backlog_id
+    )
+    assert inserted["release_operator_head_queue"]["audit_events"][0][
+        "actor"
+    ] == "observer:route_ref"
+
+
+def test_release_operator_head_queue_route_ref_scope_and_credentials_fail_closed(
+    conn,
+    monkeypatch,
+):
+    queue_backlog_id = "AC-RELEASE-QUEUE-ROUTE-REFUSED"
+    _insert_release_queue_backlog(conn, queue_backlog_id)
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args: pytest.fail("route-ref refusal must not fall back to operator"),
+    )
+
+    with pytest.raises(GovernanceError) as missing_scope:
+        server.handle_project_release_operator_head_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "action": "insert",
+                    "backlog_id": queue_backlog_id,
+                    "route_token_ref": "rtok-release-queue",
+                },
+            )
+        )
+    assert missing_scope.value.code == (
+        "release_operator_head_queue_route_scope_required"
+    )
+
+    with pytest.raises(GovernanceError) as raw_token:
+        server.handle_project_release_operator_head_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "action": "insert",
+                    "backlog_id": queue_backlog_id,
+                    "route_token_ref": "rtok-release-queue",
+                    "authorization_backlog_id": "AC-AUTH",
+                    "authorization_task_id": "task-auth",
+                    "route_token": {"raw": "must-not-be-accepted"},
+                },
+            )
+        )
+    assert raw_token.value.code == (
+        "release_operator_head_queue_raw_credential_refused"
+    )
+
+
+def test_release_operator_head_queue_route_ref_wrong_scope_and_action_fail_closed(
+    conn,
+    monkeypatch,
+):
+    authorization_backlog_id = "AC-RELEASE-QUEUE-REAL-ROUTE-AUTH"
+    queue_backlog_id = "AC-RELEASE-QUEUE-REAL-ROUTE-TARGET"
+    authorization_task_id = "task-release-queue-real-route-auth"
+    _insert_release_queue_backlog(conn, authorization_backlog_id)
+    _insert_release_queue_backlog(conn, queue_backlog_id)
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=authorization_backlog_id,
+        task_id=authorization_task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["release_operator_head_queue_insert"],
+        evidence_refs=["timeline:release-queue-route-auth"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args: pytest.fail("route-ref refusal must not fall back to operator"),
+    )
+
+    with pytest.raises(GovernanceError) as wrong_backlog:
+        server.handle_project_release_operator_head_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "action": "insert",
+                    "backlog_id": queue_backlog_id,
+                    "route_token_ref": issued["route_token_ref"],
+                    "authorization_backlog_id": "AC-WRONG-AUTH-SCOPE",
+                    "authorization_task_id": authorization_task_id,
+                },
+            )
+        )
+    assert wrong_backlog.value.code == "route_token_required"
+
+    with pytest.raises(GovernanceError) as wrong_action:
+        server.handle_project_release_operator_head_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "action": "remove",
+                    "backlog_id": queue_backlog_id,
+                    "reason": "must fail before queue mutation",
+                    "route_token_ref": issued["route_token_ref"],
+                    "authorization_backlog_id": authorization_backlog_id,
+                    "authorization_task_id": authorization_task_id,
+                },
+            )
+        )
+    assert wrong_action.value.code == "route_token_required"
+    assert server.handle_project_release_operator_head_queue(
+        _ctx({"project_id": PID})
+    )["release_operator_head_queue"]["items"] == []
+
+    inserted = server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "action": "insert",
+                "backlog_id": queue_backlog_id,
+                "route_token_ref": issued["route_token_ref"],
+                "authorization_backlog_id": authorization_backlog_id,
+                "authorization_task_id": authorization_task_id,
+            },
+        )
+    )
+    assert inserted["ok"] is True
+    assert inserted["authorization"]["route_token_gate"]["action"] == (
+        "release_operator_head_queue_insert"
+    )
+
+
+def test_release_queue_route_actions_are_observer_admin_control_scope():
+    route_scope = observer_route_context._route_lane_requirements_for_actions(
+        [
+            "observer_direct_mutation_exception",
+            "release_operator_head_queue_insert",
+            "release_operator_head_queue_reorder",
+            "release_operator_head_queue_skip",
+            "release_operator_head_queue_remove",
+        ]
+    )
+
+    assert route_scope["route_action_scope"]["unknown_actions"] == []
+    assert route_scope["route_action_scope"][
+        "requires_mf_sub_implementation_lane"
+    ] is False
+
+
 def test_release_operator_head_queue_pinned_active_precedence_is_non_skippable(
     conn,
     monkeypatch,
@@ -57526,6 +57766,26 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
         "mutation_method": "POST",
         "path": "/api/projects/{project_id}/release-operator-head-queue",
         "mutation_roles": ["observer", "coordinator"],
+        "mutation_authority": {
+            "accepted_modes": [
+                "graph_governance_operator_session",
+                "server_registered_route_token_ref",
+            ],
+            "route_ref_fields": [
+                "route_token_ref",
+                "authorization_backlog_id",
+                "authorization_task_id",
+            ],
+            "route_ref_action_grants": [
+                "release_operator_head_queue_insert",
+                "release_operator_head_queue_reorder",
+                "release_operator_head_queue_skip",
+                "release_operator_head_queue_remove",
+            ],
+            "queue_member_scope_separate_from_authorization_scope": True,
+            "raw_route_token_accepted": False,
+            "raw_observer_session_token_accepted": False,
+        },
         "bounded_capacity": 32,
         "actions": ["insert", "reorder", "skip", "remove"],
         "remove_active_historical_requires": [

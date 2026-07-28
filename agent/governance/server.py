@@ -78729,6 +78729,26 @@ def _onboard_contract_route_guide(
             "mutation_method": "POST",
             "path": "/api/projects/{project_id}/release-operator-head-queue",
             "mutation_roles": ["observer", "coordinator"],
+            "mutation_authority": {
+                "accepted_modes": [
+                    "graph_governance_operator_session",
+                    "server_registered_route_token_ref",
+                ],
+                "route_ref_fields": [
+                    "route_token_ref",
+                    "authorization_backlog_id",
+                    "authorization_task_id",
+                ],
+                "route_ref_action_grants": [
+                    "release_operator_head_queue_insert",
+                    "release_operator_head_queue_reorder",
+                    "release_operator_head_queue_skip",
+                    "release_operator_head_queue_remove",
+                ],
+                "queue_member_scope_separate_from_authorization_scope": True,
+                "raw_route_token_accepted": False,
+                "raw_observer_session_token_accepted": False,
+            },
             "bounded_capacity": RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS,
             "actions": ["insert", "reorder", "skip", "remove"],
             "remove_active_historical_requires": [
@@ -110699,12 +110719,6 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
                 ),
             }
 
-        session = _require_graph_governance_operator(
-            ctx,
-            conn,
-            "backlog.release-operator-head-queue.mutate",
-        )
-        actor = str(session.get("principal_id") or session.get("role") or "operator")
         body = ctx.body if isinstance(ctx.body, Mapping) else {}
         action = str(body.get("action") or "").strip().lower()
         if action not in {"insert", "reorder", "skip", "remove"}:
@@ -110713,6 +110727,85 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
                 "error": "invalid_release_operator_head_queue_action",
                 "allowed_actions": ["insert", "reorder", "skip", "remove"],
             }
+
+        route_token_ref = str(body.get("route_token_ref") or "").strip()
+        route_gate: dict[str, Any] = {}
+        if route_token_ref:
+            forbidden_credential_fields = sorted(
+                key
+                for key in (
+                    "route_token",
+                    "route_waiver",
+                    "route_token_waiver",
+                    "observer_session_token",
+                    "session_token",
+                    "qa_session_token",
+                    "gov_token",
+                    "x_gov_token",
+                )
+                if body.get(key) not in (None, "", {}, [])
+            )
+            if forbidden_credential_fields:
+                raise GovernanceError(
+                    "release_operator_head_queue_raw_credential_refused",
+                    (
+                        "release queue route-ref authorization accepts only an "
+                        "opaque server-registered route_token_ref"
+                    ),
+                    422,
+                    {
+                        "forbidden_fields": forbidden_credential_fields,
+                        "raw_route_token_accepted": False,
+                        "raw_observer_session_token_accepted": False,
+                    },
+                )
+            authorization_backlog_id = str(
+                body.get("authorization_backlog_id") or ""
+            ).strip()
+            authorization_task_id = str(
+                body.get("authorization_task_id") or ""
+            ).strip()
+            if not authorization_backlog_id or not authorization_task_id:
+                raise GovernanceError(
+                    "release_operator_head_queue_route_scope_required",
+                    (
+                        "route-ref queue mutation requires separate "
+                        "authorization_backlog_id and authorization_task_id"
+                    ),
+                    422,
+                    {
+                        "required_fields": [
+                            "route_token_ref",
+                            "authorization_backlog_id",
+                            "authorization_task_id",
+                        ],
+                        "queue_member_scope_separate_from_authorization_scope": True,
+                    },
+                )
+            route_gate = _require_route_token_mutation_gate(
+                ctx,
+                action=f"release_operator_head_queue_{action}",
+                project_id=project_id,
+                backlog_id=authorization_backlog_id,
+                task_id=authorization_task_id,
+            )
+            actor = str(route_gate.get("caller_role") or "observer") + ":route_ref"
+            _record_route_token_gate_event(
+                conn,
+                project_id,
+                route_gate,
+                backlog_id=authorization_backlog_id,
+                task_id=authorization_task_id,
+            )
+        else:
+            session = _require_graph_governance_operator(
+                ctx,
+                conn,
+                "backlog.release-operator-head-queue.mutate",
+            )
+            actor = str(
+                session.get("principal_id") or session.get("role") or "operator"
+            )
 
         # Serialize the bounded read/validate/write sequence across governance
         # processes so position shifts and exact-membership reorder stay atomic.
@@ -111142,6 +111235,17 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
             "action": action,
             "event_id": event_id,
             "release_operator_head_queue": view,
+            "authorization": {
+                "mode": (
+                    "server_registered_route_token_ref"
+                    if route_gate
+                    else "graph_governance_operator_session"
+                ),
+                "route_token_gate": (
+                    _route_gate_public_summary(route_gate) if route_gate else {}
+                ),
+                "raw_credentials_exposed": False,
+            },
         }
         if action == "skip":
             one_shot = _release_operator_head_queue_view(

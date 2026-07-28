@@ -1020,6 +1020,9 @@ def test_mcp_stdio_release_operator_head_queue_schema_is_listed():
         "remove",
     ]
     assert {
+        "route_token_ref",
+        "authorization_backlog_id",
+        "authorization_task_id",
         "historical_non_schedulable",
         "historical_execution_resume_allowed",
         "evidence_refs",
@@ -1049,6 +1052,9 @@ def test_both_mcp_adapters_route_release_queue_read_and_historical_remove(
         "position",
         "pinned",
         "reason",
+        "route_token_ref",
+        "authorization_backlog_id",
+        "authorization_task_id",
         "historical_non_schedulable",
         "historical_execution_resume_allowed",
         "evidence_refs",
@@ -1079,6 +1085,9 @@ def test_both_mcp_adapters_route_release_queue_read_and_historical_remove(
         "action": "remove",
         "backlog_id": "AC-HISTORICAL",
         "reason": "terminal audit-only source",
+        "route_token_ref": "rtok-release-queue",
+        "authorization_backlog_id": "AC-QUEUE-AUTH",
+        "authorization_task_id": "task-queue-auth",
         "historical_non_schedulable": True,
         "historical_execution_resume_allowed": False,
         "evidence_refs": [
@@ -1097,6 +1106,9 @@ def test_both_mcp_adapters_route_release_queue_read_and_historical_remove(
             "action": "remove",
             "backlog_id": "AC-HISTORICAL",
             "reason": "terminal audit-only source",
+            "route_token_ref": "rtok-release-queue",
+            "authorization_backlog_id": "AC-QUEUE-AUTH",
+            "authorization_task_id": "task-queue-auth",
             "historical_non_schedulable": True,
             "historical_execution_resume_allowed": False,
             "evidence_refs": [

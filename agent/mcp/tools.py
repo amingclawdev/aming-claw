@@ -1897,7 +1897,9 @@ TOOLS: list[dict] = [
         "name": "release_operator_head_queue",
         "description": (
             "Read or mutate the bounded release-operator queue. Mutations are "
-            "operator-authorized and audited. Removing an active historical "
+            "authorized by an operator session or an opaque server-registered "
+            "route_token_ref with separate authorization backlog/task scope, "
+            "and are audited. Removing an active historical "
             "membership requires historical_non_schedulable=true, "
             "historical_execution_resume_allowed=false, and durable "
             "evidence_refs; active integration-epoch members remain protected."
@@ -1925,6 +1927,24 @@ TOOLS: list[dict] = [
                 "reason": {
                     "type": "string",
                     "description": "Non-empty audit reason for queue mutation.",
+                },
+                "route_token_ref": {
+                    "type": "string",
+                    "description": (
+                        "Opaque server-registered route token reference for "
+                        "mutations; raw route/session tokens are not accepted."
+                    ),
+                },
+                "authorization_backlog_id": {
+                    "type": "string",
+                    "description": (
+                        "Backlog scope bound to route_token_ref; separate from "
+                        "the queue member backlog_id."
+                    ),
+                },
+                "authorization_task_id": {
+                    "type": "string",
+                    "description": "Task scope bound to route_token_ref.",
                 },
                 "historical_non_schedulable": {
                     "type": "boolean",
