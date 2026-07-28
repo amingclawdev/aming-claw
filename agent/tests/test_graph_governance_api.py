@@ -61388,8 +61388,17 @@ def test_contract_runtime_compact_current_coalesces_live_dispatch_projection(
     exact_identity = bridge["post_dispatch_runtime_identity"]
     assert exact_identity["status"] == "exact_completed_dispatch"
     assert exact_identity["runtime_context_id"] == runtime_context.runtime_context_id
+    assert exact_identity["merge_queue_id"] == runtime_context.merge_queue_id
+    assert exact_identity["merge_queue_id_source"] == (
+        "ContractRuntime.completed_lines.observer_dispatch_bounded_workers"
+    )
     assert exact_identity["target_project_root"] == str(target_project_root)
     assert exact_identity["worktree_path"] == str(worktree_path)
+    assert current["runtime_context"]["status"] == "ready"
+    assert current["runtime_context"]["current_values"]["merge_queue_id"] == (
+        runtime_context.merge_queue_id
+    )
+    assert current["runtime_context"]["route_local_merge_queue_id_allowed"] is False
 
     submit_body = bridge["copy_safe_bridge_payload"][
         "contract_runtime_submit_line_body_after_bridge"
@@ -61422,6 +61431,210 @@ def test_contract_runtime_compact_current_coalesces_live_dispatch_projection(
     )
     assert conflicting_bridge["post_dispatch_runtime_identity"]["status"] == (
         "allocation_or_dispatch_required"
+    )
+
+
+def test_rejected_worker_startup_does_not_advance_contract_runtime_projection(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-MF-PARALLEL-REJECTED-STARTUP-NO-PROJECTION"
+    worker_task_id = "mf-sub-rejected-startup"
+    worker_token = "token-mf-sub-rejected-startup"
+    worker_fence = "fence-mf-sub-rejected-startup"
+    worktree = tmp_path / worker_task_id
+    worktree.mkdir()
+    successor, runtime_context = (
+        _setup_mf_parallel_contract_runtime_worker_dispatch(
+            conn,
+            backlog_id=backlog_id,
+            task_id="mf-parallel-rejected-startup-parent",
+            worker_task_id=worker_task_id,
+            fence_token=worker_fence,
+            token=worker_token,
+            worktree_path=str(worktree),
+            target_project_root=str(worktree),
+        )
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
+
+    worker_read = server.handle_project_contract_runtime_line_write(
+        _ctx(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            method="POST",
+            body={
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "fence_token": worker_fence,
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "target_project_root": str(worktree),
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "evidence_kind": "read_receipt",
+                "read_receipt_hash": "sha256:" + "1" * 64,
+                "payload": {
+                    "schema_version": "mf_parallel.worker_read_receipt.v1",
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "read_receipt_hash": "sha256:" + "1" * 64,
+                },
+            },
+        )
+    )
+    assert worker_read["ok"] is True
+    assert worker_read["next_legal_action"]["line_id"] == "worker_startup"
+
+    rejected = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "worker_id": worker_identity,
+                "worker_slot_id": worker_identity,
+                "agent_id": "host-mf-sub-rejected-startup",
+                "actual_host_worker_id": "host-mf-sub-rejected-startup",
+                "worker_session_id": "host-mf-sub-rejected-startup",
+                "worker_transcript_ref": "codex:host-mf-sub-rejected-startup",
+                "harness_type": "codex",
+                "filer_principal": "host-mf-sub-rejected-startup",
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "session_token": worker_token,
+                "fence_token": worker_fence,
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "branch": runtime_context.branch_ref,
+                "head_commit": runtime_context.target_head_commit,
+                "base_commit": runtime_context.base_commit,
+                "target_head_commit": runtime_context.target_head_commit,
+                "merge_queue_id": "mq-wrong-route-local",
+                "owned_files": list(runtime_context.owned_files),
+                "startup_source": "codex_cli_exec",
+                "read_receipt_hash": "sha256:read-rejected-startup",
+                "read_receipt_event_id": "rejected-startup-read",
+                **route_identity,
+            },
+        )
+    )
+
+    assert rejected["ok"] is False
+    assert rejected["event_kind"] == "mf_subagent_startup_refusal"
+    refusal_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="mf_subagent_startup_refusal",
+    )
+    assert len(refusal_events) == 1
+    assert refusal_events[0]["status"] == "blocked"
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            "observer",
+            query={"response_view": "cli_current"},
+        )
+    )
+    assert current["next_legal_action"]["line_id"] == "worker_startup"
+    assert current["runtime_context"]["current_values"]["merge_queue_id"] == (
+        runtime_context.merge_queue_id
+    )
+    record = server._contract_runtime_store(conn).get(contract_execution_id)
+    assert record["completed_lines"][-1]["line_id"] == (
+        "worker_read_runtime_guide"
+    )
+    assert all(
+        line.get("line_id") != "worker_startup"
+        for line in record["completed_lines"]
+    )
+
+
+def test_worker_guide_does_not_use_dispatch_queue_when_runtime_queue_is_missing(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-MF-PARALLEL-MISSING-RUNTIME-QUEUE-NOT-ACTIONABLE"
+    worker_task_id = "mf-sub-missing-runtime-queue"
+    worker_token = "token-mf-sub-missing-runtime-queue"
+    worker_fence = "fence-mf-sub-missing-runtime-queue"
+    worktree = tmp_path / worker_task_id
+    worktree.mkdir()
+    _successor, runtime_context = (
+        _setup_mf_parallel_contract_runtime_worker_dispatch(
+            conn,
+            backlog_id=backlog_id,
+            task_id="mf-parallel-missing-runtime-queue-parent",
+            worker_task_id=worker_task_id,
+            fence_token=worker_fence,
+            token=worker_token,
+            worktree_path=str(worktree),
+            target_project_root=str(worktree),
+        )
+    )
+    conn.execute(
+        """
+        UPDATE parallel_branch_runtime_contexts
+        SET merge_queue_id = ''
+        WHERE project_id = ? AND task_id = ?
+        """,
+        (PID, worker_task_id),
+    )
+    conn.commit()
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": backlog_id,
+                "fence_token": worker_fence,
+                "session_token": worker_token,
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "target_project_root": str(worktree),
+            },
+        )
+    )
+
+    assert guide["runtime_context"]["status"] == (
+        "blocked_missing_authoritative_merge_queue_id"
+    )
+    assert guide["runtime_context"]["current_values"]["merge_queue_id"] == ""
+    startup = guide["startup_facade_payload_skeleton"]
+    assert startup["actionable"] is False
+    assert startup["copy_safe_body"] == {}
+    assert startup["missing_required_fields"] == [
+        "runtime_context.current_values.merge_queue_id"
+    ]
+    assert runtime_context.merge_queue_id not in json.dumps(
+        startup,
+        sort_keys=True,
     )
 
 
@@ -70150,7 +70363,7 @@ def test_source_backed_mf_parallel_dispatch_issues_ticket_only_before_worker_rea
         )
     )
     assert current["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
-    assert current["contract_revision_id"] == "rev4"
+    assert current["contract_revision_id"] == "rev6"
     assert current["contract_revision_id"] == current[
         "contract_runtime_current_state"
     ]["contract_revision_id"]
@@ -70241,15 +70454,17 @@ def test_source_backed_mf_parallel_dispatch_issues_ticket_only_before_worker_rea
                 "fence_token": fence_token,
                 "session_token_ref": runtime_context_session_token_ref(runtime_context),
                 "target_project_root": str(tmp_path),
-                "stage_id": "worker_read",
-                "line_id": "worker_read_runtime_guide",
-                "evidence_kind": "read_receipt",
-                "payload": {
-                    "schema_version": "mf_parallel.worker_read_receipt.v1",
-                    "runtime_context_id": runtime_context.runtime_context_id,
-                    "task_id": worker_task_id,
-                    "parent_task_id": backlog_id,
-                },
+                    "stage_id": "worker_read",
+                    "line_id": "worker_read_runtime_guide",
+                    "evidence_kind": "read_receipt",
+                    "read_receipt_hash": "sha256:" + "3" * 64,
+                    "payload": {
+                        "schema_version": "mf_parallel.worker_read_receipt.v1",
+                        "runtime_context_id": runtime_context.runtime_context_id,
+                        "task_id": worker_task_id,
+                        "parent_task_id": backlog_id,
+                        "read_receipt_hash": "sha256:" + "3" * 64,
+                    },
             },
         )
     )
@@ -81186,7 +81401,7 @@ def test_contract_runtime_current_accepts_copy_safe_mf_sub_worker_proof(conn):
 
     assert current["actor_role"] == "mf_sub"
     assert current["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
-    assert current["contract_revision_id"] == "rev4"
+    assert current["contract_revision_id"] == "rev6"
     assert current["contract_revision_id"] == current[
         "contract_runtime_current_state"
     ]["contract_revision_id"]
@@ -82267,10 +82482,12 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
                 "stage_id": "worker_read",
                 "line_id": "worker_read_runtime_guide",
                 "evidence_kind": "read_receipt",
+                "read_receipt_hash": "sha256:" + "2" * 64,
                 "payload": {
                     "schema_version": "mf_parallel.worker_read_receipt.v1",
                     "runtime_context_id": runtime_context.runtime_context_id,
                     "task_id": runtime_context.task_id,
+                    "read_receipt_hash": "sha256:" + "2" * 64,
                 },
             },
         )
@@ -82366,6 +82583,15 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
         )
     )
     assert current["observer_command_id"] == successor["contract_execution_id"]
+    current_worker_view = current["runtime_context_service"]["views"][
+        "worker_view"
+    ]
+    assert current_worker_view["task"]["merge_queue_id"] == (
+        runtime_context.merge_queue_id
+    )
+    assert current_worker_view["graph_query_identity"]["merge_queue_id"] == (
+        runtime_context.merge_queue_id
+    )
     assert current["contract_runtime_dispatch_identity"]["source_ref"].startswith(
         f"contract_runtime:{successor['contract_execution_id']}:completed_lines:"
     )
@@ -82388,6 +82614,14 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
         "finish_time_worker_attestation_submission"
     ]["copy_safe_body"]
     assert startup_copy["observer_command_id"] == successor["contract_execution_id"]
+    assert startup_copy["merge_queue_id"] == runtime_context.merge_queue_id
+    assert guide["runtime_context"]["status"] == "ready"
+    assert guide["runtime_context"]["current_values"]["merge_queue_id"] == (
+        runtime_context.merge_queue_id
+    )
+    assert guide["worker_guide"]["runtime_context"]["current_values"][
+        "merge_queue_id"
+    ] == runtime_context.merge_queue_id
     assert finish_copy["observer_command_id"] == successor["contract_execution_id"]
     assert finish_copy["observer_command_id_source"] == (
         "contract_runtime_execution_id_bridge"
@@ -82803,6 +83037,42 @@ def test_contract_dispatch_identity_without_source_is_non_reconstructable():
     assert resolution["reason_code"] == (
         "source_backed_contract_runtime_dispatch_line_missing"
     )
+
+
+def test_contract_runtime_projection_excludes_rejected_startup_timeline_source():
+    refusal_event = {
+        "id": 4242,
+        "task_id": "worker-rejected-startup-source",
+        "event_type": "mf_subagent.startup_refusal",
+        "event_kind": "mf_subagent_startup_refusal",
+        "phase": "startup_gate",
+        "status": "blocked",
+        "actor": "mf_sub:worker-rejected-startup-source",
+        "payload": {"action": "record_mf_subagent_startup_refusal"},
+    }
+
+    timeline_refs, startup_payload, finish_payload, _close_payload = (
+        server._runtime_context_service_timeline_refs(
+            None,
+            project_id=PID,
+            task_id="worker-rejected-startup-source",
+            backlog_id="AC-REJECTED-STARTUP-SOURCE",
+            timeline_events=[refusal_event],
+        )
+    )
+    source_map = server._contract_runtime_projection_source_map(
+        timeline_events=[refusal_event],
+        timeline_refs=timeline_refs,
+        graph_refs={},
+        finish_payload=finish_payload,
+    )
+
+    assert "startup_event_ref" not in timeline_refs
+    assert timeline_refs["rejected_startup_event_refs"] == ["timeline:4242"]
+    assert startup_payload["event_id"] == ""
+    assert startup_payload["payload"] == {}
+    assert source_map["startup"]["source_ref"] == ""
+    assert source_map["startup"]["source_event"] == {}
 
 
 def test_mf_parallel_finish_projection_uses_source_backed_worker_commit():

@@ -12976,6 +12976,7 @@ def _runtime_context_service_timeline_refs(
         "producer": "task_timeline",
         "implementation_event_refs": [],
         "verification_event_refs": [],
+        "rejected_startup_event_refs": [],
     }
     startup_event: dict[str, Any] = {}
     finish_event: dict[str, Any] = {}
@@ -12997,6 +12998,19 @@ def _runtime_context_service_timeline_refs(
         event_type_normalized = event_type.strip().lower().replace("-", "_")
         event_kind_normalized = event_kind.strip().lower().replace("-", "_")
         phase_normalized = phase.strip().lower().replace("-", "_")
+        event_status_normalized = (
+            str(event.get("status") or "").strip().lower().replace("-", "_")
+        )
+        startup_status_allows_projection = event_status_normalized in {
+            "accepted",
+            "complete",
+            "completed",
+            "ok",
+            "pass",
+            "passed",
+            "succeeded",
+            "success",
+        }
         action_normalized = str(payload.get("action") or "").strip().lower()
         haystack = " ".join(
             (
@@ -13028,7 +13042,10 @@ def _runtime_context_service_timeline_refs(
             event_kind_normalized == "mf_subagent_startup"
             or event_type_normalized == "mf_subagent.startup"
         )
-        if is_startup:
+        is_startup_like = "startup" in haystack and not is_read_receipt
+        if is_startup_like and not startup_status_allows_projection:
+            refs["rejected_startup_event_refs"].append(ref)
+        if is_startup and startup_status_allows_projection:
             refs["startup_event_ref"] = ref
             startup_event = dict(event)
             startup_payload = public_contract_revision_payload(payload)
@@ -13068,8 +13085,8 @@ def _runtime_context_service_timeline_refs(
                         startup_hint[key] = value
         elif (
             not refs.get("startup_event_ref")
-            and "startup" in haystack
-            and not is_read_receipt
+            and is_startup_like
+            and startup_status_allows_projection
         ):
             refs["startup_event_ref"] = ref
             startup_event = dict(event)
@@ -17143,6 +17160,129 @@ def _runtime_context_worker_guide_response(
     service = current_state_response.get("runtime_context_service")
     service = service if isinstance(service, Mapping) else {}
     views = service.get("views") if isinstance(service.get("views"), Mapping) else {}
+    current_view = (
+        dict(views.get("current"))
+        if isinstance(views.get("current"), Mapping)
+        else {}
+    )
+    worker_view_current_source = (
+        dict(views.get("worker_view"))
+        if isinstance(views.get("worker_view"), Mapping)
+        else {}
+    )
+    worker_task_current_source = (
+        dict(worker_view_current_source.get("task"))
+        if isinstance(worker_view_current_source.get("task"), Mapping)
+        else {}
+    )
+    worker_graph_current_source = (
+        dict(worker_view_current_source.get("graph_query_identity"))
+        if isinstance(
+            worker_view_current_source.get("graph_query_identity"),
+            Mapping,
+        )
+        else {}
+    )
+    worker_branch_current_source = (
+        dict(worker_view_current_source.get("branch"))
+        if isinstance(worker_view_current_source.get("branch"), Mapping)
+        else {}
+    )
+    runtime_context_current_values = (
+        dict(current_view.get("current_values"))
+        if isinstance(current_view.get("current_values"), Mapping)
+        else {}
+    )
+    if not runtime_context_current_values:
+        runtime_context_current_values = {
+            "runtime_context_id": (
+                worker_view_current_source.get("runtime_context_id")
+                or worker_task_current_source.get("runtime_context_id")
+                or ""
+            ),
+            "task_id": (
+                worker_view_current_source.get("task_id")
+                or worker_task_current_source.get("task_id")
+                or ""
+            ),
+            "parent_task_id": (
+                worker_view_current_source.get("parent_task_id")
+                or worker_task_current_source.get("parent_task_id")
+                or worker_graph_current_source.get("parent_task_id")
+                or ""
+            ),
+            "target_project_root": (
+                worker_graph_current_source.get("target_project_root")
+                or worker_task_current_source.get("target_project_root")
+                or worker_branch_current_source.get("target_project_root")
+                or ""
+            ),
+            "worktree_path": (
+                worker_branch_current_source.get("worktree_path")
+                or worker_task_current_source.get("worktree_path")
+                or ""
+            ),
+            "branch_ref": (
+                worker_graph_current_source.get("branch_ref")
+                or worker_task_current_source.get("branch_ref")
+                or worker_branch_current_source.get("branch_ref")
+                or ""
+            ),
+            "base_commit": (
+                worker_graph_current_source.get("base_commit")
+                or worker_task_current_source.get("base_commit")
+                or worker_branch_current_source.get("base_commit")
+                or ""
+            ),
+            "target_head_commit": (
+                worker_graph_current_source.get("target_head_commit")
+                or worker_task_current_source.get("target_head_commit")
+                or worker_branch_current_source.get("target_head_commit")
+                or ""
+            ),
+            "merge_queue_id": (
+                worker_task_current_source.get("merge_queue_id")
+                or worker_graph_current_source.get("merge_queue_id")
+                or ""
+            ),
+        }
+    authoritative_merge_queue_id = str(
+        runtime_context_current_values.get("merge_queue_id") or ""
+    ).strip()
+    runtime_context_projection = {
+        "schema_version": "runtime_context.authoritative_current_values.v1",
+        "status": (
+            "ready"
+            if authoritative_merge_queue_id
+            else "blocked_missing_authoritative_merge_queue_id"
+        ),
+        "source": "parallel_branch_runtime_contexts",
+        "source_of_authority": "RuntimeContext.current_values",
+        "current_values": {
+            key: runtime_context_current_values.get(key, "")
+            for key in (
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "target_project_root",
+                "worktree_path",
+                "branch_ref",
+                "base_commit",
+                "target_head_commit",
+                "merge_queue_id",
+            )
+        },
+        "required_worker_startup_field": (
+            "runtime_context.current_values.merge_queue_id"
+        ),
+        "merge_queue_id_source": (
+            "parallel_branch_runtime_contexts.merge_queue_id"
+        ),
+        "copy_safe": True,
+        "route_local_merge_queue_id_allowed": False,
+        "caller_inferred_merge_queue_id_allowed": False,
+        "placeholder_merge_queue_id_actionable": False,
+    }
     worker_view = dict(views.get("worker_view") or {})
     action_plan = dict(worker_view.get("action_plan") or views.get("action_plan") or {})
     control_plane = dict(
@@ -18726,10 +18866,7 @@ def _runtime_context_worker_guide_response(
             or ""
         ),
         merge_queue_id=str(
-            graph_identity.get("merge_queue_id")
-            or task.get("merge_queue_id")
-            or branch_view.get("merge_queue_id")
-            or ""
+            authoritative_merge_queue_id
         ),
         route_identity=route_identity,
         fence_token_hash=str(
@@ -18804,6 +18941,29 @@ def _runtime_context_worker_guide_response(
         actionable_payloads,
         worker_scope_files,
     )
+    if contract_worker_commit_required and not authoritative_merge_queue_id:
+        startup_skeleton = dict(
+            actionable_payloads.get("startup_facade_payload_skeleton") or {}
+        )
+        startup_skeleton.update(
+            {
+                "status": "blocked_missing_authoritative_merge_queue_id",
+                "actionable": False,
+                "body": {},
+                "copy_safe_body": {},
+                "missing_required_fields": [
+                    "runtime_context.current_values.merge_queue_id"
+                ],
+                "next_action": "re_read_runtime_context_current_or_stop",
+                "message": (
+                    "Worker startup is not actionable until the server exposes "
+                    "the exact RuntimeContext current merge_queue_id."
+                ),
+            }
+        )
+        actionable_payloads["startup_facade_payload_skeleton"] = (
+            startup_skeleton
+        )
     if contract_runtime_resolution_blocked:
         actionable_payloads = {
             "schema_version": (
@@ -18850,6 +19010,7 @@ def _runtime_context_worker_guide_response(
         "retry_policy": retry_policy,
         "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
         "runtime_context_id": runtime_context_id,
+        "runtime_context": runtime_context_projection,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "contract_execution_id": str(
@@ -18930,6 +19091,7 @@ def _runtime_context_worker_guide_response(
         "worker_guide": {
             "schema_version": "runtime_context.worker_guide.v1",
             "runtime_context_id": runtime_context_id,
+            "runtime_context": runtime_context_projection,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
             "contract_execution_id": str(
@@ -19032,6 +19194,10 @@ def _runtime_context_worker_guide_response(
                 "runtime_context_id": runtime_context_id,
                 "task_id": graph_identity.get("task_id") or task_id,
                 "parent_task_id": parent_task_id,
+                "merge_queue_id": runtime_context_current_values.get(
+                    "merge_queue_id",
+                    "",
+                ),
                 "worker_role": graph_identity.get("worker_role") or "mf_sub",
                 "governance_project_id": (
                     graph_identity.get("governance_project_id")
@@ -63293,6 +63459,10 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
     )
     worker_id = next_text("worker_id", next_text("worker_slot_id", "<worker id>"))
     worker_slot_id = next_text("worker_slot_id", worker_id)
+    dispatch_merge_queue_id = _exact_text(
+        dispatch_payload.get("merge_queue_id")
+    )
+    merge_queue_id = dispatch_merge_queue_id or next_text("merge_queue_id")
     target_project_root = next_text(
         "target_project_root",
         next_text("project_root", "<registered target project root>"),
@@ -63465,6 +63635,8 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
         "post_dispatch_runtime_identity": {
             "status": (
                 "exact_completed_dispatch"
+                if dispatch_payload and dispatch_merge_queue_id
+                else "blocked_missing_authoritative_merge_queue_id"
                 if dispatch_payload
                 else "allocation_or_dispatch_required"
             ),
@@ -63480,6 +63652,15 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             "parent_task_id": parent_task_id,
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
+            "merge_queue_id": (
+                dispatch_merge_queue_id if dispatch_payload else merge_queue_id
+            ),
+            "merge_queue_id_source": (
+                "ContractRuntime.completed_lines."
+                "observer_dispatch_bounded_workers"
+                if dispatch_payload and dispatch_merge_queue_id
+                else ""
+            ),
             "target_project_root": target_project_root,
             "worktree_path": next_text(
                 "worktree_path",
@@ -63516,6 +63697,89 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             "raw_worker_env_delivery": "worker_host_envelope",
             "session_token_ref_alone_authorizes_writes": False,
         },
+    }
+
+
+def _contract_runtime_authoritative_runtime_context_projection(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one exact dispatched RuntimeContext into ContractRuntime reads."""
+
+    if not _is_mf_parallel_record_contract_id(str(record.get("contract_id") or "")):
+        return {}
+    from .parallel_branch_runtime import (
+        runtime_context_effective_target_project_root,
+        runtime_context_id_for_branch_context,
+    )
+
+    contexts: dict[str, Any] = {}
+    for line in record.get("completed_lines") or []:
+        if not isinstance(line, Mapping):
+            continue
+        if (
+            str(line.get("stage_id") or "").strip() != "dispatch"
+            or str(line.get("line_id") or "").strip()
+            != "observer_dispatch_bounded_workers"
+            or str(line.get("evidence_kind") or "").strip()
+            != "dispatch_bounded_worker"
+        ):
+            continue
+        context = _contract_runtime_context_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=line,
+        )
+        if context is None:
+            continue
+        runtime_context_id = runtime_context_id_for_branch_context(context)
+        if runtime_context_id:
+            contexts[runtime_context_id] = context
+    if len(contexts) != 1:
+        return {}
+
+    runtime_context_id, context = next(iter(contexts.items()))
+    merge_queue_id = str(getattr(context, "merge_queue_id", "") or "").strip()
+    current_values = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": str(getattr(context, "task_id", "") or "").strip(),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "target_project_root": runtime_context_effective_target_project_root(
+            context
+        ),
+        "worktree_path": str(
+            getattr(context, "worktree_path", "") or ""
+        ).strip(),
+        "branch_ref": str(getattr(context, "branch_ref", "") or "").strip(),
+        "base_commit": str(getattr(context, "base_commit", "") or "").strip(),
+        "target_head_commit": str(
+            getattr(context, "target_head_commit", "") or ""
+        ).strip(),
+        "merge_queue_id": merge_queue_id,
+    }
+    return {
+        "schema_version": "runtime_context.authoritative_current_values.v1",
+        "status": (
+            "ready"
+            if merge_queue_id
+            else "blocked_missing_authoritative_merge_queue_id"
+        ),
+        "source": "parallel_branch_runtime_contexts",
+        "source_of_authority": "RuntimeContext.current_values",
+        "current_values": current_values,
+        "required_worker_startup_field": (
+            "runtime_context.current_values.merge_queue_id"
+        ),
+        "merge_queue_id_source": (
+            "parallel_branch_runtime_contexts.merge_queue_id"
+        ),
+        "copy_safe": True,
+        "route_local_merge_queue_id_allowed": False,
+        "caller_inferred_merge_queue_id_allowed": False,
+        "placeholder_merge_queue_id_actionable": False,
     }
 
 
@@ -68344,6 +68608,11 @@ def _contract_runtime_projection_source_map(
         timeline_events,
         review_ready_ref or finish_ref,
     )
+    startup_ref = str(timeline_refs.get("startup_event_ref") or "").strip()
+    startup_event = _contract_runtime_projection_event_for_ref(
+        timeline_events,
+        startup_ref,
+    )
     finish_source_payload = (
         finish_payload.get("payload")
         if isinstance(finish_payload.get("payload"), Mapping)
@@ -68355,8 +68624,9 @@ def _contract_runtime_projection_source_map(
             "read_receipt_hash": str(timeline_refs.get("read_receipt_hash") or ""),
         },
         "startup": {
-            "source_ref": str(timeline_refs.get("startup_event_ref") or ""),
+            "source_ref": startup_ref,
             "payload": dict(timeline_refs.get("startup_hint") or {}),
+            "source_event": startup_event,
         },
         "graph_trace": {
             "source_ref": f"graph_trace:{graph_trace_ids[0]}"
@@ -68494,6 +68764,12 @@ def _contract_runtime_projected_worker_line(
         source_key=source_key,
         timeline_refs=timeline_refs,
     )
+    source_event = (
+        source.get("source_event")
+        if isinstance(source.get("source_event"), Mapping)
+        else {}
+    )
+    source_status = str(source_event.get("status") or "").strip().lower()
     payload = {
         "schema_version": "mf_parallel.runtime_context_worker_line_projection.v1",
         "source": "runtime_context_worker_evidence",
@@ -68545,6 +68821,8 @@ def _contract_runtime_projected_worker_line(
             ),
         },
     }
+    if source_status:
+        line["status"] = source_status
     if head_commit:
         line["commit_sha"] = head_commit
     if graph_trace_ids:
@@ -112167,6 +112445,7 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
     active_epoch_payload: dict[str, Any] = {}
     active_epoch_resume: dict[str, Any] = {}
     active_epoch_backlog_scope = ""
+    runtime_context_projection: dict[str, Any] = {}
     with DBContext(project_id) as conn:
         record = _contract_runtime_store(conn).get(contract_execution_id)
         actor_role = _contract_runtime_effective_actor_role(
@@ -112192,6 +112471,13 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
                 ),
                 actor_role=actor_role,
             )
+        runtime_context_projection = (
+            _contract_runtime_authoritative_runtime_context_projection(
+                conn,
+                project_id=project_id,
+                record=record,
+            )
+        )
         from .parallel_branch_runtime import (
             integration_epoch_resume_payload,
             integration_epoch_to_dict,
@@ -112216,6 +112502,8 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
         request_id=ctx.request_id,
     )
     response["actor_role"] = actor_role
+    if runtime_context_projection:
+        response["runtime_context"] = runtime_context_projection
     if active_epoch_payload:
         from .contract_state_runtime import integration_epoch_resume_projection
 

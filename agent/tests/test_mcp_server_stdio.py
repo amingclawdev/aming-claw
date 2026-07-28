@@ -1618,6 +1618,57 @@ def test_governance_mcp_runtime_context_worker_guide_tool_is_read_only(monkeypat
     ]
 
 
+def test_mcp_runtime_reads_preserve_authoritative_merge_queue_projection(
+    monkeypatch,
+):
+    projection = {
+        "schema_version": "runtime_context.authoritative_current_values.v1",
+        "status": "ready",
+        "source_of_authority": "RuntimeContext.current_values",
+        "current_values": {
+            "runtime_context_id": "mfrctx-merge-queue-projection",
+            "task_id": "worker-merge-queue-projection",
+            "merge_queue_id": "mq-merge-queue-projection",
+        },
+        "route_local_merge_queue_id_allowed": False,
+    }
+
+    def fake_http(method: str, path: str, body: dict | None = None):
+        assert method == "GET"
+        assert body is None
+        return {
+            "ok": True,
+            "runtime_context": projection,
+            "endpoint": path,
+        }
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+
+    contract_current = governance_mcp_server._dispatch_tool(
+        "contract_runtime_current",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-merge-queue-projection",
+        },
+    )
+    worker_guide = governance_mcp_server._dispatch_tool(
+        "runtime_context_worker_guide",
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-merge-queue-projection",
+        },
+    )
+
+    for response in (contract_current, worker_guide):
+        assert response["runtime_context"] == projection
+        assert response["runtime_context"]["current_values"][
+            "merge_queue_id"
+        ] == "mq-merge-queue-projection"
+        assert response["runtime_context"][
+            "route_local_merge_queue_id_allowed"
+        ] is False
+
+
 def test_worker_auth_env_is_added_only_at_runtime_mcp_http_boundary(monkeypatch):
     session_token = "worker-session-secret"
     fence_token = "worker-fence-secret"

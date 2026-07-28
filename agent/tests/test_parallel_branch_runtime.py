@@ -2176,6 +2176,11 @@ def test_runtime_context_worker_guide_carries_branch_runtime_owned_files() -> No
     assert worker_view["target_files"] == list(target_files)
     assert worker_view["owned_files"] == list(owned_files)
     assert worker_view["capability_boundary"]["owned_files"] == list(owned_files)
+    assert current["current_values"]["merge_queue_id"] == context.merge_queue_id
+    assert worker_view["task"]["merge_queue_id"] == context.merge_queue_id
+    assert worker_view["graph_query_identity"]["merge_queue_id"] == (
+        context.merge_queue_id
+    )
     assert implementation_step["owned_files"] == list(owned_files)
     assert read_action["worker_constraints"]["scope"]["owned_files"] == list(owned_files)
 
@@ -6134,6 +6139,13 @@ def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None
         payload=_startup_payload(str(worktree), runtime_context_id="mfrctx-other"),
         now_iso=NOW,
     )
+    wrong_merge_queue = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(str(worktree), merge_queue_id="mq-wrong"),
+        now_iso=NOW,
+    )
     missing_merge_payload = _startup_payload(str(worktree))
     missing_merge_payload.pop("merge_queue_id")
     missing_merge_queue = record_mf_subagent_startup(
@@ -6168,6 +6180,8 @@ def test_mf_sub_startup_blocks_allocation_only_and_stale_fence(tmp_path) -> None
     assert wrong_agent["blocker_id"] == "agent_id_mismatch"
     assert wrong_runtime_context["ok"] is False
     assert wrong_runtime_context["blocker_id"] == "runtime_context_id_mismatch"
+    assert wrong_merge_queue["ok"] is False
+    assert wrong_merge_queue["blocker_id"] == "merge_queue_id_mismatch"
     assert missing_merge_queue["ok"] is False
     assert missing_merge_queue["blocker_id"] == (
         "no_truthful_bounded_mf_sub_startup_surface_available"
