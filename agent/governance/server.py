@@ -63189,15 +63189,13 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
                     continue
                 dispatch_candidates.append(candidate)
 
-    dispatch_candidates_by_identity: dict[
-        tuple[str, str, str, str, str, str],
-        list[Mapping[str, Any]],
-    ] = {}
-    for candidate in dispatch_candidates:
+    def _dispatch_candidate_identity(
+        candidate: Mapping[str, Any],
+    ) -> tuple[str, str, str, str, str, str]:
         worker_identity = _exact_text(
             candidate.get("worker_slot_id") or candidate.get("worker_id")
         )
-        identity = (
+        return (
             _exact_text(candidate.get("runtime_context_id")),
             _exact_text(candidate.get("task_id")),
             _exact_text(candidate.get("parent_task_id")),
@@ -63205,6 +63203,42 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             _exact_text(candidate.get("target_project_root")),
             _exact_text(candidate.get("worktree_path")),
         )
+
+    candidate_identities = [
+        (candidate, _dispatch_candidate_identity(candidate))
+        for candidate in dispatch_candidates
+    ]
+
+    def _strict_compatible_identity_subset(
+        candidate_identity: tuple[str, str, str, str, str, str],
+        richer_identity: tuple[str, str, str, str, str, str],
+    ) -> bool:
+        if sum(bool(value) for value in candidate_identity) >= sum(
+            bool(value) for value in richer_identity
+        ):
+            return False
+        return all(
+            not value or (richer_value and value == richer_value)
+            for value, richer_value in zip(candidate_identity, richer_identity)
+        )
+
+    maximal_dispatch_candidates = [
+        (candidate, identity)
+        for index, (candidate, identity) in enumerate(candidate_identities)
+        if not any(
+            index != other_index
+            and _strict_compatible_identity_subset(identity, other_identity)
+            for other_index, (_other_candidate, other_identity) in enumerate(
+                candidate_identities
+            )
+        )
+    ]
+
+    dispatch_candidates_by_identity: dict[
+        tuple[str, str, str, str, str, str],
+        list[Mapping[str, Any]],
+    ] = {}
+    for candidate, identity in maximal_dispatch_candidates:
         dispatch_candidates_by_identity.setdefault(identity, []).append(candidate)
 
     dispatch_payload: Mapping[str, Any] = {}
@@ -65285,6 +65319,65 @@ def _contract_runtime_guide_for_response(
     return guide
 
 
+def _contract_runtime_compact_exact_dispatch_bridge(
+    bridge: Mapping[str, Any],
+) -> dict[str, Any]:
+    post_dispatch_identity = (
+        bridge.get("post_dispatch_runtime_identity")
+        if isinstance(bridge.get("post_dispatch_runtime_identity"), Mapping)
+        else {}
+    )
+    if str(post_dispatch_identity.get("status") or "").strip() != (
+        "exact_completed_dispatch"
+    ):
+        return dict(bridge)
+
+    copy_safe_bridge = (
+        bridge.get("copy_safe_bridge_payload")
+        if isinstance(bridge.get("copy_safe_bridge_payload"), Mapping)
+        else {}
+    )
+    compact_copy_safe_bridge = {
+        key: dict(value) if isinstance(value, Mapping) else value
+        for key, value in copy_safe_bridge.items()
+        if key
+        in {
+            "runtime_context_worker_guide",
+            "contract_runtime_submit_line_body_after_bridge",
+        }
+    }
+    host_handoff = (
+        dict(bridge.get("worker_host_envelope_handoff"))
+        if isinstance(bridge.get("worker_host_envelope_handoff"), Mapping)
+        else {}
+    )
+    host_handoff.pop("capacity_fallback_guidance", None)
+
+    compact = {
+        key: dict(value) if isinstance(value, Mapping) else value
+        for key, value in bridge.items()
+        if key
+        not in {
+            "copy_safe_bridge_payload",
+            "parallel_branch_allocate_submission",
+            "worker_host_envelope_handoff",
+            "capacity_fallback_guidance",
+        }
+    }
+    compact["copy_safe_bridge_payload"] = compact_copy_safe_bridge
+    compact["worker_host_envelope_handoff"] = host_handoff
+    compact["compact_projection"] = {
+        "status": "exact_dispatch_redundancy_omitted",
+        "omitted_sections": [
+            "parallel_branch_allocate_submission",
+            "duplicate_worker_host_envelope_handoff",
+            "duplicate_capacity_fallback_guidance",
+        ],
+        "source_of_authority": "ContractRuntime.completed_lines",
+    }
+    return compact
+
+
 def _contract_runtime_response(
     record: Mapping[str, Any],
     *,
@@ -65344,6 +65437,24 @@ def _contract_runtime_response(
 
     response.pop("contract_runtime_current_state", None)
     response.pop("runtime_guide", None)
+    next_legal_action = (
+        dict(response.get("next_legal_action"))
+        if isinstance(response.get("next_legal_action"), Mapping)
+        else {}
+    )
+    bridge = (
+        next_legal_action.get("mf_sub_host_bridge_guidance")
+        if isinstance(
+            next_legal_action.get("mf_sub_host_bridge_guidance"),
+            Mapping,
+        )
+        else {}
+    )
+    if bridge:
+        next_legal_action["mf_sub_host_bridge_guidance"] = (
+            _contract_runtime_compact_exact_dispatch_bridge(bridge)
+        )
+        response["next_legal_action"] = next_legal_action
     response.update(
         {
             "schema_version": "contract_runtime.compact_cli_response.v1",

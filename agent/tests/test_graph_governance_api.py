@@ -60892,6 +60892,85 @@ def test_contract_runtime_mf_sub_bridge_replays_distinct_dispatch_target_root(
         )
 
 
+def test_contract_runtime_compact_current_coalesces_live_dispatch_projection(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-MF-PARALLEL-LIVE-DISPATCH-PROJECTION"
+    target_project_root = tmp_path / "daily-planner-lite"
+    worktree_path = target_project_root / ".worktrees" / "mf-sub-live-dispatch"
+    target_project_root.mkdir()
+    worktree_path.mkdir(parents=True)
+    successor, runtime_context = (
+        _setup_mf_parallel_contract_runtime_worker_dispatch(
+            conn,
+            backlog_id=backlog_id,
+            task_id="mf-parallel-live-dispatch-parent",
+            worker_task_id="mf-sub-live-dispatch",
+            fence_token="fence-mf-sub-live-dispatch",
+            token="token-mf-sub-live-dispatch",
+            worktree_path=str(worktree_path),
+            target_project_root=str(target_project_root),
+        )
+    )
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            "observer",
+            query={"response_view": "cli_current"},
+        )
+    )
+
+    assert current["schema_version"] == "contract_runtime.compact_cli_response.v1"
+    assert "runtime_guide" not in current
+    assert "contract_runtime_current_state" not in current
+    assert "completed_lines" not in current
+    assert len(json.dumps(current)) < 16_384
+    bridge = current["next_legal_action"]["mf_sub_host_bridge_guidance"]
+    exact_identity = bridge["post_dispatch_runtime_identity"]
+    assert exact_identity["status"] == "exact_completed_dispatch"
+    assert exact_identity["runtime_context_id"] == runtime_context.runtime_context_id
+    assert exact_identity["target_project_root"] == str(target_project_root)
+    assert exact_identity["worktree_path"] == str(worktree_path)
+
+    submit_body = bridge["copy_safe_bridge_payload"][
+        "contract_runtime_submit_line_body_after_bridge"
+    ]
+    worker_guide_body = bridge["copy_safe_bridge_payload"][
+        "runtime_context_worker_guide"
+    ]
+    initial_join_body = bridge["worker_host_envelope_handoff"]["initial_join"][
+        "copy_safe_body"
+    ]
+    for body in (submit_body, worker_guide_body, initial_join_body):
+        assert body["runtime_context_id"] == runtime_context.runtime_context_id
+        assert body["target_project_root"] == str(target_project_root)
+        assert body["target_project_root"] != str(worktree_path)
+
+    record = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    conflicting_guide = json.loads(json.dumps(record["runtime_guide"]))
+    dispatch_line = next(
+        line
+        for line in conflicting_guide["completed_lines"]
+        if line["line_id"] == "observer_dispatch_bounded_workers"
+    )
+    dispatch_line["payload"]["target_project_root"] = str(
+        tmp_path / "conflicting-project-root"
+    )
+    conflicting_bridge = server._contract_runtime_mf_sub_host_bridge_guidance(
+        conflicting_guide
+    )
+    assert conflicting_bridge["post_dispatch_runtime_identity"]["status"] == (
+        "allocation_or_dispatch_required"
+    )
+
+
 def test_contract_runtime_dispatch_projects_canonical_allocation_payload():
     contract_execution_id = "cex-mf-parallel-dispatch-guide"
     route_token_ref = "rtok-mf-parallel-dispatch-guide"
