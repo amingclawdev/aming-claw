@@ -57519,7 +57519,8 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
     assert guide["interface_index"]["mf_batch_parallel_enter"]["path"] == (
         "/api/projects/{project_id}/mf-batch-parallel/enter"
     )
-    assert guide["interface_index"]["release_operator_head_queue"] == {
+    release_queue = guide["interface_index"]["release_operator_head_queue"]
+    assert release_queue == {
         "kind": "http",
         "read_method": "GET",
         "mutation_method": "POST",
@@ -57527,6 +57528,27 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
         "mutation_roles": ["observer", "coordinator"],
         "bounded_capacity": 32,
         "actions": ["insert", "reorder", "skip", "remove"],
+        "remove_active_historical_requires": [
+            "backlog_id",
+            "reason",
+            "historical_non_schedulable=true",
+            "historical_execution_resume_allowed=false",
+            "evidence_refs",
+        ],
+        "remove_guards": {
+            "operator_authorized": True,
+            "non_empty_reason": True,
+            "non_empty_evidence_refs_for_active_execution": True,
+            "active_integration_epoch_member_removable": False,
+            "ordinary_active_execution_requires_historical_proof": True,
+        },
+        "removal_effect": {
+            "queue_membership_only": True,
+            "backlog_deleted": False,
+            "contract_runtime_audit_deleted": False,
+            "audited": True,
+            "reversible_by_audited_insert": True,
+        },
     }
     graph_first = guide["graph_first_policy"]
     assert graph_first["source_symbol_discovery"]["tool_agnostic"] is True

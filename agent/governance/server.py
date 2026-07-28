@@ -78731,6 +78731,27 @@ def _onboard_contract_route_guide(
             "mutation_roles": ["observer", "coordinator"],
             "bounded_capacity": RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS,
             "actions": ["insert", "reorder", "skip", "remove"],
+            "remove_active_historical_requires": [
+                "backlog_id",
+                "reason",
+                "historical_non_schedulable=true",
+                "historical_execution_resume_allowed=false",
+                "evidence_refs",
+            ],
+            "remove_guards": {
+                "operator_authorized": True,
+                "non_empty_reason": True,
+                "non_empty_evidence_refs_for_active_execution": True,
+                "active_integration_epoch_member_removable": False,
+                "ordinary_active_execution_requires_historical_proof": True,
+            },
+            "removal_effect": {
+                "queue_membership_only": True,
+                "backlog_deleted": False,
+                "contract_runtime_audit_deleted": False,
+                "audited": True,
+                "reversible_by_audited_insert": True,
+            },
         },
         "contract_chain_current": {
             "kind": "mcp_or_http",
