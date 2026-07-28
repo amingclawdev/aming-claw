@@ -52987,6 +52987,24 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         "live_regression",
     ]
     post_mutation = direct_main["copy_safe_post_mutation_events"]
+    changed_files_placeholder = post_mutation["implementation"][
+        "arguments_template"
+    ]["payload"]["changed_files"]
+    assert changed_files_placeholder.startswith(
+        "<replace with the exact changed-files list"
+    )
+    assert post_mutation["immutable_allowed_files"] == template["allowed_files"]
+    assert (
+        "may be a strict subset of immutable_allowed_files"
+        in post_mutation["changed_files_rule"]
+    )
+    assert post_mutation["implementation"]["same_value_replacements"][
+        changed_files_placeholder
+    ] == [
+        "payload.changed_files",
+        "payload.dirty_scope_check.changed_files",
+        "payload.diff_check.changed_files",
+    ]
     assert implementation_shape["copy_safe_event"] == post_mutation[
         "implementation"
     ]
@@ -53000,6 +53018,16 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         assert event_template["identity_ready"] is True
         assert event_template["executable_after_replacements"] is True
         assert event_template["raw_route_token_required"] is False
+    assert post_mutation["preclose_check"]["mcp_tool"] == (
+        "mf_timeline_precheck"
+    )
+    assert post_mutation["preclose_check"]["arguments_template"]["view"] == (
+        "full"
+    )
+    assert post_mutation["preclose_check"]["mutates_backlog_chain"] is False
+    assert post_mutation["preclose_check"]["required_before"] == (
+        "first backlog_close"
+    )
     assert post_mutation["canonical_field_policy"] == {
         "implementation": {
             "required": [
@@ -53173,6 +53201,14 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         post_mutation["implementation"]["arguments_template"]
     )
     implementation_arguments["commit_sha"] = close_commit
+    actual_changed_files = ["agent/governance/server.py"]
+    implementation_arguments["payload"]["changed_files"] = actual_changed_files
+    implementation_arguments["payload"]["dirty_scope_check"][
+        "changed_files"
+    ] = actual_changed_files
+    implementation_arguments["payload"]["diff_check"][
+        "changed_files"
+    ] = actual_changed_files
     server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
@@ -58081,7 +58117,7 @@ def test_contract_bound_direct_main_capsule_mint_validate_hash_and_refresh_termi
         body={
             "backlog_id": backlog_id,
             "role": "observer",
-            "work_type": "operator_supervised_direct_main",
+            "work_type": "direct_main",
             "route_token_ref": "rtok-capsule-direct-main",
             "response_view": "compact",
         },
@@ -58107,6 +58143,146 @@ def test_contract_bound_direct_main_capsule_mint_validate_hash_and_refresh_termi
             is None
         )
         _assert_compact_capsule_fetches_every_advertised_section(compact)
+
+    role_guidance = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": compact["guide_capsule_ref"],
+                "sections": ["role_guidance"],
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "direct_main",
+            },
+        )
+    )["sections"]["role_guidance"]
+    shapes = role_guidance["direct_main_evidence_shapes"]
+    assert shapes["schema_version"].endswith("compact_evidence_shapes.v1")
+    assert shapes["immutable_allowed_files"]
+    assert shapes["pre_mutation"]["verification"]["dirty_scope"] == {
+        "allowed_files": "<copy immutable_allowed_files exactly>",
+        "exact_match": True,
+    }
+    changed_files_ref = shapes["implementation"]["payload"]["changed_files"]
+    assert changed_files_ref.startswith("<exact changed-files list; subset")
+    assert shapes["implementation"]["payload"]["dirty_scope_check"][
+        "allowed_files"
+    ] == "<copy immutable_allowed_files exactly>"
+    assert shapes["implementation"]["payload"]["dirty_scope_check"][
+        "changed_files"
+    ] == changed_files_ref
+    assert (
+        "may be a strict subset of immutable_allowed_files"
+        in shapes["changed_files_rule"]
+    )
+    assert shapes["close_ready"]["verification"]["runtime_sync"]["status"] == (
+        "passed"
+    )
+    assert shapes["close_ready"]["verification"]["live_regression"]["status"] == (
+        "passed"
+    )
+    assert shapes["close_ready"]["verification"]["graph_reconciled"] is True
+    assert shapes["close_ready"]["verification"]["preflight_ok"] is True
+    assert shapes["preclose_check"]["mcp_tool"] == "mf_timeline_precheck"
+    assert shapes["preclose_check"]["view"] == "full"
+    assert shapes["preclose_check"]["mutates_backlog_chain"] is False
+    assert shapes["preclose_check"]["required_before"] == "first backlog_close"
+    assert "build_assets_synced" in shapes["forbidden_aliases"]
+    assert len(json.dumps(role_guidance).encode("utf-8")) <= 6 * 1024
+
+
+def test_parentless_direct_main_preclose_failure_projects_exact_file_diagnostics(
+    monkeypatch,
+):
+    backlog_id = "AC-PARENTLESS-PRECLOSE-EXACT-FILE-DIAGNOSTICS"
+    execution_id = "onboard-service-parentless-preclose"
+    direct_event = {
+        "id": 99101,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "event_kind": "observer_direct_implementation_exception",
+        "payload": {},
+    }
+    changed_file_scope = {
+        "changed_files": [
+            "agent/governance/server.py",
+            "agent/tests/test_mcp_server_stdio.py",
+        ],
+        "allowed_files": ["agent/governance/server.py"],
+        "unexpected_changed_files": ["agent/tests/test_mcp_server_stdio.py"],
+        "within_allowed_scope": False,
+    }
+
+    monkeypatch.setattr(
+        server,
+        "_observer_root_route_identity_from_event",
+        lambda _event: {
+            "route_id": "route-parentless-preclose",
+            "route_context_hash": _fake_sha("route-parentless-preclose"),
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_close_authority_route_token_backed_event",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_observer_direct_exception_event",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "missing_fields": [],
+            "event": {"id": direct_event["id"]},
+        },
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "mf_close_gate_verification",
+        lambda *_args, **_kwargs: {
+            "observer_direct_close_exception_gate": {
+                "passed": False,
+                "missing_requirement_ids": [
+                    "changed_files_within_allowed_scope"
+                ],
+                "changed_file_scope": changed_file_scope,
+                "implementation_event": {"id": 99102},
+                "verification_event": {"id": 99103},
+                "close_ready_event": {"id": 99104},
+            },
+            "missing_event_kinds": [],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_parentless_direct_main_graph_trace_gate",
+        lambda *_args, **_kwargs: {
+            "passed": True,
+            "missing_requirement_ids": [],
+            "verified_trace_ids": ["gqt-parentless-preclose"],
+        },
+    )
+
+    gate = server._contract_runtime_parentless_direct_main_close_authority_gate(
+        project_id=PID,
+        bug_id=backlog_id,
+        requested_execution_id=execution_id,
+        close_commit="a" * 40,
+        timeline_events=[direct_event],
+        row_declared_files=["agent/governance/server.py"],
+    )
+
+    assert gate["passed"] is False
+    assert gate["missing_requirement_ids"] == [
+        "changed_files_within_allowed_scope"
+    ]
+    assert gate["changed_file_scope"] == changed_file_scope
+    assert gate["selected_evidence_events"] == {
+        "implementation": {"id": 99102},
+        "verification": {"id": 99103},
+        "close_ready": {"id": 99104},
+    }
+
 
 def test_ordinary_mf_parallel_capsule_fetches_all_sections(conn):
     backlog_id = "AC-CAPSULE-ORDINARY-MF-PARALLEL"

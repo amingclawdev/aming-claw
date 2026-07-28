@@ -78712,6 +78712,10 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
     allowed_files = _runtime_context_service_dedupe(
         [str(path or "").strip() for path in target_files]
     )
+    changed_files_placeholder = (
+        "<replace with the exact changed-files list; every item must be in "
+        "immutable_allowed_files>"
+    )
     close_commit_placeholder = "<replace with the exact closing HEAD commit>"
     full_reconcile_snapshot_placeholder = (
         "<replace with the active current-HEAD full reconcile snapshot id>"
@@ -78736,15 +78740,15 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
         "actor": "observer",
         "commit_sha": close_commit_placeholder,
         "payload": {
-            "changed_files": allowed_files,
+            "changed_files": changed_files_placeholder,
             "dirty_scope_check": {
                 "allowed_files": allowed_files,
-                "changed_files": allowed_files,
+                "changed_files": changed_files_placeholder,
                 "unexpected_files": [],
                 "exact_match": True,
             },
             "diff_check": {
-                "changed_files": allowed_files,
+                "changed_files": changed_files_placeholder,
                 "unexpected_files": [],
                 "exact_match": True,
             },
@@ -78801,14 +78805,31 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
             "onboard_route_guide.parentless_direct_main."
             "copy_safe_post_mutation_events.v1"
         ),
+        "immutable_allowed_files": allowed_files,
+        "changed_files_rule": (
+            "replace every changed-files placeholder with the same exact list "
+            "of files changed by the implementation commit; that list may be "
+            "a strict subset of immutable_allowed_files but may never contain "
+            "an item outside it"
+        ),
         "implementation": {
             **common,
             "arguments_template": implementation_arguments,
-            "replace_before_submit": ["commit_sha"],
+            "replace_before_submit": [
+                "commit_sha",
+                "payload.changed_files",
+                "payload.dirty_scope_check.changed_files",
+                "payload.diff_check.changed_files",
+            ],
             "same_value_replacements": {
                 close_commit_placeholder: [
                     "commit_sha",
-                ]
+                ],
+                changed_files_placeholder: [
+                    "payload.changed_files",
+                    "payload.dirty_scope_check.changed_files",
+                    "payload.diff_check.changed_files",
+                ],
             },
             "required_canonical_fields": [
                 "payload.changed_files",
@@ -78860,6 +78881,45 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
                 "full reconcile"
             ),
         },
+        "preclose_check": {
+            "mcp_tool": "mf_timeline_precheck",
+            "copy_safe": True,
+            "arguments_template": {
+                "project_id": str(project_id or "").strip(),
+                "bug_id": str(backlog_id or "").strip(),
+                "close_commit": close_commit_placeholder,
+                "view": "full",
+                "include_events": False,
+            },
+            "replace_before_submit": ["close_commit"],
+            "same_value_replacements": {
+                close_commit_placeholder: ["close_commit"],
+            },
+            "required_before": "first backlog_close",
+            "pass_paths": [
+                (
+                    "timeline_gate."
+                    "contract_runtime_parentless_direct_main_close_authority_gate."
+                    "passed"
+                ),
+                (
+                    "timeline_gate.contract_runtime_close_authority_projection."
+                    "parentless_direct_main_close_authority_gate.passed"
+                ),
+            ],
+            "failure_diagnostics_path": (
+                "timeline_gate.contract_runtime_close_authority_projection."
+                "parentless_direct_main_close_authority_gate."
+                "changed_file_scope"
+            ),
+            "mutates_backlog_chain": False,
+            "fail_closed": True,
+            "ordering": (
+                "run after close_ready and before the first backlog_close; "
+                "never call backlog_close when neither authority pass path is "
+                "true"
+            ),
+        },
         "canonical_field_policy": {
             "implementation": {
                 "required": [
@@ -78896,6 +78956,177 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
                 "current-HEAD full reconcile, then start a fresh generation."
             ),
         },
+    }
+
+
+def _onboard_parentless_direct_main_compact_evidence_guidance(
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    route_token_ref: str,
+    target_files: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Project exact direct-main evidence shapes into bounded capsule guidance."""
+
+    allowed_files = _runtime_context_service_dedupe(
+        [str(path or "").strip() for path in target_files]
+    )
+    allowed_files_ref = "<copy immutable_allowed_files exactly>"
+    changed_files_ref = (
+        "<exact changed-files list; subset of immutable_allowed_files>"
+    )
+    graph_trace_ref = "<DB-verified graph_query trace_id>"
+    approval_ref = "<operator approval reference>"
+    close_commit_ref = "<exact closing HEAD commit>"
+    snapshot_ref = "<active current-HEAD full snapshot id>"
+    common = {
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "route_token_ref": str(route_token_ref or "").strip(),
+    }
+    return {
+        "schema_version": (
+            "onboard_route_guide.parentless_direct_main."
+            "compact_evidence_shapes.v1"
+        ),
+        "immutable_allowed_files": allowed_files,
+        "same_value_replacements": {
+            allowed_files_ref: [
+                "pre_mutation.verification.dirty_scope.allowed_files",
+                "pre_mutation.artifact_refs.allowed_files",
+                "implementation.payload.dirty_scope_check.allowed_files",
+            ],
+            changed_files_ref: [
+                "implementation.payload.changed_files",
+                "implementation.payload.dirty_scope_check.changed_files",
+            ],
+            close_commit_ref: [
+                "implementation.commit_sha",
+                "close_ready.commit_sha",
+                "close_ready.verification.runtime_sync.commit_sha",
+                "close_ready.verification.live_regression.commit_sha",
+                "close_ready.verification.full_reconcile_snapshot.commit_sha",
+                "preclose_check.close_commit",
+            ],
+        },
+        "pre_mutation": {
+            **common,
+            "event_type": "mf.observer_direct_implementation_exception",
+            "event_kind": "observer_direct_implementation_exception",
+            "phase": "pre_mutation",
+            "status": "accepted",
+            "decision": "operator_supervised_direct_main_approved",
+            "payload": {
+                "reason": "<bounded operator-approved reason>",
+                "observer_direct_mutation": True,
+                "tiny_deterministic_scope": True,
+            },
+            "verification": {
+                "dirty_scope": {
+                    "allowed_files": allowed_files_ref,
+                    "exact_match": True,
+                },
+                "operator_approval": {
+                    "approved": True,
+                    "approval_ref": approval_ref,
+                },
+                "db_verified_pre_implementation_graph_trace": True,
+            },
+            "artifact_refs": {
+                "allowed_files": allowed_files_ref,
+                "graph_trace_ids": [graph_trace_ref],
+                "operator_approval_ref": approval_ref,
+            },
+            "ordering": "after graph_query and before any mutation",
+        },
+        "implementation": {
+            **common,
+            "event_type": "observer.implementation",
+            "event_kind": "implementation",
+            "phase": "implementation",
+            "status": "passed",
+            "commit_sha": close_commit_ref,
+            "payload": {
+                "changed_files": changed_files_ref,
+                "dirty_scope_check": {
+                    "allowed_files": allowed_files_ref,
+                    "changed_files": changed_files_ref,
+                    "unexpected_files": [],
+                    "exact_match": True,
+                },
+            },
+        },
+        "changed_files_rule": (
+            "replace the placeholder with the exact implementation diff; it "
+            "may be a strict subset of immutable_allowed_files and must not "
+            "contain an unexpected file"
+        ),
+        "close_ready": {
+            **common,
+            "event_type": "observer.close_ready",
+            "event_kind": "close_ready",
+            "phase": "close_ready",
+            "status": "passed",
+            "commit_sha": close_commit_ref,
+            "verification": {
+                "runtime_sync": {
+                    "status": "passed",
+                    "commit_sha": close_commit_ref,
+                },
+                "live_regression": {
+                    "status": "passed",
+                    "commit_sha": close_commit_ref,
+                },
+                "graph_reconciled": True,
+                "preflight_ok": True,
+                "full_reconcile_snapshot": {
+                    "snapshot_id": snapshot_ref,
+                    "commit_sha": close_commit_ref,
+                    "active": True,
+                    "snapshot_kind": "full",
+                },
+            },
+        },
+        "preclose_check": {
+            "mcp_tool": "mf_timeline_precheck",
+            "project_id": str(project_id or "").strip(),
+            "bug_id": str(backlog_id or "").strip(),
+            "close_commit": close_commit_ref,
+            "view": "full",
+            "include_events": False,
+            "required_before": "first backlog_close",
+            "pass_paths": [
+                (
+                    "timeline_gate."
+                    "contract_runtime_parentless_direct_main_close_authority_gate."
+                    "passed"
+                ),
+                (
+                    "timeline_gate.contract_runtime_close_authority_projection."
+                    "parentless_direct_main_close_authority_gate.passed"
+                ),
+            ],
+            "failure_diagnostics_path": (
+                "timeline_gate.contract_runtime_close_authority_projection."
+                "parentless_direct_main_close_authority_gate."
+                "changed_file_scope"
+            ),
+            "fail_closed": True,
+            "mutates_backlog_chain": False,
+        },
+        "forbidden_aliases": [
+            "dirty_scope_exact_match",
+            "redeploy_runtime_sync",
+            "active_full_reconcile",
+            "build_assets_synced",
+            "dashboard_browser_e2e",
+            "current_head_full_reconcile",
+        ],
+        "source_of_authority": "ContractRuntime close gate",
+        "copy_safe": True,
+        "authorizes_write": False,
     }
 
 
@@ -82698,6 +82929,22 @@ def _onboard_route_guide_compact_service_response(
             ),
         )
     )
+    direct_main_evidence_shapes = (
+        _onboard_parentless_direct_main_compact_evidence_guidance(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=str(record.get("contract_execution_id") or ""),
+            route_token_ref=str(record.get("route_token_ref") or ""),
+            target_files=target_files,
+        )
+        if selected_role_key == "observer"
+        and selected_work_type
+        in {
+            "direct_main",
+            "operator_supervised_direct_main",
+        }
+        else {}
+    )
 
     def build_sections() -> dict[str, Any]:
         sections = {
@@ -82732,6 +82979,7 @@ def _onboard_route_guide_compact_service_response(
                     "legitimate_evidence_bindings": (
                         legitimate_evidence_bindings
                     ),
+                    "direct_main_evidence_shapes": direct_main_evidence_shapes,
                     "required_sequence": [
                         "read_compact_onboard_route_guide",
                         "fetch_only_named_bounded_sections_when_needed",
@@ -97270,6 +97518,22 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
                 if direct_event.get("id")
                 else str(direct_event.get("event_id") or "")
             ],
+            "changed_file_scope": (
+                dict(direct_gate.get("changed_file_scope") or {})
+                if isinstance(direct_gate.get("changed_file_scope"), Mapping)
+                else {}
+            ),
+            "selected_evidence_events": {
+                "implementation": dict(
+                    direct_gate.get("implementation_event") or {}
+                ),
+                "verification": dict(
+                    direct_gate.get("verification_event") or {}
+                ),
+                "close_ready": dict(
+                    direct_gate.get("close_ready_event") or {}
+                ),
+            },
             "checks": {
                 "has_observer_direct_exception": True,
                 "observer_direct_close_exception_gate_passed": bool(

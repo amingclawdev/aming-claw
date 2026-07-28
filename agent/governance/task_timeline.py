@@ -9427,6 +9427,7 @@ def observer_direct_pre_mutation_authority_schema() -> dict[str, Any]:
                 "operator_approval.approved=true",
                 "operator_approval.approval_ref",
                 "dirty_scope.exact_match=true",
+                "dirty_scope.allowed_files=immutable_row_declared_file_scope",
                 "db_verified_pre_implementation_graph_trace=true",
             ],
             "artifact_ref_fields": [
@@ -9436,6 +9437,18 @@ def observer_direct_pre_mutation_authority_schema() -> dict[str, Any]:
             ],
             "ordering": "append_before_any_mutation",
             "authority": "server_route_token_gate",
+        },
+        "field_semantics": {
+            "dirty_scope.exact_match=true": (
+                "exact_match=true is accepted only when the same dirty_scope "
+                "object also carries allowed_files exactly equal to the "
+                "immutable backlog target_files + test_files scope"
+            ),
+            "allowed_file_fence": (
+                "the immutable row-declared scope is authoritative; missing "
+                "or unexpected changed files must be diagnosed before the "
+                "first backlog_close and must never be auto-admitted"
+            ),
         },
         "required_requirement_ids": [
             "source_backed_server_route_gate_shape",

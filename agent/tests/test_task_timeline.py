@@ -10281,6 +10281,21 @@ class TestTaskTimeline(unittest.TestCase):
     def test_observer_direct_exception_requires_allowed_changed_file_scope(self):
         from agent.governance import task_timeline
 
+        authority_schema = (
+            task_timeline.observer_direct_pre_mutation_authority_schema()
+        )
+        assert (
+            "dirty_scope.allowed_files=immutable_row_declared_file_scope"
+            in authority_schema["canonical_timeline_event"][
+                "verification_fields"
+            ]
+        )
+        assert "exact_match=true is accepted only when" in (
+            authority_schema["field_semantics"][
+                "dirty_scope.exact_match=true"
+            ]
+        )
+
         close_commit = "abc1234"
         contract = {
             "governance_policy": STRICT_GOVERNANCE_POLICY,
