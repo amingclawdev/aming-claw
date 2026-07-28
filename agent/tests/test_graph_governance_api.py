@@ -59685,6 +59685,123 @@ def test_onboard_route_guide_completed_projection_returns_selected_successor_ent
         )
 
 
+def test_onboard_route_guide_compact_mf_parallel_projects_copy_safe_route_issue_input(
+    conn,
+):
+    backlog_id = "AC-ONBOARD-COMPACT-MF-PARALLEL-ROUTE-INPUT"
+    other_backlog_id = "AC-ONBOARD-COMPACT-MF-PARALLEL-ROUTE-INPUT-OTHER"
+    for row_id in (backlog_id, other_backlog_id):
+        _insert_simple_mf_close_backlog(conn, row_id)
+        conn.execute(
+            """
+            UPDATE backlog_bugs
+               SET target_files = ?, test_files = ?
+             WHERE bug_id = ?
+            """,
+            (
+                json.dumps(["agent/governance/server.py"]),
+                json.dumps(["agent/tests/test_graph_governance_api.py"]),
+                row_id,
+            ),
+        )
+    conn.commit()
+
+    compact = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "mf_parallel",
+                "response_view": "compact",
+            },
+        )
+    )
+
+    next_action = compact["next_legal_action"]
+    action_input = compact["action_input"]
+    service_task_id = server._onboard_service_execution_id(PID, backlog_id)
+    assert next_action["action"] == "mf_parallel_enter"
+    assert next_action["interface"] == "mf_parallel_enter"
+    assert next_action["requires_route_token_ref"] is True
+    assert next_action["requires_active_observer_session"] is True
+    assert next_action["action_input_interface"] == "observer_route_context_issue"
+    assert compact["action_input_path"] == "action_input"
+    assert action_input == {
+        "project_id": PID,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": service_task_id,
+        "target_files": [
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+        "allowed_actions": ["onboard_route_guide", "mf_parallel_enter"],
+        "evidence_refs": [
+            f"onboard_service:{service_task_id}",
+            f"backlog:{backlog_id}",
+        ],
+    }
+    serialized = json.dumps(compact, sort_keys=True)
+    assert "session_token" not in json.dumps(action_input, sort_keys=True)
+    assert "route_token" not in json.dumps(action_input, sort_keys=True)
+    assert compact["raw_session_token_exposed"] is False
+    assert compact["raw_route_token_exposed"] is False
+    assert len(serialized.encode("utf-8")) <= 16 * 1024
+
+    capsule = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": compact["guide_capsule_ref"],
+                "sections": ["next_action", "action_input"],
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "mf_parallel",
+            },
+        )
+    )
+    assert capsule["ok"] is True
+    assert capsule["sections"]["next_action"]["requires_route_token_ref"] is True
+    assert capsule["sections"]["action_input"]["body"] == action_input
+
+    other = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": other_backlog_id,
+                "role": "observer",
+                "work_type": "mf_parallel",
+                "response_view": "compact",
+            },
+        )
+    )
+    assert other["guide_capsule_ref"] != compact["guide_capsule_ref"]
+    assert other["action_input"]["backlog_id"] == other_backlog_id
+    assert other["action_input"]["task_id"] == server._onboard_service_execution_id(
+        PID, other_backlog_id
+    )
+    wrong_scope = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": compact["guide_capsule_ref"],
+                "sections": ["action_input"],
+                "backlog_id": other_backlog_id,
+                "role": "observer",
+                "work_type": "mf_parallel",
+            },
+        )
+    )
+    assert wrong_scope["status"] == "refresh_required"
+    assert wrong_scope["reason"] == "guide_capsule_wrong_scope"
+    assert wrong_scope["mismatched_fields"] == ["backlog_id"]
+
+
 def test_onboard_route_guide_service_continues_blocked_candidate_with_audited_bypass(
     conn,
 ):
@@ -86302,6 +86419,115 @@ def test_onboard_route_guide_marks_onboard_service_ref_enter_only_for_mf_paralle
     assert response["onboard_route_guide"]["backlog_chain_binding"]["continue"][
         "next_legal_action"
     ]["route_token_ref"] == ""
+
+
+def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution_id(
+    conn,
+):
+    backlog_id = "AC-ROW-FIRST-GUIDE-MF-PARALLEL-ENTER"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "mf_parallel",
+                "response_view": "compact",
+            },
+        )
+    )
+    action_input = guide["action_input"]
+
+    register_status, registered = server.handle_observer_session_register(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "observer_kind": "codex",
+                "session_label": "row-first-mf-parallel",
+            },
+        )
+    )
+    assert register_status == 201
+    observer_session_id = registered["session_id"]
+    heartbeat = server.handle_observer_session_heartbeat(
+        _ctx(
+            {
+                "project_id": PID,
+                "session_id": observer_session_id,
+            },
+            method="POST",
+            body={"session_token": registered["session_token"]},
+        )
+    )
+    assert heartbeat["ok"] is True
+
+    with pytest.raises(ValidationError, match="requires route_token_ref"):
+        server.handle_project_mf_parallel_enter(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "reason": "No route proof must fail closed.",
+                    "task_id": "row-first-mf-parallel-worker",
+                    "observer_session_id": observer_session_id,
+                    "onboard_service_waiver": True,
+                    "target_files": action_input["target_files"],
+                },
+            )
+        )
+
+    issued = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=action_input,
+        )
+    )
+    assert issued["ok"] is True
+
+    enter_body = {
+        "backlog_id": backlog_id,
+        "reason": "Start bounded row-first mf_parallel work from projected route.",
+        "task_id": "row-first-mf-parallel-worker",
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": issued["route_token_ref"],
+        "onboard_service_waiver": True,
+        "target_files": action_input["target_files"],
+    }
+    assert "contract_execution_id" not in enter_body
+    entered = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=enter_body,
+        )
+    )
+
+    service_task_id = server._onboard_service_execution_id(PID, backlog_id)
+    assert action_input["task_id"] == service_task_id
+    assert entered["ok"] is True
+    assert entered["parent_contract_execution_id"] == service_task_id
+    assert entered["root_contract_execution_id"] == service_task_id
+    assert entered["contract_execution_id"]
+    assert entered["next_legal_action"]["id"] == "observer_prefill_child_contracts"
 
 
 def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(

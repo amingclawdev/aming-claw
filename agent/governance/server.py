@@ -80321,6 +80321,32 @@ def _onboard_route_guide_service_next_action(
     }
 
 
+def _onboard_route_guide_completed_mf_parallel_action_input(
+    *,
+    project_id: str,
+    backlog_id: str,
+    target_files: Sequence[str],
+) -> dict[str, Any]:
+    """Copy-safe route-issue payload for the row-first mf_parallel successor."""
+
+    onboard_service_task_id = _onboard_service_execution_id(project_id, backlog_id)
+    scoped_target_files = _runtime_context_public_file_values(target_files)
+    return {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": onboard_service_task_id,
+        "target_files": scoped_target_files,
+        "allowed_actions": _observer_route_context_issue_allowed_actions(
+            ["onboard_route_guide", "mf_parallel_enter"]
+        ),
+        "evidence_refs": [
+            f"onboard_service:{onboard_service_task_id}",
+            f"backlog:{backlog_id}",
+        ],
+    }
+
+
 def _onboard_route_guide_completed_next_action(
     *,
     role: str = "",
@@ -80436,6 +80462,11 @@ def _onboard_route_guide_completed_next_action(
             ),
         }
     if selected_work_type in {"parallel_worker", "mf_parallel"}:
+        action_input = _onboard_route_guide_completed_mf_parallel_action_input(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            target_files=target_files,
+        )
         return {
             **base,
             "id": "mf_parallel_enter",
@@ -80444,6 +80475,27 @@ def _onboard_route_guide_completed_next_action(
             "path": "/api/projects/{project_id}/mf-parallel/enter",
             "requires_role": "observer",
             "requires_route_token_ref": True,
+            "requires_active_observer_session": True,
+            "observer_session_prerequisite": {
+                "required": True,
+                "register_interface": "observer_session_register",
+                "keepalive_interface": "observer_session_heartbeat",
+                "instruction": (
+                    "register or heartbeat an active observer session before "
+                    "issuing this route and calling mf_parallel_enter"
+                ),
+                "raw_session_token_persisted": False,
+            },
+            "action_input_interface": "observer_route_context_issue",
+            "action_input": action_input,
+            "action_input_copy_safe": True,
+            "allowed_actions": list(action_input["allowed_actions"]),
+            "route_token_ref_source": (
+                "observer_route_context_issue.route_token_ref"
+            ),
+            "mf_parallel_enter_contract_execution_id_required": False,
+            "raw_session_token_exposed": False,
+            "raw_route_token_exposed": False,
             "contract_template_id": MF_PARALLEL_CONTRACT_ID,
             "single_backlog_scoped": True,
             "requires_observer_dispatch": True,
@@ -81854,6 +81906,7 @@ def _onboard_route_guide_compact_service_response(
         for key, value in {
             "id": str(next_action.get("id") or ""),
             "action": action,
+            "interface": str(next_action.get("interface") or ""),
             "line_id": str(next_action.get("line_id") or ""),
             "stage_id": str(next_action.get("stage_id") or ""),
             "description": str(
@@ -81869,9 +81922,23 @@ def _onboard_route_guide_compact_service_response(
                 or next_action.get("required_owner_role")
                 or ""
             ),
+            "requires_role": str(next_action.get("requires_role") or ""),
+            "requires_route_token_ref": (
+                True
+                if next_action.get("requires_route_token_ref") is True
+                else None
+            ),
+            "requires_active_observer_session": (
+                True
+                if next_action.get("requires_active_observer_session") is True
+                else None
+            ),
+            "action_input_interface": str(
+                next_action.get("action_input_interface") or ""
+            ),
             "blocker_ids": blocker_ids,
         }.items()
-        if value not in ("", [], {})
+        if value not in ("", [], {}, None)
     }
     authority = {
         "source_of_authority": source_of_authority,
