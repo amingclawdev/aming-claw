@@ -60583,7 +60583,7 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
         "<parent MF task_id from runtime_context>"
     )
     assert capacity_guidance["preserve_runtime_identity"]["target_project_root"] == (
-        "<assigned worker worktree path>"
+        "<runtime-context canonical target_project_root>"
     )
     assert set(capacity_guidance["required_identity_fields"]) == {
         "runtime_context_id",
@@ -60755,6 +60755,141 @@ def test_contract_runtime_mf_sub_bridge_exposes_canonical_allocation_payload():
     assert submission["worker_host_envelope_handoff"] == guidance[
         "worker_host_envelope_handoff"
     ]
+
+
+def test_contract_runtime_mf_sub_bridge_replays_distinct_dispatch_target_root(
+    conn,
+):
+    backlog_id = "AC-MF-PARALLEL-DISTINCT-TARGET-ROOT"
+    execution_id = "cex-mf-parallel-distinct-target-root"
+    target_project_root = "/repo/daily-planner-lite"
+    worktree_path = f"{target_project_root}/.worktrees/mf-sub-distinct-root"
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id="mf-sub-distinct-root",
+        parent_task_id=execution_id,
+        worktree_path=worktree_path,
+        target_project_root=target_project_root,
+    )
+    route_identity = {
+        "route_id": "route-mf-sub-distinct-root",
+        "route_context_hash": _fake_sha("mf-sub-distinct-root:context"),
+        "prompt_contract_id": "rprompt-mf-sub-distinct-root",
+        "prompt_contract_hash": _fake_sha("mf-sub-distinct-root:prompt"),
+        "route_token_ref": "rtok-mf-sub-distinct-root",
+        "visible_injection_manifest_hash": _fake_sha(
+            "mf-sub-distinct-root:manifest"
+        ),
+    }
+    worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
+    dispatch_payload = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_identity,
+        "worker_slot_id": worker_identity,
+        "target_project_root": target_project_root,
+        "worktree_path": worktree_path,
+        "branch_ref": runtime_context.branch_ref,
+        "base_commit": "base-distinct-root",
+        "target_head_commit": "target-distinct-root",
+        "merge_queue_id": "mq-distinct-root",
+        "owned_files": ["agent/governance/server.py"],
+        "route_identity": route_identity,
+    }
+    guidance = server._contract_runtime_mf_sub_host_bridge_guidance(
+        {
+            "execution": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "contract_execution_id": execution_id,
+            },
+            "contract": {"contract_id": server.MF_PARALLEL_CONTRACT_ID},
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch",
+                    "line_id": "observer_dispatch_bounded_workers",
+                    "evidence_kind": "dispatch_bounded_worker",
+                    "payload": dispatch_payload,
+                }
+            ],
+            "next_legal_action": {
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "evidence_kind": "read_receipt",
+                "owner_role": "mf_sub",
+                "allowed_writer_roles": ["mf_sub"],
+            },
+            "writer_role_safe_copy_payload": {
+                "copy_payload": {
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "contract_execution_id": execution_id,
+                }
+            },
+        }
+    )
+
+    exact_identity = guidance["post_dispatch_runtime_identity"]
+    assert exact_identity["status"] == "exact_completed_dispatch"
+    assert exact_identity["runtime_context_id"] == runtime_context.runtime_context_id
+    assert exact_identity["target_project_root"] == target_project_root
+    assert exact_identity["worktree_path"] == worktree_path
+    assert exact_identity["worktree_alias_submitted_as_target_project_root"] is False
+
+    submit_body = guidance["copy_safe_bridge_payload"][
+        "contract_runtime_submit_line_body_after_bridge"
+    ]
+    worker_guide_body = guidance["copy_safe_bridge_payload"][
+        "runtime_context_worker_guide"
+    ]
+    initial_join_body = dict(
+        guidance["worker_host_envelope_handoff"]["initial_join"]["copy_safe_body"]
+    )
+    for body in (submit_body, worker_guide_body, initial_join_body):
+        assert body["runtime_context_id"] == runtime_context.runtime_context_id
+        assert body["target_project_root"] == target_project_root
+        assert body["target_project_root"] != worktree_path
+
+    initial_join_body.update(
+        {
+            "agent_id": worker_identity,
+            "actual_host_worker_id": worker_identity,
+            "worker_session_id": "host-session-mf-sub-distinct-root",
+            "reason": "replay exact server-projected initial-join body",
+        }
+    )
+    issued = parallel_branch_runtime.initial_join_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PID,
+        runtime_context_id=initial_join_body["runtime_context_id"],
+        task_id=initial_join_body["task_id"],
+        parent_task_id=initial_join_body["parent_task_id"],
+        target_project_root=initial_join_body["target_project_root"],
+        agent_id=initial_join_body["agent_id"],
+        actual_host_worker_id=initial_join_body["actual_host_worker_id"],
+        worker_session_id=initial_join_body["worker_session_id"],
+        ttl_seconds=initial_join_body["ttl_seconds"],
+        reason=initial_join_body["reason"],
+    )
+    assert issued["status"] == "session_token_initial_join_issued"
+    assert issued["host_envelope"]["target_project_root"] == target_project_root
+
+    with pytest.raises(BranchRuntimeFenceError):
+        parallel_branch_runtime.initial_join_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PID,
+            runtime_context_id=runtime_context.runtime_context_id,
+            task_id=runtime_context.task_id,
+            parent_task_id=execution_id,
+            target_project_root=worktree_path,
+            agent_id=worker_identity,
+            actual_host_worker_id=worker_identity,
+            worker_session_id="host-session-mf-sub-distinct-root-alias",
+            reason="worktree alias remains invalid for initial join",
+        )
 
 
 def test_contract_runtime_dispatch_projects_canonical_allocation_payload():

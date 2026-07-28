@@ -62863,7 +62863,7 @@ def _mf_sub_capacity_fallback_guidance(
         ),
         "target_project_root": _copy_value(
             target_project_root,
-            "<assigned worker worktree path>",
+            "<runtime-context canonical target_project_root>",
         ),
         "session_token_ref": _copy_value(
             session_token_ref,
@@ -62970,7 +62970,9 @@ def _mf_sub_worker_host_envelope_handoff(
     runtime_context_id = runtime_context_id or "<worker runtime_context_id>"
     task_id = task_id or "<worker task_id>"
     parent_task_id = parent_task_id or "<parent MF task_id>"
-    target_project_root = target_project_root or "<assigned worker worktree path>"
+    target_project_root = (
+        target_project_root or "<runtime-context canonical target_project_root>"
+    )
     worker_id = worker_id or "<actual host-created worker id>"
     worker_slot_id = worker_slot_id or worker_id
     safe_route_identity = {
@@ -63129,13 +63131,126 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
         else {}
     )
 
+    def _exact_text(value: Any) -> str:
+        text = str(value or "").strip()
+        if text.startswith("<") and text.endswith(">"):
+            return ""
+        return text
+
+    dispatch_candidates: list[Mapping[str, Any]] = []
+    completed_lines = guide.get("completed_lines")
+    if isinstance(completed_lines, list):
+        selector_fields = (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_id",
+            "worker_slot_id",
+        )
+        selectors = {
+            field: _exact_text(next_action.get(field))
+            for field in selector_fields
+            if _exact_text(next_action.get(field))
+        }
+        for completed_line in completed_lines:
+            if not isinstance(completed_line, Mapping):
+                continue
+            if str(completed_line.get("stage_id") or "").strip() != "dispatch":
+                continue
+            if (
+                str(completed_line.get("line_id") or "").strip()
+                != "observer_dispatch_bounded_workers"
+            ):
+                continue
+            if (
+                str(completed_line.get("evidence_kind") or "").strip()
+                != "dispatch_bounded_worker"
+            ):
+                continue
+            for candidate in _contract_runtime_mapping_candidates(completed_line):
+                if not all(
+                    _exact_text(candidate.get(field))
+                    for field in (
+                        "runtime_context_id",
+                        "task_id",
+                        "target_project_root",
+                    )
+                ):
+                    continue
+                if not _exact_text(
+                    candidate.get("worker_slot_id") or candidate.get("worker_id")
+                ):
+                    continue
+                if any(
+                    _exact_text(candidate.get(field))
+                    and _exact_text(candidate.get(field)) != expected
+                    for field, expected in selectors.items()
+                ):
+                    continue
+                dispatch_candidates.append(candidate)
+
+    dispatch_candidates_by_identity: dict[
+        tuple[str, str, str, str, str, str],
+        list[Mapping[str, Any]],
+    ] = {}
+    for candidate in dispatch_candidates:
+        worker_identity = _exact_text(
+            candidate.get("worker_slot_id") or candidate.get("worker_id")
+        )
+        identity = (
+            _exact_text(candidate.get("runtime_context_id")),
+            _exact_text(candidate.get("task_id")),
+            _exact_text(candidate.get("parent_task_id")),
+            worker_identity,
+            _exact_text(candidate.get("target_project_root")),
+            _exact_text(candidate.get("worktree_path")),
+        )
+        dispatch_candidates_by_identity.setdefault(identity, []).append(candidate)
+
+    dispatch_payload: Mapping[str, Any] = {}
+    if len(dispatch_candidates_by_identity) == 1:
+        dispatch_payload = max(
+            next(iter(dispatch_candidates_by_identity.values())),
+            key=lambda candidate: sum(
+                bool(_exact_text(candidate.get(field)))
+                for field in (
+                    "runtime_context_id",
+                    "task_id",
+                    "parent_task_id",
+                    "worker_id",
+                    "worker_slot_id",
+                    "target_project_root",
+                    "worktree_path",
+                    "branch_ref",
+                    "base_commit",
+                    "target_head_commit",
+                    "merge_queue_id",
+                )
+            )
+            + int(isinstance(candidate.get("route_identity"), Mapping))
+            + int(
+                isinstance(candidate.get("owned_files"), (list, tuple))
+                and bool(candidate.get("owned_files"))
+            ),
+        )
+    dispatch_route_identity = (
+        dispatch_payload.get("route_identity")
+        if isinstance(dispatch_payload.get("route_identity"), Mapping)
+        else {}
+    )
+
     def next_text(field: str, default: str = "") -> str:
-        return str(
-            next_action.get(field)
-            or next_route_identity.get(field)
-            or execution.get(field)
-            or default
-        ).strip()
+        for source in (
+            next_action,
+            next_route_identity,
+            dispatch_payload,
+            dispatch_route_identity,
+            execution,
+        ):
+            text = _exact_text(source.get(field))
+            if text:
+                return text
+        return str(default or "").strip()
 
     worker_task_id = next_text("task_id", "<bounded worker task_id>")
     parent_task_id = next_text(
@@ -63153,6 +63268,12 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
         "owned_files",
         "target_files",
     )
+    if not owned_files and dispatch_payload:
+        owned_files = _runtime_context_service_query_values(
+            dispatch_payload,
+            "owned_files",
+            "target_files",
+        )
     allocation_route_identity = {
         field: next_text(field, f"<{field}>")
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
@@ -63210,23 +63331,37 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
     submit_line_body = dict(copy_payload)
     submit_line_body.update(
         {
-            "runtime_context_id": "<from parallel_branch_allocate/runtime_context>",
-            "task_id": "<worker task_id from runtime_context>",
-            "parent_task_id": "<parent MF task_id from runtime_context>",
+            "runtime_context_id": next_text(
+                "runtime_context_id",
+                "<from parallel_branch_allocate/runtime_context>",
+            ),
+            "task_id": worker_task_id,
+            "parent_task_id": parent_task_id,
             "worker_role": "mf_sub",
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
             "fence_token": "<worker fence_token from allocation envelope>",
-            "target_project_root": "<assigned worker worktree path>",
-            "session_token_ref": "<copy-safe worker session_token_ref>",
+            "target_project_root": target_project_root,
+            "session_token_ref": next_text(
+                "session_token_ref",
+                "<copy-safe worker session_token_ref>",
+            ),
         }
     )
     worker_host_envelope_handoff = _mf_sub_worker_host_envelope_handoff(
-        project_id=str(execution.get("project_id") or ""),
+        project_id=project_id,
         runtime_context_id=str(submit_line_body.get("runtime_context_id") or ""),
         task_id=str(submit_line_body.get("task_id") or ""),
         parent_task_id=str(submit_line_body.get("parent_task_id") or ""),
         target_project_root=str(submit_line_body.get("target_project_root") or ""),
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
         session_token_ref=str(submit_line_body.get("session_token_ref") or ""),
         fence_token=str(submit_line_body.get("fence_token") or ""),
+        merge_queue_id=next_text(
+            "merge_queue_id",
+            "<runtime_context merge_queue_id>",
+        ),
         route_identity=submit_line_body,
     )
     capacity_fallback_guidance = worker_host_envelope_handoff.get(
@@ -63274,12 +63409,16 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
         "copy_safe_bridge_payload": {
             "parallel_branch_allocate": parallel_branch_allocate_submission,
             "runtime_context_worker_guide": {
-                "project_id": str(execution.get("project_id") or ""),
-                "runtime_context_id": "<worker runtime_context_id>",
-                "parent_task_id": "<parent MF task_id>",
+                "project_id": project_id,
+                "runtime_context_id": str(
+                    submit_line_body.get("runtime_context_id") or ""
+                ),
+                "parent_task_id": parent_task_id,
                 "fence_token": "<worker fence_token>",
-                "session_token_ref": "<copy-safe worker session_token_ref>",
-                "target_project_root": "<assigned worker worktree path>",
+                "session_token_ref": str(
+                    submit_line_body.get("session_token_ref") or ""
+                ),
+                "target_project_root": target_project_root,
                 "view": "worker_view",
             },
             "contract_runtime_submit_line_body_after_bridge": submit_line_body,
@@ -63289,6 +63428,34 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
         "parallel_branch_allocate_submission": parallel_branch_allocate_submission,
         "worker_host_envelope_handoff": worker_host_envelope_handoff,
         "capacity_fallback_guidance": capacity_fallback_guidance,
+        "post_dispatch_runtime_identity": {
+            "status": (
+                "exact_completed_dispatch"
+                if dispatch_payload
+                else "allocation_or_dispatch_required"
+            ),
+            "source": (
+                "ContractRuntime.completed_lines.observer_dispatch_bounded_workers"
+                if dispatch_payload
+                else "next_legal_action_or_allocation_result"
+            ),
+            "runtime_context_id": str(
+                submit_line_body.get("runtime_context_id") or ""
+            ),
+            "task_id": worker_task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "target_project_root": target_project_root,
+            "worktree_path": next_text(
+                "worktree_path",
+                "<absolute worker worktree>",
+            ),
+            "target_project_root_fence": (
+                "runtime_context_effective_target_project_root"
+            ),
+            "worktree_alias_submitted_as_target_project_root": False,
+        },
         "forbidden_shortcuts": [
             "observer_body_actor_role_mf_sub",
             "observer_written_worker_evidence",
