@@ -1894,6 +1894,65 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "release_operator_head_queue",
+        "description": (
+            "Read or mutate the bounded release-operator queue. Mutations are "
+            "operator-authorized and audited. Removing an active historical "
+            "membership requires historical_non_schedulable=true, "
+            "historical_execution_resume_allowed=false, and durable "
+            "evidence_refs; active integration-epoch members remain protected."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "action": {
+                    "type": "string",
+                    "enum": ["read", "insert", "reorder", "skip", "remove"],
+                    "default": "read",
+                },
+                "backlog_id": {
+                    "type": "string",
+                    "description": "Exact queue member for insert, skip, or remove.",
+                },
+                "backlog_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Exact full membership order for reorder.",
+                },
+                "position": {"type": "integer", "minimum": 1},
+                "pinned": {"type": "boolean"},
+                "reason": {
+                    "type": "string",
+                    "description": "Non-empty audit reason for queue mutation.",
+                },
+                "historical_non_schedulable": {
+                    "type": "boolean",
+                    "description": (
+                        "Explicit operator assertion required to remove an "
+                        "active historical queue membership."
+                    ),
+                },
+                "historical_execution_resume_allowed": {
+                    "type": "boolean",
+                    "description": (
+                        "Must be false when removing an active historical "
+                        "queue membership."
+                    ),
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Durable backlog, contract-runtime, timeline, request, "
+                        "or operator evidence refs for historical removal."
+                    ),
+                },
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
         "name": "backlog_upsert",
         "description": "Create or update a backlog bug. Use this before MF/observer hotfix code changes.",
         "inputSchema": {
@@ -4527,6 +4586,20 @@ class ToolDispatcher:
             pid = args["project_id"]
             bug_id = urllib.parse.quote(str(args["bug_id"]), safe="")
             return self._api("GET", f"/api/backlog/{pid}/{bug_id}")
+
+        if name == "release_operator_head_queue":
+            pid = args["project_id"]
+            action = str(args.get("action") or "read").strip().lower()
+            path = f"/api/projects/{pid}/release-operator-head-queue"
+            if action == "read":
+                return self._api("GET", path)
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            body["action"] = action
+            return self._api("POST", path, body)
 
         if name == "backlog_upsert":
             pid = args["project_id"]

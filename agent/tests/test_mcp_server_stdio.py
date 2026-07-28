@@ -999,6 +999,36 @@ def test_mcp_stdio_observer_route_context_issue_schema_is_listed():
     }.issubset(properties)
 
 
+def test_mcp_stdio_release_operator_head_queue_schema_is_listed():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = responses[0]["result"]["tools"]
+    queue = next(
+        tool for tool in tools
+        if tool["name"] == "release_operator_head_queue"
+    )
+    properties = queue["inputSchema"]["properties"]
+    assert properties["action"]["enum"] == [
+        "read",
+        "insert",
+        "reorder",
+        "skip",
+        "remove",
+    ]
+    assert {
+        "historical_non_schedulable",
+        "historical_execution_resume_allowed",
+        "evidence_refs",
+    }.issubset(properties)
+    assert "active integration-epoch members remain protected" in queue[
+        "description"
+    ]
+
+
 def test_mcp_stdio_public_safe_batch_close_blocker_schema_guidance():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},

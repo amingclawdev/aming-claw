@@ -146,6 +146,63 @@ def test_onboard_mcp_defaults_compact_and_routes_bounded_capsule_sections():
     )
 
 
+def test_release_operator_head_queue_schema_and_dispatch():
+    properties = _tool_properties("release_operator_head_queue")
+    assert properties["action"]["enum"] == [
+        "read",
+        "insert",
+        "reorder",
+        "skip",
+        "remove",
+    ]
+    assert properties["action"]["default"] == "read"
+    assert {
+        "backlog_id",
+        "backlog_ids",
+        "reason",
+        "historical_non_schedulable",
+        "historical_execution_resume_allowed",
+        "evidence_refs",
+    }.issubset(properties)
+
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    dispatcher.dispatch(
+        "release_operator_head_queue",
+        {"project_id": "aming-claw"},
+    )
+    assert recorder.calls[-1] == (
+        "GET",
+        "/api/projects/aming-claw/release-operator-head-queue",
+        None,
+    )
+
+    dispatcher.dispatch(
+        "release_operator_head_queue",
+        {
+            "project_id": "aming-claw",
+            "action": "remove",
+            "backlog_id": "AC-HISTORICAL",
+            "reason": "terminal audit-only source",
+            "historical_non_schedulable": True,
+            "historical_execution_resume_allowed": False,
+            "evidence_refs": ["backlog:AC-HISTORICAL", "timeline:42"],
+        },
+    )
+    assert recorder.calls[-1] == (
+        "POST",
+        "/api/projects/aming-claw/release-operator-head-queue",
+        {
+            "action": "remove",
+            "backlog_id": "AC-HISTORICAL",
+            "reason": "terminal audit-only source",
+            "historical_non_schedulable": True,
+            "historical_execution_resume_allowed": False,
+            "evidence_refs": ["backlog:AC-HISTORICAL", "timeline:42"],
+        },
+    )
+
+
 def test_task_timeline_append_schema_separates_qa_audit_from_close_statuses():
     properties = _tool_properties("task_timeline_append")
     description = properties["status"]["description"]
