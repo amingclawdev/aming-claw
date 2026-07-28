@@ -57090,6 +57090,178 @@ def test_release_operator_head_queue_pinned_active_precedence_is_non_skippable(
     ] is True
 
 
+def test_release_operator_head_queue_historical_active_remove_is_audited(
+    conn,
+    monkeypatch,
+):
+    head_id = "AC-RELEASE-REMOVE-NEXT"
+    historical_id = "AC-RELEASE-REMOVE-HISTORICAL"
+    _insert_release_queue_backlog(conn, head_id)
+    _insert_release_queue_backlog(conn, historical_id)
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args: {"role": "observer", "principal_id": "release-operator"},
+    )
+
+    server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"action": "insert", "backlog_id": head_id},
+        )
+    )
+    server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "action": "insert",
+                "backlog_id": historical_id,
+                "position": 1,
+                "pinned": True,
+            },
+        )
+    )
+    server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"backlog_id": historical_id, "role": "observer"},
+        )
+    )
+    conn.execute(
+        """
+        UPDATE backlog_contract_chain_current
+        SET current_contract_execution_id = ?,
+            current_contract_id = 'mf_parallel.v2',
+            active_child_contract_execution_id = ?,
+            readiness_state = 'contract_active',
+            next_legal_action_json = ?
+        WHERE project_id = ? AND backlog_id = ?
+        """,
+        (
+            "cex-release-remove-historical",
+            "cex-release-remove-historical",
+            '{"line_id":"worker_implementation","action":"record_implementation"}',
+            PID,
+            historical_id,
+        ),
+    )
+    conn.commit()
+
+    code, refusal = server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "action": "remove",
+                "backlog_id": historical_id,
+                "reason": "proof is required for an active execution",
+            },
+        )
+    )
+    assert code == 409
+    assert refusal["error"] == (
+        "active_release_execution_queue_membership_nonremovable"
+    )
+    assert refusal["position_preserved"] is True
+
+    removed = server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "action": "remove",
+                "backlog_id": historical_id,
+                "reason": "historical source is terminal audit-only",
+                "historical_non_schedulable": True,
+                "historical_execution_resume_allowed": False,
+                "evidence_refs": [
+                    "backlog:AC-HISTORICAL-SOURCE",
+                    "contract-runtime:cex-release-remove-historical",
+                ],
+            },
+        )
+    )
+    queue = removed["release_operator_head_queue"]
+    assert [item["backlog_id"] for item in queue["items"]] == [head_id]
+    assert queue["head"]["backlog_id"] == head_id
+    audit = queue["audit_events"][0]
+    assert audit["action"] == "remove"
+    assert audit["backlog_id"] == historical_id
+    assert audit["after"]["removed"] is True
+    assert audit["after"]["backlog_and_contract_audit_preserved"] is True
+    assert audit["after"]["evidence_refs"] == [
+        "backlog:AC-HISTORICAL-SOURCE",
+        "contract-runtime:cex-release-remove-historical",
+    ]
+    assert conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?",
+        (historical_id,),
+    ).fetchone() is not None
+    assert conn.execute(
+        """
+        SELECT current_contract_execution_id
+        FROM backlog_contract_chain_current
+        WHERE project_id = ? AND backlog_id = ?
+        """,
+        (PID, historical_id),
+    ).fetchone() is not None
+
+
+def test_release_operator_head_queue_remove_preserves_active_integration_epoch(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-RELEASE-REMOVE-ACTIVE-EPOCH"
+    _insert_release_queue_backlog(conn, backlog_id)
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args: {"role": "observer", "principal_id": "release-operator"},
+    )
+    server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"action": "insert", "backlog_id": backlog_id},
+        )
+    )
+    monkeypatch.setattr(
+        server,
+        "_release_operator_head_queue_integration_epoch_guard",
+        lambda *_args, **_kwargs: {
+            "protected_backlog_ids": [backlog_id],
+            "integration_epochs": ["epoch-release-remove"],
+            "member_guards": {
+                backlog_id: {"integration_epoch_id": "epoch-release-remove"}
+            },
+        },
+    )
+
+    code, refusal = server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "action": "remove",
+                "backlog_id": backlog_id,
+                "reason": "must fail closed during an active epoch",
+                "historical_non_schedulable": True,
+                "historical_execution_resume_allowed": False,
+                "evidence_refs": ["integration-epoch:epoch-release-remove"],
+            },
+        )
+    )
+    assert code == 409
+    assert refusal["error"] == (
+        "active_integration_epoch_position_nonremovable"
+    )
+    assert refusal["position_preserved"] is True
+    assert refusal["no_pass_claim"] is True
+
+
 def test_release_operator_head_queue_preserves_reconciled_epoch_member_positions(
     conn,
     monkeypatch,
@@ -57354,7 +57526,7 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
         "path": "/api/projects/{project_id}/release-operator-head-queue",
         "mutation_roles": ["observer", "coordinator"],
         "bounded_capacity": 32,
-        "actions": ["insert", "reorder", "skip"],
+        "actions": ["insert", "reorder", "skip", "remove"],
     }
     graph_first = guide["graph_first_policy"]
     assert graph_first["source_symbol_discovery"]["tool_agnostic"] is True

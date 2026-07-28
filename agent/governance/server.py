@@ -78730,7 +78730,7 @@ def _onboard_contract_route_guide(
             "path": "/api/projects/{project_id}/release-operator-head-queue",
             "mutation_roles": ["observer", "coordinator"],
             "bounded_capacity": RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS,
-            "actions": ["insert", "reorder", "skip"],
+            "actions": ["insert", "reorder", "skip", "remove"],
         },
         "contract_chain_current": {
             "kind": "mcp_or_http",
@@ -110686,11 +110686,11 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
         actor = str(session.get("principal_id") or session.get("role") or "operator")
         body = ctx.body if isinstance(ctx.body, Mapping) else {}
         action = str(body.get("action") or "").strip().lower()
-        if action not in {"insert", "reorder", "skip"}:
+        if action not in {"insert", "reorder", "skip", "remove"}:
             return 400, {
                 "ok": False,
                 "error": "invalid_release_operator_head_queue_action",
-                "allowed_actions": ["insert", "reorder", "skip"],
+                "allowed_actions": ["insert", "reorder", "skip", "remove"],
             }
 
         # Serialize the bounded read/validate/write sequence across governance
@@ -110892,7 +110892,7 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
                 after={"backlog_ids": ordered},
             )
 
-        else:
+        elif action == "skip":
             backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
             reason = str(body.get("reason") or "").strip()
             if not backlog_id or not reason:
@@ -110983,6 +110983,135 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
                 reason=reason,
                 before=before_item,
                 after=after_item,
+            )
+
+        else:
+            backlog_id = str(
+                body.get("backlog_id") or body.get("bug_id") or ""
+            ).strip()
+            reason = str(body.get("reason") or "").strip()
+            if not backlog_id or not reason:
+                return 400, {
+                    "ok": False,
+                    "error": (
+                        "release_operator_head_queue_remove_requires_"
+                        "backlog_and_reason"
+                    ),
+                }
+            before_item = next(
+                (
+                    item
+                    for item in before_view.get("items") or []
+                    if item.get("backlog_id") == backlog_id
+                ),
+                None,
+            )
+            if before_item is None:
+                return 404, {
+                    "ok": False,
+                    "error": "release_operator_head_queue_item_not_found",
+                    "backlog_id": backlog_id,
+                }
+            if (
+                integration_epoch_guard
+                and backlog_id
+                in set(
+                    integration_epoch_guard.get("protected_backlog_ids") or []
+                )
+            ):
+                member_epoch_guard = (
+                    integration_epoch_guard.get("member_guards") or {}
+                ).get(backlog_id) or {}
+                return 409, {
+                    "ok": False,
+                    "error": (
+                        "active_integration_epoch_position_nonremovable"
+                    ),
+                    "backlog_id": backlog_id,
+                    "position": before_item.get("position"),
+                    "position_preserved": True,
+                    "no_pass_claim": True,
+                    "protected_backlog_ids": integration_epoch_guard.get(
+                        "protected_backlog_ids"
+                    )
+                    or [],
+                    "integration_epochs": integration_epoch_guard.get(
+                        "integration_epochs"
+                    )
+                    or [],
+                    **member_epoch_guard,
+                }
+
+            historical_non_schedulable = _body_bool(
+                body, "historical_non_schedulable", False
+            )
+            historical_execution_resume_allowed = _body_bool(
+                body, "historical_execution_resume_allowed", True
+            )
+            evidence_refs = _body_string_list(body, "evidence_refs") or []
+            historical_removal_proof = bool(
+                historical_non_schedulable
+                and not historical_execution_resume_allowed
+                and evidence_refs
+            )
+            if bool(before_item.get("active_execution")) and not (
+                historical_removal_proof
+            ):
+                return 409, {
+                    "ok": False,
+                    "error": (
+                        "active_release_execution_queue_membership_"
+                        "nonremovable"
+                    ),
+                    "backlog_id": backlog_id,
+                    "position": before_item.get("position"),
+                    "active_contract_execution_id": before_item.get(
+                        "active_contract_execution_id"
+                    ),
+                    "required_fields": [
+                        "historical_non_schedulable=true",
+                        "historical_execution_resume_allowed=false",
+                        "evidence_refs",
+                    ],
+                    "position_preserved": True,
+                    "no_pass_claim": True,
+                }
+
+            removed_position = int(before_item.get("position") or 0)
+            conn.execute(
+                """
+                DELETE FROM release_operator_head_queue
+                WHERE project_id = ? AND backlog_id = ?
+                """,
+                (project_id, backlog_id),
+            )
+            now = _utc_now()
+            conn.execute(
+                """
+                UPDATE release_operator_head_queue
+                SET position = position - 1, updated_at = ?
+                WHERE project_id = ? AND position > ?
+                """,
+                (now, project_id, removed_position),
+            )
+            event_id = _record_release_operator_head_queue_event(
+                conn,
+                project_id=project_id,
+                action="remove",
+                backlog_id=backlog_id,
+                actor=actor,
+                reason=reason,
+                before=before_item,
+                after={
+                    "removed": True,
+                    "previous_position": removed_position,
+                    "historical_non_schedulable": historical_non_schedulable,
+                    "historical_execution_resume_allowed": (
+                        historical_execution_resume_allowed
+                    ),
+                    "evidence_refs": evidence_refs,
+                    "backlog_and_contract_audit_preserved": True,
+                },
             )
 
         conn.commit()
