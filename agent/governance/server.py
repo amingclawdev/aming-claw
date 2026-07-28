@@ -11734,6 +11734,16 @@ def _parallel_branch_allocate_contract_revision_payload(
             "test_commands",
             "test_command",
         ),
+        "profile_requirements": (
+            dict(body.get("profile_requirements") or {})
+            if isinstance(body.get("profile_requirements"), Mapping)
+            else {}
+        ),
+        "retry_policy": (
+            dict(body.get("retry_policy") or {})
+            if isinstance(body.get("retry_policy"), Mapping)
+            else {}
+        ),
         "branch_ref": str(body.get("branch_ref") or saved_context.get("branch_ref") or ""),
         "target_project_root": str(
             saved_context.get("target_project_root")
@@ -63478,6 +63488,23 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             "owned_files",
             "target_files",
         )
+    profile_requirements = (
+        dict(next_action.get("profile_requirements") or {})
+        if isinstance(next_action.get("profile_requirements"), Mapping)
+        else dict(dispatch_payload.get("profile_requirements") or {})
+        if isinstance(dispatch_payload.get("profile_requirements"), Mapping)
+        else {
+            "profile_id": "codex-mf-sub",
+            "harness": "codex",
+        }
+    )
+    retry_policy = (
+        dict(next_action.get("retry_policy") or {})
+        if isinstance(next_action.get("retry_policy"), Mapping)
+        else dict(dispatch_payload.get("retry_policy") or {})
+        if isinstance(dispatch_payload.get("retry_policy"), Mapping)
+        else {"attempt": 1, "max_attempts": 2}
+    )
     allocation_route_identity = {
         field: next_text(field, f"<{field}>")
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
@@ -63509,6 +63536,8 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             "<runtime_context merge_queue_id>",
         ),
         "owned_files": owned_files or ["<repo-relative owned file>"],
+        "profile_requirements": profile_requirements,
+        "retry_policy": retry_policy,
         "route_identity": dict(allocation_route_identity),
         **allocation_route_identity,
     }
@@ -63783,6 +63812,220 @@ def _contract_runtime_authoritative_runtime_context_projection(
     }
 
 
+def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Hydrate the pre-dispatch writer body from persisted allocation authority."""
+
+    projected = dict(record)
+    if not _is_mf_parallel_record_contract_id(
+        str(record.get("contract_id") or "")
+    ):
+        return projected, {}
+    guide = (
+        dict(record.get("runtime_guide") or {})
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_action = (
+        dict(guide.get("next_legal_action") or {})
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if (
+        str(next_action.get("stage_id") or "").strip() != "dispatch"
+        or str(next_action.get("line_id") or "").strip()
+        != "observer_dispatch_bounded_workers"
+        or str(next_action.get("evidence_kind") or "").strip()
+        != "dispatch_bounded_worker"
+    ):
+        return projected, {}
+
+    safe_copy = (
+        dict(guide.get("writer_role_safe_copy_payload") or {})
+        if isinstance(guide.get("writer_role_safe_copy_payload"), Mapping)
+        else {}
+    )
+    copy_payload = (
+        dict(safe_copy.get("copy_payload") or {})
+        if isinstance(safe_copy.get("copy_payload"), Mapping)
+        else {}
+    )
+    if not copy_payload:
+        return projected, {}
+
+    from .parallel_branch_runtime import (
+        branch_contract_revision_to_dict,
+        get_latest_branch_contract_revision,
+        list_branch_contexts,
+        runtime_context_effective_target_project_root,
+        runtime_context_id_for_branch_context,
+    )
+
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    candidates: list[tuple[Any, dict[str, Any]]] = []
+    for context in list_branch_contexts(conn, project_id):
+        if str(getattr(context, "backlog_id", "") or "").strip() != backlog_id:
+            continue
+        if _runtime_context_mf_sub_parent_task_id(context) != execution_id:
+            continue
+        runtime_context_id = runtime_context_id_for_branch_context(context)
+        revision = get_latest_branch_contract_revision(
+            conn,
+            project_id,
+            runtime_context_id,
+        )
+        if revision is None:
+            continue
+        revision_payload = branch_contract_revision_to_dict(revision)
+        contract_identity = _runtime_context_contract_execution_identity(
+            revision_payload
+        )
+        if (
+            str(contract_identity.get("contract_execution_id") or "").strip()
+            != execution_id
+        ):
+            continue
+        candidates.append((context, revision_payload))
+    if len(candidates) != 1:
+        return projected, {}
+
+    context, revision_payload = candidates[0]
+    revision_body = (
+        dict(revision_payload.get("payload") or {})
+        if isinstance(revision_payload.get("payload"), Mapping)
+        else {}
+    )
+    route_identity = _parallel_branch_runtime_contract_route_identity(
+        revision_payload
+    )
+    profile_requirements = (
+        dict(revision_body.get("profile_requirements") or {})
+        if isinstance(revision_body.get("profile_requirements"), Mapping)
+        else {}
+    )
+    retry_policy = (
+        dict(revision_body.get("retry_policy") or {})
+        if isinstance(revision_body.get("retry_policy"), Mapping)
+        else {}
+    )
+    branch_ref = str(getattr(context, "branch_ref", "") or "").strip()
+    if branch_ref and not branch_ref.startswith("refs/"):
+        branch_ref = f"refs/heads/{branch_ref}"
+    worker_id = str(
+        getattr(context, "worker_id", "")
+        or getattr(context, "worker_slot_id", "")
+        or ""
+    ).strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    dispatch_payload = {
+        "schema_version": "mf_parallel.dispatch_bounded_worker.v1",
+        "runtime_context_id": runtime_context_id_for_branch_context(context),
+        "task_id": str(getattr(context, "task_id", "") or "").strip(),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "root_task_id": str(
+            getattr(context, "root_task_id", "") or execution_id
+        ).strip(),
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": str(
+            getattr(context, "agent_id", "")
+            or getattr(context, "allocation_owner", "")
+            or worker_id
+        ).strip(),
+        "observer_command_id": execution_id,
+        "target_project_root": runtime_context_effective_target_project_root(
+            context
+        ),
+        "worktree_path": str(
+            getattr(context, "worktree_path", "") or ""
+        ).strip(),
+        "branch_ref": branch_ref,
+        "base_commit": str(
+            getattr(context, "base_commit", "") or ""
+        ).strip(),
+        "target_head_commit": str(
+            getattr(context, "target_head_commit", "") or ""
+        ).strip(),
+        "merge_queue_id": str(
+            getattr(context, "merge_queue_id", "") or ""
+        ).strip(),
+        "owned_files": sorted(
+            set(
+                getattr(context, "owned_files", ())
+                or getattr(context, "target_files", ())
+                or ()
+            )
+        ),
+        "profile_requirements": profile_requirements,
+        "retry_policy": retry_policy,
+        "route_identity": dict(route_identity),
+        **dict(route_identity),
+    }
+    policy = _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+    required_fields = _runtime_context_service_dedupe(
+        [
+            *policy.get("required_dispatch_fields", []),
+            *policy.get("required_child_route_fields", []),
+        ]
+    )
+    missing_fields = [
+        field
+        for field in required_fields
+        if dispatch_payload.get(field) in (None, "", [], {})
+    ]
+    if missing_fields:
+        return projected, {
+            "schema_version": (
+                "contract_runtime.mf_parallel_dispatch_copy_safe_projection.v1"
+            ),
+            "status": "blocked_incomplete_persisted_authority",
+            "missing_fields": sorted(set(missing_fields)),
+            "runtime_context_id": dispatch_payload["runtime_context_id"],
+            "source_of_authority": (
+                "RuntimeContext+ContractRevision+observer_route_token_refs"
+            ),
+            "copy_safe_body_available": False,
+        }
+
+    copy_payload.update(dispatch_payload)
+    copy_payload["payload"] = dict(dispatch_payload)
+    safe_copy["copy_payload"] = copy_payload
+    guide["writer_role_safe_copy_payload"] = safe_copy
+    next_action.update(dispatch_payload)
+    next_action["writer_role_safe_copy_payload"] = dict(safe_copy)
+    next_action["copy_safe_dispatch_ready"] = True
+    next_action["dispatch_copy_safe_body_source"] = (
+        "RuntimeContext+ContractRevision+observer_route_token_refs"
+    )
+    guide["next_legal_action"] = next_action
+    projection = {
+        "schema_version": (
+            "contract_runtime.mf_parallel_dispatch_copy_safe_projection.v1"
+        ),
+        "status": "ready",
+        "runtime_context_id": dispatch_payload["runtime_context_id"],
+        "task_id": dispatch_payload["task_id"],
+        "source_of_authority": (
+            "RuntimeContext+ContractRevision+observer_route_token_refs"
+        ),
+        "copy_safe_body_available": True,
+        "raw_private_context_exposed": False,
+    }
+    guide["dispatch_copy_safe_projection"] = projection
+    projected["runtime_guide"] = guide
+    return projected, projection
+
+
 def _runtime_next_action_from_guide(
     guide: Mapping[str, Any],
     *,
@@ -63865,11 +64108,14 @@ def _runtime_next_action_from_guide(
         "target_project_root",
         "project_root",
         "repo_root",
+        "worktree_path",
         "branch_ref",
         "branch",
         "base_commit",
         "target_head_commit",
         "merge_queue_id",
+        "root_task_id",
+        "agent_id",
         "route_id",
         "route_context_hash",
         "prompt_contract_id",
@@ -63897,6 +64143,8 @@ def _runtime_next_action_from_guide(
         "canonical_next_action_before_recovery",
         "immutable_prior_evidence_policy",
         "submit_line_guidance",
+        "copy_safe_dispatch_ready",
+        "dispatch_copy_safe_body_source",
     ):
         if key in next_line:
             result[key] = next_line[key]
@@ -63913,24 +64161,47 @@ def _runtime_next_action_from_guide(
         and str(contract.get("contract_id") or "").strip()
         == MF_PARALLEL_CONTRACT_ID
     ):
-        synthetic_guide = dict(guide)
-        synthetic_guide["next_legal_action"] = {
-            **dict(next_line),
-            "owner_role": "mf_sub",
-            "allowed_writer_roles": ["mf_sub"],
-        }
-        allocation_bridge = _contract_runtime_mf_sub_host_bridge_guidance(
-            synthetic_guide
-        )
-        allocation_submission = dict(
-            allocation_bridge.get("parallel_branch_allocate_submission") or {}
-        )
-        if allocation_submission:
-            result["parallel_branch_allocate_submission"] = (
-                allocation_submission
+        if next_line.get("copy_safe_dispatch_ready") is not True:
+            synthetic_guide = dict(guide)
+            synthetic_guide["next_legal_action"] = {
+                **dict(next_line),
+                "owner_role": "mf_sub",
+                "allowed_writer_roles": ["mf_sub"],
+            }
+            allocation_bridge = _contract_runtime_mf_sub_host_bridge_guidance(
+                synthetic_guide
             )
-            result["copy_safe_dispatch_payload"] = {
-                "parallel_branch_allocate": allocation_submission,
+            allocation_submission = dict(
+                allocation_bridge.get("parallel_branch_allocate_submission")
+                or {}
+            )
+            if allocation_submission:
+                result["parallel_branch_allocate_submission"] = (
+                    allocation_submission
+                )
+                result["copy_safe_dispatch_payload"] = {
+                    "parallel_branch_allocate": allocation_submission,
+                }
+        copy_payload = (
+            dict(writer_safe_copy.get("copy_payload") or {})
+            if isinstance(writer_safe_copy, Mapping)
+            and isinstance(writer_safe_copy.get("copy_payload"), Mapping)
+            else {}
+        )
+        if next_line.get("copy_safe_dispatch_ready") is True and copy_payload:
+            result.setdefault("copy_safe_dispatch_payload", {})[
+                "contract_runtime_submit_line"
+            ] = {
+                "schema_version": (
+                    "contract_runtime.copy_safe_dispatch_submission.v1"
+                ),
+                "mcp_tool": "contract_runtime_submit_line",
+                "body_source": (
+                    "writer_role_safe_copy_payload.copy_payload"
+                ),
+                "copy_safe_body": copy_payload,
+                "submit_unchanged": True,
+                "source_spelunking_required": False,
             }
     bridge_guidance = _contract_runtime_mf_sub_host_bridge_guidance(guide)
     if bridge_guidance:
@@ -66147,6 +66418,13 @@ def _contract_runtime_read(
         )
     runtime.current_guide(contract_execution_id, actor_role=actor_role)
     record = runtime.store.get(contract_execution_id)
+    record, _dispatch_copy_projection = (
+        _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
+            conn,
+            project_id=str(record.get("project_id") or ""),
+            record=record,
+        )
+    )
     record, _projection = _contract_runtime_apply_mf_parallel_context_projection(
         conn,
         project_id=str(record.get("project_id") or ""),
@@ -113232,6 +113510,13 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
             else:
                 runtime.current_guide(contract_execution_id, actor_role=actor_role)
                 record = runtime.store.get(contract_execution_id)
+                record, _dispatch_copy_projection = (
+                    _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
+                        conn,
+                        project_id=project_id,
+                        record=record,
+                    )
+                )
                 record, projection = (
                     _contract_runtime_apply_mf_parallel_context_projection(
                         conn,
@@ -113662,6 +113947,13 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                 runtime.current_guide(contract_execution_id, actor_role=actor_role)
                 record = runtime.store.get(contract_execution_id)
                 stored_record = record
+                record, _dispatch_copy_projection = (
+                    _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
+                        conn,
+                        project_id=project_id,
+                        record=record,
+                    )
+                )
                 record, projection = (
                     _contract_runtime_apply_mf_parallel_context_projection(
                         conn,

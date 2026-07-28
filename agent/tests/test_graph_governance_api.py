@@ -61870,10 +61870,196 @@ def test_contract_runtime_dispatch_projects_canonical_allocation_payload():
     assert body["target_project_root"] == "/repo"
     assert body["worker_id"] == "mf-sub-dispatch-guide"
     assert body["owned_files"] == ["agent/governance/server.py"]
+    assert body["profile_requirements"] == {
+        "profile_id": "codex-mf-sub",
+        "harness": "codex",
+    }
+    assert body["retry_policy"] == {"attempt": 1, "max_attempts": 2}
     assert "observer_command_id" not in body
     assert submission["worker_host_envelope_handoff"]["delivery"] == (
         "worker_host_envelope"
     )
+
+
+def test_contract_runtime_dispatch_copy_safe_body_hydrates_after_allocate_and_submits_unchanged(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-MF-PARALLEL-DISPATCH-COPY-SAFE"
+    parent_task_id = "dispatch-copy-safe-parent"
+    worker_task_id = "dispatch-copy-safe-worker"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-dispatch-copy-safe-root",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": parent_task_id,
+                "reason": "Exercise the post-allocation copy-safe dispatch body.",
+                "route_token_ref": "rtok-dispatch-copy-safe-root",
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    execution_id = successor["contract_execution_id"]
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+            },
+        )
+    )
+    assert prefill["ok"] is True
+
+    route_token_ref = "rtok-dispatch-copy-safe-child"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+    )
+    profile_requirements = {
+        "profile_id": "codex-mf-sub",
+        "harness": "codex",
+        "provider": "openai",
+    }
+    retry_policy = {"attempt": 1, "max_attempts": 2}
+    worktree_path = tmp_path / "workers" / worker_task_id
+    status, allocated = (
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "contract_execution_id": execution_id,
+                    "successor_contract_execution_id": execution_id,
+                    "current_contract_execution_id": execution_id,
+                    "parent_task_id": execution_id,
+                    "root_task_id": successor[
+                        "root_contract_execution_id"
+                    ],
+                    "task_id": worker_task_id,
+                    "worker_id": "worker-dispatch-copy-safe",
+                    "agent_id": "host-dispatch-copy-safe",
+                    "target_project_root": str(tmp_path),
+                    "workspace_root": str(tmp_path),
+                    "worktree_path": str(worktree_path),
+                    "base_commit": "a" * 40,
+                    "target_head_commit": "a" * 40,
+                    "merge_queue_id": "mq-dispatch-copy-safe",
+                    "owned_files": ["agent/governance/server.py"],
+                    "profile_requirements": profile_requirements,
+                    "retry_policy": retry_policy,
+                    "route_token_ref": route_token_ref,
+                    "issue_same_owner_session_token": False,
+                    "create_worktree": False,
+                },
+            )
+        )
+    )
+    assert status == 201
+    assert allocated["ok"] is True
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="GET",
+        )
+    )
+    next_action = current["next_legal_action"]
+    assert next_action["line_id"] == "observer_dispatch_bounded_workers"
+    assert next_action["copy_safe_dispatch_ready"] is True
+    copy_body = next_action["writer_role_safe_copy_payload"]["copy_payload"]
+    dispatch_body = copy_body["payload"]
+    assert dispatch_body["runtime_context_id"] == allocated["context"][
+        "runtime_context_id"
+    ]
+    assert dispatch_body["task_id"] == worker_task_id
+    assert dispatch_body["parent_task_id"] == execution_id
+    assert dispatch_body["root_task_id"] == successor[
+        "root_contract_execution_id"
+    ]
+    assert dispatch_body["agent_id"] == "host-dispatch-copy-safe"
+    assert dispatch_body["target_project_root"] == str(tmp_path)
+    assert dispatch_body["worktree_path"] == str(worktree_path)
+    assert dispatch_body["branch_ref"].startswith("refs/heads/")
+    assert dispatch_body["profile_requirements"] == profile_requirements
+    assert dispatch_body["retry_policy"] == retry_policy
+    assert dispatch_body["route_token_ref"] == route_token_ref
+    assert copy_body["route_token_ref"] == route_token_ref
+    assert next_action["copy_safe_dispatch_payload"][
+        "contract_runtime_submit_line"
+    ]["copy_safe_body"] == copy_body
+    assert "parallel_branch_allocate" not in next_action[
+        "copy_safe_dispatch_payload"
+    ]
+    assert "parallel_branch_allocate_submission" not in next_action
+
+    for field, replacement in (
+        ("profile_requirements", None),
+        ("branch_ref", "refs/heads/wrong-dispatch-branch"),
+        ("route_token_ref", None),
+    ):
+        rejected_body = json.loads(json.dumps(copy_body))
+        if replacement is None:
+            rejected_body.pop(field, None)
+            rejected_body["payload"].pop(field, None)
+            if field == "route_token_ref":
+                rejected_body["payload"]["route_identity"].pop(field, None)
+        else:
+            rejected_body[field] = replacement
+            rejected_body["payload"][field] = replacement
+        rejected = server.handle_project_contract_runtime_line_write_precheck(
+            _ctx_with_role(
+                {"project_id": PID, "contract_execution_id": execution_id},
+                "observer",
+                method="POST",
+                body=rejected_body,
+            )
+        )
+        assert rejected["ok"] is False
+
+    accepted = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body=copy_body,
+        )
+    )
+    assert accepted["ok"] is True
+    assert accepted["next_legal_action"]["line_id"] == (
+        "worker_read_runtime_guide"
+    )
+    persisted = json.dumps(accepted, sort_keys=True)
+    assert '"route_token":' not in persisted
+    assert '"session_token":' not in persisted
 
 
 def test_contract_update_blocked_precheck_pauses_until_hotfix_successor_complete(conn):

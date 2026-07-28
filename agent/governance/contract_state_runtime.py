@@ -962,8 +962,11 @@ _MF_PARALLEL_DEFAULT_REQUIREMENTS = [
         "id": "observer_dispatch_bounded_workers",
         "action": "dispatch_bounded_worker",
         "detail": (
-            "record bounded worker dispatch evidence with task_id, parent_task_id, "
-            "runtime_context_id, branch/worktree/fence, owned_files, and merge_queue_id"
+            "allocate the bounded RuntimeContext, re-read ContractRuntime, then "
+            "submit writer_role_safe_copy_payload.copy_payload unchanged; the "
+            "server-projected body includes task/parent/root/worker identity, "
+            "distinct target/worktree roots, full branch/base/target/merge "
+            "authority, owned_files, child route identity, and profile/retry policy"
         ),
         "accepted_event_kinds": [
             "dispatch_bounded_worker",

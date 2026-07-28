@@ -2614,6 +2614,17 @@ def test_builtin_mf_parallel_v2_requirements_transition_finish_directly_to_qa_gr
         "observer_close_ready",
     ]
     assert "worker_review_ready_handoff" not in projection["required_evidence"]
+    dispatch_requirement = next(
+        item
+        for item in contract_state_runtime._MF_PARALLEL_DEFAULT_REQUIREMENTS
+        if item["id"] == "observer_dispatch_bounded_workers"
+    )
+    assert (
+        "writer_role_safe_copy_payload.copy_payload unchanged"
+        in dispatch_requirement["detail"]
+    )
+    assert "child route identity" in dispatch_requirement["detail"]
+    assert "profile/retry policy" in dispatch_requirement["detail"]
 
     qa_graph = build_contract_state_projection(
         [

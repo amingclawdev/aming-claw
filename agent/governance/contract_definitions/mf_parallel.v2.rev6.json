@@ -68,7 +68,7 @@
             "allowed_writer_roles": [
               "observer"
             ],
-            "description": "Record server-validated bounded worker dispatch evidence with distinct target_project_root and worktree_path, complete child route identity, profile/retry policy, owned files, and branch/base/target/merge authority.",
+            "description": "After parallel_branch_allocate, re-read ContractRuntime and submit writer_role_safe_copy_payload.copy_payload unchanged. The server-projected body must contain the persisted runtime/task/parent/root/worker/host identity, distinct target_project_root and worktree_path, fully-qualified branch/base/target/merge authority, owned files, complete child route identity, and profile/retry policy.",
             "evidence_kind": "dispatch_bounded_worker",
             "line_id": "observer_dispatch_bounded_workers",
             "owner_role": "observer",
