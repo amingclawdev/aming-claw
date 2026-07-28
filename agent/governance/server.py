@@ -62993,6 +62993,97 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
         if isinstance(safe_copy.get("copy_payload"), Mapping)
         else {}
     )
+    execution_id = str(execution.get("contract_execution_id") or "").strip()
+    project_id = str(
+        execution.get("project_id") or copy_payload.get("project_id") or ""
+    )
+    backlog_id = str(
+        copy_payload.get("backlog_id") or execution.get("backlog_id") or ""
+    ).strip()
+    next_route_identity = (
+        next_action.get("route_identity")
+        if isinstance(next_action.get("route_identity"), Mapping)
+        else {}
+    )
+
+    def next_text(field: str, default: str = "") -> str:
+        return str(
+            next_action.get(field)
+            or next_route_identity.get(field)
+            or execution.get(field)
+            or default
+        ).strip()
+
+    worker_task_id = next_text("task_id", "<bounded worker task_id>")
+    parent_task_id = next_text(
+        "parent_task_id",
+        execution_id or "<contract execution id>",
+    )
+    worker_id = next_text("worker_id", next_text("worker_slot_id", "<worker id>"))
+    worker_slot_id = next_text("worker_slot_id", worker_id)
+    target_project_root = next_text(
+        "target_project_root",
+        next_text("project_root", "<registered target project root>"),
+    )
+    owned_files = _runtime_context_service_query_values(
+        next_action,
+        "owned_files",
+        "target_files",
+    )
+    allocation_route_identity = {
+        field: next_text(field, f"<{field}>")
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    canonical_allocation_body = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "successor_contract_execution_id": execution_id,
+        "current_contract_execution_id": execution_id,
+        "task_id": worker_task_id,
+        "parent_task_id": parent_task_id,
+        "root_task_id": next_text(
+            "root_task_id",
+            str(execution.get("root_contract_execution_id") or "<root task id>"),
+        ),
+        "worker_id": worker_id,
+        "agent_id": next_text("agent_id", "<actual host-created worker id>"),
+        "target_project_root": target_project_root,
+        "worktree_path": next_text("worktree_path", "<absolute worker worktree>"),
+        "branch_ref": next_text("branch_ref", "<refs/heads/worker-branch>"),
+        "base_commit": next_text("base_commit", "<exact base commit>"),
+        "target_head_commit": next_text(
+            "target_head_commit",
+            "<exact target HEAD commit>",
+        ),
+        "merge_queue_id": next_text(
+            "merge_queue_id",
+            "<runtime_context merge_queue_id>",
+        ),
+        "owned_files": owned_files or ["<repo-relative owned file>"],
+        "route_identity": dict(allocation_route_identity),
+        **allocation_route_identity,
+    }
+    parallel_branch_allocate_submission = {
+        "schema_version": (
+            "contract_runtime.parallel_branch_allocate_submission.v1"
+        ),
+        "mcp_tool": "parallel_branch_allocate",
+        "body_source": "copy_safe_body",
+        "copy_safe_body": canonical_allocation_body,
+        "contract_scope_source": "contract_execution_id",
+        "required_contract_scope_fields": [
+            "backlog_id",
+            "contract_execution_id",
+        ],
+        "observer_command_id_contract_scope_fallback_required": False,
+        "source_spelunking_required": False,
+        "after_success": [
+            "use returned runtime_context_id and session_token_ref",
+            "deliver worker_host_envelope to the actual host-created worker",
+            "worker reads runtime_context_worker_guide before protected writes",
+        ],
+    }
     submit_line_body = dict(copy_payload)
     submit_line_body.update(
         {
@@ -63018,6 +63109,9 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
     capacity_fallback_guidance = worker_host_envelope_handoff.get(
         "capacity_fallback_guidance",
         {},
+    )
+    parallel_branch_allocate_submission["worker_host_envelope_handoff"] = (
+        worker_host_envelope_handoff
     )
     return {
         "schema_version": "contract_runtime.mf_sub_host_bridge_guidance.v1",
@@ -63055,6 +63149,7 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             "raw_env_recovery": "worker_host_envelope_handoff",
         },
         "copy_safe_bridge_payload": {
+            "parallel_branch_allocate": parallel_branch_allocate_submission,
             "runtime_context_worker_guide": {
                 "project_id": str(execution.get("project_id") or ""),
                 "runtime_context_id": "<worker runtime_context_id>",
@@ -63068,6 +63163,7 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             "worker_host_envelope_handoff": worker_host_envelope_handoff,
             "capacity_fallback_guidance": capacity_fallback_guidance,
         },
+        "parallel_branch_allocate_submission": parallel_branch_allocate_submission,
         "worker_host_envelope_handoff": worker_host_envelope_handoff,
         "capacity_fallback_guidance": capacity_fallback_guidance,
         "forbidden_shortcuts": [
@@ -63219,6 +63315,35 @@ def _runtime_next_action_from_guide(
     writer_safe_copy = guide.get("writer_role_safe_copy_payload")
     if isinstance(writer_safe_copy, Mapping):
         result["writer_role_safe_copy_payload"] = dict(writer_safe_copy)
+    contract = (
+        guide.get("contract")
+        if isinstance(guide.get("contract"), Mapping)
+        else {}
+    )
+    if (
+        line_id == "observer_dispatch_bounded_workers"
+        and str(contract.get("contract_id") or "").strip()
+        == MF_PARALLEL_CONTRACT_ID
+    ):
+        synthetic_guide = dict(guide)
+        synthetic_guide["next_legal_action"] = {
+            **dict(next_line),
+            "owner_role": "mf_sub",
+            "allowed_writer_roles": ["mf_sub"],
+        }
+        allocation_bridge = _contract_runtime_mf_sub_host_bridge_guidance(
+            synthetic_guide
+        )
+        allocation_submission = dict(
+            allocation_bridge.get("parallel_branch_allocate_submission") or {}
+        )
+        if allocation_submission:
+            result["parallel_branch_allocate_submission"] = (
+                allocation_submission
+            )
+            result["copy_safe_dispatch_payload"] = {
+                "parallel_branch_allocate": allocation_submission,
+            }
     bridge_guidance = _contract_runtime_mf_sub_host_bridge_guidance(guide)
     if bridge_guidance:
         result["mf_sub_host_bridge_guidance"] = bridge_guidance

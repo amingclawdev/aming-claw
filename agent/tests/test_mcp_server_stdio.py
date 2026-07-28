@@ -1157,6 +1157,9 @@ def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields
     tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
     properties = tools["parallel_branch_allocate"]["inputSchema"]["properties"]
     assert {
+        "contract_execution_id",
+        "successor_contract_execution_id",
+        "current_contract_execution_id",
         "observer_command_id",
         "route_id",
         "route_context_hash",
@@ -1174,6 +1177,9 @@ def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields
         "route_token_ref",
     }.issubset(properties)
     for key in (
+        "contract_execution_id",
+        "successor_contract_execution_id",
+        "current_contract_execution_id",
         "observer_command_id",
         "route_id",
         "route_context_hash",
@@ -1236,6 +1242,9 @@ def test_mcp_stdio_parallel_branch_allocate_schema_fields_forwarded():
             "task_id": "mf-sub-allocate",
             "parent_task_id": "AC-ALLOCATE",
             "backlog_id": "AC-ALLOCATE",
+            "contract_execution_id": "cex-allocate",
+            "successor_contract_execution_id": "cex-allocate",
+            "current_contract_execution_id": "cex-allocate",
             "observer_command_id": "cmd-allocate",
             "route_id": route_identity["route_id"],
             "route_context_hash": route_identity["route_context_hash"],
@@ -1269,6 +1278,9 @@ def test_mcp_stdio_parallel_branch_allocate_schema_fields_forwarded():
                 "task_id": "mf-sub-allocate",
                 "parent_task_id": "AC-ALLOCATE",
                 "backlog_id": "AC-ALLOCATE",
+                "contract_execution_id": "cex-allocate",
+                "successor_contract_execution_id": "cex-allocate",
+                "current_contract_execution_id": "cex-allocate",
                 "observer_command_id": "cmd-allocate",
                 "route_id": route_identity["route_id"],
                 "route_context_hash": route_identity["route_context_hash"],
@@ -1309,6 +1321,9 @@ def test_governance_mcp_parallel_branch_allocate_schema_and_dispatch(monkeypatch
     )
     properties = tool["inputSchema"]["properties"]
     assert {
+        "contract_execution_id",
+        "successor_contract_execution_id",
+        "current_contract_execution_id",
         "observer_command_id",
         "route_id",
         "route_context_hash",
@@ -1327,6 +1342,9 @@ def test_governance_mcp_parallel_branch_allocate_schema_and_dispatch(monkeypatch
         {
             "project_id": "aming-claw",
             "task_id": "mf-sub-allocate",
+            "contract_execution_id": "cex-allocate",
+            "successor_contract_execution_id": "cex-allocate",
+            "current_contract_execution_id": "cex-allocate",
             "observer_command_id": "cmd-allocate",
             "route_context_hash": "sha256:route",
             "prompt_contract_id": "rprompt-allocate",
@@ -1342,6 +1360,9 @@ def test_governance_mcp_parallel_branch_allocate_schema_and_dispatch(monkeypatch
             "/api/graph-governance/aming-claw/parallel-branches/allocate",
             {
                 "task_id": "mf-sub-allocate",
+                "contract_execution_id": "cex-allocate",
+                "successor_contract_execution_id": "cex-allocate",
+                "current_contract_execution_id": "cex-allocate",
                 "observer_command_id": "cmd-allocate",
                 "route_context_hash": "sha256:route",
                 "prompt_contract_id": "rprompt-allocate",

@@ -752,6 +752,27 @@ def _parallel_branch_allocate_schema_properties() -> dict[str, Any]:
         },
         "batch_id": {"type": "string"},
         "backlog_id": {"type": "string"},
+        "contract_execution_id": {
+            "type": "string",
+            "description": (
+                "Canonical ContractRuntime execution scope used to resolve a "
+                "protected route_token_ref for this allocation."
+            ),
+        },
+        "successor_contract_execution_id": {
+            "type": "string",
+            "description": (
+                "Canonical successor ContractRuntime execution scope alias. "
+                "Prefer the value projected by live ContractRuntime guidance."
+            ),
+        },
+        "current_contract_execution_id": {
+            "type": "string",
+            "description": (
+                "Canonical current ContractRuntime execution scope alias. "
+                "Accepted without requiring a cex-shaped observer_command_id."
+            ),
+        },
         "chain_id": {"type": "string"},
         "parent_task_id": {"type": "string"},
         "root_task_id": {"type": "string"},
