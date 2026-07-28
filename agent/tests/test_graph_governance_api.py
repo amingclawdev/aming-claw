@@ -9036,7 +9036,6 @@ def _ref_only_parallel_allocate_body(
         "task_id": task_id,
         "parent_task_id": contract_execution_id,
         "contract_execution_id": contract_execution_id,
-        "observer_command_id": contract_execution_id,
         "backlog_id": "AC-ALLOCATE-REF-ONLY",
         "workspace_root": str(tmp_path / "workers"),
         "worktree_path": str(tmp_path / "workers" / task_id),
@@ -60367,6 +60366,157 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
     assert previous_source["ok"] is True
     assert previous_source["actor_role"] == "mf_sub"
     assert previous_source["next_legal_action"]["id"] == "worker_revision_precheck"
+
+
+def test_contract_runtime_mf_sub_bridge_exposes_canonical_allocation_payload():
+    contract_execution_id = "cex-mf-parallel-guide"
+    route_identity = {
+        "route_id": "route-mf-parallel-guide",
+        "route_context_hash": _fake_sha("mf-parallel-guide:context"),
+        "prompt_contract_id": "rprompt-mf-parallel-guide",
+        "prompt_contract_hash": _fake_sha("mf-parallel-guide:prompt"),
+        "route_token_ref": "rtok-mf-parallel-guide",
+        "visible_injection_manifest_hash": _fake_sha(
+            "mf-parallel-guide:manifest"
+        ),
+    }
+    guidance = server._contract_runtime_mf_sub_host_bridge_guidance(
+        {
+            "execution": {
+                "project_id": PID,
+                "backlog_id": "AC-MF-PARALLEL-GUIDE",
+                "contract_execution_id": contract_execution_id,
+                "root_contract_execution_id": "cex-onboard-guide",
+            },
+            "contract": {"contract_id": server.MF_PARALLEL_CONTRACT_ID},
+            "next_legal_action": {
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "evidence_kind": "read_receipt",
+                "owner_role": "mf_sub",
+                "allowed_writer_roles": ["mf_sub"],
+                "task_id": "mf-parallel-guide-worker",
+                "parent_task_id": contract_execution_id,
+                "worker_id": "mf-sub-guide",
+                "worker_slot_id": "mf-sub-guide",
+                "target_project_root": "/repo",
+                "worktree_path": "/repo/.worktrees/mf-sub-guide",
+                "branch_ref": "refs/heads/codex/mf-sub-guide",
+                "base_commit": "base-guide",
+                "target_head_commit": "target-guide",
+                "merge_queue_id": "mq-guide",
+                "owned_files": [
+                    "agent/governance/mcp_server.py",
+                    "agent/mcp/tools.py",
+                ],
+                "route_identity": route_identity,
+            },
+            "writer_role_safe_copy_payload": {
+                "copy_payload": {
+                    "project_id": PID,
+                    "backlog_id": "AC-MF-PARALLEL-GUIDE",
+                    "contract_execution_id": contract_execution_id,
+                }
+            },
+        }
+    )
+
+    submission = guidance["copy_safe_bridge_payload"][
+        "parallel_branch_allocate"
+    ]
+    assert submission == guidance["parallel_branch_allocate_submission"]
+    assert submission["mcp_tool"] == "parallel_branch_allocate"
+    assert submission["contract_scope_source"] == "contract_execution_id"
+    assert (
+        submission["observer_command_id_contract_scope_fallback_required"]
+        is False
+    )
+    assert submission["source_spelunking_required"] is False
+    body = submission["copy_safe_body"]
+    assert body["backlog_id"] == "AC-MF-PARALLEL-GUIDE"
+    assert body["contract_execution_id"] == contract_execution_id
+    assert body["successor_contract_execution_id"] == contract_execution_id
+    assert body["current_contract_execution_id"] == contract_execution_id
+    assert body["task_id"] == "mf-parallel-guide-worker"
+    assert body["parent_task_id"] == contract_execution_id
+    assert body["target_project_root"] == "/repo"
+    assert body["worktree_path"] == "/repo/.worktrees/mf-sub-guide"
+    assert body["branch_ref"] == "refs/heads/codex/mf-sub-guide"
+    assert body["base_commit"] == "base-guide"
+    assert body["target_head_commit"] == "target-guide"
+    assert body["merge_queue_id"] == "mq-guide"
+    assert body["owned_files"] == [
+        "agent/governance/mcp_server.py",
+        "agent/mcp/tools.py",
+    ]
+    assert body["route_token_ref"] == route_identity["route_token_ref"]
+    assert body["route_identity"] == route_identity
+    assert "observer_command_id" not in body
+    assert submission["worker_host_envelope_handoff"] == guidance[
+        "worker_host_envelope_handoff"
+    ]
+
+
+def test_contract_runtime_dispatch_projects_canonical_allocation_payload():
+    contract_execution_id = "cex-mf-parallel-dispatch-guide"
+    route_token_ref = "rtok-mf-parallel-dispatch-guide"
+    guide = {
+        "execution": {
+            "project_id": PID,
+            "backlog_id": "AC-MF-PARALLEL-DISPATCH-GUIDE",
+            "contract_execution_id": contract_execution_id,
+            "root_contract_execution_id": "cex-onboard-dispatch-guide",
+            "route_token_ref": route_token_ref,
+            "execution_state_revision": 2,
+        },
+        "contract": {"contract_id": server.MF_PARALLEL_CONTRACT_ID},
+        "next_legal_action": {
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "evidence_kind": "dispatch_bounded_worker",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "task_id": "mf-parallel-dispatch-worker",
+            "parent_task_id": contract_execution_id,
+            "worker_id": "mf-sub-dispatch-guide",
+            "worker_slot_id": "mf-sub-dispatch-guide",
+            "target_project_root": "/repo",
+            "worktree_path": "/repo/.worktrees/mf-sub-dispatch-guide",
+            "branch_ref": "refs/heads/codex/mf-sub-dispatch-guide",
+            "base_commit": "base-dispatch-guide",
+            "target_head_commit": "target-dispatch-guide",
+            "merge_queue_id": "mq-dispatch-guide",
+            "owned_files": ["agent/governance/server.py"],
+        },
+        "writer_role_safe_copy_payload": {
+            "copy_payload": {
+                "project_id": PID,
+                "backlog_id": "AC-MF-PARALLEL-DISPATCH-GUIDE",
+                "contract_execution_id": contract_execution_id,
+            }
+        },
+    }
+
+    projected = server._runtime_next_action_from_guide(guide)
+    submission = projected["parallel_branch_allocate_submission"]
+    assert projected["copy_safe_dispatch_payload"][
+        "parallel_branch_allocate"
+    ] == submission
+    body = submission["copy_safe_body"]
+    assert body["backlog_id"] == "AC-MF-PARALLEL-DISPATCH-GUIDE"
+    assert body["contract_execution_id"] == contract_execution_id
+    assert body["successor_contract_execution_id"] == contract_execution_id
+    assert body["current_contract_execution_id"] == contract_execution_id
+    assert body["route_token_ref"] == route_token_ref
+    assert body["base_commit"] == "base-dispatch-guide"
+    assert body["target_head_commit"] == "target-dispatch-guide"
+    assert body["target_project_root"] == "/repo"
+    assert body["worker_id"] == "mf-sub-dispatch-guide"
+    assert body["owned_files"] == ["agent/governance/server.py"]
+    assert "observer_command_id" not in body
+    assert submission["worker_host_envelope_handoff"]["delivery"] == (
+        "worker_host_envelope"
+    )
 
 
 def test_contract_update_blocked_precheck_pauses_until_hotfix_successor_complete(conn):
