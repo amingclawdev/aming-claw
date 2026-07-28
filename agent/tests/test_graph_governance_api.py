@@ -8726,6 +8726,58 @@ def test_parallel_branch_allocate_route_materializes_worktree_and_updates_read_m
     assert lanes[0]["graph_epoch"]["base_commit"]
 
 
+def test_parallel_branch_allocate_omitted_root_uses_registered_project(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    repo = _git_repo(tmp_path)
+    base_commit = batch_jobs.git_commit(repo)
+    resolved: list[tuple[str, object, bool]] = []
+
+    def resolve_project_root(project_id, explicit_root=None, *, fallback_self=True):
+        resolved.append((project_id, explicit_root, fallback_self))
+        return repo
+
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        resolve_project_root,
+    )
+
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "registered-root-allocation",
+                "backlog_id": "AC-REGISTERED-ROOT-ALLOCATION",
+                "worker_id": "registered-root-worker",
+                "merge_queue_id": "mergeq-registered-root",
+                "base_commit": base_commit,
+                "target_head_commit": base_commit,
+                "create_worktree": True,
+            },
+        )
+    )
+
+    assert status == 201
+    assert created["ok"] is True
+    assert resolved == [(PID, None, True)]
+    context = created["context"]
+    expected_worktree = (
+        repo
+        / ".worktrees"
+        / "registered-root-worker"
+        / "registered-root-allocation"
+    )
+    assert context["base_commit"] == base_commit
+    assert context["target_head_commit"] == base_commit
+    assert context["worktree_path"] == str(expected_worktree)
+    assert context["target_project_root"] == str(expected_worktree)
+    assert created["worktree"]["created"] is True
+
+
 def test_parallel_branch_allocate_projects_missing_target_root_to_nested_worktree(
     conn,
     tmp_path,

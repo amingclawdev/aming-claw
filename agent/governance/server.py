@@ -11032,6 +11032,30 @@ def _parallel_branch_allocate_normalize_worktree_path(
     return context
 
 
+def _parallel_branch_allocate_workspace_root(
+    project_id: str,
+    body: Mapping[str, Any],
+) -> str:
+    """Resolve an omitted allocation root from the governed project registry."""
+
+    explicit_root = str(
+        body.get("workspace_root")
+        or body.get("repo_root_path")
+        or ""
+    ).strip()
+    if explicit_root:
+        return explicit_root
+
+    registered_root = project_service.resolve_project_root(
+        project_id,
+        None,
+        fallback_self=True,
+    )
+    if registered_root is not None:
+        return str(registered_root)
+    return os.getcwd()
+
+
 def _parallel_branch_allocate_materialized_target_project_root(context: Any) -> Any:
     """Bind an absent/stale target root to the actual materialized worktree."""
 
@@ -12117,10 +12141,9 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     if not task_id:
         raise ValidationError("task_id is required")
 
-    workspace_root = str(
-        ctx.body.get("workspace_root")
-        or ctx.body.get("repo_root_path")
-        or os.getcwd()
+    workspace_root = _parallel_branch_allocate_workspace_root(
+        project_id,
+        ctx.body,
     )
     base_commit = str(ctx.body.get("base_commit") or "").strip()
     target_head_commit = str(ctx.body.get("target_head_commit") or "").strip()
