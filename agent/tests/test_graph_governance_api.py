@@ -59721,12 +59721,17 @@ def test_onboard_route_guide_compact_mf_parallel_projects_copy_safe_route_issue_
 
     next_action = compact["next_legal_action"]
     action_input = compact["action_input"]
+    successor_action_input = next_action["successor_action_input"]
     service_task_id = server._onboard_service_execution_id(PID, backlog_id)
     assert next_action["action"] == "mf_parallel_enter"
     assert next_action["interface"] == "mf_parallel_enter"
     assert next_action["requires_route_token_ref"] is True
     assert next_action["requires_active_observer_session"] is True
     assert next_action["action_input_interface"] == "observer_route_context_issue"
+    assert next_action["successor_action_input_interface"] == "mf_parallel_enter"
+    assert (
+        next_action["mf_parallel_enter_contract_execution_id_required"] is False
+    )
     assert compact["action_input_path"] == "action_input"
     assert action_input == {
         "project_id": PID,
@@ -59743,6 +59748,37 @@ def test_onboard_route_guide_compact_mf_parallel_projects_copy_safe_route_issue_
             f"backlog:{backlog_id}",
         ],
     }
+    assert successor_action_input["interface"] == "mf_parallel_enter"
+    assert successor_action_input["static_body"] == {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "onboard_service_waiver": True,
+        "target_files": [
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+        "owned_files": [
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+    }
+    assert successor_action_input["dynamic_fields"][
+        "observer_route_token_ref"
+    ]["source"] == "observer_route_context_issue.route_token_ref"
+    assert set(successor_action_input["dynamic_fields"]) == {
+        "observer_session_id",
+        "observer_route_token_ref",
+        "task_id",
+        "reason",
+    }
+    assert successor_action_input["omitted_fields"] == [
+        "contract_execution_id"
+    ]
+    assert successor_action_input["contract_execution_id_required"] is False
+    assert successor_action_input["contract_execution_id_omitted"] is True
+    assert "contract_execution_id" not in successor_action_input["static_body"]
+    assert "session_token" not in successor_action_input["static_body"]
+    assert "route_token" not in successor_action_input["static_body"]
     serialized = json.dumps(compact, sort_keys=True)
     assert "session_token" not in json.dumps(action_input, sort_keys=True)
     assert "route_token" not in json.dumps(action_input, sort_keys=True)
@@ -59765,7 +59801,19 @@ def test_onboard_route_guide_compact_mf_parallel_projects_copy_safe_route_issue_
     )
     assert capsule["ok"] is True
     assert capsule["sections"]["next_action"]["requires_route_token_ref"] is True
+    assert (
+        capsule["sections"]["next_action"]["successor_action_input"]
+        == successor_action_input
+    )
     assert capsule["sections"]["action_input"]["body"] == action_input
+    assert (
+        capsule["sections"]["action_input"]["successor_body"]
+        == successor_action_input
+    )
+    assert (
+        capsule["sections"]["action_input"]["successor_interface"]
+        == "mf_parallel_enter"
+    )
 
     other = server.handle_project_onboard_route_guide(
         _ctx(
@@ -59784,6 +59832,9 @@ def test_onboard_route_guide_compact_mf_parallel_projects_copy_safe_route_issue_
     assert other["action_input"]["task_id"] == server._onboard_service_execution_id(
         PID, other_backlog_id
     )
+    assert other["next_legal_action"]["successor_action_input"]["static_body"][
+        "backlog_id"
+    ] == other_backlog_id
     wrong_scope = server.handle_project_onboard_route_guide_capsule(
         _ctx(
             {"project_id": PID},
@@ -86453,6 +86504,46 @@ def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution
         )
     )
     action_input = guide["action_input"]
+    compact_next_action = guide["next_legal_action"]
+    successor_action_input = compact_next_action["successor_action_input"]
+    capsule = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": guide["guide_capsule_ref"],
+                "sections": ["next_action", "action_input"],
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "mf_parallel",
+            },
+        )
+    )
+    assert capsule["ok"] is True
+    assert (
+        capsule["sections"]["next_action"]["successor_action_input"]
+        == successor_action_input
+    )
+    capsule_successor = capsule["sections"]["action_input"]["successor_body"]
+    assert capsule_successor == successor_action_input
+    assert capsule_successor["contract_execution_id_required"] is False
+    assert capsule_successor["contract_execution_id_omitted"] is True
+    assert capsule_successor["omitted_fields"] == ["contract_execution_id"]
+    projected_static_body = dict(capsule_successor["static_body"])
+    projected_dynamic_fields = capsule_successor["dynamic_fields"]
+    assert projected_static_body["onboard_service_waiver"] is True
+    assert set(projected_dynamic_fields) == {
+        "observer_session_id",
+        "observer_route_token_ref",
+        "task_id",
+        "reason",
+    }
+    assert projected_dynamic_fields["observer_session_id"]["source"].startswith(
+        "observer_session_register.session_id"
+    )
+    assert projected_dynamic_fields["observer_route_token_ref"]["source"] == (
+        "observer_route_context_issue.route_token_ref"
+    )
 
     register_status, registered = server.handle_observer_session_register(
         _ctx(
@@ -86479,18 +86570,17 @@ def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution
     assert heartbeat["ok"] is True
 
     with pytest.raises(ValidationError, match="requires route_token_ref"):
+        no_route_body = {
+            **projected_static_body,
+            "reason": "No route proof must fail closed.",
+            "task_id": "row-first-mf-parallel-worker",
+            "observer_session_id": observer_session_id,
+        }
         server.handle_project_mf_parallel_enter(
             _ctx(
                 {"project_id": PID},
                 method="POST",
-                body={
-                    "backlog_id": backlog_id,
-                    "reason": "No route proof must fail closed.",
-                    "task_id": "row-first-mf-parallel-worker",
-                    "observer_session_id": observer_session_id,
-                    "onboard_service_waiver": True,
-                    "target_files": action_input["target_files"],
-                },
+                body=no_route_body,
             )
         )
 
@@ -86504,15 +86594,26 @@ def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution
     assert issued["ok"] is True
 
     enter_body = {
-        "backlog_id": backlog_id,
+        **projected_static_body,
         "reason": "Start bounded row-first mf_parallel work from projected route.",
         "task_id": "row-first-mf-parallel-worker",
         "observer_session_id": observer_session_id,
         "observer_route_token_ref": issued["route_token_ref"],
-        "onboard_service_waiver": True,
-        "target_files": action_input["target_files"],
     }
     assert "contract_execution_id" not in enter_body
+    missing_waiver_body = dict(enter_body)
+    missing_waiver_body.pop("onboard_service_waiver")
+    with pytest.raises(
+        ValidationError,
+        match="onboard_route_guide service waiver",
+    ):
+        server.handle_project_mf_parallel_enter(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=missing_waiver_body,
+            )
+        )
     entered = server.handle_project_mf_parallel_enter(
         _ctx(
             {"project_id": PID},

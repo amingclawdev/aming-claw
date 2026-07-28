@@ -80347,6 +80347,64 @@ def _onboard_route_guide_completed_mf_parallel_action_input(
     }
 
 
+def _onboard_route_guide_completed_mf_parallel_successor_action_input(
+    *,
+    project_id: str,
+    backlog_id: str,
+    target_files: Sequence[str],
+) -> dict[str, Any]:
+    """Copy-safe second-step mf_parallel_enter input projected after route issue."""
+
+    scoped_target_files = _runtime_context_public_file_values(target_files)
+    return {
+        "schema_version": (
+            "onboard_route_guide.mf_parallel_successor_action_input.v1"
+        ),
+        "interface": "mf_parallel_enter",
+        "source": (
+            "onboard_route_guide.next_legal_action.successor_action_input"
+        ),
+        "copy_safe": True,
+        "static_body": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "onboard_service_waiver": True,
+            "target_files": scoped_target_files,
+            "owned_files": scoped_target_files,
+        },
+        "dynamic_fields": {
+            "observer_session_id": {
+                "required": True,
+                "placeholder": "<active_observer_session_id>",
+                "source": (
+                    "observer_session_register.session_id or active "
+                    "observer_session_heartbeat.session_id"
+                ),
+            },
+            "observer_route_token_ref": {
+                "required": True,
+                "placeholder": "<route_token_ref>",
+                "source": "observer_route_context_issue.route_token_ref",
+            },
+            "task_id": {
+                "required": True,
+                "placeholder": "<bounded_worker_task_id>",
+                "source": "caller_selected_bounded_worker_task_id",
+            },
+            "reason": {
+                "required": True,
+                "placeholder": "<human_reason>",
+                "source": "caller_supplied_human_reason",
+            },
+        },
+        "omitted_fields": ["contract_execution_id"],
+        "contract_execution_id_required": False,
+        "contract_execution_id_omitted": True,
+        "raw_session_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+
+
 def _onboard_route_guide_completed_next_action(
     *,
     role: str = "",
@@ -80467,6 +80525,13 @@ def _onboard_route_guide_completed_next_action(
             backlog_id=backlog_id,
             target_files=target_files,
         )
+        successor_action_input = (
+            _onboard_route_guide_completed_mf_parallel_successor_action_input(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                target_files=target_files,
+            )
+        )
         return {
             **base,
             "id": "mf_parallel_enter",
@@ -80489,6 +80554,8 @@ def _onboard_route_guide_completed_next_action(
             "action_input_interface": "observer_route_context_issue",
             "action_input": action_input,
             "action_input_copy_safe": True,
+            "successor_action_input_interface": "mf_parallel_enter",
+            "successor_action_input": successor_action_input,
             "allowed_actions": list(action_input["allowed_actions"]),
             "route_token_ref_source": (
                 "observer_route_context_issue.route_token_ref"
@@ -81877,6 +81944,14 @@ def _onboard_route_guide_compact_service_response(
     action_input, action_input_path = (
         _onboard_guide_capsule_find_action_input(next_action)
     )
+    successor_action_input = (
+        _onboard_guide_capsule_bounded_section(
+            next_action.get("successor_action_input"),
+            section_name="successor_action_input",
+        )
+        if isinstance(next_action.get("successor_action_input"), Mapping)
+        else {}
+    )
     action = str(
         next_action.get("action")
         or next_action.get("id")
@@ -81936,6 +82011,18 @@ def _onboard_route_guide_compact_service_response(
             "action_input_interface": str(
                 next_action.get("action_input_interface") or ""
             ),
+            "successor_action_input_interface": str(
+                next_action.get("successor_action_input_interface") or ""
+            ),
+            "successor_action_input": successor_action_input,
+            "mf_parallel_enter_contract_execution_id_required": (
+                False
+                if next_action.get(
+                    "mf_parallel_enter_contract_execution_id_required"
+                )
+                is False
+                else None
+            ),
             "blocker_ids": blocker_ids,
         }.items()
         if value not in ("", [], {}, None)
@@ -81982,6 +82069,10 @@ def _onboard_route_guide_compact_service_response(
         "action_input_path": action_input_path,
         "action_input_available": bool(action_input),
         "action_input_keys": sorted(action_input) if action_input else [],
+        "successor_action_input_available": bool(successor_action_input),
+        "successor_action_input_keys": (
+            sorted(successor_action_input) if successor_action_input else []
+        ),
         "target_files": [str(item) for item in target_files[:64]],
     }
     selected_qa_guidance = (
@@ -82025,6 +82116,13 @@ def _onboard_route_guide_compact_service_response(
                 {
                     "source_path": action_input_path,
                     "body": action_input,
+                    "successor_interface": str(
+                        next_action.get("successor_action_input_interface") or ""
+                    ),
+                    "successor_source": str(
+                        successor_action_input.get("source") or ""
+                    ),
+                    "successor_body": successor_action_input,
                     "allowed_action_summary": action_summary,
                 },
                 section_name="action_input",
