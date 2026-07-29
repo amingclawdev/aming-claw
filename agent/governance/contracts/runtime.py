@@ -6954,9 +6954,70 @@ class ContractRuntime:
 
         exact_replay = False
         if matching_dispatches:
-            _matching_index, matched = matching_dispatches[-1]
+            matching_index, matched = matching_dispatches[-1]
+            matched_payload = (
+                matched.get("payload")
+                if isinstance(matched.get("payload"), Mapping)
+                else {}
+            )
+            matched_revision = (
+                matched_payload.get("failed_qa_rework_dispatch_revision")
+                if isinstance(
+                    matched_payload.get(
+                        "failed_qa_rework_dispatch_revision"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+            matched_authority = (
+                matched_payload.get(
+                    "failed_qa_rework_dispatch_revision_authority"
+                )
+                if isinstance(
+                    matched_payload.get(
+                        "failed_qa_rework_dispatch_revision_authority"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
             exact_replay = (
-                _worker_commit_text(matched, "parent_task_id")
+                len(matching_dispatches) == 1
+                and matching_index > failed_qa_index
+                and matched_revision.get("append_only_history_preserved") is True
+                and matched_revision.get("timeline_projection_authoritative") is False
+                and int(
+                    matched_revision.get("failed_qa_completed_line_index")
+                    if matched_revision.get("failed_qa_completed_line_index")
+                    is not None
+                    else -1
+                )
+                == failed_qa_index
+                and str(matched_revision.get("runtime_context_id") or "").strip()
+                == runtime_context_id
+                and str(matched_revision.get("task_id") or "").strip() == task_id
+                and matched_authority.get("server_derived") is True
+                and str(matched_authority.get("source") or "").strip()
+                == "parallel_branch_allocate_failed_qa_rework"
+                and str(
+                    matched_authority.get("contract_execution_id") or ""
+                ).strip()
+                == str(contract_execution_id).strip()
+                and int(
+                    matched_authority.get("failed_qa_completed_line_index")
+                    if matched_authority.get("failed_qa_completed_line_index")
+                    is not None
+                    else -1
+                )
+                == failed_qa_index
+                and str(
+                    matched_authority.get("runtime_context_id") or ""
+                ).strip()
+                == runtime_context_id
+                and str(matched_authority.get("task_id") or "").strip()
+                == task_id
+                and _worker_commit_text(matched, "parent_task_id")
                 == parent_task_id
                 and _worker_commit_text(matched, "worker_id")
                 == _worker_commit_text(effective_write, "worker_id")

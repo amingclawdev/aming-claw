@@ -604,9 +604,7 @@ def test_failed_qa_fresh_dispatch_revision_is_append_only_single_cas_and_replay_
             expected_revision=None,
         ):
             self.update_calls += 1
-            if self.update_calls > 1:
-                raise AssertionError("fresh dispatch revision must use one CAS")
-            assert expected_revision == 11
+            assert expected_revision == self.record["execution_state_revision"]
             self.record = deepcopy(updated)
             return deepcopy(self.record)
 
@@ -691,3 +689,78 @@ def test_failed_qa_fresh_dispatch_revision_is_append_only_single_cas_and_replay_
     assert store.update_calls == 1
     assert len(store.record["completed_lines"]) == 3
     assert store.record["execution_state_revision"] == 12
+
+    preserved_first_cycle = deepcopy(store.record["completed_lines"])
+    later_failed_qa = deepcopy(failed_qa)
+    later_failed_qa["payload"]["acceptance_failed"] = [
+        "second_rework_generation_required"
+    ]
+    store.record["completed_lines"].extend(
+        [
+            {
+                "stage_id": "worker_commit",
+                "line_id": "worker_commit",
+                "actor_role": "mf_sub",
+                "evidence_kind": "worker_commit",
+                "commit_sha": "a" * 40,
+            },
+            later_failed_qa,
+        ]
+    )
+    store.record["execution_state_revision"] = 13
+
+    stale_cycle_replay = runtime.revise_failed_qa_observer_dispatch(
+        record["contract_execution_id"],
+        write,
+        actor_role="observer",
+    )
+    assert stale_cycle_replay["ok"] is False
+    assert any(
+        "active failed QA line" in error
+        for error in stale_cycle_replay["decision"]["errors"]
+    )
+    assert store.update_calls == 1
+    assert store.record["completed_lines"][:3] == preserved_first_cycle
+
+    second_write = deepcopy(write)
+    second_write["runtime_context_id"] = "mfrctx-replacement-cycle-2"
+    second_write["task_id"] = "worker-replacement-cycle-2"
+    second_write["worker_id"] = "worker-replacement-cycle-2"
+    second_write["worker_slot_id"] = "worker-replacement-cycle-2"
+    second_write["route_token_ref"] = "rtok-replacement-cycle-2"
+    second_write["payload"].update(
+        {
+            "runtime_context_id": "mfrctx-replacement-cycle-2",
+            "task_id": "worker-replacement-cycle-2",
+            "worker_id": "worker-replacement-cycle-2",
+            "worker_slot_id": "worker-replacement-cycle-2",
+            "route_token_ref": "rtok-replacement-cycle-2",
+        }
+    )
+    second_authority = second_write["payload"][
+        "failed_qa_rework_dispatch_revision_authority"
+    ]
+    second_authority.update(
+        {
+            "failed_qa_completed_line_index": 4,
+            "runtime_context_id": "mfrctx-replacement-cycle-2",
+            "task_id": "worker-replacement-cycle-2",
+        }
+    )
+    second_result = runtime.revise_failed_qa_observer_dispatch(
+        record["contract_execution_id"],
+        second_write,
+        actor_role="observer",
+    )
+    assert second_result["ok"] is True
+    assert second_result["status"] == "revised"
+    assert store.update_calls == 2
+    assert store.record["completed_lines"][:3] == preserved_first_cycle
+    second_exact_replay = runtime.revise_failed_qa_observer_dispatch(
+        record["contract_execution_id"],
+        second_write,
+        actor_role="observer",
+    )
+    assert second_exact_replay["ok"] is True
+    assert second_exact_replay["status"] == "already_completed"
+    assert store.update_calls == 2

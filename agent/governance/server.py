@@ -12688,6 +12688,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     conn, active_epoch
                 ),
             }
+        worktree_result: dict[str, Any] | None = None
         with sqlite_write_lock():
             if not create_worktree:
                 existing = get_branch_context(conn, project_id, task_id)
@@ -12787,6 +12788,29 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 runtime_contract_revision = branch_contract_revision_to_dict(
                     revision
                 )
+
+            if create_worktree:
+                worktree_result = materialize_branch_worktree(
+                    conn,
+                    project_id=project_id,
+                    task_id=task_id,
+                    repo_root_path=workspace_root,
+                    fence_token=allocation_fence_token,
+                    now_iso=str(ctx.body.get("now_iso") or ""),
+                )
+                saved = get_branch_context(conn, project_id, task_id) or saved
+                projected = (
+                    _parallel_branch_allocate_materialized_target_project_root(
+                        saved
+                    )
+                )
+                if projected != saved:
+                    saved = upsert_branch_context(
+                        conn,
+                        projected,
+                        now_iso=str(ctx.body.get("now_iso") or ""),
+                    )
+
             contract_runtime_dispatch_revision = (
                 _parallel_branch_allocate_failed_qa_dispatch_revision(
                     conn,
@@ -12795,35 +12819,11 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     body=effective_body,
                 )
             )
-            conn.commit()
 
-        worktree_result: dict[str, Any] | None = None
-        if create_worktree:
-            worktree_result = materialize_branch_worktree(
-                conn,
-                project_id=project_id,
-                task_id=task_id,
-                repo_root_path=workspace_root,
-                fence_token=allocation_fence_token,
-                now_iso=str(ctx.body.get("now_iso") or ""),
-            )
-            conn.commit()
-            saved = get_branch_context(conn, project_id, task_id) or saved
-            projected = _parallel_branch_allocate_materialized_target_project_root(
-                saved
-            )
-            if projected != saved:
-                with sqlite_write_lock():
-                    saved = upsert_branch_context(
-                        conn,
-                        projected,
-                        now_iso=str(ctx.body.get("now_iso") or ""),
-                    )
-                    conn.commit()
-
-        if should_issue_same_owner_session_token:
-            same_owner_worker_session = issue_mf_subagent_session_token(saved)
-            with sqlite_write_lock():
+            if should_issue_same_owner_session_token:
+                same_owner_worker_session = issue_mf_subagent_session_token(
+                    saved
+                )
                 saved = upsert_branch_context(
                     conn,
                     replace(
@@ -12834,26 +12834,24 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     ),
                     now_iso=str(ctx.body.get("now_iso") or ""),
                 )
-                conn.commit()
 
-        if not runtime_contract_revision:
-            route_identity_for_revision, owned_files_for_revision = (
-                _parallel_branch_allocate_should_persist_contract_revision(
-                    effective_body,
-                    owned_files=saved.owned_files or request_owned_files,
+            if not runtime_contract_revision:
+                route_identity_for_revision, owned_files_for_revision = (
+                    _parallel_branch_allocate_should_persist_contract_revision(
+                        effective_body,
+                        owned_files=saved.owned_files or request_owned_files,
+                    )
                 )
-            )
-        if (
-            not runtime_contract_revision
-            and route_identity_for_revision
-            and owned_files_for_revision
-        ):
-            saved_context = branch_context_to_dict(saved)
-            route_gate = _parallel_branch_allocate_route_gate(
-                effective_body,
-                route_identity_for_revision,
-            )
-            with sqlite_write_lock():
+            if (
+                not runtime_contract_revision
+                and route_identity_for_revision
+                and owned_files_for_revision
+            ):
+                saved_context = branch_context_to_dict(saved)
+                route_gate = _parallel_branch_allocate_route_gate(
+                    effective_body,
+                    route_identity_for_revision,
+                )
                 revision = append_branch_contract_revision(
                     conn,
                     saved,
@@ -12874,8 +12872,10 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     actor="parallel_branch_allocate",
                     now_iso=str(ctx.body.get("now_iso") or ""),
                 )
-                conn.commit()
-            runtime_contract_revision = branch_contract_revision_to_dict(revision)
+                runtime_contract_revision = branch_contract_revision_to_dict(
+                    revision
+                )
+            conn.commit()
 
         response = {
             "ok": True,
@@ -75438,8 +75438,46 @@ def _contract_runtime_observer_merge_completed_round(
                 payload,
                 ("commit_sha", "head_commit", *explicit_candidate_keys),
             )
-        for candidate in _qa_review_claim_containers(line):
-            add_values(candidate, explicit_candidate_keys)
+        def add_nested_authority_values(
+            value: Any,
+            *,
+            path: tuple[str, ...] = (),
+        ) -> None:
+            if isinstance(value, Mapping):
+                current_key = path[-1].lower() if path else ""
+                if _qa_is_immutable_external_audit_subtree(path, value) or (
+                    "baseline" in current_key
+                    or "comparison" in current_key
+                    or current_key == "immediate_parent_full_file"
+                ):
+                    return
+                add_values(value, explicit_candidate_keys)
+                for raw_key, child in value.items():
+                    key = str(raw_key or "").strip().lower()
+                    child_path = (*path, key)
+                    if _qa_is_immutable_external_audit_subtree(
+                        child_path,
+                        child,
+                    ):
+                        continue
+                    if (
+                        "baseline" in key
+                        or "comparison" in key
+                        or key == "immediate_parent_full_file"
+                    ):
+                        continue
+                    add_nested_authority_values(child, path=child_path)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    add_nested_authority_values(child, path=path)
+
+        for key, nested in line.items():
+            if key == "payload":
+                continue
+            add_nested_authority_values(nested, path=(str(key),))
+        if isinstance(payload, Mapping):
+            for key, nested in payload.items():
+                add_nested_authority_values(nested, path=("payload", str(key)))
         return canonical
 
     def has_no_identity_conflict(
@@ -91184,22 +91222,70 @@ def _contract_runtime_matching_completed_line(
     }
 
     def commit_values(value: Mapping[str, Any]) -> set[str]:
-        return {
-            str(candidate.get(key) or "").strip().lower()
-            for candidate in _contract_runtime_mapping_candidates(value)
-            for key in (
-                "commit_sha",
-                "worker_commit_sha",
-                "candidate_commit_sha",
-                "head_commit",
-                "validated_head_commit",
-                "immutable_head_commit",
+        canonical: set[str] = set()
+        explicit_keys = (
+            "worker_commit_sha",
+            "candidate_commit_sha",
+            "validated_head_commit",
+            "immutable_head_commit",
+        )
+
+        def add_fields(
+            candidate: Mapping[str, Any],
+            keys: Sequence[str],
+        ) -> None:
+            for key in keys:
+                commit = str(candidate.get(key) or "").strip()
+                if re.fullmatch(
+                    r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}",
+                    commit,
+                ):
+                    canonical.add(commit.lower())
+
+        add_fields(value, ("commit_sha", "head_commit", *explicit_keys))
+        payload = (
+            value.get("payload")
+            if isinstance(value.get("payload"), Mapping)
+            else {}
+        )
+        add_fields(payload, ("commit_sha", "head_commit", *explicit_keys))
+
+        def add_nested(
+            nested: Any,
+            *,
+            path: tuple[str, ...],
+        ) -> None:
+            if isinstance(nested, Mapping):
+                current_key = path[-1].lower() if path else ""
+                if _qa_is_immutable_external_audit_subtree(
+                    path,
+                    nested,
+                ) or (
+                    "baseline" in current_key
+                    or "comparison" in current_key
+                    or current_key == "immediate_parent_full_file"
+                ):
+                    return
+                add_fields(nested, explicit_keys)
+                for key, child in nested.items():
+                    add_nested(
+                        child,
+                        path=(*path, str(key or "").strip().lower()),
+                    )
+            elif isinstance(nested, (list, tuple)):
+                for child in nested:
+                    add_nested(child, path=path)
+
+        for key, nested in value.items():
+            if key == "payload":
+                continue
+            add_nested(nested, path=(str(key or "").strip().lower(),))
+        for key, nested in payload.items():
+            add_nested(
+                nested,
+                path=("payload", str(key or "").strip().lower()),
             )
-            if re.fullmatch(
-                r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}",
-                str(candidate.get(key) or "").strip(),
-            )
-        }
+        return canonical
 
     def scope_values(
         value: Mapping[str, Any],
@@ -105463,22 +105549,18 @@ def _contract_runtime_execution_ticket_consumption(
     }
 
 
-def _contract_runtime_dispatch_ticket_authority(
+def _contract_runtime_current_dispatch_authority_line(
     record: Mapping[str, Any],
-    current_state: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Project the accepted mf_parallel dispatch during the pre-worker window."""
+    """Select the one dispatch that owns the current worker/QA generation."""
 
-    if not _is_mf_parallel_record_contract_id(
-        str(record.get("contract_id") or "").strip()
-    ):
-        return {}
-    authority_policy = (
-        _contract_runtime_mf_parallel_dispatch_authority_policy(record)
-    )
     dispatch_lines: list[tuple[int, Mapping[str, Any], Mapping[str, Any]]] = []
     for index, line in _contract_runtime_completed_lines(record):
-        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
         if (
             str(line.get("stage_id") or "").strip() == "dispatch"
             and str(line.get("line_id") or "").strip()
@@ -105496,73 +105578,129 @@ def _contract_runtime_dispatch_ticket_authority(
                 "dispatch authority"
             ),
         }
-    if len(dispatch_lines) != 1:
-        failed_qa_index = _active_failed_qa_line_index(
-            list(record.get("completed_lines") or []),
-            source_record=record,
-        )
-        failed_qa_replacements = []
-        for candidate in dispatch_lines:
-            candidate_index, _candidate_line, candidate_payload = candidate
-            revision = (
-                candidate_payload.get("failed_qa_rework_dispatch_revision")
-                if isinstance(
-                    candidate_payload.get(
-                        "failed_qa_rework_dispatch_revision"
-                    ),
-                    Mapping,
-                )
-                else {}
+    if len(dispatch_lines) == 1:
+        index, line, payload = dispatch_lines[0]
+        return {
+            "status": "selected",
+            "completed_line_index": index,
+            "line": line,
+            "payload": payload,
+        }
+
+    failed_qa_index = _active_failed_qa_line_index(
+        list(record.get("completed_lines") or []),
+        source_record=record,
+    )
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    replacements: list[
+        tuple[int, Mapping[str, Any], Mapping[str, Any]]
+    ] = []
+    for candidate in dispatch_lines:
+        candidate_index, candidate_line, candidate_payload = candidate
+        revision = (
+            candidate_payload.get("failed_qa_rework_dispatch_revision")
+            if isinstance(
+                candidate_payload.get("failed_qa_rework_dispatch_revision"),
+                Mapping,
             )
-            revision_authority = (
+            else {}
+        )
+        revision_authority = (
+            candidate_payload.get(
+                "failed_qa_rework_dispatch_revision_authority"
+            )
+            if isinstance(
                 candidate_payload.get(
                     "failed_qa_rework_dispatch_revision_authority"
-                )
-                if isinstance(
-                    candidate_payload.get(
-                        "failed_qa_rework_dispatch_revision_authority"
-                    ),
-                    Mapping,
-                )
-                else {}
-            )
-            if (
-                candidate_index > failed_qa_index >= 0
-                and revision.get("append_only_history_preserved") is True
-                and revision.get("timeline_projection_authoritative") is False
-                and int(
-                    revision.get("failed_qa_completed_line_index")
-                    if revision.get("failed_qa_completed_line_index")
-                    is not None
-                    else -1
-                )
-                == failed_qa_index
-                and revision_authority.get("server_derived") is True
-                and str(revision_authority.get("source") or "").strip()
-                == "parallel_branch_allocate_failed_qa_rework"
-                and int(
-                    revision_authority.get(
-                        "failed_qa_completed_line_index"
-                    )
-                    if revision_authority.get(
-                        "failed_qa_completed_line_index"
-                    )
-                    is not None
-                    else -1
-                )
-                == failed_qa_index
-            ):
-                failed_qa_replacements.append(candidate)
-        if len(failed_qa_replacements) != 1:
-            return {
-                "status": "invalid",
-                "error": (
-                    "canonical ContractRuntime dispatch authority is ambiguous"
                 ),
-            }
-        dispatch_lines = failed_qa_replacements
+                Mapping,
+            )
+            else {}
+        )
 
-    dispatch_index, line, payload = dispatch_lines[0]
+        def unique_text(field: str, *aliases: str) -> str:
+            values = {
+                str(source.get(key) or "").strip()
+                for source in (candidate_line, candidate_payload)
+                for key in (field, *aliases)
+                if str(source.get(key) or "").strip()
+            }
+            return next(iter(values)) if len(values) == 1 else ""
+
+        runtime_context_id = unique_text("runtime_context_id")
+        task_id = unique_text("task_id", "worker_task_id")
+        if (
+            candidate_index > failed_qa_index >= 0
+            and runtime_context_id
+            and task_id
+            and revision.get("append_only_history_preserved") is True
+            and revision.get("timeline_projection_authoritative") is False
+            and int(
+                revision.get("failed_qa_completed_line_index")
+                if revision.get("failed_qa_completed_line_index") is not None
+                else -1
+            )
+            == failed_qa_index
+            and str(revision.get("runtime_context_id") or "").strip()
+            == runtime_context_id
+            and str(revision.get("task_id") or "").strip() == task_id
+            and revision_authority.get("server_derived") is True
+            and str(revision_authority.get("source") or "").strip()
+            == "parallel_branch_allocate_failed_qa_rework"
+            and str(
+                revision_authority.get("contract_execution_id") or ""
+            ).strip()
+            == contract_execution_id
+            and int(
+                revision_authority.get("failed_qa_completed_line_index")
+                if revision_authority.get("failed_qa_completed_line_index")
+                is not None
+                else -1
+            )
+            == failed_qa_index
+            and str(
+                revision_authority.get("runtime_context_id") or ""
+            ).strip()
+            == runtime_context_id
+            and str(revision_authority.get("task_id") or "").strip()
+            == task_id
+        ):
+            replacements.append(candidate)
+    if len(replacements) != 1:
+        return {
+            "status": "invalid",
+            "error": "canonical ContractRuntime dispatch authority is ambiguous",
+        }
+    index, line, payload = replacements[0]
+    return {
+        "status": "selected",
+        "completed_line_index": index,
+        "line": line,
+        "payload": payload,
+    }
+
+
+def _contract_runtime_dispatch_ticket_authority(
+    record: Mapping[str, Any],
+    current_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the accepted mf_parallel dispatch during the pre-worker window."""
+
+    if not _is_mf_parallel_record_contract_id(
+        str(record.get("contract_id") or "").strip()
+    ):
+        return {}
+    authority_policy = (
+        _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+    )
+    selected = _contract_runtime_current_dispatch_authority_line(record)
+    if selected.get("status") != "selected":
+        return selected
+    dispatch_index = int(selected["completed_line_index"])
+    line = selected["line"]
+    payload = selected["payload"]
     actual_next = (
         current_state.get("next_legal_action")
         if isinstance(current_state.get("next_legal_action"), Mapping)
@@ -105778,14 +105916,10 @@ def _contract_runtime_qa_ticket_authority(
         next_action.get("line_id") or next_action.get("id") or ""
     ).strip() not in {"qa_graph_context", "qa_independent_verification"}:
         return {}
-    dispatch: Mapping[str, Any] = {}
-    for _index, line in _contract_runtime_completed_lines(record):
-        if str(line.get("line_id") or "").strip() == "observer_dispatch_bounded_workers":
-            payload = line.get("payload")
-            dispatch = payload if isinstance(payload, Mapping) else line
-            break
-    if not dispatch:
-        return {}
+    selected = _contract_runtime_current_dispatch_authority_line(record)
+    if selected.get("status") != "selected":
+        return selected
+    dispatch = selected["payload"]
     profile = dispatch.get("profile_requirements")
     profile = dict(profile) if isinstance(profile, Mapping) else {}
     profile.pop("profile_id", None)
@@ -105900,6 +106034,12 @@ def _observer_runtime_text_contract_runtime_authority(
         current_state["ticket_authority_status"] = "qa_execution_ready"
         current_state["ticket_authority_source_ref"] = str(
             qa_ticket_authority.get("source_ref") or ""
+        )
+    elif qa_ticket_authority.get("status") == "invalid":
+        current_state["ticket_authority_status"] = "invalid"
+        current_state["ticket_authority_error"] = str(
+            qa_ticket_authority.get("error")
+            or "invalid QA execution ticket authority"
         )
     elif dispatch_authority.get("status") == "projected":
         current_state["next_legal_action"] = dict(
