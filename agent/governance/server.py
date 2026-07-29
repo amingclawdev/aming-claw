@@ -77555,15 +77555,24 @@ def _contract_runtime_line_reports_disqualifying_failed_qa(
     *,
     record: Mapping[str, Any] | None = None,
 ) -> bool:
-    """Separate inherited no-PASS failures from candidate QA failures.
+    """Separate immutable QA observations from candidate QA failures.
 
     The generic recursive detector intentionally treats every positive
-    ``failed`` count as failed QA.  A canonical candidate-scoped no-PASS line
-    is the narrow exception: its accepted baseline ledger proves that those
-    failures are inherited while candidate-new failures remain zero.
+    ``failed`` count as failed QA.  Two authenticated exceptions are narrow
+    enough to preserve fail-closed behavior:
+
+    * a canonical candidate-scoped no-PASS line whose accepted baseline ledger
+      proves that inherited failures have no candidate delta; and
+    * an explicit top-level QA PASS whose server-derived completion gate proves
+      the verdict, while positive counts occur only on immutable
+      ``baseline_observation`` rows.
     """
 
     if _contract_runtime_candidate_scoped_no_pass_line(line, record=record):
+        return False
+    if _contract_runtime_authenticated_qa_pass_has_only_baseline_observations(
+        line
+    ):
         return False
     return _contract_runtime_value_reports_failed_qa(line)
 
@@ -88917,6 +88926,21 @@ _CONTRACT_RUNTIME_QA_FAILURE_STATUS_FIELDS = frozenset(
 _CONTRACT_RUNTIME_QA_FAILURE_STATUSES = frozenset(
     {"fail", "failed", "failure", "rejected", "blocked"}
 )
+_CONTRACT_RUNTIME_QA_PASSING_STATUSES = frozenset(
+    {
+        "accept",
+        "accepted",
+        "complete",
+        "completed",
+        "ok",
+        "pass",
+        "passed",
+        "success",
+        "succeeded",
+        "validate",
+        "validated",
+    }
+)
 _CONTRACT_RUNTIME_QA_FAILURE_COUNT_FIELDS = frozenset(
     {"failed", "failures", "failed_count", "failure_count", "error_count"}
 )
@@ -88964,8 +88988,16 @@ def _contract_runtime_qa_failure_text_signal(value: Any) -> bool:
     return any(marker in text for marker in _CONTRACT_RUNTIME_QA_FAILURE_TEXT_MARKERS)
 
 
-def _contract_runtime_value_reports_failed_qa(value: Any) -> bool:
+def _contract_runtime_value_reports_failed_qa(
+    value: Any,
+    *,
+    allow_baseline_observation_counts: bool = False,
+) -> bool:
     if isinstance(value, Mapping):
+        baseline_observation = (
+            str(value.get("status") or "").strip().lower()
+            == "baseline_observation"
+        )
         for raw_key, item in value.items():
             key = str(raw_key or "").strip().lower()
             if (
@@ -88977,6 +89009,10 @@ def _contract_runtime_value_reports_failed_qa(value: Any) -> bool:
             if (
                 key in _CONTRACT_RUNTIME_QA_FAILURE_COUNT_FIELDS
                 and _contract_runtime_truthy_failure_count(item)
+                and not (
+                    allow_baseline_observation_counts
+                    and baseline_observation
+                )
             ):
                 return True
             if (
@@ -88984,12 +89020,73 @@ def _contract_runtime_value_reports_failed_qa(value: Any) -> bool:
                 and _contract_runtime_qa_failure_text_signal(item)
             ):
                 return True
-            if _contract_runtime_value_reports_failed_qa(item):
+            if _contract_runtime_value_reports_failed_qa(
+                item,
+                allow_baseline_observation_counts=(
+                    allow_baseline_observation_counts
+                ),
+            ):
                 return True
         return False
     if isinstance(value, list):
-        return any(_contract_runtime_value_reports_failed_qa(item) for item in value)
+        return any(
+            _contract_runtime_value_reports_failed_qa(
+                item,
+                allow_baseline_observation_counts=(
+                    allow_baseline_observation_counts
+                ),
+            )
+            for item in value
+        )
     return False
+
+
+def _contract_runtime_authenticated_qa_pass_has_only_baseline_observations(
+    line: Mapping[str, Any],
+) -> bool:
+    """Recognize historical baseline counts under an authenticated QA PASS.
+
+    Only the direct count fields on a ``baseline_observation`` mapping are
+    ignored. Nested mappings are still scanned, so candidate-result failures
+    remain disqualifying.
+    """
+
+    provenance = (
+        line.get("qa_evidence_provenance")
+        if isinstance(line.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    completion_gate = (
+        provenance.get("completion_status_gate")
+        if isinstance(provenance.get("completion_status_gate"), Mapping)
+        else {}
+    )
+    top_level_status = str(line.get("status") or "").strip().lower()
+    return bool(
+        str(line.get("line_id") or "").strip()
+        == "qa_independent_verification"
+        and str(line.get("actor_role") or "").strip() == "qa"
+        and str(line.get("evidence_kind") or "").strip()
+        == "independent_verification"
+        and top_level_status in _CONTRACT_RUNTIME_QA_PASSING_STATUSES
+        and _contract_runtime_authenticated_qa_provenance(line)
+        and str(completion_gate.get("schema_version") or "")
+        == "contract_runtime.qa_completion_status_gate.v1"
+        and str(completion_gate.get("source") or "")
+        == "contract_runtime_line_write_normalization"
+        and completion_gate.get("server_derived") is True
+        and completion_gate.get("top_level_status_present") is True
+        and completion_gate.get("top_level_status_passing") is True
+        and completion_gate.get("nested_payload_decision_satisfies") is False
+        and str(completion_gate.get("normalized_status") or "").strip().lower()
+        in _CONTRACT_RUNTIME_QA_PASSING_STATUSES
+        and not (
+            _contract_runtime_value_reports_failed_qa(
+                line,
+                allow_baseline_observation_counts=True,
+            )
+        )
+    )
 
 
 def _contract_runtime_known_baseline_qa_acceptance(
