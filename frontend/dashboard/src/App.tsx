@@ -171,15 +171,95 @@ interface DataBundle {
   health: HealthResponse;
   status: StatusResponse;
   summary: ActiveSummaryResponse;
-  projection: ProjectionResponse;
+  projection: ProjectionResponse | null;
   nodes: NodeRecord[];
   edges: EdgeRecord[];
-  ops: OperationsQueueResponse;
-  feedback: FeedbackQueueResponse;
-  assetImpactReminders: AssetImpactRemindersResponse;
-  assetInbox: AssetInboxResponse;
+  ops: OperationsQueueResponse | null;
+  feedback: FeedbackQueueResponse | null;
+  assetImpactReminders: AssetImpactRemindersResponse | null;
+  assetInbox: AssetInboxResponse | null;
   backlog: BacklogResponse;
   loadedAt: string;
+}
+
+interface DashboardBootstrapPlan {
+  backlog: boolean;
+  snapshot: boolean;
+  projection: boolean;
+  nodes: boolean;
+  edges: boolean;
+  operations: boolean;
+  feedback: boolean;
+  assetInbox: boolean;
+  assetImpactReminders: boolean;
+  aiConfig: boolean;
+}
+
+export function dashboardBootstrapPlan(view: ViewName): DashboardBootstrapPlan {
+  const empty = {
+    backlog: false,
+    snapshot: false,
+    projection: false,
+    nodes: false,
+    edges: false,
+    operations: false,
+    feedback: false,
+    assetInbox: false,
+    assetImpactReminders: false,
+    aiConfig: false,
+  };
+  if (view === "backlog" || view === "activity") {
+    return { ...empty, backlog: true };
+  }
+  if (view === "overview") {
+    return {
+      ...empty,
+      backlog: true,
+      snapshot: true,
+      projection: true,
+      nodes: true,
+      edges: true,
+      operations: true,
+      feedback: true,
+      aiConfig: true,
+    };
+  }
+  if (view === "graph") {
+    return {
+      ...empty,
+      backlog: true,
+      snapshot: true,
+      projection: true,
+      nodes: true,
+      edges: true,
+      feedback: true,
+      aiConfig: true,
+    };
+  }
+  if (view === "operations") {
+    return { ...empty, backlog: true, snapshot: true, operations: true, aiConfig: true };
+  }
+  if (view === "review") {
+    return {
+      ...empty,
+      backlog: true,
+      snapshot: true,
+      feedback: true,
+      assetImpactReminders: true,
+      aiConfig: true,
+    };
+  }
+  if (view === "assets") {
+    return {
+      ...empty,
+      backlog: true,
+      snapshot: true,
+      nodes: true,
+      assetInbox: true,
+      aiConfig: true,
+    };
+  }
+  return empty;
 }
 
 interface Toast {
@@ -202,22 +282,6 @@ const CLOSED_BACKLOG_STATUSES = new Set([
   "SUPERSEDED",
   "VOID",
 ]);
-
-function emptyOperationsQueue(projectId: string, snapshotId: string): OperationsQueueResponse {
-  return {
-    ok: true,
-    project_id: projectId,
-    snapshot_id: snapshotId,
-    active_snapshot_id: snapshotId,
-    count: 0,
-    operations: [],
-    summary: {
-      by_type: {},
-      by_status: {},
-      pending_scope_reconcile_count: 0,
-    },
-  };
-}
 
 function emptyAssetImpactReminders(
   projectId: string,
@@ -246,11 +310,18 @@ const DEFAULT_AI_MODELS: Record<string, string[]> = {
 };
 
 export default function App() {
+  const initialLocation = useMemo(() => readDashboardLocation(), []);
   const [data, setData] = useState<DataBundle | null>(null);
+  const [dataScope, setDataScope] = useState<{ projectId: string; view: ViewName } | null>(null);
+  const [shellHealth, setShellHealth] = useState<HealthResponse | null>(null);
+  const [backlogData, setBacklogData] = useState<BacklogResponse | null>(() =>
+    api.backlogMemoryFor(initialLocation.projectId) ?? null,
+  );
+  const [backlogProjectId, setBacklogProjectId] = useState(initialLocation.projectId);
   const [loading, setLoading] = useState(true);
   const loadingRef = useRef(loading);
+  const fetchEpochRef = useRef(0);
   const [error, setError] = useState<string | null>(null);
-  const initialLocation = useMemo(() => readDashboardLocation(), []);
   const [view, setView] = useState<ViewName>(initialLocation.view);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [pinnedEdge, setPinnedEdge] = useState<PinnedEdge | null>(null);
@@ -341,6 +412,10 @@ export default function App() {
 
   const resetProjectScopedUi = useCallback(() => {
     setData(null);
+    setDataScope(null);
+    setShellHealth(null);
+    setBacklogData(null);
+    setBacklogProjectId("");
     setError(null);
     setSelectedNodeId(null);
     setPinnedEdge(null);
@@ -369,42 +444,86 @@ export default function App() {
 
   const fetchAll = useCallback(async (signal?: AbortSignal) => {
     const requestProjectId = currentProjectId;
+    const requestView = view;
+    const requestEpoch = ++fetchEpochRef.current;
+    const plan = dashboardBootstrapPlan(requestView);
+    const isCurrentRequest = () =>
+      fetchEpochRef.current === requestEpoch &&
+      currentProjectIdRef.current === requestProjectId;
     setApiProjectId(requestProjectId);
     setLoading(true);
     setError(null);
     try {
-      const [health, projectList] = await Promise.all([
+      const commonRequest = Promise.all([
         api.health(signal),
         api.projects(signal),
-      ]);
-      const listedProjects = projectList.projects ?? [];
-      const projectKnown = listedProjects.some((project) => project.project_id === requestProjectId);
-      setProjects(projectKnown || view === "projects" ? listedProjects : ensureProjectOption(listedProjects, requestProjectId));
-      if (!projectKnown && view === "projects") {
-        setData(null);
-        setAiConfig(null);
+      ]).then(([health, projectList]) => {
+        const listedProjects = projectList.projects ?? [];
+        const projectKnown = listedProjects.some((project) => project.project_id === requestProjectId);
+        if (isCurrentRequest()) {
+          setShellHealth(health);
+          setProjects(
+            projectKnown || requestView === "projects"
+              ? listedProjects
+              : ensureProjectOption(listedProjects, requestProjectId),
+          );
+        }
+        return { health, projectKnown };
+      });
+
+      if (requestView === "backlog" || requestView === "activity") {
+        const backlogRequest = api.backlogFor(requestProjectId, signal).then((backlog) => {
+          if (isCurrentRequest()) {
+            setBacklogData(backlog);
+            setBacklogProjectId(requestProjectId);
+          }
+          return backlog;
+        });
+        await Promise.all([commonRequest, backlogRequest]);
         return;
       }
-      if (view === "inbox" || view === "demo") {
-        setData(null);
-        setAiConfig(null);
+
+      const { health, projectKnown } = await commonRequest;
+      if (!projectKnown && requestView === "projects") {
+        if (isCurrentRequest()) {
+          setData(null);
+          setDataScope(null);
+          setAiConfig(null);
+        }
         return;
       }
+      if (requestView === "projects" || requestView === "inbox" || requestView === "demo") {
+        if (isCurrentRequest()) {
+          setData(null);
+          setDataScope(null);
+          setAiConfig(null);
+        }
+        return;
+      }
+
       const [status, summary, projection, backlog, aiCfg] = await Promise.all([
         api.statusFor(requestProjectId, signal),
         api.activeSummaryFor(requestProjectId, signal),
-        api.activeProjectionFor(requestProjectId, signal),
-        api.backlogFor(requestProjectId, signal),
-        api.aiConfigFor(requestProjectId, signal),
+        plan.projection ? api.activeProjectionFor(requestProjectId, signal) : Promise.resolve(null),
+        plan.backlog ? api.backlogFor(requestProjectId, signal) : Promise.resolve(null),
+        plan.aiConfig ? api.aiConfigFor(requestProjectId, signal) : Promise.resolve(null),
       ]);
-      setAiConfig(aiCfg);
       const snapshotId = status.active_snapshot_id || summary.snapshot_id;
-      const [nodesRes, edgesRes, feedback, assetInbox, assetImpactReminders] = await Promise.all([
-        api.nodesFor(requestProjectId, snapshotId, 1000, signal),
-        api.edgesFor(requestProjectId, snapshotId, 4000, signal),
-        api.feedbackQueueFor(requestProjectId, snapshotId, signal),
-        api.assetInboxFor(requestProjectId, snapshotId, signal),
-        api
+      const [nodesRes, edgesRes, feedback, assetInbox, assetImpactReminders, ops] = await Promise.all([
+        plan.nodes
+          ? api.nodesFor(requestProjectId, snapshotId, 1000, signal)
+          : Promise.resolve({ nodes: [] }),
+        plan.edges
+          ? api.edgesFor(requestProjectId, snapshotId, 4000, signal)
+          : Promise.resolve({ edges: [] }),
+        plan.feedback
+          ? api.feedbackQueueFor(requestProjectId, snapshotId, signal)
+          : Promise.resolve(null),
+        plan.assetInbox
+          ? api.assetInboxFor(requestProjectId, snapshotId, signal)
+          : Promise.resolve(null),
+        plan.assetImpactReminders
+          ? api
           .assetImpactRemindersFor(requestProjectId, { asset_kind: "", status: "pending" }, signal)
           .catch((assetImpactError) => {
             if ((assetImpactError as { name?: string }).name === "AbortError") throw assetImpactError;
@@ -414,7 +533,11 @@ export default function App() {
                 : (assetImpactError as Error).message;
             console.warn("Asset impact reminders refresh failed", assetImpactError);
             return emptyAssetImpactReminders(requestProjectId, { unavailable: true, error: msg });
-          }),
+          })
+          : Promise.resolve(null),
+        plan.operations
+          ? api.operationsQueueFor(requestProjectId, signal)
+          : Promise.resolve(null),
       ]);
       // projection.projection is null when the snapshot was just rebuilt and
       // the semantic projection hasn't been computed yet. mergeProjection
@@ -427,6 +550,10 @@ export default function App() {
         const h = healthMap.get(n.node_id);
         return h ? { ...n, _health: h._health } : n;
       });
+      if (!isCurrentRequest() || !backlog) return;
+      setAiConfig(aiCfg);
+      setBacklogData(backlog);
+      setBacklogProjectId(requestProjectId);
       setData({
         health,
         status,
@@ -434,37 +561,32 @@ export default function App() {
         projection,
         nodes: mergedWithHealth,
         edges: edgesRes.edges,
-        ops: emptyOperationsQueue(requestProjectId, snapshotId),
+        ops,
         feedback,
         assetImpactReminders,
         assetInbox,
         backlog,
         loadedAt: new Date().toISOString(),
       });
-      api.operationsQueueFor(requestProjectId, signal)
-        .then((ops) => {
-          setData((current) => {
-            if (!current) return current;
-            const currentProjectId = current.status.project_id || current.summary.project_id;
-            const currentSnapshotId = current.status.active_snapshot_id || current.summary.snapshot_id;
-            if (currentProjectId !== requestProjectId || currentSnapshotId !== snapshotId) return current;
-            return { ...current, ops };
-          });
-        })
-        .catch((opsError) => {
-          if ((opsError as { name?: string }).name === "AbortError") return;
-          console.warn("Operations queue refresh failed", opsError);
-        });
+      setDataScope({ projectId: requestProjectId, view: requestView });
     } catch (e) {
       if ((e as { name?: string }).name === "AbortError") return;
-      if (shouldFallbackToProjects(e) && view === "projects") {
+      if (!isCurrentRequest()) return;
+      if (shouldFallbackToProjects(e) && requestView === "projects") {
         setData(null);
+        setDataScope(null);
         setAiConfig(null);
         setError(null);
         return;
       }
-      if (shouldFallbackToProjects(e) && view !== "projects" && view !== "inbox" && view !== "demo") {
+      if (
+        shouldFallbackToProjects(e) &&
+        requestView !== "projects" &&
+        requestView !== "inbox" &&
+        requestView !== "demo"
+      ) {
         setData(null);
+        setDataScope(null);
         setAiConfig(null);
         setView("projects");
         const msg = e instanceof ApiError ? `${e.message} ${e.body}` : (e as Error).message;
@@ -480,7 +602,7 @@ export default function App() {
       setError(msg);
       setToast({ kind: "error", msg: `Load failed: ${msg}` });
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) setLoading(false);
     }
   }, [currentProjectId, view]);
 
@@ -1164,6 +1286,16 @@ export default function App() {
     setActionPanelOpen(true);
   }, []);
 
+  const projectData = dataScope?.projectId === currentProjectId ? data : null;
+  const viewData =
+    dataScope?.projectId === currentProjectId && dataScope.view === view ? data : null;
+  const currentBacklog =
+    backlogProjectId === currentProjectId ? backlogData : null;
+  const activeViewReady =
+    view === "backlog" || view === "activity"
+      ? Boolean(currentBacklog)
+      : Boolean(viewData);
+
   if (view === "inbox") {
     const projectLabel = projectDisplayName(projects, currentProjectId);
     const handleEnterEngineerMode = () => {
@@ -1235,11 +1367,11 @@ export default function App() {
     <div className="app">
       <Header
         loading={loading}
-        summary={data?.summary}
-        status={data?.status}
-        health={data?.health}
-        ops={data?.ops}
-        loadedAt={data?.loadedAt}
+        summary={projectData?.summary}
+        status={projectData?.status}
+        health={shellHealth ?? projectData?.health}
+        ops={projectData?.ops ?? undefined}
+        loadedAt={projectData?.loadedAt}
         projectId={currentProjectId}
         projects={projects}
         aiConfig={aiConfig}
@@ -1262,8 +1394,8 @@ export default function App() {
         onClearMultiSelect={clearMultiSelect}
       />
       <StaleGraphBanner
-        health={data?.health}
-        status={data?.status}
+        health={projectData?.health}
+        status={projectData?.status}
         busy={reconcileBusy}
         phase={reconcilePhase}
         phaseDetail={reconcileDetail}
@@ -1271,21 +1403,21 @@ export default function App() {
       />
       <div className="app-body">
         <TreePanel
-          nodes={data?.nodes ?? []}
+          nodes={viewData?.nodes ?? []}
           selectedNodeId={selectedNodeId}
           activeView={view}
-          assetInbox={data?.assetInbox ?? null}
+          assetInbox={viewData?.assetInbox ?? null}
           assetTreeSelection={assetTreeSelection}
           assetStatusFilter={assetStatusFilter}
           assetSearch={assetSearch}
           selectedAssetId={selectedAssetId}
-          opsCount={data?.ops?.count ?? 0}
+          opsCount={viewData?.ops?.count ?? 0}
           reviewCount={
-            (data?.feedback?.summary?.visible_group_count ?? 0) +
-            countAssetImpactReminders(data?.assetImpactReminders)
+            (viewData?.feedback?.summary?.visible_group_count ?? 0) +
+            countAssetImpactReminders(viewData?.assetImpactReminders)
           }
-          assetCount={data?.assetInbox?.summary?.operator_review_count ?? 0}
-          backlogCount={countOpenBacklog(data?.backlog)}
+          assetCount={viewData?.assetInbox?.summary?.operator_review_count ?? 0}
+          backlogCount={countOpenBacklog(currentBacklog ?? undefined)}
           projectCount={projects.length}
           onSelectNode={handleSelectNode}
           onAssetTreeSelectionChange={setAssetTreeSelection}
@@ -1298,7 +1430,7 @@ export default function App() {
           onToggleCollapsed={() => setSidebarCollapsed((prev) => !prev)}
         />
         <main className="main scrollbar-thin">
-          {error && !data && view !== "projects" ? (
+          {error && !activeViewReady && view !== "projects" ? (
             <div className="view">
               <div className="empty">
                 Load failed. Check the governance service is reachable at{" "}
@@ -1321,10 +1453,10 @@ export default function App() {
           {view === "demo" ? (
             <DemoLaunchView projectId={currentProjectId} />
           ) : null}
-          {view === "overview" && data ? (
-            <OverviewView data={data} onSelectNode={handleSelectNode} />
+          {view === "overview" && viewData?.projection && viewData.feedback && viewData.ops ? (
+            <OverviewView data={{ ...viewData, projection: viewData.projection, feedback: viewData.feedback, ops: viewData.ops }} onSelectNode={handleSelectNode} />
           ) : null}
-          {view === "graph" && data ? (
+          {view === "graph" && viewData ? (
             <div className="graph-with-drawer">
               <div className="graph-with-drawer-main">
                 {assetReturnContext ? (
@@ -1336,8 +1468,8 @@ export default function App() {
                   </div>
                 ) : null}
                 <GraphView
-                  nodes={data.nodes}
-                  edges={data.edges}
+                  nodes={viewData.nodes}
+                  edges={viewData.edges}
                   selectedNodeId={selectedNodeId}
                   pinnedEdge={pinnedEdge}
                   onPinEdge={handlePinEdge}
@@ -1352,12 +1484,12 @@ export default function App() {
                 <InspectorDrawer
                   node={selectedNode}
                   pinnedEdge={pinnedEdge}
-                  allNodes={data.nodes}
-                  edges={data.edges}
-                  feedback={data.feedback}
-                  snapshotId={data.status?.active_snapshot_id ?? data.summary?.snapshot_id ?? null}
+                  allNodes={viewData.nodes}
+                  edges={viewData.edges}
+                  feedback={viewData.feedback}
+                  snapshotId={viewData.status?.active_snapshot_id ?? viewData.summary?.snapshot_id ?? null}
                   edgeSemantics={
-                    (data.projection?.projection?.edge_semantics as
+                    (viewData.projection?.projection?.edge_semantics as
                       | Record<string, unknown>
                       | undefined) ?? null
                   }
@@ -1378,19 +1510,19 @@ export default function App() {
               ) : null}
             </div>
           ) : null}
-          {view === "operations" && data ? (
+          {view === "operations" && viewData?.ops ? (
             <OperationsQueueView
-              ops={data.ops}
+              ops={viewData.ops}
               onCancelOperation={handleCancelOperation}
               onCancelAllByType={handleCancelAllByType}
               onClearTerminal={handleClearTerminal}
             />
           ) : null}
-          {view === "review" && data ? (
+          {view === "review" && viewData?.feedback && viewData.assetImpactReminders ? (
             <ReviewQueueView
               projectId={currentProjectId}
-              feedback={data.feedback}
-              assetImpactReminders={data.assetImpactReminders}
+              feedback={viewData.feedback}
+              assetImpactReminders={viewData.assetImpactReminders}
               assetImpactReminderEvents={assetImpactEventsByReminder}
               assetImpactBusyId={assetImpactBusyId}
               assetImpactError={assetImpactError}
@@ -1402,12 +1534,12 @@ export default function App() {
               onOpenEdgeInGraph={handleSelectEdgeFromReview}
             />
           ) : null}
-          {view === "assets" && data ? (
+          {view === "assets" && viewData?.assetInbox ? (
             <AssetInboxView
-              assetInbox={data.assetInbox}
+              assetInbox={viewData.assetInbox}
               projectId={currentProjectId}
-              snapshotId={data.status?.active_snapshot_id ?? data.summary?.snapshot_id ?? ""}
-              nodes={data.nodes}
+              snapshotId={viewData.status?.active_snapshot_id ?? viewData.summary?.snapshot_id ?? ""}
+              nodes={viewData.nodes}
               treeSelection={assetTreeSelection}
               statusFilter={assetStatusFilter}
               search={assetSearch}
@@ -1417,19 +1549,19 @@ export default function App() {
               workspaceRoot={activeWorkspaceRoot}
             />
           ) : null}
-          {view === "backlog" && data ? (
+          {view === "backlog" && currentBacklog ? (
             <BacklogView
-              backlog={data.backlog}
+              backlog={currentBacklog}
               projectId={currentProjectId}
             />
           ) : null}
-          {view === "activity" && data ? (
+          {view === "activity" && currentBacklog ? (
             <TaskPlaybackView
-              backlog={data.backlog}
+              backlog={currentBacklog}
               projectId={currentProjectId}
             />
           ) : null}
-          {!data && !error && view !== "projects" && view !== "demo" ? (
+          {!activeViewReady && !error && view !== "projects" && view !== "demo" ? (
             <div className="view">
               <div className="empty">
                 <span className="spinner" /> Loading governance snapshot…

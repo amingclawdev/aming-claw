@@ -374,10 +374,10 @@ export class ApiError extends Error {
 
 export const api = {
   health(signal?: AbortSignal) {
-    return getJSON<HealthResponse>("/api/health", signal);
+    return getPublicJSONSingleFlight<HealthResponse>("/api/health", signal);
   },
   projects(signal?: AbortSignal) {
-    return getJSON<ProjectsResponse>("/api/projects", signal);
+    return getPublicJSONSingleFlight<ProjectsResponse>("/api/projects", signal);
   },
   projectConfig(signal?: AbortSignal) {
     return getJSON<ProjectConfigResponse>(`/api/projects/${pid()}/config`, signal);
