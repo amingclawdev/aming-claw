@@ -143,10 +143,30 @@ def test_generation_restart_requires_signed_governance_failure_disposition() -> 
             ),
         ),
     )
+    authority_ref = "timeline:123"
     product_packet = {
         "schema_version": "observer.failure_domain_evidence_disposition.v1",
+        "source_event_ref": authority_ref,
+        "authority_ref": authority_ref,
+        "authority_ref_status": "accepted",
+        "authority_source": "server_persisted_observer_route_event",
+        "authority_hash_source": "server_projection_from_persisted_event",
         "failure_domain": "target_product_defect",
-        "observer_principal": "observer-session-1",
+        "observer_principal": "observer-route:rtok-observer-session-1",
+        "observer_principal_binding": {
+            "schema_version": (
+                "observer.failure_domain_principal_route_binding.v1"
+            ),
+            "server_projected": True,
+            "status": "accepted",
+            "caller_role": "observer",
+            "observer_principal": (
+                "observer-route:rtok-observer-session-1"
+            ),
+            "route_token_ref": "rtok-observer-session-1",
+            "registry_verified": True,
+            "source_event_ref": authority_ref,
+        },
         "observation_refs": ["timeline:browser-failure"],
         "invalidated_evidence_refs": [
             {
@@ -165,6 +185,27 @@ def test_generation_restart_requires_signed_governance_failure_disposition() -> 
     product_packet["authority_hash"] = (
         observer_failure_domain_disposition_hash(product_packet)
     )
+    caller_packet = {
+        key: value
+        for key, value in product_packet.items()
+        if key
+        not in {
+            "authority_ref",
+            "authority_ref_status",
+            "authority_source",
+            "authority_hash_source",
+            "observer_principal_binding",
+            "source_event_ref",
+        }
+    }
+    caller_packet["authority_hash"] = (
+        observer_failure_domain_disposition_hash(caller_packet)
+    )
+    with pytest.raises(
+        ValueError,
+        match="server-persisted accepted authority ref",
+    ):
+        validate_observer_failure_domain_disposition(caller_packet)
     with pytest.raises(
         ValueError,
         match="fresh generation requires signed governance-lane invalidation",
@@ -174,6 +215,7 @@ def test_generation_restart_requires_signed_governance_failure_disposition() -> 
             severe_integration_failure=True,
             generation_restart_requested=True,
             failure_domain_disposition=product_packet,
+            failure_domain_disposition_ref=authority_ref,
         )
 
     governance_packet = {
@@ -202,6 +244,7 @@ def test_generation_restart_requires_signed_governance_failure_disposition() -> 
     validated = validate_observer_failure_domain_disposition(
         governance_packet,
         require_generation_restart=True,
+        server_persisted_authority_ref=authority_ref,
     )
     assert validated["failure_domain"] == (
         "governance_lane_evidence_invalid"
@@ -211,6 +254,7 @@ def test_generation_restart_requires_signed_governance_failure_disposition() -> 
         severe_integration_failure=True,
         generation_restart_requested=True,
         failure_domain_disposition=governance_packet,
+        failure_domain_disposition_ref=authority_ref,
     )
     assert plan.rollback_required is True
 

@@ -13996,18 +13996,34 @@ def decide_persisted_batch_rollback_replay(
     severe_integration_failure: bool = False,
     generation_restart_requested: bool = False,
     failure_domain_disposition: Mapping[str, Any] | None = None,
+    failure_domain_disposition_ref: str = "",
     corrected_replay_order: tuple[str, ...] = (),
     scenario_id: str = "PB-004",
 ) -> BatchRollbackPlan:
-    """Replay batch rollback decisions from durable batch rows."""
+    """Replay batch rollback decisions from durable batch rows.
+
+    Generation restart authority is never inferred from a caller-supplied
+    packet.  The server resolves ``failure_domain_disposition_ref`` against
+    the timeline DB first, then supplies the resulting packet and the exact
+    persisted ref together.
+    """
     runtime = get_batch_merge_runtime(conn, project_id, batch_id)
     if runtime is None:
         raise KeyError(f"batch runtime not found: {project_id}/{batch_id}")
+    if generation_restart_requested and (
+        not str(failure_domain_disposition_ref or "").strip()
+        or not isinstance(failure_domain_disposition, Mapping)
+    ):
+        raise ValueError(
+            "generation restart requires a server-resolved persisted "
+            "failure_domain_disposition_ref"
+        )
     return decide_batch_rollback_replay(
         runtime,
         severe_integration_failure=severe_integration_failure,
         generation_restart_requested=generation_restart_requested,
         failure_domain_disposition=failure_domain_disposition,
+        failure_domain_disposition_ref=failure_domain_disposition_ref,
         corrected_replay_order=corrected_replay_order,
         scenario_id=scenario_id,
     )
@@ -20584,6 +20600,13 @@ OBSERVER_FAILURE_DOMAIN_ALLOWED_NEXT_TOPOLOGIES = {
     ),
 }
 
+OBSERVER_FAILURE_DOMAIN_AUTHORITY_SOURCE = (
+    "server_persisted_observer_route_event"
+)
+OBSERVER_FAILURE_DOMAIN_AUTHORITY_HASH_SOURCE = (
+    "server_projection_from_persisted_event"
+)
+
 
 def observer_failure_domain_disposition_hash(
     disposition: Mapping[str, Any],
@@ -20602,6 +20625,7 @@ def validate_observer_failure_domain_disposition(
     disposition: Mapping[str, Any] | None,
     *,
     require_generation_restart: bool = False,
+    server_persisted_authority_ref: str = "",
 ) -> dict[str, Any]:
     """Validate a server-signed observer failure-domain disposition.
 
@@ -20615,6 +20639,13 @@ def validate_observer_failure_domain_disposition(
     domain = str(packet.get("failure_domain") or "").strip()
     principal = str(packet.get("observer_principal") or "").strip()
     authority_hash = str(packet.get("authority_hash") or "").strip()
+    authority_ref = str(packet.get("authority_ref") or "").strip()
+    persisted_ref = str(server_persisted_authority_ref or "").strip()
+    principal_binding = (
+        dict(packet.get("observer_principal_binding"))
+        if isinstance(packet.get("observer_principal_binding"), Mapping)
+        else {}
+    )
     next_topology = str(packet.get("next_topology") or "").strip()
     observation_refs = tuple(
         str(ref).strip()
@@ -20653,6 +20684,48 @@ def validate_observer_failure_domain_disposition(
         raise ValueError("failure_domain is not governed")
     if not principal:
         raise ValueError("observer_principal is required")
+    if (
+        not persisted_ref
+        or not authority_ref
+        or authority_ref != persisted_ref
+        or not authority_ref.startswith("timeline:")
+        or str(packet.get("source_event_ref") or "").strip() != authority_ref
+        or str(packet.get("authority_source") or "").strip()
+        != OBSERVER_FAILURE_DOMAIN_AUTHORITY_SOURCE
+        or str(packet.get("authority_hash_source") or "").strip()
+        != OBSERVER_FAILURE_DOMAIN_AUTHORITY_HASH_SOURCE
+        or str(packet.get("authority_ref_status") or "").strip().lower()
+        != "accepted"
+    ):
+        raise ValueError(
+            "failure-domain disposition requires a server-persisted "
+            "accepted authority ref"
+        )
+    binding_status = str(principal_binding.get("status") or "").strip().lower()
+    bound_route_token_ref = str(
+        principal_binding.get("route_token_ref") or ""
+    ).strip()
+    if (
+        principal_binding.get("server_projected") is not True
+        or binding_status != "accepted"
+        or str(principal_binding.get("caller_role") or "").strip().lower()
+        != "observer"
+        or not bound_route_token_ref
+        or not (
+            principal_binding.get("registry_verified") is True
+            or principal_binding.get("server_issued_binding") is True
+            or principal_binding.get("resolved_from_ref") is True
+        )
+        or str(principal_binding.get("observer_principal") or "").strip()
+        != principal
+        or principal != f"observer-route:{bound_route_token_ref}"
+        or str(principal_binding.get("source_event_ref") or "").strip()
+        != authority_ref
+    ):
+        raise ValueError(
+            "observer_principal must be bound to an authenticated "
+            "server-registered observer route"
+        )
     if not observation_refs:
         raise ValueError("observation_refs are required")
     if next_topology not in (
@@ -20700,6 +20773,7 @@ def decide_batch_rollback_replay(
     severe_integration_failure: bool = False,
     generation_restart_requested: bool = False,
     failure_domain_disposition: Mapping[str, Any] | None = None,
+    failure_domain_disposition_ref: str = "",
     corrected_replay_order: tuple[str, ...] = (),
     scenario_id: str = "PB-004",
 ) -> BatchRollbackPlan:
@@ -20708,6 +20782,9 @@ def decide_batch_rollback_replay(
         validate_observer_failure_domain_disposition(
             failure_domain_disposition,
             require_generation_restart=True,
+            server_persisted_authority_ref=(
+                failure_domain_disposition_ref
+            ),
         )
     rollback_target = runtime.rollback_target_commit or runtime.batch_base_commit
     rollback_required = bool(

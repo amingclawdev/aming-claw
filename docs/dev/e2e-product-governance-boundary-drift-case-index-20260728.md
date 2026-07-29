@@ -53,4 +53,8 @@ The governed domains are:
 
 Generation restart is rejected when the packet is missing, unsigned, names a
 different topology, omits causal reasons, or attempts to invalidate evidence
-that the server disposition preserved.
+that the server disposition preserved. The restart call passes only the
+accepted timeline `failure_domain_disposition_ref`; the server reloads that DB
+row, verifies its observer actor and registered route binding, and reconstructs
+the immutable authority packet. Caller-computed hashes, raw packet bodies,
+unknown refs, and non-accepted refs are negative cases.

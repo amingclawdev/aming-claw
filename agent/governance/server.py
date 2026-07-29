@@ -31121,17 +31121,145 @@ def _observer_failure_domain_ref_values(value: Any) -> list[str]:
     return _runtime_context_service_dedupe(refs)
 
 
+def _observer_failure_domain_event_requested(
+    event: Mapping[str, Any],
+) -> bool:
+    tokens = {
+        str(event.get(field) or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        for field in ("event_type", "event_kind")
+    }
+    return bool(
+        tokens.intersection(
+            {
+                "observer.failure_domain_disposition",
+                "observer_failure_domain_disposition",
+                "failure_domain_disposition",
+            }
+        )
+    )
+
+
+def _observer_failure_domain_authority_from_route_gate(
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    actor: str,
+    status: str,
+    route_gate: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Project the authenticated observer principal/route binding."""
+
+    gate = (
+        _route_gate_public_summary(route_gate)
+        if isinstance(route_gate, Mapping)
+        else {}
+    )
+    gate_status = str(
+        gate.get("status") or gate.get("decision") or ""
+    ).strip().lower()
+    observer_actor = str(actor or "").strip()
+    principal_role_token = observer_actor.lower().replace("-", "_")
+    scope = (
+        dict(gate.get("scope"))
+        if isinstance(gate.get("scope"), Mapping)
+        else {}
+    )
+    if (
+        str(status or "").strip().lower() != "accepted"
+        or not observer_actor
+        or not (
+            principal_role_token.startswith("observer")
+            or principal_role_token.startswith("obs_")
+        )
+        or gate_status
+        not in {
+            "accepted",
+            "allowed",
+            "ok",
+            "passed",
+            "succeeded",
+            "success",
+            "route_token_ref_resolved",
+        }
+        or str(gate.get("caller_role") or "").strip().lower()
+        != "observer"
+        or not str(gate.get("route_token_ref") or "").strip()
+        or not (
+            gate.get("registry_verified") is True
+            or gate.get("server_issued_binding") is True
+            or gate.get("resolved_from_ref") is True
+        )
+        or (
+            str(scope.get("project_id") or project_id).strip()
+            != project_id
+        )
+        or (
+            backlog_id
+            and str(scope.get("backlog_id") or "").strip()
+            != backlog_id
+        )
+        or (
+            task_id
+            and str(scope.get("task_id") or "").strip() != task_id
+        )
+    ):
+        return {}
+    route_token_ref = str(gate.get("route_token_ref") or "").strip()
+    return {
+        "schema_version": (
+            "observer.failure_domain_principal_route_binding.v1"
+        ),
+        "server_projected": True,
+        "projection_source": (
+            "server_registered_observer_route_token_ref"
+        ),
+        "status": "accepted",
+        "observer_principal": f"observer-route:{route_token_ref}",
+        "observer_actor": observer_actor,
+        "caller_role": "observer",
+        "route_token_ref": route_token_ref,
+        "route_id": str(gate.get("route_id") or ""),
+        "route_context_hash": str(
+            gate.get("route_context_hash") or ""
+        ),
+        "prompt_contract_id": str(
+            gate.get("prompt_contract_id") or ""
+        ),
+        "prompt_contract_hash": str(
+            gate.get("prompt_contract_hash") or ""
+        ),
+        "registry_verified": True,
+        "server_issued_binding": bool(
+            gate.get("server_issued_binding")
+        ),
+        "resolved_from_ref": bool(gate.get("resolved_from_ref")),
+        "scope": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        },
+    }
+
+
 def _observer_failure_domain_disposition_from_event(
     event: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build a server-signed, QA-preserving observation disposition."""
 
     from .parallel_branch_runtime import (
+        OBSERVER_FAILURE_DOMAIN_AUTHORITY_HASH_SOURCE,
+        OBSERVER_FAILURE_DOMAIN_AUTHORITY_SOURCE,
         OBSERVER_FAILURE_DOMAIN_NEXT_TOPOLOGY,
         observer_failure_domain_disposition_hash,
         validate_observer_failure_domain_disposition,
     )
 
+    if str(event.get("status") or "").strip().lower() != "accepted":
+        return {}
     payload = (
         dict(event.get("payload"))
         if isinstance(event.get("payload"), Mapping)
@@ -31156,9 +31284,78 @@ def _observer_failure_domain_disposition_from_event(
         return {}
     event_id = str(event.get("id") or "").strip()
     source_event_ref = f"timeline:{event_id}" if event_id else ""
-    observer_principal = str(event.get("actor") or "").strip()
-    if not observer_principal:
+    if not source_event_ref:
         return {}
+    observer_actor = str(event.get("actor") or "").strip()
+    if not observer_actor:
+        return {}
+    observer_principal_role = observer_actor.lower().replace("-", "_")
+    if not (
+        observer_principal_role.startswith("observer")
+        or observer_principal_role.startswith("obs_")
+    ):
+        return {}
+    persisted_principal_binding = (
+        dict(payload.get("observer_failure_domain_authority"))
+        if isinstance(
+            payload.get("observer_failure_domain_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    binding_status = str(
+        persisted_principal_binding.get("status") or ""
+    ).strip().lower()
+    binding_scope = (
+        dict(persisted_principal_binding.get("scope"))
+        if isinstance(persisted_principal_binding.get("scope"), Mapping)
+        else {}
+    )
+    if (
+        persisted_principal_binding.get("server_projected") is not True
+        or binding_status != "accepted"
+        or str(
+            persisted_principal_binding.get("caller_role") or ""
+        ).strip().lower()
+        != "observer"
+        or str(
+            persisted_principal_binding.get("observer_actor") or ""
+        ).strip()
+        != observer_actor
+        or not str(
+            persisted_principal_binding.get("route_token_ref") or ""
+        ).strip()
+        or not (
+            persisted_principal_binding.get("registry_verified") is True
+            or persisted_principal_binding.get("server_issued_binding")
+            is True
+            or persisted_principal_binding.get("resolved_from_ref") is True
+        )
+        or str(binding_scope.get("project_id") or "").strip()
+        != str(event.get("project_id") or "").strip()
+        or str(binding_scope.get("backlog_id") or "").strip()
+        != str(event.get("backlog_id") or "").strip()
+        or str(binding_scope.get("task_id") or "").strip()
+        != str(event.get("task_id") or "").strip()
+    ):
+        return {}
+    observer_principal = str(
+        persisted_principal_binding.get("observer_principal") or ""
+    ).strip()
+    expected_route_principal = (
+        "observer-route:"
+        + str(
+            persisted_principal_binding.get("route_token_ref") or ""
+        ).strip()
+    )
+    if observer_principal != expected_route_principal:
+        return {}
+    principal_binding = {
+        **persisted_principal_binding,
+        "source_event_ref": source_event_ref,
+        "observer_principal": observer_principal,
+        "observer_actor": observer_actor,
+    }
     observation_refs = _observer_failure_domain_ref_values(
         supplied.get("observation_refs")
         or supplied.get("observation_event_refs")
@@ -31271,9 +31468,18 @@ def _observer_failure_domain_disposition_from_event(
         ),
         "source": "server_task_timeline_projection",
         "source_event_ref": source_event_ref,
+        "authority_ref": source_event_ref,
+        "authority_ref_status": "accepted",
+        "authority_source": OBSERVER_FAILURE_DOMAIN_AUTHORITY_SOURCE,
+        "authority_hash_source": (
+            OBSERVER_FAILURE_DOMAIN_AUTHORITY_HASH_SOURCE
+        ),
         "failure_domain": domain,
         "observer_principal": observer_principal,
-        "observer_principal_source": "task_timeline.actor",
+        "observer_principal_source": (
+            "server_registered_observer_route_binding"
+        ),
+        "observer_principal_binding": principal_binding,
         "observation_refs": observation_refs,
         "invalidated_evidence_refs": accepted_invalidated,
         "rejected_invalidation_refs": rejected_invalidated,
@@ -31292,7 +31498,10 @@ def _observer_failure_domain_disposition_from_event(
     packet["authority_hash"] = observer_failure_domain_disposition_hash(
         packet
     )
-    return validate_observer_failure_domain_disposition(packet)
+    return validate_observer_failure_domain_disposition(
+        packet,
+        server_persisted_authority_ref=source_event_ref,
+    )
 
 
 def _latest_observer_failure_domain_disposition(
@@ -31305,7 +31514,6 @@ def _latest_observer_failure_domain_disposition(
     """Return the newest valid disposition for a live guide projection."""
 
     from .parallel_branch_runtime import (
-        observer_failure_domain_disposition_hash,
         validate_observer_failure_domain_disposition,
     )
 
@@ -31336,46 +31544,111 @@ def _latest_observer_failure_domain_disposition(
     ):
         disposition = _observer_failure_domain_disposition_from_event(event)
         if disposition:
-            invalidated_refs = {
-                str(item.get("ref") or "").strip()
-                for item in disposition.get("invalidated_evidence_refs") or []
-                if isinstance(item, Mapping)
-            }
-            preserved_refs = list(
-                disposition.get("preserved_evidence_refs") or []
-            )
-            for evidence_event in events:
-                evidence_marker = " ".join(
-                    str(evidence_event.get(field) or "").strip().lower()
-                    for field in ("event_type", "event_kind", "phase")
-                )
-                if not any(
-                    marker in evidence_marker
-                    for marker in (
-                        "implementation",
-                        "startup",
-                        "finish",
-                        "qa",
-                        "merge",
-                        "reconcile",
-                        "batch",
-                        "epoch",
-                    )
-                ):
-                    continue
-                evidence_ref = _runtime_context_event_ref(evidence_event)
-                if evidence_ref and evidence_ref not in invalidated_refs:
-                    preserved_refs.append(evidence_ref)
-            disposition["preserved_evidence_refs"] = (
-                _runtime_context_service_dedupe(preserved_refs)
-            )
-            disposition["authority_hash"] = (
-                observer_failure_domain_disposition_hash(disposition)
-            )
             return validate_observer_failure_domain_disposition(
-                disposition
+                disposition,
+                server_persisted_authority_ref=str(
+                    disposition.get("authority_ref") or ""
+                ),
             )
     return {}
+
+
+def _observer_failure_domain_disposition_from_ref(
+    conn,
+    *,
+    project_id: str,
+    authority_ref: str,
+    backlog_id: str = "",
+    task_id: str = "",
+) -> dict[str, Any]:
+    """Resolve one accepted disposition exclusively from its persisted row."""
+
+    from . import task_timeline
+
+    ref = str(authority_ref or "").strip()
+    match = re.fullmatch(r"timeline:(\d+)", ref)
+    if not match:
+        raise ValidationError(
+            "failure_domain_disposition_ref must be an exact timeline:<id> ref"
+        )
+    event_id = int(match.group(1))
+    row = conn.execute(
+        """
+        SELECT * FROM task_timeline_events
+        WHERE project_id = ? AND id = ?
+        """,
+        (project_id, event_id),
+    ).fetchone()
+    if row is None:
+        raise ValidationError(
+            "failure_domain_disposition_ref does not exist in the governance DB"
+        )
+    event = task_timeline._row_to_dict(row)
+    if (
+        backlog_id
+        and str(event.get("backlog_id") or "").strip() != backlog_id
+    ):
+        raise ValidationError(
+            "failure_domain_disposition_ref backlog scope mismatch"
+        )
+    if task_id and str(event.get("task_id") or "").strip() != task_id:
+        raise ValidationError(
+            "failure_domain_disposition_ref task scope mismatch"
+        )
+    if str(event.get("status") or "").strip().lower() != "accepted":
+        raise ValidationError(
+            "failure_domain_disposition_ref is not an accepted DB event"
+        )
+    disposition = _observer_failure_domain_disposition_from_event(event)
+    if (
+        not disposition
+        or str(disposition.get("authority_ref") or "").strip() != ref
+    ):
+        raise ValidationError(
+            "failure_domain_disposition_ref is not an authenticated "
+            "observer authority event"
+        )
+    return disposition
+
+
+def _observer_failure_domain_restart_authority_from_body(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """Resolve batch restart authority from a DB ref, never a body packet."""
+
+    generation_restart_requested = _query_bool(
+        body,
+        "generation_restart_requested",
+        False,
+    )
+    if not generation_restart_requested:
+        return False, "", None
+    if isinstance(body.get("failure_domain_disposition"), Mapping):
+        raise ValidationError(
+            "caller-supplied failure_domain_disposition packets are not "
+            "restart authority; submit only a server-persisted "
+            "failure_domain_disposition_ref"
+        )
+    authority_ref = str(
+        body.get("failure_domain_disposition_ref")
+        or body.get("authority_ref")
+        or ""
+    ).strip()
+    if not authority_ref:
+        raise ValidationError(
+            "generation restart requires failure_domain_disposition_ref"
+        )
+    disposition = _observer_failure_domain_disposition_from_ref(
+        conn,
+        project_id=project_id,
+        authority_ref=authority_ref,
+        backlog_id=str(body.get("backlog_id") or "").strip(),
+        task_id=str(body.get("task_id") or "").strip(),
+    )
+    return True, authority_ref, disposition
 
 
 def _runtime_context_scope_insufficiency_observer_disposition(
@@ -44061,6 +44334,15 @@ def handle_graph_governance_parallel_branch_batch_runtime(ctx: RequestContext):
             rollback_projection_id=str(ctx.body.get("rollback_projection_id") or ""),
             failure_reason=str(ctx.body.get("failure_reason") or ""),
         )
+        (
+            generation_restart_requested,
+            failure_domain_disposition_ref,
+            failure_domain_disposition,
+        ) = _observer_failure_domain_restart_authority_from_body(
+            conn,
+            project_id=project_id,
+            body=ctx.body,
+        )
 
         with sqlite_write_lock():
             saved = upsert_batch_merge_runtime(
@@ -44073,18 +44355,10 @@ def handle_graph_governance_parallel_branch_batch_runtime(ctx: RequestContext):
                 project_id,
                 batch_id,
                 severe_integration_failure=severe,
-                generation_restart_requested=_query_bool(
-                    ctx.body,
-                    "generation_restart_requested",
-                    False,
-                ),
-                failure_domain_disposition=(
-                    ctx.body.get("failure_domain_disposition")
-                    if isinstance(
-                        ctx.body.get("failure_domain_disposition"),
-                        Mapping,
-                    )
-                    else None
+                generation_restart_requested=generation_restart_requested,
+                failure_domain_disposition=failure_domain_disposition,
+                failure_domain_disposition_ref=(
+                    failure_domain_disposition_ref
                 ),
                 corrected_replay_order=tuple(_query_statuses(ctx.body, "corrected_replay_order")),
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-004"),
@@ -60045,6 +60319,7 @@ _SERVER_PROJECTED_TIMELINE_KEYS = frozenset(
         "contract_gate_decision",
         "meta_contract_gate",
         "observer_direct_pre_mutation_authority",
+        "observer_failure_domain_authority",
         "source_backed_contract_gate_authority",
         *_ROUTE_ACTION_SCOPE_LINEAGE_KEYS,
     }
@@ -102013,6 +102288,43 @@ def handle_task_timeline_append(ctx: RequestContext):
         raw_status = ctx.body.get("status", "")
         raw_payload = _timeline_payload_with_route_gate(ctx.body, route_gate)
         raw_payload = _strip_caller_route_action_scope_lineage(raw_payload)
+        failure_domain_event = {
+            "event_type": ctx.body.get("event_type", ""),
+            "event_kind": raw_event_kind,
+        }
+        if _observer_failure_domain_event_requested(failure_domain_event):
+            failure_domain_authority = (
+                _observer_failure_domain_authority_from_route_gate(
+                    project_id=project_id,
+                    backlog_id=str(
+                        ctx.body.get("backlog_id") or ""
+                    ).strip(),
+                    task_id=str(ctx.body.get("task_id") or "").strip(),
+                    actor=str(ctx.body.get("actor") or "").strip(),
+                    status=str(raw_status or "").strip(),
+                    route_gate=route_gate,
+                )
+            )
+            if not failure_domain_authority:
+                raise GovernanceError(
+                    "observer_failure_domain_authority_required",
+                    (
+                        "failure-domain disposition requires an accepted "
+                        "observer actor bound to a server-registered route"
+                    ),
+                    422,
+                    {
+                        "required_actor_role": "observer",
+                        "required_route_binding": (
+                            "server_registered_observer_route_token_ref"
+                        ),
+                        "caller_authority_hash_accepted": False,
+                        "server_projection_required": True,
+                    },
+                )
+            raw_payload["observer_failure_domain_authority"] = (
+                failure_domain_authority
+            )
         if trusted_qa_verification_authority:
             raw_payload["source_backed_contract_gate_authority"] = (
                 task_timeline.source_backed_qa_session_authority(
