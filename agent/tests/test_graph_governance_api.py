@@ -80147,6 +80147,15 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
         "evidence_owner_role": "qa",
         "observer_impersonation": False,
         "parent_materialization_authorized": False,
+        "completion_status_gate": {
+            "schema_version": "contract_runtime.qa_completion_status_gate.v1",
+            "server_derived": True,
+            "source": "contract_runtime_line_write_normalization",
+            "normalized_status": "passed",
+            "top_level_status_present": True,
+            "top_level_status_passing": True,
+            "nested_payload_decision_satisfies": False,
+        },
         "authenticated_qa_binding": {
             "schema_version": "contract_runtime.authenticated_qa_binding.v1",
             "server_derived": True,
@@ -80228,6 +80237,25 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
         qa_verification(fresh_commit, "passed", task_id),
     ]
     completed_lines[-1]["validated_head_commit"] = fresh_commit
+    baseline_observations = [
+        {
+            "name": "graph API full baseline observation",
+            "status": "baseline_observation",
+            "passed": 947,
+            "failed": 42,
+            "verdict_impact": "none",
+        },
+        {
+            "name": "mf_sub full baseline observation",
+            "status": "baseline_observation",
+            "passed": 286,
+            "failed": 1,
+            "verdict_impact": "none",
+        },
+    ]
+    completed_lines[-1]["tests"] = json.loads(
+        json.dumps(baseline_observations)
+    )
     completed_lines[-1]["test_results"] = {
         "baseline": {"commit_sha": old_commit},
         "candidate": {"commit_sha": fresh_commit},
@@ -80237,6 +80265,9 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
         "immediate_parent_full_file": {
             "commit_sha": immediate_parent_commit,
         },
+        "passed": True,
+        "status": "passed",
+        "tests": json.loads(json.dumps(baseline_observations)),
     }
     completed_lines[-1]["artifact_refs"] = {
         "external_no_pass_baseline_ledger": {
@@ -80248,6 +80279,9 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
         }
     }
     completed_lines[-1]["payload"]["candidate_commit_sha"] = fresh_commit
+    completed_lines[-1]["payload"]["focused_tests"] = json.loads(
+        json.dumps(baseline_observations)
+    )
     completed_lines[-1]["payload"]["live_source_tuple"] = {
         "schema_version": "qa.live_source_tuple.v1",
         "authority_scope": "immutable_external_audit",
@@ -80304,6 +80338,8 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
         "merge_queue_item_id": "mqitem-292cb9e3fc6bc3dec0527a0c",
         "merge_event_ref": "timeline:18257",
     }
+    assert "worker_role" not in completed_lines[5]
+    assert "worker_role" not in completed_lines[6]
 
     canonical_candidate_conflict = json.loads(json.dumps(record))
     canonical_candidate_conflict["completed_lines"][6]["payload"][
@@ -80314,6 +80350,60 @@ def test_observer_merge_round_uses_latest_authenticated_qa_rework_generation(
             conn,
             project_id=PID,
             record=canonical_candidate_conflict,
+            context=context,
+            branch_head=fresh_commit,
+        )
+        == {}
+    )
+
+    unauthenticated_qa = json.loads(json.dumps(record))
+    unauthenticated_qa["completed_lines"][6].pop(
+        "qa_evidence_provenance"
+    )
+    assert (
+        server._contract_runtime_observer_merge_completed_round(
+            conn,
+            project_id=PID,
+            record=unauthenticated_qa,
+            context=context,
+            branch_head=fresh_commit,
+        )
+        == {}
+    )
+
+    active_candidate_failure = json.loads(json.dumps(record))
+    active_candidate_failure["completed_lines"][6]["payload"][
+        "focused_tests"
+    ].append(
+        {
+            "name": "candidate regression",
+            "status": "failed",
+            "failed": 1,
+        }
+    )
+    assert (
+        server._contract_runtime_observer_merge_completed_round(
+            conn,
+            project_id=PID,
+            record=active_candidate_failure,
+            context=context,
+            branch_head=fresh_commit,
+        )
+        == {}
+    )
+
+    nested_active_failure = json.loads(json.dumps(record))
+    nested_active_failure["completed_lines"][6]["tests"][0][
+        "candidate_result"
+    ] = {
+        "status": "failed",
+        "failed": 1,
+    }
+    assert (
+        server._contract_runtime_observer_merge_completed_round(
+            conn,
+            project_id=PID,
+            record=nested_active_failure,
             context=context,
             branch_head=fresh_commit,
         )
