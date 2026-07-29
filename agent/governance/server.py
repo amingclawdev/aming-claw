@@ -12296,21 +12296,33 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         ctx.body or {},
         "target_files",
     )
+    request_file_fence_explicit = any(
+        key in (ctx.body or {}) for key in ("owned_files", "target_files")
+    )
     backlog_test_files = _parallel_branch_allocate_row_test_files(
         project_id,
         str(ctx.body.get("backlog_id") or ""),
     )
-    if not request_owned_files:
-        request_owned_files = list(request_target_files)
-    if not request_target_files:
-        request_target_files = list(request_owned_files)
-    if backlog_test_files:
-        request_owned_files = _runtime_context_public_file_values(
-            [*request_owned_files, *backlog_test_files]
+    conn = get_connection(project_id)
+    if request_file_fence_explicit:
+        if not request_owned_files:
+            request_owned_files = list(request_target_files)
+        if not request_target_files:
+            request_target_files = list(request_owned_files)
+        if request_owned_files or request_target_files:
+            request_owned_files = _runtime_context_public_file_values(
+                [*request_owned_files, *backlog_test_files]
+            )
+            request_target_files = _runtime_context_public_file_values(
+                [*request_target_files, *backlog_test_files]
+            )
+    else:
+        _, row_declared_files = _backlog_acceptance_scope_authority(
+            conn,
+            str(ctx.body.get("backlog_id") or ""),
         )
-        request_target_files = _runtime_context_public_file_values(
-            [*request_target_files, *backlog_test_files]
-        )
+        request_owned_files = list(row_declared_files)
+        request_target_files = list(row_declared_files)
     worktree_root = str(ctx.body.get("worktree_root") or ".worktrees")
     contract_parent_lineage = _parallel_branch_allocate_contract_parent_lineage(
         ctx.body or {}
@@ -12394,7 +12406,6 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         and requested_agent_id == allocation_owner
     )
 
-    conn = get_connection(project_id)
     authority_revision: dict[str, Any] = {}
     runtime_contract_revision: dict[str, Any] = {}
     route_identity_for_revision: dict[str, Any] = {}
@@ -12443,7 +12454,11 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             project_id=project_id,
             backlog_id=str(ctx.body.get("backlog_id") or ""),
             task_id=task_id,
-            allowed_files=request_owned_files or request_target_files,
+            allowed_files=(
+                request_owned_files or request_target_files
+                if request_file_fence_explicit
+                else _ACCEPTANCE_FILE_FENCE_UNSET
+            ),
             actor_role=str(ctx.body.get("caller_role") or "observer"),
             reported_acceptance_criteria=reported_acceptance,
             implementation_started=acceptance_implementation_started,
@@ -78696,6 +78711,29 @@ def _backlog_declared_direct_file_scope(conn, backlog_id: str) -> list[str]:
 
 
 _ACCEPTANCE_SCOPE_REPORT_UNSET = object()
+_ACCEPTANCE_FILE_FENCE_UNSET = object()
+
+
+def _acceptance_file_fence_argument(
+    *sources: Mapping[str, Any],
+    keys: Sequence[str] = ("owned_files", "target_files"),
+) -> Any:
+    """Preserve omitted versus explicitly empty file-fence proposals."""
+
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        present_keys = [key for key in keys if key in source]
+        if not present_keys:
+            continue
+        return _runtime_context_public_file_values(
+            [
+                path
+                for key in present_keys
+                for path in _string_list_field(source.get(key))
+            ]
+        )
+    return _ACCEPTANCE_FILE_FENCE_UNSET
 
 
 def _backlog_acceptance_scope_authority(
@@ -78787,7 +78825,7 @@ def _require_backlog_acceptance_file_fence_closure(
     *,
     project_id: str,
     backlog_id: str,
-    allowed_files: Sequence[str],
+    allowed_files: Any = _ACCEPTANCE_FILE_FENCE_UNSET,
     task_id: str = "",
     actor_role: str = "observer",
     reported_acceptance_criteria: Any = _ACCEPTANCE_SCOPE_REPORT_UNSET,
@@ -78798,8 +78836,9 @@ def _require_backlog_acceptance_file_fence_closure(
     from .contract_state_runtime import acceptance_file_fence_closure_gate
 
     criteria, row_files = _backlog_acceptance_scope_authority(conn, backlog_id)
+    file_fence_input_omitted = allowed_files is _ACCEPTANCE_FILE_FENCE_UNSET
     effective_allowed_files = _runtime_context_public_file_values(
-        list(allowed_files) or row_files
+        row_files if file_fence_input_omitted else list(allowed_files)
     )
     if implementation_started is None:
         implementation_started = _backlog_acceptance_implementation_started(
@@ -78828,6 +78867,12 @@ def _require_backlog_acceptance_file_fence_closure(
             "task_id": task_id,
             "row_declared_files": row_files,
             "minted_fence_files": effective_allowed_files,
+            "file_fence_input_omitted": file_fence_input_omitted,
+            "file_fence_source": (
+                "backlog_row_derived"
+                if file_fence_input_omitted
+                else "caller_proposed"
+            ),
             "evaluated_before_allocation_or_dispatch": True,
         }
     )
@@ -86640,6 +86685,7 @@ def _direct_fix_materialize_dispatch_runtime_context(
         "target_graph_root",
     ) or worktree_path or workspace_root
     owned_files = _runtime_context_service_query_values(payload, "owned_files", "target_files")
+    acceptance_file_fence = _acceptance_file_fence_argument(payload, write)
     if not owned_files:
         owned_files = _runtime_context_service_query_values(
             write,
@@ -86682,7 +86728,7 @@ def _direct_fix_materialize_dispatch_runtime_context(
             project_id=project_id,
             backlog_id=backlog_id,
             task_id=task_id,
-            allowed_files=owned_files,
+            allowed_files=acceptance_file_fence,
             actor_role="observer",
             reported_acceptance_criteria=reported_acceptance,
             implementation_started=acceptance_implementation_started,
@@ -89025,6 +89071,10 @@ def _mf_parallel_successor_runtime_enter(
         body={},
         metadata=metadata if isinstance(metadata, Mapping) else {},
     )
+    acceptance_file_fence = _acceptance_file_fence_argument(
+        metadata if isinstance(metadata, Mapping) else {},
+        keys=("route_token_issue_target_files", "target_files", "owned_files"),
+    )
     try:
         existing_successor = store.get(successor_execution_id)
     except ContractRuntimeError:
@@ -89067,7 +89117,7 @@ def _mf_parallel_successor_runtime_enter(
             project_id=project_id,
             backlog_id=backlog_id,
             task_id=task_id,
-            allowed_files=child_route_target_files,
+            allowed_files=acceptance_file_fence,
             actor_role=actor_role,
             reported_acceptance_criteria=reported_acceptance,
             implementation_started=implementation_started,

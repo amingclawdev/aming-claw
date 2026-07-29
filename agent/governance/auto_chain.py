@@ -5297,6 +5297,18 @@ def _gate_version_check(conn, project_id, result, metadata):
         return True, f"version check skipped: {e}"
 
 
+_PM_FIELD_UNSET = object()
+
+
+def _pm_first_present_field(field, *sources):
+    """Resolve PM fields by presence so explicit empty values do not fall through."""
+
+    for source in sources:
+        if isinstance(source, dict) and field in source:
+            return source[field]
+    return _PM_FIELD_UNSET
+
+
 def _gate_post_pm(conn, project_id, result, metadata):
     """Validate PM PRD has mandatory fields + explain-or-provide for soft fields.
 
@@ -5313,29 +5325,32 @@ def _gate_post_pm(conn, project_id, result, metadata):
     prd = result.get("prd", {})
 
     # === Hard mandatory fields ===
-    missing = []
-    for field in ("target_files", "verification", "acceptance_criteria"):
-        if not result.get(field) and not prd.get(field) and not metadata.get(field):
-            missing.append(field)
+    mandatory = {
+        field: _pm_first_present_field(field, result, prd, metadata)
+        for field in ("target_files", "verification", "acceptance_criteria")
+    }
+    missing = [
+        field
+        for field, value in mandatory.items()
+        if value is _PM_FIELD_UNSET
+    ]
     if missing:
         return False, f"PRD missing mandatory fields: {missing}"
 
-    target_files = (result.get("target_files") or prd.get("target_files")
-                    or metadata.get("target_files") or [])
+    target_files = mandatory["target_files"]
     if not target_files:
         return False, "PRD target_files is empty"
-    criteria = (
-        result.get("acceptance_criteria")
-        or prd.get("acceptance_criteria")
-        or metadata.get("acceptance_criteria")
-        or []
-    )
-    test_files = (
-        result.get("test_files")
-        or prd.get("test_files")
-        or metadata.get("test_files")
-        or []
-    )
+    empty_mandatory = [
+        field
+        for field in ("verification", "acceptance_criteria")
+        if not mandatory[field]
+    ]
+    if empty_mandatory:
+        return False, f"PRD missing mandatory fields: {empty_mandatory}"
+    criteria = mandatory["acceptance_criteria"]
+    test_files = _pm_first_present_field("test_files", result, prd, metadata)
+    if test_files is _PM_FIELD_UNSET:
+        test_files = []
     target_file_scope = (
         [target_files] if isinstance(target_files, str) else list(target_files)
     )

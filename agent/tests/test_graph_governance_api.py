@@ -9719,6 +9719,209 @@ def test_pg002_parallel_allocate_blocks_acceptance_outside_worker_file_fence(
     assert get_branch_context(conn, PID, task_id) is None
 
 
+def test_parallel_allocate_explicit_empty_file_fence_fails_before_any_write(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-ALLOCATE-EXPLICIT-EMPTY-FENCE"
+    task_id = "allocate-explicit-empty-fence-worker"
+    required_files = [
+        "agent/governance/server.py",
+        "agent/governance/auto_chain.py",
+    ]
+    criterion_ids = [
+        "AC-ALLOCATE-EMPTY-SERVER",
+        "AC-ALLOCATE-EMPTY-DISPATCH",
+    ]
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+        SET target_files = ?, test_files = ?, acceptance_criteria = ?
+        WHERE bug_id = ?
+        """,
+        (
+            json.dumps(required_files),
+            json.dumps([]),
+            json.dumps(
+                [
+                    {
+                        "id": criterion_id,
+                        "required_scope": {
+                            "kind": "files",
+                            "files": [required_file],
+                        },
+                    }
+                    for criterion_id, required_file in zip(
+                        criterion_ids,
+                        required_files,
+                    )
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    tables = [
+        "parallel_branch_runtime_contexts",
+        "parallel_branch_runtime_contract_revisions",
+        "parallel_branch_merge_queue_items",
+        "task_timeline_events",
+    ]
+
+    def task_row_counts() -> dict[str, int]:
+        return {
+            table: int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {table}
+                    WHERE project_id = ? AND task_id = ?
+                    """,
+                    (PID, task_id),
+                ).fetchone()[0]
+            )
+            for table in tables
+        }
+
+    before = task_row_counts()
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": task_id,
+                    "backlog_id": backlog_id,
+                    "parent_task_id": backlog_id,
+                    "workspace_root": str(tmp_path),
+                    "worker_id": "explicit-empty-worker",
+                    "owned_files": [],
+                    "target_files": [],
+                    "base_commit": "base-explicit-empty",
+                    "target_head_commit": "head-explicit-empty",
+                    "merge_queue_id": "mq-explicit-empty",
+                    "create_worktree": False,
+                },
+            )
+        )
+
+    assert rejected.value.code == "acceptance_file_fence_closure_failed"
+    assert rejected.value.status == 422
+    assert rejected.value.details["criterion_ids"] == criterion_ids
+    assert rejected.value.details["missing_required_files"] == sorted(required_files)
+    assert rejected.value.details["minted_fence_files"] == []
+    assert rejected.value.details["row_declared_files"] == required_files
+    assert rejected.value.details["file_fence_input_omitted"] is False
+    assert rejected.value.details["file_fence_source"] == "caller_proposed"
+    assert task_row_counts() == before
+    assert get_branch_context(conn, PID, task_id) is None
+
+
+def test_acceptance_file_fence_argument_preserves_omitted_and_explicit_empty():
+    assert server._acceptance_file_fence_argument(
+        {"owned_files": []},
+        {"target_files": ["agent/governance/server.py"]},
+    ) == []
+    assert server._acceptance_file_fence_argument(
+        {},
+        {"target_files": ["agent/governance/server.py"]},
+    ) == ["agent/governance/server.py"]
+    assert (
+        server._acceptance_file_fence_argument({})
+        is server._ACCEPTANCE_FILE_FENCE_UNSET
+    )
+
+
+def test_parallel_allocate_omitted_file_fence_derives_backlog_scope(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-ALLOCATE-OMITTED-FENCE"
+    task_id = "allocate-omitted-fence-worker"
+    contract_execution_id = "cex-allocate-omitted-fence"
+    required_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+        SET target_files = ?, test_files = ?, acceptance_criteria = ?
+        WHERE bug_id = ?
+        """,
+        (
+            json.dumps(required_files[:1]),
+            json.dumps(required_files[1:]),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-ALLOCATE-OMITTED",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": required_files,
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    _persist_parallel_allocate_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_id="route-allocate-omitted-fence",
+        route_context_hash="sha256:route-allocate-omitted-fence",
+        prompt_contract_id="rprompt-allocate-omitted-fence",
+        prompt_contract_hash="sha256:prompt-allocate-omitted-fence",
+        visible_injection_manifest_hash="sha256:visible-omitted-fence",
+        route_token_ref="rtok-allocate-omitted-fence",
+    )
+    conn.commit()
+
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": task_id,
+                "backlog_id": backlog_id,
+                "parent_task_id": backlog_id,
+                "contract_execution_id": contract_execution_id,
+                "observer_command_id": "cmd-allocate-omitted-fence",
+                "workspace_root": str(tmp_path),
+                "worktree_path": str(tmp_path / task_id),
+                "worker_id": "omitted-fence-worker",
+                "fence_token": "fence-allocate-omitted",
+                "base_commit": "base-allocate-omitted",
+                "target_head_commit": "head-allocate-omitted",
+                "merge_queue_id": "mq-allocate-omitted",
+                "route_id": "route-allocate-omitted-fence",
+                "route_context_hash": "sha256:route-allocate-omitted-fence",
+                "prompt_contract_id": "rprompt-allocate-omitted-fence",
+                "prompt_contract_hash": "sha256:prompt-allocate-omitted-fence",
+                "route_token_ref": "rtok-allocate-omitted-fence",
+                "visible_injection_manifest_hash": "sha256:visible-omitted-fence",
+                "create_worktree": False,
+            },
+        )
+    )
+
+    assert status == 201
+    assert created["context"]["owned_files"] == required_files
+    assert created["context"]["target_files"] == required_files
+    closure = created["runtime_contract_revision"]["payload"][
+        "acceptance_scope_closure"
+    ]
+    assert closure["accepted"] is True
+    assert closure["minted_fence_files"] == required_files
+    assert closure["file_fence_input_omitted"] is True
+    assert closure["file_fence_source"] == "backlog_row_derived"
+
+
 def test_observer_runtime_text_prepare_projects_route_identity_to_allocated_context(
     conn,
     tmp_path,

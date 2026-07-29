@@ -5,9 +5,16 @@ import sqlite3
 from agent.governance import auto_chain
 
 
-def _pm_result(*, criteria, target_files=None):
+_TARGET_FILES_UNSET = object()
+
+
+def _pm_result(*, criteria, target_files=_TARGET_FILES_UNSET):
     return {
-        "target_files": target_files or ["agent/governance/auto_chain.py"],
+        "target_files": (
+            ["agent/governance/auto_chain.py"]
+            if target_files is _TARGET_FILES_UNSET
+            else target_files
+        ),
         "test_files": ["agent/tests/test_auto_chain.py"],
         "acceptance_criteria": criteria,
         "verification": {"commands": ["pytest agent/tests/test_auto_chain.py"]},
@@ -131,3 +138,44 @@ def test_post_pm_gate_accepts_files_nodes_and_external_verification(monkeypatch)
     assert result["acceptance_scope_closure"][
         "verification_only_external_dependencies"
     ] == ["browser:e2e"]
+
+
+def test_post_pm_gate_does_not_replace_explicit_empty_fence_from_metadata(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        auto_chain,
+        "_get_task_graph_doc_associations",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        auto_chain,
+        "_get_graph_related_nodes",
+        lambda *_args, **_kwargs: [],
+    )
+    conn = sqlite3.connect(":memory:")
+    result = _pm_result(
+        target_files=[],
+        criteria=[
+            {
+                "id": "AC-PM-EXPLICIT-EMPTY",
+                "required_scope": {
+                    "kind": "files",
+                    "files": ["agent/governance/auto_chain.py"],
+                },
+            }
+        ],
+    )
+
+    passed, reason = auto_chain._gate_post_pm(
+        conn,
+        "aming-claw",
+        result,
+        {
+            "task_id": "pm-explicit-empty",
+            "target_files": ["agent/governance/auto_chain.py"],
+        },
+    )
+
+    assert passed is False
+    assert reason == "PRD target_files is empty"
