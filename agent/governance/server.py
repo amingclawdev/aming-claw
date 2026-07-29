@@ -31255,7 +31255,7 @@ def _observer_failure_domain_invalidation_event(
     evidence_ref: str,
     route_binding: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Resolve one passing, exact-scope governance-lane evidence ref."""
+    """Resolve one passing, exact-scope evidence ref and its disposition."""
 
     from . import task_timeline
 
@@ -31300,7 +31300,57 @@ def _observer_failure_domain_invalidation_event(
         )
     ):
         return {}
-    return evidence_event
+    evidence_markers = {
+        str(evidence_event.get(field) or "")
+        .strip()
+        .lower()
+        .replace(".", "_")
+        .replace("-", "_")
+        for field in ("event_kind", "event_type", "phase")
+        if str(evidence_event.get(field) or "").strip()
+    }
+    if evidence_markers.intersection(
+        {
+            "batch_integration_epoch",
+            "parallel_batch_integration_epoch",
+            "batch_integration",
+        }
+    ):
+        server_evidence_kind = "batch_integration_epoch"
+    elif evidence_markers.intersection(
+        {
+            "qa_independent_verification",
+            "independent_qa_verification",
+            "qa_verification",
+            "independent_qa",
+            "qa",
+        }
+    ):
+        server_evidence_kind = "independent_qa"
+    elif evidence_markers.intersection(
+        {"parallel_live_merge", "live_merge", "merge"}
+    ):
+        server_evidence_kind = "merge"
+    elif evidence_markers.intersection(
+        {"current_full_reconcile", "graph_reconcile", "reconcile"}
+    ):
+        server_evidence_kind = "current_full_reconcile"
+    elif "observer_route_binding_verification" in evidence_markers:
+        server_evidence_kind = "observer_route_binding_verification"
+    else:
+        server_evidence_kind = "unaffected_child_evidence"
+    invalidation_eligible = (
+        server_evidence_kind == "observer_route_binding_verification"
+    )
+    return {
+        "invalidation_eligible": invalidation_eligible,
+        "server_evidence_kind": server_evidence_kind,
+        "server_evidence_domain": (
+            "governance_lane_invalidatable"
+            if invalidation_eligible
+            else "unaffected_child_or_protected_evidence"
+        ),
+    }
 
 
 def _observer_failure_domain_disposition_from_event(
@@ -31452,14 +31502,40 @@ def _observer_failure_domain_disposition_from_event(
             continue
         normalized = {"ref": ref, "causal_reason": causal_reason}
         if domain == "governance_lane_evidence_invalid":
-            if not _observer_failure_domain_invalidation_event(
-                conn,
-                authority_event=event,
-                evidence_ref=ref,
-                route_binding=persisted_principal_binding,
-            ):
+            evidence_disposition = (
+                _observer_failure_domain_invalidation_event(
+                    conn,
+                    authority_event=event,
+                    evidence_ref=ref,
+                    route_binding=persisted_principal_binding,
+                )
+            )
+            if not evidence_disposition:
                 return {}
-            accepted_invalidated.append(normalized)
+            if evidence_disposition.get("invalidation_eligible") is True:
+                accepted_invalidated.append(normalized)
+            else:
+                rejected_invalidated.append(
+                    {
+                        **normalized,
+                        "rejection_reason": (
+                            "server_evidence_kind_is_not_governance_lane_"
+                            "invalidatable"
+                        ),
+                        "server_evidence_kind": str(
+                            evidence_disposition.get(
+                                "server_evidence_kind"
+                            )
+                            or ""
+                        ),
+                        "server_evidence_domain": str(
+                            evidence_disposition.get(
+                                "server_evidence_domain"
+                            )
+                            or ""
+                        ),
+                    }
+                )
         elif ref in observation_refs:
             accepted_invalidated.append(normalized)
         else:

@@ -497,6 +497,218 @@ def test_governance_lane_invalidation_ref_fails_closed_without_exact_db_scope(
         )
 
 
+@pytest.mark.parametrize(
+    (
+        "evidence_case",
+        "event_type",
+        "event_kind",
+        "phase",
+        "server_evidence_kind",
+        "invalidation_eligible",
+    ),
+    (
+        (
+            "independent_qa",
+            "qa.independent_verification",
+            "qa_verification",
+            "qa",
+            "independent_qa",
+            False,
+        ),
+        (
+            "merge",
+            "parallel.live_merge",
+            "live_merge",
+            "merge",
+            "merge",
+            False,
+        ),
+        (
+            "current_full_reconcile",
+            "graph.reconcile",
+            "reconcile",
+            "current_full_reconcile",
+            "current_full_reconcile",
+            False,
+        ),
+        (
+            "batch_integration_epoch",
+            "observer.batch_integration_epoch",
+            "observer_command",
+            "batch_integration_epoch",
+            "batch_integration_epoch",
+            False,
+        ),
+        (
+            "unaffected_child",
+            "observer.unaffected_child_evidence",
+            "observer_command",
+            "observation",
+            "unaffected_child_evidence",
+            False,
+        ),
+        (
+            "route_binding_verification",
+            "observer.route_binding_verification",
+            "observer_route_binding_verification",
+            "verification",
+            "observer_route_binding_verification",
+            True,
+        ),
+    ),
+)
+def test_governance_lane_invalidation_uses_server_evidence_kind_eligibility(
+    conn,
+    evidence_case,
+    event_type,
+    event_kind,
+    phase,
+    server_evidence_kind,
+    invalidation_eligible,
+):
+    backlog_id = f"AC-FAILURE-DOMAIN-KIND-{evidence_case}"
+    task_id = f"failure-domain-kind-{evidence_case}"
+    route_identity = {
+        "route_id": f"route-failure-domain-kind-{evidence_case}",
+        "route_context_hash": _fake_sha(
+            f"route-failure-domain-kind-{evidence_case}"
+        ),
+        "prompt_contract_id": (
+            f"rprompt-failure-domain-kind-{evidence_case}"
+        ),
+        "prompt_contract_hash": _fake_sha(
+            f"prompt-failure-domain-kind-{evidence_case}"
+        ),
+        "route_token_ref": (
+            f"rtok-failure-domain-kind-{evidence_case}"
+        ),
+        "visible_injection_manifest_hash": _fake_sha(
+            f"visible-failure-domain-kind-{evidence_case}"
+        ),
+    }
+    evidence = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type=event_type,
+        event_kind=event_kind,
+        phase=phase,
+        actor=(
+            "qa"
+            if evidence_case == "independent_qa"
+            else "observer-session-evidence-kind"
+        ),
+        status="accepted",
+        payload=route_identity,
+    )
+    evidence_ref = f"timeline:{evidence['id']}"
+    authority = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="observer.failure_domain_disposition",
+        event_kind="observer_command",
+        phase="post_merge_browser_observation",
+        actor="observer-session-evidence-kind",
+        status="accepted",
+        payload={
+            "observer_failure_domain_authority": {
+                "schema_version": (
+                    "observer.failure_domain_principal_route_binding.v1"
+                ),
+                "server_projected": True,
+                "status": "accepted",
+                "observer_principal": (
+                    f"observer-route:{route_identity['route_token_ref']}"
+                ),
+                "observer_actor": "observer-session-evidence-kind",
+                "caller_role": "observer",
+                **route_identity,
+                "registry_verified": True,
+                "scope": {
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                },
+            },
+            "failure_domain": "governance_lane_evidence_invalid",
+            "observation_refs": [evidence_ref],
+            "invalidated_evidence_refs": [
+                {
+                    "ref": evidence_ref,
+                    "causal_reason": "claimed governance-lane invalidation",
+                    "evidence_kind": (
+                        "observer_route_binding_verification"
+                    ),
+                }
+            ],
+        },
+    )
+    conn.commit()
+
+    authority_ref = f"timeline:{authority['id']}"
+    disposition = server._observer_failure_domain_disposition_from_ref(
+        conn,
+        project_id=PID,
+        authority_ref=authority_ref,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    if invalidation_eligible:
+        assert disposition["invalidated_evidence_refs"] == [
+            {
+                "ref": evidence_ref,
+                "causal_reason": "claimed governance-lane invalidation",
+            }
+        ]
+        assert disposition["rejected_invalidation_refs"] == []
+        assert evidence_ref not in disposition["preserved_evidence_refs"]
+        assert disposition["generation_restart_allowed"] is True
+        restart_requested, resolved_ref, _ = (
+            server._observer_failure_domain_restart_authority_from_body(
+                conn,
+                project_id=PID,
+                body={
+                    "generation_restart_requested": True,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "failure_domain_disposition_ref": authority_ref,
+                },
+            )
+        )
+        assert restart_requested is True
+        assert resolved_ref == authority_ref
+    else:
+        assert disposition["invalidated_evidence_refs"] == []
+        assert disposition["generation_restart_allowed"] is False
+        assert evidence_ref in disposition["preserved_evidence_refs"]
+        assert disposition["rejected_invalidation_refs"] == [
+            {
+                "ref": evidence_ref,
+                "causal_reason": "claimed governance-lane invalidation",
+                "rejection_reason": (
+                    "server_evidence_kind_is_not_governance_lane_"
+                    "invalidatable"
+                ),
+                "server_evidence_kind": server_evidence_kind,
+                "server_evidence_domain": (
+                    "unaffected_child_or_protected_evidence"
+                ),
+            }
+        ]
+        with pytest.raises(
+            ValueError,
+            match="fresh generation requires signed governance-lane",
+        ):
+            parallel_branch_runtime.validate_observer_failure_domain_disposition(
+                disposition,
+                require_generation_restart=True,
+                server_persisted_authority_ref=authority_ref,
+            )
+
+
 def test_failure_domain_principal_is_derived_from_registered_observer_route():
     gate = {
         "status": "passed",
