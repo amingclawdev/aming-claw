@@ -43633,6 +43633,7 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
         get_branch_context,
         integration_epoch_resume_payload,
         integration_epoch_to_dict,
+        is_never_materialized_planned_merge_queue_item,
         list_merge_queue_items,
         queue_merge_item_for_branch_context,
     )
@@ -43718,6 +43719,9 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                 postmerge_recovery_authority is None
                 and runtime_context is not None
                 and existing_task_items
+                and not is_never_materialized_planned_merge_queue_item(
+                    existing_task_items[0]
+                )
             ):
                 dependency_candidate_authority = (
                     _dependency_revalidation_qa_candidate_authority(

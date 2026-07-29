@@ -20060,6 +20060,102 @@ def test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision(c
     assert read["read_model"]["branch_lanes"][0]["merge_queue_id"] == queue_id
 
 
+@pytest.mark.parametrize(
+    ("planned_branch_ref", "planned_branch_head"),
+    [
+        ("", ""),
+        ("refs/heads/main", "allocation-base-candidate"),
+    ],
+)
+def test_batch_first_materialize_replaces_planned_candidate_without_revalidation(
+    conn,
+    monkeypatch,
+    planned_branch_ref,
+    planned_branch_head,
+):
+    task_id = "batch-first-materialize-worker"
+    backlog_id = "AC-BATCH-FIRST-MATERIALIZE"
+    queue_id = "mq-batch-first-materialize"
+    queue_item_id = "mqitem-batch-first-materialize"
+    worker_commit = "worker-finish-gated-candidate"
+    target_head = "batch-target-head"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="batch-first-materialize",
+            backlog_id=backlog_id,
+            parent_task_id="cex-batch-first-materialize",
+            task_id=task_id,
+            branch_ref="refs/heads/codex/batch-first-materialize-worker",
+            status=STATE_VALIDATED,
+            fence_token="fence-batch-first-materialize",
+            merge_queue_id=queue_id,
+            base_commit=target_head,
+            head_commit=worker_commit,
+            target_head_commit=target_head,
+        ),
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id=queue_item_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                branch_ref=planned_branch_ref,
+                queue_index=1,
+                status="planned",
+                target_ref="refs/heads/main",
+                base_commit=target_head,
+                branch_head=planned_branch_head,
+                current_target_head=target_head,
+            )
+        ],
+    )
+    conn.commit()
+
+    def reject_revalidation(*_args, **_kwargs):
+        raise AssertionError(
+            "first materialize must not enter dependency revalidation"
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_dependency_revalidation_qa_candidate_authority",
+        reject_revalidation,
+    )
+
+    queued = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": task_id,
+                "merge_queue_id": queue_id,
+                "queue_item_id": queue_item_id,
+                "status": "merge_ready",
+                "fence_token": "fence-batch-first-materialize",
+                "current_target_head": target_head,
+                "route_waiver": _route_waiver(
+                    "merge_queue",
+                    task_id=task_id,
+                ),
+            },
+        )
+    )
+
+    assert queued["ok"] is True
+    assert queued["queue_item"]["status"] == "merge_ready"
+    assert queued["queue_item"]["branch_ref"] == (
+        "refs/heads/codex/batch-first-materialize-worker"
+    )
+    assert queued["queue_item"]["branch_head"] == worker_commit
+    assert queued["timeline_event_recorded"]["status"] == "accepted"
+
+
 def test_materialized_noop_durable_queue_status_projects_recovery(conn):
     task_id = "materialized-noop-current-task"
     queue_id = "mergeq-api-materialized-noop"
