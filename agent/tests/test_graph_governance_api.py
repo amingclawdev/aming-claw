@@ -35649,6 +35649,7 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
             trace_id=qa_trace_id,
             snapshot_id="scope-failed-qa-cumulative-qa",
             candidate_commit_sha=initial_head,
+            comparison_base_commit_sha=base_commit,
             backlog_id=backlog_id,
             task_id=runtime_context.task_id,
             target_project_root=str(target_root),
@@ -36218,8 +36219,14 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
         text=True,
     )
     second_revised_head = batch_jobs.git_commit(target_root)
+    record_before_second_revision = runtime.store.get(
+        successor["contract_execution_id"]
+    )
     history_before_second_revision = copy.deepcopy(
-        runtime.store.get(successor["contract_execution_id"])["completed_lines"]
+        record_before_second_revision["completed_lines"]
+    )
+    revision_before_second_revision = int(
+        record_before_second_revision["execution_state_revision"]
     )
     prior_second_lineage = _worker_implementation_lineage(
         second_failed_record,
@@ -36254,6 +36261,12 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
     assert second_canonical["supersedes_implementation_lineage_ref"]
 
     twice_revised_record = runtime.store.get(successor["contract_execution_id"])
+    assert twice_revised_record["execution_state_revision"] == (
+        revision_before_second_revision + 1
+    )
+    assert len(twice_revised_record["completed_lines"]) == (
+        len(history_before_second_revision) + 1
+    )
     assert twice_revised_record["completed_lines"][
         : len(history_before_second_revision)
     ] == history_before_second_revision

@@ -6455,8 +6455,11 @@ class ContractRuntime:
             errors.append("implementation revision requires implementation evidence")
         if failed_qa_index < 0:
             errors.append("implementation revision requires active failed independent QA")
+        timing_errors: list[str] = []
         if str(next_action.get("line_id") or "").strip() != "worker_commit":
-            errors.append("implementation revision is only legal before retry worker_commit")
+            timing_errors.append(
+                "implementation revision is only legal before retry worker_commit"
+            )
 
         runtime_context_id = _worker_commit_text(
             effective_write,
@@ -6484,6 +6487,7 @@ class ContractRuntime:
         if prior_implementation is None:
             errors.append("implementation revision requires a post-failed-QA implementation")
 
+        retry_worker_commit_exists = False
         for candidate in lines[failed_qa_index + 1 :]:
             if not isinstance(candidate, Mapping):
                 continue
@@ -6496,8 +6500,12 @@ class ContractRuntime:
                 continue
             if task_id and _worker_commit_text(candidate, "task_id") != task_id:
                 continue
-            errors.append("implementation revision is closed after retry worker_commit")
+            retry_worker_commit_exists = True
             break
+        if retry_worker_commit_exists:
+            timing_errors.append(
+                "implementation revision is closed after retry worker_commit"
+            )
 
         identity_fields = (
             "runtime_context_id",
@@ -6636,6 +6644,52 @@ class ContractRuntime:
         ) != graph_trace_ids:
             errors.append("implementation revision requires exact DB-verified graph traces")
 
+        prior_payload = (
+            prior_implementation.get("payload")
+            if prior_implementation is not None
+            and isinstance(prior_implementation.get("payload"), Mapping)
+            else {}
+        )
+        prior_revision = (
+            prior_payload.get("canonical_rework_lineage_revision")
+            if isinstance(
+                prior_payload.get("canonical_rework_lineage_revision"),
+                Mapping,
+            )
+            else {}
+        )
+        exact_replay = bool(
+            prior_implementation is not None
+            and str(prior_implementation.get("commit_sha") or "").strip()
+            == commit_sha
+            and sorted(
+                set(
+                    _worker_commit_strings(
+                        prior_implementation,
+                        "changed_files",
+                    )
+                )
+            )
+            == changed_files
+            and sorted(
+                set(
+                    _worker_commit_strings(
+                        prior_implementation,
+                        "graph_trace_ids",
+                        "graph_query_trace_ids",
+                        "verified_trace_ids",
+                    )
+                )
+            )
+            == graph_trace_ids
+            and _worker_commit_text(
+                prior_implementation,
+                "session_token_ref",
+            )
+            == revised_session_token_ref
+            and str(prior_revision.get("revision_event_ref") or "").strip()
+            == revision_event_ref
+        )
         if errors:
             return {
                 "schema_version": "contract_runtime_write_result.v1",
@@ -6643,6 +6697,30 @@ class ContractRuntime:
                 "decision": WriteGateDecision(
                     ok=False,
                     errors=tuple(dict.fromkeys(errors)),
+                ).to_dict(),
+                "record": record,
+            }
+        if exact_replay:
+            return {
+                "schema_version": "contract_runtime_write_result.v1",
+                "ok": True,
+                "status": "already_completed",
+                "decision": WriteGateDecision(ok=True).to_dict(),
+                "record": record,
+                "supersedes_implementation_lineage_ref": str(
+                    prior_revision.get(
+                        "supersedes_implementation_lineage_ref"
+                    )
+                    or ""
+                ),
+            }
+        if timing_errors:
+            return {
+                "schema_version": "contract_runtime_write_result.v1",
+                "ok": False,
+                "decision": WriteGateDecision(
+                    ok=False,
+                    errors=tuple(dict.fromkeys(timing_errors)),
                 ).to_dict(),
                 "record": record,
             }
@@ -6682,13 +6760,38 @@ class ContractRuntime:
         )
         completed_lines = [*lines, written_line]
         expected_revision = int(record.get("execution_state_revision") or 1)
-        updated_record = dict(record)
-        updated_record["completed_lines"] = completed_lines
-        updated_record["execution_state_revision"] = expected_revision + 1
+        candidate = dict(record)
+        candidate["completed_lines"] = completed_lines
+        candidate["execution_state_revision"] = expected_revision + 1
+        prepared = self._record_view(
+            candidate,
+            actor_role=effective_actor_role,
+            completed_lines=completed_lines,
+        )
+        prepared_next_action = (
+            prepared.get("runtime_guide", {}).get("next_legal_action", {})
+            if isinstance(prepared.get("runtime_guide"), Mapping)
+            else {}
+        )
+        if (
+            str(prepared_next_action.get("line_id") or "").strip()
+            != "worker_commit"
+        ):
+            return {
+                "schema_version": "contract_runtime_write_result.v1",
+                "ok": False,
+                "decision": WriteGateDecision(
+                    ok=False,
+                    errors=(
+                        "implementation revision must project retry worker_commit",
+                    ),
+                ).to_dict(),
+                "record": record,
+            }
         try:
             self.store.update(
                 contract_execution_id,
-                updated_record,
+                prepared,
                 expected_revision=expected_revision,
             )
         except ContractRuntimeError as exc:
@@ -6701,13 +6804,6 @@ class ContractRuntime:
                 ).to_dict(),
                 "record": self.store.get(contract_execution_id),
             }
-        next_guide = self.current_guide(
-            contract_execution_id,
-            actor_role=effective_actor_role,
-        )
-        persisted = self.store.get(contract_execution_id)
-        persisted["runtime_guide"] = next_guide
-        self.store.update(contract_execution_id, persisted)
         return {
             "schema_version": "contract_runtime_write_result.v1",
             "ok": True,

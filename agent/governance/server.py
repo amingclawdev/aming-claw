@@ -34331,6 +34331,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         return {}
 
     canonical_payload = dict(payload)
+    canonical_payload["commit_sha"] = actual_head
     canonical_payload["failed_qa_revision_rejoin_marker"] = dict(
         resolved_revision_marker
     )
@@ -34581,9 +34582,14 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
                 },
             )
         expected_revision = int(record.get("execution_state_revision") or 1)
-        updated_record = dict(record)
-        updated_record["completed_lines"] = revised_lines
-        updated_record["execution_state_revision"] = expected_revision + 1
+        candidate_record = dict(record)
+        candidate_record["completed_lines"] = revised_lines
+        candidate_record["execution_state_revision"] = expected_revision + 1
+        updated_record = runtime._record_view(
+            candidate_record,
+            actor_role="mf_sub",
+            completed_lines=revised_lines,
+        )
         try:
             runtime.store.update(
                 contract_execution_id,
@@ -34601,7 +34607,6 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
                     "fail_closed": True,
                 },
             ) from exc
-        runtime.current_guide(contract_execution_id, actor_role="mf_sub")
         persisted = runtime.store.get(contract_execution_id)
         latest = _worker_commit_completed_implementation(
             persisted,
@@ -34726,6 +34731,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
                 "fail_closed": True,
             },
         )
+    result_status = str(result.get("status") or "revised").strip()
     updated = result.get("record") if isinstance(result.get("record"), Mapping) else {}
     latest = _worker_commit_completed_implementation(
         updated,
@@ -34737,7 +34743,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
     return {
         "schema_version": "runtime_context.canonical_contract_line.v1",
         "accepted": True,
-        "status": "revised",
+        "status": result_status,
         "canonical": True,
         "source_of_authority": "ContractRuntime.completed_lines",
         "contract_execution_id": str(record.get("contract_execution_id") or ""),
@@ -35618,10 +35624,25 @@ def _runtime_context_submit_canonical_contract_line(
         ),
         {},
     )
-    return {
+    completed_payload = (
+        completed_line.get("payload")
+        if isinstance(completed_line.get("payload"), Mapping)
+        else {}
+    )
+    canonical_rework_revision = (
+        completed_payload.get("canonical_rework_lineage_revision")
+        if isinstance(
+            completed_payload.get("canonical_rework_lineage_revision"),
+            Mapping,
+        )
+        else {}
+    )
+    response = {
         "schema_version": "runtime_context.canonical_contract_line.v1",
         "accepted": True,
-        "status": "completed",
+        "status": (
+            "revised" if canonical_rework_revision else "completed"
+        ),
         "canonical": True,
         "source_of_authority": "ContractRuntime.completed_lines",
         "contract_execution_id": execution_id,
@@ -35641,6 +35662,29 @@ def _runtime_context_submit_canonical_contract_line(
         "next_legal_action": current_state.get("next_legal_action") or {},
         "timeline_projection_authoritative": False,
     }
+    if canonical_rework_revision:
+        response.update(
+            {
+                "commit_sha": str(
+                    completed_line.get("commit_sha")
+                    or canonical_rework_revision.get("commit_sha")
+                    or ""
+                ),
+                "supersedes_implementation_lineage_ref": str(
+                    canonical_rework_revision.get(
+                        "supersedes_implementation_lineage_ref"
+                    )
+                    or ""
+                ),
+                "append_only_history_preserved": bool(
+                    canonical_rework_revision.get(
+                        "append_only_history_preserved"
+                    )
+                    is True
+                ),
+            }
+        )
+    return response
 
 
 def _runtime_context_cross_project_graph_contract_preflight(
@@ -91424,10 +91468,30 @@ def _contract_runtime_close_gate(
                     "canonical_submit_required": True,
                 }
             if prevalidation.get("status") == "validated_submission":
-                canonical_norm_payload = dict(
-                    prevalidation.get("canonical_payload")
-                    or canonical_norm_payload
-                )
+                return {
+                    "schema_version": (
+                        _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
+                    ),
+                    "accepted": True,
+                    "status": "validated_submission",
+                    "primary_decision_source": True,
+                    "agent_facing_decision_source": (
+                        "contract_runtime_first_missing_line"
+                    ),
+                    "meta_contract_gate_decision_source": False,
+                    "contract_execution_id": contract_execution_id,
+                    "actor_role": actor_role,
+                    "requested_event_kind": event_kind,
+                    "stage_id": line.get("stage_id", ""),
+                    "line_id": line.get("line_id", ""),
+                    "evidence_kind": line.get("evidence_kind", ""),
+                    "decision": {"ok": True, "errors": []},
+                    "next_legal_action": dict(
+                        current_state.get("next_legal_action") or {}
+                    ),
+                    "canonical_submit_required": True,
+                    "failed_qa_rework_prevalidated": True,
+                }
             if not prevalidation:
                 correction_intent_present = (
                     "precommit_implementation_correction_intent"
