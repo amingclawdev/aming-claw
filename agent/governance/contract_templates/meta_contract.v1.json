@@ -171,6 +171,36 @@
     "qa_is_sole_candidate_verdict_author": true,
     "observer_may_author_or_rewrite_qa_verdict": false
   },
+  "acceptance_file_fence_closure_policy": {
+    "schema_version": "meta_contract.acceptance_file_fence_closure.v1",
+    "enforced_before": [
+      "contract_binding",
+      "parallel_branch_allocate",
+      "dispatch_bounded_worker",
+      "mf_batch_parallel_fanout"
+    ],
+    "criterion_authority_required_fields": [
+      "id",
+      "required_scope"
+    ],
+    "required_scope_kinds": [
+      "files",
+      "nodes",
+      "files_and_nodes",
+      "verification_only_external_dependency",
+      "unresolved"
+    ],
+    "free_text_authority_allowed": false,
+    "required_file_union_must_be_contained_by": [
+      "target_files",
+      "owned_files"
+    ],
+    "unresolved_scope_policy": "fail_closed",
+    "worker_or_qa_scope_widening_allowed": false,
+    "pre_implementation_revision_owner": "observer",
+    "post_implementation_revision_policy": "fresh_or_rework_contract",
+    "bypass_allowed": false
+  },
   "hotfix_profile": {
     "profile": "HOTFIX",
     "entry_event_type": "hotfix.entered",

@@ -27,6 +27,194 @@ from agent.governance.contracts.runtime import (
 from agent.governance.contracts.write_gate import validate_contract_write
 
 
+def test_acceptance_file_fence_closure_requires_stable_structured_authority():
+    gate = contract_state_runtime.acceptance_file_fence_closure_gate(
+        [
+            "free text is descriptive, not authority",
+            {
+                "id": "AC-VALID",
+                "required_scope": {"kind": "unresolved"},
+            },
+            {
+                "id": "AC-VALID",
+                "required_scope": {
+                    "kind": "files",
+                    "files": ["agent/governance/server.py"],
+                },
+            },
+        ],
+        ["agent/governance/server.py"],
+    )
+
+    assert gate["accepted"] is False
+    assert gate["errors"] == [
+        "acceptance_criteria_require_stable_ids",
+        "acceptance_criterion_ids_must_be_unique",
+        "acceptance_criteria_require_structured_required_scope",
+        "acceptance_required_scope_unresolved",
+    ]
+    assert gate["duplicate_criterion_ids"] == ["AC-VALID"]
+    assert gate["unresolved_criterion_ids"] == ["AC-VALID"]
+    assert gate["copy_safe_observer_remediation"]["owner_role"] == "observer"
+    assert gate["free_text_authority_allowed"] is False
+    assert stable_sha256(gate) == stable_sha256(
+        contract_state_runtime.acceptance_file_fence_closure_gate(
+            [
+                "free text is descriptive, not authority",
+                {
+                    "id": "AC-VALID",
+                    "required_scope": {"kind": "unresolved"},
+                },
+                {
+                    "id": "AC-VALID",
+                    "required_scope": {
+                        "kind": "files",
+                        "files": ["agent/governance/server.py"],
+                    },
+                },
+            ],
+            ["agent/governance/server.py"],
+        )
+    )
+
+
+def test_acceptance_file_fence_closure_reports_exact_missing_files():
+    gate = contract_state_runtime.acceptance_file_fence_closure_gate(
+        [
+            {
+                "id": "AC-SERVER",
+                "required_scope": {
+                    "kind": "files",
+                    "files": [
+                        "agent/governance/server.py",
+                        "agent/tests/test_graph_governance_api.py",
+                    ],
+                },
+            },
+            {
+                "id": "AC-NODE",
+                "required_scope": {
+                    "kind": "nodes",
+                    "node_ids": ["governance.contract_mint"],
+                },
+            },
+            {
+                "id": "AC-E2E",
+                "required_scope": {
+                    "kind": "verification_only_external_dependency",
+                    "dependency_id": "browser:e2e",
+                },
+            },
+        ],
+        ["agent/governance/server.py"],
+    )
+
+    assert gate["accepted"] is False
+    assert gate["criterion_ids"] == ["AC-SERVER", "AC-NODE", "AC-E2E"]
+    assert gate["missing_required_files"] == [
+        "agent/tests/test_graph_governance_api.py"
+    ]
+    assert gate["required_node_union"] == ["governance.contract_mint"]
+    assert gate["verification_only_external_dependencies"] == ["browser:e2e"]
+
+
+def test_acceptance_file_fence_closure_accepts_closed_scope_and_empty_set():
+    criteria = [
+        {
+            "id": "AC-FILES",
+            "required_scope": {
+                "kind": "files_and_nodes",
+                "files": ["agent/governance/server.py"],
+                "node_ids": ["governance.server"],
+            },
+        }
+    ]
+
+    closed = contract_state_runtime.acceptance_file_fence_closure_gate(
+        criteria,
+        ["agent/governance/server.py"],
+    )
+    empty = contract_state_runtime.acceptance_file_fence_closure_gate([], [])
+
+    assert closed["accepted"] is True
+    assert closed["required_file_union"] == ["agent/governance/server.py"]
+    assert empty["accepted"] is True
+    assert empty["criterion_count"] == 0
+
+
+def test_acceptance_file_fence_closure_forbids_worker_or_qa_widening():
+    authority = [
+        {
+            "id": "AC-ONE",
+            "required_scope": {
+                "kind": "files",
+                "files": ["agent/governance/server.py"],
+            },
+        }
+    ]
+    widened = [
+        *authority,
+        {
+            "id": "AC-TWO",
+            "required_scope": {
+                "kind": "files",
+                "files": ["agent/governance/auto_chain.py"],
+            },
+        },
+    ]
+
+    gate = contract_state_runtime.acceptance_file_fence_closure_gate(
+        authority,
+        ["agent/governance/server.py", "agent/governance/auto_chain.py"],
+        actor_role="qa",
+        reported_acceptance_criteria=widened,
+        implementation_started=True,
+    )
+
+    assert gate["accepted"] is False
+    assert gate["errors"] == [
+        "worker_or_qa_acceptance_scope_widening_forbidden"
+    ]
+    assert gate["copy_safe_observer_remediation"]["action"] == (
+        "create_fresh_or_rework_contract_with_revised_file_fence"
+    )
+    assert gate["copy_safe_observer_remediation"][
+        "worker_or_qa_scope_widening_allowed"
+    ] is False
+
+
+def test_meta_and_mf_parallel_templates_require_acceptance_file_fence_closure():
+    template_root = Path(__file__).resolve().parents[1] / "governance" / "contract_templates"
+    meta = json.loads((template_root / "meta_contract.v1.json").read_text())
+    mf_parallel = json.loads((template_root / "mf_parallel.v2.json").read_text())
+
+    for policy in (
+        meta["acceptance_file_fence_closure_policy"],
+        mf_parallel["acceptance_file_fence_closure_policy"],
+    ):
+        assert policy["criterion_authority_required_fields"] == [
+            "id",
+            "required_scope",
+        ]
+        assert policy["required_scope_kinds"] == [
+            "files",
+            "nodes",
+            "files_and_nodes",
+            "verification_only_external_dependency",
+            "unresolved",
+        ]
+        assert policy["required_file_union_must_be_contained_by"] == [
+            "target_files",
+            "owned_files",
+        ]
+        assert policy["unresolved_scope_policy"] == "fail_closed"
+        assert policy["worker_or_qa_scope_widening_allowed"] is False
+        assert policy["post_implementation_revision_policy"] == (
+            "fresh_or_rework_contract"
+        )
+        assert policy["bypass_allowed"] is False
+
+
 def test_failed_qa_rejoin_marker_resets_only_prior_revision_proof_lines():
     runtime_context_id = "mfrctx-failed-qa-route-rebind"
     task_id = "worker-failed-qa-route-rebind"

@@ -54,6 +54,36 @@
     "shared_backlog_close_token_allowed": false,
     "description": "mf_parallel.v2 remains scoped to one backlog row. For multiple backlog rows, create an mf_batch_parallel.v1 parent route that fans out to one mf_parallel successor per row."
   },
+  "acceptance_file_fence_closure_policy": {
+    "schema_version": "mf_parallel.acceptance_file_fence_closure.v1",
+    "authority_source": "backlog.acceptance_criteria",
+    "enforced_before": [
+      "mf_parallel_successor_binding",
+      "parallel_branch_allocate",
+      "observer_dispatch_bounded_workers"
+    ],
+    "criterion_authority_required_fields": [
+      "id",
+      "required_scope"
+    ],
+    "required_scope_kinds": [
+      "files",
+      "nodes",
+      "files_and_nodes",
+      "verification_only_external_dependency",
+      "unresolved"
+    ],
+    "required_file_union_must_be_contained_by": [
+      "target_files",
+      "owned_files"
+    ],
+    "unresolved_scope_policy": "fail_closed",
+    "worker_or_qa_scope_widening_allowed": false,
+    "pre_implementation_revision_owner": "observer",
+    "post_implementation_revision_policy": "fresh_or_rework_contract",
+    "copy_safe_observer_remediation_required": true,
+    "bypass_allowed": false
+  },
   "runtime_contract_hints": {
     "schema_version": "contract_template.runtime_hints.v1",
     "contract_definition_id": "mf_parallel.v2",
@@ -210,6 +240,7 @@
       "recommended_topology",
       "owned_files",
       "target_files",
+      "acceptance_scope_closure",
       "test_files",
       "test_commands",
       "responsibility",
@@ -229,6 +260,7 @@
         "target_files",
         "test_files",
         "acceptance_criteria",
+        "acceptance_scope_closure",
         "route_identity",
         "evidence_required",
         "selected_topology",
@@ -420,6 +452,7 @@
           "prompt_contract_hash",
           "route_token_ref",
           "owned_files",
+          "acceptance_scope_closure",
           "test_commands",
           "required_evidence"
         ],
@@ -430,6 +463,7 @@
           "branch runtime registration is current",
           "child route identity and parent lineage are present",
           "owned_files are non-empty and projected into worker_constraints.scope.owned_files",
+          "acceptance_scope_closure passed before the child contract or runtime context was minted",
           "runtime worker guide implementation_and_tests step lists the same owned_files",
           "worker graph query identity is mf_subagent-scoped"
         ],
@@ -437,6 +471,7 @@
           "child prefill is missing",
           "child prefill is stale relative to parent route identity",
           "owned_files are empty or differ between dispatch payload and runtime guide",
+          "acceptance scope is missing, unresolved, malformed, or requires files outside owned_files",
           "worktree_path is used as target_project_root for write facades instead of the canonical target_project_root"
         ],
         "next_action_on_block": "refresh_child_contract_prefill_before_dispatch"
