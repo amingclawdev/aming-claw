@@ -106,6 +106,103 @@ from agent.governance.parallel_branch_runtime import (
 PID = "graph-api-test"
 
 
+def test_live_observer_guide_projects_signed_failure_domain_disposition(conn):
+    backlog_id = "AC-FAILURE-DOMAIN-LIVE-GUIDE"
+    task_id = "failure-domain-active-task"
+    upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id="batch-failure-domain",
+            epoch_id="epoch-failure-domain",
+            coordination_backlog_id=backlog_id,
+            target_ref="refs/heads/main",
+            base_head="a" * 40,
+            current_head="b" * 40,
+            merge_queue_id="mq-failure-domain",
+            active_queue_item_id="mq-failure-domain:item-1",
+            active_task_id=task_id,
+            active_backlog_id=backlog_id,
+            status="open",
+        ),
+        now_iso="2026-07-29T12:00:00Z",
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="observer.failure_domain_disposition",
+        event_kind="observer_command",
+        phase="post_merge_browser_observation",
+        actor="observer-session-live-guide",
+        status="accepted",
+        payload={
+            "failure_domain": "harness_or_identity",
+            "observation_refs": ["timeline:browser-failure"],
+            "invalidated_evidence_refs": [
+                {
+                    "ref": "timeline:browser-failure",
+                    "causal_reason": "Browser session identity expired",
+                },
+                {
+                    "ref": "timeline:qa-pass",
+                    "causal_reason": "observer attempted broad invalidation",
+                },
+            ],
+            "preserved_evidence_refs": [
+                "timeline:qa-pass",
+                "timeline:merge",
+                "timeline:reconcile",
+                "batch-epoch:epoch-failure-domain",
+            ],
+        },
+    )
+    conn.commit()
+
+    guide = server._onboard_route_guide_service_response(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        response_view="full",
+    )
+
+    packet = guide["failure_domain_disposition"]
+    assert packet["failure_domain"] == "harness_or_identity"
+    assert packet["observer_principal"] == "observer-session-live-guide"
+    assert packet["next_topology"] == "rerun_browser_evidence_only"
+    assert packet["authority_hash"].startswith("sha256:")
+    assert packet["generation_restart_allowed"] is False
+    assert packet["qa_verdict_preserved"] is True
+    assert packet["invalidated_evidence_refs"] == [
+        {
+            "ref": "timeline:browser-failure",
+            "causal_reason": "Browser session identity expired",
+        }
+    ]
+    assert "timeline:qa-pass" in packet["preserved_evidence_refs"]
+    assert packet["rejected_invalidation_refs"][0]["ref"] == (
+        "timeline:qa-pass"
+    )
+    assert guide["next_legal_action"]["failure_domain_disposition"] == packet
+    compact = server._onboard_route_guide_service_response(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        response_view="compact",
+    )
+    compact_packet = compact["failure_domain_disposition"]
+    assert compact_packet["failure_domain"] == "harness_or_identity"
+    assert compact_packet["authority_hash"] == packet["authority_hash"]
+    assert "failure_domain_disposition" in compact["guide_capsule"][
+        "available_sections"
+    ]
+
+
 def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commit(
     conn,
     monkeypatch,

@@ -31096,6 +31096,288 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         conn.close()
 
 
+def _observer_failure_domain_ref_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return _runtime_context_service_dedupe(
+            [item.strip() for item in value.split(",")]
+        )
+    if isinstance(value, Mapping):
+        value = list(value.values())
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    refs: list[str] = []
+    for item in value:
+        if isinstance(item, Mapping):
+            ref = str(
+                item.get("ref")
+                or item.get("evidence_ref")
+                or item.get("event_ref")
+                or ""
+            ).strip()
+        else:
+            ref = str(item or "").strip()
+        if ref:
+            refs.append(ref)
+    return _runtime_context_service_dedupe(refs)
+
+
+def _observer_failure_domain_disposition_from_event(
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a server-signed, QA-preserving observation disposition."""
+
+    from .parallel_branch_runtime import (
+        OBSERVER_FAILURE_DOMAIN_NEXT_TOPOLOGY,
+        observer_failure_domain_disposition_hash,
+        validate_observer_failure_domain_disposition,
+    )
+
+    payload = (
+        dict(event.get("payload"))
+        if isinstance(event.get("payload"), Mapping)
+        else {}
+    )
+    supplied = (
+        payload.get("failure_domain_disposition")
+        if isinstance(payload.get("failure_domain_disposition"), Mapping)
+        else payload
+    )
+    domain = str(supplied.get("failure_domain") or "").strip()
+    if domain not in OBSERVER_FAILURE_DOMAIN_NEXT_TOPOLOGY:
+        return {}
+    event_markers = " ".join(
+        str(event.get(field) or "").strip().lower()
+        for field in ("event_type", "event_kind", "phase", "actor")
+    )
+    if not any(
+        marker in event_markers
+        for marker in ("observer", "browser", "visual", "cleanup", "admin")
+    ):
+        return {}
+    event_id = str(event.get("id") or "").strip()
+    source_event_ref = f"timeline:{event_id}" if event_id else ""
+    observer_principal = str(event.get("actor") or "").strip()
+    if not observer_principal:
+        return {}
+    observation_refs = _observer_failure_domain_ref_values(
+        supplied.get("observation_refs")
+        or supplied.get("observation_event_refs")
+    )
+    if source_event_ref and source_event_ref not in observation_refs:
+        observation_refs.append(source_event_ref)
+    if not observation_refs:
+        return {}
+
+    reason_by_ref = {
+        str(key).strip(): str(value or "").strip()
+        for key, value in (
+            supplied.get("invalidation_reasons") or {}
+        ).items()
+        if str(key).strip() and str(value or "").strip()
+    } if isinstance(supplied.get("invalidation_reasons"), Mapping) else {}
+    raw_invalidated = supplied.get("invalidated_evidence_refs") or []
+    if isinstance(raw_invalidated, Mapping):
+        raw_invalidated = [raw_invalidated]
+    accepted_invalidated: list[dict[str, str]] = []
+    rejected_invalidated: list[dict[str, str]] = []
+    for item in raw_invalidated if isinstance(raw_invalidated, list) else []:
+        if isinstance(item, Mapping):
+            ref = str(
+                item.get("ref") or item.get("evidence_ref") or ""
+            ).strip()
+            causal_reason = str(
+                item.get("causal_reason") or item.get("reason") or ""
+            ).strip()
+        else:
+            ref = str(item or "").strip()
+            causal_reason = reason_by_ref.get(ref, "")
+        if not ref or not causal_reason:
+            continue
+        normalized = {"ref": ref, "causal_reason": causal_reason}
+        if (
+            domain == "governance_lane_evidence_invalid"
+            or ref in observation_refs
+        ):
+            accepted_invalidated.append(normalized)
+        else:
+            rejected_invalidated.append(
+                {
+                    **normalized,
+                    "rejection_reason": (
+                        "non_governance_failure_cannot_invalidate_prior_"
+                        "qa_merge_reconcile_or_batch_evidence"
+                    ),
+                }
+            )
+
+    preserved_refs: list[str] = []
+    for field in (
+        "preserved_evidence_refs",
+        "unaffected_evidence_refs",
+        "child_evidence_refs",
+        "qa_evidence_refs",
+        "merge_evidence_refs",
+        "reconcile_evidence_refs",
+        "batch_epoch_evidence_refs",
+    ):
+        preserved_refs.extend(
+            _observer_failure_domain_ref_values(supplied.get(field))
+        )
+    preserved_refs.extend(
+        item["ref"] for item in rejected_invalidated
+    )
+    invalidated_refs = {
+        item["ref"] for item in accepted_invalidated
+    }
+    preserved_refs = [
+        ref
+        for ref in _runtime_context_service_dedupe(preserved_refs)
+        if ref not in invalidated_refs
+    ]
+    generation_restart_allowed = bool(
+        domain == "governance_lane_evidence_invalid"
+        and accepted_invalidated
+    )
+    acceptance_scope_relation = str(
+        supplied.get("acceptance_scope_relation") or ""
+    ).strip()
+    inside_acceptance_scope = supplied.get("inside_acceptance_scope")
+    if inside_acceptance_scope is None:
+        inside_acceptance_scope = supplied.get("in_acceptance_scope")
+    if domain == "target_product_defect":
+        if (
+            inside_acceptance_scope is True
+            or acceptance_scope_relation in {"inside", "in_scope"}
+        ):
+            next_topology = "bounded_same_row_rework"
+            acceptance_scope_relation = "inside"
+        elif (
+            inside_acceptance_scope is False
+            or acceptance_scope_relation
+            in {"outside", "out_of_scope", "outside_acceptance_scope"}
+        ):
+            next_topology = "blocked_parent_successor"
+            acceptance_scope_relation = "outside"
+        else:
+            next_topology = (
+                "bounded_same_row_rework_or_blocked_parent_successor"
+            )
+            acceptance_scope_relation = "not_supplied"
+    else:
+        next_topology = OBSERVER_FAILURE_DOMAIN_NEXT_TOPOLOGY[domain]
+    packet: dict[str, Any] = {
+        "schema_version": (
+            "observer.failure_domain_evidence_disposition.v1"
+        ),
+        "source": "server_task_timeline_projection",
+        "source_event_ref": source_event_ref,
+        "failure_domain": domain,
+        "observer_principal": observer_principal,
+        "observer_principal_source": "task_timeline.actor",
+        "observation_refs": observation_refs,
+        "invalidated_evidence_refs": accepted_invalidated,
+        "rejected_invalidation_refs": rejected_invalidated,
+        "preserved_evidence_refs": preserved_refs,
+        "acceptance_scope_relation": acceptance_scope_relation,
+        "next_topology": next_topology,
+        "qa_verdict_authority": "authenticated_independent_qa_only",
+        "qa_verdict_preserved": True,
+        "observer_may_author_or_rewrite_qa_verdict": False,
+        "preserve_unaffected_child_qa_merge_reconcile_batch_epoch_evidence": (
+            True
+        ),
+        "generation_restart_allowed": generation_restart_allowed,
+        "generation_restart_requires_this_authority_hash": True,
+    }
+    packet["authority_hash"] = observer_failure_domain_disposition_hash(
+        packet
+    )
+    return validate_observer_failure_domain_disposition(packet)
+
+
+def _latest_observer_failure_domain_disposition(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str = "",
+) -> dict[str, Any]:
+    """Return the newest valid disposition for a live guide projection."""
+
+    from .parallel_branch_runtime import (
+        observer_failure_domain_disposition_hash,
+        validate_observer_failure_domain_disposition,
+    )
+
+    events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
+    if task_id:
+        backlog_events = _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id="",
+            backlog_id=backlog_id,
+        )
+        events_by_ref = {
+            _runtime_context_event_ref(event)
+            or json.dumps(event, sort_keys=True, default=str): dict(event)
+            for event in [*events, *backlog_events]
+            if isinstance(event, Mapping)
+        }
+        events = list(events_by_ref.values())
+    for event in sorted(
+        events,
+        key=_runtime_context_service_timeline_event_order_key,
+        reverse=True,
+    ):
+        disposition = _observer_failure_domain_disposition_from_event(event)
+        if disposition:
+            invalidated_refs = {
+                str(item.get("ref") or "").strip()
+                for item in disposition.get("invalidated_evidence_refs") or []
+                if isinstance(item, Mapping)
+            }
+            preserved_refs = list(
+                disposition.get("preserved_evidence_refs") or []
+            )
+            for evidence_event in events:
+                evidence_marker = " ".join(
+                    str(evidence_event.get(field) or "").strip().lower()
+                    for field in ("event_type", "event_kind", "phase")
+                )
+                if not any(
+                    marker in evidence_marker
+                    for marker in (
+                        "implementation",
+                        "startup",
+                        "finish",
+                        "qa",
+                        "merge",
+                        "reconcile",
+                        "batch",
+                        "epoch",
+                    )
+                ):
+                    continue
+                evidence_ref = _runtime_context_event_ref(evidence_event)
+                if evidence_ref and evidence_ref not in invalidated_refs:
+                    preserved_refs.append(evidence_ref)
+            disposition["preserved_evidence_refs"] = (
+                _runtime_context_service_dedupe(preserved_refs)
+            )
+            disposition["authority_hash"] = (
+                observer_failure_domain_disposition_hash(disposition)
+            )
+            return validate_observer_failure_domain_disposition(
+                disposition
+            )
+    return {}
+
+
 def _runtime_context_scope_insufficiency_observer_disposition(
     *,
     project_id: str,
@@ -43791,6 +44073,19 @@ def handle_graph_governance_parallel_branch_batch_runtime(ctx: RequestContext):
                 project_id,
                 batch_id,
                 severe_integration_failure=severe,
+                generation_restart_requested=_query_bool(
+                    ctx.body,
+                    "generation_restart_requested",
+                    False,
+                ),
+                failure_domain_disposition=(
+                    ctx.body.get("failure_domain_disposition")
+                    if isinstance(
+                        ctx.body.get("failure_domain_disposition"),
+                        Mapping,
+                    )
+                    else None
+                ),
                 corrected_replay_order=tuple(_query_statuses(ctx.body, "corrected_replay_order")),
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-004"),
             )
@@ -84684,6 +84979,19 @@ def _onboard_guide_capsule_current_projection(
     ).strip()
     if canonical_backlog_id != backlog_id:
         return current
+    failure_domain_disposition = (
+        _latest_observer_failure_domain_disposition(
+            conn,
+            project_id=project_id,
+            backlog_id=canonical_backlog_id,
+            task_id=str(active_epoch.active_task_id or ""),
+        )
+    )
+    if failure_domain_disposition:
+        resume = {
+            **dict(resume),
+            "failure_domain_disposition": failure_domain_disposition,
+        }
     overlay = dict(current)
     overlay.update(
         {
@@ -84945,6 +85253,17 @@ def _onboard_route_guide_compact_service_response(
         )
         else {}
     )
+    failure_domain_disposition = (
+        runtime_resume.get("failure_domain_disposition")
+        if isinstance(
+            runtime_resume.get("failure_domain_disposition"), Mapping
+        )
+        else current_projection.get("failure_domain_disposition")
+        if isinstance(
+            current_projection.get("failure_domain_disposition"), Mapping
+        )
+        else {}
+    )
     action_summary = {
         "action": action,
         "allowed_actions": allowed_actions,
@@ -85063,6 +85382,13 @@ def _onboard_route_guide_compact_service_response(
                     section_name="fresh_generation_barrier",
                 )
             )
+        if failure_domain_disposition:
+            sections["failure_domain_disposition"] = (
+                _onboard_guide_capsule_bounded_section(
+                    failure_domain_disposition,
+                    section_name="failure_domain_disposition",
+                )
+            )
         return sections
 
     entry, cache_metrics = _onboard_guide_capsule_get_or_create(
@@ -85152,6 +85478,13 @@ def _onboard_route_guide_compact_service_response(
             _onboard_guide_capsule_bounded_section(
                 completed_repair_barrier,
                 section_name="fresh_generation_barrier",
+            )
+        )
+    if failure_domain_disposition:
+        response["failure_domain_disposition"] = (
+            _onboard_guide_capsule_bounded_section(
+                failure_domain_disposition,
+                section_name="failure_domain_disposition",
             )
         )
     measured = _onboard_guide_capsule_serialized_bytes(response)
@@ -85470,6 +85803,19 @@ def _onboard_route_guide_service_response(
             or active_epoch.coordination_backlog_id
             or backlog_id
         ).strip()
+        failure_domain_disposition = (
+            _latest_observer_failure_domain_disposition(
+                conn,
+                project_id=project_id,
+                backlog_id=canonical_backlog_id,
+                task_id=str(active_epoch.active_task_id or ""),
+            )
+        )
+        if failure_domain_disposition:
+            resume = {
+                **dict(resume),
+                "failure_domain_disposition": failure_domain_disposition,
+            }
         if response_view == "compact":
             current_projection = _onboard_guide_capsule_current_projection(
                 conn,
@@ -85509,6 +85855,7 @@ def _onboard_route_guide_service_response(
             },
             "integration_epoch": integration_epoch_to_dict(active_epoch),
             "next_legal_action": resume,
+            "failure_domain_disposition": failure_domain_disposition,
             "position_skippable": False,
             "raw_route_token_required": False,
             "raw_route_token_exposed": False,
@@ -85735,6 +86082,22 @@ def _onboard_route_guide_service_response(
             runtime_resume["projection_degraded_reason"] = (
                 current_projection.get("degraded_flags") or {}
             )
+    failure_domain_disposition = (
+        _latest_observer_failure_domain_disposition(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    )
+    if failure_domain_disposition:
+        runtime_resume = {
+            **dict(runtime_resume),
+            "failure_domain_disposition": failure_domain_disposition,
+        }
+        current_projection = {
+            **dict(current_projection),
+            "failure_domain_disposition": failure_domain_disposition,
+        }
     next_action = _onboard_route_guide_service_next_action(
         role=role,
         work_type=work_type,
@@ -85869,6 +86232,15 @@ def _onboard_route_guide_service_response(
         if isinstance(route_guide, dict):
             route_guide["completed_repair_fresh_generation_barrier"] = dict(
                 completed_repair_barrier
+            )
+    if failure_domain_disposition:
+        guidance["failure_domain_disposition"] = dict(
+            failure_domain_disposition
+        )
+        route_guide = guidance.get("onboard_route_guide")
+        if isinstance(route_guide, dict):
+            route_guide["failure_domain_disposition"] = dict(
+                failure_domain_disposition
             )
     _onboard_route_guide_apply_runtime_route_token_scope(
         conn,

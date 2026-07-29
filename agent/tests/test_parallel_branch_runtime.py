@@ -59,6 +59,8 @@ from agent.governance.parallel_branch_runtime import (
     BranchRuntimeFenceError,
     BranchRuntimeTask,
     BranchTaskRuntimeContext,
+    BatchMergeItem,
+    BatchMergeRuntime,
     DependencyRevalidationQaCandidateAuthority,
     MergeQueueItem,
     PostQaMergeConflictRejoinAuthority,
@@ -74,6 +76,7 @@ from agent.governance.parallel_branch_runtime import (
     build_runtime_context_projection,
     build_runtime_context_worker_view,
     decide_merge_queue,
+    decide_batch_rollback_replay,
     decide_restart_recovery,
     ensure_branch_runtime_schema,
     get_branch_context,
@@ -101,6 +104,8 @@ from agent.governance.parallel_branch_runtime import (
     runtime_context_session_token_lease_view,
     runtime_context_secret_hash,
     runtime_tasks_from_contexts,
+    observer_failure_domain_disposition_hash,
+    validate_observer_failure_domain_disposition,
     upsert_branch_context,
     upsert_merge_queue_item,
     validate_mf_subagent_graph_query_identity,
@@ -118,6 +123,96 @@ PB001_BRANCH_NAMES = {
     "T4": "codex/PB001-T4-dashboard-read-model",
     "T5": "codex/PB001-T5-chain-adapter",
 }
+
+
+def test_generation_restart_requires_signed_governance_failure_disposition() -> None:
+    runtime = BatchMergeRuntime(
+        project_id=PROJECT_ID,
+        batch_id="generation-restart-disposition",
+        target_ref="refs/heads/main",
+        batch_base_commit="a" * 40,
+        current_target_head="b" * 40,
+        items=(
+            BatchMergeItem(
+                task_id="lane-1",
+                branch_ref="refs/heads/codex/lane-1",
+                worktree_path="/repo/.worktrees/lane-1",
+                queue_index=1,
+                status=STATE_MERGE_FAILED,
+                branch_head="c" * 40,
+            ),
+        ),
+    )
+    product_packet = {
+        "schema_version": "observer.failure_domain_evidence_disposition.v1",
+        "failure_domain": "target_product_defect",
+        "observer_principal": "observer-session-1",
+        "observation_refs": ["timeline:browser-failure"],
+        "invalidated_evidence_refs": [
+            {
+                "ref": "timeline:browser-failure",
+                "causal_reason": "target product assertion failed",
+            }
+        ],
+        "preserved_evidence_refs": ["timeline:qa-pass", "timeline:merge"],
+        "next_topology": (
+            "bounded_same_row_rework_or_blocked_parent_successor"
+        ),
+        "qa_verdict_authority": "authenticated_independent_qa_only",
+        "qa_verdict_preserved": True,
+        "generation_restart_allowed": False,
+    }
+    product_packet["authority_hash"] = (
+        observer_failure_domain_disposition_hash(product_packet)
+    )
+    with pytest.raises(
+        ValueError,
+        match="fresh generation requires signed governance-lane invalidation",
+    ):
+        decide_batch_rollback_replay(
+            runtime,
+            severe_integration_failure=True,
+            generation_restart_requested=True,
+            failure_domain_disposition=product_packet,
+        )
+
+    governance_packet = {
+        **product_packet,
+        "failure_domain": "governance_lane_evidence_invalid",
+        "invalidated_evidence_refs": [
+            {
+                "ref": "timeline:route-binding",
+                "causal_reason": "server verification proved route identity invalid",
+            }
+        ],
+        "preserved_evidence_refs": [
+            "timeline:qa-pass",
+            "timeline:merge",
+            "timeline:reconcile",
+        ],
+        "next_topology": (
+            "fresh_generation_after_explicit_evidence_invalidation"
+        ),
+        "generation_restart_allowed": True,
+    }
+    governance_packet.pop("authority_hash", None)
+    governance_packet["authority_hash"] = (
+        observer_failure_domain_disposition_hash(governance_packet)
+    )
+    validated = validate_observer_failure_domain_disposition(
+        governance_packet,
+        require_generation_restart=True,
+    )
+    assert validated["failure_domain"] == (
+        "governance_lane_evidence_invalid"
+    )
+    plan = decide_batch_rollback_replay(
+        runtime,
+        severe_integration_failure=True,
+        generation_restart_requested=True,
+        failure_domain_disposition=governance_packet,
+    )
+    assert plan.rollback_required is True
 
 
 def test_mf_parallel_v2_qa_graph_context_guides_exact_graph_evidence_shape() -> None:
@@ -1993,12 +2088,17 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
         "read_receipt_hash_action"
     ]
     assert invalid_action["status"] == "invalid_foundational_evidence"
-    assert invalid_action["next_action"] == "discard_generation_and_repair_root"
+    assert invalid_action["next_action"] == (
+        "request_governance_lane_failure_domain_disposition"
+    )
     assert invalid_action["invalid_foundational_evidence"][
         "historical_backfill_allowed"
     ] is False
     assert invalid_action["invalid_foundational_evidence"][
         "resume_source_after_repair"
+    ] is False
+    assert invalid_action["invalid_foundational_evidence"][
+        "generation_restart_allowed"
     ] is False
 
     with_progress = build_runtime_context_projection(

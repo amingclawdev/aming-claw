@@ -84,6 +84,54 @@ STRICT_GOVERNANCE_POLICY = {
 }
 
 
+def test_observer_failure_disposition_cannot_supersede_independent_qa_verdict():
+    from agent.governance import task_timeline
+
+    result = task_timeline._independent_qa_gate(
+        [
+            {
+                "id": 1,
+                "project_id": "proj",
+                "backlog_id": "AC-FAILURE-DOMAIN-QA",
+                "task_id": "worker-1",
+                "event_type": "qa.independent_verification",
+                "event_kind": "qa_verification",
+                "phase": "qa",
+                "actor": "qa-session-1",
+                "status": "passed",
+            },
+            {
+                "id": 2,
+                "project_id": "proj",
+                "backlog_id": "AC-FAILURE-DOMAIN-QA",
+                "task_id": "worker-1",
+                "event_type": "observer.failure_domain_disposition",
+                "event_kind": "observer_command",
+                "phase": "post_merge_browser_observation",
+                "actor": "observer-session-1",
+                "status": "failed",
+                "payload": {
+                    "failure_domain": "target_product_defect",
+                    "qa_verdict": "no_pass",
+                    "supersede_qa_verdict": True,
+                    "authority_hash": _fake_sha("failure-domain"),
+                },
+            },
+        ],
+        STRICT_GOVERNANCE_POLICY,
+    )
+
+    assert result["passed"] is True
+    assert result["evidence_events"][0]["id"] == 1
+    assert result["observer_dispositions_are_verdict_neutral"] is True
+    disposition = result["observer_failure_domain_dispositions"][0]
+    assert disposition["qa_verdict_preserved"] is True
+    assert (
+        disposition["can_author_convert_erase_or_supersede_qa_verdict"]
+        is False
+    )
+
+
 def test_recent_timeline_compact_view_omits_raw_payload(tmp_path):
     from agent.governance import server, task_timeline
 

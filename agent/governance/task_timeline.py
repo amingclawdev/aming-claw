@@ -3099,11 +3099,38 @@ def _independent_qa_gate(
     # not constitute independent verification.
     evidence_events: list[dict[str, Any]] = []
     rejected_events: list[dict[str, Any]] = []
+    observer_failure_domain_dispositions: list[dict[str, Any]] = []
     events_by_ref: dict[str, dict[str, Any]] = {}
     for raw in rows:
         event = _mapping(raw)
         for ref in _independent_qa_event_ref_tokens(event):
             events_by_ref.setdefault(ref, event)
+        payload = _mapping(event.get("payload"))
+        disposition = _mapping(
+            payload.get("failure_domain_disposition")
+        ) or payload
+        failure_domain = _text(disposition.get("failure_domain"))
+        observer_marker = " ".join(
+            _text(event.get(field)).lower()
+            for field in ("event_type", "event_kind", "phase", "actor")
+        )
+        if failure_domain and "observer" in observer_marker:
+            observer_failure_domain_dispositions.append(
+                {
+                    "id": event.get("id"),
+                    "event_kind": event.get("event_kind"),
+                    "actor": event.get("actor"),
+                    "failure_domain": failure_domain,
+                    "authority_hash": _text(
+                        disposition.get("authority_hash")
+                    ),
+                    "qa_verdict_authority": (
+                        "authenticated_independent_qa_only"
+                    ),
+                    "qa_verdict_preserved": True,
+                    "can_author_convert_erase_or_supersede_qa_verdict": False,
+                }
+            )
 
     for raw_event in rows:
         event = _mapping(raw_event)
@@ -3279,6 +3306,10 @@ def _independent_qa_gate(
         "evidence_events": evidence_events,
         "rejected_evidence_events": rejected_events,
         "known_worker_slot_ids": sorted(worker_slot_ids),
+        "observer_failure_domain_dispositions": (
+            observer_failure_domain_dispositions
+        ),
+        "observer_dispositions_are_verdict_neutral": True,
     }
 
 

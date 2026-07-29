@@ -618,6 +618,7 @@ _META_ACTION_ALIASES = {
     "observer_command": "observer_command",
     "observer_command_complete": "observer_command",
     "observer_command_disposition": "observer_command",
+    "observer_failure_domain_disposition": "observer_command",
     "observer_visual_smoke": "observer_visual_smoke",
     "visual_smoke": "observer_visual_smoke",
     "independent_verification": "independent_verification",
@@ -6108,6 +6109,38 @@ def validate_meta_contract_timeline_event(
         action=action,
         trusted_runtime_context_worker_proof=trusted_runtime_context_worker_proof,
     )
+    event_markers = set(_meta_event_markers(event))
+    failure_disposition = {}
+    event_payload = event.get("payload")
+    if isinstance(event_payload, Mapping):
+        nested_disposition = event_payload.get(
+            "failure_domain_disposition"
+        )
+        failure_disposition = (
+            dict(nested_disposition)
+            if isinstance(nested_disposition, Mapping)
+            else dict(event_payload)
+        )
+    if "observer_failure_domain_disposition" in event_markers:
+        forbidden_verdict_claims = [
+            key
+            for key in (
+                "qa_verdict",
+                "qa_decision",
+                "convert_qa_verdict",
+                "erase_qa_verdict",
+                "supersede_qa_verdict",
+                "supersedes_qa_verdict",
+                "qa_verdict_ref_replaced",
+            )
+            if failure_disposition.get(key) not in (None, "", False, [], {})
+        ]
+        if forbidden_verdict_claims:
+            raise MfSubagentContractError(
+                "observer failure-domain disposition is verdict-neutral; "
+                "independent QA remains the sole PASS/NO-PASS authority: "
+                + ", ".join(forbidden_verdict_claims)
+            )
     forbidden_always = {
         _normalized_action(item)
         for item in _string_list_forgiving(meta.get("forbidden_always"))
