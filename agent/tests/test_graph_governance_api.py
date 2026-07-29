@@ -106,6 +106,650 @@ from agent.governance.parallel_branch_runtime import (
 PID = "graph-api-test"
 
 
+def test_live_observer_guide_projects_signed_failure_domain_disposition(conn):
+    backlog_id = "AC-FAILURE-DOMAIN-LIVE-GUIDE"
+    task_id = "failure-domain-active-task"
+    upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id="batch-failure-domain",
+            epoch_id="epoch-failure-domain",
+            coordination_backlog_id=backlog_id,
+            target_ref="refs/heads/main",
+            base_head="a" * 40,
+            current_head="b" * 40,
+            merge_queue_id="mq-failure-domain",
+            active_queue_item_id="mq-failure-domain:item-1",
+            active_task_id=task_id,
+            active_backlog_id=backlog_id,
+            status="open",
+        ),
+        now_iso="2026-07-29T12:00:00Z",
+    )
+    recorded_disposition = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="observer.failure_domain_disposition",
+        event_kind="observer_command",
+        phase="post_merge_browser_observation",
+        actor="observer-session-live-guide",
+        status="accepted",
+        payload={
+            "observer_failure_domain_authority": {
+                "schema_version": (
+                    "observer.failure_domain_principal_route_binding.v1"
+                ),
+                "server_projected": True,
+                "status": "accepted",
+                "observer_principal": (
+                    "observer-route:rtok-failure-domain-live-guide"
+                ),
+                "observer_actor": "observer-session-live-guide",
+                "caller_role": "observer",
+                "route_token_ref": "rtok-failure-domain-live-guide",
+                "route_id": "route-failure-domain-live-guide",
+                "route_context_hash": _fake_sha(
+                    "failure-domain-live-guide"
+                ),
+                "registry_verified": True,
+                "scope": {
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                },
+            },
+            "failure_domain": "harness_or_identity",
+            "observation_refs": ["timeline:browser-failure"],
+            "invalidated_evidence_refs": [
+                {
+                    "ref": "timeline:browser-failure",
+                    "causal_reason": "Browser session identity expired",
+                },
+                {
+                    "ref": "timeline:qa-pass",
+                    "causal_reason": "observer attempted broad invalidation",
+                },
+            ],
+            "preserved_evidence_refs": [
+                "timeline:qa-pass",
+                "timeline:merge",
+                "timeline:reconcile",
+                "batch-epoch:epoch-failure-domain",
+            ],
+        },
+    )
+    conn.commit()
+
+    guide = server._onboard_route_guide_service_response(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        response_view="full",
+    )
+
+    packet = guide["failure_domain_disposition"]
+    assert packet["failure_domain"] == "harness_or_identity"
+    assert packet["observer_principal"] == (
+        "observer-route:rtok-failure-domain-live-guide"
+    )
+    assert packet["observer_principal_binding"]["observer_actor"] == (
+        "observer-session-live-guide"
+    )
+    assert packet["authority_ref"].startswith("timeline:")
+    assert packet["authority_ref_status"] == "accepted"
+    assert packet["observer_principal_binding"]["caller_role"] == "observer"
+    resolved = server._observer_failure_domain_disposition_from_ref(
+        conn,
+        project_id=PID,
+        authority_ref=f"timeline:{recorded_disposition['id']}",
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    assert resolved["authority_hash"] == packet["authority_hash"]
+    with pytest.raises(
+        server.ValidationError,
+        match="caller-supplied failure_domain_disposition",
+    ):
+        server._observer_failure_domain_restart_authority_from_body(
+            conn,
+            project_id=PID,
+            body={
+                "generation_restart_requested": True,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "failure_domain_disposition": packet,
+            },
+        )
+    assert packet["next_topology"] == "rerun_browser_evidence_only"
+    assert packet["authority_hash"].startswith("sha256:")
+    assert packet["generation_restart_allowed"] is False
+    assert packet["qa_verdict_preserved"] is True
+    assert packet["invalidated_evidence_refs"] == [
+        {
+            "ref": "timeline:browser-failure",
+            "causal_reason": "Browser session identity expired",
+        }
+    ]
+    assert "timeline:qa-pass" in packet["preserved_evidence_refs"]
+    assert packet["rejected_invalidation_refs"][0]["ref"] == (
+        "timeline:qa-pass"
+    )
+    assert guide["next_legal_action"]["failure_domain_disposition"] == packet
+    compact = server._onboard_route_guide_service_response(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        response_view="compact",
+    )
+    compact_packet = compact["failure_domain_disposition"]
+    assert compact_packet["failure_domain"] == "harness_or_identity"
+    assert compact_packet["authority_hash"] == packet["authority_hash"]
+    assert "failure_domain_disposition" in compact["guide_capsule"][
+        "available_sections"
+    ]
+
+
+def test_failure_domain_authority_rejects_unaccepted_or_non_observer_db_rows(
+    conn,
+):
+    backlog_id = "AC-FAILURE-DOMAIN-AUTHORITY-NEGATIVE"
+    task_id = "failure-domain-authority-negative"
+    route_identity = {
+        "route_id": "route-failure-domain-negative",
+        "route_context_hash": _fake_sha("failure-domain-negative"),
+        "route_token_ref": "rtok-failure-domain-negative",
+    }
+    accepted_evidence = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="observer.route_binding_verification",
+        event_kind="observer_route_binding_verification",
+        phase="verification",
+        actor="observer-session-negative",
+        status="accepted",
+        payload=route_identity,
+    )
+    accepted_evidence_ref = f"timeline:{accepted_evidence['id']}"
+
+    def payload(principal: str) -> dict:
+        return {
+            "observer_failure_domain_authority": {
+                "schema_version": (
+                    "observer.failure_domain_principal_route_binding.v1"
+                ),
+                "server_projected": True,
+                "status": "accepted",
+                "observer_principal": (
+                    "observer-route:rtok-failure-domain-negative"
+                ),
+                "observer_actor": principal,
+                "caller_role": "observer",
+                **route_identity,
+                "registry_verified": True,
+                "scope": {
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                },
+            },
+            "failure_domain": "governance_lane_evidence_invalid",
+            "observation_refs": ["timeline:browser-failure"],
+            "invalidated_evidence_refs": [
+                {
+                    "ref": accepted_evidence_ref,
+                    "causal_reason": "server DB verification rejected binding",
+                }
+            ],
+        }
+
+    observer_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="observer.failure_domain_disposition",
+        event_kind="observer_command",
+        phase="post_merge_browser_observation",
+        actor="observer-session-negative",
+        status="accepted",
+        payload=payload("observer-session-negative"),
+    )
+    rejected = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="observer.failure_domain_disposition",
+        event_kind="observer_command",
+        phase="post_merge_browser_observation",
+        actor="observer-session-negative",
+        status="failed",
+        payload=payload("observer-session-negative"),
+    )
+    conn.commit()
+
+    non_observer = {
+        **observer_event,
+        "actor": "qa",
+        "payload": payload("qa"),
+    }
+    assert server._observer_failure_domain_disposition_from_event(
+        non_observer
+    ) == {}
+    restart_requested, authority_ref, disposition = (
+        server._observer_failure_domain_restart_authority_from_body(
+            conn,
+            project_id=PID,
+            body={
+                "generation_restart_requested": True,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "failure_domain_disposition_ref": (
+                    f"timeline:{observer_event['id']}"
+                ),
+            },
+        )
+    )
+    assert restart_requested is True
+    assert authority_ref == f"timeline:{observer_event['id']}"
+    assert disposition["failure_domain"] == (
+        "governance_lane_evidence_invalid"
+    )
+    assert disposition["invalidated_evidence_refs"][0]["ref"] == (
+        accepted_evidence_ref
+    )
+    with pytest.raises(
+        server.ValidationError,
+        match="not an accepted DB event",
+    ):
+        server._observer_failure_domain_disposition_from_ref(
+            conn,
+            project_id=PID,
+            authority_ref=f"timeline:{rejected['id']}",
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    with pytest.raises(
+        server.ValidationError,
+        match="does not exist",
+    ):
+        server._observer_failure_domain_disposition_from_ref(
+            conn,
+            project_id=PID,
+            authority_ref="timeline:999999999",
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+
+
+@pytest.mark.parametrize(
+    "evidence_case",
+    ("nonexistent", "failed", "cross_scope", "cross_route"),
+)
+def test_governance_lane_invalidation_ref_fails_closed_without_exact_db_scope(
+    conn,
+    evidence_case,
+):
+    backlog_id = f"AC-FAILURE-DOMAIN-DB-SCOPE-{evidence_case}"
+    task_id = f"failure-domain-db-scope-{evidence_case}"
+    route_identity = {
+        "route_id": f"route-failure-domain-{evidence_case}",
+        "route_context_hash": _fake_sha(
+            f"route-failure-domain-{evidence_case}"
+        ),
+        "prompt_contract_id": f"rprompt-failure-domain-{evidence_case}",
+        "prompt_contract_hash": _fake_sha(
+            f"prompt-failure-domain-{evidence_case}"
+        ),
+        "route_token_ref": f"rtok-failure-domain-{evidence_case}",
+        "visible_injection_manifest_hash": _fake_sha(
+            f"visible-failure-domain-{evidence_case}"
+        ),
+    }
+    evidence_ref = "timeline:999999999"
+    if evidence_case != "nonexistent":
+        evidence_route = dict(route_identity)
+        evidence_task_id = task_id
+        evidence_status = "accepted"
+        if evidence_case == "failed":
+            evidence_status = "failed"
+        elif evidence_case == "cross_scope":
+            evidence_task_id = f"{task_id}-other"
+        elif evidence_case == "cross_route":
+            evidence_route["route_token_ref"] = (
+                f"{route_identity['route_token_ref']}-other"
+            )
+        evidence = task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=evidence_task_id,
+            event_type="observer.route_binding_verification",
+            event_kind="observer_route_binding_verification",
+            phase="verification",
+            actor="observer-session-db-scope",
+            status=evidence_status,
+            payload=evidence_route,
+        )
+        evidence_ref = f"timeline:{evidence['id']}"
+
+    authority = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="observer.failure_domain_disposition",
+        event_kind="observer_command",
+        phase="post_merge_browser_observation",
+        actor="observer-session-db-scope",
+        status="accepted",
+        payload={
+            "observer_failure_domain_authority": {
+                "schema_version": (
+                    "observer.failure_domain_principal_route_binding.v1"
+                ),
+                "server_projected": True,
+                "status": "accepted",
+                "observer_principal": (
+                    f"observer-route:{route_identity['route_token_ref']}"
+                ),
+                "observer_actor": "observer-session-db-scope",
+                "caller_role": "observer",
+                **route_identity,
+                "registry_verified": True,
+                "scope": {
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                },
+            },
+            "failure_domain": "governance_lane_evidence_invalid",
+            "observation_refs": [evidence_ref],
+            "invalidated_evidence_refs": [
+                {
+                    "ref": evidence_ref,
+                    "causal_reason": "route verification evidence invalid",
+                }
+            ],
+        },
+    )
+    conn.commit()
+
+    with pytest.raises(
+        server.ValidationError,
+        match="not an authenticated observer authority event",
+    ):
+        server._observer_failure_domain_disposition_from_ref(
+            conn,
+            project_id=PID,
+            authority_ref=f"timeline:{authority['id']}",
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "evidence_case",
+        "event_type",
+        "event_kind",
+        "phase",
+        "server_evidence_kind",
+        "invalidation_eligible",
+    ),
+    (
+        (
+            "independent_qa",
+            "qa.independent_verification",
+            "qa_verification",
+            "qa",
+            "independent_qa",
+            False,
+        ),
+        (
+            "merge",
+            "parallel.live_merge",
+            "live_merge",
+            "merge",
+            "merge",
+            False,
+        ),
+        (
+            "current_full_reconcile",
+            "graph.reconcile",
+            "reconcile",
+            "current_full_reconcile",
+            "current_full_reconcile",
+            False,
+        ),
+        (
+            "batch_integration_epoch",
+            "observer.batch_integration_epoch",
+            "observer_command",
+            "batch_integration_epoch",
+            "batch_integration_epoch",
+            False,
+        ),
+        (
+            "unaffected_child",
+            "observer.unaffected_child_evidence",
+            "observer_command",
+            "observation",
+            "unaffected_child_evidence",
+            False,
+        ),
+        (
+            "route_binding_verification",
+            "observer.route_binding_verification",
+            "observer_route_binding_verification",
+            "verification",
+            "observer_route_binding_verification",
+            True,
+        ),
+    ),
+)
+def test_governance_lane_invalidation_uses_server_evidence_kind_eligibility(
+    conn,
+    evidence_case,
+    event_type,
+    event_kind,
+    phase,
+    server_evidence_kind,
+    invalidation_eligible,
+):
+    backlog_id = f"AC-FAILURE-DOMAIN-KIND-{evidence_case}"
+    task_id = f"failure-domain-kind-{evidence_case}"
+    route_identity = {
+        "route_id": f"route-failure-domain-kind-{evidence_case}",
+        "route_context_hash": _fake_sha(
+            f"route-failure-domain-kind-{evidence_case}"
+        ),
+        "prompt_contract_id": (
+            f"rprompt-failure-domain-kind-{evidence_case}"
+        ),
+        "prompt_contract_hash": _fake_sha(
+            f"prompt-failure-domain-kind-{evidence_case}"
+        ),
+        "route_token_ref": (
+            f"rtok-failure-domain-kind-{evidence_case}"
+        ),
+        "visible_injection_manifest_hash": _fake_sha(
+            f"visible-failure-domain-kind-{evidence_case}"
+        ),
+    }
+    evidence = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type=event_type,
+        event_kind=event_kind,
+        phase=phase,
+        actor=(
+            "qa"
+            if evidence_case == "independent_qa"
+            else "observer-session-evidence-kind"
+        ),
+        status="accepted",
+        payload=route_identity,
+    )
+    evidence_ref = f"timeline:{evidence['id']}"
+    authority = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="observer.failure_domain_disposition",
+        event_kind="observer_command",
+        phase="post_merge_browser_observation",
+        actor="observer-session-evidence-kind",
+        status="accepted",
+        payload={
+            "observer_failure_domain_authority": {
+                "schema_version": (
+                    "observer.failure_domain_principal_route_binding.v1"
+                ),
+                "server_projected": True,
+                "status": "accepted",
+                "observer_principal": (
+                    f"observer-route:{route_identity['route_token_ref']}"
+                ),
+                "observer_actor": "observer-session-evidence-kind",
+                "caller_role": "observer",
+                **route_identity,
+                "registry_verified": True,
+                "scope": {
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                },
+            },
+            "failure_domain": "governance_lane_evidence_invalid",
+            "observation_refs": [evidence_ref],
+            "invalidated_evidence_refs": [
+                {
+                    "ref": evidence_ref,
+                    "causal_reason": "claimed governance-lane invalidation",
+                    "evidence_kind": (
+                        "observer_route_binding_verification"
+                    ),
+                }
+            ],
+        },
+    )
+    conn.commit()
+
+    authority_ref = f"timeline:{authority['id']}"
+    disposition = server._observer_failure_domain_disposition_from_ref(
+        conn,
+        project_id=PID,
+        authority_ref=authority_ref,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    if invalidation_eligible:
+        assert disposition["invalidated_evidence_refs"] == [
+            {
+                "ref": evidence_ref,
+                "causal_reason": "claimed governance-lane invalidation",
+            }
+        ]
+        assert disposition["rejected_invalidation_refs"] == []
+        assert evidence_ref not in disposition["preserved_evidence_refs"]
+        assert disposition["generation_restart_allowed"] is True
+        restart_requested, resolved_ref, _ = (
+            server._observer_failure_domain_restart_authority_from_body(
+                conn,
+                project_id=PID,
+                body={
+                    "generation_restart_requested": True,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "failure_domain_disposition_ref": authority_ref,
+                },
+            )
+        )
+        assert restart_requested is True
+        assert resolved_ref == authority_ref
+    else:
+        assert disposition["invalidated_evidence_refs"] == []
+        assert disposition["generation_restart_allowed"] is False
+        assert evidence_ref in disposition["preserved_evidence_refs"]
+        assert disposition["rejected_invalidation_refs"] == [
+            {
+                "ref": evidence_ref,
+                "causal_reason": "claimed governance-lane invalidation",
+                "rejection_reason": (
+                    "server_evidence_kind_is_not_governance_lane_"
+                    "invalidatable"
+                ),
+                "server_evidence_kind": server_evidence_kind,
+                "server_evidence_domain": (
+                    "unaffected_child_or_protected_evidence"
+                ),
+            }
+        ]
+        with pytest.raises(
+            ValueError,
+            match="fresh generation requires signed governance-lane",
+        ):
+            parallel_branch_runtime.validate_observer_failure_domain_disposition(
+                disposition,
+                require_generation_restart=True,
+                server_persisted_authority_ref=authority_ref,
+            )
+
+
+def test_failure_domain_principal_is_derived_from_registered_observer_route():
+    gate = {
+        "status": "passed",
+        "caller_role": "observer",
+        "route_token_ref": "rtok-principal-binding",
+        "route_id": "route-principal-binding",
+        "route_context_hash": _fake_sha("route-principal-binding"),
+        "registry_verified": True,
+        "scope": {
+            "project_id": PID,
+            "backlog_id": "AC-PRINCIPAL-BINDING",
+            "task_id": "principal-binding-task",
+        },
+    }
+    authority = server._observer_failure_domain_authority_from_route_gate(
+        project_id=PID,
+        backlog_id="AC-PRINCIPAL-BINDING",
+        task_id="principal-binding-task",
+        actor="observer-session-principal-binding",
+        status="accepted",
+        route_gate=gate,
+    )
+    assert authority["observer_principal"] == (
+        "observer-route:rtok-principal-binding"
+    )
+    assert authority["observer_actor"] == (
+        "observer-session-principal-binding"
+    )
+    assert (
+        server._observer_failure_domain_authority_from_route_gate(
+            project_id=PID,
+            backlog_id="AC-PRINCIPAL-BINDING",
+            task_id="principal-binding-task",
+            actor="qa",
+            status="accepted",
+            route_gate=gate,
+        )
+        == {}
+    )
+
+
 def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commit(
     conn,
     monkeypatch,

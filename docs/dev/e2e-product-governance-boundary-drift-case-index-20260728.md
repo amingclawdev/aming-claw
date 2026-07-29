@@ -28,3 +28,33 @@ Fixed E2E acceptance:
 5. Update umbrella
    `AC-RC-RECOVERY-ZERO-BYPASS-HAPPY-PATH-HOT-WINDOW-R1-20260723` only after
    all three fixed cases are jointly satisfiable.
+
+## Post-QA/post-merge observation failure domains
+
+The observer must classify a later Browser, visual, cleanup, or administrative
+failure without rewriting the authenticated independent QA verdict. The live
+observer guide exposes the server-signed disposition packet and preserves every
+unaffected child, QA, merge, reconcile, and batch-epoch evidence ref.
+
+| Case | Boundary | Required topology |
+|---|---|---|
+| PG-001 / Generation 48 | The observation proves a target-product defect that is inside the row's acceptance scope. | Keep the QA verdict immutable and route bounded same-row rework. An outside-scope discovery instead blocks the parent and creates a bounded successor; it never turns the observer into a QA verdict author. |
+| PG-002 / Generation 59 | The observation is outside the current acceptance scope. | Preserve the completed child/QA/merge/reconcile evidence, block the parent at the boundary, and route a bounded successor. Do not discard the generation. |
+
+The governed domains are:
+
+- `target_product_defect`: bounded same-row rework or a blocked-parent
+  successor, selected by acceptance scope.
+- `harness_or_identity`: rerun Browser evidence only.
+- `cleanup_or_admin`: retry the procedural suffix only.
+- `governance_lane_evidence_invalid`: the only domain that may request a fresh
+  generation, and only when the signed packet names each invalidated evidence
+  ref with a causal reason.
+
+Generation restart is rejected when the packet is missing, unsigned, names a
+different topology, omits causal reasons, or attempts to invalidate evidence
+that the server disposition preserved. The restart call passes only the
+accepted timeline `failure_domain_disposition_ref`; the server reloads that DB
+row, verifies its observer actor and registered route binding, and reconstructs
+the immutable authority packet. Caller-computed hashes, raw packet bodies,
+unknown refs, and non-accepted refs are negative cases.

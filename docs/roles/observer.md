@@ -112,6 +112,38 @@ not mutate or delete earlier contract revisions.
 
 ---
 
+## Post-QA Observation Failure Disposition
+
+Authenticated independent QA is the sole PASS/NO-PASS authority. A later
+observer Browser, visual, cleanup, or administrative observation is
+verdict-neutral: it cannot author, convert, erase, or supersede the QA verdict.
+Read the live `onboard_route_guide(role="observer")` disposition before taking
+recovery action.
+
+The server-signed packet contains `failure_domain`, `observer_principal`,
+`observer_principal_binding`, an accepted `authority_ref`, `observation_refs`,
+`invalidated_evidence_refs` with one causal reason per ref,
+`preserved_evidence_refs`, `next_topology`, and `authority_hash`.
+`observer_principal` is derived from the server-registered observer route ref;
+the caller's `actor` label and a caller-computed hash are never authority.
+
+- `target_product_defect` routes bounded same-row rework when the defect is
+  inside acceptance scope, otherwise a blocked-parent successor.
+- `harness_or_identity` reruns only Browser evidence.
+- `cleanup_or_admin` retries only the procedural suffix.
+- `governance_lane_evidence_invalid` is the only domain allowed to request a
+  fresh generation.
+
+Never restart or discard a generation from an unsigned observation, a broad
+“severe failure” flag, or a packet without explicit invalidated refs and causal
+reasons. Batch rollback/replay accepts only the persisted `authority_ref`; it
+rejects raw disposition packets, missing refs, and DB rows whose status is not
+accepted. Preserve unaffected child, QA, merge, reconcile, and batch-epoch
+evidence. PG-001/Generation 48 and PG-002/Generation 59 are the canonical
+acceptance-boundary cases.
+
+---
+
 ## Route-Token Gate For Protected Mutations
 
 High-risk governance mutations must carry route-owned evidence. The protected

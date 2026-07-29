@@ -7640,7 +7640,7 @@ def _runtime_context_read_receipt_hash_action(
         "worker_identity": worker_identity,
         "status": status,
         "next_action": (
-            "discard_generation_and_repair_root"
+            "request_governance_lane_failure_domain_disposition"
             if invalid_foundational_evidence
             else (
                 "none"
@@ -7660,13 +7660,23 @@ def _runtime_context_read_receipt_hash_action(
                 "schema_version": (
                     "runtime_context.invalid_foundational_evidence.v1"
                 ),
-                "status": "generation_discard_required",
+                "status": "failure_domain_disposition_required",
                 "reason": "worker_read_receipt_hash_invalid",
                 "source_event_ref": read_receipt_ref,
                 "historical_evidence_immutable": True,
                 "historical_backfill_allowed": False,
                 "resume_source_after_repair": False,
-                "next_action": "repair_root_then_start_fresh_generation",
+                "proposed_failure_domain": (
+                    "governance_lane_evidence_invalid"
+                ),
+                "proposed_invalidated_evidence_refs": (
+                    [read_receipt_ref] if read_receipt_ref else []
+                ),
+                "generation_restart_allowed": False,
+                "generation_restart_requires_signed_disposition": True,
+                "next_action": (
+                    "request_governance_lane_failure_domain_disposition"
+                ),
             }
             if invalid_foundational_evidence
             else {}
@@ -13984,16 +13994,36 @@ def decide_persisted_batch_rollback_replay(
     batch_id: str,
     *,
     severe_integration_failure: bool = False,
+    generation_restart_requested: bool = False,
+    failure_domain_disposition: Mapping[str, Any] | None = None,
+    failure_domain_disposition_ref: str = "",
     corrected_replay_order: tuple[str, ...] = (),
     scenario_id: str = "PB-004",
 ) -> BatchRollbackPlan:
-    """Replay batch rollback decisions from durable batch rows."""
+    """Replay batch rollback decisions from durable batch rows.
+
+    Generation restart authority is never inferred from a caller-supplied
+    packet.  The server resolves ``failure_domain_disposition_ref`` against
+    the timeline DB first, then supplies the resulting packet and the exact
+    persisted ref together.
+    """
     runtime = get_batch_merge_runtime(conn, project_id, batch_id)
     if runtime is None:
         raise KeyError(f"batch runtime not found: {project_id}/{batch_id}")
+    if generation_restart_requested and (
+        not str(failure_domain_disposition_ref or "").strip()
+        or not isinstance(failure_domain_disposition, Mapping)
+    ):
+        raise ValueError(
+            "generation restart requires a server-resolved persisted "
+            "failure_domain_disposition_ref"
+        )
     return decide_batch_rollback_replay(
         runtime,
         severe_integration_failure=severe_integration_failure,
+        generation_restart_requested=generation_restart_requested,
+        failure_domain_disposition=failure_domain_disposition,
+        failure_domain_disposition_ref=failure_domain_disposition_ref,
         corrected_replay_order=corrected_replay_order,
         scenario_id=scenario_id,
     )
@@ -20540,14 +20570,222 @@ def _batch_dashboard_rows(
     return tuple(rows)
 
 
+OBSERVER_FAILURE_DOMAINS = frozenset(
+    {
+        "target_product_defect",
+        "harness_or_identity",
+        "cleanup_or_admin",
+        "governance_lane_evidence_invalid",
+    }
+)
+
+OBSERVER_FAILURE_DOMAIN_NEXT_TOPOLOGY = {
+    "target_product_defect": "bounded_same_row_rework_or_blocked_parent_successor",
+    "harness_or_identity": "rerun_browser_evidence_only",
+    "cleanup_or_admin": "retry_procedural_suffix_only",
+    "governance_lane_evidence_invalid": "fresh_generation_after_explicit_evidence_invalidation",
+}
+
+OBSERVER_FAILURE_DOMAIN_ALLOWED_NEXT_TOPOLOGIES = {
+    **{
+        domain: frozenset({topology})
+        for domain, topology in OBSERVER_FAILURE_DOMAIN_NEXT_TOPOLOGY.items()
+    },
+    "target_product_defect": frozenset(
+        {
+            "bounded_same_row_rework",
+            "blocked_parent_successor",
+            "bounded_same_row_rework_or_blocked_parent_successor",
+        }
+    ),
+}
+
+OBSERVER_FAILURE_DOMAIN_AUTHORITY_SOURCE = (
+    "server_persisted_observer_route_event"
+)
+OBSERVER_FAILURE_DOMAIN_AUTHORITY_HASH_SOURCE = (
+    "server_projection_from_persisted_event"
+)
+
+
+def observer_failure_domain_disposition_hash(
+    disposition: Mapping[str, Any],
+) -> str:
+    """Return the canonical server authority hash for a disposition packet."""
+
+    unsigned = {
+        str(key): value
+        for key, value in dict(disposition or {}).items()
+        if str(key) != "authority_hash"
+    }
+    return _stable_authority_hash(unsigned)
+
+
+def validate_observer_failure_domain_disposition(
+    disposition: Mapping[str, Any] | None,
+    *,
+    require_generation_restart: bool = False,
+    server_persisted_authority_ref: str = "",
+) -> dict[str, Any]:
+    """Validate a server-signed observer failure-domain disposition.
+
+    The packet is deliberately evidence-disposition authority, not QA verdict
+    authority.  Only a governance-lane evidence failure may authorize a fresh
+    generation, and even then every invalidated ref needs an explicit causal
+    reason.
+    """
+
+    packet = dict(disposition or {})
+    domain = str(packet.get("failure_domain") or "").strip()
+    principal = str(packet.get("observer_principal") or "").strip()
+    authority_hash = str(packet.get("authority_hash") or "").strip()
+    authority_ref = str(packet.get("authority_ref") or "").strip()
+    persisted_ref = str(server_persisted_authority_ref or "").strip()
+    principal_binding = (
+        dict(packet.get("observer_principal_binding"))
+        if isinstance(packet.get("observer_principal_binding"), Mapping)
+        else {}
+    )
+    next_topology = str(packet.get("next_topology") or "").strip()
+    observation_refs = tuple(
+        str(ref).strip()
+        for ref in packet.get("observation_refs") or ()
+        if str(ref).strip()
+    )
+    preserved_refs = tuple(
+        str(ref).strip()
+        for ref in packet.get("preserved_evidence_refs") or ()
+        if str(ref).strip()
+    )
+    invalidated_items = packet.get("invalidated_evidence_refs") or ()
+    if isinstance(invalidated_items, Mapping):
+        invalidated_items = [invalidated_items]
+    normalized_invalidated: list[dict[str, str]] = []
+    for item in invalidated_items:
+        if not isinstance(item, Mapping):
+            raise ValueError(
+                "invalidated_evidence_refs must contain ref/reason mappings"
+            )
+        ref = str(item.get("ref") or item.get("evidence_ref") or "").strip()
+        reason = str(
+            item.get("causal_reason") or item.get("reason") or ""
+        ).strip()
+        if not ref or not reason:
+            raise ValueError(
+                "every invalidated evidence ref requires a causal reason"
+            )
+        normalized_invalidated.append(
+            {"ref": ref, "causal_reason": reason}
+        )
+    invalidated_refs = {
+        item["ref"] for item in normalized_invalidated
+    }
+    if domain not in OBSERVER_FAILURE_DOMAINS:
+        raise ValueError("failure_domain is not governed")
+    if not principal:
+        raise ValueError("observer_principal is required")
+    if (
+        not persisted_ref
+        or not authority_ref
+        or authority_ref != persisted_ref
+        or not authority_ref.startswith("timeline:")
+        or str(packet.get("source_event_ref") or "").strip() != authority_ref
+        or str(packet.get("authority_source") or "").strip()
+        != OBSERVER_FAILURE_DOMAIN_AUTHORITY_SOURCE
+        or str(packet.get("authority_hash_source") or "").strip()
+        != OBSERVER_FAILURE_DOMAIN_AUTHORITY_HASH_SOURCE
+        or str(packet.get("authority_ref_status") or "").strip().lower()
+        != "accepted"
+    ):
+        raise ValueError(
+            "failure-domain disposition requires a server-persisted "
+            "accepted authority ref"
+        )
+    binding_status = str(principal_binding.get("status") or "").strip().lower()
+    bound_route_token_ref = str(
+        principal_binding.get("route_token_ref") or ""
+    ).strip()
+    if (
+        principal_binding.get("server_projected") is not True
+        or binding_status != "accepted"
+        or str(principal_binding.get("caller_role") or "").strip().lower()
+        != "observer"
+        or not bound_route_token_ref
+        or not (
+            principal_binding.get("registry_verified") is True
+            or principal_binding.get("server_issued_binding") is True
+            or principal_binding.get("resolved_from_ref") is True
+        )
+        or str(principal_binding.get("observer_principal") or "").strip()
+        != principal
+        or principal != f"observer-route:{bound_route_token_ref}"
+        or str(principal_binding.get("source_event_ref") or "").strip()
+        != authority_ref
+    ):
+        raise ValueError(
+            "observer_principal must be bound to an authenticated "
+            "server-registered observer route"
+        )
+    if not observation_refs:
+        raise ValueError("observation_refs are required")
+    if next_topology not in (
+        OBSERVER_FAILURE_DOMAIN_ALLOWED_NEXT_TOPOLOGIES[domain]
+    ):
+        raise ValueError("next_topology does not match failure_domain")
+    if set(preserved_refs).intersection(invalidated_refs):
+        raise ValueError(
+            "preserved and invalidated evidence refs must be disjoint"
+        )
+    if (
+        not authority_hash
+        or authority_hash
+        != observer_failure_domain_disposition_hash(packet)
+    ):
+        raise ValueError("failure-domain disposition authority_hash is invalid")
+    if packet.get("qa_verdict_authority") != (
+        "authenticated_independent_qa_only"
+    ):
+        raise ValueError(
+            "failure-domain disposition must preserve independent QA authority"
+        )
+    if packet.get("qa_verdict_preserved") is not True:
+        raise ValueError(
+            "failure-domain disposition cannot erase or supersede QA verdict"
+        )
+    restart_allowed = bool(
+        domain == "governance_lane_evidence_invalid"
+        and normalized_invalidated
+        and packet.get("generation_restart_allowed") is True
+    )
+    if require_generation_restart and not restart_allowed:
+        raise ValueError(
+            "fresh generation requires signed governance-lane invalidation "
+            "with explicit causal evidence refs"
+        )
+    packet["invalidated_evidence_refs"] = normalized_invalidated
+    packet["generation_restart_allowed"] = restart_allowed
+    return packet
+
+
 def decide_batch_rollback_replay(
     runtime: BatchMergeRuntime,
     *,
     severe_integration_failure: bool = False,
+    generation_restart_requested: bool = False,
+    failure_domain_disposition: Mapping[str, Any] | None = None,
+    failure_domain_disposition_ref: str = "",
     corrected_replay_order: tuple[str, ...] = (),
     scenario_id: str = "PB-004",
 ) -> BatchRollbackPlan:
     """Plan batch rollback/replay without mutating git, graph, semantic, or DB state."""
+    if generation_restart_requested:
+        validate_observer_failure_domain_disposition(
+            failure_domain_disposition,
+            require_generation_restart=True,
+            server_persisted_authority_ref=(
+                failure_domain_disposition_ref
+            ),
+        )
     rollback_target = runtime.rollback_target_commit or runtime.batch_base_commit
     rollback_required = bool(
         severe_integration_failure

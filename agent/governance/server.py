@@ -31096,6 +31096,709 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         conn.close()
 
 
+def _observer_failure_domain_ref_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return _runtime_context_service_dedupe(
+            [item.strip() for item in value.split(",")]
+        )
+    if isinstance(value, Mapping):
+        value = list(value.values())
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    refs: list[str] = []
+    for item in value:
+        if isinstance(item, Mapping):
+            ref = str(
+                item.get("ref")
+                or item.get("evidence_ref")
+                or item.get("event_ref")
+                or ""
+            ).strip()
+        else:
+            ref = str(item or "").strip()
+        if ref:
+            refs.append(ref)
+    return _runtime_context_service_dedupe(refs)
+
+
+def _observer_failure_domain_event_requested(
+    event: Mapping[str, Any],
+) -> bool:
+    tokens = {
+        str(event.get(field) or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        for field in ("event_type", "event_kind")
+    }
+    return bool(
+        tokens.intersection(
+            {
+                "observer.failure_domain_disposition",
+                "observer_failure_domain_disposition",
+                "failure_domain_disposition",
+            }
+        )
+    )
+
+
+def _observer_failure_domain_authority_from_route_gate(
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    actor: str,
+    status: str,
+    route_gate: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Project the authenticated observer principal/route binding."""
+
+    gate = (
+        _route_gate_public_summary(route_gate)
+        if isinstance(route_gate, Mapping)
+        else {}
+    )
+    gate_status = str(
+        gate.get("status") or gate.get("decision") or ""
+    ).strip().lower()
+    observer_actor = str(actor or "").strip()
+    principal_role_token = observer_actor.lower().replace("-", "_")
+    scope = (
+        dict(gate.get("scope"))
+        if isinstance(gate.get("scope"), Mapping)
+        else {}
+    )
+    if (
+        str(status or "").strip().lower() != "accepted"
+        or not observer_actor
+        or not (
+            principal_role_token.startswith("observer")
+            or principal_role_token.startswith("obs_")
+        )
+        or gate_status
+        not in {
+            "accepted",
+            "allowed",
+            "ok",
+            "passed",
+            "succeeded",
+            "success",
+            "route_token_ref_resolved",
+        }
+        or str(gate.get("caller_role") or "").strip().lower()
+        != "observer"
+        or not str(gate.get("route_token_ref") or "").strip()
+        or not (
+            gate.get("registry_verified") is True
+            or gate.get("server_issued_binding") is True
+            or gate.get("resolved_from_ref") is True
+        )
+        or (
+            str(scope.get("project_id") or project_id).strip()
+            != project_id
+        )
+        or (
+            backlog_id
+            and str(scope.get("backlog_id") or "").strip()
+            != backlog_id
+        )
+        or (
+            task_id
+            and str(scope.get("task_id") or "").strip() != task_id
+        )
+    ):
+        return {}
+    route_token_ref = str(gate.get("route_token_ref") or "").strip()
+    return {
+        "schema_version": (
+            "observer.failure_domain_principal_route_binding.v1"
+        ),
+        "server_projected": True,
+        "projection_source": (
+            "server_registered_observer_route_token_ref"
+        ),
+        "status": "accepted",
+        "observer_principal": f"observer-route:{route_token_ref}",
+        "observer_actor": observer_actor,
+        "caller_role": "observer",
+        "route_token_ref": route_token_ref,
+        "route_id": str(gate.get("route_id") or ""),
+        "route_context_hash": str(
+            gate.get("route_context_hash") or ""
+        ),
+        "prompt_contract_id": str(
+            gate.get("prompt_contract_id") or ""
+        ),
+        "prompt_contract_hash": str(
+            gate.get("prompt_contract_hash") or ""
+        ),
+        "visible_injection_manifest_hash": str(
+            gate.get("visible_injection_manifest_hash") or ""
+        ),
+        "registry_verified": True,
+        "server_issued_binding": bool(
+            gate.get("server_issued_binding")
+        ),
+        "resolved_from_ref": bool(gate.get("resolved_from_ref")),
+        "scope": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        },
+    }
+
+
+def _observer_failure_domain_invalidation_event(
+    conn,
+    *,
+    authority_event: Mapping[str, Any],
+    evidence_ref: str,
+    route_binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve one passing, exact-scope evidence ref and its disposition."""
+
+    from . import task_timeline
+
+    match = re.fullmatch(r"timeline:(\d+)", str(evidence_ref or "").strip())
+    if conn is None or not match:
+        return {}
+    row = conn.execute(
+        """
+        SELECT * FROM task_timeline_events
+        WHERE project_id = ? AND id = ?
+        """,
+        (
+            str(authority_event.get("project_id") or "").strip(),
+            int(match.group(1)),
+        ),
+    ).fetchone()
+    if row is None:
+        return {}
+    evidence_event = task_timeline._row_to_dict(row)
+    if str(evidence_event.get("status") or "").strip().lower() not in {
+        "accepted",
+        "ok",
+        "pass",
+        "passed",
+        "succeeded",
+        "success",
+    }:
+        return {}
+    for field in ("project_id", "backlog_id", "task_id"):
+        if str(evidence_event.get(field) or "").strip() != str(
+            authority_event.get(field) or ""
+        ).strip():
+            return {}
+    expected_route = _route_identity_public_summary(route_binding)
+    evidence_route = _observer_root_route_identity_from_event(evidence_event)
+    if (
+        not expected_route.get("route_token_ref")
+        or any(
+            str(evidence_route.get(field) or "").strip()
+            != str(expected_route.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
+    ):
+        return {}
+    evidence_markers = {
+        str(evidence_event.get(field) or "")
+        .strip()
+        .lower()
+        .replace(".", "_")
+        .replace("-", "_")
+        for field in ("event_kind", "event_type", "phase")
+        if str(evidence_event.get(field) or "").strip()
+    }
+    if evidence_markers.intersection(
+        {
+            "batch_integration_epoch",
+            "parallel_batch_integration_epoch",
+            "batch_integration",
+        }
+    ):
+        server_evidence_kind = "batch_integration_epoch"
+    elif evidence_markers.intersection(
+        {
+            "qa_independent_verification",
+            "independent_qa_verification",
+            "qa_verification",
+            "independent_qa",
+            "qa",
+        }
+    ):
+        server_evidence_kind = "independent_qa"
+    elif evidence_markers.intersection(
+        {"parallel_live_merge", "live_merge", "merge"}
+    ):
+        server_evidence_kind = "merge"
+    elif evidence_markers.intersection(
+        {"current_full_reconcile", "graph_reconcile", "reconcile"}
+    ):
+        server_evidence_kind = "current_full_reconcile"
+    elif "observer_route_binding_verification" in evidence_markers:
+        server_evidence_kind = "observer_route_binding_verification"
+    else:
+        server_evidence_kind = "unaffected_child_evidence"
+    invalidation_eligible = (
+        server_evidence_kind == "observer_route_binding_verification"
+    )
+    return {
+        "invalidation_eligible": invalidation_eligible,
+        "server_evidence_kind": server_evidence_kind,
+        "server_evidence_domain": (
+            "governance_lane_invalidatable"
+            if invalidation_eligible
+            else "unaffected_child_or_protected_evidence"
+        ),
+    }
+
+
+def _observer_failure_domain_disposition_from_event(
+    event: Mapping[str, Any],
+    *,
+    conn=None,
+) -> dict[str, Any]:
+    """Build a server-signed, QA-preserving observation disposition."""
+
+    from .parallel_branch_runtime import (
+        OBSERVER_FAILURE_DOMAIN_AUTHORITY_HASH_SOURCE,
+        OBSERVER_FAILURE_DOMAIN_AUTHORITY_SOURCE,
+        OBSERVER_FAILURE_DOMAIN_NEXT_TOPOLOGY,
+        observer_failure_domain_disposition_hash,
+        validate_observer_failure_domain_disposition,
+    )
+
+    if str(event.get("status") or "").strip().lower() != "accepted":
+        return {}
+    payload = (
+        dict(event.get("payload"))
+        if isinstance(event.get("payload"), Mapping)
+        else {}
+    )
+    supplied = (
+        payload.get("failure_domain_disposition")
+        if isinstance(payload.get("failure_domain_disposition"), Mapping)
+        else payload
+    )
+    domain = str(supplied.get("failure_domain") or "").strip()
+    if domain not in OBSERVER_FAILURE_DOMAIN_NEXT_TOPOLOGY:
+        return {}
+    event_markers = " ".join(
+        str(event.get(field) or "").strip().lower()
+        for field in ("event_type", "event_kind", "phase", "actor")
+    )
+    if not any(
+        marker in event_markers
+        for marker in ("observer", "browser", "visual", "cleanup", "admin")
+    ):
+        return {}
+    event_id = str(event.get("id") or "").strip()
+    source_event_ref = f"timeline:{event_id}" if event_id else ""
+    if not source_event_ref:
+        return {}
+    observer_actor = str(event.get("actor") or "").strip()
+    if not observer_actor:
+        return {}
+    observer_principal_role = observer_actor.lower().replace("-", "_")
+    if not (
+        observer_principal_role.startswith("observer")
+        or observer_principal_role.startswith("obs_")
+    ):
+        return {}
+    persisted_principal_binding = (
+        dict(payload.get("observer_failure_domain_authority"))
+        if isinstance(
+            payload.get("observer_failure_domain_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    binding_status = str(
+        persisted_principal_binding.get("status") or ""
+    ).strip().lower()
+    binding_scope = (
+        dict(persisted_principal_binding.get("scope"))
+        if isinstance(persisted_principal_binding.get("scope"), Mapping)
+        else {}
+    )
+    if (
+        persisted_principal_binding.get("server_projected") is not True
+        or binding_status != "accepted"
+        or str(
+            persisted_principal_binding.get("caller_role") or ""
+        ).strip().lower()
+        != "observer"
+        or str(
+            persisted_principal_binding.get("observer_actor") or ""
+        ).strip()
+        != observer_actor
+        or not str(
+            persisted_principal_binding.get("route_token_ref") or ""
+        ).strip()
+        or not (
+            persisted_principal_binding.get("registry_verified") is True
+            or persisted_principal_binding.get("server_issued_binding")
+            is True
+            or persisted_principal_binding.get("resolved_from_ref") is True
+        )
+        or str(binding_scope.get("project_id") or "").strip()
+        != str(event.get("project_id") or "").strip()
+        or str(binding_scope.get("backlog_id") or "").strip()
+        != str(event.get("backlog_id") or "").strip()
+        or str(binding_scope.get("task_id") or "").strip()
+        != str(event.get("task_id") or "").strip()
+    ):
+        return {}
+    observer_principal = str(
+        persisted_principal_binding.get("observer_principal") or ""
+    ).strip()
+    expected_route_principal = (
+        "observer-route:"
+        + str(
+            persisted_principal_binding.get("route_token_ref") or ""
+        ).strip()
+    )
+    if observer_principal != expected_route_principal:
+        return {}
+    principal_binding = {
+        **persisted_principal_binding,
+        "source_event_ref": source_event_ref,
+        "observer_principal": observer_principal,
+        "observer_actor": observer_actor,
+    }
+    observation_refs = _observer_failure_domain_ref_values(
+        supplied.get("observation_refs")
+        or supplied.get("observation_event_refs")
+    )
+    if source_event_ref and source_event_ref not in observation_refs:
+        observation_refs.append(source_event_ref)
+    if not observation_refs:
+        return {}
+
+    reason_by_ref = {
+        str(key).strip(): str(value or "").strip()
+        for key, value in (
+            supplied.get("invalidation_reasons") or {}
+        ).items()
+        if str(key).strip() and str(value or "").strip()
+    } if isinstance(supplied.get("invalidation_reasons"), Mapping) else {}
+    raw_invalidated = supplied.get("invalidated_evidence_refs") or []
+    if isinstance(raw_invalidated, Mapping):
+        raw_invalidated = [raw_invalidated]
+    accepted_invalidated: list[dict[str, str]] = []
+    rejected_invalidated: list[dict[str, str]] = []
+    for item in raw_invalidated if isinstance(raw_invalidated, list) else []:
+        if isinstance(item, Mapping):
+            ref = str(
+                item.get("ref") or item.get("evidence_ref") or ""
+            ).strip()
+            causal_reason = str(
+                item.get("causal_reason") or item.get("reason") or ""
+            ).strip()
+        else:
+            ref = str(item or "").strip()
+            causal_reason = reason_by_ref.get(ref, "")
+        if not ref or not causal_reason:
+            continue
+        normalized = {"ref": ref, "causal_reason": causal_reason}
+        if domain == "governance_lane_evidence_invalid":
+            evidence_disposition = (
+                _observer_failure_domain_invalidation_event(
+                    conn,
+                    authority_event=event,
+                    evidence_ref=ref,
+                    route_binding=persisted_principal_binding,
+                )
+            )
+            if not evidence_disposition:
+                return {}
+            if evidence_disposition.get("invalidation_eligible") is True:
+                accepted_invalidated.append(normalized)
+            else:
+                rejected_invalidated.append(
+                    {
+                        **normalized,
+                        "rejection_reason": (
+                            "server_evidence_kind_is_not_governance_lane_"
+                            "invalidatable"
+                        ),
+                        "server_evidence_kind": str(
+                            evidence_disposition.get(
+                                "server_evidence_kind"
+                            )
+                            or ""
+                        ),
+                        "server_evidence_domain": str(
+                            evidence_disposition.get(
+                                "server_evidence_domain"
+                            )
+                            or ""
+                        ),
+                    }
+                )
+        elif ref in observation_refs:
+            accepted_invalidated.append(normalized)
+        else:
+            rejected_invalidated.append(
+                {
+                    **normalized,
+                    "rejection_reason": (
+                        "non_governance_failure_cannot_invalidate_prior_"
+                        "qa_merge_reconcile_or_batch_evidence"
+                    ),
+                }
+            )
+
+    preserved_refs: list[str] = []
+    for field in (
+        "preserved_evidence_refs",
+        "unaffected_evidence_refs",
+        "child_evidence_refs",
+        "qa_evidence_refs",
+        "merge_evidence_refs",
+        "reconcile_evidence_refs",
+        "batch_epoch_evidence_refs",
+    ):
+        preserved_refs.extend(
+            _observer_failure_domain_ref_values(supplied.get(field))
+        )
+    preserved_refs.extend(
+        item["ref"] for item in rejected_invalidated
+    )
+    invalidated_refs = {
+        item["ref"] for item in accepted_invalidated
+    }
+    preserved_refs = [
+        ref
+        for ref in _runtime_context_service_dedupe(preserved_refs)
+        if ref not in invalidated_refs
+    ]
+    generation_restart_allowed = bool(
+        domain == "governance_lane_evidence_invalid"
+        and accepted_invalidated
+    )
+    acceptance_scope_relation = str(
+        supplied.get("acceptance_scope_relation") or ""
+    ).strip()
+    inside_acceptance_scope = supplied.get("inside_acceptance_scope")
+    if inside_acceptance_scope is None:
+        inside_acceptance_scope = supplied.get("in_acceptance_scope")
+    if domain == "target_product_defect":
+        if (
+            inside_acceptance_scope is True
+            or acceptance_scope_relation in {"inside", "in_scope"}
+        ):
+            next_topology = "bounded_same_row_rework"
+            acceptance_scope_relation = "inside"
+        elif (
+            inside_acceptance_scope is False
+            or acceptance_scope_relation
+            in {"outside", "out_of_scope", "outside_acceptance_scope"}
+        ):
+            next_topology = "blocked_parent_successor"
+            acceptance_scope_relation = "outside"
+        else:
+            next_topology = (
+                "bounded_same_row_rework_or_blocked_parent_successor"
+            )
+            acceptance_scope_relation = "not_supplied"
+    else:
+        next_topology = OBSERVER_FAILURE_DOMAIN_NEXT_TOPOLOGY[domain]
+    packet: dict[str, Any] = {
+        "schema_version": (
+            "observer.failure_domain_evidence_disposition.v1"
+        ),
+        "source": "server_task_timeline_projection",
+        "source_event_ref": source_event_ref,
+        "authority_ref": source_event_ref,
+        "authority_ref_status": "accepted",
+        "authority_source": OBSERVER_FAILURE_DOMAIN_AUTHORITY_SOURCE,
+        "authority_hash_source": (
+            OBSERVER_FAILURE_DOMAIN_AUTHORITY_HASH_SOURCE
+        ),
+        "failure_domain": domain,
+        "observer_principal": observer_principal,
+        "observer_principal_source": (
+            "server_registered_observer_route_binding"
+        ),
+        "observer_principal_binding": principal_binding,
+        "observation_refs": observation_refs,
+        "invalidated_evidence_refs": accepted_invalidated,
+        "rejected_invalidation_refs": rejected_invalidated,
+        "preserved_evidence_refs": preserved_refs,
+        "acceptance_scope_relation": acceptance_scope_relation,
+        "next_topology": next_topology,
+        "qa_verdict_authority": "authenticated_independent_qa_only",
+        "qa_verdict_preserved": True,
+        "observer_may_author_or_rewrite_qa_verdict": False,
+        "preserve_unaffected_child_qa_merge_reconcile_batch_epoch_evidence": (
+            True
+        ),
+        "generation_restart_allowed": generation_restart_allowed,
+        "generation_restart_requires_this_authority_hash": True,
+    }
+    packet["authority_hash"] = observer_failure_domain_disposition_hash(
+        packet
+    )
+    return validate_observer_failure_domain_disposition(
+        packet,
+        server_persisted_authority_ref=source_event_ref,
+    )
+
+
+def _latest_observer_failure_domain_disposition(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str = "",
+) -> dict[str, Any]:
+    """Return the newest valid disposition for a live guide projection."""
+
+    from .parallel_branch_runtime import (
+        validate_observer_failure_domain_disposition,
+    )
+
+    events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
+    if task_id:
+        backlog_events = _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id="",
+            backlog_id=backlog_id,
+        )
+        events_by_ref = {
+            _runtime_context_event_ref(event)
+            or json.dumps(event, sort_keys=True, default=str): dict(event)
+            for event in [*events, *backlog_events]
+            if isinstance(event, Mapping)
+        }
+        events = list(events_by_ref.values())
+    for event in sorted(
+        events,
+        key=_runtime_context_service_timeline_event_order_key,
+        reverse=True,
+    ):
+        disposition = _observer_failure_domain_disposition_from_event(
+            event,
+            conn=conn,
+        )
+        if disposition:
+            return validate_observer_failure_domain_disposition(
+                disposition,
+                server_persisted_authority_ref=str(
+                    disposition.get("authority_ref") or ""
+                ),
+            )
+    return {}
+
+
+def _observer_failure_domain_disposition_from_ref(
+    conn,
+    *,
+    project_id: str,
+    authority_ref: str,
+    backlog_id: str = "",
+    task_id: str = "",
+) -> dict[str, Any]:
+    """Resolve one accepted disposition exclusively from its persisted row."""
+
+    from . import task_timeline
+
+    ref = str(authority_ref or "").strip()
+    match = re.fullmatch(r"timeline:(\d+)", ref)
+    if not match:
+        raise ValidationError(
+            "failure_domain_disposition_ref must be an exact timeline:<id> ref"
+        )
+    event_id = int(match.group(1))
+    row = conn.execute(
+        """
+        SELECT * FROM task_timeline_events
+        WHERE project_id = ? AND id = ?
+        """,
+        (project_id, event_id),
+    ).fetchone()
+    if row is None:
+        raise ValidationError(
+            "failure_domain_disposition_ref does not exist in the governance DB"
+        )
+    event = task_timeline._row_to_dict(row)
+    if (
+        backlog_id
+        and str(event.get("backlog_id") or "").strip() != backlog_id
+    ):
+        raise ValidationError(
+            "failure_domain_disposition_ref backlog scope mismatch"
+        )
+    if task_id and str(event.get("task_id") or "").strip() != task_id:
+        raise ValidationError(
+            "failure_domain_disposition_ref task scope mismatch"
+        )
+    if str(event.get("status") or "").strip().lower() != "accepted":
+        raise ValidationError(
+            "failure_domain_disposition_ref is not an accepted DB event"
+        )
+    disposition = _observer_failure_domain_disposition_from_event(
+        event,
+        conn=conn,
+    )
+    if (
+        not disposition
+        or str(disposition.get("authority_ref") or "").strip() != ref
+    ):
+        raise ValidationError(
+            "failure_domain_disposition_ref is not an authenticated "
+            "observer authority event"
+        )
+    return disposition
+
+
+def _observer_failure_domain_restart_authority_from_body(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """Resolve batch restart authority from a DB ref, never a body packet."""
+
+    generation_restart_requested = _query_bool(
+        body,
+        "generation_restart_requested",
+        False,
+    )
+    if not generation_restart_requested:
+        return False, "", None
+    if isinstance(body.get("failure_domain_disposition"), Mapping):
+        raise ValidationError(
+            "caller-supplied failure_domain_disposition packets are not "
+            "restart authority; submit only a server-persisted "
+            "failure_domain_disposition_ref"
+        )
+    authority_ref = str(
+        body.get("failure_domain_disposition_ref")
+        or body.get("authority_ref")
+        or ""
+    ).strip()
+    if not authority_ref:
+        raise ValidationError(
+            "generation restart requires failure_domain_disposition_ref"
+        )
+    disposition = _observer_failure_domain_disposition_from_ref(
+        conn,
+        project_id=project_id,
+        authority_ref=authority_ref,
+        backlog_id=str(body.get("backlog_id") or "").strip(),
+        task_id=str(body.get("task_id") or "").strip(),
+    )
+    return True, authority_ref, disposition
+
+
 def _runtime_context_scope_insufficiency_observer_disposition(
     *,
     project_id: str,
@@ -43779,6 +44482,15 @@ def handle_graph_governance_parallel_branch_batch_runtime(ctx: RequestContext):
             rollback_projection_id=str(ctx.body.get("rollback_projection_id") or ""),
             failure_reason=str(ctx.body.get("failure_reason") or ""),
         )
+        (
+            generation_restart_requested,
+            failure_domain_disposition_ref,
+            failure_domain_disposition,
+        ) = _observer_failure_domain_restart_authority_from_body(
+            conn,
+            project_id=project_id,
+            body=ctx.body,
+        )
 
         with sqlite_write_lock():
             saved = upsert_batch_merge_runtime(
@@ -43791,6 +44503,11 @@ def handle_graph_governance_parallel_branch_batch_runtime(ctx: RequestContext):
                 project_id,
                 batch_id,
                 severe_integration_failure=severe,
+                generation_restart_requested=generation_restart_requested,
+                failure_domain_disposition=failure_domain_disposition,
+                failure_domain_disposition_ref=(
+                    failure_domain_disposition_ref
+                ),
                 corrected_replay_order=tuple(_query_statuses(ctx.body, "corrected_replay_order")),
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-004"),
             )
@@ -59750,6 +60467,7 @@ _SERVER_PROJECTED_TIMELINE_KEYS = frozenset(
         "contract_gate_decision",
         "meta_contract_gate",
         "observer_direct_pre_mutation_authority",
+        "observer_failure_domain_authority",
         "source_backed_contract_gate_authority",
         *_ROUTE_ACTION_SCOPE_LINEAGE_KEYS,
     }
@@ -84684,6 +85402,19 @@ def _onboard_guide_capsule_current_projection(
     ).strip()
     if canonical_backlog_id != backlog_id:
         return current
+    failure_domain_disposition = (
+        _latest_observer_failure_domain_disposition(
+            conn,
+            project_id=project_id,
+            backlog_id=canonical_backlog_id,
+            task_id=str(active_epoch.active_task_id or ""),
+        )
+    )
+    if failure_domain_disposition:
+        resume = {
+            **dict(resume),
+            "failure_domain_disposition": failure_domain_disposition,
+        }
     overlay = dict(current)
     overlay.update(
         {
@@ -84945,6 +85676,17 @@ def _onboard_route_guide_compact_service_response(
         )
         else {}
     )
+    failure_domain_disposition = (
+        runtime_resume.get("failure_domain_disposition")
+        if isinstance(
+            runtime_resume.get("failure_domain_disposition"), Mapping
+        )
+        else current_projection.get("failure_domain_disposition")
+        if isinstance(
+            current_projection.get("failure_domain_disposition"), Mapping
+        )
+        else {}
+    )
     action_summary = {
         "action": action,
         "allowed_actions": allowed_actions,
@@ -85063,6 +85805,13 @@ def _onboard_route_guide_compact_service_response(
                     section_name="fresh_generation_barrier",
                 )
             )
+        if failure_domain_disposition:
+            sections["failure_domain_disposition"] = (
+                _onboard_guide_capsule_bounded_section(
+                    failure_domain_disposition,
+                    section_name="failure_domain_disposition",
+                )
+            )
         return sections
 
     entry, cache_metrics = _onboard_guide_capsule_get_or_create(
@@ -85152,6 +85901,13 @@ def _onboard_route_guide_compact_service_response(
             _onboard_guide_capsule_bounded_section(
                 completed_repair_barrier,
                 section_name="fresh_generation_barrier",
+            )
+        )
+    if failure_domain_disposition:
+        response["failure_domain_disposition"] = (
+            _onboard_guide_capsule_bounded_section(
+                failure_domain_disposition,
+                section_name="failure_domain_disposition",
             )
         )
     measured = _onboard_guide_capsule_serialized_bytes(response)
@@ -85470,6 +86226,19 @@ def _onboard_route_guide_service_response(
             or active_epoch.coordination_backlog_id
             or backlog_id
         ).strip()
+        failure_domain_disposition = (
+            _latest_observer_failure_domain_disposition(
+                conn,
+                project_id=project_id,
+                backlog_id=canonical_backlog_id,
+                task_id=str(active_epoch.active_task_id or ""),
+            )
+        )
+        if failure_domain_disposition:
+            resume = {
+                **dict(resume),
+                "failure_domain_disposition": failure_domain_disposition,
+            }
         if response_view == "compact":
             current_projection = _onboard_guide_capsule_current_projection(
                 conn,
@@ -85509,6 +86278,7 @@ def _onboard_route_guide_service_response(
             },
             "integration_epoch": integration_epoch_to_dict(active_epoch),
             "next_legal_action": resume,
+            "failure_domain_disposition": failure_domain_disposition,
             "position_skippable": False,
             "raw_route_token_required": False,
             "raw_route_token_exposed": False,
@@ -85735,6 +86505,22 @@ def _onboard_route_guide_service_response(
             runtime_resume["projection_degraded_reason"] = (
                 current_projection.get("degraded_flags") or {}
             )
+    failure_domain_disposition = (
+        _latest_observer_failure_domain_disposition(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    )
+    if failure_domain_disposition:
+        runtime_resume = {
+            **dict(runtime_resume),
+            "failure_domain_disposition": failure_domain_disposition,
+        }
+        current_projection = {
+            **dict(current_projection),
+            "failure_domain_disposition": failure_domain_disposition,
+        }
     next_action = _onboard_route_guide_service_next_action(
         role=role,
         work_type=work_type,
@@ -85869,6 +86655,15 @@ def _onboard_route_guide_service_response(
         if isinstance(route_guide, dict):
             route_guide["completed_repair_fresh_generation_barrier"] = dict(
                 completed_repair_barrier
+            )
+    if failure_domain_disposition:
+        guidance["failure_domain_disposition"] = dict(
+            failure_domain_disposition
+        )
+        route_guide = guidance.get("onboard_route_guide")
+        if isinstance(route_guide, dict):
+            route_guide["failure_domain_disposition"] = dict(
+                failure_domain_disposition
             )
     _onboard_route_guide_apply_runtime_route_token_scope(
         conn,
@@ -101641,6 +102436,43 @@ def handle_task_timeline_append(ctx: RequestContext):
         raw_status = ctx.body.get("status", "")
         raw_payload = _timeline_payload_with_route_gate(ctx.body, route_gate)
         raw_payload = _strip_caller_route_action_scope_lineage(raw_payload)
+        failure_domain_event = {
+            "event_type": ctx.body.get("event_type", ""),
+            "event_kind": raw_event_kind,
+        }
+        if _observer_failure_domain_event_requested(failure_domain_event):
+            failure_domain_authority = (
+                _observer_failure_domain_authority_from_route_gate(
+                    project_id=project_id,
+                    backlog_id=str(
+                        ctx.body.get("backlog_id") or ""
+                    ).strip(),
+                    task_id=str(ctx.body.get("task_id") or "").strip(),
+                    actor=str(ctx.body.get("actor") or "").strip(),
+                    status=str(raw_status or "").strip(),
+                    route_gate=route_gate,
+                )
+            )
+            if not failure_domain_authority:
+                raise GovernanceError(
+                    "observer_failure_domain_authority_required",
+                    (
+                        "failure-domain disposition requires an accepted "
+                        "observer actor bound to a server-registered route"
+                    ),
+                    422,
+                    {
+                        "required_actor_role": "observer",
+                        "required_route_binding": (
+                            "server_registered_observer_route_token_ref"
+                        ),
+                        "caller_authority_hash_accepted": False,
+                        "server_projection_required": True,
+                    },
+                )
+            raw_payload["observer_failure_domain_authority"] = (
+                failure_domain_authority
+            )
         if trusted_qa_verification_authority:
             raw_payload["source_backed_contract_gate_authority"] = (
                 task_timeline.source_backed_qa_session_authority(

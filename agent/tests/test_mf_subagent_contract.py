@@ -70,6 +70,36 @@ from agent.governance.parallel_branch_runtime import (
 )
 
 
+def test_meta_contract_observer_failure_disposition_is_verdict_neutral() -> None:
+    event = {
+        "event_type": "observer.failure_domain_disposition",
+        "event_kind": "observer_command",
+        "phase": "post_merge_browser_observation",
+        "actor": "observer",
+        "status": "accepted",
+        "payload": {
+            "failure_domain": "harness_or_identity",
+            "observation_refs": ["timeline:browser-failure"],
+            "preserved_evidence_refs": ["timeline:qa-pass"],
+        },
+    }
+    accepted = validate_meta_contract_timeline_event(event)
+    assert accepted["allowed"] is True
+    assert accepted["role"] == OBSERVER_COORDINATOR_ROLE
+    assert accepted["action"] == "observer_command"
+
+    event["payload"] = {
+        **event["payload"],
+        "qa_verdict": "no_pass",
+        "supersede_qa_verdict": True,
+    }
+    with pytest.raises(
+        MfSubagentContractError,
+        match="independent QA remains the sole PASS/NO-PASS authority",
+    ):
+        validate_meta_contract_timeline_event(event)
+
+
 def test_mf_parallel_template_requires_subagent_fence_and_graph_trace_contract() -> None:
     template_path = (
         _repo_root
