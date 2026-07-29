@@ -11975,6 +11975,238 @@ def _parallel_branch_allocate_should_persist_contract_revision(
     return route_identity, revision_owned_files
 
 
+def _parallel_branch_allocate_failed_qa_dispatch_revision(
+    conn,
+    *,
+    project_id: str,
+    context,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Append fresh failed-QA dispatch authority during production allocate."""
+
+    contract_execution_id = _runtime_context_public_text(
+        body.get("contract_execution_id"),
+        body.get("successor_contract_execution_id"),
+        body.get("current_contract_execution_id"),
+    )
+    stage_type = str(
+        getattr(context, "stage_type", "") or body.get("stage_type") or ""
+    ).strip()
+    if (
+        not contract_execution_id
+        or stage_type != "failed_qa_rework"
+        or int(getattr(context, "attempt", 0) or body.get("attempt") or 0) < 2
+    ):
+        return {}
+
+    runtime = _contract_runtime(conn)
+    try:
+        record = runtime.store.get(contract_execution_id)
+    except ContractRuntimeError:
+        return {}
+    if (
+        not _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+        or str(record.get("project_id") or "") != str(project_id)
+        or str(record.get("backlog_id") or "")
+        != str(getattr(context, "backlog_id", "") or "")
+    ):
+        return {}
+
+    completed_lines = list(record.get("completed_lines") or [])
+    failed_qa_index = _active_failed_qa_line_index(
+        completed_lines,
+        source_record=record,
+    )
+    if failed_qa_index < 0:
+        return {}
+
+    route_identity = _parallel_branch_runtime_contract_route_identity(body)
+    owned_files = _runtime_context_public_file_values(
+        list(getattr(context, "owned_files", ()) or ())
+        or list(getattr(context, "target_files", ()) or ())
+    )
+    prior_dispatch_payload: dict[str, Any] = {}
+    for line in reversed(completed_lines):
+        if not isinstance(line, Mapping):
+            continue
+        if (
+            str(line.get("stage_id") or "") == "dispatch"
+            and str(line.get("line_id") or "")
+            == "observer_dispatch_bounded_workers"
+            and str(line.get("evidence_kind") or "")
+            == "dispatch_bounded_worker"
+        ):
+            prior_dispatch_payload = (
+                dict(line.get("payload"))
+                if isinstance(line.get("payload"), Mapping)
+                else {}
+            )
+            break
+
+    def _mapping_or_prior(field: str) -> dict[str, Any]:
+        requested = body.get(field)
+        if isinstance(requested, Mapping) and requested:
+            return dict(requested)
+        prior = prior_dispatch_payload.get(field)
+        return dict(prior) if isinstance(prior, Mapping) else {}
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(
+        getattr(context, "worker_id", "")
+        or getattr(context, "worker_slot_id", "")
+        or ""
+    ).strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    canonical = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "observer_command_id": contract_execution_id,
+        "target_project_root": str(
+            getattr(context, "target_project_root", "") or ""
+        ),
+        "worktree_path": str(getattr(context, "worktree_path", "") or ""),
+        "branch_ref": str(getattr(context, "branch_ref", "") or ""),
+        "base_commit": str(getattr(context, "base_commit", "") or ""),
+        "target_head_commit": str(
+            getattr(context, "target_head_commit", "") or ""
+        ),
+        "merge_queue_id": str(
+            getattr(context, "merge_queue_id", "") or ""
+        ),
+        "owned_files": owned_files,
+    }
+    payload = {
+        "schema_version": "mf_parallel.dispatch_bounded_worker.v1",
+        **canonical,
+        "profile_requirements": _mapping_or_prior("profile_requirements"),
+        "retry_policy": _mapping_or_prior("retry_policy"),
+        "route_identity": dict(route_identity),
+        **dict(route_identity),
+        "failed_qa_rework_dispatch_revision_authority": {
+            "schema_version": (
+                "parallel_branch_allocate.failed_qa_dispatch_revision_authority.v1"
+            ),
+            "source": "parallel_branch_allocate_failed_qa_rework",
+            "server_derived": True,
+            "contract_execution_id": contract_execution_id,
+            "failed_qa_completed_line_index": failed_qa_index,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "append_only_history_required": True,
+            "timeline_projection_authoritative": False,
+        },
+    }
+    write = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "actor_role": "observer",
+        "evidence_kind": "dispatch_bounded_worker",
+        **canonical,
+        **dict(route_identity),
+        "payload": payload,
+    }
+    write, dispatch_errors = _contract_runtime_bind_mf_parallel_dispatch_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        write=write,
+    )
+    if dispatch_errors:
+        raise GovernanceError(
+            "parallel_branch_allocate_failed_qa_dispatch_invalid",
+            (
+                "fresh failed-QA RuntimeContext allocation could not append "
+                "canonical ContractRuntime dispatch authority"
+            ),
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "errors": dispatch_errors,
+                "timeline_projection_authoritative": False,
+            },
+        )
+    result = runtime.revise_failed_qa_observer_dispatch(
+        contract_execution_id,
+        write,
+        actor_role="observer",
+    )
+    if not result.get("ok"):
+        decision = (
+            dict(result.get("decision"))
+            if isinstance(result.get("decision"), Mapping)
+            else {}
+        )
+        decision_errors = _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(decision, "errors")
+        )
+        retry_safe = "stale execution_state_revision" in decision_errors
+        raise GovernanceError(
+            "parallel_branch_allocate_failed_qa_dispatch_revision_rejected",
+            (
+                "fresh failed-QA RuntimeContext allocation was rejected by "
+                "canonical ContractRuntime dispatch revision"
+            ),
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "decision": decision,
+                "timeline_projection_authoritative": False,
+                "allocation_transaction_rolled_back": True,
+                "allocation_retry_safe": retry_safe,
+                "retry_identity": {
+                    "contract_execution_id": contract_execution_id,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                },
+                "next_legal_action": (
+                    "retry_same_parallel_branch_allocate_request"
+                    if retry_safe
+                    else "correct_dispatch_revision_rejection_then_retry"
+                ),
+                "contract_runtime_line_mutated": False,
+            },
+        )
+    stored = result.get("record") if isinstance(result.get("record"), Mapping) else {}
+    dispatch_match = _contract_runtime_dispatch_line_match(stored, context)
+    return {
+        "schema_version": (
+            "parallel_branch_allocate.failed_qa_dispatch_revision.v1"
+        ),
+        "ok": True,
+        "status": str(result.get("status") or "revised"),
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "execution_state_revision": int(
+            stored.get("execution_state_revision") or 0
+        ),
+        "contract_runtime_line_mutated": bool(
+            result.get("contract_runtime_line_mutated")
+        ),
+        "append_only_history_preserved": True,
+        "timeline_projection_authoritative": False,
+        "source_ref": str(dispatch_match.get("source_ref") or ""),
+    }
+
+
 def _parallel_branch_allocate_effective_route_body(
     conn,
     *,
@@ -12387,6 +12619,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     conn = get_connection(project_id)
     authority_revision: dict[str, Any] = {}
     runtime_contract_revision: dict[str, Any] = {}
+    contract_runtime_dispatch_revision: dict[str, Any] = {}
     route_identity_for_revision: dict[str, Any] = {}
     owned_files_for_revision: list[str] = []
     try:
@@ -12455,6 +12688,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     conn, active_epoch
                 ),
             }
+        worktree_result: dict[str, Any] | None = None
         with sqlite_write_lock():
             if not create_worktree:
                 existing = get_branch_context(conn, project_id, task_id)
@@ -12554,35 +12788,42 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 runtime_contract_revision = branch_contract_revision_to_dict(
                     revision
                 )
-            conn.commit()
 
-        worktree_result: dict[str, Any] | None = None
-        if create_worktree:
-            worktree_result = materialize_branch_worktree(
-                conn,
-                project_id=project_id,
-                task_id=task_id,
-                repo_root_path=workspace_root,
-                fence_token=allocation_fence_token,
-                now_iso=str(ctx.body.get("now_iso") or ""),
-            )
-            conn.commit()
-            saved = get_branch_context(conn, project_id, task_id) or saved
-            projected = _parallel_branch_allocate_materialized_target_project_root(
-                saved
-            )
-            if projected != saved:
-                with sqlite_write_lock():
+            if create_worktree:
+                worktree_result = materialize_branch_worktree(
+                    conn,
+                    project_id=project_id,
+                    task_id=task_id,
+                    repo_root_path=workspace_root,
+                    fence_token=allocation_fence_token,
+                    now_iso=str(ctx.body.get("now_iso") or ""),
+                )
+                saved = get_branch_context(conn, project_id, task_id) or saved
+                projected = (
+                    _parallel_branch_allocate_materialized_target_project_root(
+                        saved
+                    )
+                )
+                if projected != saved:
                     saved = upsert_branch_context(
                         conn,
                         projected,
                         now_iso=str(ctx.body.get("now_iso") or ""),
                     )
-                    conn.commit()
 
-        if should_issue_same_owner_session_token:
-            same_owner_worker_session = issue_mf_subagent_session_token(saved)
-            with sqlite_write_lock():
+            contract_runtime_dispatch_revision = (
+                _parallel_branch_allocate_failed_qa_dispatch_revision(
+                    conn,
+                    project_id=project_id,
+                    context=saved,
+                    body=effective_body,
+                )
+            )
+
+            if should_issue_same_owner_session_token:
+                same_owner_worker_session = issue_mf_subagent_session_token(
+                    saved
+                )
                 saved = upsert_branch_context(
                     conn,
                     replace(
@@ -12593,26 +12834,24 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     ),
                     now_iso=str(ctx.body.get("now_iso") or ""),
                 )
-                conn.commit()
 
-        if not runtime_contract_revision:
-            route_identity_for_revision, owned_files_for_revision = (
-                _parallel_branch_allocate_should_persist_contract_revision(
-                    effective_body,
-                    owned_files=saved.owned_files or request_owned_files,
+            if not runtime_contract_revision:
+                route_identity_for_revision, owned_files_for_revision = (
+                    _parallel_branch_allocate_should_persist_contract_revision(
+                        effective_body,
+                        owned_files=saved.owned_files or request_owned_files,
+                    )
                 )
-            )
-        if (
-            not runtime_contract_revision
-            and route_identity_for_revision
-            and owned_files_for_revision
-        ):
-            saved_context = branch_context_to_dict(saved)
-            route_gate = _parallel_branch_allocate_route_gate(
-                effective_body,
-                route_identity_for_revision,
-            )
-            with sqlite_write_lock():
+            if (
+                not runtime_contract_revision
+                and route_identity_for_revision
+                and owned_files_for_revision
+            ):
+                saved_context = branch_context_to_dict(saved)
+                route_gate = _parallel_branch_allocate_route_gate(
+                    effective_body,
+                    route_identity_for_revision,
+                )
                 revision = append_branch_contract_revision(
                     conn,
                     saved,
@@ -12633,8 +12872,10 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     actor="parallel_branch_allocate",
                     now_iso=str(ctx.body.get("now_iso") or ""),
                 )
-                conn.commit()
-            runtime_contract_revision = branch_contract_revision_to_dict(revision)
+                runtime_contract_revision = branch_contract_revision_to_dict(
+                    revision
+                )
+            conn.commit()
 
         response = {
             "ok": True,
@@ -12666,6 +12907,10 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         }
         if runtime_contract_revision:
             response["runtime_contract_revision"] = runtime_contract_revision
+        if contract_runtime_dispatch_revision:
+            response["contract_runtime_dispatch_revision"] = (
+                contract_runtime_dispatch_revision
+            )
         if authority_revision:
             response["authority_revision"] = authority_revision
         try:
@@ -12748,6 +12993,9 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         if same_owner_worker_session:
             response["same_owner_worker_session"] = same_owner_worker_session
         return 201, response
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -16728,6 +16976,41 @@ def _runtime_context_qa_verification_guide(
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
         if str(route_identity.get(field) or "").strip()
     }
+    runtime_state = (
+        contract_runtime_state
+        if isinstance(contract_runtime_state, Mapping)
+        else {}
+    )
+    runtime_next_action = (
+        runtime_state.get("next_legal_action")
+        if isinstance(runtime_state.get("next_legal_action"), Mapping)
+        else {}
+    )
+    writer_payload_projection = (
+        runtime_next_action.get("writer_role_safe_copy_payload")
+        if isinstance(
+            runtime_next_action.get("writer_role_safe_copy_payload"),
+            Mapping,
+        )
+        else {}
+    )
+    projected_writer_copy_payload = (
+        dict(writer_payload_projection.get("copy_payload"))
+        if isinstance(
+            writer_payload_projection.get("copy_payload"), Mapping
+        )
+        else {}
+    )
+    qa_writer_copy_payload = (
+        projected_writer_copy_payload
+        if (
+            str(projected_writer_copy_payload.get("line_id") or "")
+            == "qa_independent_verification"
+            and str(projected_writer_copy_payload.get("actor_role") or "")
+            == "qa"
+        )
+        else {}
+    )
     parent_route_identity = dict(safe_route_identity)
     if project_id:
         parent_route_identity["selected_project"] = project_id
@@ -16830,6 +17113,201 @@ def _runtime_context_qa_verification_guide(
             ],
         },
     }
+    inherited_failure_identity = "<inherited-baseline-failure-identity>"
+    inherited_failure_count = "<inherited-baseline-failure-count>"
+    candidate_passed_count = "<candidate-passed-count>"
+    comparison_base_commit = (
+        "<comparison-base-commit-from-db-verified-qa-graph-context>"
+    )
+    candidate_commit = "<full-candidate-commit>"
+    canonical_external_no_pass_baseline_body = {
+        **qa_writer_copy_payload,
+        **base_append_body,
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "evidence_kind": "independent_verification",
+        "status": "accepted",
+        "verdict": "accepted",
+        "commit_sha": candidate_commit,
+        "graph_trace_ids": ["<db-verified-qa-graph-query-trace-id>"],
+        "graph_query_trace_ids": [
+            "<db-verified-qa-graph-query-trace-id>"
+        ],
+        "no_pass_claim": True,
+        "overall_release_pass_claimed": False,
+        "payload": {
+            **dict(base_append_body["payload"]),
+            "schema_version": "qa_independent_verification.v1",
+            "base_commit_sha": comparison_base_commit,
+            "candidate_commit_sha": candidate_commit,
+            "acceptance_scope": (
+                "candidate_regression_and_acceptance_criteria"
+            ),
+            "row_scoped_qa_pass": True,
+            "verdict": "accepted",
+            "full_suite_claim": "not_claimed",
+            "external_full_suite_ledger_location": (
+                "artifact_refs.external_no_pass_baseline_ledger"
+            ),
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "status": "accepted",
+            "test_results": {
+                "baseline": {
+                    "failed": inherited_failure_count,
+                    "passed": candidate_passed_count,
+                    "failure_identities": [inherited_failure_identity],
+                },
+                "candidate": {
+                    "failed": inherited_failure_count,
+                    "passed": candidate_passed_count,
+                    "failure_identities": [inherited_failure_identity],
+                },
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+            },
+        },
+        "test_results": {
+            "schema_version": "qa_candidate_acceptance_results.v1",
+            "scope": "candidate_regression_and_acceptance_criteria",
+            "row_scoped_qa_pass": True,
+            "focused_failed": 0,
+            "focused_passed": 1,
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "passed": False,
+            "overall_release_pass": False,
+            "overall_release_pass_claimed": False,
+            "status": "accepted",
+        },
+        "verification": {
+            "schema_version": "qa_independent_verification.v1",
+            "acceptance_scope": (
+                "candidate_regression_and_acceptance_criteria"
+            ),
+            "row_scoped_qa_pass": True,
+            "verdict": "accepted",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "status": "accepted",
+        },
+        "artifact_refs": {
+            "external_no_pass_baseline_ledger": {
+                "schema_version": (
+                    _CONTRACT_RUNTIME_NO_PASS_LEDGER_SCHEMA_VERSION
+                ),
+                "base_commit_sha": comparison_base_commit,
+                "candidate_commit_sha": candidate_commit,
+                "base_failure_identities": [inherited_failure_identity],
+                "candidate_failure_identities": [
+                    inherited_failure_identity
+                ],
+                "base_reproduction": {
+                    "reproduced": inherited_failure_count,
+                    "total": inherited_failure_count,
+                    "failure_identities": [inherited_failure_identity],
+                },
+                "candidate_suite_counts": {
+                    "baseline_known_non_green": inherited_failure_count,
+                    "failed": inherited_failure_count,
+                    "passed": candidate_passed_count,
+                },
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+                "refs": ["<immutable-base-reproduction-evidence-ref>"],
+            }
+        },
+    }
+    external_no_pass_baseline_policy = {
+        "schema_version": (
+            "runtime_context.qa_external_no_pass_baseline_policy.v1"
+        ),
+        "status": "canonical_copy_safe_body_available",
+        "writer_body_path": (
+            "append_evidence.canonical_external_no_pass_baseline_body"
+        ),
+        "precheck": {
+            "tool": "contract_runtime_line_write_precheck",
+            "body_source": (
+                "append_evidence.canonical_external_no_pass_baseline_body"
+            ),
+            "required_before_submit": True,
+            "precheck_mutates_completed_lines": False,
+        },
+        "contract_runtime_writer_copy_payload": {
+            "source": (
+                "contract_runtime_current_state.next_legal_action."
+                "writer_role_safe_copy_payload.copy_payload"
+            ),
+            "bound_to_current_writer": bool(qa_writer_copy_payload),
+            "required_line_id": "qa_independent_verification",
+            "required_actor_role": "qa",
+            "canonical_body_overrides": {
+                "status": "accepted",
+                "verdict": "accepted",
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+            },
+        },
+        "use_only_when": [
+            "row-scoped candidate acceptance and focused verification pass",
+            "the compared full suite contains inherited baseline failures",
+            "candidate_new_failures is exactly zero",
+            "the candidate and base failure identity sets are exactly equal",
+        ],
+        "verdict_semantics": {
+            "row_scoped_qa_pass": True,
+            "row_scoped_status": "accepted",
+            "overall_release_pass_claimed": False,
+            "full_suite_claim": "not_claimed",
+            "no_pass_claim": True,
+        },
+        "caller_substitutions_required": {
+            "base_commit_sha": (
+                "comparison_base_commit_sha from the DB-verified "
+                "qa_graph_context"
+            ),
+            "candidate_commit_sha": (
+                "the exact bounded QA session candidate commit"
+            ),
+            "failure_identities": (
+                "the same non-empty duplicate-free identity set in base, "
+                "candidate, and base_reproduction"
+            ),
+            "counts": (
+                "exact integers matching the identity set and candidate "
+                "suite result"
+            ),
+            "refs": "immutable base-reproduction evidence references",
+        },
+        "server_authority": {
+            "validator": "_contract_runtime_qa_no_pass_ledger_authority",
+            "binder": "_contract_runtime_bind_qa_no_pass_ledger_authority",
+            "canonical_ledger_path": (
+                "artifact_refs.external_no_pass_baseline_ledger"
+            ),
+            "server_normalized_is_server_only": True,
+        },
+        "fail_closed": {
+            "ordinary_pass_with_positive_failed_counts_rejected": True,
+            "malformed_ledger_rejected_before_durable_mutation": True,
+            "candidate_new_failure_ledger_rejected_before_durable_mutation": (
+                True
+            ),
+            "identity_or_count_mismatch_rejected": True,
+        },
+        "copy_safe": True,
+        "raw_qa_session_token_in_body": False,
+    }
     failed_audit_body = {
         **base_append_body,
         "status": "failed",
@@ -16873,11 +17351,6 @@ def _runtime_context_qa_verification_guide(
         parent_task_id=parent_task_id,
         target_project_root=target_project_root,
         route_identity=safe_route_identity,
-    )
-    runtime_state = (
-        contract_runtime_state
-        if isinstance(contract_runtime_state, Mapping)
-        else {}
     )
     legitimate_evidence_bindings = _governed_evidence_binding_guide(
         onboard_contract_execution_id=str(
@@ -17149,6 +17622,12 @@ def _runtime_context_qa_verification_guide(
             "qa_graph_context_body": qa_graph_context_shape,
             "focused_pass_with_full_suite_caveat_body": (
                 focused_pass_with_full_suite_caveat_body
+            ),
+            "canonical_external_no_pass_baseline_body": (
+                canonical_external_no_pass_baseline_body
+            ),
+            "external_no_pass_baseline_policy": (
+                external_no_pass_baseline_policy
             ),
             "failed_audit_body": failed_audit_body,
             "scope_insufficiency_finding_policy": {
@@ -34331,6 +34810,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         return {}
 
     canonical_payload = dict(payload)
+    canonical_payload["commit_sha"] = actual_head
     canonical_payload["failed_qa_revision_rejoin_marker"] = dict(
         resolved_revision_marker
     )
@@ -34581,9 +35061,14 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
                 },
             )
         expected_revision = int(record.get("execution_state_revision") or 1)
-        updated_record = dict(record)
-        updated_record["completed_lines"] = revised_lines
-        updated_record["execution_state_revision"] = expected_revision + 1
+        candidate_record = dict(record)
+        candidate_record["completed_lines"] = revised_lines
+        candidate_record["execution_state_revision"] = expected_revision + 1
+        updated_record = runtime._record_view(
+            candidate_record,
+            actor_role="mf_sub",
+            completed_lines=revised_lines,
+        )
         try:
             runtime.store.update(
                 contract_execution_id,
@@ -34601,7 +35086,6 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
                     "fail_closed": True,
                 },
             ) from exc
-        runtime.current_guide(contract_execution_id, actor_role="mf_sub")
         persisted = runtime.store.get(contract_execution_id)
         latest = _worker_commit_completed_implementation(
             persisted,
@@ -34726,6 +35210,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
                 "fail_closed": True,
             },
         )
+    result_status = str(result.get("status") or "revised").strip()
     updated = result.get("record") if isinstance(result.get("record"), Mapping) else {}
     latest = _worker_commit_completed_implementation(
         updated,
@@ -34737,7 +35222,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
     return {
         "schema_version": "runtime_context.canonical_contract_line.v1",
         "accepted": True,
-        "status": "revised",
+        "status": result_status,
         "canonical": True,
         "source_of_authority": "ContractRuntime.completed_lines",
         "contract_execution_id": str(record.get("contract_execution_id") or ""),
@@ -35618,10 +36103,25 @@ def _runtime_context_submit_canonical_contract_line(
         ),
         {},
     )
-    return {
+    completed_payload = (
+        completed_line.get("payload")
+        if isinstance(completed_line.get("payload"), Mapping)
+        else {}
+    )
+    canonical_rework_revision = (
+        completed_payload.get("canonical_rework_lineage_revision")
+        if isinstance(
+            completed_payload.get("canonical_rework_lineage_revision"),
+            Mapping,
+        )
+        else {}
+    )
+    response = {
         "schema_version": "runtime_context.canonical_contract_line.v1",
         "accepted": True,
-        "status": "completed",
+        "status": (
+            "revised" if canonical_rework_revision else "completed"
+        ),
         "canonical": True,
         "source_of_authority": "ContractRuntime.completed_lines",
         "contract_execution_id": execution_id,
@@ -35641,6 +36141,29 @@ def _runtime_context_submit_canonical_contract_line(
         "next_legal_action": current_state.get("next_legal_action") or {},
         "timeline_projection_authoritative": False,
     }
+    if canonical_rework_revision:
+        response.update(
+            {
+                "commit_sha": str(
+                    completed_line.get("commit_sha")
+                    or canonical_rework_revision.get("commit_sha")
+                    or ""
+                ),
+                "supersedes_implementation_lineage_ref": str(
+                    canonical_rework_revision.get(
+                        "supersedes_implementation_lineage_ref"
+                    )
+                    or ""
+                ),
+                "append_only_history_preserved": bool(
+                    canonical_rework_revision.get(
+                        "append_only_history_preserved"
+                    )
+                    is True
+                ),
+            }
+        )
+    return response
 
 
 def _runtime_context_cross_project_graph_contract_preflight(
@@ -74915,8 +75438,46 @@ def _contract_runtime_observer_merge_completed_round(
                 payload,
                 ("commit_sha", "head_commit", *explicit_candidate_keys),
             )
-        for candidate in _qa_review_claim_containers(line):
-            add_values(candidate, explicit_candidate_keys)
+        def add_nested_authority_values(
+            value: Any,
+            *,
+            path: tuple[str, ...] = (),
+        ) -> None:
+            if isinstance(value, Mapping):
+                current_key = path[-1].lower() if path else ""
+                if _qa_is_immutable_external_audit_subtree(path, value) or (
+                    "baseline" in current_key
+                    or "comparison" in current_key
+                    or current_key == "immediate_parent_full_file"
+                ):
+                    return
+                add_values(value, explicit_candidate_keys)
+                for raw_key, child in value.items():
+                    key = str(raw_key or "").strip().lower()
+                    child_path = (*path, key)
+                    if _qa_is_immutable_external_audit_subtree(
+                        child_path,
+                        child,
+                    ):
+                        continue
+                    if (
+                        "baseline" in key
+                        or "comparison" in key
+                        or key == "immediate_parent_full_file"
+                    ):
+                        continue
+                    add_nested_authority_values(child, path=child_path)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    add_nested_authority_values(child, path=path)
+
+        for key, nested in line.items():
+            if key == "payload":
+                continue
+            add_nested_authority_values(nested, path=(str(key),))
+        if isinstance(payload, Mapping):
+            for key, nested in payload.items():
+                add_nested_authority_values(nested, path=("payload", str(key)))
         return canonical
 
     def has_no_identity_conflict(
@@ -90661,22 +91222,70 @@ def _contract_runtime_matching_completed_line(
     }
 
     def commit_values(value: Mapping[str, Any]) -> set[str]:
-        return {
-            str(candidate.get(key) or "").strip().lower()
-            for candidate in _contract_runtime_mapping_candidates(value)
-            for key in (
-                "commit_sha",
-                "worker_commit_sha",
-                "candidate_commit_sha",
-                "head_commit",
-                "validated_head_commit",
-                "immutable_head_commit",
+        canonical: set[str] = set()
+        explicit_keys = (
+            "worker_commit_sha",
+            "candidate_commit_sha",
+            "validated_head_commit",
+            "immutable_head_commit",
+        )
+
+        def add_fields(
+            candidate: Mapping[str, Any],
+            keys: Sequence[str],
+        ) -> None:
+            for key in keys:
+                commit = str(candidate.get(key) or "").strip()
+                if re.fullmatch(
+                    r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}",
+                    commit,
+                ):
+                    canonical.add(commit.lower())
+
+        add_fields(value, ("commit_sha", "head_commit", *explicit_keys))
+        payload = (
+            value.get("payload")
+            if isinstance(value.get("payload"), Mapping)
+            else {}
+        )
+        add_fields(payload, ("commit_sha", "head_commit", *explicit_keys))
+
+        def add_nested(
+            nested: Any,
+            *,
+            path: tuple[str, ...],
+        ) -> None:
+            if isinstance(nested, Mapping):
+                current_key = path[-1].lower() if path else ""
+                if _qa_is_immutable_external_audit_subtree(
+                    path,
+                    nested,
+                ) or (
+                    "baseline" in current_key
+                    or "comparison" in current_key
+                    or current_key == "immediate_parent_full_file"
+                ):
+                    return
+                add_fields(nested, explicit_keys)
+                for key, child in nested.items():
+                    add_nested(
+                        child,
+                        path=(*path, str(key or "").strip().lower()),
+                    )
+            elif isinstance(nested, (list, tuple)):
+                for child in nested:
+                    add_nested(child, path=path)
+
+        for key, nested in value.items():
+            if key == "payload":
+                continue
+            add_nested(nested, path=(str(key or "").strip().lower(),))
+        for key, nested in payload.items():
+            add_nested(
+                nested,
+                path=("payload", str(key or "").strip().lower()),
             )
-            if re.fullmatch(
-                r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}",
-                str(candidate.get(key) or "").strip(),
-            )
-        }
+        return canonical
 
     def scope_values(
         value: Mapping[str, Any],
@@ -91424,10 +92033,30 @@ def _contract_runtime_close_gate(
                     "canonical_submit_required": True,
                 }
             if prevalidation.get("status") == "validated_submission":
-                canonical_norm_payload = dict(
-                    prevalidation.get("canonical_payload")
-                    or canonical_norm_payload
-                )
+                return {
+                    "schema_version": (
+                        _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
+                    ),
+                    "accepted": True,
+                    "status": "validated_submission",
+                    "primary_decision_source": True,
+                    "agent_facing_decision_source": (
+                        "contract_runtime_first_missing_line"
+                    ),
+                    "meta_contract_gate_decision_source": False,
+                    "contract_execution_id": contract_execution_id,
+                    "actor_role": actor_role,
+                    "requested_event_kind": event_kind,
+                    "stage_id": line.get("stage_id", ""),
+                    "line_id": line.get("line_id", ""),
+                    "evidence_kind": line.get("evidence_kind", ""),
+                    "decision": {"ok": True, "errors": []},
+                    "next_legal_action": dict(
+                        current_state.get("next_legal_action") or {}
+                    ),
+                    "canonical_submit_required": True,
+                    "failed_qa_rework_prevalidated": True,
+                }
             if not prevalidation:
                 correction_intent_present = (
                     "precommit_implementation_correction_intent"
@@ -104920,22 +105549,18 @@ def _contract_runtime_execution_ticket_consumption(
     }
 
 
-def _contract_runtime_dispatch_ticket_authority(
+def _contract_runtime_current_dispatch_authority_line(
     record: Mapping[str, Any],
-    current_state: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Project the accepted mf_parallel dispatch during the pre-worker window."""
+    """Select the one dispatch that owns the current worker/QA generation."""
 
-    if not _is_mf_parallel_record_contract_id(
-        str(record.get("contract_id") or "").strip()
-    ):
-        return {}
-    authority_policy = (
-        _contract_runtime_mf_parallel_dispatch_authority_policy(record)
-    )
     dispatch_lines: list[tuple[int, Mapping[str, Any], Mapping[str, Any]]] = []
     for index, line in _contract_runtime_completed_lines(record):
-        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
         if (
             str(line.get("stage_id") or "").strip() == "dispatch"
             and str(line.get("line_id") or "").strip()
@@ -104953,13 +105578,129 @@ def _contract_runtime_dispatch_ticket_authority(
                 "dispatch authority"
             ),
         }
-    if len(dispatch_lines) != 1:
+    if len(dispatch_lines) == 1:
+        index, line, payload = dispatch_lines[0]
+        return {
+            "status": "selected",
+            "completed_line_index": index,
+            "line": line,
+            "payload": payload,
+        }
+
+    failed_qa_index = _active_failed_qa_line_index(
+        list(record.get("completed_lines") or []),
+        source_record=record,
+    )
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    replacements: list[
+        tuple[int, Mapping[str, Any], Mapping[str, Any]]
+    ] = []
+    for candidate in dispatch_lines:
+        candidate_index, candidate_line, candidate_payload = candidate
+        revision = (
+            candidate_payload.get("failed_qa_rework_dispatch_revision")
+            if isinstance(
+                candidate_payload.get("failed_qa_rework_dispatch_revision"),
+                Mapping,
+            )
+            else {}
+        )
+        revision_authority = (
+            candidate_payload.get(
+                "failed_qa_rework_dispatch_revision_authority"
+            )
+            if isinstance(
+                candidate_payload.get(
+                    "failed_qa_rework_dispatch_revision_authority"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+
+        def unique_text(field: str, *aliases: str) -> str:
+            values = {
+                str(source.get(key) or "").strip()
+                for source in (candidate_line, candidate_payload)
+                for key in (field, *aliases)
+                if str(source.get(key) or "").strip()
+            }
+            return next(iter(values)) if len(values) == 1 else ""
+
+        runtime_context_id = unique_text("runtime_context_id")
+        task_id = unique_text("task_id", "worker_task_id")
+        if (
+            candidate_index > failed_qa_index >= 0
+            and runtime_context_id
+            and task_id
+            and revision.get("append_only_history_preserved") is True
+            and revision.get("timeline_projection_authoritative") is False
+            and int(
+                revision.get("failed_qa_completed_line_index")
+                if revision.get("failed_qa_completed_line_index") is not None
+                else -1
+            )
+            == failed_qa_index
+            and str(revision.get("runtime_context_id") or "").strip()
+            == runtime_context_id
+            and str(revision.get("task_id") or "").strip() == task_id
+            and revision_authority.get("server_derived") is True
+            and str(revision_authority.get("source") or "").strip()
+            == "parallel_branch_allocate_failed_qa_rework"
+            and str(
+                revision_authority.get("contract_execution_id") or ""
+            ).strip()
+            == contract_execution_id
+            and int(
+                revision_authority.get("failed_qa_completed_line_index")
+                if revision_authority.get("failed_qa_completed_line_index")
+                is not None
+                else -1
+            )
+            == failed_qa_index
+            and str(
+                revision_authority.get("runtime_context_id") or ""
+            ).strip()
+            == runtime_context_id
+            and str(revision_authority.get("task_id") or "").strip()
+            == task_id
+        ):
+            replacements.append(candidate)
+    if len(replacements) != 1:
         return {
             "status": "invalid",
             "error": "canonical ContractRuntime dispatch authority is ambiguous",
         }
+    index, line, payload = replacements[0]
+    return {
+        "status": "selected",
+        "completed_line_index": index,
+        "line": line,
+        "payload": payload,
+    }
 
-    dispatch_index, line, payload = dispatch_lines[0]
+
+def _contract_runtime_dispatch_ticket_authority(
+    record: Mapping[str, Any],
+    current_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the accepted mf_parallel dispatch during the pre-worker window."""
+
+    if not _is_mf_parallel_record_contract_id(
+        str(record.get("contract_id") or "").strip()
+    ):
+        return {}
+    authority_policy = (
+        _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+    )
+    selected = _contract_runtime_current_dispatch_authority_line(record)
+    if selected.get("status") != "selected":
+        return selected
+    dispatch_index = int(selected["completed_line_index"])
+    line = selected["line"]
+    payload = selected["payload"]
     actual_next = (
         current_state.get("next_legal_action")
         if isinstance(current_state.get("next_legal_action"), Mapping)
@@ -105175,14 +105916,10 @@ def _contract_runtime_qa_ticket_authority(
         next_action.get("line_id") or next_action.get("id") or ""
     ).strip() not in {"qa_graph_context", "qa_independent_verification"}:
         return {}
-    dispatch: Mapping[str, Any] = {}
-    for _index, line in _contract_runtime_completed_lines(record):
-        if str(line.get("line_id") or "").strip() == "observer_dispatch_bounded_workers":
-            payload = line.get("payload")
-            dispatch = payload if isinstance(payload, Mapping) else line
-            break
-    if not dispatch:
-        return {}
+    selected = _contract_runtime_current_dispatch_authority_line(record)
+    if selected.get("status") != "selected":
+        return selected
+    dispatch = selected["payload"]
     profile = dispatch.get("profile_requirements")
     profile = dict(profile) if isinstance(profile, Mapping) else {}
     profile.pop("profile_id", None)
@@ -105297,6 +106034,12 @@ def _observer_runtime_text_contract_runtime_authority(
         current_state["ticket_authority_status"] = "qa_execution_ready"
         current_state["ticket_authority_source_ref"] = str(
             qa_ticket_authority.get("source_ref") or ""
+        )
+    elif qa_ticket_authority.get("status") == "invalid":
+        current_state["ticket_authority_status"] = "invalid"
+        current_state["ticket_authority_error"] = str(
+            qa_ticket_authority.get("error")
+            or "invalid QA execution ticket authority"
         )
     elif dispatch_authority.get("status") == "projected":
         current_state["next_legal_action"] = dict(
