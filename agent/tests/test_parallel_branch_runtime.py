@@ -3767,6 +3767,210 @@ def test_runtime_context_current_values_accept_legacy_implementation_evidence_ki
     )
 
 
+def test_runtime_context_timeline_derived_evidence_binds_current_finish_order_independent() -> None:
+    from agent.governance import parallel_branch_runtime as runtime
+
+    context = _runtime_projection_context()
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+    route_identity = {
+        "route_id": "route-failed-qa-rework-current",
+        "route_context_hash": "sha256:route-failed-qa-rework-current",
+        "prompt_contract_id": "rprompt-failed-qa-rework-current",
+        "prompt_contract_hash": "sha256:prompt-failed-qa-rework-current",
+        "route_token_ref": "rtok-failed-qa-rework-current",
+        "visible_injection_manifest_hash": (
+            "sha256:visible-failed-qa-rework-current"
+        ),
+    }
+    commits = (
+        "1" * 40,
+        "2" * 40,
+        "3" * 40,
+        "4" * 40,
+        "5" * 40,
+    )
+    cycle_ids = (
+        (19041, 19042, 19043, 19046),
+        (19050, 19051, 19052, 19053),
+        (19060, 19062, 19063, 19064),
+        (19068, 19070, 19071, 19072),
+        (19075, 19076, 19078, 19079),
+    )
+    events = []
+    for commit_sha, (
+        implementation_id,
+        commit_id,
+        attestation_id,
+        finish_id,
+    ) in zip(commits, cycle_ids, strict=True):
+        implementation_ref = f"timeline:{implementation_id}"
+        lineage_ref = f"contract-runtime:worker-implementation:{commit_sha}"
+        common = {
+            "runtime_context_id": runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.root_task_id,
+            "backlog_id": context.backlog_id,
+            "worker_role": "mf_sub",
+            "fence_token": context.fence_token,
+            "head_commit": commit_sha,
+            "implementation_event_ref": implementation_ref,
+            "implementation_lineage_ref": lineage_ref,
+            **route_identity,
+        }
+        events.extend(
+            [
+                {
+                    "id": implementation_id,
+                    "task_id": context.task_id,
+                    "backlog_id": context.backlog_id,
+                    "event_type": "mf.implementation",
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "status": "passed",
+                    "actor": context.worker_slot_id,
+                    "commit_sha": commit_sha,
+                    "payload": dict(common),
+                },
+                {
+                    "id": commit_id,
+                    "task_id": context.task_id,
+                    "backlog_id": context.backlog_id,
+                    "event_type": "mf_subagent.worker_commit",
+                    "event_kind": "worker_commit",
+                    "phase": "worker_commit",
+                    "status": "passed",
+                    "actor": context.worker_slot_id,
+                    "commit_sha": commit_sha,
+                    "payload": {
+                        **common,
+                        "worker_commit_sha": commit_sha,
+                        "validated_head_commit": commit_sha,
+                    },
+                },
+                {
+                    "id": attestation_id,
+                    "task_id": context.task_id,
+                    "backlog_id": context.backlog_id,
+                    "event_type": (
+                        "mf_subagent.finish_time_worker_attestation"
+                    ),
+                    "event_kind": "worker_progress",
+                    "phase": "finish_time_worker_attestation",
+                    "status": "passed",
+                    "actor": context.worker_slot_id,
+                    "commit_sha": commit_sha,
+                    "payload": {
+                        **common,
+                        "action": "record_finish_time_worker_attestation",
+                        "finish_time_worker_self_attestation": {
+                            "status": "passed",
+                            "finish_time_self_attesting": True,
+                        },
+                    },
+                },
+                {
+                    "id": finish_id,
+                    "task_id": context.task_id,
+                    "backlog_id": context.backlog_id,
+                    "event_type": "mf_subagent.finish_gate",
+                    "event_kind": "mf_subagent_finish_gate",
+                    "phase": "finish_gate",
+                    "status": "passed",
+                    "actor": context.worker_slot_id,
+                    "commit_sha": commit_sha,
+                    "payload": {
+                        **common,
+                        "validated_head_commit": commit_sha,
+                        "checkpoint_id": context.task_id,
+                    },
+                },
+            ]
+        )
+    events.extend(
+        [
+            {
+                "id": 19080,
+                "task_id": context.task_id,
+                "backlog_id": context.backlog_id,
+                "event_type": "qa.independent_verification",
+                "event_kind": "independent_verification",
+                "phase": "verification",
+                "status": "passed",
+                "actor": "qa",
+                "commit_sha": commits[-1],
+                "payload": {
+                    "candidate_commit": commits[-1],
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "backlog_id": context.backlog_id,
+                },
+            },
+            {
+                "id": 19082,
+                "task_id": context.task_id,
+                "backlog_id": context.backlog_id,
+                "event_type": "parallel.route_action_precheck",
+                "event_kind": "route_action_precheck",
+                "phase": "merge_precheck",
+                "status": "passed",
+                "actor": "observer",
+                "commit_sha": commits[-1],
+                "payload": {
+                    "candidate_commit": commits[-1],
+                    "worker_finish_gate_ref": "timeline:19079",
+                    "independent_verification_ref": "timeline:19080",
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "backlog_id": context.backlog_id,
+                    **route_identity,
+                },
+            },
+        ]
+    )
+    orders = (
+        events,
+        list(reversed(events)),
+        list(reversed(events + [dict(events[0]), dict(events[4])])),
+    )
+
+    projections = [
+        runtime._runtime_context_timeline_derived_evidence(
+            order,
+            runtime_context_id=runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=context.root_task_id,
+            backlog_id=context.backlog_id,
+            fence_token=context.fence_token,
+            route_identity=route_identity,
+        )
+        for order in orders
+    ]
+
+    for projection in projections:
+        refs = projection["timeline_refs"]
+        assert refs["worker_commit_event_ref"] == "timeline:19076"
+        assert refs["worker_commit_sha"] == commits[-1]
+        assert refs["latest_implementation_event_ref"] == "timeline:19075"
+        assert refs["finish_event_ref"] == "timeline:19079"
+        assert refs["finish_event_refs"] == [
+            "timeline:19046",
+            "timeline:19053",
+            "timeline:19064",
+            "timeline:19072",
+            "timeline:19079",
+        ]
+        assert refs["verification_event_refs"] == ["timeline:19080"]
+        assert refs["route_action_precheck_event_ref"] == "timeline:19082"
+        assert projection["finish_gate"]["event_id"] == "timeline:19079"
+        assert projection["finish_gate"]["payload"]["validated_head_commit"] == (
+            commits[-1]
+        )
+        assert projection["route_identity"] == route_identity
+    assert projections[0] == projections[1] == projections[2]
+
+
 def test_runtime_context_current_values_read_worker_progress_finish_time_attestation() -> None:
     context = _runtime_projection_context()
     runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)

@@ -13214,6 +13214,129 @@ def _runtime_context_is_finish_time_worker_attestation_event(
     )
 
 
+def _runtime_context_service_timeline_event_order_key(
+    event: Mapping[str, Any],
+) -> tuple[int, int, str, str, str]:
+    """Return an append-only event rank that is independent of input order."""
+
+    event_ref = _runtime_context_event_ref(event)
+    match = re.fullmatch(r"timeline:(\d+)", event_ref)
+    sequence = int(match.group(1)) if match else -1
+    return (
+        1 if match else 0,
+        sequence,
+        str(event.get("created_at") or "").strip(),
+        event_ref,
+        json.dumps(event, sort_keys=True, separators=(",", ":"), default=str),
+    )
+
+
+def _runtime_context_service_event_lineage_identity(
+    event: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    if not isinstance(event, Mapping):
+        return {}
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+
+    def _text(*values: Any) -> str:
+        for value in values:
+            text = _runtime_context_non_placeholder_text(value)
+            if text:
+                return text
+        return ""
+
+    return {
+        "commit_sha": _text(
+            event.get("commit_sha"),
+            payload.get("worker_commit_sha"),
+            payload.get("validated_head_commit"),
+            payload.get("head_commit"),
+            _timeline_first_deep_text(payload, "worker_commit_sha"),
+            _timeline_first_deep_text(payload, "validated_head_commit"),
+            _timeline_first_deep_text(payload, "head_commit"),
+        ),
+        "implementation_event_ref": _text(
+            payload.get("implementation_event_ref"),
+            _timeline_first_deep_text(payload, "implementation_event_ref"),
+        ),
+        "implementation_lineage_ref": _text(
+            payload.get("implementation_lineage_ref"),
+            _timeline_first_deep_text(payload, "implementation_lineage_ref"),
+        ),
+    }
+
+
+def _runtime_context_service_event_lineage_match_score(
+    event: Mapping[str, Any],
+    lineage: Mapping[str, Any],
+) -> int:
+    actual = _runtime_context_service_event_lineage_identity(event)
+    score = 0
+    expected_implementation_ref = _runtime_context_non_placeholder_text(
+        lineage.get("implementation_event_ref")
+    )
+    if (
+        expected_implementation_ref
+        and _runtime_context_event_ref(event) == expected_implementation_ref
+    ):
+        score += 4
+    for field in (
+        "commit_sha",
+        "implementation_event_ref",
+        "implementation_lineage_ref",
+    ):
+        expected_value = _runtime_context_non_placeholder_text(lineage.get(field))
+        actual_value = _runtime_context_non_placeholder_text(actual.get(field))
+        if not expected_value or not actual_value:
+            continue
+        if actual_value != expected_value:
+            return -1
+        score += 1
+    return score
+
+
+def _runtime_context_service_event_matches_lineage(
+    event: Mapping[str, Any],
+    lineage: Mapping[str, Any],
+) -> bool:
+    return _runtime_context_service_event_lineage_match_score(event, lineage) > 0
+
+
+def _runtime_context_service_select_lineage_event(
+    events: Sequence[Mapping[str, Any]],
+    lineage: Mapping[str, Any],
+) -> dict[str, Any]:
+    candidates = [
+        dict(event)
+        for event in events
+        if isinstance(event, Mapping)
+        and _runtime_context_service_event_matches_lineage(event, lineage)
+    ]
+    if not candidates and not any(
+        _runtime_context_non_placeholder_text(lineage.get(field))
+        for field in (
+            "commit_sha",
+            "implementation_event_ref",
+            "implementation_lineage_ref",
+        )
+    ):
+        candidates = [dict(event) for event in events if isinstance(event, Mapping)]
+    return (
+        max(
+            candidates,
+            key=lambda event: (
+                _runtime_context_service_event_lineage_match_score(
+                    event,
+                    lineage,
+                ),
+                _runtime_context_service_timeline_event_order_key(event),
+            ),
+        )
+        if candidates
+        else {}
+    )
+
+
 def _runtime_context_service_timeline_refs(
     conn,
     *,
@@ -13232,6 +13355,10 @@ def _runtime_context_service_timeline_refs(
             task_id=task_id,
             backlog_id=backlog_id,
         )
+    events = sorted(
+        (dict(event) for event in events if isinstance(event, Mapping)),
+        key=_runtime_context_service_timeline_event_order_key,
+    )
     refs: dict[str, Any] = {
         "source": "task_timeline.list_events",
         "producer": "task_timeline",
@@ -13246,6 +13373,11 @@ def _runtime_context_service_timeline_refs(
     worker_graph_trace_ids: list[str] = []
     verification_graph_trace_ids: list[str] = []
     close_graph_trace_ids: list[str] = []
+    implementation_events: list[dict[str, Any]] = []
+    finish_events: list[dict[str, Any]] = []
+    finish_attestation_events: list[dict[str, Any]] = []
+    verification_events: list[dict[str, Any]] = []
+    route_action_precheck_events: list[dict[str, Any]] = []
     for event in events:
         event_task_id = str(event.get("task_id") or "").strip()
         if task_id and event_task_id and event_task_id != task_id:
@@ -13364,36 +13496,13 @@ def _runtime_context_service_timeline_refs(
             "review_ready",
             "checkpoint",
         }
-        if not refs.get("finish_event_ref") and is_finish_gate:
-            refs["finish_event_ref"] = ref
-            finish_event = dict(event)
+        if is_finish_gate:
+            finish_events.append(dict(event))
         is_finish_time_worker_attestation = (
             _runtime_context_is_finish_time_worker_attestation_event(event)
         )
-        if is_finish_time_worker_attestation and not finish_attestation:
-            from .parallel_branch_runtime import public_contract_revision_payload
-
-            observer_command_id = _runtime_context_non_placeholder_text(
-                _timeline_first_deep_text(payload, "observer_command_id")
-            )
-            if observer_command_id:
-                refs["observer_command_id"] = observer_command_id
-            finish_attestation = {
-                "payload": public_contract_revision_payload(payload),
-                "worker_self_attestation": public_contract_revision_payload(
-                    payload.get("finish_time_worker_self_attestation") or {}
-                ),
-                "worker_self_attestation_gate": {
-                    "schema_version": "runtime_context.finish_time_worker_attestation_gate.v1",
-                    "status": "passed",
-                    "passed": True,
-                    "close_satisfying": True,
-                },
-                "test_results": public_contract_revision_payload(
-                    payload.get("test_results") or {}
-                ),
-                "attestation_event_ref": ref,
-            }
+        if is_finish_time_worker_attestation:
+            finish_attestation_events.append(dict(event))
         if (
             not refs.get("close_ready_event_ref")
             and event_kind_normalized == "close_ready"
@@ -13402,6 +13511,7 @@ def _runtime_context_service_timeline_refs(
             close_event = dict(event)
         if is_implementation:
             refs["implementation_event_refs"].append(ref)
+            implementation_events.append(dict(event))
             implementation_payload = public_contract_revision_payload(payload)
             refs["latest_implementation_event_ref"] = ref
             refs["latest_implementation_payload"] = implementation_payload
@@ -13465,6 +13575,9 @@ def _runtime_context_service_timeline_refs(
         )
         if is_verification:
             refs["verification_event_refs"].append(ref)
+            verification_events.append(dict(event))
+        if event_kind_normalized == "route_action_precheck":
+            route_action_precheck_events.append(dict(event))
         event_graph_trace_ids = _runtime_context_service_graph_trace_values_from_event(
             event
         )
@@ -13479,6 +13592,184 @@ def _runtime_context_service_timeline_refs(
             verification_graph_trace_ids.extend(event_graph_trace_ids)
         elif event_kind_normalized == "close_ready":
             close_graph_trace_ids.extend(event_graph_trace_ids)
+    refs["implementation_event_refs"] = _runtime_context_service_dedupe(
+        refs["implementation_event_refs"]
+    )
+    refs["rejected_startup_event_refs"] = _runtime_context_service_dedupe(
+        refs["rejected_startup_event_refs"]
+    )
+    worker_lineage = _runtime_context_service_event_lineage_identity(
+        {
+            "commit_sha": refs.get("worker_commit_sha"),
+            "payload": refs.get("worker_commit_payload") or {},
+        }
+    )
+    selected_implementation = _runtime_context_service_select_lineage_event(
+        implementation_events,
+        worker_lineage,
+    )
+    if selected_implementation:
+        selected_implementation_ref = _runtime_context_event_ref(
+            selected_implementation
+        )
+        selected_implementation_payload = public_contract_revision_payload(
+            selected_implementation.get("payload") or {}
+        )
+        refs["latest_implementation_event_ref"] = selected_implementation_ref
+        refs["latest_implementation_payload"] = selected_implementation_payload
+        implementation_tests = (
+            selected_implementation_payload.get("test_results")
+            if isinstance(
+                selected_implementation_payload.get("test_results"), Mapping
+            )
+            else {}
+        )
+        if not implementation_tests:
+            implementation_tests = _runtime_context_test_results_from_tests(
+                selected_implementation_payload.get("tests")
+            )
+        if implementation_tests:
+            refs["test_results"] = public_contract_revision_payload(
+                implementation_tests
+            )
+        selected_changed_files = _runtime_context_service_query_values(
+            selected_implementation_payload,
+            "changed_files",
+        )
+        if not selected_changed_files:
+            selected_changed_files = _runtime_context_service_query_values(
+                selected_implementation_payload,
+                "worker_changed_files",
+            )
+        if selected_changed_files:
+            refs["changed_files"] = selected_changed_files
+        selected_identity = _runtime_context_service_event_lineage_identity(
+            selected_implementation
+        )
+        worker_lineage = {
+            **selected_identity,
+            **{
+                key: value
+                for key, value in worker_lineage.items()
+                if _runtime_context_non_placeholder_text(value)
+            },
+        }
+    if refs.get("worker_commit_sha"):
+        refs["head_commit"] = refs["worker_commit_sha"]
+
+    refs["finish_event_refs"] = _runtime_context_service_dedupe(
+        [_runtime_context_event_ref(event) for event in finish_events]
+    )
+    finish_event = _runtime_context_service_select_lineage_event(
+        finish_events,
+        worker_lineage,
+    )
+    if finish_event:
+        refs["finish_event_ref"] = _runtime_context_event_ref(finish_event)
+
+    refs["finish_time_attestation_event_refs"] = (
+        _runtime_context_service_dedupe(
+            [
+                _runtime_context_event_ref(event)
+                for event in finish_attestation_events
+            ]
+        )
+    )
+    selected_attestation = _runtime_context_service_select_lineage_event(
+        finish_attestation_events,
+        worker_lineage,
+    )
+    if selected_attestation:
+        selected_attestation_payload = (
+            selected_attestation.get("payload")
+            if isinstance(selected_attestation.get("payload"), Mapping)
+            else {}
+        )
+        observer_command_id = _runtime_context_non_placeholder_text(
+            _timeline_first_deep_text(
+                selected_attestation_payload,
+                "observer_command_id",
+            )
+        )
+        if observer_command_id:
+            refs["observer_command_id"] = observer_command_id
+        finish_attestation = {
+            "payload": public_contract_revision_payload(
+                selected_attestation_payload
+            ),
+            "worker_self_attestation": public_contract_revision_payload(
+                selected_attestation_payload.get(
+                    "finish_time_worker_self_attestation"
+                )
+                or {}
+            ),
+            "worker_self_attestation_gate": {
+                "schema_version": "runtime_context.finish_time_worker_attestation_gate.v1",
+                "status": "passed",
+                "passed": True,
+                "close_satisfying": True,
+            },
+            "test_results": public_contract_revision_payload(
+                selected_attestation_payload.get("test_results") or {}
+            ),
+            "attestation_event_ref": _runtime_context_event_ref(
+                selected_attestation
+            ),
+        }
+
+    all_verification_refs = _runtime_context_service_dedupe(
+        [_runtime_context_event_ref(event) for event in verification_events]
+    )
+    refs["historical_verification_event_refs"] = all_verification_refs
+    if worker_lineage.get("commit_sha"):
+        refs["verification_event_refs"] = _runtime_context_service_dedupe(
+            [
+                _runtime_context_event_ref(event)
+                for event in verification_events
+                if _runtime_context_service_event_matches_lineage(
+                    event,
+                    {"commit_sha": worker_lineage.get("commit_sha")},
+                )
+            ]
+        )
+    else:
+        refs["verification_event_refs"] = all_verification_refs
+
+    refs["route_action_precheck_event_refs"] = _runtime_context_service_dedupe(
+        [
+            _runtime_context_event_ref(event)
+            for event in route_action_precheck_events
+        ]
+    )
+    route_candidates = [
+        event
+        for event in route_action_precheck_events
+        if (
+            not worker_lineage.get("commit_sha")
+            or _runtime_context_service_event_matches_lineage(
+                event,
+                {"commit_sha": worker_lineage.get("commit_sha")},
+            )
+        )
+        and (
+            not refs.get("finish_event_ref")
+            or not _runtime_context_non_placeholder_text(
+                _timeline_first_deep_text(event, "worker_finish_gate_ref")
+            )
+            or _runtime_context_non_placeholder_text(
+                _timeline_first_deep_text(event, "worker_finish_gate_ref")
+            )
+            == refs.get("finish_event_ref")
+        )
+    ]
+    if route_candidates:
+        selected_route_precheck = max(
+            route_candidates,
+            key=_runtime_context_service_timeline_event_order_key,
+        )
+        refs["route_action_precheck_event_ref"] = _runtime_context_event_ref(
+            selected_route_precheck
+        )
     if worker_graph_trace_ids:
         refs["graph_trace_ids"] = _runtime_context_service_dedupe(
             worker_graph_trace_ids
