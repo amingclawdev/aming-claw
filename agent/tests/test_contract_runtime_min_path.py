@@ -14,6 +14,7 @@ from agent.governance.contracts.runtime import (
     _audited_bypass_recovery_fallback,
     _audited_bypass_terminal_disposition,
     _contract_completion_satisfying_lines,
+    _line_status_allows_contract_completion,
     _project_current_contract_state,
     _project_record_state,
     _worker_implementation_lineage,
@@ -288,6 +289,335 @@ def test_failed_qa_rejoin_marker_resets_only_prior_revision_proof_lines():
     assert old_qa not in satisfying
     assert fresh_implementation in satisfying
     assert fresh_qa in satisfying
+
+
+@pytest.mark.parametrize(
+    ("line_order", "qa_shape", "expected_next"),
+    [
+        ("semantic", "authenticated_observations", "observer_merge"),
+        ("qa_before_worker", "authenticated_observations", "observer_merge"),
+        ("semantic", "authenticated_failure", "worker_implementation"),
+        ("semantic", "unauthenticated_observations", "worker_implementation"),
+        ("semantic", "authenticated_sibling_failure", "worker_implementation"),
+    ],
+)
+def test_projected_authenticated_qa_pass_keeps_baseline_observations_audit_only(
+    tmp_path,
+    line_order,
+    qa_shape,
+    expected_next,
+):
+    line_contracts = [
+        (
+            "orchestration",
+            "observer_prefill_child_contracts",
+            "observer",
+            "contract_binding",
+        ),
+        (
+            "dispatch",
+            "observer_dispatch_bounded_workers",
+            "observer",
+            "dispatch_bounded_worker",
+        ),
+        ("worker_read", "worker_read_runtime_guide", "mf_sub", "read_receipt"),
+        ("worker_startup", "worker_startup", "mf_sub", "mf_subagent_startup"),
+        ("worker_context", "worker_graph_context", "mf_sub", "graph_trace"),
+        (
+            "worker_implementation",
+            "worker_implementation",
+            "mf_sub",
+            "implementation",
+        ),
+        ("worker_commit", "worker_commit", "mf_sub", "worker_commit"),
+        (
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "mf_sub",
+            "record_finish_time_worker_attestation",
+        ),
+        (
+            "worker_finish",
+            "worker_finish_gate",
+            "mf_sub",
+            "mf_subagent_finish_gate",
+        ),
+        ("qa_graph_context", "qa_graph_context", "qa", "graph_trace"),
+        (
+            "qa",
+            "qa_independent_verification",
+            "qa",
+            "independent_verification",
+        ),
+        ("observer_integration", "observer_merge", "observer", "merge"),
+    ]
+    stages = []
+    prior_line_id = ""
+    for stage_id, line_id, owner_role, evidence_kind in line_contracts:
+        line = {
+            "line_id": line_id,
+            "owner_role": owner_role,
+            "allowed_writer_roles": [owner_role],
+            "evidence_kind": evidence_kind,
+        }
+        if prior_line_id:
+            line["requires"] = [prior_line_id]
+        stages.append({"stage_id": stage_id, "lines": [line]})
+        prior_line_id = line_id
+    _write_contract_definition(
+        tmp_path,
+        contract_id="mf_parallel.v2",
+        stages=stages,
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    execution_id = f"cex-projected-qa-observation-{line_order}-{qa_shape}"
+    record = runtime.start_execution(
+        "mf_parallel.v2",
+        project_id="aming-claw",
+        backlog_id="AC-PROJECTED-QA-PASS-BASELINE-OBSERVATIONS",
+        contract_execution_id=execution_id,
+        actor_role="observer",
+        version="v1",
+        revision="rev1",
+    )
+    runtime_context_id = "mfrctx-projected-qa-observation"
+    task_id = "worker-projected-qa-observation"
+    parent_task_id = execution_id
+    common = {
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+    }
+    lines = [
+        {
+            "stage_id": "orchestration",
+            "line_id": "observer_prefill_child_contracts",
+            "actor_role": "observer",
+            "evidence_kind": "contract_binding",
+            "status": "accepted",
+        },
+        {
+            **common,
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "actor_role": "observer",
+            "evidence_kind": "dispatch_bounded_worker",
+        },
+        {
+            **common,
+            "stage_id": "worker_read",
+            "line_id": "worker_read_runtime_guide",
+            "actor_role": "mf_sub",
+            "evidence_kind": "read_receipt",
+        },
+        {
+            **common,
+            "stage_id": "worker_startup",
+            "line_id": "worker_startup",
+            "actor_role": "mf_sub",
+            "evidence_kind": "mf_subagent_startup",
+            "status": "passed",
+        },
+        {
+            **common,
+            "stage_id": "worker_context",
+            "line_id": "worker_graph_context",
+            "actor_role": "mf_sub",
+            "evidence_kind": "graph_trace",
+            "payload": {"graph_trace_evidence": {"db_verified": True}},
+        },
+        {
+            **common,
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "actor_role": "mf_sub",
+            "evidence_kind": "implementation",
+            "status": "accepted",
+        },
+        {
+            **common,
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+            "actor_role": "mf_sub",
+            "evidence_kind": "worker_commit",
+        },
+        {
+            **common,
+            "stage_id": "worker_attestation",
+            "line_id": "worker_finish_time_attestation",
+            "actor_role": "mf_sub",
+            "evidence_kind": "record_finish_time_worker_attestation",
+        },
+        {
+            **common,
+            "stage_id": "worker_finish",
+            "line_id": "worker_finish_gate",
+            "actor_role": "mf_sub",
+            "evidence_kind": "mf_subagent_finish_gate",
+        },
+        {
+            **common,
+            "stage_id": "qa_graph_context",
+            "line_id": "qa_graph_context",
+            "actor_role": "qa",
+            "evidence_kind": "graph_trace",
+            "payload": {"graph_trace_evidence": {"db_verified": True}},
+        },
+    ]
+    qa_line = {
+        **common,
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "status": "passed",
+        "verdict": "pass",
+        "authorization_source": "qa_session_token_ref",
+        "observer_impersonation": False,
+        "parent_materialization_authorized": False,
+        "qa_evidence_provenance": {
+            "schema_version": "qa_evidence_provenance.v1",
+            "server_derived": True,
+            "authorization_source": "qa_session_token_ref",
+            "evidence_owner_role": "qa",
+            "observer_impersonation": False,
+            "parent_materialization_authorized": False,
+            "authenticated_qa_binding": {
+                "schema_version": (
+                    "contract_runtime.authenticated_qa_binding.v1"
+                ),
+                "server_derived": True,
+                "qa_principal": "qa:projected-observation",
+                "qa_session_id": "ses-projected-observation",
+                "independent_verification_session_matched": True,
+            },
+            "completion_status_gate": {
+                "schema_version": (
+                    "contract_runtime.qa_completion_status_gate.v1"
+                ),
+                "server_derived": True,
+                "top_level_status_present": True,
+                "top_level_status_passing": True,
+                "normalized_status": "passed",
+                "nested_payload_decision_satisfies": False,
+            },
+        },
+        "payload": {
+            "status": "passed",
+            "verdict": "pass",
+            "focused_tests": [
+                {"status": "passed", "failed": 0},
+                {"status": "baseline_observation", "failed": 42},
+            ],
+        },
+        "tests": [
+            {"status": "passed", "failed": 0},
+            {"status": "baseline_observation", "failed": 1},
+        ],
+        "test_results": {
+            "status": "passed",
+            "tests": [
+                {"status": "passed", "failed": 0},
+                {"status": "baseline_observation", "failed": 1},
+            ],
+        },
+        "verification": {"status": "passed", "verdict": "pass"},
+    }
+    if qa_shape == "authenticated_failure":
+        qa_line["status"] = "failed"
+        qa_line["verdict"] = "fail"
+        qa_line["qa_evidence_provenance"]["completion_status_gate"].update(
+            {
+                "top_level_status_passing": False,
+                "normalized_status": "failed",
+            }
+        )
+    elif qa_shape == "unauthenticated_observations":
+        qa_line["qa_evidence_provenance"].pop("authenticated_qa_binding")
+    elif qa_shape == "authenticated_sibling_failure":
+        qa_line["test_results"]["failed"] = 1
+    lines.append(qa_line)
+    if line_order == "qa_before_worker":
+        lines = [*lines[:2], *lines[-2:], *lines[2:-2]]
+
+    persisted = dict(record)
+    persisted["completed_lines"] = lines
+    persisted["execution_state_revision"] = 12
+    runtime.store.update(
+        execution_id,
+        persisted,
+        expected_revision=int(record["execution_state_revision"]),
+    )
+    projection = {
+        "schema_version": (
+            "contract_runtime.mf_parallel_runtime_context_projection.v1"
+        ),
+        "source": "runtime_context_worker_evidence",
+        "projected_completed_lines": lines,
+        "failed_qa_revision_rejoin_contexts": [
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+            }
+        ],
+    }
+
+    views = [
+        runtime.projected_record(
+            execution_id,
+            actor_role="observer",
+            completed_lines=lines,
+            projection=projection,
+        )
+        for _ in range(10)
+    ]
+    assert {
+        view["runtime_guide"]["next_legal_action"]["line_id"]
+        for view in views
+    } == {expected_next}
+    assert len(
+        {
+            view["runtime_guide"]["runtime_guide_hash"]
+            for view in views
+        }
+    ) == 1
+
+    guide = views[0]["runtime_guide"]
+    assert guide["writer_role_safe_copy_payload"]["copy_payload"][
+        "line_id"
+    ] == expected_next
+    submit_guidance = guide["post_projection_submit_line_guidance"]
+    assert submit_guidance["projected_line_ids"] == [
+        line["line_id"] for line in lines
+    ]
+    assert submit_guidance["duplicate_submit_line_required"] is False
+    if expected_next == "observer_merge":
+        assert _line_status_allows_contract_completion(qa_line) is True
+        assert guide.get("failed_qa_rework") is None
+        merge_precheck = runtime.precheck_line_write(
+            execution_id,
+            dict(
+                guide["writer_role_safe_copy_payload"]["copy_payload"]
+            ),
+            actor_role="observer",
+            projected_completed_lines=lines,
+            projection=projection,
+        )
+        assert merge_precheck["ok"] is True
+        assert merge_precheck["completed_lines_count"] == len(lines)
+    else:
+        assert _line_status_allows_contract_completion(qa_line) is False
+        assert guide["failed_qa_rework"]["status"] == (
+            "blocked_by_failed_independent_qa"
+        )
 
 
 def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
