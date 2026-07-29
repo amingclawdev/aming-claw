@@ -20837,6 +20837,31 @@ def _runtime_context_worker_recovery_payloads(
         "raw_session_token_exposed": False,
         "raw_fence_token_exposed": False,
     }
+    startup_semantic_role_binding = {
+        "schema_version": "runtime_context.startup_semantic_role_binding.v1",
+        "source": "runtime_context_allocation_contract",
+        "semantic_role": "mf_sub",
+        "worker_role": "mf_sub",
+        "server_verification_required": True,
+        "role_authority_fields": [
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_role",
+            "session_token or session_token_ref",
+            "fence_token",
+            "target_project_root",
+        ],
+        "opaque_identity_fields": [
+            "actual_host_worker_id",
+            "worker_session_id",
+            "filer_principal",
+            "host_session_id",
+        ],
+        "opaque_identity_is_role_bearing": False,
+        "actual_host_worker_id": normalized_actual_host_worker_id,
+        "worker_session_id": normalized_worker_session_id,
+    }
     actual_host_identity_binding = {
         "schema_version": "runtime_context.actual_host_identity_binding.v1",
         "required_before_initial_join_when_agent_id_is_placeholder": True,
@@ -21327,6 +21352,7 @@ def _runtime_context_worker_recovery_payloads(
         "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
         "write_authorization_policy": dict(write_authorization_policy),
         "worker_identity_pointers": dict(worker_identity_pointers),
+        "semantic_role_binding": dict(startup_semantic_role_binding),
         **safe_route_identity,
     }
     startup_payload = {
@@ -21368,6 +21394,7 @@ def _runtime_context_worker_recovery_payloads(
             "raw_fence_token_persisted": False,
             "required_real_worker_identity_fields": startup_identity_required_fields,
             "worker_identity_pointers": dict(worker_identity_pointers),
+            "semantic_role_binding": dict(startup_semantic_role_binding),
             **safe_route_identity,
         }
     }
@@ -21814,6 +21841,7 @@ def _runtime_context_worker_recovery_payloads(
         "host_startup_id": normalized_host_startup_id,
         "host_session_id": normalized_host_session_id,
         "worker_identity_pointers": worker_identity_pointers,
+        "startup_semantic_role_binding": startup_semantic_role_binding,
         "actual_host_identity_binding": actual_host_identity_binding,
         "branch": normalized_branch_ref,
         "branch_ref": normalized_branch_ref,
@@ -40347,6 +40375,19 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                             or ""
                         )
                         in {"server_verified", "server_verified_ref"}
+                        and (
+                            not isinstance(
+                                startup_gate_payload.get(
+                                    "semantic_role_binding"
+                                ),
+                                Mapping,
+                            )
+                            or startup_gate_payload.get(
+                                "semantic_role_binding",
+                                {},
+                            ).get("semantic_role_accepted")
+                            is True
+                        )
                     )
                     if missing_worker_proof_fields:
                         if server_verified_worker_proof:
@@ -40371,7 +40412,8 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                         worker_provenance = {}
                     elif server_verified_worker_proof:
                         submitted_actor = str(
-                            event.get("actor")
+                            event_payload.get("submitted_actor")
+                            or event.get("actor")
                             or startup_gate_payload.get("filer_principal")
                             or startup_gate_payload.get("worker_session_id")
                             or startup_gate_payload.get(
@@ -40383,6 +40425,20 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                             task_timeline.source_backed_runtime_context_worker_authority(
                                 worker_provenance
                             )
+                        )
+                        semantic_role_binding = (
+                            dict(
+                                startup_gate_payload.get(
+                                    "semantic_role_binding"
+                                )
+                            )
+                            if isinstance(
+                                startup_gate_payload.get(
+                                    "semantic_role_binding"
+                                ),
+                                Mapping,
+                            )
+                            else {}
                         )
                         event_payload.update(
                             {
@@ -40415,6 +40471,30 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                                 "submitter_principal": worker_slot_id,
                                 "submitter_session": session_token_ref,
                                 "submitted_actor": submitted_actor,
+                                "semantic_actor": "mf_sub",
+                                "semantic_role_binding": (
+                                    semantic_role_binding
+                                    or {
+                                        "schema_version": (
+                                            "runtime_context."
+                                            "startup_semantic_role_binding.v1"
+                                        ),
+                                        "source": (
+                                            "server_verified_"
+                                            "runtime_context_startup"
+                                        ),
+                                        "semantic_role": "mf_sub",
+                                        "worker_role": "mf_sub",
+                                        "server_verified": True,
+                                        "opaque_identity_fields": [
+                                            "actual_host_worker_id",
+                                            "worker_session_id",
+                                            "filer_principal",
+                                            "host_session_id",
+                                        ],
+                                        "opaque_identity_is_role_bearing": False,
+                                    }
+                                ),
                                 "observer_impersonation": False,
                                 "worker_evidence_provenance": (
                                     worker_provenance

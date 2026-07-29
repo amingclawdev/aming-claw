@@ -5288,6 +5288,12 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
     assert gate["actual_host_worker_id"] == "worker-startup"
     assert gate["allocation_owner"] == "agent-startup"
     assert gate["observer_allocation_owner"] == "agent-startup"
+    assert gate["semantic_role_binding"]["semantic_role"] == "mf_sub"
+    assert gate["semantic_role_binding"]["server_verified"] is True
+    assert gate["semantic_role_binding"]["semantic_role_accepted"] is True
+    assert gate["semantic_role_binding"][
+        "opaque_identity_is_role_bearing"
+    ] is False
     assert gate["session_token_hash"].startswith("sha256:")
     assert gate["session_token_persisted"] is False
     assert "fence_token" not in gate
@@ -5317,7 +5323,10 @@ def test_worker_transcript_mf_sub_startup_records_real_worker_identity_and_token
         sort_keys=True,
     )
     assert result["timeline_event"]["event_kind"] == "mf_subagent_startup"
-    assert result["timeline_event"]["actor"] == "codex-session-startup"
+    assert result["timeline_event"]["actor"] == "mf_sub"
+    assert result["timeline_event"]["payload"]["submitted_actor"] == (
+        "codex-session-startup"
+    )
     assert result["timeline_event"]["payload"]["mf_subagent_startup_gate"] == gate
 
     accepted = validate_mf_subagent_graph_query_identity(

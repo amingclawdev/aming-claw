@@ -5873,6 +5873,26 @@ def _meta_runtime_context_worker_proof_present(event: Mapping[str, Any]) -> bool
     return False
 
 
+def _meta_principal_is_explicit_qa_role(value: Any) -> bool:
+    """Return true only when the principal itself is an explicit QA role.
+
+    Host-created worker/session principals are opaque audit identities.  A
+    suffix such as ``/root/alloc_root_qa`` is therefore not an actor-role
+    declaration, while ``qa-repair-worker`` and ``reviewer-worker`` are.
+    """
+
+    principal = _normalized_action(value)
+    if not principal:
+        return False
+    return any(
+        principal == token
+        or principal.startswith(f"{token}_")
+        or principal.startswith(f"{token}:")
+        or principal.startswith(f"{token}/")
+        for token in _META_QA_ROLE_TOKENS
+    )
+
+
 def _meta_explicit_qa_marker(event: Mapping[str, Any]) -> bool:
     for marker in _meta_event_markers(event):
         if marker.startswith("qa_") or "independent_verification" in marker:
@@ -5902,6 +5922,11 @@ def _meta_role_from_event_with_trust(
         and action in _META_WORKER_AUTHORED_ACTIONS
         and _meta_runtime_context_worker_proof_present(event)
     ):
+        # A real authenticated QA/reviewer principal remains QA.  All other
+        # host/session identifiers are opaque audit values once the server has
+        # verified the exact RuntimeContext worker proof.
+        if _meta_principal_is_explicit_qa_role(actor):
+            return "qa"
         return MF_SUB_ROLE
     actor_role = _meta_normalize_role(actor)
     if actor_role in {OBSERVER_COORDINATOR_ROLE, "qa", MF_SUB_ROLE, "operator", "judge", "system"}:
