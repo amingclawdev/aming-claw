@@ -31232,6 +31232,9 @@ def _observer_failure_domain_authority_from_route_gate(
         "prompt_contract_hash": str(
             gate.get("prompt_contract_hash") or ""
         ),
+        "visible_injection_manifest_hash": str(
+            gate.get("visible_injection_manifest_hash") or ""
+        ),
         "registry_verified": True,
         "server_issued_binding": bool(
             gate.get("server_issued_binding")
@@ -31245,8 +31248,65 @@ def _observer_failure_domain_authority_from_route_gate(
     }
 
 
+def _observer_failure_domain_invalidation_event(
+    conn,
+    *,
+    authority_event: Mapping[str, Any],
+    evidence_ref: str,
+    route_binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve one passing, exact-scope governance-lane evidence ref."""
+
+    from . import task_timeline
+
+    match = re.fullmatch(r"timeline:(\d+)", str(evidence_ref or "").strip())
+    if conn is None or not match:
+        return {}
+    row = conn.execute(
+        """
+        SELECT * FROM task_timeline_events
+        WHERE project_id = ? AND id = ?
+        """,
+        (
+            str(authority_event.get("project_id") or "").strip(),
+            int(match.group(1)),
+        ),
+    ).fetchone()
+    if row is None:
+        return {}
+    evidence_event = task_timeline._row_to_dict(row)
+    if str(evidence_event.get("status") or "").strip().lower() not in {
+        "accepted",
+        "ok",
+        "pass",
+        "passed",
+        "succeeded",
+        "success",
+    }:
+        return {}
+    for field in ("project_id", "backlog_id", "task_id"):
+        if str(evidence_event.get(field) or "").strip() != str(
+            authority_event.get(field) or ""
+        ).strip():
+            return {}
+    expected_route = _route_identity_public_summary(route_binding)
+    evidence_route = _observer_root_route_identity_from_event(evidence_event)
+    if (
+        not expected_route.get("route_token_ref")
+        or any(
+            str(evidence_route.get(field) or "").strip()
+            != str(expected_route.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
+    ):
+        return {}
+    return evidence_event
+
+
 def _observer_failure_domain_disposition_from_event(
     event: Mapping[str, Any],
+    *,
+    conn=None,
 ) -> dict[str, Any]:
     """Build a server-signed, QA-preserving observation disposition."""
 
@@ -31391,10 +31451,16 @@ def _observer_failure_domain_disposition_from_event(
         if not ref or not causal_reason:
             continue
         normalized = {"ref": ref, "causal_reason": causal_reason}
-        if (
-            domain == "governance_lane_evidence_invalid"
-            or ref in observation_refs
-        ):
+        if domain == "governance_lane_evidence_invalid":
+            if not _observer_failure_domain_invalidation_event(
+                conn,
+                authority_event=event,
+                evidence_ref=ref,
+                route_binding=persisted_principal_binding,
+            ):
+                return {}
+            accepted_invalidated.append(normalized)
+        elif ref in observation_refs:
             accepted_invalidated.append(normalized)
         else:
             rejected_invalidated.append(
@@ -31542,7 +31608,10 @@ def _latest_observer_failure_domain_disposition(
         key=_runtime_context_service_timeline_event_order_key,
         reverse=True,
     ):
-        disposition = _observer_failure_domain_disposition_from_event(event)
+        disposition = _observer_failure_domain_disposition_from_event(
+            event,
+            conn=conn,
+        )
         if disposition:
             return validate_observer_failure_domain_disposition(
                 disposition,
@@ -31599,7 +31668,10 @@ def _observer_failure_domain_disposition_from_ref(
         raise ValidationError(
             "failure_domain_disposition_ref is not an accepted DB event"
         )
-    disposition = _observer_failure_domain_disposition_from_event(event)
+    disposition = _observer_failure_domain_disposition_from_event(
+        event,
+        conn=conn,
+    )
     if (
         not disposition
         or str(disposition.get("authority_ref") or "").strip() != ref
