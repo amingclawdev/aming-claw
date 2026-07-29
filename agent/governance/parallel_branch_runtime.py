@@ -17424,6 +17424,22 @@ def _materialization_git_root(context: BranchTaskRuntimeContext) -> Path | None:
     return None
 
 
+def is_never_materialized_planned_merge_queue_item(
+    item: MergeQueueItem | None,
+) -> bool:
+    """Return whether a durable Batch row is still an allocation placeholder.
+
+    A planned row may carry the allocation/base branch identity, but that
+    identity is not an immutable QA candidate until the first materialization
+    replaces the row with a live merge-queue status.
+    """
+
+    return bool(
+        item is not None
+        and _normalize_merge_queue_status(item.status) == "planned"
+    )
+
+
 def _refresh_merge_queue_heads_for_materialization(
     context: BranchTaskRuntimeContext,
     *,
@@ -17799,6 +17815,9 @@ def queue_merge_item_for_branch_context(
         if context.replay_source != "mf_sub_finish_gate":
             raise ValueError("validated mf_sub finish gate checkpoint is required")
 
+    planned_first_materialize = (
+        is_never_materialized_planned_merge_queue_item(existing_item)
+    )
     (
         refreshed_branch_head,
         refreshed_target_head,
@@ -17811,7 +17830,7 @@ def queue_merge_item_for_branch_context(
             if candidate_recovery is not None
             else (
                 str(existing_item.branch_head or "")
-                if existing_item is not None
+                if existing_item is not None and not planned_first_materialize
                 else ""
             )
         ),
