@@ -4465,6 +4465,109 @@ def _line_shape_allows_contract_completion(line: Mapping[str, Any]) -> bool:
     return not (blocked_schemas and schema_version in blocked_schemas)
 
 
+def _contains_completion_blocker_outside_baseline_observation(
+    value: Any,
+) -> bool:
+    """Keep explicit frozen-baseline observations out of the QA verdict.
+
+    A ``baseline_observation`` mapping may carry the non-zero failure count it
+    observed.  That narrow container-local count is audit evidence, not a QA
+    FAIL.  Blocking fields outside that exact mapping, including siblings and
+    nested children, remain authoritative.
+    """
+
+    if isinstance(value, Mapping):
+        baseline_observation = (
+            str(value.get("status") or "").strip().lower()
+            == "baseline_observation"
+        )
+        for raw_key, item in value.items():
+            key = str(raw_key or "").strip().lower()
+            if (
+                key in _CONTRACT_COMPLETION_STATUS_FIELDS
+                and str(item or "").strip().lower()
+                in _CONTRACT_COMPLETION_BLOCKING_STATUSES
+            ):
+                return True
+            if (
+                key in _CONTRACT_COMPLETION_FAILURE_COUNT_FIELDS
+                and _truthy_failure_count(item)
+                and not baseline_observation
+            ):
+                return True
+            if _contains_completion_blocker_outside_baseline_observation(
+                item
+            ):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(
+            _contains_completion_blocker_outside_baseline_observation(item)
+            for item in value
+        )
+    return False
+
+
+def _authenticated_qa_pass_with_baseline_observations(
+    line: Mapping[str, Any],
+) -> bool:
+    """Recognize only server-bound QA PASS with observation-local failures."""
+
+    provenance = (
+        line.get("qa_evidence_provenance")
+        if isinstance(line.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    binding = (
+        provenance.get("authenticated_qa_binding")
+        if isinstance(provenance.get("authenticated_qa_binding"), Mapping)
+        else {}
+    )
+    status_gate = (
+        provenance.get("completion_status_gate")
+        if isinstance(provenance.get("completion_status_gate"), Mapping)
+        else {}
+    )
+    qa_status = str(line.get("status") or "").strip().lower()
+    return bool(
+        str(line.get("line_id") or "").strip()
+        == "qa_independent_verification"
+        and str(line.get("actor_role") or "").strip().lower() == "qa"
+        and str(line.get("evidence_kind") or "").strip()
+        == "independent_verification"
+        and qa_status in _QA_COMPLETION_PASSING_STATUSES
+        and str(line.get("authorization_source") or "")
+        == "qa_session_token_ref"
+        and line.get("observer_impersonation") is False
+        and line.get("parent_materialization_authorized") is False
+        and str(provenance.get("schema_version") or "")
+        == "qa_evidence_provenance.v1"
+        and provenance.get("server_derived") is True
+        and str(provenance.get("authorization_source") or "")
+        == "qa_session_token_ref"
+        and str(provenance.get("evidence_owner_role") or "") == "qa"
+        and provenance.get("observer_impersonation") is False
+        and provenance.get("parent_materialization_authorized") is False
+        and str(binding.get("schema_version") or "")
+        == "contract_runtime.authenticated_qa_binding.v1"
+        and binding.get("server_derived") is True
+        and binding.get("independent_verification_session_matched") is True
+        and str(binding.get("qa_principal") or "").strip()
+        and str(binding.get("qa_session_id") or "").strip()
+        and str(status_gate.get("schema_version") or "")
+        == _QA_COMPLETION_STATUS_GATE_SCHEMA_VERSION
+        and status_gate.get("server_derived") is True
+        and status_gate.get("top_level_status_present") is True
+        and status_gate.get("top_level_status_passing") is True
+        and str(status_gate.get("normalized_status") or "") == qa_status
+        and status_gate.get("nested_payload_decision_satisfies") is False
+        and not _contains_completion_blocker_outside_baseline_observation(
+            line
+        )
+        and not _qa_independent_verification_summary_reports_failure(line)
+    )
+
+
 def _line_status_allows_contract_completion(
     line: Mapping[str, Any],
     *,
@@ -4490,10 +4593,18 @@ def _line_status_allows_contract_completion(
             source_line_index=source_line_index,
         )
     )
+    authenticated_observation_pass = bool(
+        line_id == "qa_independent_verification"
+        and _authenticated_qa_pass_with_baseline_observations(line)
+    )
     if _contains_contract_completion_blocker(line.get("qa_evidence_provenance")):
         return False
     if (
-        not (canonical_no_pass or canonical_rework_baseline)
+        not (
+            canonical_no_pass
+            or canonical_rework_baseline
+            or authenticated_observation_pass
+        )
         and _contains_contract_completion_blocker(line.get("verification"))
     ):
         return False
@@ -4526,8 +4637,12 @@ def _line_status_allows_contract_completion(
         # persisted line. Command/test summaries and artifact references are
         # first-class evidence containers that may contradict an otherwise
         # passing top-level status. The authenticated canonical no-PASS ledger
-        # above remains the sole narrow exception.
-        if _contains_contract_completion_blocker(line):
+        # and explicit, container-local baseline observations are the only
+        # narrow exceptions.
+        if (
+            not authenticated_observation_pass
+            and _contains_contract_completion_blocker(line)
+        ):
             return False
         if _qa_independent_verification_summary_reports_failure(line):
             return False
