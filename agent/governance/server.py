@@ -43577,6 +43577,50 @@ def _audited_postmerge_recovery_authority(
     )
 
 
+def _active_epoch_merge_queue_materialization_allowed(
+    conn,
+    *,
+    active_epoch: Any,
+    runtime_context: Any,
+    project_id: str,
+    task_id: str,
+    merge_queue_id: str,
+) -> bool:
+    """Allow the active planned row to bind its finished runtime lane in place."""
+
+    if active_epoch is None or runtime_context is None:
+        return False
+    if (
+        str(runtime_context.batch_id or "") != str(active_epoch.batch_id or "")
+        or str(merge_queue_id or "") != str(active_epoch.merge_queue_id or "")
+    ):
+        return False
+    if str(task_id or "") == str(active_epoch.active_task_id or ""):
+        return True
+    if str(active_epoch.status or "") != "open":
+        return False
+
+    from .parallel_branch_runtime import get_merge_queue_item
+
+    active_item = get_merge_queue_item(
+        conn,
+        project_id,
+        str(active_epoch.merge_queue_id or ""),
+        str(active_epoch.active_queue_item_id or ""),
+    )
+    if active_item is None:
+        return False
+    return bool(
+        str(active_item.status or "") == "planned"
+        and not str(active_item.branch_ref or "").strip()
+        and str(active_item.task_id or "") == str(active_epoch.active_task_id or "")
+        and str(active_item.backlog_id or "")
+        == str(runtime_context.backlog_id or "")
+        and str(active_item.target_ref or "")
+        == str(active_epoch.target_ref or "")
+    )
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-queue/materialize")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-queue")
 def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
@@ -43617,11 +43661,15 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
             target_ref=target_ref,
         )
         runtime_context = get_branch_context(conn, project_id, task_id)
-        if active_epoch is not None and (
-            runtime_context is None
-            or runtime_context.batch_id != active_epoch.batch_id
-            or merge_queue_id != active_epoch.merge_queue_id
-            or task_id != active_epoch.active_task_id
+        if active_epoch is not None and not (
+            _active_epoch_merge_queue_materialization_allowed(
+                conn,
+                active_epoch=active_epoch,
+                runtime_context=runtime_context,
+                project_id=project_id,
+                task_id=task_id,
+                merge_queue_id=merge_queue_id,
+            )
         ):
             return 409, {
                 "ok": False,

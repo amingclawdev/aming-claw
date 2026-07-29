@@ -17484,6 +17484,41 @@ def _durable_graph_epoch_dependencies(values: Sequence[str]) -> tuple[str, ...]:
     )
 
 
+def _rebind_merge_queue_task_dependencies(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    merge_queue_id: str,
+    previous_task_id: str,
+    materialized_task_id: str,
+    now_iso: str = "",
+) -> None:
+    """Keep queue dependency edges attached when a planned row binds a lane."""
+
+    previous = str(previous_task_id or "").strip()
+    materialized = str(materialized_task_id or "").strip()
+    if not previous or not materialized or previous == materialized:
+        return
+
+    def rebound(values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(materialized if value == previous else value for value in values)
+
+    for candidate in list_merge_queue_items(conn, project_id, merge_queue_id):
+        updated = replace(
+            candidate,
+            depends_on=rebound(candidate.depends_on),
+            hard_depends_on=rebound(candidate.hard_depends_on),
+            serializes_after=rebound(candidate.serializes_after),
+            conflicts_with=rebound(candidate.conflicts_with),
+            same_node_or_file_conflicts=rebound(
+                candidate.same_node_or_file_conflicts
+            ),
+            requires_graph_epoch=rebound(candidate.requires_graph_epoch),
+        )
+        if updated != candidate:
+            upsert_merge_queue_item(conn, updated, now_iso=now_iso)
+
+
 def queue_merge_item_for_branch_context(
     conn: sqlite3.Connection,
     *,
@@ -17523,9 +17558,14 @@ def queue_merge_item_for_branch_context(
     context = get_branch_context(conn, project_id, task_id)
     if context is None:
         raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
+    canonical_context_queue_id = str(context.merge_queue_id or "").strip()
+    if canonical_context_queue_id and canonical_context_queue_id != queue_id:
+        raise ValueError(
+            "merge_queue_id does not match the authoritative runtime context"
+        )
     postmerge_recovery = audited_postmerge_recovery_authority
-    resolved_queue_item_id = queue_item_id or f"{queue_id}:{task_id}"
-    existing_candidate_rows = conn.execute(
+    context_backlog_id = str(context.backlog_id or "").strip()
+    existing_task_rows = conn.execute(
         """
         SELECT queue_item_id
         FROM parallel_branch_merge_queue_items
@@ -17534,14 +17574,41 @@ def queue_merge_item_for_branch_context(
         """,
         (project_id, queue_id, task_id),
     ).fetchall()
-    if len(existing_candidate_rows) > 1:
-        raise ValueError("durable merge queue task identity is ambiguous")
+    existing_backlog_rows = (
+        conn.execute(
+            """
+            SELECT queue_item_id
+            FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND merge_queue_id = ? AND backlog_id = ?
+            ORDER BY queue_item_id
+            """,
+            (project_id, queue_id, context_backlog_id),
+        ).fetchall()
+        if context_backlog_id
+        else []
+    )
+    existing_candidate_ids = {
+        str(row["queue_item_id"] or "").strip()
+        for row in (*existing_task_rows, *existing_backlog_rows)
+        if str(row["queue_item_id"] or "").strip()
+    }
+    if len(existing_candidate_ids) > 1:
+        raise ValueError(
+            "durable merge queue task/backlog identity is ambiguous"
+        )
+    canonical_existing_id = next(iter(existing_candidate_ids), "")
+    requested_queue_item_id = str(queue_item_id or "").strip()
     if (
-        existing_candidate_rows
-        and str(existing_candidate_rows[0]["queue_item_id"] or "")
-        != resolved_queue_item_id
+        canonical_existing_id
+        and requested_queue_item_id
+        and requested_queue_item_id != canonical_existing_id
     ):
         raise ValueError("durable merge queue item identity changed")
+    resolved_queue_item_id = (
+        canonical_existing_id
+        or requested_queue_item_id
+        or f"{queue_id}:{task_id}"
+    )
     existing_item = (
         get_merge_queue_item(
             conn,
@@ -17549,9 +17616,31 @@ def queue_merge_item_for_branch_context(
             queue_id,
             resolved_queue_item_id,
         )
-        if existing_candidate_rows
+        if canonical_existing_id or requested_queue_item_id
         else None
     )
+    if existing_item is not None and (
+        (
+            existing_item.task_id != task_id
+            and (
+                not context_backlog_id
+                or existing_item.backlog_id != context_backlog_id
+            )
+        )
+        or (
+            context_backlog_id
+            and existing_item.backlog_id
+            and existing_item.backlog_id != context_backlog_id
+        )
+    ):
+        raise ValueError("durable merge queue item identity changed")
+    if (
+        existing_item is not None
+        and existing_item.queue_index
+        and queue_index
+        and existing_item.queue_index != queue_index
+    ):
+        raise ValueError("durable merge queue order changed")
     candidate_recovery = dependency_revalidation_candidate_authority
     if candidate_recovery is not None:
         if not isinstance(
@@ -17746,11 +17835,16 @@ def queue_merge_item_for_branch_context(
                 "server-resolved current target"
             )
         authoritative_validated_target_head = refreshed_target_head
+    rebound_planned_task_id = (
+        str(existing_item.task_id or "").strip()
+        if existing_item is not None and existing_item.task_id != task_id
+        else ""
+    )
     item = MergeQueueItem(
         project_id=project_id,
         merge_queue_id=queue_id,
         queue_item_id=resolved_queue_item_id,
-        backlog_id=str(context.backlog_id or ""),
+        backlog_id=context_backlog_id,
         recovery_mode=(
             AUDITED_POSTMERGE_RECOVERY_MODE
             if postmerge_recovery is not None
@@ -17763,15 +17857,68 @@ def queue_merge_item_for_branch_context(
         ),
         task_id=task_id,
         branch_ref=context.branch_ref,
-        queue_index=queue_index,
+        queue_index=(
+            existing_item.queue_index
+            if existing_item is not None and existing_item.queue_index
+            else queue_index
+        ),
         status=requested_status,
-        depends_on=tuple(depends_on or context.depends_on),
-        hard_depends_on=tuple(hard_depends_on),
-        serializes_after=tuple(serializes_after),
-        conflicts_with=tuple(conflicts_with),
-        same_node_or_file_conflicts=tuple(same_node_or_file_conflicts),
-        requires_graph_epoch=_durable_graph_epoch_dependencies(requires_graph_epoch),
-        target_ref=target_ref or context.ref_name or "refs/heads/main",
+        depends_on=tuple(
+            (
+                existing_item.depends_on
+                if existing_item is not None and existing_item.depends_on
+                else ()
+            )
+            or depends_on
+            or context.depends_on
+        ),
+        hard_depends_on=tuple(
+            (
+                existing_item.hard_depends_on
+                if existing_item is not None and existing_item.hard_depends_on
+                else ()
+            )
+            or hard_depends_on
+        ),
+        serializes_after=tuple(
+            (
+                existing_item.serializes_after
+                if existing_item is not None and existing_item.serializes_after
+                else ()
+            )
+            or serializes_after
+        ),
+        conflicts_with=tuple(
+            (
+                existing_item.conflicts_with
+                if existing_item is not None and existing_item.conflicts_with
+                else ()
+            )
+            or conflicts_with
+        ),
+        same_node_or_file_conflicts=tuple(
+            (
+                existing_item.same_node_or_file_conflicts
+                if existing_item is not None
+                and existing_item.same_node_or_file_conflicts
+                else ()
+            )
+            or same_node_or_file_conflicts
+        ),
+        requires_graph_epoch=_durable_graph_epoch_dependencies(
+            (
+                existing_item.requires_graph_epoch
+                if existing_item is not None and existing_item.requires_graph_epoch
+                else ()
+            )
+            or requires_graph_epoch
+        ),
+        target_ref=(
+            (existing_item.target_ref if existing_item is not None else "")
+            or target_ref
+            or context.ref_name
+            or "refs/heads/main"
+        ),
         base_commit=context.base_commit,
         branch_head=refreshed_branch_head,
         validated_target_head=authoritative_validated_target_head,
@@ -17782,6 +17929,23 @@ def queue_merge_item_for_branch_context(
         projection_id=context.projection_id,
     )
     saved_item = upsert_merge_queue_item(conn, item, now_iso=now_iso)
+    _rebind_merge_queue_task_dependencies(
+        conn,
+        project_id=project_id,
+        merge_queue_id=queue_id,
+        previous_task_id=rebound_planned_task_id,
+        materialized_task_id=task_id,
+        now_iso=now_iso,
+    )
+    saved_item = (
+        get_merge_queue_item(
+            conn,
+            project_id,
+            queue_id,
+            resolved_queue_item_id,
+        )
+        or saved_item
+    )
     next_context_status = (
         _finish_checkpoint_context_status_after_merge_queue_materialize(context)
         if require_finish_gate
@@ -17796,6 +17960,26 @@ def queue_merge_item_for_branch_context(
         target_head_commit=saved_item.current_target_head or context.target_head_commit,
     )
     saved_context = upsert_branch_context(conn, updated_context, now_iso=now_iso)
+    active_epoch = get_active_integration_epoch(
+        conn,
+        project_id,
+        merge_queue_id=queue_id,
+    )
+    if (
+        active_epoch is not None
+        and active_epoch.status == INTEGRATION_EPOCH_OPEN
+        and active_epoch.active_queue_item_id == saved_item.queue_item_id
+    ):
+        upsert_integration_epoch(
+            conn,
+            replace(
+                active_epoch,
+                active_task_id=saved_item.task_id,
+                active_backlog_id=saved_item.backlog_id,
+                active_checkpoint_id=saved_context.checkpoint_id,
+            ),
+            now_iso=now_iso,
+        )
     result = {
         "context": public_branch_context_to_dict(saved_context),
         "queue_item": merge_queue_item_to_dict(saved_item),
