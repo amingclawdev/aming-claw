@@ -70959,6 +70959,67 @@ def test_mf_parallel_dispatch_ticket_authority_rejects_ambiguous_dispatch():
     }
 
 
+def test_mf_parallel_dispatch_ticket_authority_projects_failed_qa_replacement():
+    old_dispatch = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "dispatch_bounded_worker",
+        "actor_role": "observer",
+        "payload": {
+            "runtime_context_id": "mfrctx-old-dispatch",
+            "task_id": "old-dispatch-worker",
+            "parent_task_id": "cex-failed-qa-dispatch-ticket",
+        },
+    }
+    failed_qa = {
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "evidence_kind": "independent_verification",
+        "actor_role": "qa",
+        "status": "failed",
+        "payload": {"status": "failed", "verdict": "FAIL"},
+    }
+    replacement = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "dispatch_bounded_worker",
+        "actor_role": "observer",
+        "payload": {
+            "runtime_context_id": "mfrctx-fresh-dispatch",
+            "task_id": "fresh-dispatch-worker",
+            "parent_task_id": "cex-failed-qa-dispatch-ticket",
+            "failed_qa_rework_dispatch_revision": {
+                "append_only_history_preserved": True,
+                "timeline_projection_authoritative": False,
+                "failed_qa_completed_line_index": 1,
+            },
+            "failed_qa_rework_dispatch_revision_authority": {
+                "source": "parallel_branch_allocate_failed_qa_rework",
+                "server_derived": True,
+                "failed_qa_completed_line_index": 1,
+            },
+        },
+    }
+
+    authority = server._contract_runtime_dispatch_ticket_authority(
+        {
+            "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+            "contract_execution_id": "cex-failed-qa-dispatch-ticket",
+            "completed_lines": [old_dispatch, failed_qa, replacement],
+        },
+        {"next_legal_action": {"line_id": "worker_read_runtime_guide"}},
+    )
+
+    assert authority["status"] == "projected"
+    assert authority["source_ref"].endswith(":completed_lines:2")
+    assert authority["next_legal_action"]["runtime_context_id"] == (
+        "mfrctx-fresh-dispatch"
+    )
+    assert authority["next_legal_action"]["task_id"] == (
+        "fresh-dispatch-worker"
+    )
+
+
 def test_mf_parallel_dispatch_ticket_authority_rejects_conflicting_route_identity():
     authority = server._contract_runtime_dispatch_ticket_authority(
         {
@@ -76551,6 +76612,386 @@ def test_fresh_failed_qa_context_read_receipt_persists_and_startup_discovers_it(
         line.get("line_id") == "worker_startup"
         for line in after_startup_record["completed_lines"]
     ) == before_worker_startup_count
+
+
+def test_failed_qa_fresh_allocate_appends_dispatch_then_initial_join_receipt_startup(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-FAILED-QA-FRESH-ALLOCATE-DISPATCH"
+    fresh_task_id = "failed-qa-fresh-dispatch-worker"
+    target_root = tmp_path / f"{fresh_task_id}-attempt-2"
+    head_commit = _init_test_git_repo(target_root)
+    subprocess.run(
+        ["git", "checkout", "-b", f"codex/{fresh_task_id}-attempt-2"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: target_root,
+    )
+    successor, old_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="failed-qa-fresh-dispatch-parent",
+        worker_task_id="failed-qa-fresh-dispatch-old-worker",
+        fence_token="fence-failed-qa-fresh-dispatch-old",
+        token="failed-qa-fresh-dispatch-old-token",
+        worktree_path=str(target_root),
+        target_project_root=str(target_root),
+        base_commit=head_commit,
+    )
+    old_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        old_context,
+        backlog_id=backlog_id,
+        fence_token="fence-failed-qa-fresh-dispatch-old",
+        graph_trace_id="gqt-failed-qa-fresh-dispatch-old-worker",
+        head_commit=head_commit,
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=contract_execution_id,
+        runtime_context=old_context,
+        parent_task_id=backlog_id,
+        graph_trace_id="gqt-failed-qa-fresh-dispatch-old-worker",
+        head_commit=head_commit,
+        implementation_event_ref=f"timeline:{old_events['implementation']}",
+    )
+
+    qa_trace_id = "gqt-failed-qa-fresh-dispatch-qa"
+    qa_evidence = _insert_exact_qa_graph_query_trace(
+        conn,
+        trace_id=qa_trace_id,
+        snapshot_id="scope-failed-qa-fresh-dispatch-qa",
+        candidate_commit_sha=head_commit,
+        backlog_id=backlog_id,
+        task_id=old_context.task_id,
+        target_project_root=str(target_root),
+        created_at="2026-07-29T22:00:00Z",
+    )
+    qa_graph = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa_graph_context",
+                "line_id": "qa_graph_context",
+                "evidence_kind": "graph_trace",
+                "graph_trace_ids": [qa_trace_id],
+                "db_verified": True,
+                "query_source": "qa",
+                "query_purpose": "independent_verification",
+                "payload": {
+                    "schema_version": "mf_parallel.qa_graph_context.v1",
+                    "graph_trace_ids": [qa_trace_id],
+                    "graph_trace_evidence": qa_evidence,
+                },
+            },
+        )
+    )
+    assert qa_graph["ok"] is True
+    failed_qa = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "runtime_context_id": old_context.runtime_context_id,
+                "task_id": old_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "payload": {
+                    "status": "failed",
+                    "verdict": "FAIL",
+                    "runtime_context_id": old_context.runtime_context_id,
+                    "task_id": old_context.task_id,
+                    "parent_task_id": backlog_id,
+                },
+                "verification": {
+                    "result": "failed",
+                    "verdict": "FAIL",
+                    "acceptance_failed": ["fresh_runtime_scope_required"],
+                },
+            },
+        )
+    )
+    assert failed_qa["ok"] is True
+
+    route_identity = {
+        "route_id": "route-failed-qa-fresh-dispatch",
+        "route_context_hash": _fake_sha("failed-qa-fresh-dispatch-route"),
+        "prompt_contract_id": "rprompt-failed-qa-fresh-dispatch",
+        "prompt_contract_hash": _fake_sha("failed-qa-fresh-dispatch-prompt"),
+        "visible_injection_manifest_hash": _fake_sha(
+            "failed-qa-fresh-dispatch-visible"
+        ),
+        "route_token_ref": "rtok-failed-qa-fresh-dispatch",
+    }
+    _persist_parallel_allocate_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        **route_identity,
+    )
+    conn.commit()
+    before_allocate = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    historical_dispatch = next(
+        copy.deepcopy(line)
+        for line in before_allocate["completed_lines"]
+        if line.get("line_id") == "observer_dispatch_bounded_workers"
+    )
+
+    allocate_body = {
+        "task_id": fresh_task_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "parent_task_id": contract_execution_id,
+        "root_task_id": contract_execution_id,
+        "stage_type": "failed_qa_rework",
+        "attempt": 2,
+        "workspace_root": str(target_root),
+        "worktree_root": str(target_root),
+        "target_project_root": str(target_root),
+        "base_commit": head_commit,
+        "target_head_commit": head_commit,
+        "merge_queue_id": f"mq-{fresh_task_id}",
+        "owned_files": ["agent/governance/server.py"],
+        "target_files": ["agent/governance/server.py"],
+        "allocation_owner": "observer",
+        "worker_id": fresh_task_id,
+        "worker_slot_id": fresh_task_id,
+        "create_worktree": False,
+        **route_identity,
+    }
+    runtime_class = type(server._contract_runtime(conn))
+    original_revision = runtime_class.revise_failed_qa_observer_dispatch
+    revision_attempts = 0
+
+    def reject_first_revision(self, *args, **kwargs):
+        nonlocal revision_attempts
+        revision_attempts += 1
+        if revision_attempts == 1:
+            return {
+                "ok": False,
+                "decision": {
+                    "ok": False,
+                    "errors": ["stale execution_state_revision"],
+                },
+                "record": self.store.get(contract_execution_id),
+            }
+        return original_revision(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        runtime_class,
+        "revise_failed_qa_observer_dispatch",
+        reject_first_revision,
+    )
+    with pytest.raises(GovernanceError) as rejected_allocate:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=allocate_body,
+            )
+        )
+    assert rejected_allocate.value.code == (
+        "parallel_branch_allocate_failed_qa_dispatch_revision_rejected"
+    )
+    assert rejected_allocate.value.details["allocation_transaction_rolled_back"] is True
+    assert rejected_allocate.value.details["allocation_retry_safe"] is True
+    assert rejected_allocate.value.details["next_legal_action"] == (
+        "retry_same_parallel_branch_allocate_request"
+    )
+    assert get_branch_context(conn, PID, fresh_task_id) is None
+    after_rejection = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    assert sum(
+        line.get("line_id") == "observer_dispatch_bounded_workers"
+        for line in after_rejection["completed_lines"]
+    ) == 1
+
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=allocate_body,
+        )
+    )
+    assert status == 201, allocated
+    revision = allocated["contract_runtime_dispatch_revision"]
+    assert revision["status"] == "revised"
+    assert revision["append_only_history_preserved"] is True
+    assert revision["timeline_projection_authoritative"] is False
+    fresh_context_id = allocated["context"]["runtime_context_id"]
+    fresh_context = get_branch_context(conn, PID, fresh_task_id)
+    assert fresh_context is not None
+    assert fresh_context.stage_type == "failed_qa_rework"
+    assert fresh_context.attempt == 2
+
+    after_allocate = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    dispatches = [
+        line
+        for line in after_allocate["completed_lines"]
+        if line.get("line_id") == "observer_dispatch_bounded_workers"
+    ]
+    assert len(dispatches) == 2
+    assert dispatches[0] == historical_dispatch
+    assert dispatches[1]["runtime_context_id"] == fresh_context_id
+    assert dispatches[1]["task_id"] == fresh_task_id
+    assert revision["source_ref"].endswith(
+        f":completed_lines:{len(after_allocate['completed_lines']) - 1}"
+    )
+    resolved_dispatch = server._contract_runtime_dispatch_identity_resolution(
+        after_allocate,
+        fresh_context,
+    )
+    assert resolved_dispatch["accepted"] is True
+    assert resolved_dispatch["runtime_context_id"] == fresh_context_id
+    assert resolved_dispatch["source_ref"] == revision["source_ref"]
+
+    joined = (
+        server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": fresh_task_id,
+                    "parent_task_id": contract_execution_id,
+                    "target_project_root": str(target_root),
+                    "agent_id": "host-failed-qa-fresh-dispatch",
+                    "actual_host_worker_id": (
+                        "host-failed-qa-fresh-dispatch"
+                    ),
+                    "worker_session_id": (
+                        "session-failed-qa-fresh-dispatch"
+                    ),
+                    "reason": (
+                        "fresh failed-QA scope requires first worker host envelope"
+                    ),
+                    **route_identity,
+                },
+            )
+        )
+    )
+    assert joined["ok"] is True
+    fresh_token = joined["session_token"]
+    fresh_fence = joined["fence_token"]
+    fresh_session_ref = joined["session_token_ref"]
+
+    receipt_hash = _fake_sha("failed-qa-fresh-dispatch-read")
+    read_response = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": fresh_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "contract_execution_id": contract_execution_id,
+                "parent_task_id": contract_execution_id,
+                "fence_token": fresh_fence,
+                "session_token": fresh_token,
+                "session_token_ref": fresh_session_ref,
+                "target_project_root": str(target_root),
+                "actor": fresh_task_id,
+                "read_receipt_hash": receipt_hash,
+                "launch_text_hash": _fake_sha(
+                    "failed-qa-fresh-dispatch-launch"
+                ),
+                **route_identity,
+            },
+        )
+    )
+    assert read_response["ok"] is True
+    read_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=fresh_task_id,
+        event_kind="mf_subagent_read_receipt",
+    )
+    assert len(read_events) == 1
+
+    startup = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": fresh_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": fresh_task_id,
+                "parent_task_id": contract_execution_id,
+                "contract_execution_id": contract_execution_id,
+                "session_token": fresh_token,
+                "session_token_ref": fresh_session_ref,
+                "fence_token": fresh_fence,
+                "agent_id": "host-failed-qa-fresh-dispatch",
+                "actual_host_worker_id": (
+                    "host-failed-qa-fresh-dispatch"
+                ),
+                "worker_session_id": "session-failed-qa-fresh-dispatch",
+                "worker_transcript_ref": (
+                    "codex:session-failed-qa-fresh-dispatch"
+                ),
+                "harness_type": "codex",
+                "filer_principal": "session-failed-qa-fresh-dispatch",
+                "actual_cwd": str(target_root),
+                "actual_git_root": str(target_root),
+                "branch": allocated["context"]["branch_ref"],
+                "branch_ref": allocated["context"]["branch_ref"],
+                "head_commit": head_commit,
+                "base_commit": head_commit,
+                "target_head_commit": head_commit,
+                "merge_queue_id": allocated["context"]["merge_queue_id"],
+                "owned_files": ["agent/governance/server.py"],
+                "read_receipt_hash": receipt_hash,
+                "read_receipt_event_id": str(read_events[0]["id"]),
+                "startup_source": "codex_desktop_governed_dispatch",
+                **route_identity,
+            },
+        )
+    )
+    assert startup["ok"] is True
+    startup_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=fresh_task_id,
+        event_kind="mf_subagent_startup",
+    )
+    assert len(startup_events) == 1
+    dispatch_identity = startup_events[0]["payload"][
+        "mf_subagent_startup_gate"
+    ]["contract_runtime_dispatch_identity"]
+    assert dispatch_identity["accepted"] is True
+    assert dispatch_identity["runtime_context_id"] == fresh_context_id
+    assert dispatch_identity["source_ref"] == revision["source_ref"]
+
+
 def test_runtime_context_read_receipt_rolls_back_contract_when_timeline_write_fails(
     conn,
     tmp_path,

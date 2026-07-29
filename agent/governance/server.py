@@ -11975,6 +11975,238 @@ def _parallel_branch_allocate_should_persist_contract_revision(
     return route_identity, revision_owned_files
 
 
+def _parallel_branch_allocate_failed_qa_dispatch_revision(
+    conn,
+    *,
+    project_id: str,
+    context,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Append fresh failed-QA dispatch authority during production allocate."""
+
+    contract_execution_id = _runtime_context_public_text(
+        body.get("contract_execution_id"),
+        body.get("successor_contract_execution_id"),
+        body.get("current_contract_execution_id"),
+    )
+    stage_type = str(
+        getattr(context, "stage_type", "") or body.get("stage_type") or ""
+    ).strip()
+    if (
+        not contract_execution_id
+        or stage_type != "failed_qa_rework"
+        or int(getattr(context, "attempt", 0) or body.get("attempt") or 0) < 2
+    ):
+        return {}
+
+    runtime = _contract_runtime(conn)
+    try:
+        record = runtime.store.get(contract_execution_id)
+    except ContractRuntimeError:
+        return {}
+    if (
+        not _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+        or str(record.get("project_id") or "") != str(project_id)
+        or str(record.get("backlog_id") or "")
+        != str(getattr(context, "backlog_id", "") or "")
+    ):
+        return {}
+
+    completed_lines = list(record.get("completed_lines") or [])
+    failed_qa_index = _active_failed_qa_line_index(
+        completed_lines,
+        source_record=record,
+    )
+    if failed_qa_index < 0:
+        return {}
+
+    route_identity = _parallel_branch_runtime_contract_route_identity(body)
+    owned_files = _runtime_context_public_file_values(
+        list(getattr(context, "owned_files", ()) or ())
+        or list(getattr(context, "target_files", ()) or ())
+    )
+    prior_dispatch_payload: dict[str, Any] = {}
+    for line in reversed(completed_lines):
+        if not isinstance(line, Mapping):
+            continue
+        if (
+            str(line.get("stage_id") or "") == "dispatch"
+            and str(line.get("line_id") or "")
+            == "observer_dispatch_bounded_workers"
+            and str(line.get("evidence_kind") or "")
+            == "dispatch_bounded_worker"
+        ):
+            prior_dispatch_payload = (
+                dict(line.get("payload"))
+                if isinstance(line.get("payload"), Mapping)
+                else {}
+            )
+            break
+
+    def _mapping_or_prior(field: str) -> dict[str, Any]:
+        requested = body.get(field)
+        if isinstance(requested, Mapping) and requested:
+            return dict(requested)
+        prior = prior_dispatch_payload.get(field)
+        return dict(prior) if isinstance(prior, Mapping) else {}
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(
+        getattr(context, "worker_id", "")
+        or getattr(context, "worker_slot_id", "")
+        or ""
+    ).strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    canonical = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "observer_command_id": contract_execution_id,
+        "target_project_root": str(
+            getattr(context, "target_project_root", "") or ""
+        ),
+        "worktree_path": str(getattr(context, "worktree_path", "") or ""),
+        "branch_ref": str(getattr(context, "branch_ref", "") or ""),
+        "base_commit": str(getattr(context, "base_commit", "") or ""),
+        "target_head_commit": str(
+            getattr(context, "target_head_commit", "") or ""
+        ),
+        "merge_queue_id": str(
+            getattr(context, "merge_queue_id", "") or ""
+        ),
+        "owned_files": owned_files,
+    }
+    payload = {
+        "schema_version": "mf_parallel.dispatch_bounded_worker.v1",
+        **canonical,
+        "profile_requirements": _mapping_or_prior("profile_requirements"),
+        "retry_policy": _mapping_or_prior("retry_policy"),
+        "route_identity": dict(route_identity),
+        **dict(route_identity),
+        "failed_qa_rework_dispatch_revision_authority": {
+            "schema_version": (
+                "parallel_branch_allocate.failed_qa_dispatch_revision_authority.v1"
+            ),
+            "source": "parallel_branch_allocate_failed_qa_rework",
+            "server_derived": True,
+            "contract_execution_id": contract_execution_id,
+            "failed_qa_completed_line_index": failed_qa_index,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "append_only_history_required": True,
+            "timeline_projection_authoritative": False,
+        },
+    }
+    write = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "actor_role": "observer",
+        "evidence_kind": "dispatch_bounded_worker",
+        **canonical,
+        **dict(route_identity),
+        "payload": payload,
+    }
+    write, dispatch_errors = _contract_runtime_bind_mf_parallel_dispatch_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        write=write,
+    )
+    if dispatch_errors:
+        raise GovernanceError(
+            "parallel_branch_allocate_failed_qa_dispatch_invalid",
+            (
+                "fresh failed-QA RuntimeContext allocation could not append "
+                "canonical ContractRuntime dispatch authority"
+            ),
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "errors": dispatch_errors,
+                "timeline_projection_authoritative": False,
+            },
+        )
+    result = runtime.revise_failed_qa_observer_dispatch(
+        contract_execution_id,
+        write,
+        actor_role="observer",
+    )
+    if not result.get("ok"):
+        decision = (
+            dict(result.get("decision"))
+            if isinstance(result.get("decision"), Mapping)
+            else {}
+        )
+        decision_errors = _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(decision, "errors")
+        )
+        retry_safe = "stale execution_state_revision" in decision_errors
+        raise GovernanceError(
+            "parallel_branch_allocate_failed_qa_dispatch_revision_rejected",
+            (
+                "fresh failed-QA RuntimeContext allocation was rejected by "
+                "canonical ContractRuntime dispatch revision"
+            ),
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "decision": decision,
+                "timeline_projection_authoritative": False,
+                "allocation_transaction_rolled_back": True,
+                "allocation_retry_safe": retry_safe,
+                "retry_identity": {
+                    "contract_execution_id": contract_execution_id,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                },
+                "next_legal_action": (
+                    "retry_same_parallel_branch_allocate_request"
+                    if retry_safe
+                    else "correct_dispatch_revision_rejection_then_retry"
+                ),
+                "contract_runtime_line_mutated": False,
+            },
+        )
+    stored = result.get("record") if isinstance(result.get("record"), Mapping) else {}
+    dispatch_match = _contract_runtime_dispatch_line_match(stored, context)
+    return {
+        "schema_version": (
+            "parallel_branch_allocate.failed_qa_dispatch_revision.v1"
+        ),
+        "ok": True,
+        "status": str(result.get("status") or "revised"),
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "execution_state_revision": int(
+            stored.get("execution_state_revision") or 0
+        ),
+        "contract_runtime_line_mutated": bool(
+            result.get("contract_runtime_line_mutated")
+        ),
+        "append_only_history_preserved": True,
+        "timeline_projection_authoritative": False,
+        "source_ref": str(dispatch_match.get("source_ref") or ""),
+    }
+
+
 def _parallel_branch_allocate_effective_route_body(
     conn,
     *,
@@ -12387,6 +12619,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     conn = get_connection(project_id)
     authority_revision: dict[str, Any] = {}
     runtime_contract_revision: dict[str, Any] = {}
+    contract_runtime_dispatch_revision: dict[str, Any] = {}
     route_identity_for_revision: dict[str, Any] = {}
     owned_files_for_revision: list[str] = []
     try:
@@ -12554,6 +12787,14 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 runtime_contract_revision = branch_contract_revision_to_dict(
                     revision
                 )
+            contract_runtime_dispatch_revision = (
+                _parallel_branch_allocate_failed_qa_dispatch_revision(
+                    conn,
+                    project_id=project_id,
+                    context=saved,
+                    body=effective_body,
+                )
+            )
             conn.commit()
 
         worktree_result: dict[str, Any] | None = None
@@ -12666,6 +12907,10 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         }
         if runtime_contract_revision:
             response["runtime_contract_revision"] = runtime_contract_revision
+        if contract_runtime_dispatch_revision:
+            response["contract_runtime_dispatch_revision"] = (
+                contract_runtime_dispatch_revision
+            )
         if authority_revision:
             response["authority_revision"] = authority_revision
         try:
@@ -12748,6 +12993,9 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         if same_owner_worker_session:
             response["same_owner_worker_session"] = same_owner_worker_session
         return 201, response
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -105249,10 +105497,70 @@ def _contract_runtime_dispatch_ticket_authority(
             ),
         }
     if len(dispatch_lines) != 1:
-        return {
-            "status": "invalid",
-            "error": "canonical ContractRuntime dispatch authority is ambiguous",
-        }
+        failed_qa_index = _active_failed_qa_line_index(
+            list(record.get("completed_lines") or []),
+            source_record=record,
+        )
+        failed_qa_replacements = []
+        for candidate in dispatch_lines:
+            candidate_index, _candidate_line, candidate_payload = candidate
+            revision = (
+                candidate_payload.get("failed_qa_rework_dispatch_revision")
+                if isinstance(
+                    candidate_payload.get(
+                        "failed_qa_rework_dispatch_revision"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+            revision_authority = (
+                candidate_payload.get(
+                    "failed_qa_rework_dispatch_revision_authority"
+                )
+                if isinstance(
+                    candidate_payload.get(
+                        "failed_qa_rework_dispatch_revision_authority"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+            if (
+                candidate_index > failed_qa_index >= 0
+                and revision.get("append_only_history_preserved") is True
+                and revision.get("timeline_projection_authoritative") is False
+                and int(
+                    revision.get("failed_qa_completed_line_index")
+                    if revision.get("failed_qa_completed_line_index")
+                    is not None
+                    else -1
+                )
+                == failed_qa_index
+                and revision_authority.get("server_derived") is True
+                and str(revision_authority.get("source") or "").strip()
+                == "parallel_branch_allocate_failed_qa_rework"
+                and int(
+                    revision_authority.get(
+                        "failed_qa_completed_line_index"
+                    )
+                    if revision_authority.get(
+                        "failed_qa_completed_line_index"
+                    )
+                    is not None
+                    else -1
+                )
+                == failed_qa_index
+            ):
+                failed_qa_replacements.append(candidate)
+        if len(failed_qa_replacements) != 1:
+            return {
+                "status": "invalid",
+                "error": (
+                    "canonical ContractRuntime dispatch authority is ambiguous"
+                ),
+            }
+        dispatch_lines = failed_qa_replacements
 
     dispatch_index, line, payload = dispatch_lines[0]
     actual_next = (

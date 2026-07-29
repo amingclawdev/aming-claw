@@ -550,3 +550,144 @@ def test_failed_qa_revision_prepares_guide_before_single_cas_update():
         for error in rejected_later_revision["decision"]["errors"]
     )
     assert store.update_calls == 1
+
+
+def test_failed_qa_fresh_dispatch_revision_is_append_only_single_cas_and_replay_safe():
+    historical_dispatch = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "actor_role": "observer",
+        "evidence_kind": "dispatch_bounded_worker",
+        "runtime_context_id": "mfrctx-original",
+        "task_id": "worker-original",
+        "parent_task_id": "cex-failed-qa-fresh-dispatch",
+        "worker_id": "worker-original",
+        "worker_slot_id": "worker-original",
+        "owned_files": ["agent/governance/server.py"],
+        "payload": {
+            "runtime_context_id": "mfrctx-original",
+            "task_id": "worker-original",
+            "parent_task_id": "cex-failed-qa-fresh-dispatch",
+            "worker_role": "mf_sub",
+        },
+    }
+    failed_qa = {
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "status": "failed",
+        "payload": {"status": "failed", "verdict": "FAIL"},
+    }
+    record = {
+        "contract_execution_id": "cex-failed-qa-fresh-dispatch",
+        "contract_id": "mf_parallel.v2",
+        "project_id": "project-failed-qa-fresh-dispatch",
+        "backlog_id": "backlog-failed-qa-fresh-dispatch",
+        "execution_state_revision": 11,
+        "completed_lines": [historical_dispatch, failed_qa],
+    }
+
+    class _SingleCasStore:
+        def __init__(self):
+            self.record = deepcopy(record)
+            self.update_calls = 0
+
+        def get(self, _contract_execution_id):
+            return deepcopy(self.record)
+
+        def update(
+            self,
+            _contract_execution_id,
+            updated,
+            *,
+            expected_revision=None,
+        ):
+            self.update_calls += 1
+            if self.update_calls > 1:
+                raise AssertionError("fresh dispatch revision must use one CAS")
+            assert expected_revision == 11
+            self.record = deepcopy(updated)
+            return deepcopy(self.record)
+
+    store = _SingleCasStore()
+    runtime = object.__new__(ContractRuntime)
+    runtime.store = store
+
+    def _record_view(source, *, actor_role=None, completed_lines=None, **_kwargs):
+        view = deepcopy(dict(source))
+        view["completed_lines"] = deepcopy(list(completed_lines or []))
+        view["runtime_guide"] = {
+            "next_legal_action": {
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "owner_role": "mf_sub",
+                "evidence_kind": "read_receipt",
+            }
+        }
+        view["precheck_decision"] = WriteGateDecision(ok=True).to_dict()
+        return view
+
+    runtime._record_view = _record_view
+    identity = {
+        "runtime_context_id": "mfrctx-replacement",
+        "task_id": "worker-replacement",
+        "parent_task_id": "cex-failed-qa-fresh-dispatch",
+        "worker_id": "worker-replacement",
+        "worker_slot_id": "worker-replacement",
+        "owned_files": [
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+        "route_token_ref": "rtok-replacement",
+    }
+    write = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "actor_role": "observer",
+        "evidence_kind": "dispatch_bounded_worker",
+        **identity,
+        "payload": {
+            **identity,
+            "worker_role": "mf_sub",
+            "failed_qa_rework_dispatch_revision_authority": {
+                "source": "parallel_branch_allocate_failed_qa_rework",
+                "server_derived": True,
+                "contract_execution_id": record["contract_execution_id"],
+                "failed_qa_completed_line_index": 1,
+                "runtime_context_id": identity["runtime_context_id"],
+                "task_id": identity["task_id"],
+            },
+        },
+    }
+
+    result = runtime.revise_failed_qa_observer_dispatch(
+        record["contract_execution_id"],
+        write,
+        actor_role="observer",
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "revised"
+    assert result["append_only_history_preserved"] is True
+    assert store.update_calls == 1
+    assert store.record["execution_state_revision"] == 12
+    assert len(store.record["completed_lines"]) == 3
+    assert store.record["completed_lines"][0] == historical_dispatch
+    replacement = store.record["completed_lines"][-1]
+    assert replacement["runtime_context_id"] == "mfrctx-replacement"
+    assert replacement["payload"]["failed_qa_rework_dispatch_revision"][
+        "timeline_projection_authoritative"
+    ] is False
+
+    exact_replay = runtime.revise_failed_qa_observer_dispatch(
+        record["contract_execution_id"],
+        write,
+        actor_role="observer",
+    )
+    assert exact_replay["ok"] is True
+    assert exact_replay["status"] == "already_completed"
+    assert exact_replay["contract_runtime_line_mutated"] is False
+    assert store.update_calls == 1
+    assert len(store.record["completed_lines"]) == 3
+    assert store.record["execution_state_revision"] == 12

@@ -6815,6 +6815,258 @@ class ContractRuntime:
             ],
         }
 
+    def revise_failed_qa_observer_dispatch(
+        self,
+        contract_execution_id: str,
+        write: Mapping[str, Any],
+        *,
+        actor_role: str | None = None,
+    ) -> dict[str, Any]:
+        """Append one source-backed dispatch for a fresh failed-QA rework lane.
+
+        Failed QA may prove that the original RuntimeContext fence is too
+        narrow.  Allocating the replacement context must not rewrite the
+        historical dispatch, and a timeline dispatch is not ContractRuntime
+        authority.  This narrow control-plane revision therefore appends one
+        observer-owned dispatch bound to the replacement context.  Exact
+        replay is mutation-free; conflicting reuse of the same replacement
+        identity is rejected.
+        """
+
+        effective_write = dict(write)
+        effective_actor_role = _effective_actor_role(
+            effective_write,
+            actor_role=actor_role,
+        )
+        if effective_actor_role:
+            effective_write["actor_role"] = effective_actor_role
+        _enrich_line_instance_fields(effective_write)
+
+        record = self.store.get(contract_execution_id)
+        lines = list(record.get("completed_lines") or [])
+        failed_qa_index = _active_failed_qa_line_index(
+            lines,
+            source_record=record,
+        )
+        payload = (
+            dict(effective_write.get("payload"))
+            if isinstance(effective_write.get("payload"), Mapping)
+            else {}
+        )
+        authority = (
+            dict(payload.get("failed_qa_rework_dispatch_revision_authority"))
+            if isinstance(
+                payload.get("failed_qa_rework_dispatch_revision_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        runtime_context_id = _worker_commit_text(
+            effective_write,
+            "runtime_context_id",
+        )
+        task_id = _worker_commit_text(effective_write, "task_id")
+        parent_task_id = _worker_commit_text(
+            effective_write,
+            "parent_task_id",
+        )
+        errors: list[str] = []
+        if _record_contract_id(record) not in {"mf_parallel", "mf_parallel.v2"}:
+            errors.append("failed-QA dispatch revision requires mf_parallel.v2")
+        if effective_actor_role != "observer":
+            errors.append("failed-QA dispatch revision requires actor_role=observer")
+        if str(effective_write.get("stage_id") or "").strip() != "dispatch":
+            errors.append("failed-QA dispatch revision requires stage_id=dispatch")
+        if (
+            str(effective_write.get("line_id") or "").strip()
+            != "observer_dispatch_bounded_workers"
+        ):
+            errors.append(
+                "failed-QA dispatch revision requires observer_dispatch_bounded_workers"
+            )
+        if (
+            str(effective_write.get("evidence_kind") or "").strip()
+            != "dispatch_bounded_worker"
+        ):
+            errors.append(
+                "failed-QA dispatch revision requires dispatch_bounded_worker evidence"
+            )
+        if failed_qa_index < 0:
+            errors.append(
+                "failed-QA dispatch revision requires active failed independent QA"
+            )
+        for field, value in (
+            ("runtime_context_id", runtime_context_id),
+            ("task_id", task_id),
+            ("parent_task_id", parent_task_id),
+        ):
+            if not value:
+                errors.append(f"failed-QA dispatch revision requires {field}")
+        if authority.get("server_derived") is not True or str(
+            authority.get("source") or ""
+        ).strip() != "parallel_branch_allocate_failed_qa_rework":
+            errors.append(
+                "failed-QA dispatch revision requires server-derived allocation authority"
+            )
+        if str(authority.get("contract_execution_id") or "").strip() != str(
+            contract_execution_id
+        ).strip():
+            errors.append(
+                "failed-QA dispatch revision contract_execution_id must match"
+            )
+        if int(
+            authority.get("failed_qa_completed_line_index")
+            if authority.get("failed_qa_completed_line_index") is not None
+            else -1
+        ) != int(failed_qa_index):
+            errors.append(
+                "failed-QA dispatch revision must bind the active failed QA line"
+            )
+        if str(authority.get("runtime_context_id") or "").strip() != (
+            runtime_context_id
+        ):
+            errors.append(
+                "failed-QA dispatch revision authority runtime_context_id must match"
+            )
+        if str(authority.get("task_id") or "").strip() != task_id:
+            errors.append(
+                "failed-QA dispatch revision authority task_id must match"
+            )
+
+        matching_dispatches: list[tuple[int, Mapping[str, Any]]] = []
+        for index, candidate in enumerate(lines):
+            if not isinstance(candidate, Mapping):
+                continue
+            if (
+                str(candidate.get("stage_id") or "").strip() != "dispatch"
+                or str(candidate.get("line_id") or "").strip()
+                != "observer_dispatch_bounded_workers"
+                or str(candidate.get("evidence_kind") or "").strip()
+                != "dispatch_bounded_worker"
+            ):
+                continue
+            if (
+                _worker_commit_text(candidate, "runtime_context_id")
+                == runtime_context_id
+                and _worker_commit_text(candidate, "task_id") == task_id
+            ):
+                matching_dispatches.append((index, candidate))
+
+        exact_replay = False
+        if matching_dispatches:
+            _matching_index, matched = matching_dispatches[-1]
+            exact_replay = (
+                _worker_commit_text(matched, "parent_task_id")
+                == parent_task_id
+                and _worker_commit_text(matched, "worker_id")
+                == _worker_commit_text(effective_write, "worker_id")
+                and _worker_commit_text(matched, "worker_slot_id")
+                == _worker_commit_text(effective_write, "worker_slot_id")
+                and sorted(
+                    set(_worker_commit_strings(matched, "owned_files"))
+                )
+                == sorted(
+                    set(
+                        _worker_commit_strings(
+                            effective_write,
+                            "owned_files",
+                        )
+                    )
+                )
+                and str(
+                    _first_deep_contract_value(
+                        matched,
+                        "route_token_ref",
+                    )
+                    or ""
+                ).strip()
+                == str(
+                    _first_deep_contract_value(
+                        effective_write,
+                        "route_token_ref",
+                    )
+                    or ""
+                ).strip()
+            )
+            if not exact_replay:
+                errors.append(
+                    "failed-QA dispatch revision conflicts with the existing "
+                    "replacement RuntimeContext dispatch"
+                )
+
+        if errors:
+            return {
+                "schema_version": "contract_runtime_write_result.v1",
+                "ok": False,
+                "decision": WriteGateDecision(
+                    ok=False,
+                    errors=tuple(dict.fromkeys(errors)),
+                ).to_dict(),
+                "record": record,
+            }
+        if exact_replay:
+            return {
+                "schema_version": "contract_runtime_write_result.v1",
+                "ok": True,
+                "status": "already_completed",
+                "decision": WriteGateDecision(ok=True).to_dict(),
+                "record": record,
+                "contract_runtime_line_mutated": False,
+                "completed_line_already_recorded": True,
+            }
+
+        payload["failed_qa_rework_dispatch_revision"] = {
+            "schema_version": (
+                "contract_runtime.failed_qa_rework_dispatch_revision.v1"
+            ),
+            "source": "parallel_branch_allocate",
+            "failed_qa_completed_line_index": failed_qa_index,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "append_only_history_preserved": True,
+            "timeline_projection_authoritative": False,
+        }
+        effective_write["payload"] = payload
+        written_line = _line_evidence_from_write(
+            effective_write,
+            effective_actor_role,
+        )
+        completed_lines = [*lines, written_line]
+        expected_revision = int(record.get("execution_state_revision") or 1)
+        candidate = dict(record)
+        candidate["completed_lines"] = completed_lines
+        candidate["execution_state_revision"] = expected_revision + 1
+        prepared = self._record_view(
+            candidate,
+            actor_role=effective_actor_role,
+            completed_lines=completed_lines,
+        )
+        try:
+            self.store.update(
+                contract_execution_id,
+                prepared,
+                expected_revision=expected_revision,
+            )
+        except ContractRuntimeError as exc:
+            return {
+                "schema_version": "contract_runtime_write_result.v1",
+                "ok": False,
+                "decision": WriteGateDecision(
+                    ok=False,
+                    errors=(str(exc),),
+                ).to_dict(),
+                "record": self.store.get(contract_execution_id),
+            }
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": True,
+            "status": "revised",
+            "decision": WriteGateDecision(ok=True).to_dict(),
+            "record": self.store.get(contract_execution_id),
+            "contract_runtime_line_mutated": True,
+            "append_only_history_preserved": True,
+        }
+
     def revise_precommit_worker_implementation(
         self,
         contract_execution_id: str,
