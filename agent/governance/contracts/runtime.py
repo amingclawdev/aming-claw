@@ -4203,7 +4203,8 @@ def _worker_commit_completed_implementation(
     runtime_context_id: str,
     task_id: str,
 ) -> Mapping[str, Any] | None:
-    for line in reversed(list(record.get("completed_lines") or [])):
+    lines = list(record.get("completed_lines") or [])
+    for index, line in reversed(list(enumerate(lines))):
         if not isinstance(line, Mapping):
             continue
         if str(line.get("line_id") or "").strip() != "worker_implementation":
@@ -4213,6 +4214,12 @@ def _worker_commit_completed_implementation(
         if runtime_context_id and line_runtime_context_id != runtime_context_id:
             continue
         if task_id and line_task_id != task_id:
+            continue
+        if not _line_status_allows_contract_completion(
+            line,
+            source_record=record,
+            source_line_index=index,
+        ):
             continue
         return line
     return None
@@ -4467,6 +4474,14 @@ def _line_status_allows_contract_completion(
     if _mapping_own_fields_contain_contract_completion_blocker(line):
         return False
     line_id = str(line.get("line_id") or "").strip()
+    canonical_rework_baseline = bool(
+        line_id == "worker_implementation"
+        and _worker_implementation_canonical_baseline_completion(
+            line,
+            source_record=source_record,
+            source_line_index=source_line_index,
+        )
+    )
     canonical_no_pass = bool(
         line_id == "qa_independent_verification"
         and _qa_independent_verification_canonical_no_pass_completion(
@@ -4477,8 +4492,9 @@ def _line_status_allows_contract_completion(
     )
     if _contains_contract_completion_blocker(line.get("qa_evidence_provenance")):
         return False
-    if not canonical_no_pass and _contains_contract_completion_blocker(
-        line.get("verification")
+    if (
+        not (canonical_no_pass or canonical_rework_baseline)
+        and _contains_contract_completion_blocker(line.get("verification"))
     ):
         return False
     if line_id == "qa_independent_verification":
@@ -4516,6 +4532,247 @@ def _line_status_allows_contract_completion(
         if _qa_independent_verification_summary_reports_failure(line):
             return False
     return True
+
+
+def _worker_implementation_canonical_baseline_completion(
+    line: Mapping[str, Any],
+    *,
+    source_record: Mapping[str, Any] | None,
+    source_line_index: int,
+) -> bool:
+    """Accept one persisted, server-verified failed-QA baseline rework line.
+
+    Positive historical failures are completion-satisfying only when they are
+    bound to the canonical failed-QA rework authority and exactly reproduce an
+    immutable positive baseline with zero candidate-new failures.  The source
+    membership requirement keeps generic counts-only implementation lines from
+    becoming completion authority.
+    """
+
+    if not isinstance(source_record, Mapping):
+        return False
+    persisted_index = _source_record_completed_line_index(line, source_record)
+    if persisted_index < 0 or source_line_index != persisted_index:
+        return False
+    lines = source_record.get("completed_lines")
+    if not isinstance(lines, list) or persisted_index >= len(lines):
+        return False
+
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    revision = (
+        payload.get("canonical_rework_lineage_revision")
+        if isinstance(payload.get("canonical_rework_lineage_revision"), Mapping)
+        else {}
+    )
+    authority = (
+        payload.get("canonical_rework_lineage_revision_authority")
+        if isinstance(
+            payload.get("canonical_rework_lineage_revision_authority"), Mapping
+        )
+        else {}
+    )
+    rejoin = (
+        payload.get("failed_qa_revision_rejoin_marker")
+        if isinstance(payload.get("failed_qa_revision_rejoin_marker"), Mapping)
+        else {}
+    )
+    graph = (
+        payload.get("graph_trace_db_evidence")
+        if isinstance(payload.get("graph_trace_db_evidence"), Mapping)
+        else {}
+    )
+    provenance = (
+        payload.get("worker_evidence_provenance")
+        if isinstance(payload.get("worker_evidence_provenance"), Mapping)
+        else {}
+    )
+    execution_id = str(source_record.get("contract_execution_id") or "").strip()
+    runtime_context_id = _worker_commit_text(line, "runtime_context_id")
+    task_id = _worker_commit_text(line, "task_id")
+    parent_task_id = _worker_commit_text(line, "parent_task_id")
+    commit_sha = str(line.get("commit_sha") or "").strip().lower()
+    revision_event_ref = str(revision.get("revision_event_ref") or "").strip()
+    try:
+        failed_qa_index = int(revision.get("failed_qa_completed_line_index"))
+    except (TypeError, ValueError):
+        return False
+    failed_qa_ref = (
+        f"contract_runtime:{execution_id}:completed_lines:{failed_qa_index}"
+    )
+    if not (
+        _record_contract_id(source_record) in {"mf_parallel", "mf_parallel.v2"}
+        and execution_id
+        and 0 <= failed_qa_index < persisted_index
+        and str(lines[failed_qa_index].get("line_id") or "").strip()
+        == "qa_independent_verification"
+        and not _line_status_allows_contract_completion(
+            lines[failed_qa_index],
+            source_record=source_record,
+            source_line_index=failed_qa_index,
+        )
+        and str(line.get("actor_role") or "").strip() == "mf_sub"
+        and str(line.get("evidence_kind") or "").strip() == "implementation"
+        and str(line.get("status") or "").strip().lower() == "completed"
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha)
+        and str(revision.get("schema_version") or "")
+        == "contract_runtime.worker_implementation_rework_revision.v1"
+        and str(revision.get("source") or "")
+        == "server_verified_failed_qa_rework"
+        and revision.get("append_only_history_preserved") is True
+        and str(revision.get("commit_sha") or "").strip().lower() == commit_sha
+        and re.fullmatch(r"timeline:[1-9][0-9]*", revision_event_ref)
+        and str(authority.get("schema_version") or "")
+        == "runtime_context.clean_cumulative_git_revision_authority.v1"
+        and str(authority.get("source") or "")
+        == "runtime_context_clean_cumulative_git_revision"
+        and authority.get("server_derived") is True
+        and authority.get("clean_worktree") is True
+        and str(authority.get("actual_head_commit") or "").strip().lower()
+        == commit_sha
+        and str(authority.get("revision_event_ref") or "").strip()
+        == revision_event_ref
+        and str(authority.get("failed_qa_source_ref") or "").strip()
+        == failed_qa_ref
+        and str(rejoin.get("schema_version") or "")
+        == "contract_runtime.failed_qa_revision_rejoin_marker.v1"
+        and str(rejoin.get("source") or "")
+        == "accepted_runtime_context_rejoin_event"
+        and rejoin.get("evidence_backfill") is False
+        and str(rejoin.get("contract_execution_id") or "").strip()
+        == execution_id
+        and str(rejoin.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(rejoin.get("task_id") or "").strip() == task_id
+        and str(rejoin.get("parent_task_id") or "").strip() == parent_task_id
+        and str(rejoin.get("revision_event_ref") or "").strip()
+        == revision_event_ref
+        and str(rejoin.get("failed_qa_source") or "")
+        == "contract_runtime_completed_lines"
+        and str(rejoin.get("failed_qa_source_ref") or "").strip()
+        == failed_qa_ref
+        and str(graph.get("schema_version") or "")
+        == "mf_subagent_graph_trace_db_evidence.v1"
+        and graph.get("db_verified") is True
+        and not list(graph.get("missing_trace_ids") or [])
+        and not list(graph.get("identity_mismatches") or [])
+        and str(graph.get("query_source") or "") == "mf_subagent"
+        and str(graph.get("worker_role") or "") == "mf_sub"
+        and str(graph.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(graph.get("task_id") or "").strip() == task_id
+        and str(graph.get("parent_task_id") or "").strip() == parent_task_id
+        and str(provenance.get("schema_version") or "")
+        == "contract_runtime.worker_evidence_provenance.v1"
+        and str(provenance.get("source") or "")
+        == "runtime_context_copy_safe_worker_proof"
+        and provenance.get("verified") is True
+        and provenance.get("worker_owned") is True
+        and str(provenance.get("worker_role") or "") == "mf_sub"
+        and str(provenance.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(provenance.get("task_id") or "").strip() == task_id
+    ):
+        return False
+
+    trace_ids = _qa_no_pass_failure_identities(payload.get("graph_trace_ids"))
+    verified_trace_ids = _qa_no_pass_failure_identities(
+        graph.get("verified_trace_ids")
+    )
+    requested_trace_ids = _qa_no_pass_failure_identities(
+        graph.get("requested_trace_ids")
+    )
+    if not (trace_ids and trace_ids == verified_trace_ids == requested_trace_ids):
+        return False
+
+    count_sources: list[Mapping[str, Any]] = []
+    for raw_source in (
+        line.get("test_results"),
+        line.get("verification"),
+        payload.get("test_results"),
+        payload.get("verification"),
+    ):
+        if not isinstance(raw_source, Mapping):
+            continue
+        affected = raw_source.get("affected_suite")
+        count_sources.append(
+            affected if isinstance(affected, Mapping) else raw_source
+        )
+    for test in payload.get("tests") or []:
+        if isinstance(test, Mapping) and (
+            str(test.get("name") or "") == "affected_suite_baseline_compare"
+            or str(test.get("status") or "") == "baseline_matched"
+        ):
+            count_sources.append(test)
+
+    count_tuples: list[tuple[int, int, int]] = []
+    baseline_identity_sets: list[tuple[str, ...]] = []
+    candidate_identity_sets: list[tuple[str, ...]] = []
+    for source in count_sources:
+        count_tuple = _worker_implementation_baseline_counts(source)
+        if count_tuple is not None:
+            count_tuples.append(count_tuple)
+        for key in (
+            "baseline_failure_node_ids",
+            "baseline_failure_identities",
+            "base_failure_node_ids",
+            "base_failure_identities",
+        ):
+            if key in source:
+                baseline_identity_sets.append(
+                    _qa_no_pass_failure_identities(source.get(key))
+                )
+        for key in (
+            "candidate_failure_node_ids",
+            "candidate_failure_identities",
+        ):
+            if key in source:
+                candidate_identity_sets.append(
+                    _qa_no_pass_failure_identities(source.get(key))
+                )
+    if not (
+        len(count_tuples) >= 2
+        and all(
+            baseline > 0 and candidate == baseline and candidate_new == 0
+            for baseline, candidate, candidate_new in count_tuples
+        )
+        and len(set(count_tuples)) == 1
+    ):
+        return False
+    if baseline_identity_sets or candidate_identity_sets:
+        if not (
+            baseline_identity_sets
+            and candidate_identity_sets
+            and all(baseline_identity_sets)
+            and all(candidate_identity_sets)
+            and len(set(baseline_identity_sets + candidate_identity_sets)) == 1
+        ):
+            return False
+    return True
+
+
+def _worker_implementation_baseline_counts(
+    value: Mapping[str, Any],
+) -> tuple[int, int, int] | None:
+    aliases = (
+        ("baseline_failed", "base_failed"),
+        ("candidate_failed", "affected_suite_failed", "failed"),
+        (
+            "candidate_new_failures",
+            "candidate_specific_new_failures",
+            "new_failures",
+        ),
+    )
+    selected: list[Any] = []
+    for names in aliases:
+        selected.append(next((value[name] for name in names if name in value), None))
+    if all(item is None for item in selected):
+        return None
+    if not all(
+        isinstance(item, int) and not isinstance(item, bool)
+        for item in selected
+    ):
+        return (-1, -1, -1)
+    return tuple(selected)  # type: ignore[return-value]
 
 
 _QA_NO_PASS_LEDGER_SCHEMA_VERSION = (

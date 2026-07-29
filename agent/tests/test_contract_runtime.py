@@ -8,7 +8,9 @@ from agent.governance.contracts.runtime import (
     ContractRuntime,
     WriteGateDecision,
     _active_failed_qa_line,
+    _contract_completion_satisfying_lines,
     _line_status_allows_contract_completion,
+    _worker_commit_completed_implementation,
 )
 
 
@@ -153,6 +155,272 @@ def test_accepted_no_pass_count_mismatch_is_active_failed_qa():
     )
     assert failed_index == 0
     assert failed_line is line
+
+
+def _partial_rework_baseline_record() -> dict:
+    execution_id = "cex-partial-rework-baseline"
+    runtime_context_id = "mfrctx-partial-rework-baseline"
+    task_id = "worker-partial-rework-baseline"
+    commit_sha = "b" * 40
+    revision_event_ref = "timeline:19032"
+    failed_qa_ref = (
+        f"contract_runtime:{execution_id}:completed_lines:10"
+    )
+    trace_ids = [
+        "gqt-partial-rework-baseline-a",
+        "gqt-partial-rework-baseline-b",
+    ]
+    affected_suite = {
+        "baseline_failed": 43,
+        "failed": 43,
+        "new_failures": 0,
+        "passed": 981,
+    }
+    canonical = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "actor_role": "mf_sub",
+        "evidence_kind": "implementation",
+        "status": "completed",
+        "commit_sha": commit_sha,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": execution_id,
+        "payload": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": execution_id,
+            "graph_trace_ids": trace_ids,
+            "canonical_rework_lineage_revision": {
+                "schema_version": (
+                    "contract_runtime.worker_implementation_rework_revision.v1"
+                ),
+                "source": "server_verified_failed_qa_rework",
+                "failed_qa_completed_line_index": 10,
+                "revision_event_ref": revision_event_ref,
+                "commit_sha": commit_sha,
+                "append_only_history_preserved": True,
+            },
+            "canonical_rework_lineage_revision_authority": {
+                "schema_version": (
+                    "runtime_context.clean_cumulative_git_revision_authority.v1"
+                ),
+                "source": "runtime_context_clean_cumulative_git_revision",
+                "server_derived": True,
+                "clean_worktree": True,
+                "actual_head_commit": commit_sha,
+                "revision_event_ref": revision_event_ref,
+                "failed_qa_source_ref": failed_qa_ref,
+            },
+            "failed_qa_revision_rejoin_marker": {
+                "schema_version": (
+                    "contract_runtime.failed_qa_revision_rejoin_marker.v1"
+                ),
+                "source": "accepted_runtime_context_rejoin_event",
+                "evidence_backfill": False,
+                "contract_execution_id": execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": execution_id,
+                "revision_event_ref": revision_event_ref,
+                "failed_qa_source": "contract_runtime_completed_lines",
+                "failed_qa_source_ref": failed_qa_ref,
+            },
+            "graph_trace_db_evidence": {
+                "schema_version": "mf_subagent_graph_trace_db_evidence.v1",
+                "db_verified": True,
+                "missing_trace_ids": [],
+                "identity_mismatches": [],
+                "query_source": "mf_subagent",
+                "worker_role": "mf_sub",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": execution_id,
+                "requested_trace_ids": trace_ids,
+                "verified_trace_ids": trace_ids,
+            },
+            "worker_evidence_provenance": {
+                "schema_version": (
+                    "contract_runtime.worker_evidence_provenance.v1"
+                ),
+                "source": "runtime_context_copy_safe_worker_proof",
+                "verified": True,
+                "worker_owned": True,
+                "worker_role": "mf_sub",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+            },
+            "tests": [
+                {
+                    "name": "affected_suite_baseline_compare",
+                    "status": "baseline_matched",
+                    **affected_suite,
+                }
+            ],
+        },
+        "verification": {"affected_suite": dict(affected_suite)},
+    }
+    duplicate = deepcopy(canonical)
+    duplicate["payload"].pop("canonical_rework_lineage_revision")
+    duplicate["payload"].pop(
+        "canonical_rework_lineage_revision_authority"
+    )
+    duplicate["payload"].pop("failed_qa_revision_rejoin_marker")
+    duplicate["test_results"] = {
+        "baseline_failed": 43,
+        "affected_suite_failed": 43,
+        "new_failures": 0,
+    }
+    padding = [
+        {
+            "stage_id": "historical",
+            "line_id": f"historical_{index}",
+            "actor_role": "observer",
+            "evidence_kind": "historical_context",
+            "status": "accepted",
+        }
+        for index in range(10)
+    ]
+    failed_qa = {
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "status": "failed",
+        "payload": {"status": "failed", "verdict": "FAIL"},
+    }
+    return {
+        "schema_version": "contract_runtime_execution_record.v1",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-PARTIAL-REWORK-BASELINE",
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [*padding, failed_qa, canonical, duplicate],
+    }
+
+
+def test_partial_rework_baseline_selects_canonical_line_before_duplicate():
+    record = _partial_rework_baseline_record()
+    lines = record["completed_lines"]
+    canonical = lines[11]
+    duplicate = lines[12]
+
+    assert _line_status_allows_contract_completion(
+        canonical,
+        source_record=record,
+        source_line_index=11,
+    )
+    assert not _line_status_allows_contract_completion(
+        duplicate,
+        source_record=record,
+        source_line_index=12,
+    )
+    assert _worker_commit_completed_implementation(
+        record,
+        runtime_context_id="mfrctx-partial-rework-baseline",
+        task_id="worker-partial-rework-baseline",
+    ) is canonical
+    satisfying = _contract_completion_satisfying_lines(
+        lines,
+        source_record=record,
+    )
+    assert canonical in satisfying
+    assert duplicate not in satisfying
+    assert len(record["completed_lines"]) == 13
+
+
+def test_clean_worker_implementation_still_selects_latest_completion():
+    runtime_context_id = "mfrctx-clean-worker-implementation"
+    task_id = "clean-worker-implementation"
+    earlier = {
+        "line_id": "worker_implementation",
+        "actor_role": "mf_sub",
+        "evidence_kind": "implementation",
+        "status": "completed",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "commit_sha": "a" * 40,
+        "verification": {"passed": True, "failed": 0},
+    }
+    latest = {
+        **earlier,
+        "commit_sha": "b" * 40,
+        "verification": {"passed": True, "failed": 0, "new_failures": 0},
+    }
+    record = {
+        "contract_execution_id": "cex-clean-worker-implementation",
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [earlier, latest],
+    }
+
+    assert _worker_commit_completed_implementation(
+        record,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    ) is latest
+
+
+def test_partial_rework_baseline_fails_closed_on_counts_or_identity_drift():
+    record = _partial_rework_baseline_record()
+    canonical = record["completed_lines"][11]
+    affected_sources = (
+        canonical["payload"]["tests"][0],
+        canonical["verification"]["affected_suite"],
+    )
+    for source in affected_sources:
+        source["baseline_failure_identities"] = [
+            "test_inherited_a",
+            "test_inherited_b",
+        ]
+        source["candidate_failure_identities"] = [
+            "test_inherited_a",
+            "test_inherited_b",
+        ]
+    assert _line_status_allows_contract_completion(
+        canonical,
+        source_record=record,
+        source_line_index=11,
+    )
+
+    identity_drift = deepcopy(record)
+    identity_drift["completed_lines"][11]["verification"]["affected_suite"][
+        "candidate_failure_identities"
+    ] = ["test_inherited_a", "test_candidate_new"]
+    assert not _line_status_allows_contract_completion(
+        identity_drift["completed_lines"][11],
+        source_record=identity_drift,
+        source_line_index=11,
+    )
+
+    count_drift = deepcopy(record)
+    count_drift["completed_lines"][11]["verification"]["affected_suite"][
+        "failed"
+    ] = 44
+    assert not _line_status_allows_contract_completion(
+        count_drift["completed_lines"][11],
+        source_record=count_drift,
+        source_line_index=11,
+    )
+
+    candidate_new = deepcopy(record)
+    candidate_new["completed_lines"][11]["payload"]["tests"][0][
+        "new_failures"
+    ] = 1
+    assert not _line_status_allows_contract_completion(
+        candidate_new["completed_lines"][11],
+        source_record=candidate_new,
+        source_line_index=11,
+    )
+
+    forged_authority = deepcopy(record)
+    forged_authority["completed_lines"][11]["payload"][
+        "canonical_rework_lineage_revision_authority"
+    ]["server_derived"] = False
+    assert not _line_status_allows_contract_completion(
+        forged_authority["completed_lines"][11],
+        source_record=forged_authority,
+        source_line_index=11,
+    )
 
 
 def _synthetic_later_qa_pass(*, summary: str) -> dict:
