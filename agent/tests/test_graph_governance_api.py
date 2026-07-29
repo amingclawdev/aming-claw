@@ -81,14 +81,18 @@ from agent.governance.parallel_branch_runtime import (
     STATE_MERGED,
     STATE_VALIDATED,
     STATE_WORKTREE_READY,
+    advance_integration_epoch_after_merge,
     append_branch_contract_revision,
     build_runtime_context_action_plan_view,
     build_runtime_context_lane_plan_view,
+    decide_persisted_merge_queue,
     get_branch_context,
+    get_integration_epoch,
     get_merge_queue_item,
     get_latest_branch_contract_revision,
     list_merge_queue_items,
     mf_subagent_session_token_hash,
+    open_or_validate_integration_epoch,
     queue_merge_item_for_branch_context,
     record_merge_queue_result,
     runtime_context_id_for_branch_context,
@@ -90927,6 +90931,222 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
         runtime_context_id_for_branch_context(batch_context)
     )
     assert "contract_merge_authority" not in batch_scope
+
+
+def test_batch_merge_queue_binds_finish_lanes_to_planned_order_and_epoch(conn):
+    batch_id = "mf-batch-parallel-order-binding"
+    merge_queue_id = "mq-batch-order-binding"
+    parent_backlog_id = "AC-BATCH-ORDER-BINDING"
+    row_backlog_ids = ("AC-BATCH-ORDER-ROW-1", "AC-BATCH-ORDER-ROW-2")
+    planned_task_ids = (
+        f"{batch_id}:row:1",
+        f"{batch_id}:row:2",
+    )
+    runtime_task_ids = (
+        "cex-batch-order-row-1",
+        "cex-batch-order-row-2",
+    )
+    queue_item_ids = ("mqitem-batch-order-1", "mqitem-batch-order-2")
+    target_head = "a" * 40
+    first_merge_head = "b" * 40
+    final_merge_head = "c" * 40
+
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=queue_item_ids[0],
+                backlog_id=row_backlog_ids[0],
+                task_id=planned_task_ids[0],
+                branch_ref="",
+                queue_index=1,
+                status="planned",
+                target_ref="refs/heads/main",
+                base_commit=target_head,
+                current_target_head=target_head,
+            ),
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=queue_item_ids[1],
+                backlog_id=row_backlog_ids[1],
+                task_id=planned_task_ids[1],
+                branch_ref="",
+                queue_index=2,
+                status="planned",
+                depends_on=(planned_task_ids[0],),
+                target_ref="refs/heads/main",
+                base_commit=target_head,
+                current_target_head=target_head,
+            ),
+        ],
+    )
+    runtime_contexts = []
+    for index, (backlog_id, task_id) in enumerate(
+        zip(row_backlog_ids, runtime_task_ids, strict=True),
+        start=1,
+    ):
+        runtime_contexts.append(
+            upsert_branch_context(
+                conn,
+                BranchTaskRuntimeContext(
+                    project_id=PID,
+                    batch_id=batch_id,
+                    backlog_id=backlog_id,
+                    parent_task_id=batch_id,
+                    task_id=task_id,
+                    branch_ref=f"refs/heads/codex/{task_id}",
+                    status="merge_ready",
+                    checkpoint_id=f"checkpoint-row-{index}",
+                    merge_queue_id=merge_queue_id,
+                    base_commit=target_head,
+                    head_commit=chr(ord("d") + index - 1) * 40,
+                    target_head_commit=target_head,
+                ),
+            )
+        )
+    task_timeline.ensure_schema(conn)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=parent_backlog_id,
+        task_id=batch_id,
+        event_type="mf_batch_parallel.entered",
+        event_kind="contract_binding",
+        phase="orchestration",
+        status="accepted",
+        actor="observer",
+        payload={
+            "batch_id": batch_id,
+            "merge_queue_id": merge_queue_id,
+            "backlog_id": parent_backlog_id,
+        },
+    )
+    conn.commit()
+
+    first_result = queue_merge_item_for_branch_context(
+        conn,
+        project_id=PID,
+        task_id=runtime_task_ids[0],
+        merge_queue_id=merge_queue_id,
+        status="merge_ready",
+        current_target_head=target_head,
+    )
+    assert first_result["queue_item"]["queue_item_id"] == queue_item_ids[0]
+    after_first = list_merge_queue_items(conn, PID, merge_queue_id)
+    assert len(after_first) == 2
+    assert [item.queue_index for item in after_first] == [1, 2]
+    assert after_first[0].task_id == runtime_task_ids[0]
+    assert after_first[0].branch_ref == runtime_contexts[0].branch_ref
+    assert after_first[1].depends_on == (runtime_task_ids[0],)
+
+    epoch = open_or_validate_integration_epoch(
+        conn,
+        item=after_first[0],
+        batch_id=batch_id,
+        target_head=target_head,
+        checkpoint_id=runtime_contexts[0].checkpoint_id,
+    )
+    upsert_merge_queue_item(
+        conn,
+        replace(
+            after_first[0],
+            status=STATE_MERGED,
+            merge_commit=first_merge_head,
+            target_head_before_merge=target_head,
+            target_head_after_merge=first_merge_head,
+            current_target_head=first_merge_head,
+        ),
+    )
+    epoch = advance_integration_epoch_after_merge(
+        conn,
+        project_id=PID,
+        batch_id=batch_id,
+        queue_item_id=queue_item_ids[0],
+        merge_commit=first_merge_head,
+    )
+    assert epoch.active_queue_item_id == queue_item_ids[1]
+    assert epoch.active_task_id == planned_task_ids[1]
+    assert server._active_epoch_merge_queue_materialization_allowed(
+        conn,
+        active_epoch=epoch,
+        runtime_context=runtime_contexts[1],
+        project_id=PID,
+        task_id=runtime_task_ids[1],
+        merge_queue_id=merge_queue_id,
+    )
+    assert not server._active_epoch_merge_queue_materialization_allowed(
+        conn,
+        active_epoch=epoch,
+        runtime_context=runtime_contexts[1],
+        project_id=PID,
+        task_id=runtime_task_ids[1],
+        merge_queue_id="mq-route-local-must-not-replace-runtime",
+    )
+    with pytest.raises(
+        ValueError,
+        match="authoritative runtime context",
+    ):
+        queue_merge_item_for_branch_context(
+            conn,
+            project_id=PID,
+            task_id=runtime_task_ids[1],
+            merge_queue_id="mq-route-local-must-not-replace-runtime",
+            status="merge_ready",
+        )
+
+    second_result = queue_merge_item_for_branch_context(
+        conn,
+        project_id=PID,
+        task_id=runtime_task_ids[1],
+        merge_queue_id=merge_queue_id,
+        status="merge_ready",
+        current_target_head=first_merge_head,
+    )
+    assert second_result["queue_item"]["queue_item_id"] == queue_item_ids[1]
+    after_second = list_merge_queue_items(conn, PID, merge_queue_id)
+    assert len(after_second) == 2
+    assert [item.queue_index for item in after_second] == [1, 2]
+    assert [item.task_id for item in after_second] == list(runtime_task_ids)
+    assert all(item.branch_ref for item in after_second)
+    assert after_second[1].depends_on == (runtime_task_ids[0],)
+    rebound_epoch = get_integration_epoch(conn, PID, batch_id)
+    assert rebound_epoch is not None
+    assert rebound_epoch.active_queue_item_id == queue_item_ids[1]
+    assert rebound_epoch.active_task_id == runtime_task_ids[1]
+    assert rebound_epoch.active_checkpoint_id == runtime_contexts[1].checkpoint_id
+
+    decision = decide_persisted_merge_queue(
+        conn,
+        PID,
+        merge_queue_id,
+        target_ref="refs/heads/main",
+        current_target_head=first_merge_head,
+    )
+    assert decision.mergeable_task_ids == (runtime_task_ids[1],)
+    upsert_merge_queue_item(
+        conn,
+        replace(
+            after_second[1],
+            status=STATE_MERGED,
+            merge_commit=final_merge_head,
+            target_head_before_merge=first_merge_head,
+            target_head_after_merge=final_merge_head,
+            current_target_head=final_merge_head,
+        ),
+    )
+    final_epoch = advance_integration_epoch_after_merge(
+        conn,
+        project_id=PID,
+        batch_id=batch_id,
+        queue_item_id=queue_item_ids[1],
+        merge_commit=final_merge_head,
+    )
+    assert final_epoch.status == "reconcile_pending"
+    assert final_epoch.remaining_queue_item_ids == ()
+    assert final_epoch.active_queue_item_id == ""
 
 
 def test_observer_route_context_issue_blocks_multi_backlog_task_mismatch(conn):
