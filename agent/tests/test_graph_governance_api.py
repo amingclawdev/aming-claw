@@ -10383,9 +10383,10 @@ def test_parallel_branch_allocate_without_worktree_preserves_materialized_runtim
                 "backlog_id": "ARCH-PB-ALLOC",
                 "worker_id": "worker api",
                 "workspace_root": "/repo",
-                "base_commit": "base-new",
-                "target_head_commit": "target-new",
-                "fence_token": "fence-new",
+                "worktree_path": "/repo/.worktrees/worker-api/api-branch-task",
+                "base_commit": "base-existing",
+                "target_head_commit": "target-existing",
+                "merge_queue_id": "mergeq-existing",
                 "create_worktree": False,
                 "now_iso": "2026-05-17T07:12:00Z",
             },
@@ -39655,6 +39656,9 @@ def test_scope_insufficiency_request_is_append_only_and_returns_disposition(
     assert disposition["copy_safe_next_request"][
         "persisted_fence_preserved_when_omitted"
     ] is True
+    assert disposition["copy_safe_next_request"]["body"][
+        "contract_execution_id"
+    ] == context.root_task_id
     saved = get_branch_context(conn, PID, context.task_id)
     assert saved is not None
     assert tuple(saved.owned_files) == original_owned_files
@@ -39670,6 +39674,171 @@ def test_scope_insufficiency_request_is_append_only_and_returns_disposition(
     )
     assert events[0]["payload"]["qa_verdict_authored"] is False
     assert events[0]["payload"]["outside_active_fence"] == ["missing.py"]
+
+
+def test_scope_insufficiency_copy_safe_revision_replay_validates_persisted_identity(
+    conn,
+    tmp_path,
+):
+    task_id = "scope-copy-safe-replay"
+    contract_execution_id = "cex-scope-copy-safe-replay"
+    backlog_id = "AC-SCOPE-COPY-SAFE-REPLAY"
+    route_token_ref = "rtok-scope-copy-safe-replay"
+    session_token = "session-scope-copy-safe-replay"
+    persisted_fence = "fence-scope-copy-safe-replay"
+    branch_name = f"codex/{task_id}"
+    repo = _git_repo(tmp_path)
+    subprocess.run(
+        ["git", "branch", "-M", branch_name],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(repo),
+            task_id=task_id,
+            parent_task_id=contract_execution_id,
+            root_task_id=contract_execution_id,
+            backlog_id=backlog_id,
+            stage_task_id=task_id,
+            stage_type="mf_sub",
+            worker_id="scope-copy-safe-worker",
+            worker_slot_id="scope-copy-safe-worker",
+            branch_ref=f"refs/heads/{branch_name}",
+            ref_name=branch_name,
+            worktree_path=str(repo),
+            base_commit=head_commit,
+            head_commit=head_commit,
+            target_head_commit=head_commit,
+            merge_queue_id="mq-scope-copy-safe-replay",
+            target_files=("owned.py",),
+            owned_files=("owned.py",),
+            status=STATE_WORKTREE_READY,
+            fence_token=persisted_fence,
+            session_token_hash=mf_subagent_session_token_hash(session_token),
+            lease_id="lease-scope-copy-safe-replay",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+    )
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["parallel_branch_allocate"],
+    )
+    route_identity = {
+        "route_id": f"route-{route_token_ref}",
+        "route_context_hash": _fake_sha(f"{route_token_ref}:context"),
+        "prompt_contract_id": f"prompt-{route_token_ref}",
+        "prompt_contract_hash": _fake_sha(f"{route_token_ref}:prompt"),
+        "visible_injection_manifest_hash": _fake_sha(
+            f"{route_token_ref}:manifest"
+        ),
+        "route_token_ref": route_token_ref,
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-scope-copy-safe-replay",
+        payload={
+            "target_files": ["owned.py"],
+            "owned_files": ["owned.py"],
+        },
+        route_identity=route_identity,
+    )
+    conn.commit()
+
+    scope_response = (
+        server.handle_graph_governance_runtime_context_scope_insufficiency_request(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                method="POST",
+                body={
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "parent_task_id": contract_execution_id,
+                    "target_project_root": str(repo),
+                    "session_token": session_token,
+                    "fence_token": persisted_fence,
+                    "missing_files": ["missing.py"],
+                    "requested_files": ["owned.py", "missing.py"],
+                    "blocked_acceptance_ids": ["AC-1"],
+                    "reason": "missing.py is required by AC-1",
+                    "graph_refs": ["graph-query:gqt-scope-copy-safe-replay"],
+                },
+            )
+        )
+    )
+    canonical_body = scope_response["observer_disposition"][
+        "copy_safe_next_request"
+    ]["body"]
+    assert "agent_id" not in canonical_body
+    assert "fence_token" not in canonical_body
+    assert canonical_body["contract_execution_id"] == contract_execution_id
+
+    conflict_status, conflict = (
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    **canonical_body,
+                    "fence_token": "explicit-conflicting-fence",
+                },
+            )
+        )
+    )
+    assert conflict_status == 409
+    assert conflict["error"] == "persisted_runtime_context_identity_mismatch"
+    assert conflict["mismatches"] == [
+        {
+            "field": "fence_token",
+            "requested": "explicit-conflicting-fence",
+            "persisted": persisted_fence,
+        }
+    ]
+    after_conflict = get_branch_context(conn, PID, task_id)
+    assert after_conflict is not None
+    assert after_conflict.fence_token == persisted_fence
+    assert tuple(after_conflict.owned_files) == ("owned.py",)
+
+    replay_status, replay = (
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=canonical_body,
+            )
+        )
+    )
+    assert replay_status == 201
+    assert "same_owner_worker_session" not in replay
+    assert replay["authority_revision"]["scope_changed"] is True
+    assert replay["context"]["fence_token"] == persisted_fence
+    assert set(replay["context"]["owned_files"]) == {"missing.py", "owned.py"}
+    reloaded = get_branch_context(conn, PID, task_id)
+    assert reloaded is not None
+    assert reloaded.fence_token == persisted_fence
+    assert set(reloaded.owned_files) == {"missing.py", "owned.py"}
 
 
 def test_scope_insufficiency_after_implementation_requires_fresh_runtime(

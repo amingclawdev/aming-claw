@@ -12458,10 +12458,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         with sqlite_write_lock():
             if not create_worktree:
                 existing = get_branch_context(conn, project_id, task_id)
-                if (
-                    should_issue_same_owner_session_token
-                    and is_materialized_branch_context(existing)
-                ):
+                if is_materialized_branch_context(existing):
                     mismatches = _parallel_branch_allocate_identity_mismatches(
                         existing,
                         context,
@@ -30268,6 +30265,7 @@ def _runtime_context_scope_insufficiency_observer_disposition(
                 "body": {
                     "project_id": project_id,
                     "backlog_id": common["backlog_id"],
+                    "contract_execution_id": common["parent_task_id"],
                     "task_id": "<new bounded rework task_id>",
                     "parent_task_id": common["parent_task_id"],
                     "target_project_root": common["target_project_root"],
@@ -30302,6 +30300,7 @@ def _runtime_context_scope_insufficiency_observer_disposition(
             "body": {
                 "project_id": project_id,
                 "backlog_id": common["backlog_id"],
+                "contract_execution_id": common["parent_task_id"],
                 "task_id": common["source_task_id"],
                 "parent_task_id": common["parent_task_id"],
                 "target_project_root": common["target_project_root"],
