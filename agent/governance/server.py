@@ -25833,10 +25833,12 @@ def _runtime_context_finish_gate_submission_payload(
         submission_body["worker_session_id"] = worker_session_id
     if filer_principal:
         submission_body["filer_principal"] = filer_principal
+    # The finish gate validates the worker's execution location against the
+    # assigned worktree.  Caller-supplied attestation paths are not authoritative
+    # and must not replace that runtime-context identity.
     for field in ("actual_cwd", "actual_git_root"):
-        value = str(body.get(field) or target_project_root or "").strip()
-        if value:
-            submission_body[field] = value
+        if worktree_path:
+            submission_body[field] = worktree_path
     if route_identity_payload:
         submission_body["route_identity"] = route_identity_payload
     return {

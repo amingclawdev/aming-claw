@@ -588,12 +588,20 @@ def test_runtime_context_head_projection_prefers_assigned_worktree(
         target_head_commit=fixture.main_head,
         checkpoint_id="",
     )
+    route_identity = {
+        "route_id": "route-distinct-worktree",
+        "route_context_hash": "sha256:route-distinct-worktree",
+        "prompt_contract_id": "rprompt-distinct-worktree",
+        "prompt_contract_hash": "sha256:prompt-distinct-worktree",
+        "route_token_ref": "rtok-distinct-worktree",
+        "visible_injection_manifest_hash": "sha256:visible-distinct-worktree",
+    }
     finish_submission = server._runtime_context_finish_gate_submission_payload(
         project_id=PID,
         runtime_context_id="mfrctx-distinct-worktree",
         context=context,
         parent_task_id="runtime-context-parent",
-        route_identity={},
+        route_identity=route_identity,
         finish_time_worker_self_attestation={},
         head_commit=worker_head,
         changed_files=["agent/governance/server.py"],
@@ -601,12 +609,63 @@ def test_runtime_context_head_projection_prefers_assigned_worktree(
         graph_trace_ids=[],
         read_receipt_event_id="",
         read_receipt_hash="",
-        request_body={"target_project_root": str(project_root)},
+        request_body={
+            "target_project_root": str(project_root),
+            "actual_cwd": str(project_root),
+            "actual_git_root": str(project_root),
+        },
     )
     finish_projection = finish_submission["row_scoped_finish_head_projection"]
     assert finish_projection["status"] == "in_sync"
     assert finish_projection["current_branch_head_commit"] == worker_head
     assert finish_projection["row_scoped_implementation_head_commit"] == worker_head
+    finish_body = finish_submission["body"]
+    assert finish_body["target_project_root"] == str(project_root)
+    assert finish_body["actual_cwd"] == str(worktree)
+    assert finish_body["actual_git_root"] == str(worktree)
+    assert finish_body["route_identity"] == route_identity
+    assert finish_body["fence_token"].startswith("<same fence_token")
+    assert finish_body["session_token"].startswith("<same runtime_context")
+    assert finish_submission["privacy_boundary"] == {
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    assert "rtok-distinct-worktree" in json.dumps(finish_submission, sort_keys=True)
+
+    same_root_context = SimpleNamespace(
+        task_id="runtime-context-same-root-task",
+        backlog_id="AC-RUNTIME-CONTEXT-SAME-ROOT-HEAD",
+        target_project_root=str(project_root),
+        worktree_path=str(project_root),
+        head_commit=fixture.main_head,
+        base_commit=fixture.main_head,
+        target_head_commit=fixture.main_head,
+        checkpoint_id="",
+    )
+    same_root_submission = server._runtime_context_finish_gate_submission_payload(
+        project_id=PID,
+        runtime_context_id="mfrctx-same-root",
+        context=same_root_context,
+        parent_task_id="runtime-context-parent",
+        route_identity={},
+        finish_time_worker_self_attestation={},
+        head_commit=fixture.main_head,
+        changed_files=[],
+        test_results={"status": "passed", "passed": True},
+        graph_trace_ids=[],
+        read_receipt_event_id="",
+        read_receipt_hash="",
+        request_body={
+            "target_project_root": str(project_root),
+            "actual_cwd": str(worktree),
+            "actual_git_root": str(worktree),
+        },
+    )
+    same_root_body = same_root_submission["body"]
+    assert same_root_body["target_project_root"] == str(project_root)
+    assert same_root_body["actual_cwd"] == str(project_root)
+    assert same_root_body["actual_git_root"] == str(project_root)
 
 
 def test_route_token_ref_superseded_guidance_prefers_same_scope_issue():
