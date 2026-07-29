@@ -1278,6 +1278,88 @@ def test_meta_contract_accepts_server_verified_runtime_context_worker_proof() ->
     assert gate["observer_worker_transport"] is False
 
 
+def test_meta_contract_trusted_worker_proof_precedes_opaque_qa_suffix() -> None:
+    gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "mf_subagent.startup",
+            "event_kind": "mf_subagent_startup",
+            "actor": "/root/alloc_root_qa",
+            "status": "passed",
+            "payload": {
+                "runtime_context_id": "mfrctx-opaque-qa",
+                "task_id": "worker-opaque-qa",
+                "parent_task_id": "cex-opaque-qa",
+                "target_project_root": "/tmp/worker-opaque-qa",
+                "worker_role": "mf_sub",
+                "worker_id": "slot-opaque-qa",
+                "worker_slot_id": "slot-opaque-qa",
+                "session_token_ref": "wstok-opaque-qa",
+                "fence_token_hash": "sha256:fence-opaque-qa",
+                "worker_evidence_provenance": {
+                    "source": "runtime_context_copy_safe_worker_proof",
+                    "verified": True,
+                    "worker_owned": True,
+                    "observer_impersonation": False,
+                    "runtime_context_id": "mfrctx-opaque-qa",
+                    "task_id": "worker-opaque-qa",
+                    "parent_task_id": "cex-opaque-qa",
+                    "target_project_root": "/tmp/worker-opaque-qa",
+                    "worker_role": "mf_sub",
+                    "worker_id": "slot-opaque-qa",
+                    "worker_slot_id": "slot-opaque-qa",
+                    "session_token_ref": "wstok-opaque-qa",
+                    "fence_token_hash": "sha256:fence-opaque-qa",
+                },
+            },
+        },
+        trusted_runtime_context_worker_proof=True,
+    )
+
+    assert gate["allowed"] is True
+    assert gate["role"] == MF_SUB_ROLE
+    assert gate["action"] == "mf_subagent_startup"
+
+
+def test_meta_contract_trusted_worker_proof_does_not_relabel_explicit_qa() -> None:
+    with pytest.raises(
+        MfSubagentContractError,
+        match="role=qa action=mf_subagent_startup",
+    ):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "mf_subagent.startup",
+                "event_kind": "mf_subagent_startup",
+                "actor": "qa-repair-worker",
+                "status": "passed",
+                "payload": {
+                    "runtime_context_id": "mfrctx-explicit-qa",
+                    "task_id": "worker-explicit-qa",
+                    "parent_task_id": "cex-explicit-qa",
+                    "target_project_root": "/tmp/worker-explicit-qa",
+                    "worker_role": "mf_sub",
+                    "worker_id": "slot-explicit-qa",
+                    "session_token_ref": "wstok-explicit-qa",
+                    "fence_token_hash": "sha256:fence-explicit-qa",
+                    "worker_evidence_provenance": {
+                        "source": "runtime_context_copy_safe_worker_proof",
+                        "verified": True,
+                        "worker_owned": True,
+                        "observer_impersonation": False,
+                        "runtime_context_id": "mfrctx-explicit-qa",
+                        "task_id": "worker-explicit-qa",
+                        "parent_task_id": "cex-explicit-qa",
+                        "target_project_root": "/tmp/worker-explicit-qa",
+                        "worker_role": "mf_sub",
+                        "worker_id": "slot-explicit-qa",
+                        "session_token_ref": "wstok-explicit-qa",
+                        "fence_token_hash": "sha256:fence-explicit-qa",
+                    },
+                },
+            },
+            trusted_runtime_context_worker_proof=True,
+        )
+
+
 def test_meta_contract_rejects_observer_claimed_runtime_context_worker_proof() -> None:
     with pytest.raises(MfSubagentContractError, match="author_worker_evidence"):
         validate_meta_contract_timeline_event(

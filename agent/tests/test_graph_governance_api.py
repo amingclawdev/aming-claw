@@ -21950,13 +21950,13 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
                 "worker_role": "mf_sub",
                 "worker_id": "startup-worker",
                 "agent_id": "startup-agent",
-                "actual_host_worker_id": "observer_merge_root_scope_worker_r1",
-                "worker_session_id": "observer_merge_root_scope_worker_r1",
+                "actual_host_worker_id": "/root/alloc_root_qa",
+                "worker_session_id": "/root/alloc_root_qa",
                 "worker_transcript_ref": (
-                    "multi_agent:observer_merge_root_scope_worker_r1"
+                    "multi_agent:/root/alloc_root_qa"
                 ),
                 "harness_type": "codex",
-                "filer_principal": "observer_merge_root_scope_worker_r1",
+                "filer_principal": "/root/alloc_root_qa",
                 "runtime_context_id": runtime_context_id_for_branch_context(
                     runtime_context
                 ),
@@ -21999,20 +21999,25 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
     startup_gate = events[0]["payload"]["mf_subagent_startup_gate"]
     assert startup_gate["worker_role"] == "mf_sub"
     assert startup_gate["actual_host_worker_id"] == (
-        "observer_merge_root_scope_worker_r1"
+        "/root/alloc_root_qa"
     )
     assert startup_gate["worker_session_id"] == (
-        "observer_merge_root_scope_worker_r1"
+        "/root/alloc_root_qa"
     )
     assert startup_gate["worker_transcript_ref"] == (
-        "multi_agent:observer_merge_root_scope_worker_r1"
+        "multi_agent:/root/alloc_root_qa"
     )
     assert startup_gate["harness_type"] == "codex"
     assert events[0]["actor"] == "mf_sub"
     persisted_payload = events[0]["payload"]
     assert persisted_payload["submitted_actor"] == (
-        "observer_merge_root_scope_worker_r1"
+        "/root/alloc_root_qa"
     )
+    assert persisted_payload["semantic_actor"] == "mf_sub"
+    assert persisted_payload["semantic_role_binding"]["semantic_role"] == "mf_sub"
+    assert persisted_payload["semantic_role_binding"][
+        "opaque_identity_is_role_bearing"
+    ] is False
     assert persisted_payload["authorization_source"] == (
         "runtime_context_copy_safe_worker_proof"
     )
@@ -40739,6 +40744,13 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     assert startup_copy["worker_identity_pointers"]["allocation_owner"] == (
         "agent-session-ref"
     )
+    assert startup_copy["semantic_role_binding"]["semantic_role"] == "mf_sub"
+    assert startup_copy["semantic_role_binding"][
+        "server_verification_required"
+    ] is True
+    assert startup_copy["semantic_role_binding"][
+        "opaque_identity_is_role_bearing"
+    ] is False
     assert startup_copy["branch"] == "refs/heads/codex/worker-session-ref"
     assert startup_copy["branch_ref"] == "refs/heads/codex/worker-session-ref"
     assert startup_copy["base_commit"] == "base-session-ref"
@@ -40804,7 +40816,7 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     assert "raw-session-ref" not in persisted_receipt
     assert "fence-session-ref" not in persisted_receipt
 
-    actual_worker_id = "019f-session-ref-real-worker"
+    actual_worker_id = "/root/alloc_root_qa"
     initial_join_body = dict(initial_join_submission["copy_safe_body"])
     initial_join_body.update(
         {
@@ -40867,6 +40879,11 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     assert startup_gate["session_token_evidence_type"] == "server_verified"
     assert startup_gate["server_issued_session_token_verified"] is True
     assert startup_gate["agent_id_match_mode"] == "initial_join_actual_host_worker"
+    assert startup_gate["actual_host_worker_id"] == "/root/alloc_root_qa"
+    assert startup_gate["semantic_role_binding"]["semantic_role"] == "mf_sub"
+    assert startup_gate["semantic_role_binding"][
+        "opaque_identity_is_role_bearing"
+    ] is False
 
     graph_body = {
         "tool": "find_node_by_path",

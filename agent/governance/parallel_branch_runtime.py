@@ -14269,6 +14269,18 @@ def _startup_path_text(value: str) -> str:
         return text
 
 
+def _startup_principal_is_explicit_qa_role(value: Any) -> bool:
+    principal = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        str(value or "").strip().lower(),
+    ).strip("_")
+    return any(
+        principal == token or principal.startswith(f"{token}_")
+        for token in ("qa", "reviewer", "verifier")
+    )
+
+
 def _startup_path_matches(actual: str, expected: str) -> bool:
     actual_text = _startup_path_text(actual)
     expected_text = _startup_path_text(expected)
@@ -16720,6 +16732,32 @@ def record_mf_subagent_startup(
         "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
         "role": "mf_sub",
+        "semantic_role_binding": {
+            "schema_version": "runtime_context.startup_semantic_role_binding.v1",
+            "source": "server_verified_runtime_context_startup",
+            "semantic_role": "mf_sub",
+            "worker_role": "mf_sub",
+            "server_verified": bool(server_verified_session_token_evidence),
+            "role_authority_fields": [
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_role",
+                "session_token_ref",
+                "fence_token_hash",
+                "target_project_root",
+            ],
+            "opaque_identity_fields": [
+                "actual_host_worker_id",
+                "worker_session_id",
+                "filer_principal",
+                "host_session_id",
+            ],
+            "opaque_identity_is_role_bearing": False,
+            "actual_host_worker_id": actual_host_worker_id,
+            "worker_session_id": worker_session_id,
+            "filer_principal": filer_principal,
+        },
         "allocation_owner": allocation_owner,
         "observer_allocation_owner": allocation_owner,
         "worker_slot_id": worker_slot_id,
@@ -16812,13 +16850,30 @@ def record_mf_subagent_startup(
     }
     if launch_text_hash:
         gate["launch_text_hash"] = launch_text_hash
+    submitted_actor = filer_principal or worker_session_id or agent_id or "mf_sub"
+    explicit_qa_principal = _startup_principal_is_explicit_qa_role(
+        submitted_actor
+    )
+    gate["semantic_role_binding"]["explicit_qa_principal"] = (
+        explicit_qa_principal
+    )
+    gate["semantic_role_binding"]["semantic_role_accepted"] = bool(
+        server_verified_session_token_evidence and not explicit_qa_principal
+    )
     timeline_event = {
         "schema_version": 2,
         "event_type": "mf_subagent.startup",
         "event_kind": "mf_subagent_startup",
         "phase": "startup_gate",
         "status": "passed",
-        "actor": filer_principal or worker_session_id or agent_id or "mf_sub",
+        # The token/session/fence/context join above is the role authority.
+        # Host-created principals are retained as audit data and must never be
+        # lexically reclassified as QA/observer by the timeline meta-contract.
+        "actor": (
+            "mf_sub"
+            if gate["semantic_role_binding"]["semantic_role_accepted"]
+            else submitted_actor
+        ),
         "project_id": project_id,
         "backlog_id": saved.backlog_id,
         "task_id": saved.task_id,
@@ -16826,6 +16881,8 @@ def record_mf_subagent_startup(
         "correlation_id": observer_command_id or host_startup_id,
         "payload": {
             "mf_subagent_startup_gate": gate,
+            "submitted_actor": submitted_actor,
+            "semantic_role_binding": dict(gate["semantic_role_binding"]),
         },
         "artifact_refs": {
             "runtime_context_id": runtime_context_id,
