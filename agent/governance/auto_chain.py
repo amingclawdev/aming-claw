@@ -4961,6 +4961,35 @@ def _do_subtask_fanout(conn, project_id, pm_task_id, result, metadata, trace_id,
     from datetime import datetime, timezone
 
     subtasks = result["subtasks"]
+    from .contract_state_runtime import acceptance_file_fence_closure_gate
+
+    subtask_scope_closures = {}
+    for index, subtask in enumerate(subtasks, start=1):
+        subtask_id = str(subtask.get("id") or f"<subtask:{index}>")
+        target_file_scope = subtask.get("target_files") or []
+        test_file_scope = subtask.get("test_files") or []
+        if isinstance(target_file_scope, str):
+            target_file_scope = [target_file_scope]
+        if isinstance(test_file_scope, str):
+            test_file_scope = [test_file_scope]
+        closure = acceptance_file_fence_closure_gate(
+            subtask.get("acceptance_criteria") or [],
+            [
+                *target_file_scope,
+                *test_file_scope,
+            ],
+            authority_source=f"auto_chain.pm_prd.subtasks:{subtask_id}",
+            actor_role="pm",
+            implementation_started=False,
+        )
+        subtask_scope_closures[subtask_id] = closure
+        if not closure["accepted"]:
+            return {
+                "fanout_blocked": True,
+                "reason": "subtask acceptance scope is not closed by its file fence",
+                "subtask_id": subtask_id,
+                "acceptance_scope_closure": closure,
+            }
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     group = SubtaskGroup(
@@ -4981,7 +5010,7 @@ def _do_subtask_fanout(conn, project_id, pm_task_id, result, metadata, trace_id,
     )
 
     created_tasks = []
-    for st in subtasks:
+    for index, st in enumerate(subtasks, start=1):
         deps = st.get("depends_on") or []
         is_blocked = len(deps) > 0
 
@@ -4997,6 +5026,9 @@ def _do_subtask_fanout(conn, project_id, pm_task_id, result, metadata, trace_id,
             "verification": st.get("verification", {}),
             "test_files": st.get("test_files", []),
             "subtask_title": st.get("title", ""),
+            "acceptance_scope_closure": subtask_scope_closures.get(
+                str(st.get("id") or f"<subtask:{index}>"), {}
+            ),
         }
 
         prompt = _render_dev_contract_prompt(pm_task_id, st_meta)
@@ -5292,6 +5324,42 @@ def _gate_post_pm(conn, project_id, result, metadata):
                     or metadata.get("target_files") or [])
     if not target_files:
         return False, "PRD target_files is empty"
+    criteria = (
+        result.get("acceptance_criteria")
+        or prd.get("acceptance_criteria")
+        or metadata.get("acceptance_criteria")
+        or []
+    )
+    test_files = (
+        result.get("test_files")
+        or prd.get("test_files")
+        or metadata.get("test_files")
+        or []
+    )
+    target_file_scope = (
+        [target_files] if isinstance(target_files, str) else list(target_files)
+    )
+    test_file_scope = (
+        [test_files] if isinstance(test_files, str) else list(test_files)
+    )
+    from .contract_state_runtime import acceptance_file_fence_closure_gate
+
+    acceptance_scope_closure = acceptance_file_fence_closure_gate(
+        criteria,
+        [*target_file_scope, *test_file_scope],
+        authority_source="auto_chain.pm_prd.acceptance_criteria",
+        actor_role="pm",
+        implementation_started=False,
+    )
+    result["acceptance_scope_closure"] = acceptance_scope_closure
+    if not acceptance_scope_closure["accepted"]:
+        return False, (
+            "PRD acceptance scope is not closed by target_files/test_files: "
+            f"{acceptance_scope_closure['errors']}; "
+            f"criterion_ids={acceptance_scope_closure['criterion_ids']}; "
+            "missing_required_files="
+            f"{acceptance_scope_closure['missing_required_files']}"
+        )
 
     # G4: Auto-populate doc_impact from graph if PM left it empty
     doc_impact = result.get("doc_impact") or prd.get("doc_impact")

@@ -11,7 +11,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .contracts.write_gate import bounded_qa_graph_decision_errors
 
@@ -2151,6 +2151,235 @@ def _backlog_target_files(row: Mapping[str, Any]) -> list[str]:
             parsed = value
         return _string_list(parsed)
     return _string_list(value)
+
+
+_ACCEPTANCE_SCOPE_IMPLEMENTATION_KINDS = (
+    "files",
+    "nodes",
+    "files_and_nodes",
+)
+_ACCEPTANCE_SCOPE_IMPLEMENTATION_KIND_SET = frozenset(
+    _ACCEPTANCE_SCOPE_IMPLEMENTATION_KINDS
+)
+_ACCEPTANCE_SCOPE_EXTERNAL_KIND = "verification_only_external_dependency"
+_ACCEPTANCE_SCOPE_UNRESOLVED_KIND = "unresolved"
+
+
+def _acceptance_scope_list(value: Any) -> list[Any]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return [value] if value.strip() else []
+        return parsed if isinstance(parsed, list) else [parsed]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if value in (None, ""):
+        return []
+    return [value]
+
+
+def _acceptance_scope_strings(value: Any) -> list[str]:
+    values = _acceptance_scope_list(value)
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def _stable_acceptance_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if (
+        not text
+        or len(text) > 128
+        or not text[0].isalnum()
+        or any(not (char.isalnum() or char in "._:-") for char in text)
+    ):
+        return ""
+    return text
+
+
+def acceptance_file_fence_closure_gate(
+    acceptance_criteria: Any,
+    allowed_files: Sequence[str],
+    *,
+    authority_source: str = "backlog.acceptance_criteria",
+    actor_role: str = "observer",
+    reported_acceptance_criteria: Any = None,
+    implementation_started: bool = False,
+) -> dict[str, Any]:
+    """Prove structured acceptance scope is closed by a minted file fence.
+
+    Criterion prose remains descriptive only. Authority comes from a stable
+    criterion ``id`` plus a structured ``required_scope`` declaration:
+    implementation files/nodes, a verification-only external dependency, or
+    an explicitly unresolved scope. Unresolved or malformed declarations fail
+    closed. Callers may report the authoritative declarations, but may not
+    replace or widen them during dispatch.
+    """
+
+    raw_criteria = _acceptance_scope_list(acceptance_criteria)
+    allowed = _acceptance_scope_strings(allowed_files)
+    allowed_set = set(allowed)
+    actor = str(actor_role or "").strip().lower()
+    criterion_ids: list[str] = []
+    duplicate_ids: list[str] = []
+    missing_id_refs: list[str] = []
+    missing_scope_ids: list[str] = []
+    unresolved_ids: list[str] = []
+    invalid_scope_ids: list[str] = []
+    required_files: list[str] = []
+    required_nodes: list[str] = []
+    external_dependencies: list[str] = []
+    canonical_criteria: list[dict[str, Any]] = []
+
+    for index, item in enumerate(raw_criteria, start=1):
+        diagnostic_ref = f"<criterion:{index}>"
+        if not isinstance(item, Mapping):
+            missing_id_refs.append(diagnostic_ref)
+            missing_scope_ids.append(diagnostic_ref)
+            continue
+        criterion_id = _stable_acceptance_id(item.get("id"))
+        diagnostic_id = criterion_id or diagnostic_ref
+        if not criterion_id:
+            missing_id_refs.append(diagnostic_ref)
+        elif criterion_id in criterion_ids:
+            duplicate_ids.append(criterion_id)
+        else:
+            criterion_ids.append(criterion_id)
+        scope = item.get("required_scope")
+        if not isinstance(scope, Mapping):
+            missing_scope_ids.append(diagnostic_id)
+            continue
+        kind = str(scope.get("kind") or "").strip().lower()
+        files = _acceptance_scope_strings(scope.get("files"))
+        nodes = _acceptance_scope_strings(
+            scope.get("node_ids") or scope.get("nodes")
+        )
+        dependency_id = str(
+            scope.get("dependency_id") or scope.get("dependency_ref") or ""
+        ).strip()
+        valid_scope = True
+        if kind in _ACCEPTANCE_SCOPE_IMPLEMENTATION_KIND_SET:
+            valid_scope = (
+                bool(files)
+                if kind == "files"
+                else bool(nodes)
+                if kind == "nodes"
+                else bool(files and nodes)
+            )
+        elif kind == _ACCEPTANCE_SCOPE_EXTERNAL_KIND:
+            valid_scope = bool(dependency_id) and not files and not nodes
+        elif kind == _ACCEPTANCE_SCOPE_UNRESOLVED_KIND:
+            unresolved_ids.append(diagnostic_id)
+        else:
+            valid_scope = False
+        if not valid_scope:
+            invalid_scope_ids.append(diagnostic_id)
+        for path in files:
+            if path not in required_files:
+                required_files.append(path)
+        for node_id in nodes:
+            if node_id not in required_nodes:
+                required_nodes.append(node_id)
+        if dependency_id and dependency_id not in external_dependencies:
+            external_dependencies.append(dependency_id)
+        canonical_criteria.append(
+            {
+                "id": criterion_id,
+                "required_scope": {
+                    "kind": kind,
+                    "files": files,
+                    "node_ids": nodes,
+                    "dependency_id": dependency_id,
+                },
+            }
+        )
+
+    authority_mismatch = False
+    if reported_acceptance_criteria is not None:
+        authority_mismatch = _acceptance_scope_list(
+            reported_acceptance_criteria
+        ) != raw_criteria
+    missing_required_files = sorted(set(required_files) - allowed_set)
+    errors: list[str] = []
+    if missing_id_refs:
+        errors.append("acceptance_criteria_require_stable_ids")
+    if duplicate_ids:
+        errors.append("acceptance_criterion_ids_must_be_unique")
+    if missing_scope_ids:
+        errors.append("acceptance_criteria_require_structured_required_scope")
+    if invalid_scope_ids:
+        errors.append("acceptance_required_scope_invalid")
+    if unresolved_ids:
+        errors.append("acceptance_required_scope_unresolved")
+    if missing_required_files:
+        errors.append("acceptance_required_files_outside_minted_fence")
+    if authority_mismatch:
+        errors.append(
+            "worker_or_qa_acceptance_scope_widening_forbidden"
+            if actor in {"worker", "mf_sub", "qa"}
+            else "request_acceptance_scope_differs_from_backlog_authority"
+        )
+
+    accepted = not errors
+    remediation_action = (
+        "create_fresh_or_rework_contract_with_revised_file_fence"
+        if implementation_started
+        else "observer_revise_acceptance_scope_and_file_fence_before_implementation"
+    )
+    return {
+        "schema_version": "acceptance_file_fence_closure_gate.v1",
+        "accepted": accepted,
+        "passed": accepted,
+        "status": "passed" if accepted else "blocked",
+        "authority_source": str(authority_source or "backlog.acceptance_criteria"),
+        "authority_is_structured": True,
+        "free_text_authority_allowed": False,
+        "criterion_count": len(raw_criteria),
+        "criterion_ids": criterion_ids,
+        "missing_id_criterion_refs": missing_id_refs,
+        "duplicate_criterion_ids": sorted(set(duplicate_ids)),
+        "missing_scope_criterion_ids": sorted(set(missing_scope_ids)),
+        "invalid_scope_criterion_ids": sorted(set(invalid_scope_ids)),
+        "unresolved_criterion_ids": sorted(set(unresolved_ids)),
+        "required_file_union": required_files,
+        "required_node_union": required_nodes,
+        "verification_only_external_dependencies": external_dependencies,
+        "allowed_files": allowed,
+        "missing_required_files": missing_required_files,
+        "authority_mismatch": authority_mismatch,
+        "actor_role": actor,
+        "implementation_started": bool(implementation_started),
+        "errors": errors,
+        "canonical_scope_declarations": canonical_criteria,
+        "copy_safe_observer_remediation": {
+            "owner_role": "observer",
+            "action": remediation_action,
+            "criterion_ids": sorted(
+                set(
+                    missing_id_refs
+                    + duplicate_ids
+                    + missing_scope_ids
+                    + invalid_scope_ids
+                    + unresolved_ids
+                )
+            ),
+            "missing_required_files": missing_required_files,
+            "required_scope_kinds": [
+                *_ACCEPTANCE_SCOPE_IMPLEMENTATION_KINDS,
+                _ACCEPTANCE_SCOPE_EXTERNAL_KIND,
+                _ACCEPTANCE_SCOPE_UNRESOLVED_KIND,
+            ],
+            "update_authority": authority_source,
+            "worker_or_qa_scope_widening_allowed": False,
+            "post_implementation_in_place_widening_allowed": False,
+        },
+    }
 
 
 def _route_token_ref_renewal_hint(

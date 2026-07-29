@@ -9514,10 +9514,28 @@ def test_parallel_branch_allocate_includes_backlog_test_files_in_worker_scope(
     backlog_id = "AC-ALLOCATE-CONTRACT-TEST-SCOPE"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     conn.execute(
-        "UPDATE backlog_bugs SET target_files = ?, test_files = ? WHERE bug_id = ?",
+        """
+        UPDATE backlog_bugs
+        SET target_files = ?, test_files = ?, acceptance_criteria = ?
+        WHERE bug_id = ?
+        """,
         (
             json.dumps(["agent/governance/server.py"]),
             json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-ALLOCATE-TEST-SCOPE",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": [
+                                "agent/governance/server.py",
+                                "agent/tests/test_graph_governance_api.py",
+                            ],
+                        },
+                    }
+                ]
+            ),
             backlog_id,
         ),
     )
@@ -9582,6 +9600,10 @@ def test_parallel_branch_allocate_includes_backlog_test_files_in_worker_scope(
     assert revision["payload"]["test_files"] == [
         "agent/tests/test_graph_governance_api.py"
     ]
+    assert revision["payload"]["acceptance_criteria"][0]["id"] == (
+        "AC-ALLOCATE-TEST-SCOPE"
+    )
+    assert revision["payload"]["acceptance_scope_closure"]["accepted"] is True
 
     dispatch = created["dispatch_timeline_event"]
     assert dispatch["status"] == "recorded"
@@ -9616,6 +9638,85 @@ def test_parallel_branch_allocate_includes_backlog_test_files_in_worker_scope(
     assert worker_guide["control_plane_summary"]["read_receipt_hash_action"][
         "worker_constraints"
     ]["scope"]["owned_files"] == expected_scope
+
+
+def test_pg002_parallel_allocate_blocks_acceptance_outside_worker_file_fence(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-PG002-ACCEPTANCE-FENCE"
+    task_id = "pg002-acceptance-fence-worker"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+        SET target_files = ?, test_files = ?, acceptance_criteria = ?
+        WHERE bug_id = ?
+        """,
+        (
+            json.dumps(
+                [
+                    "agent/governance/server.py",
+                    "agent/governance/auto_chain.py",
+                ]
+            ),
+            json.dumps([]),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-PG002-SERVER",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": ["agent/governance/server.py"],
+                        },
+                    },
+                    {
+                        "id": "AC-PG002-DISPATCH",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": ["agent/governance/auto_chain.py"],
+                        },
+                    },
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": task_id,
+                    "backlog_id": backlog_id,
+                    "parent_task_id": backlog_id,
+                    "workspace_root": str(tmp_path),
+                    "worker_id": "pg002-worker",
+                    "owned_files": ["agent/governance/server.py"],
+                    "target_files": ["agent/governance/server.py"],
+                    "base_commit": "base-pg002",
+                    "target_head_commit": "head-pg002",
+                    "merge_queue_id": "mq-pg002",
+                    "create_worktree": False,
+                },
+            )
+        )
+
+    assert rejected.value.code == "acceptance_file_fence_closure_failed"
+    assert rejected.value.details["criterion_ids"] == [
+        "AC-PG002-SERVER",
+        "AC-PG002-DISPATCH",
+    ]
+    assert rejected.value.details["missing_required_files"] == [
+        "agent/governance/auto_chain.py"
+    ]
+    assert rejected.value.details["copy_safe_observer_remediation"]["action"] == (
+        "observer_revise_acceptance_scope_and_file_fence_before_implementation"
+    )
+    assert get_branch_context(conn, PID, task_id) is None
 
 
 def test_observer_runtime_text_prepare_projects_route_identity_to_allocated_context(
@@ -45534,8 +45635,26 @@ def _parentless_direct_main_pre_mutation_graph_scope(
 ) -> tuple[str, str, dict[str, str]]:
     _insert_simple_mf_close_backlog(conn, backlog_id)
     conn.execute(
-        "UPDATE backlog_bugs SET target_files = ? WHERE bug_id = ?",
-        (json.dumps(["agent/governance/server.py"]), backlog_id),
+        """
+        UPDATE backlog_bugs
+        SET target_files = ?, acceptance_criteria = ?
+        WHERE bug_id = ?
+        """,
+        (
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-DIRECT-MAIN",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": ["agent/governance/server.py"],
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
     )
     conn.commit()
     guide = server.handle_project_onboard_route_guide(
@@ -88468,20 +88587,54 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     for row_id in (backlog_id, child_a, child_b):
         _insert_simple_mf_close_backlog(conn, row_id)
     conn.execute(
-        "UPDATE backlog_bugs SET target_files = ?, test_files = ?, priority = ? WHERE bug_id = ?",
+        """
+        UPDATE backlog_bugs
+        SET target_files = ?, test_files = ?, priority = ?,
+            acceptance_criteria = ?
+        WHERE bug_id = ?
+        """,
         (
             json.dumps(["agent/governance/server.py"]),
             json.dumps(["agent/tests/test_graph_governance_api.py"]),
             "P1",
+            json.dumps(
+                [
+                    {
+                        "id": "AC-BATCH-A",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": ["agent/governance/server.py"],
+                        },
+                    }
+                ]
+            ),
             child_a,
         ),
     )
     conn.execute(
-        "UPDATE backlog_bugs SET target_files = ?, test_files = ?, priority = ? WHERE bug_id = ?",
+        """
+        UPDATE backlog_bugs
+        SET target_files = ?, test_files = ?, priority = ?,
+            acceptance_criteria = ?
+        WHERE bug_id = ?
+        """,
         (
             json.dumps(["agent/governance/parallel_branch_runtime.py"]),
             json.dumps(["agent/tests/test_parallel_branch_read_model.py"]),
             "P0",
+            json.dumps(
+                [
+                    {
+                        "id": "AC-BATCH-B",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": [
+                                "agent/governance/parallel_branch_runtime.py"
+                            ],
+                        },
+                    }
+                ]
+            ),
             child_b,
         ),
     )
@@ -88524,6 +88677,12 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     assert result["root_contract_execution_id"] == service_parent
     assert result["preflight_gate"]["status"] == "passed"
     assert result["preflight_gate"]["fanout_ready"] is True
+    assert result["acceptance_scope_closures"][child_a]["criterion_ids"] == [
+        "AC-BATCH-A"
+    ]
+    assert result["acceptance_scope_closures"][child_b]["criterion_ids"] == [
+        "AC-BATCH-B"
+    ]
     assert result["preflight_gate"]["target_head_commit"] == "target-head-1"
     assert result["merge_queue_plan"]["planner_only"] is False
     assert result["merge_queue_plan"]["durable_queue_write"] is True

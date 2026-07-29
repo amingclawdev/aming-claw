@@ -302,3 +302,27 @@ Disposition remains role-separated:
 
 The acceptance evidence and request ids are indexed in
 `docs/dev/e2e-product-governance-boundary-drift-case-index-20260728.md`.
+
+## 11. Acceptance-to-file-fence closure
+
+Contract binding and worker dispatch now treat acceptance scope as structured
+authority, not prose. Every acceptance criterion that exists must carry a
+stable, unique `id` and a `required_scope` object with one of these kinds:
+`files`, `nodes`, `files_and_nodes`,
+`verification_only_external_dependency`, or `unresolved`. Descriptive text
+may still explain the criterion, but it cannot grant file or graph authority.
+
+Before `direct_main`, `mf_parallel`, or `mf_batch_parallel` can bind, allocate,
+fan out, or dispatch implementation, the server computes the union of every
+declared required file and proves it is contained by the minted
+`target_files`/`owned_files` fence. Missing ids, malformed declarations,
+duplicate ids, unresolved scope, and exact missing files fail closed before
+runtime allocation or queue mutation. The rejection includes the criterion
+ids, missing files, and copy-safe observer remediation.
+
+Workers and QA may report against this authority but cannot widen it. Before
+implementation, the observer must revise the authoritative backlog/PRD
+declaration and mint a matching fence. Once implementation evidence exists,
+scope change requires a fresh or rework contract; an in-place worker/QA report
+never grants authority. Verification-only external dependencies are recorded
+for QA/E2E planning and deliberately add no implementation file authority.

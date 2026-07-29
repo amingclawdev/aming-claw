@@ -11683,6 +11683,8 @@ def _parallel_branch_allocate_contract_revision_payload(
     route_identity: Mapping[str, Any],
     owned_files: Sequence[str],
     test_files: Sequence[str] = (),
+    acceptance_criteria: Sequence[Any] | None = None,
+    acceptance_scope_closure: Mapping[str, Any] | None = None,
     authority_revision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     from .parallel_branch_runtime import public_contract_revision_payload
@@ -11730,10 +11732,14 @@ def _parallel_branch_allocate_contract_revision_payload(
         "target_files": list(owned_files),
         "owned_files": list(owned_files),
         "test_files": list(test_files),
-        "acceptance_criteria": _runtime_context_service_query_values(
-            body,
-            "acceptance_criteria",
-            "acceptance",
+        "acceptance_criteria": list(
+            acceptance_criteria
+            if acceptance_criteria is not None
+            else _json_list_field(
+                body.get("acceptance_criteria")
+                if body.get("acceptance_criteria") is not None
+                else body.get("acceptance")
+            )
         ),
         "test_commands": _runtime_context_service_query_values(
             body,
@@ -11776,6 +11782,10 @@ def _parallel_branch_allocate_contract_revision_payload(
     if authority_revision:
         payload["authority_revision"] = public_contract_revision_payload(
             authority_revision
+        )
+    if acceptance_scope_closure:
+        payload["acceptance_scope_closure"] = public_contract_revision_payload(
+            acceptance_scope_closure
         )
     return payload
 
@@ -12389,8 +12399,55 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     runtime_contract_revision: dict[str, Any] = {}
     route_identity_for_revision: dict[str, Any] = {}
     owned_files_for_revision: list[str] = []
+    acceptance_scope_criteria: list[Any] = []
+    acceptance_scope_closure: dict[str, Any] = {}
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.allocate")
+        acceptance_existing_context = get_branch_context(
+            conn,
+            project_id,
+            task_id,
+        )
+        acceptance_implementation_started = (
+            _backlog_acceptance_implementation_started(
+                conn,
+                project_id=project_id,
+                backlog_id=str(ctx.body.get("backlog_id") or ""),
+                task_id=task_id,
+            )
+        )
+        if acceptance_implementation_started and acceptance_existing_context is not None:
+            latest_revision = _runtime_context_latest_contract_revision_payload(
+                conn,
+                acceptance_existing_context,
+            )
+            latest_payload = (
+                latest_revision.get("payload")
+                if isinstance(latest_revision.get("payload"), Mapping)
+                else {}
+            )
+            reported_acceptance = latest_payload.get("acceptance_criteria", [])
+        else:
+            reported_acceptance = (
+                ctx.body.get("acceptance_criteria")
+                if "acceptance_criteria" in ctx.body
+                else ctx.body.get("acceptance")
+                if "acceptance" in ctx.body
+                else _ACCEPTANCE_SCOPE_REPORT_UNSET
+            )
+        (
+            acceptance_scope_criteria,
+            acceptance_scope_closure,
+        ) = _require_backlog_acceptance_file_fence_closure(
+            conn,
+            project_id=project_id,
+            backlog_id=str(ctx.body.get("backlog_id") or ""),
+            task_id=task_id,
+            allowed_files=request_owned_files or request_target_files,
+            actor_role=str(ctx.body.get("caller_role") or "observer"),
+            reported_acceptance_criteria=reported_acceptance,
+            implementation_started=acceptance_implementation_started,
+        )
         effective_body = _parallel_branch_allocate_effective_route_body(
             conn,
             project_id=project_id,
@@ -12541,6 +12598,8 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                         route_identity_for_revision,
                         owned_files_for_revision,
                         test_files=backlog_test_files,
+                        acceptance_criteria=acceptance_scope_criteria,
+                        acceptance_scope_closure=acceptance_scope_closure,
                         authority_revision=authority_revision,
                     ),
                     route_gate=route_gate,
@@ -12625,6 +12684,8 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                         route_identity_for_revision,
                         owned_files_for_revision,
                         test_files=backlog_test_files,
+                        acceptance_criteria=acceptance_scope_criteria,
+                        acceptance_scope_closure=acceptance_scope_closure,
                         authority_revision=authority_revision,
                     ),
                     route_gate=route_gate,
@@ -12663,6 +12724,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             "worktree": worktree_result["worktree"] if worktree_result else None,
             "branch_strategy": worktree_result["branch_strategy"] if worktree_result else None,
             "commit_verification": commit_verification,
+            "acceptance_scope_closure": acceptance_scope_closure,
         }
         if runtime_contract_revision:
             response["runtime_contract_revision"] = runtime_contract_revision
@@ -64485,6 +64547,29 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         or getattr(context, "worker_id", "")
         or ""
     ).strip()
+    dispatch_owned_files = sorted(
+        set(
+            getattr(context, "owned_files", ())
+            or getattr(context, "target_files", ())
+            or ()
+        )
+    )
+    acceptance_scope_criteria, acceptance_scope_closure = (
+        _require_backlog_acceptance_file_fence_closure(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=str(getattr(context, "task_id", "") or "").strip(),
+            allowed_files=dispatch_owned_files,
+            actor_role="observer",
+            reported_acceptance_criteria=(
+                revision_body.get("acceptance_criteria")
+                if "acceptance_criteria" in revision_body
+                else _ACCEPTANCE_SCOPE_REPORT_UNSET
+            ),
+            implementation_started=False,
+        )
+    )
     dispatch_payload = {
         "schema_version": "mf_parallel.dispatch_bounded_worker.v1",
         "runtime_context_id": runtime_context_id_for_branch_context(context),
@@ -64518,13 +64603,9 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         "merge_queue_id": str(
             getattr(context, "merge_queue_id", "") or ""
         ).strip(),
-        "owned_files": sorted(
-            set(
-                getattr(context, "owned_files", ())
-                or getattr(context, "target_files", ())
-                or ()
-            )
-        ),
+        "owned_files": dispatch_owned_files,
+        "acceptance_criteria": acceptance_scope_criteria,
+        "acceptance_scope_closure": acceptance_scope_closure,
         "profile_requirements": profile_requirements,
         "retry_policy": retry_policy,
         "route_identity": dict(route_identity),
@@ -78614,6 +78695,155 @@ def _backlog_declared_direct_file_scope(conn, backlog_id: str) -> list[str]:
     return deduped
 
 
+_ACCEPTANCE_SCOPE_REPORT_UNSET = object()
+
+
+def _backlog_acceptance_scope_authority(
+    conn,
+    backlog_id: str,
+) -> tuple[list[Any], list[str]]:
+    """Read acceptance scope and its row-declared file fence without coercion."""
+
+    if not str(backlog_id or "").strip():
+        return [], []
+    try:
+        row = conn.execute(
+            """
+            SELECT acceptance_criteria, target_files, test_files
+            FROM backlog_bugs
+            WHERE bug_id = ?
+            """,
+            (str(backlog_id).strip(),),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None:
+        return [], []
+    criteria = _json_list_field(_row_get(row, "acceptance_criteria", ""))
+    row_files = _runtime_context_public_file_values(
+        [
+            *_string_list_field(_row_get(row, "target_files", "")),
+            *_string_list_field(_row_get(row, "test_files", "")),
+        ]
+    )
+    return criteria, row_files
+
+
+def _backlog_acceptance_implementation_started(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str = "",
+) -> bool:
+    """Detect immutable implementation evidence before suggesting scope repair."""
+
+    from . import task_timeline
+
+    try:
+        events = task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            limit=2000,
+        )
+    except sqlite3.Error:
+        return False
+    for event in events:
+        if task_id and str(event.get("task_id") or "").strip() not in {
+            "",
+            str(task_id).strip(),
+        }:
+            continue
+        tokens = {
+            str(event.get(key) or "")
+            .strip()
+            .lower()
+            .replace(".", "_")
+            .replace("-", "_")
+            for key in ("event_type", "event_kind", "phase")
+        }
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        line_id = str(payload.get("line_id") or "").strip().lower()
+        if tokens.intersection(
+            {
+                "implementation",
+                "worker_implementation",
+                "patch",
+                "review_ready",
+                "worker_commit",
+            }
+        ) or line_id in {"worker_implementation", "worker_commit"}:
+            return True
+    return False
+
+
+def _require_backlog_acceptance_file_fence_closure(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    allowed_files: Sequence[str],
+    task_id: str = "",
+    actor_role: str = "observer",
+    reported_acceptance_criteria: Any = _ACCEPTANCE_SCOPE_REPORT_UNSET,
+    implementation_started: bool | None = None,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Fail closed before mint/dispatch when acceptance exceeds the file fence."""
+
+    from .contract_state_runtime import acceptance_file_fence_closure_gate
+
+    criteria, row_files = _backlog_acceptance_scope_authority(conn, backlog_id)
+    effective_allowed_files = _runtime_context_public_file_values(
+        list(allowed_files) or row_files
+    )
+    if implementation_started is None:
+        implementation_started = _backlog_acceptance_implementation_started(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    reported = (
+        None
+        if reported_acceptance_criteria is _ACCEPTANCE_SCOPE_REPORT_UNSET
+        else reported_acceptance_criteria
+    )
+    gate = acceptance_file_fence_closure_gate(
+        criteria,
+        effective_allowed_files,
+        authority_source=f"backlog_bugs:{backlog_id}:acceptance_criteria",
+        actor_role=actor_role,
+        reported_acceptance_criteria=reported,
+        implementation_started=bool(implementation_started),
+    )
+    gate.update(
+        {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "row_declared_files": row_files,
+            "minted_fence_files": effective_allowed_files,
+            "evaluated_before_allocation_or_dispatch": True,
+        }
+    )
+    if not gate.get("accepted"):
+        raise GovernanceError(
+            "acceptance_file_fence_closure_failed",
+            (
+                "acceptance criteria are not authoritatively closed by the "
+                "minted target_files/owned_files fence"
+            ),
+            422,
+            gate,
+        )
+    return criteria, gate
+
+
 def _onboard_contract_route_issue_target_files(
     conn,
     *,
@@ -86418,6 +86648,46 @@ def _direct_fix_materialize_dispatch_runtime_context(
         )
     if not owned_files:
         owned_files = _direct_fix_child_route_token_target_files(conn, backlog_id=backlog_id)
+    from .parallel_branch_runtime import get_branch_context as get_direct_fix_context
+
+    existing_acceptance_context = get_direct_fix_context(conn, project_id, task_id)
+    acceptance_implementation_started = _backlog_acceptance_implementation_started(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    if acceptance_implementation_started and existing_acceptance_context is not None:
+        latest_revision = _runtime_context_latest_contract_revision_payload(
+            conn,
+            existing_acceptance_context,
+        )
+        latest_payload = (
+            latest_revision.get("payload")
+            if isinstance(latest_revision.get("payload"), Mapping)
+            else {}
+        )
+        reported_acceptance = latest_payload.get("acceptance_criteria", [])
+    else:
+        reported_acceptance = (
+            payload.get("acceptance_criteria")
+            if "acceptance_criteria" in payload
+            else write.get("acceptance_criteria")
+            if "acceptance_criteria" in write
+            else _ACCEPTANCE_SCOPE_REPORT_UNSET
+        )
+    acceptance_scope_criteria, acceptance_scope_closure = (
+        _require_backlog_acceptance_file_fence_closure(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            allowed_files=owned_files,
+            actor_role="observer",
+            reported_acceptance_criteria=reported_acceptance,
+            implementation_started=acceptance_implementation_started,
+        )
+    )
     current_head_commit = _runtime_context_git_head_commit(
         worktree_path,
         target_project_root,
@@ -86559,6 +86829,8 @@ def _direct_fix_materialize_dispatch_runtime_context(
                     saved_context,
                     route_identity,
                     owned_files,
+                    acceptance_criteria=acceptance_scope_criteria,
+                    acceptance_scope_closure=acceptance_scope_closure,
                 ),
                 "source": "direct_fix_dispatch_context",
                 "contract_execution_id": contract_execution_id,
@@ -86610,6 +86882,8 @@ def _direct_fix_materialize_dispatch_runtime_context(
         "merge_queue_id": saved_context.get("merge_queue_id") or merge_queue_id,
         "owned_files": owned_files,
         "target_files": owned_files,
+        "acceptance_criteria": acceptance_scope_criteria,
+        "acceptance_scope_closure": acceptance_scope_closure,
         "route_token_ref": route_token_ref,
     }
     dispatch_timeline_event = _record_bounded_worker_dispatch_event(
@@ -86640,6 +86914,8 @@ def _direct_fix_materialize_dispatch_runtime_context(
         "merge_queue_id": saved_context.get("merge_queue_id") or merge_queue_id,
         "owned_files": owned_files,
         "target_files": owned_files,
+        "acceptance_criteria": acceptance_scope_criteria,
+        "acceptance_scope_closure": acceptance_scope_closure,
         "fence_token_present": bool(saved.fence_token),
         "fence_token_delivery": "runtime_context_private_envelope",
         "session_token_ref": session_token_ref,
@@ -88743,9 +89019,61 @@ def _mf_parallel_successor_runtime_enter(
     handoff_event_id = _contract_runtime_stable_id(
         "handoff", project_id, backlog_id, parent_execution_id, successor_execution_id
     )
+    child_route_target_files = _onboard_contract_route_issue_target_files(
+        conn,
+        backlog_id=backlog_id,
+        body={},
+        metadata=metadata if isinstance(metadata, Mapping) else {},
+    )
     try:
-        successor = store.get(successor_execution_id)
+        existing_successor = store.get(successor_execution_id)
     except ContractRuntimeError:
+        existing_successor = None
+    completed_lines = (
+        existing_successor.get("completed_lines")
+        if isinstance(existing_successor, Mapping)
+        and isinstance(existing_successor.get("completed_lines"), list)
+        else []
+    )
+    implementation_started = any(
+        str(line.get("line_id") or "") in {"worker_implementation", "worker_commit"}
+        for line in completed_lines
+        if isinstance(line, Mapping)
+    )
+    if not implementation_started:
+        implementation_started = _backlog_acceptance_implementation_started(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    existing_metadata = (
+        existing_successor.get("metadata")
+        if isinstance(existing_successor, Mapping)
+        and isinstance(existing_successor.get("metadata"), Mapping)
+        else {}
+    )
+    if implementation_started:
+        reported_acceptance = existing_metadata.get("acceptance_criteria", [])
+    else:
+        reported_acceptance = (
+            metadata.get("acceptance_criteria")
+            if isinstance(metadata, Mapping) and "acceptance_criteria" in metadata
+            else _ACCEPTANCE_SCOPE_REPORT_UNSET
+        )
+    acceptance_scope_criteria, acceptance_scope_closure = (
+        _require_backlog_acceptance_file_fence_closure(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            allowed_files=child_route_target_files,
+            actor_role=actor_role,
+            reported_acceptance_criteria=reported_acceptance,
+            implementation_started=implementation_started,
+        )
+    )
+    if existing_successor is None:
         successor = runtime.start_execution(
             MF_PARALLEL_CONTRACT_ID,
             project_id=project_id,
@@ -88768,14 +89096,17 @@ def _mf_parallel_successor_runtime_enter(
                 "task_id": task_id,
             },
             metadata={
+                **dict(metadata or {}),
                 "facade": "mf_parallel",
                 "generic_crud_exposed": False,
                 "handoff_reason": reason,
                 "handoff_event_id": handoff_event_id,
-                **dict(metadata or {}),
+                "acceptance_criteria": acceptance_scope_criteria,
+                "acceptance_scope_closure": acceptance_scope_closure,
             },
         )
     else:
+        successor = existing_successor
         if not _is_mf_parallel_record_contract_id(str(successor.get("contract_id") or "")):
             raise ValidationError(
                 "mf_parallel facade can only enter mf_parallel executions",
@@ -88787,12 +89118,6 @@ def _mf_parallel_successor_runtime_enter(
         if route_token_ref and not str(successor.get("route_token_ref") or ""):
             successor["route_token_ref"] = route_token_ref
             store.update(successor_execution_id, successor)
-    child_route_target_files = _onboard_contract_route_issue_target_files(
-        conn,
-        backlog_id=backlog_id,
-        body={},
-        metadata=metadata if isinstance(metadata, Mapping) else {},
-    )
     successor, child_route_binding = _contract_runtime_with_child_route_token_ref(
         conn,
         project_id=project_id,
@@ -100512,6 +100837,28 @@ def handle_task_timeline_append(ctx: RequestContext):
                 "observer_direct_implementation_exception",
             }
         ):
+            reported_acceptance = (
+                norm_payload.get("acceptance_criteria")
+                if "acceptance_criteria" in norm_payload
+                else _ACCEPTANCE_SCOPE_REPORT_UNSET
+            )
+            _, acceptance_scope_closure = (
+                _require_backlog_acceptance_file_fence_closure(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=str(
+                        ctx.body.get("backlog_id") or ""
+                    ).strip(),
+                    task_id=str(ctx.body.get("task_id") or "").strip(),
+                    allowed_files=_backlog_declared_direct_file_scope(
+                        conn,
+                        str(ctx.body.get("backlog_id") or "").strip(),
+                    ),
+                    actor_role=trusted_contract_runtime_actor_role
+                    or str(ctx.body.get("actor") or "observer"),
+                    reported_acceptance_criteria=reported_acceptance,
+                )
+            )
             provisional_event = {
                 "project_id": project_id,
                 "backlog_id": str(ctx.body.get("backlog_id") or "").strip(),
@@ -100580,6 +100927,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                         "historical_backfill_allowed": False,
                     },
                 )
+            norm_payload["acceptance_scope_closure"] = acceptance_scope_closure
             norm_payload["observer_direct_pre_mutation_authority"] = {
                 "schema_version": (
                     "observer_direct_pre_mutation_authority_projection.v1"
@@ -111855,7 +112203,8 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
             )
         rows = conn.execute(
             f"""
-            SELECT bug_id, status, priority, target_files, test_files
+            SELECT bug_id, status, priority, target_files, test_files,
+                   acceptance_criteria
             FROM backlog_bugs
             WHERE bug_id IN ({",".join("?" for _ in backlog_ids)})
             """,
@@ -111874,6 +112223,7 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                         "priority": "",
                         "target_files": [],
                         "test_files": [],
+                        "acceptance_criteria": [],
                     }
                 )
                 continue
@@ -111884,8 +112234,32 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                     "priority": _row_get(row, "priority", ""),
                     "target_files": _row_get(row, "target_files", ""),
                     "test_files": _row_get(row, "test_files", ""),
+                    "acceptance_criteria": _row_get(
+                        row, "acceptance_criteria", ""
+                    ),
                 }
             )
+        acceptance_scope_closures: dict[str, dict[str, Any]] = {}
+        for row in preflight_rows:
+            row_id = str(row.get("bug_id") or "")
+            if row.get("missing"):
+                continue
+            row_files = _runtime_context_public_file_values(
+                [
+                    *_string_list_field(row.get("target_files")),
+                    *_string_list_field(row.get("test_files")),
+                ]
+            )
+            _, row_gate = _require_backlog_acceptance_file_fence_closure(
+                conn,
+                project_id=project_id,
+                backlog_id=row_id,
+                task_id=task_id or batch_id,
+                allowed_files=row_files,
+                actor_role=derived_actor_role,
+                implementation_started=False,
+            )
+            acceptance_scope_closures[row_id] = row_gate
         preflight_gate = plan_mf_batch_parallel_preflight(
             project_id=project_id,
             coordination_backlog_id=backlog_id,
@@ -111978,6 +112352,9 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                 "path": "/api/projects/{project_id}/mf-parallel/enter",
                 "requires_distinct_route_token_ref": True,
                 "route_token_task_id_policy": "mf_parallel_successor_execution_id",
+                "acceptance_scope_closure": dict(
+                    acceptance_scope_closures.get(row_id) or {}
+                ),
                 "owned_files": list(
                     queue_items_by_backlog.get(row_id, {}).get("owned_files") or []
                 ),
@@ -112029,6 +112406,7 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                 ONBOARD_ROUTE_GUIDE_SERVICE_ID if onboard_service_waiver else ""
             ),
             "preflight_gate": preflight_gate,
+            "acceptance_scope_closures": acceptance_scope_closures,
             "merge_queue_plan": preflight_gate.get("merge_queue_plan") or {},
             "fanout_policy": {
                 "schema_version": "mf_batch_parallel.fanout_policy.v1",
@@ -112078,6 +112456,7 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
         "contract_chain_id": contract_chain_id,
         "per_row_successors": per_row_successors,
         "preflight_gate": preflight_gate,
+        "acceptance_scope_closures": acceptance_scope_closures,
         "merge_queue_plan": preflight_gate.get("merge_queue_plan") or {},
         "route_token_ref": route_token_ref,
         "agent_facing_decision_source": "onboard_route_guide_service",
