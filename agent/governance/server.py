@@ -16728,6 +16728,41 @@ def _runtime_context_qa_verification_guide(
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
         if str(route_identity.get(field) or "").strip()
     }
+    runtime_state = (
+        contract_runtime_state
+        if isinstance(contract_runtime_state, Mapping)
+        else {}
+    )
+    runtime_next_action = (
+        runtime_state.get("next_legal_action")
+        if isinstance(runtime_state.get("next_legal_action"), Mapping)
+        else {}
+    )
+    writer_payload_projection = (
+        runtime_next_action.get("writer_role_safe_copy_payload")
+        if isinstance(
+            runtime_next_action.get("writer_role_safe_copy_payload"),
+            Mapping,
+        )
+        else {}
+    )
+    projected_writer_copy_payload = (
+        dict(writer_payload_projection.get("copy_payload"))
+        if isinstance(
+            writer_payload_projection.get("copy_payload"), Mapping
+        )
+        else {}
+    )
+    qa_writer_copy_payload = (
+        projected_writer_copy_payload
+        if (
+            str(projected_writer_copy_payload.get("line_id") or "")
+            == "qa_independent_verification"
+            and str(projected_writer_copy_payload.get("actor_role") or "")
+            == "qa"
+        )
+        else {}
+    )
     parent_route_identity = dict(safe_route_identity)
     if project_id:
         parent_route_identity["selected_project"] = project_id
@@ -16830,6 +16865,201 @@ def _runtime_context_qa_verification_guide(
             ],
         },
     }
+    inherited_failure_identity = "<inherited-baseline-failure-identity>"
+    inherited_failure_count = "<inherited-baseline-failure-count>"
+    candidate_passed_count = "<candidate-passed-count>"
+    comparison_base_commit = (
+        "<comparison-base-commit-from-db-verified-qa-graph-context>"
+    )
+    candidate_commit = "<full-candidate-commit>"
+    canonical_external_no_pass_baseline_body = {
+        **qa_writer_copy_payload,
+        **base_append_body,
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "evidence_kind": "independent_verification",
+        "status": "accepted",
+        "verdict": "accepted",
+        "commit_sha": candidate_commit,
+        "graph_trace_ids": ["<db-verified-qa-graph-query-trace-id>"],
+        "graph_query_trace_ids": [
+            "<db-verified-qa-graph-query-trace-id>"
+        ],
+        "no_pass_claim": True,
+        "overall_release_pass_claimed": False,
+        "payload": {
+            **dict(base_append_body["payload"]),
+            "schema_version": "qa_independent_verification.v1",
+            "base_commit_sha": comparison_base_commit,
+            "candidate_commit_sha": candidate_commit,
+            "acceptance_scope": (
+                "candidate_regression_and_acceptance_criteria"
+            ),
+            "row_scoped_qa_pass": True,
+            "verdict": "accepted",
+            "full_suite_claim": "not_claimed",
+            "external_full_suite_ledger_location": (
+                "artifact_refs.external_no_pass_baseline_ledger"
+            ),
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "status": "accepted",
+            "test_results": {
+                "baseline": {
+                    "failed": inherited_failure_count,
+                    "passed": candidate_passed_count,
+                    "failure_identities": [inherited_failure_identity],
+                },
+                "candidate": {
+                    "failed": inherited_failure_count,
+                    "passed": candidate_passed_count,
+                    "failure_identities": [inherited_failure_identity],
+                },
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+            },
+        },
+        "test_results": {
+            "schema_version": "qa_candidate_acceptance_results.v1",
+            "scope": "candidate_regression_and_acceptance_criteria",
+            "row_scoped_qa_pass": True,
+            "focused_failed": 0,
+            "focused_passed": 1,
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "passed": False,
+            "overall_release_pass": False,
+            "overall_release_pass_claimed": False,
+            "status": "accepted",
+        },
+        "verification": {
+            "schema_version": "qa_independent_verification.v1",
+            "acceptance_scope": (
+                "candidate_regression_and_acceptance_criteria"
+            ),
+            "row_scoped_qa_pass": True,
+            "verdict": "accepted",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "status": "accepted",
+        },
+        "artifact_refs": {
+            "external_no_pass_baseline_ledger": {
+                "schema_version": (
+                    _CONTRACT_RUNTIME_NO_PASS_LEDGER_SCHEMA_VERSION
+                ),
+                "base_commit_sha": comparison_base_commit,
+                "candidate_commit_sha": candidate_commit,
+                "base_failure_identities": [inherited_failure_identity],
+                "candidate_failure_identities": [
+                    inherited_failure_identity
+                ],
+                "base_reproduction": {
+                    "reproduced": inherited_failure_count,
+                    "total": inherited_failure_count,
+                    "failure_identities": [inherited_failure_identity],
+                },
+                "candidate_suite_counts": {
+                    "baseline_known_non_green": inherited_failure_count,
+                    "failed": inherited_failure_count,
+                    "passed": candidate_passed_count,
+                },
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+                "refs": ["<immutable-base-reproduction-evidence-ref>"],
+            }
+        },
+    }
+    external_no_pass_baseline_policy = {
+        "schema_version": (
+            "runtime_context.qa_external_no_pass_baseline_policy.v1"
+        ),
+        "status": "canonical_copy_safe_body_available",
+        "writer_body_path": (
+            "append_evidence.canonical_external_no_pass_baseline_body"
+        ),
+        "precheck": {
+            "tool": "contract_runtime_line_write_precheck",
+            "body_source": (
+                "append_evidence.canonical_external_no_pass_baseline_body"
+            ),
+            "required_before_submit": True,
+            "precheck_mutates_completed_lines": False,
+        },
+        "contract_runtime_writer_copy_payload": {
+            "source": (
+                "contract_runtime_current_state.next_legal_action."
+                "writer_role_safe_copy_payload.copy_payload"
+            ),
+            "bound_to_current_writer": bool(qa_writer_copy_payload),
+            "required_line_id": "qa_independent_verification",
+            "required_actor_role": "qa",
+            "canonical_body_overrides": {
+                "status": "accepted",
+                "verdict": "accepted",
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+            },
+        },
+        "use_only_when": [
+            "row-scoped candidate acceptance and focused verification pass",
+            "the compared full suite contains inherited baseline failures",
+            "candidate_new_failures is exactly zero",
+            "the candidate and base failure identity sets are exactly equal",
+        ],
+        "verdict_semantics": {
+            "row_scoped_qa_pass": True,
+            "row_scoped_status": "accepted",
+            "overall_release_pass_claimed": False,
+            "full_suite_claim": "not_claimed",
+            "no_pass_claim": True,
+        },
+        "caller_substitutions_required": {
+            "base_commit_sha": (
+                "comparison_base_commit_sha from the DB-verified "
+                "qa_graph_context"
+            ),
+            "candidate_commit_sha": (
+                "the exact bounded QA session candidate commit"
+            ),
+            "failure_identities": (
+                "the same non-empty duplicate-free identity set in base, "
+                "candidate, and base_reproduction"
+            ),
+            "counts": (
+                "exact integers matching the identity set and candidate "
+                "suite result"
+            ),
+            "refs": "immutable base-reproduction evidence references",
+        },
+        "server_authority": {
+            "validator": "_contract_runtime_qa_no_pass_ledger_authority",
+            "binder": "_contract_runtime_bind_qa_no_pass_ledger_authority",
+            "canonical_ledger_path": (
+                "artifact_refs.external_no_pass_baseline_ledger"
+            ),
+            "server_normalized_is_server_only": True,
+        },
+        "fail_closed": {
+            "ordinary_pass_with_positive_failed_counts_rejected": True,
+            "malformed_ledger_rejected_before_durable_mutation": True,
+            "candidate_new_failure_ledger_rejected_before_durable_mutation": (
+                True
+            ),
+            "identity_or_count_mismatch_rejected": True,
+        },
+        "copy_safe": True,
+        "raw_qa_session_token_in_body": False,
+    }
     failed_audit_body = {
         **base_append_body,
         "status": "failed",
@@ -16873,11 +17103,6 @@ def _runtime_context_qa_verification_guide(
         parent_task_id=parent_task_id,
         target_project_root=target_project_root,
         route_identity=safe_route_identity,
-    )
-    runtime_state = (
-        contract_runtime_state
-        if isinstance(contract_runtime_state, Mapping)
-        else {}
     )
     legitimate_evidence_bindings = _governed_evidence_binding_guide(
         onboard_contract_execution_id=str(
@@ -17149,6 +17374,12 @@ def _runtime_context_qa_verification_guide(
             "qa_graph_context_body": qa_graph_context_shape,
             "focused_pass_with_full_suite_caveat_body": (
                 focused_pass_with_full_suite_caveat_body
+            ),
+            "canonical_external_no_pass_baseline_body": (
+                canonical_external_no_pass_baseline_body
+            ),
+            "external_no_pass_baseline_policy": (
+                external_no_pass_baseline_policy
             ),
             "failed_audit_body": failed_audit_body,
             "scope_insufficiency_finding_policy": {

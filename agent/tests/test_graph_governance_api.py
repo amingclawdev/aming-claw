@@ -33242,6 +33242,29 @@ def test_runtime_context_qa_guide_scopes_verification_and_full_suite_caveat() ->
             "visible_injection_manifest_hash": "sha256:qa-scoped-visible",
         },
         target_files=target_files,
+        contract_runtime_state={
+            "next_legal_action": {
+                "line_id": "qa_independent_verification",
+                "writer_role_safe_copy_payload": {
+                    "copy_payload": {
+                        "project_id": PID,
+                        "backlog_id": (
+                            "AC-QA-SCOPED-VERIFICATION-FULL-SUITE-GUIDE-"
+                            "20260706"
+                        ),
+                        "contract_execution_id": "cex-qa-scoped",
+                        "definition_hash": "sha256:qa-definition",
+                        "instruction_bundle_hash": "sha256:qa-instructions",
+                        "execution_state_revision": 9,
+                        "runtime_guide_hash": "sha256:qa-writer-guide",
+                        "stage_id": "qa",
+                        "line_id": "qa_independent_verification",
+                        "actor_role": "qa",
+                        "evidence_kind": "independent_verification",
+                    }
+                },
+            }
+        },
     )
 
     bindings = guide["legitimate_evidence_bindings"]
@@ -33384,6 +33407,90 @@ def test_runtime_context_qa_guide_scopes_verification_and_full_suite_caveat() ->
         "resource_observation",
         "focused_tests_passed",
     }.issubset(set(caveat["required_fields"]))
+
+    no_pass_body = append_evidence[
+        "canonical_external_no_pass_baseline_body"
+    ]
+    no_pass_policy = append_evidence[
+        "external_no_pass_baseline_policy"
+    ]
+    assert no_pass_body["contract_execution_id"] == "cex-qa-scoped"
+    assert no_pass_body["runtime_guide_hash"] == "sha256:qa-writer-guide"
+    assert no_pass_body["actor_role"] == "qa"
+    assert no_pass_body["line_id"] == "qa_independent_verification"
+    assert no_pass_body["status"] == "accepted"
+    assert no_pass_body["verdict"] == "accepted"
+    assert no_pass_body["no_pass_claim"] is True
+    assert no_pass_body["overall_release_pass_claimed"] is False
+    assert no_pass_body["payload"]["row_scoped_qa_pass"] is True
+    assert no_pass_body["payload"]["full_suite_claim"] == "not_claimed"
+    assert no_pass_body["test_results"]["passed"] is False
+    assert no_pass_body["test_results"]["overall_release_pass"] is False
+    assert no_pass_body["verification"]["row_scoped_qa_pass"] is True
+    ledger = no_pass_body["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]
+    assert ledger["schema_version"] == (
+        "contract_runtime.external_no_pass_baseline_ledger.v2"
+    )
+    assert ledger["base_failure_identities"] == ledger[
+        "candidate_failure_identities"
+    ]
+    assert ledger["base_failure_identities"] == ledger[
+        "base_reproduction"
+    ]["failure_identities"]
+    assert ledger["candidate_suite_counts"]["failed"] == (
+        "<inherited-baseline-failure-count>"
+    )
+    assert ledger["base_reproduction"]["reproduced"] == (
+        "<inherited-baseline-failure-count>"
+    )
+    assert ledger["base_reproduction"]["total"] == (
+        "<inherited-baseline-failure-count>"
+    )
+    assert ledger["candidate_new_failures"] == 0
+    assert ledger["overall_release_pass_claimed"] is False
+    assert "server_normalized" not in ledger
+    assert server._contract_runtime_value_reports_failed_qa(
+        no_pass_body
+    ) is False
+    assert no_pass_policy["precheck"] == {
+        "tool": "contract_runtime_line_write_precheck",
+        "body_source": (
+            "append_evidence.canonical_external_no_pass_baseline_body"
+        ),
+        "required_before_submit": True,
+        "precheck_mutates_completed_lines": False,
+    }
+    assert no_pass_policy["contract_runtime_writer_copy_payload"][
+        "bound_to_current_writer"
+    ] is True
+    assert no_pass_policy["server_authority"] == {
+        "validator": "_contract_runtime_qa_no_pass_ledger_authority",
+        "binder": "_contract_runtime_bind_qa_no_pass_ledger_authority",
+        "canonical_ledger_path": (
+            "artifact_refs.external_no_pass_baseline_ledger"
+        ),
+        "server_normalized_is_server_only": True,
+    }
+    assert no_pass_policy["fail_closed"] == {
+        "ordinary_pass_with_positive_failed_counts_rejected": True,
+        "malformed_ledger_rejected_before_durable_mutation": True,
+        "candidate_new_failure_ledger_rejected_before_durable_mutation": True,
+        "identity_or_count_mismatch_rejected": True,
+    }
+
+    contradictory_ordinary_pass = json.loads(json.dumps(caveat_body))
+    contradictory_ordinary_pass["test_results"] = {
+        "passed": 41,
+        "failed": 3,
+    }
+    assert server._contract_runtime_value_reports_failed_qa(
+        contradictory_ordinary_pass
+    ) is True
+    assert server._contract_runtime_line_reports_disqualifying_failed_qa(
+        contradictory_ordinary_pass
+    ) is True
 
 
 def test_runtime_context_session_token_reissue_endpoint_audits_and_rotates(
@@ -85738,6 +85845,56 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
             }
         },
     }
+    manual_no_pass_body = json.loads(json.dumps(qa_independent_body))
+    qa_writer_guide = server._runtime_context_qa_verification_guide(
+        project_id=PID,
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        parent_task_id=task_id,
+        target_project_root=str(worktree),
+        route_identity={},
+        target_files=["agent/governance/server.py"],
+        contract_runtime_state=current,
+    )
+    guided_no_pass_body = json.loads(
+        json.dumps(
+            qa_writer_guide["append_evidence"][
+                "canonical_external_no_pass_baseline_body"
+            ]
+        )
+    )
+    assert qa_writer_guide["append_evidence"][
+        "external_no_pass_baseline_policy"
+    ]["contract_runtime_writer_copy_payload"]["bound_to_current_writer"] is True
+    for field in (
+        "commit_sha",
+        "actor_session_principal",
+        "authorization_source",
+        "evidence_owner_actor",
+        "evidence_owner_role",
+        "evidence_owner_session",
+        "submitter_principal",
+        "submitter_session",
+        "observer_impersonation",
+        "parent_materialization_authorized",
+        "qa_session_token_ref",
+        "qa_evidence_provenance",
+    ):
+        guided_no_pass_body[field] = qa_independent_body[field]
+    guided_no_pass_body["graph_trace_ids"] = [qa_graph_trace_id]
+    guided_no_pass_body["graph_query_trace_ids"] = [qa_graph_trace_id]
+    guided_no_pass_body["payload"].update(qa_independent_body["payload"])
+    guided_no_pass_body["test_results"].update(
+        qa_independent_body["test_results"]
+    )
+    guided_no_pass_body["verification"].update(
+        qa_independent_body["verification"]
+    )
+    guided_no_pass_body["artifact_refs"] = qa_independent_body[
+        "artifact_refs"
+    ]
+    qa_independent_body = guided_no_pass_body
     assert _line_status_allows_contract_completion(qa_independent_body) is False
     with pytest.raises((ContractRuntimeError, PermissionDeniedError)):
         server.handle_project_contract_runtime_line_write_precheck(
@@ -85772,6 +85929,66 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert no_pass_shape.value.code == (
         "contract_runtime_qa_no_pass_authority_shape_invalid"
     )
+    malformed_ledger = json.loads(json.dumps(qa_independent_body))
+    malformed_ledger["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]["refs"] = []
+    with pytest.raises(GovernanceError) as malformed_shape:
+        server.handle_project_contract_runtime_line_write_precheck(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor[
+                        "contract_execution_id"
+                    ],
+                },
+                "qa",
+                method="POST",
+                body=malformed_ledger,
+            )
+        )
+    assert malformed_shape.value.code == (
+        "contract_runtime_qa_no_pass_authority_shape_invalid"
+    )
+    candidate_new_ledger = json.loads(json.dumps(qa_independent_body))
+    for source in (
+        candidate_new_ledger["payload"],
+        candidate_new_ledger["payload"]["test_results"],
+        candidate_new_ledger["test_results"],
+        candidate_new_ledger["verification"],
+        candidate_new_ledger["artifact_refs"][
+            "external_no_pass_baseline_ledger"
+        ],
+    ):
+        source["candidate_new_failures"] = 1
+    with pytest.raises(GovernanceError) as candidate_new_shape:
+        server.handle_project_contract_runtime_line_write_precheck(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor[
+                        "contract_execution_id"
+                    ],
+                },
+                "qa",
+                method="POST",
+                body=candidate_new_ledger,
+            )
+        )
+    assert candidate_new_shape.value.code == (
+        "contract_runtime_qa_no_pass_authority_shape_invalid"
+    )
+    stored_after_rejected_prechecks = (
+        server._contract_runtime_store(conn).get(
+            successor["contract_execution_id"]
+        )
+    )
+    assert len(stored_after_rejected_prechecks["completed_lines"]) == len(
+        stored_before_qa["completed_lines"]
+    )
+    assert stored_after_rejected_prechecks[
+        "execution_state_revision"
+    ] == stored_before_qa["execution_state_revision"]
     precheck = server.handle_project_contract_runtime_line_write_precheck(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
@@ -85781,6 +85998,8 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         )
     )
     assert precheck["ok"] is True
+    assert precheck["would_mutate_completed_lines"] is False
+    qa_independent_body = manual_no_pass_body
 
     result = server.handle_task_timeline_append(
         _ctx_with_role(
