@@ -17127,6 +17127,199 @@ def test_runtime_context_service_refs_use_canonical_finish_time_attestation_even
     assert finish_payload["event_id"] == f"timeline:{finish_gate['id']}"
 
 
+def test_runtime_context_service_refs_bind_current_failed_qa_rework_finish_order_independent():
+    task_id = "failed-qa-rework-atomicity-worker-1"
+    backlog_id = (
+        "AC-CONTRACT-RUNTIME-FAILED-QA-REWORK-IMPLEMENTATION-"
+        "PARTIAL-REVISION-NEXT-LOOP-R1-20260729"
+    )
+    runtime_context_id = "mfrctx-a5dfddac8c879e65"
+    commits = (
+        "9195ba4800fff31fe344538e3e84743c8f37619c",
+        "abeab20fadae2820fa9eb643b4a7ba75d1302102",
+        "6f8ceda5da0446a91005abfd860c842d8b5ab67d",
+        "eb5ed3773b3071cc0db2182c4f4cded32c2fcfad",
+        "f4a5badbf288571f2c578b2796384d8e886c9663",
+    )
+    cycle_ids = (
+        (19041, 19042, 19043, 19046),
+        (19050, 19051, 19052, 19053),
+        (19060, 19062, 19063, 19064),
+        (19068, 19070, 19071, 19072),
+        (19075, 19076, 19078, 19079),
+    )
+    events = []
+    for cycle, (implementation_id, commit_id, attestation_id, finish_id) in zip(
+        commits,
+        cycle_ids,
+        strict=True,
+    ):
+        implementation_ref = f"timeline:{implementation_id}"
+        lineage_ref = f"contract-runtime:worker-implementation:{cycle}"
+        common_payload = {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": "cex-mf-parallel-9bfd567e6ecab4934e7f",
+            "backlog_id": backlog_id,
+            "worker_role": "mf_sub",
+            "head_commit": cycle,
+            "implementation_event_ref": implementation_ref,
+            "implementation_lineage_ref": lineage_ref,
+        }
+        events.extend(
+            [
+                {
+                    "id": implementation_id,
+                    "task_id": task_id,
+                    "backlog_id": backlog_id,
+                    "event_type": "mf.implementation",
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "status": "passed",
+                    "commit_sha": cycle,
+                    "payload": {
+                        **common_payload,
+                        "changed_files": ["agent/governance/server.py"],
+                    },
+                },
+                {
+                    "id": commit_id,
+                    "task_id": task_id,
+                    "backlog_id": backlog_id,
+                    "event_type": "mf_subagent.worker_commit",
+                    "event_kind": "worker_commit",
+                    "phase": "worker_commit",
+                    "status": "passed",
+                    "commit_sha": cycle,
+                    "payload": {
+                        **common_payload,
+                        "worker_commit_sha": cycle,
+                        "validated_head_commit": cycle,
+                    },
+                },
+                {
+                    "id": attestation_id,
+                    "task_id": task_id,
+                    "backlog_id": backlog_id,
+                    "event_type": (
+                        "mf_subagent.finish_time_worker_attestation"
+                    ),
+                    "event_kind": "worker_progress",
+                    "phase": "finish_time_worker_attestation",
+                    "status": "passed",
+                    "commit_sha": cycle,
+                    "payload": {
+                        **common_payload,
+                        "action": "record_finish_time_worker_attestation",
+                        "finish_time_worker_self_attestation": {
+                            "status": "passed",
+                            "finish_time_self_attesting": True,
+                        },
+                    },
+                },
+                {
+                    "id": finish_id,
+                    "task_id": task_id,
+                    "backlog_id": backlog_id,
+                    "event_type": "mf_subagent.finish_gate",
+                    "event_kind": "mf_subagent_finish_gate",
+                    "phase": "finish_gate",
+                    "status": "passed",
+                    "commit_sha": cycle,
+                    "payload": {
+                        **common_payload,
+                        "validated_head_commit": cycle,
+                        "checkpoint_id": task_id,
+                    },
+                },
+            ]
+        )
+    for event in events:
+        if event["id"] not in {19078, 19079}:
+            continue
+        event.pop("commit_sha")
+        event["payload"].pop("head_commit")
+        event["payload"].pop("validated_head_commit", None)
+        event["payload"]["candidate_commit_sha"] = commits[-1]
+        event["payload"]["test_results"] = {
+            "baseline": {"head_commit": commits[0]}
+        }
+    events.extend(
+        [
+            {
+                "id": 19080,
+                "task_id": task_id,
+                "backlog_id": backlog_id,
+                "event_type": "qa.independent_verification",
+                "event_kind": "independent_verification",
+                "phase": "verification",
+                "status": "passed",
+                "payload": {
+                    "candidate_commit": commits[-1],
+                    "test_results": {
+                        "baseline": {"head_commit": commits[0]}
+                    },
+                },
+            },
+            {
+                "id": 19082,
+                "task_id": task_id,
+                "backlog_id": backlog_id,
+                "event_type": "parallel.route_action_precheck",
+                "event_kind": "route_action_precheck",
+                "phase": "merge_precheck",
+                "status": "passed",
+                "payload": {
+                    "candidate_commit": commits[-1],
+                    "worker_finish_gate_ref": "timeline:19079",
+                    "independent_verification_ref": "timeline:19080",
+                    "test_results": {
+                        "baseline": {"head_commit": commits[0]}
+                    },
+                },
+            },
+        ]
+    )
+    orders = (
+        events,
+        list(reversed(events)),
+        list(reversed(events + [copy.deepcopy(events[0]), copy.deepcopy(events[4])])),
+    )
+
+    projections = []
+    for ordered_events in orders:
+        refs, _, finish_payload, _ = server._runtime_context_service_timeline_refs(
+            None,
+            project_id=PID,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            timeline_events=ordered_events,
+        )
+        projections.append((refs, finish_payload))
+
+    expected_finish_history = [
+        "timeline:19046",
+        "timeline:19053",
+        "timeline:19064",
+        "timeline:19072",
+        "timeline:19079",
+    ]
+    for refs, finish_payload in projections:
+        assert refs["worker_commit_event_ref"] == "timeline:19076"
+        assert refs["worker_commit_sha"] == commits[-1]
+        assert refs["latest_implementation_event_ref"] == "timeline:19075"
+        assert refs["finish_event_ref"] == "timeline:19079"
+        assert refs["finish_event_refs"] == expected_finish_history
+        assert refs["finish_time_worker_attestation_hint"][
+            "finish_time_attestation_event_ref"
+        ] == "timeline:19078"
+        assert refs["verification_event_refs"] == ["timeline:19080"]
+        assert refs["route_action_precheck_event_ref"] == "timeline:19082"
+        assert finish_payload["event_id"] == "timeline:19079"
+        assert finish_payload["payload"]["candidate_commit_sha"] == commits[-1]
+    assert projections[0] == projections[1] == projections[2]
+
+
 def test_contract_runtime_projection_source_map_uses_canonical_finish_time_attestation_ref():
     timeline_events = [
         {
