@@ -723,30 +723,10 @@ def test_failed_qa_fresh_dispatch_revision_is_append_only_single_cas_and_replay_
     assert store.record["completed_lines"][:3] == preserved_first_cycle
 
     second_write = deepcopy(write)
-    second_write["runtime_context_id"] = "mfrctx-replacement-cycle-2"
-    second_write["task_id"] = "worker-replacement-cycle-2"
-    second_write["worker_id"] = "worker-replacement-cycle-2"
-    second_write["worker_slot_id"] = "worker-replacement-cycle-2"
-    second_write["route_token_ref"] = "rtok-replacement-cycle-2"
-    second_write["payload"].update(
-        {
-            "runtime_context_id": "mfrctx-replacement-cycle-2",
-            "task_id": "worker-replacement-cycle-2",
-            "worker_id": "worker-replacement-cycle-2",
-            "worker_slot_id": "worker-replacement-cycle-2",
-            "route_token_ref": "rtok-replacement-cycle-2",
-        }
-    )
     second_authority = second_write["payload"][
         "failed_qa_rework_dispatch_revision_authority"
     ]
-    second_authority.update(
-        {
-            "failed_qa_completed_line_index": 4,
-            "runtime_context_id": "mfrctx-replacement-cycle-2",
-            "task_id": "worker-replacement-cycle-2",
-        }
-    )
+    second_authority["failed_qa_completed_line_index"] = 4
     second_result = runtime.revise_failed_qa_observer_dispatch(
         record["contract_execution_id"],
         second_write,
@@ -763,4 +743,20 @@ def test_failed_qa_fresh_dispatch_revision_is_append_only_single_cas_and_replay_
     )
     assert second_exact_replay["ok"] is True
     assert second_exact_replay["status"] == "already_completed"
+    assert store.update_calls == 2
+
+    duplicate_current_authority = deepcopy(
+        store.record["completed_lines"][-1]
+    )
+    store.record["completed_lines"].append(duplicate_current_authority)
+    multiple_current_authorities = runtime.revise_failed_qa_observer_dispatch(
+        record["contract_execution_id"],
+        second_write,
+        actor_role="observer",
+    )
+    assert multiple_current_authorities["ok"] is False
+    assert any(
+        "multiple current-cycle" in error
+        for error in multiple_current_authorities["decision"]["errors"]
+    )
     assert store.update_calls == 2

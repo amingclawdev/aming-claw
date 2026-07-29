@@ -6952,9 +6952,10 @@ class ContractRuntime:
             ):
                 matching_dispatches.append((index, candidate))
 
-        exact_replay = False
-        if matching_dispatches:
-            matching_index, matched = matching_dispatches[-1]
+        current_cycle_matching_dispatches: list[
+            tuple[int, Mapping[str, Any]]
+        ] = []
+        for matching_index, matched in matching_dispatches:
             matched_payload = (
                 matched.get("payload")
                 if isinstance(matched.get("payload"), Mapping)
@@ -6982,9 +6983,8 @@ class ContractRuntime:
                 )
                 else {}
             )
-            exact_replay = (
-                len(matching_dispatches) == 1
-                and matching_index > failed_qa_index
+            if (
+                matching_index > failed_qa_index
                 and matched_revision.get("append_only_history_preserved") is True
                 and matched_revision.get("timeline_projection_authoritative") is False
                 and int(
@@ -7017,7 +7017,21 @@ class ContractRuntime:
                 == runtime_context_id
                 and str(matched_authority.get("task_id") or "").strip()
                 == task_id
-                and _worker_commit_text(matched, "parent_task_id")
+            ):
+                current_cycle_matching_dispatches.append(
+                    (matching_index, matched)
+                )
+
+        exact_replay = False
+        if len(current_cycle_matching_dispatches) > 1:
+            errors.append(
+                "failed-QA dispatch revision has multiple current-cycle "
+                "replacement RuntimeContext authorities"
+            )
+        elif current_cycle_matching_dispatches:
+            _matching_index, matched = current_cycle_matching_dispatches[0]
+            exact_replay = (
+                _worker_commit_text(matched, "parent_task_id")
                 == parent_task_id
                 and _worker_commit_text(matched, "worker_id")
                 == _worker_commit_text(effective_write, "worker_id")
@@ -7051,7 +7065,7 @@ class ContractRuntime:
             )
             if not exact_replay:
                 errors.append(
-                    "failed-QA dispatch revision conflicts with the existing "
+                    "failed-QA dispatch revision conflicts with the current-cycle "
                     "replacement RuntimeContext dispatch"
                 )
 
