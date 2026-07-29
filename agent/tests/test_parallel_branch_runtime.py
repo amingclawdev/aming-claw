@@ -3886,6 +3886,16 @@ def test_runtime_context_timeline_derived_evidence_binds_current_finish_order_in
                 },
             ]
         )
+    for event in events:
+        if event["id"] not in {19078, 19079}:
+            continue
+        event.pop("commit_sha")
+        event["payload"].pop("head_commit")
+        event["payload"].pop("validated_head_commit", None)
+        event["payload"]["candidate_commit_sha"] = commits[-1]
+        event["payload"]["test_results"] = {
+            "baseline": {"head_commit": commits[0]}
+        }
     events.extend(
         [
             {
@@ -3897,9 +3907,11 @@ def test_runtime_context_timeline_derived_evidence_binds_current_finish_order_in
                 "phase": "verification",
                 "status": "passed",
                 "actor": "qa",
-                "commit_sha": commits[-1],
                 "payload": {
                     "candidate_commit": commits[-1],
+                    "test_results": {
+                        "baseline": {"head_commit": commits[0]}
+                    },
                     "runtime_context_id": runtime_context_id,
                     "task_id": context.task_id,
                     "parent_task_id": context.root_task_id,
@@ -3915,11 +3927,13 @@ def test_runtime_context_timeline_derived_evidence_binds_current_finish_order_in
                 "phase": "merge_precheck",
                 "status": "passed",
                 "actor": "observer",
-                "commit_sha": commits[-1],
                 "payload": {
                     "candidate_commit": commits[-1],
                     "worker_finish_gate_ref": "timeline:19079",
                     "independent_verification_ref": "timeline:19080",
+                    "test_results": {
+                        "baseline": {"head_commit": commits[0]}
+                    },
                     "runtime_context_id": runtime_context_id,
                     "task_id": context.task_id,
                     "parent_task_id": context.root_task_id,
@@ -3964,7 +3978,7 @@ def test_runtime_context_timeline_derived_evidence_binds_current_finish_order_in
         assert refs["verification_event_refs"] == ["timeline:19080"]
         assert refs["route_action_precheck_event_ref"] == "timeline:19082"
         assert projection["finish_gate"]["event_id"] == "timeline:19079"
-        assert projection["finish_gate"]["payload"]["validated_head_commit"] == (
+        assert projection["finish_gate"]["payload"]["candidate_commit_sha"] == (
             commits[-1]
         )
         assert projection["route_identity"] == route_identity

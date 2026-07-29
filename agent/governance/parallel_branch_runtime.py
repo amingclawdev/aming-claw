@@ -4052,12 +4052,20 @@ def _runtime_context_event_lineage_identity(
     return {
         "commit_sha": (
             _runtime_context_text(event.get("commit_sha"))
+            or _runtime_context_text(event.get("candidate_commit_sha"))
+            or _runtime_context_text(event.get("candidate_commit"))
             or _runtime_context_text(payload.get("worker_commit_sha"))
             or _runtime_context_text(payload.get("validated_head_commit"))
+            or _runtime_context_text(payload.get("candidate_commit_sha"))
+            or _runtime_context_text(payload.get("candidate_commit"))
+            or _runtime_context_text(payload.get("candidate_head_commit"))
+            or _runtime_context_text(payload.get("commit_sha"))
             or _runtime_context_text(payload.get("head_commit"))
             or _runtime_context_deep_text(payload, "worker_commit_sha")
             or _runtime_context_deep_text(payload, "validated_head_commit")
-            or _runtime_context_deep_text(payload, "head_commit")
+            or _runtime_context_deep_text(payload, "candidate_commit_sha")
+            or _runtime_context_deep_text(payload, "candidate_commit")
+            or _runtime_context_deep_text(payload, "candidate_head_commit")
         ),
         "implementation_event_ref": (
             _runtime_context_text(payload.get("implementation_event_ref"))

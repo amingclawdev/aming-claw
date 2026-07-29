@@ -17234,6 +17234,16 @@ def test_runtime_context_service_refs_bind_current_failed_qa_rework_finish_order
                 },
             ]
         )
+    for event in events:
+        if event["id"] not in {19078, 19079}:
+            continue
+        event.pop("commit_sha")
+        event["payload"].pop("head_commit")
+        event["payload"].pop("validated_head_commit", None)
+        event["payload"]["candidate_commit_sha"] = commits[-1]
+        event["payload"]["test_results"] = {
+            "baseline": {"head_commit": commits[0]}
+        }
     events.extend(
         [
             {
@@ -17244,8 +17254,12 @@ def test_runtime_context_service_refs_bind_current_failed_qa_rework_finish_order
                 "event_kind": "independent_verification",
                 "phase": "verification",
                 "status": "passed",
-                "commit_sha": commits[-1],
-                "payload": {"candidate_commit": commits[-1]},
+                "payload": {
+                    "candidate_commit": commits[-1],
+                    "test_results": {
+                        "baseline": {"head_commit": commits[0]}
+                    },
+                },
             },
             {
                 "id": 19082,
@@ -17255,11 +17269,13 @@ def test_runtime_context_service_refs_bind_current_failed_qa_rework_finish_order
                 "event_kind": "route_action_precheck",
                 "phase": "merge_precheck",
                 "status": "passed",
-                "commit_sha": commits[-1],
                 "payload": {
                     "candidate_commit": commits[-1],
                     "worker_finish_gate_ref": "timeline:19079",
                     "independent_verification_ref": "timeline:19080",
+                    "test_results": {
+                        "baseline": {"head_commit": commits[0]}
+                    },
                 },
             },
         ]
@@ -17300,7 +17316,7 @@ def test_runtime_context_service_refs_bind_current_failed_qa_rework_finish_order
         assert refs["verification_event_refs"] == ["timeline:19080"]
         assert refs["route_action_precheck_event_ref"] == "timeline:19082"
         assert finish_payload["event_id"] == "timeline:19079"
-        assert finish_payload["payload"]["validated_head_commit"] == commits[-1]
+        assert finish_payload["payload"]["candidate_commit_sha"] == commits[-1]
     assert projections[0] == projections[1] == projections[2]
 
 
