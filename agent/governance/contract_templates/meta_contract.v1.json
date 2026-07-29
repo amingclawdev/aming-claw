@@ -156,6 +156,21 @@
       ]
     }
   },
+  "scope_insufficiency_sideband_policy": {
+    "schema_version": "meta_contract.scope_insufficiency_sideband.v1",
+    "timeline_action": "record_blocker",
+    "event_type": "runtime_context.scope_insufficiency_requested",
+    "allowed_request_authors": [
+      "mf_sub",
+      "qa"
+    ],
+    "linear_contract_line": false,
+    "request_grants_authority": false,
+    "request_mutates_owned_files": false,
+    "observer_owns_scope_disposition": true,
+    "qa_is_sole_candidate_verdict_author": true,
+    "observer_may_author_or_rewrite_qa_verdict": false
+  },
   "hotfix_profile": {
     "profile": "HOTFIX",
     "entry_event_type": "hotfix.entered",

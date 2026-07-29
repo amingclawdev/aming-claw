@@ -272,3 +272,33 @@ These hold §9 questions 1 & 2 as DECIDED; question 3 gains the "claim exclusivi
 5. **Access-audit anomaly definition** (§3 L3) + binding to the worker session UUID.
 6. **Consistency** (§3): snapshot isolation level; observer read-your-writes; projection rebuild cost.
 7. **Migration** (§8): in-flight old-model lanes coexisting during rollout; no big-bang.
+
+---
+
+## 10. Executable scope-insufficiency sideband (mf_parallel rev7)
+
+`mf_parallel.v2` rev7 adds a sideband blocker contract without adding a stage
+or mandatory linear line. A bounded worker uses
+`runtime_context_scope_insufficiency_request`; the server authenticates the
+runtime/task/worker/fence identity and appends
+`runtime_context.scope_insufficiency_requested` with
+`event_kind=record_blocker`. The event records missing/requested files,
+blocked acceptance ids, reason, and graph refs. It never changes `owned_files`
+or grants authority.
+
+Disposition remains role-separated:
+
+1. Before implementation, the observer may issue one explicit same-runtime
+   allocation authority revision, requiring a clean worktree and complete
+   owned/base/target boundary. An omitted secret fence preserves the persisted
+   fence; any explicitly supplied conflict in fence, worktree, base, target, or
+   merge identity fails closed.
+2. After implementation, the observer must create a fresh/rework runtime.
+3. Authenticated QA alone authors PASS/NO-PASS and may attach a structured
+   scope-insufficiency finding to a failed audit. Observer routing can never
+   rewrite that verdict.
+4. New, out-of-acceptance, Browser, or late discoveries use a bounded linked
+   row while preserving the source lane's evidence.
+
+The acceptance evidence and request ids are indexed in
+`docs/dev/e2e-product-governance-boundary-drift-case-index-20260728.md`.

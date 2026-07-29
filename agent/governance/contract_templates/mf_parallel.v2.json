@@ -57,7 +57,7 @@
   "runtime_contract_hints": {
     "schema_version": "contract_template.runtime_hints.v1",
     "contract_definition_id": "mf_parallel.v2",
-    "contract_definition_revision": "rev6"
+    "contract_definition_revision": "rev7"
   },
   "route_topology_policy": {
     "schema_version": "route_topology_policy.v1",

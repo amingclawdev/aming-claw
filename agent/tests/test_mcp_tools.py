@@ -73,6 +73,59 @@ def test_runtime_context_worker_commit_tool_routes_to_canonical_facade():
     )
 
 
+def test_governance_mcp_exposes_scope_insufficiency_request_schema():
+    required = {
+        "project_id",
+        "runtime_context_id",
+        "backlog_id",
+        "task_id",
+        "parent_task_id",
+        "target_project_root",
+        "missing_files",
+        "requested_files",
+        "blocked_acceptance_ids",
+        "reason",
+        "graph_refs",
+    }
+    for registry in (governance_mcp_server.TOOLS, mcp_tools.TOOLS):
+        tool = next(
+            item
+            for item in registry
+            if item["name"] == "runtime_context_scope_insufficiency_request"
+        )
+        schema = tool["inputSchema"]
+        assert required.issubset(schema["required"])
+        assert schema["properties"]["requested_files"] == {
+            "type": "array",
+            "items": {"type": "string"},
+        }
+
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    body = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-scope-request",
+        "backlog_id": "AC-SCOPE-REQUEST",
+        "task_id": "scope-request-worker",
+        "parent_task_id": "cex-scope-request",
+        "target_project_root": "/repo",
+        "missing_files": ["missing.py"],
+        "requested_files": ["owned.py", "missing.py"],
+        "blocked_acceptance_ids": ["AC-1"],
+        "reason": "missing.py is required",
+        "graph_refs": ["graph-query:gqt-scope-request"],
+    }
+    dispatcher.dispatch("runtime_context_scope_insufficiency_request", body)
+    assert recorder.calls[-1] == (
+        "POST",
+        (
+            "/api/graph-governance/aming-claw/runtime-contexts/"
+            "mfrctx-scope-request/scope-insufficiency-requests"
+        ),
+        {key: value for key, value in body.items() if key != "project_id"},
+    )
+
+
 def test_mf_timeline_precheck_schema_exposes_repair_view():
     view = _tool_properties("mf_timeline_precheck")["view"]
     assert "repair" in view["enum"]
