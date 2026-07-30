@@ -55977,15 +55977,20 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
         (close_commit, now, backlog_id),
     )
     for index in range(3):
+        is_route_gate = index == 2
         task_timeline.record_event(
             conn,
             project_id=PID,
             backlog_id=backlog_id,
             task_id=f"playback-mf-batch-history-{index + 1}",
             event_type="worker.progress",
-            event_kind="implementation_progress",
-            phase="implementation",
-            actor="mf_sub",
+            event_kind=(
+                "route_token_gate"
+                if is_route_gate
+                else "implementation_progress"
+            ),
+            phase="route_gate" if is_route_gate else "implementation",
+            actor="observer" if is_route_gate else "mf_sub",
             status="accepted",
             payload={"history_frame": index + 1},
         )
@@ -56185,6 +56190,251 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
             "mf_route_context_gate_verification",
             real_route_gate_verification,
         )
+
+        legacy_route_gate_execution_id = "cex-1cb41c1ec4bb438d"
+        route_context_event = next(
+            event
+            for event in timeline_events
+            if event["event_kind"] == "route_token_gate"
+        )
+        route_context_event_id = route_context_event["id"]
+        route_context_hash = (
+            "sha256:e1f12a21e5db6aed0f9a0a3ed6f1642939e9c4cdd14c6a672"
+            "d02bd3a4eefec98"
+        )
+        prompt_contract_id = "rprompt-aming-05b6c9fe8f5f377a"
+        prompt_contract_hash = (
+            "sha256:05b6c9fe8f5f377a7818b0895192e218c018a3f6edf9c400f4"
+            "fa98ea88db9ab7"
+        )
+        visible_manifest_hash = (
+            "sha256:fcc520285aedcff4420d6a40d7e17255b90ed1d405ee445964"
+            "7bb3d9fe16c482"
+        )
+        route_token_ref = "rtok-1e78e90a66ebd08dc0ccfa6cd9d74041"
+        contract_chain_id = "cchain-9b0248753202860f8629"
+        legacy_route_gate = {
+            "schema_version": "mf_route_context_consumption_gate.v1",
+            "passed": True,
+            "status": "passed",
+            "same_route_identity": True,
+            "route_identity": {
+                "route_id": "route-20260730-e1f12a21e5db6aed",
+                "route_context_hash": route_context_hash,
+                "prompt_contract_id": prompt_contract_id,
+                "prompt_contract_hash": prompt_contract_hash,
+            },
+            "contract_close_gate_policy": {
+                "schema_version": "contract_close_gate_policy_projection.v1",
+                "active_lane_contract": {
+                    "schema_version": "contract_lane_execution.v1",
+                    "role": "root",
+                    "source": "contract_state",
+                    "contract_chain_id": contract_chain_id,
+                    "backlog_id": backlog_id,
+                    "active_contract_execution": {
+                        "schema_version": "active_contract_execution.v1",
+                        "project_id": PID,
+                        "backlog_id": backlog_id,
+                        "contract_execution_id": (
+                            legacy_route_gate_execution_id
+                        ),
+                        "contract_id": "mf_batch_parallel",
+                        "contract_template_id": "mf_batch_parallel.v1",
+                        "state": "accepted",
+                        "projection_watermark": route_context_event_id,
+                        "route_identity_hash": (
+                            "sha256:9e3e581102f90ab64206ecd5c1608971c7a41751770a"
+                            "0f4f263bd0ec73ad59a9"
+                        ),
+                        "route_token_ref": route_token_ref,
+                        "prompt_contract_id": prompt_contract_id,
+                        "visible_injection_manifest_hash": (
+                            visible_manifest_hash
+                        ),
+                        "contract_chain_id": contract_chain_id,
+                    },
+                    "contract_id": "mf_batch_parallel",
+                    "contract_template_id": "mf_batch_parallel.v1",
+                    "contract_execution_id": (
+                        legacy_route_gate_execution_id
+                    ),
+                    "state": "accepted",
+                    "next_legal_action": {
+                        "source": "contract_state",
+                        "contract_chain_id": contract_chain_id,
+                        "contract_execution_id": (
+                            legacy_route_gate_execution_id
+                        ),
+                        "backlog_id": backlog_id,
+                        "route_token_ref": route_token_ref,
+                        "projection_watermark": route_context_event_id,
+                    },
+                },
+            },
+            "evidence_events": {
+                "route_context": [
+                    {
+                        "id": route_context_event_id,
+                        "event_kind": "route_token_gate",
+                        "phase": "route_gate",
+                        "status": "accepted",
+                    }
+                ]
+            },
+            "checks": {
+                "route_context_present": True,
+                "same_route_identity": True,
+            },
+        }
+        scoped_patch.setattr(
+            server,
+            "read_backlog_contract_chain_current",
+            current_projection(
+                current_execution_id=parent_execution_id,
+                active_chain_execution_ids=(parent_execution_id,),
+            ),
+        )
+        legacy_route_body = (
+            server._timeline_gate_contract_runtime_projection_body(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                query={"playback_bootstrap": "compact"},
+                route_gate=legacy_route_gate,
+                timeline_events=timeline_events,
+                close_commit=close_commit,
+            )
+        )
+        assert legacy_route_body["current_contract_execution_id"] == (
+            parent_execution_id
+        )
+        legacy_runtime_projection = legacy_route_body["contract_runtime"]
+        assert legacy_runtime_projection[
+            "ignored_server_derived_unknown_contract_execution_id"
+        ] == legacy_route_gate_execution_id
+        assert legacy_runtime_projection[
+            "ignored_server_derived_execution_id_source"
+        ] == "route_gate"
+        assert legacy_runtime_projection[
+            "validated_legacy_contract_state_origin"
+        ] == {
+            "schema_version": (
+                "playback_legacy_contract_state_route_gate_origin.v1"
+            ),
+            "validated": True,
+            "source": "legacy_contract_state_route_gate",
+            "authoritative": False,
+            "close_authority": False,
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "contract_execution_id": legacy_route_gate_execution_id,
+            "contract_id": "mf_batch_parallel",
+            "contract_template_id": "mf_batch_parallel.v1",
+            "state": "accepted",
+            "contract_chain_id": contract_chain_id,
+            "projection_watermark": route_context_event_id,
+            "route_event_id": route_context_event_id,
+            "route_id": "route-20260730-e1f12a21e5db6aed",
+            "route_context_hash": route_context_hash,
+            "prompt_contract_id": prompt_contract_id,
+            "prompt_contract_hash": prompt_contract_hash,
+        }
+
+        scoped_patch.setattr(
+            task_timeline,
+            "mf_route_context_gate_verification",
+            lambda *_args, **_kwargs: legacy_route_gate,
+        )
+        server._timeline_warm_cache_clear()
+        legacy_route_compact = server.handle_task_timeline_list(
+            _ctx(
+                {"project_id": PID},
+                query={
+                    "backlog_id": backlog_id,
+                    "limit": "50",
+                    "playback_bootstrap": "compact",
+                },
+            )
+        )
+        assert legacy_route_compact["backlog_timeline_gate"]["ok"] is True
+        assert legacy_route_compact["backlog_timeline_gate"][
+            "can_close"
+        ] is True
+        assert legacy_route_compact["count"] == 4
+        assert len(legacy_route_compact["events"]) == 4
+
+        rejected_legacy_shapes = []
+        wrong_template = copy.deepcopy(legacy_route_gate)
+        wrong_template["contract_close_gate_policy"][
+            "active_lane_contract"
+        ]["contract_template_id"] = "mf_parallel.v1"
+        rejected_legacy_shapes.append(wrong_template)
+        wrong_state = copy.deepcopy(legacy_route_gate)
+        wrong_state["contract_close_gate_policy"]["active_lane_contract"][
+            "state"
+        ] = "running"
+        rejected_legacy_shapes.append(wrong_state)
+        wrong_source = copy.deepcopy(legacy_route_gate)
+        wrong_source["contract_close_gate_policy"]["active_lane_contract"][
+            "source"
+        ] = "route_gate"
+        rejected_legacy_shapes.append(wrong_source)
+        wrong_project = copy.deepcopy(legacy_route_gate)
+        wrong_project["contract_close_gate_policy"]["active_lane_contract"][
+            "active_contract_execution"
+        ]["project_id"] = "another-project"
+        rejected_legacy_shapes.append(wrong_project)
+        mismatched_identity = copy.deepcopy(legacy_route_gate)
+        mismatched_identity["same_route_identity"] = False
+        rejected_legacy_shapes.append(mismatched_identity)
+        wrong_watermark = copy.deepcopy(legacy_route_gate)
+        wrong_watermark["contract_close_gate_policy"][
+            "active_lane_contract"
+        ]["active_contract_execution"]["projection_watermark"] += 1
+        rejected_legacy_shapes.append(wrong_watermark)
+        for rejected_route_gate in rejected_legacy_shapes:
+            rejected_body = (
+                server._timeline_gate_contract_runtime_projection_body(
+                    conn,
+                    project_id=PID,
+                    backlog_id=backlog_id,
+                    query={"playback_bootstrap": "compact"},
+                    route_gate=rejected_route_gate,
+                    timeline_events=timeline_events,
+                    close_commit=close_commit,
+                )
+            )
+            assert rejected_body["contract_execution_id"] == (
+                legacy_route_gate_execution_id
+            )
+            assert (
+                "ignored_server_derived_unknown_contract_execution_id"
+                not in rejected_body["contract_runtime"]
+            )
+
+        for rejected_query, rejected_events in (
+            ({}, timeline_events),
+            ({"playback_bootstrap": "compact"}, []),
+        ):
+            rejected_body = (
+                server._timeline_gate_contract_runtime_projection_body(
+                    conn,
+                    project_id=PID,
+                    backlog_id=backlog_id,
+                    query=rejected_query,
+                    route_gate=legacy_route_gate,
+                    timeline_events=rejected_events,
+                    close_commit=close_commit,
+                )
+            )
+            assert rejected_body["contract_execution_id"] == (
+                legacy_route_gate_execution_id
+            )
+            assert (
+                "ignored_server_derived_unknown_contract_execution_id"
+                not in rejected_body["contract_runtime"]
+            )
 
         unknown_route_gate_execution_id = (
             "cex-explicit-route-gate-arbitrary-unknown"
