@@ -7989,9 +7989,22 @@ def _shared_batch_reconcile_authority_fixture(
     *,
     coordination_runtime_scope: bool = True,
     short_epoch_head: bool = False,
+    nested_enter_queue_plan: bool = False,
+    service_enter_task: bool = False,
+    task_only_reconcile_task: str = "enter",
 ) -> dict[str, Any]:
     batch_id = "batch-shared-final-reconcile"
-    coordination_task_id = "batch-shared-coordination-task"
+    batch_enter_task_id = (
+        "onboard-service-shared-final-reconcile"
+        if service_enter_task
+        else "batch-shared-coordination-task"
+    )
+    if task_only_reconcile_task == "batch":
+        coordination_task_id = batch_id
+    elif task_only_reconcile_task == "arbitrary":
+        coordination_task_id = "caller-shaped-reconcile-alias"
+    else:
+        coordination_task_id = batch_enter_task_id
     merge_queue_id = "mq-shared-final-reconcile"
     coordination_backlog_id = "AC-BATCH-SHARED-COORDINATION"
     snapshot_id = "full-shared-final-reconcile"
@@ -8143,7 +8156,7 @@ def _shared_batch_reconcile_authority_fixture(
         conn,
         project_id=PID,
         backlog_id=coordination_backlog_id,
-        task_id=coordination_task_id,
+        task_id=batch_enter_task_id,
         event_type="mf_batch_parallel.entered",
         event_kind="contract_binding",
         phase="orchestration",
@@ -8151,8 +8164,34 @@ def _shared_batch_reconcile_authority_fixture(
         status="accepted",
         payload={
             "batch_id": batch_id,
-            "merge_queue_id": merge_queue_id,
             "backlog_id": coordination_backlog_id,
+            **(
+                {
+                    "merge_queue_plan": {
+                        "merge_queue_id": merge_queue_id,
+                        "planner_only": False,
+                        "durable_queue_write": True,
+                        "durable_queue_item_count": 2,
+                        "durable_queue_items": [
+                            {
+                                "project_id": PID,
+                                "merge_queue_id": merge_queue_id,
+                                "queue_item_id": queue_item_ids[index],
+                                "backlog_id": child_backlogs[index],
+                                "task_id": child_tasks[index],
+                                "queue_index": index + 1,
+                            }
+                            for index in range(2)
+                        ],
+                        "source_of_authority": (
+                            "server."
+                            "handle_project_mf_batch_parallel_enter"
+                        ),
+                    }
+                }
+                if nested_enter_queue_plan
+                else {"merge_queue_id": merge_queue_id}
+            ),
         },
     )
     merge_events = []
@@ -8375,6 +8414,7 @@ def _shared_batch_reconcile_authority_fixture(
         "batch_id": batch_id,
         "coordination_backlog_id": coordination_backlog_id,
         "coordination_task_id": coordination_task_id,
+        "batch_enter_task_id": batch_enter_task_id,
         "merge_queue_id": merge_queue_id,
         "snapshot_id": snapshot_id,
         "final_head": final_head,
@@ -8512,6 +8552,156 @@ def test_mf_batch_task_only_reconcile_accepts_short_epoch_head_prefixes(
     assert shared["coordination_runtime_context_id"] == ""
 
 
+def test_mf_batch_task_only_reconcile_accepts_server_plan_and_batch_task(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+        nested_enter_queue_plan=True,
+        service_enter_task=True,
+        task_only_reconcile_task="batch",
+    )
+
+    authority = server._contract_runtime_shared_batch_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+        context=fixture["context"],
+        merge=fixture["merge"],
+    )
+
+    shared = authority["shared_batch_reconcile_authority"]
+    assert shared["batch_enter_task_id"] == fixture["batch_enter_task_id"]
+    assert shared["coordination_reconcile_task_id"] == fixture["batch_id"]
+    assert shared["coordination_task_id"] == fixture["batch_id"]
+
+
+def test_mf_batch_task_only_reconcile_rejects_nested_queue_mismatch(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+        nested_enter_queue_plan=True,
+        service_enter_task=True,
+        task_only_reconcile_task="batch",
+    )
+    entered_row = conn.execute(
+        """
+        SELECT id, payload_json
+        FROM task_timeline_events
+        WHERE project_id = ? AND backlog_id = ?
+          AND task_id = ? AND event_type = 'mf_batch_parallel.entered'
+        """,
+        (
+            PID,
+            fixture["coordination_backlog_id"],
+            fixture["batch_enter_task_id"],
+        ),
+    ).fetchone()
+    payload = json.loads(str(entered_row["payload_json"]))
+    payload["merge_queue_plan"]["merge_queue_id"] = "mq-cross-scope"
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            int(entered_row["id"]),
+        ),
+    )
+    conn.commit()
+
+    authority = server._contract_runtime_shared_batch_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+        context=fixture["context"],
+        merge=fixture["merge"],
+    )
+
+    assert authority == {}
+
+
+def test_mf_batch_task_only_reconcile_rejects_empty_claimed_queue_plan(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+    )
+    entered_row = conn.execute(
+        """
+        SELECT id, payload_json
+        FROM task_timeline_events
+        WHERE project_id = ? AND backlog_id = ?
+          AND task_id = ? AND event_type = 'mf_batch_parallel.entered'
+        """,
+        (
+            PID,
+            fixture["coordination_backlog_id"],
+            fixture["batch_enter_task_id"],
+        ),
+    ).fetchone()
+    payload = json.loads(str(entered_row["payload_json"]))
+    payload["merge_queue_plan"] = {}
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            int(entered_row["id"]),
+        ),
+    )
+    conn.commit()
+
+    authority = server._contract_runtime_shared_batch_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+        context=fixture["context"],
+        merge=fixture["merge"],
+    )
+
+    assert authority == {}
+
+
+def test_mf_batch_task_only_reconcile_rejects_arbitrary_task_alias(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+        nested_enter_queue_plan=True,
+        service_enter_task=True,
+        task_only_reconcile_task="arbitrary",
+    )
+
+    authority = server._contract_runtime_shared_batch_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+        context=fixture["context"],
+        merge=fixture["merge"],
+    )
+
+    assert authority == {}
+
+
 def test_mf_batch_task_only_reconcile_rejects_ambiguous_batch_binding(
     conn,
     tmp_path,
@@ -8527,7 +8717,7 @@ def test_mf_batch_task_only_reconcile_rejects_ambiguous_batch_binding(
         conn,
         project_id=PID,
         backlog_id=fixture["coordination_backlog_id"],
-        task_id=fixture["coordination_task_id"],
+        task_id=fixture["batch_enter_task_id"],
         event_type="mf_batch_parallel.entered",
         event_kind="contract_binding",
         phase="orchestration",

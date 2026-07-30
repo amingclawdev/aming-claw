@@ -75396,6 +75396,112 @@ def _contract_runtime_trusted_merge_projection(
     return {"timeline_verified": True, **next(iter(unique.values()))}
 
 
+def _contract_runtime_shared_batch_enter_binding_verified(
+    payload: Mapping[str, Any],
+    *,
+    project_id: str,
+    batch_id: str,
+    coordination_backlog_id: str,
+    merge_queue_id: str,
+    queue_rows: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Verify one server-authored batch enter against its durable queue.
+
+    Current enter events carry the queue only inside ``merge_queue_plan``.
+    Older events used the top-level ``merge_queue_id`` compatibility field.
+    When the durable plan is present, its immutable ordered child identities
+    must exactly match the closed queue; caller-shaped aliases never widen the
+    accepted binding.
+    """
+
+    if not (
+        str(payload.get("batch_id") or "").strip() == batch_id
+        and str(payload.get("backlog_id") or "").strip()
+        == coordination_backlog_id
+    ):
+        return False
+    top_level_queue_id = str(
+        payload.get("merge_queue_id") or ""
+    ).strip()
+    plan_claimed = "merge_queue_plan" in payload
+    raw_plan = payload.get("merge_queue_plan")
+    if plan_claimed and not isinstance(raw_plan, Mapping):
+        return False
+    plan = dict(raw_plan) if isinstance(raw_plan, Mapping) else {}
+    plan_queue_id = str(plan.get("merge_queue_id") or "").strip()
+    if (
+        top_level_queue_id
+        and plan_queue_id
+        and top_level_queue_id != plan_queue_id
+    ):
+        return False
+    entered_queue_id = plan_queue_id or top_level_queue_id
+    if entered_queue_id != merge_queue_id:
+        return False
+    if not plan_claimed:
+        return bool(top_level_queue_id)
+    if not plan:
+        return False
+    if not (
+        plan_queue_id == merge_queue_id
+        and plan.get("planner_only") is False
+        and plan.get("durable_queue_write") is True
+        and str(plan.get("source_of_authority") or "").strip()
+        == "server.handle_project_mf_batch_parallel_enter"
+    ):
+        return False
+    durable_items = plan.get("durable_queue_items")
+    if not isinstance(durable_items, list):
+        return False
+    try:
+        durable_item_count = int(plan.get("durable_queue_item_count"))
+    except (TypeError, ValueError):
+        return False
+    if durable_item_count != len(durable_items) or len(durable_items) != len(
+        queue_rows
+    ):
+        return False
+
+    def immutable_queue_identity(
+        item: Mapping[str, Any],
+    ) -> tuple[str, str, str, str, str, int] | None:
+        try:
+            queue_index = int(item.get("queue_index"))
+        except (TypeError, ValueError):
+            return None
+        identity = (
+            str(item.get("project_id") or "").strip(),
+            str(item.get("merge_queue_id") or "").strip(),
+            str(item.get("queue_item_id") or "").strip(),
+            str(item.get("backlog_id") or "").strip(),
+            str(item.get("task_id") or "").strip(),
+            queue_index,
+        )
+        if not all(identity[:5]) or queue_index <= 0:
+            return None
+        return identity
+
+    planned_identities = [
+        immutable_queue_identity(item)
+        if isinstance(item, Mapping)
+        else None
+        for item in durable_items
+    ]
+    durable_identities = [
+        immutable_queue_identity(item) for item in queue_rows
+    ]
+    return bool(
+        all(identity is not None for identity in planned_identities)
+        and all(identity is not None for identity in durable_identities)
+        and planned_identities == durable_identities
+        and all(
+            identity[0] == project_id and identity[1] == merge_queue_id
+            for identity in planned_identities
+            if identity is not None
+        )
+    )
+
+
 def _contract_runtime_shared_batch_reconcile_authority(
     conn,
     *,
@@ -75765,26 +75871,29 @@ def _contract_runtime_shared_batch_reconcile_authority(
     entered_candidates = [
         (row, payload)
         for row, payload in accepted_entered_bindings
-        if str(payload.get("batch_id") or "").strip() == batch_id
-        and str(payload.get("merge_queue_id") or "").strip()
-        == merge_queue_id
-        and str(payload.get("backlog_id") or "").strip()
-        == coordination_backlog_id
+        if _contract_runtime_shared_batch_enter_binding_verified(
+            payload,
+            project_id=project_id,
+            batch_id=batch_id,
+            coordination_backlog_id=coordination_backlog_id,
+            merge_queue_id=merge_queue_id,
+            queue_rows=queue_rows,
+        )
     ]
     if len(entered_candidates) != 1:
         return {}
     entered_event = entered_candidates[0][0]
     entered_event_id = int(entered_event.get("id") or 0)
-    coordination_task_id = str(
+    batch_enter_task_id = str(
         entered_event.get("task_id") or ""
     ).strip()
     same_task_entered_bindings = [
         (row, payload)
         for row, payload in accepted_entered_bindings
-        if str(row.get("task_id") or "").strip() == coordination_task_id
+        if str(row.get("task_id") or "").strip() == batch_enter_task_id
     ]
     if (
-        not coordination_task_id
+        not batch_enter_task_id
         or len(same_task_entered_bindings) != 1
         or int(same_task_entered_bindings[0][0].get("id") or 0)
         != entered_event_id
@@ -75826,6 +75935,9 @@ def _contract_runtime_shared_batch_reconcile_authority(
     if len(reconcile_rows) != 1:
         return {}
     reconcile_event = dict(reconcile_rows[0])
+    reconcile_task_id = str(
+        reconcile_event.get("task_id") or ""
+    ).strip()
     reconcile_payload = _json_loads(
         reconcile_event.get("payload_json"),
         {},
@@ -75914,7 +76026,7 @@ def _contract_runtime_shared_batch_reconcile_authority(
     legacy_task_scope = {
         "project_id": project_id,
         "backlog_id": coordination_backlog_id,
-        "task_id": coordination_task_id,
+        "task_id": reconcile_task_id,
     }
     scoped_coordination_verified = bool(
         coordination_scope_claimed
@@ -75933,10 +76045,10 @@ def _contract_runtime_shared_batch_reconcile_authority(
         and scope_identity.get("project_id") == project_id
         and scope_identity.get("backlog_id")
         == coordination_backlog_id
-        and scope_identity.get("task_id") == coordination_task_id
+        and scope_identity.get("task_id") == batch_enter_task_id
         and scope_identity.get("merge_queue_id") == merge_queue_id
         and str(getattr(coordination_context, "task_id", "") or "").strip()
-        == coordination_task_id
+        == batch_enter_task_id
         and str(
             getattr(coordination_context, "backlog_id", "") or ""
         ).strip()
@@ -75949,10 +76061,12 @@ def _contract_runtime_shared_batch_reconcile_authority(
             getattr(coordination_context, "batch_id", "") or ""
         ).strip()
         == batch_id
+        and reconcile_task_id == batch_enter_task_id
     )
     task_only_coordination_verified = bool(
         not coordination_scope_claimed
         and not scope_identity
+        and reconcile_task_id in {batch_enter_task_id, batch_id}
         and {
             str(field): str(value or "").strip()
             for field, value in route_token_scope.items()
@@ -75985,7 +76099,7 @@ def _contract_runtime_shared_batch_reconcile_authority(
         and str(reconcile_event.get("backlog_id") or "").strip()
         == coordination_backlog_id
         and str(reconcile_event.get("task_id") or "").strip()
-        == coordination_task_id
+        == reconcile_task_id
         and str(reconcile_event.get("event_type") or "").strip()
         == "graph.reconcile"
         and str(reconcile_event.get("event_kind") or "").strip()
@@ -76071,14 +76185,14 @@ def _contract_runtime_shared_batch_reconcile_authority(
         expected_contract_execution_id=(
             coordination_contract_execution_id
         ),
-        expected_task_id=coordination_task_id,
+        expected_task_id=reconcile_task_id,
         expected_runtime_context_id=coordination_runtime_context_id,
         expected_parent_task_id=coordination_parent_task_id,
         expected_merge_queue_id=(
             merge_queue_id if scoped_coordination_verified else ""
         ),
         trusted_contract_execution_lineage_verified=False,
-        reconcile_task_id=coordination_task_id,
+        reconcile_task_id=reconcile_task_id,
         reconcile_runtime_context_id=coordination_runtime_context_id,
         allow_taskless=task_only_coordination_verified,
     )
@@ -76121,7 +76235,9 @@ def _contract_runtime_shared_batch_reconcile_authority(
         "merge_queue_id": merge_queue_id,
         "epoch_id": str(epoch.get("epoch_id") or "").strip(),
         "coordination_backlog_id": coordination_backlog_id,
-        "coordination_task_id": coordination_task_id,
+        "coordination_task_id": reconcile_task_id,
+        "batch_enter_task_id": batch_enter_task_id,
+        "coordination_reconcile_task_id": reconcile_task_id,
         "coordination_runtime_context_id": (
             coordination_runtime_context_id
         ),
@@ -76205,7 +76321,7 @@ def _contract_runtime_shared_batch_reconcile_authority(
         "reconcile_event_created_at": str(
             reconcile_event.get("created_at") or ""
         ),
-        "reconcile_task_id": coordination_task_id,
+        "reconcile_task_id": reconcile_task_id,
         "reconcile_runtime_context_id": (
             coordination_runtime_context_id
         ),
