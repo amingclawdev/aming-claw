@@ -59478,7 +59478,7 @@ def test_backlog_close_projects_direct_fix_chain_when_onboard_service_is_current
     }
     _insert_simple_mf_close_backlog(conn, backlog_id)
 
-    entered = server.handle_project_direct_fix_enter(
+    entered = server._handle_project_direct_fix_enter_legacy(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -59736,7 +59736,7 @@ def test_backlog_close_incomplete_direct_fix_authority_reports_direct_fix_gate(
     }
     _insert_simple_mf_close_backlog(conn, backlog_id)
 
-    entered = server.handle_project_direct_fix_enter(
+    entered = server._handle_project_direct_fix_enter_legacy(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -59991,7 +59991,7 @@ def test_backlog_close_projects_child_authority_from_completed_overlap_component
     for row_id in (child_id, sibling_id, batch_backlog_id):
         _insert_simple_mf_close_backlog(conn, row_id)
 
-    entered = server.handle_project_direct_fix_enter(
+    entered = server._handle_project_direct_fix_enter_legacy(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -62413,6 +62413,20 @@ def test_onboard_route_guide_compact_capsule_is_bounded_warm_and_sectioned(
     assert isinstance(cold["execution_state_revision"], int)
     assert cold["projection_hash"].startswith("sha256:")
     assert cold["next_legal_action"].keys() >= {"action"}
+    assert cold["next_legal_action"]["graph_first_required"] is True
+    assert "function_index" in cold["next_legal_action"][
+        "graph_first_reminder"
+    ]
+    preflight = cold["graph_first_preflight"]
+    assert preflight["required"] is True
+    assert preflight["query_source"] == "observer"
+    assert preflight["query_purpose"] == "global_architecture_review"
+    assert preflight["sequence"][1:4] == [
+        "function_index",
+        "function_callers",
+        "function_callees",
+    ]
+    assert "graph_first" in cold["guide_capsule"]["available_sections"]
     assert "role_entries" not in cold
     assert len(serialized.encode("utf-8")) <= 16 * 1024
     assert "raw-session-secret" not in serialized
@@ -62444,6 +62458,20 @@ def test_onboard_route_guide_compact_capsule_is_bounded_warm_and_sectioned(
     assert len(json.dumps(sections).encode("utf-8")) <= 16 * 1024
     assert sections["authorizes_write"] is False
     assert sections["satisfies_gate"] is False
+    graph_first = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": cold["guide_capsule_ref"],
+                "sections": ["graph_first"],
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "multi_backlog_parallel",
+            },
+        )
+    )
+    assert graph_first["sections"]["graph_first"] == preflight
 
     wrong_scope = server.handle_project_onboard_route_guide_capsule(
         _ctx(
@@ -62479,10 +62507,20 @@ def test_onboard_route_guide_compact_is_role_isolated_and_full_is_compatible(con
     backlog_id = "AC-ONBOARD-COMPACT-ROLE-ISOLATION"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     refs = {}
-    for role, work_type in (
-        ("observer", "multi_backlog_parallel"),
-        ("worker", "parallel_worker"),
-        ("qa", "qa_verification"),
+    for role, work_type, query_source, query_purpose in (
+        (
+            "observer",
+            "multi_backlog_parallel",
+            "observer",
+            "global_architecture_review",
+        ),
+        (
+            "worker",
+            "parallel_worker",
+            "mf_subagent",
+            "subagent_context_build",
+        ),
+        ("qa", "qa_verification", "qa", "independent_verification"),
     ):
         compact = server.handle_project_onboard_route_guide(
             _ctx(
@@ -62500,6 +62538,11 @@ def test_onboard_route_guide_compact_is_role_isolated_and_full_is_compatible(con
         assert compact["selected_work_type"] == work_type
         assert compact["advisory_only"] is True
         assert compact["authorizes_write"] is False
+        assert compact["graph_first_preflight"]["query_source"] == query_source
+        assert (
+            compact["graph_first_preflight"]["query_purpose"]
+            == query_purpose
+        )
         refs[role] = compact["guide_capsule_ref"]
     assert len(set(refs.values())) == 3
 
@@ -63535,7 +63578,8 @@ def test_onboard_route_guide_suppresses_direct_fix_for_no_direct_fix_backlog(con
     guide = result["onboard_route_guide"]
     policy = guide["direct_fix_policy"]
     assert policy["allowed"] is False
-    assert policy["reason"] == "no_direct_fix"
+    assert policy["reason"] == "direct_fix_retired"
+    assert policy["source"] == "system_direct_fix_retirement_policy"
     assert policy["historical_source_resume"] is False
     assert policy["post_reconcile_action"] == (
         "full_reconcile_then_resume_frozen_nonhistorical_candidate"
@@ -63557,6 +63601,9 @@ def test_onboard_route_guide_suppresses_direct_fix_for_no_direct_fix_backlog(con
     assert "direct_fix_enter" not in guide[
         "observer_session_route_token_checklist"
     ]["required_before"]
+    assert "direct_fix_enter" not in guide[
+        "observer_session_route_token_checklist"
+    ]["protected_write_actions"]
 
     agent_guidance = result["agent_onboard_guidance"]
     assert "direct_fix_enter" not in agent_guidance["entrypoints"]
@@ -63567,6 +63614,40 @@ def test_onboard_route_guide_suppresses_direct_fix_for_no_direct_fix_backlog(con
     serialized = json.dumps(result, sort_keys=True)
     assert "blocked_parent_successor_return_to_parent" not in serialized
     assert '"return_to_parent_required"' not in serialized
+
+
+def test_direct_fix_public_entrypoint_is_retired_without_mutation(conn):
+    backlog_id = "AC-DIRECT-FIX-PUBLIC-ENTRY-RETIRED"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    before_events = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+
+    status, response = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "reason": "must not revive the retired route",
+                "parent_contract_execution_id": "cex-historical-parent",
+                "route_token_ref": "rtok-retired-direct-fix",
+            },
+        )
+    )
+
+    assert status == 409
+    assert response["error"] == "direct_fix_retired"
+    assert response["historical_evidence_readable"] is True
+    assert response["historical_execution_scheduler_eligible"] is False
+    assert response["authorizes_write"] is False
+    assert response["next_legal_action"]["action"] == "select_or_create_backlog"
+    assert "parent_to_resume" in response["forbidden_backedges"]
+    after_events = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    assert after_events == before_events
 
 
 def test_direct_fix_topology_guidance_terminalizes_bypass_without_source_backedge():
@@ -64294,6 +64375,9 @@ def test_onboard_route_guide_no_backlog_capability_query_returns_start_guide(con
     assert guide["capability_index"]["index_paths"]["backlog_start_guidance"] == (
         "agent_onboard_guidance.onboard_route_guide.backlog_start_guidance"
     )
+    assert "direct_fix_enter" not in guide["interface_index"]
+    assert "direct_fix" not in guide["backlog_chain_binding"]["create_successor"]
+    assert guide["direct_fix_policy"]["reason"] == "direct_fix_retired"
     start = guide["backlog_start_guidance"]
     assert start["create_backlog"]["mcp_tool"] == "backlog_upsert"
     assert start["select_backlog"]["list_tool"] == "backlog_list"
@@ -64303,6 +64387,42 @@ def test_onboard_route_guide_no_backlog_capability_query_returns_start_guide(con
         "not_required_for_no_backlog_discovery"
     )
     assert result["next_legal_action"]["action"] == "select_or_create_backlog"
+
+
+def test_onboard_route_guide_no_backlog_compact_pushes_graph_first_preflight(conn):
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "role": "observer",
+                "work_type": "capability_query",
+                "response_view": "compact",
+            },
+        )
+    )
+
+    assert result["response_view"] == "compact"
+    assert result["graph_first_preflight"]["required"] is True
+    assert result["graph_first_preflight"]["query_purpose"] == (
+        "global_architecture_review"
+    )
+    assert "graph_first" in result["guide_capsule"]["available_sections"]
+    assert "function_index" in result["next_legal_action"][
+        "graph_first_reminder"
+    ]
+    assert len(json.dumps(result, sort_keys=True).encode("utf-8")) <= 16 * 1024
+
+
+def test_onboard_graph_first_preflight_marks_status_admin_optional():
+    preflight = server._onboard_graph_first_preflight(
+        role="observer",
+        work_type="runtime_status",
+    )
+
+    assert preflight["required"] is False
+    assert "runtime_status" in preflight["status_admin_exemptions"]
+    assert preflight["authorizes_write"] is False
 
 
 def test_onboard_route_guide_no_backlog_system_operation_returns_policy(conn):
@@ -64932,7 +65052,7 @@ def test_onboard_route_guide_compact_mf_parallel_projects_copy_safe_route_issue_
     assert wrong_scope["mismatched_fields"] == ["backlog_id"]
 
 
-def test_onboard_route_guide_service_continues_blocked_candidate_with_audited_bypass(
+def test_onboard_route_guide_keeps_blocked_candidate_audit_only_without_direct_fix(
     conn,
 ):
     backlog_id = "AC-ONBOARD-ROUTE-GUIDE-RESUME-DIRECT-FIX"
@@ -64997,30 +65117,21 @@ def test_onboard_route_guide_service_continues_blocked_candidate_with_audited_by
     assert route_guide["backlog_chain_binding"]["runtime_resume"][
         "next_legal_action"
     ] == {}
-    direct_fix_successor = route_guide["backlog_chain_binding"]["create_successor"][
-        "direct_fix"
+    assert "direct_fix" not in route_guide["backlog_chain_binding"][
+        "create_successor"
     ]
-    assert {
-        key: direct_fix_successor[key]
-        for key in (
-            "interface",
-            "requires_role",
-            "requires_route_token_ref",
-            "requires_parent_contract_execution_id",
-            "blocked_parent_only",
-            "contract_template_id",
-        )
-    } == {
-        "interface": "direct_fix_enter",
-        "requires_role": "observer",
-        "requires_route_token_ref": True,
-        "requires_parent_contract_execution_id": True,
-        "blocked_parent_only": True,
-        "contract_template_id": "direct_fix.v1",
+    assert route_guide["direct_fix_policy"] == {
+        "schema_version": "onboard_route_guide.direct_fix_policy.v1",
+        "allowed": False,
+        "source": "system_direct_fix_retirement_policy",
+        "reason": "direct_fix_retired",
+        "historical_source_resume": False,
+        "next_action": (
+            "file or select a fresh independently bounded row in the current "
+            "world; never resume, return to, or retry the historical source "
+            "execution"
+        ),
     }
-    assert direct_fix_successor["guide"]["classifications"][1]["id"] == (
-        "terminal_bypass_source_independent_root_repair"
-    )
 
 
 def test_contract_update_start_accepts_onboard_service_waiver_parent(conn):
@@ -67022,7 +67133,7 @@ def test_direct_fix_enter_accepts_mf_parallel_failed_qa_parent(conn):
     current = runtime.current_guide(execution_id, actor_role="observer")
     assert current["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
 
-    entered = server.handle_project_direct_fix_enter(
+    entered = server._handle_project_direct_fix_enter_legacy(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -67190,7 +67301,7 @@ def test_direct_fix_enter_rejects_mf_parallel_when_latest_qa_passed(conn):
         ValidationError,
         match="parent contract does not allow requested successor",
     ):
-        server.handle_project_direct_fix_enter(
+        server._handle_project_direct_fix_enter_legacy(
             _ctx_with_role(
                 {"project_id": PID},
                 "observer",
@@ -67802,13 +67913,13 @@ def test_latest_failed_qa_keeps_noncanonical_or_candidate_failure_fail_closed(
     assert revision["failed_qa_source_ref"].endswith("completed_lines:2")
 
 
-def test_direct_fix_enter_accepts_blocked_onboard_service_parent(conn):
+def test_legacy_direct_fix_record_does_not_restore_onboard_parent_backedge(conn):
     backlog_id = "AC-DIRECT-FIX-BLOCKED-ONBOARD-SERVICE-PARENT"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
     direct_execution_id = "cex-direct-fix-onboard-service-parent-test"
 
-    entered = server.handle_project_direct_fix_enter(
+    entered = server._handle_project_direct_fix_enter_legacy(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -67851,10 +67962,14 @@ def test_direct_fix_enter_accepts_blocked_onboard_service_parent(conn):
     blocked_line = parent["completed_lines"][-1]
     assert blocked_line["status"] == "blocked"
     assert blocked_line["payload"]["blocked_successor_contract_id"] == "mf_parallel"
-    assert parent["runtime_guide"]["next_legal_action"]["action"] == (
-        "continue_with_audited_bypass"
+    assert parent["runtime_guide"]["next_legal_action"] is None
+    agent_guidance = server._onboard_contract_agent_guidance(
+        parent,
+        next_legal_action={},
+        selected_role="observer",
     )
-    assert parent["runtime_guide"]["next_legal_action"]["direct_fix_required"] is False
+    assert "direct_fix_enter" not in agent_guidance["entrypoints"]
+    assert agent_guidance["direct_fix_policy"]["reason"] == "direct_fix_retired"
 
 
 def test_direct_fix_enter_mints_child_route_ref_for_runtime_writes(conn):
@@ -67880,7 +67995,7 @@ def test_direct_fix_enter_mints_child_route_ref_for_runtime_writes(conn):
         token=parent_issue["route_token"],
     )
 
-    entered = server.handle_project_direct_fix_enter(
+    entered = server._handle_project_direct_fix_enter_legacy(
         _ctx_with_role(
             {"project_id": PID},
             "coordinator",
@@ -67940,7 +68055,7 @@ def test_direct_fix_enter_mints_child_route_ref_for_runtime_writes(conn):
     ]
     assert child_refs == [child_ref]
 
-    retry = server.handle_project_direct_fix_enter(
+    retry = server._handle_project_direct_fix_enter_legacy(
         _ctx_with_role(
             {"project_id": PID},
             "coordinator",
@@ -68118,7 +68233,7 @@ def test_direct_fix_enter_binds_legacy_existing_successor_once(conn):
     )
     conn.commit()
 
-    entered = server.handle_project_direct_fix_enter(
+    entered = server._handle_project_direct_fix_enter_legacy(
         _ctx_with_role(
             {"project_id": PID},
             "coordinator",
@@ -68289,7 +68404,7 @@ def test_direct_fix_dispatch_materializes_missing_worker_identity_and_commits(
         lambda *paths: head_commit,
     )
 
-    entered = server.handle_project_direct_fix_enter(
+    entered = server._handle_project_direct_fix_enter_legacy(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -68450,7 +68565,7 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(
         ],
     )
 
-    entered = server.handle_project_direct_fix_enter(
+    entered = server._handle_project_direct_fix_enter_legacy(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -69017,7 +69132,7 @@ def test_direct_fix_worker_repair_accepts_source_backed_runtime_timeline(
         b"direct-fix-runtime-timeline-candidate"
     ).hexdigest()
 
-    entered = server.handle_project_direct_fix_enter(
+    entered = server._handle_project_direct_fix_enter_legacy(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -69361,7 +69476,7 @@ def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(
     _insert_simple_mf_close_backlog(conn, backlog_id)
     parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
 
-    entered = server.handle_project_direct_fix_enter(
+    entered = server._handle_project_direct_fix_enter_legacy(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -69535,7 +69650,7 @@ def test_direct_fix_enter_rejects_onboard_service_parent_without_blocker(conn):
         ValidationError,
         match="requires blocked successor evidence",
     ):
-        server.handle_project_direct_fix_enter(
+        server._handle_project_direct_fix_enter_legacy(
             _ctx_with_role(
                 {"project_id": PID},
                 "observer",

@@ -43,8 +43,8 @@ instructions.
    is unavailable, or source-hint status says docs/config/tests are not
    materialized.
 8. For observer-owned protected writes, establish the observer identity in this
-   order before `direct_fix_enter`, `mf_parallel_enter`, backlog close, route
-   renewals, or other protected writes: call `observer_session_register`, keep
+   order before `mf_parallel_enter`, backlog close, route renewals, or other
+   protected writes: call `observer_session_register`, keep
    the session alive with `observer_session_heartbeat` every 300 seconds, then
    call `observer_route_context_issue` or `observer_route_context_renew`.
    `observer_session_id` plus its session token proves observer liveness;
@@ -118,15 +118,17 @@ instructions.
   renewal; never request or paste a raw route token.
 - `observer_hotfix` / `hotfix_enter` are not ordinary observer paths. Use them
   only when the live guide returns `legacy_operator_recovery` or an operator has
-  explicitly requested legacy recovery. Normal repairs should use
-  `direct_fix_enter`, `mf_parallel_enter`, or the current ContractRuntime
-  `next_legal_action`.
-- Direct-fix topology must be classified before action: parentless
-  single-branch direct merge, blocked-parent successor that returns to parent,
-  or multi/parallel merge queue. Before stopping or replacing a worker, audit
-  progress from runtime current state and timeline evidence; complete direct
-  fix with independent QA, branch-service validation when runtime code changed,
-  merge or redeploy, full reconcile, and protected backlog close.
+  explicitly requested legacy recovery.
+- `direct_fix` / `direct_fix_enter` is retired. Treat historical direct-fix
+  ContractRuntime and timeline rows as immutable audit evidence only; never
+  enter, resume, return to, or retry them. File a fresh independently bounded
+  backlog row in the current world, complete its own QA/integration/reconcile,
+  and validate through fresh work rather than a parent/source backedge.
+- The default compact onboard response and its `graph_first` capsule section
+  must be consumed before diagnosis, design, implementation, or scope proposal.
+  Use its role-conditioned query purpose, start with exact-symbol
+  `function_index`, inspect callers/callees, preserve DB-backed trace ids, and
+  record a graph miss/unavailability reason before source-only fallback.
 - For authoritative activation after an ordinary merge or redeploy, call
   `graph_current_full_reconcile` with `semantic_use_ai=false`; this still runs
   full structural and semantic materialization. Use `semantic_use_ai=true` only

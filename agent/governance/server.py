@@ -82280,6 +82280,82 @@ def _onboard_graph_first_policy() -> dict[str, Any]:
     }
 
 
+def _onboard_graph_first_preflight(
+    *,
+    role: str,
+    work_type: str,
+) -> dict[str, Any]:
+    """Return the bounded graph-first packet carried by compact onboarding."""
+
+    selected_role = str(role or "").strip().lower() or "observer"
+    if selected_role in {"mf_sub", "sub_worker"}:
+        selected_role = "worker"
+    role_identity = {
+        "observer": {
+            "query_source": "observer",
+            "query_purpose": "global_architecture_review",
+        },
+        "worker": {
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+        },
+        "qa": {
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+        },
+    }.get(
+        selected_role,
+        {
+            "query_source": "observer",
+            "query_purpose": "global_architecture_review",
+        },
+    )
+    selected_work_type = str(work_type or "").strip() or "capability_query"
+    status_only_work_types = {
+        "runtime_status",
+        "backlog_status",
+        "queue_read",
+        "status_query",
+    }
+    required = selected_work_type not in status_only_work_types
+    return {
+        "schema_version": "onboard_route_guide.graph_first_preflight.v1",
+        "required": required,
+        "selected_role": selected_role,
+        "selected_work_type": selected_work_type,
+        "query_source": role_identity["query_source"],
+        "query_purpose": role_identity["query_purpose"],
+        "sequence": [
+            "discover_exact_source_symbol_names",
+            "function_index",
+            "function_callers",
+            "function_callees",
+            "preserve_graph_query_trace_ids",
+        ],
+        "source_fallback": {
+            "allowed_only_when": [
+                "graph_query_no_match",
+                "graph_unavailable",
+                "source_hint_not_materialized",
+            ],
+            "record_any_of": [
+                "graph_trace_id",
+                "graph_unavailability_reason",
+                "source_hint_status",
+            ],
+        },
+        "status_admin_exemptions": sorted(status_only_work_types),
+        "reminder": (
+            "Before diagnosis, design, implementation, or scope proposal: "
+            "resolve exact symbols with function_index, inspect callers/callees, "
+            "and preserve graph trace ids before any source fallback."
+        ),
+        "advisory_only": True,
+        "authorizes_write": False,
+        "satisfies_gate": False,
+    }
+
+
 _ONBOARD_NO_BACKLOG_WORK_TYPES = {"", "capability_query", "system_operation"}
 
 
@@ -83495,7 +83571,10 @@ def _onboard_contract_route_guide(
     contract_execution_id = str(record.get("contract_execution_id") or "")
     route_token_ref = str(record.get("route_token_ref") or "")
     metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
-    no_direct_fix = metadata.get("no_direct_fix") is True
+    # direct_fix is a retired repair-on-block/back-to-parent control-flow path.
+    # Historical ContractRuntime evidence remains readable, but ordinary
+    # onboarding never advertises or authorizes a new successor.
+    no_direct_fix = True
     legacy_onboard_contract_waived = bool(metadata.get("legacy_onboard_contract_waived"))
     service_source = str(metadata.get("service_source") or "").strip()
     if not service_source:
@@ -84677,17 +84756,13 @@ def _onboard_contract_route_guide(
         direct_fix_policy = {
             "schema_version": "onboard_route_guide.direct_fix_policy.v1",
             "allowed": False,
-            "source": str(
-                metadata.get("direct_fix_policy_source")
-                or "backlog_bypass_policy"
-            ),
-            "reason": "no_direct_fix",
+            "source": "system_direct_fix_retirement_policy",
+            "reason": "direct_fix_retired",
             "historical_source_resume": False,
             "next_action": (
-                "continue only the current independently filed repair row; "
-                "after independent QA, ordered integration, and an activated "
-                "current-HEAD full reconcile, perform only the row-declared "
-                "nonhistorical successor activity"
+                "file or select a fresh independently bounded row in the "
+                "current world; never resume, return to, or retry the "
+                "historical source execution"
             ),
         }
         post_reconcile_action = str(
@@ -84742,6 +84817,17 @@ def _onboard_contract_route_guide(
                 for action in checklist_required
                 if action != "direct_fix_enter"
             ]
+        protected_write_actions = guide[
+            "observer_session_route_token_checklist"
+        ].get("protected_write_actions")
+        if isinstance(protected_write_actions, list):
+            guide["observer_session_route_token_checklist"][
+                "protected_write_actions"
+            ] = [
+                action
+                for action in protected_write_actions
+                if action != "direct_fix_enter"
+            ]
     return guide
 
 
@@ -84761,7 +84847,7 @@ def _onboard_contract_agent_guidance(
         if isinstance(record.get("metadata"), Mapping)
         else {}
     )
-    no_direct_fix = metadata.get("no_direct_fix") is True
+    no_direct_fix = True
     requested_role = str(
         selected_role or next_legal_action.get("role") or "observer"
     ).strip()
@@ -87122,6 +87208,10 @@ def _onboard_route_guide_compact_service_response(
     selected_role_key = (
         "worker" if selected_role in {"mf_sub", "worker"} else selected_role
     )
+    graph_first_preflight = _onboard_graph_first_preflight(
+        role=selected_role,
+        work_type=selected_work_type,
+    )
     selected_guidance_path = (
         "agent_onboard_guidance.onboard_route_guide.role_entries."
         + selected_role_key
@@ -87185,6 +87275,12 @@ def _onboard_route_guide_compact_service_response(
                 or next_action.get("reason")
                 or ""
             )[:1200],
+            "next_step": str(next_action.get("next_step") or "")[:1200],
+            "graph_first_reminder": graph_first_preflight["reminder"],
+            "graph_first_required": graph_first_preflight["required"],
+            "graph_first_query_purpose": graph_first_preflight[
+                "query_purpose"
+            ],
             "method": str(next_action.get("method") or ""),
             "path": str(next_action.get("path") or ""),
             "owner_role": str(
@@ -87371,6 +87467,10 @@ def _onboard_route_guide_compact_service_response(
                 },
                 section_name="role_guidance",
             ),
+            "graph_first": _onboard_guide_capsule_bounded_section(
+                graph_first_preflight,
+                section_name="graph_first",
+            ),
             "runtime_identity": _onboard_guide_capsule_bounded_section(
                 identity,
                 section_name="runtime_identity",
@@ -87410,6 +87510,7 @@ def _onboard_route_guide_compact_service_response(
         "selected_work_type": selected_work_type,
         "selected_guidance_json_path": selected_guidance_path,
         "next_legal_action": next_action_projection,
+        "graph_first_preflight": graph_first_preflight,
         "source_of_authority": source_of_authority,
         "contract_execution_id": identity["contract_execution_id"],
         "execution_state_revision": identity["execution_state_revision"],
@@ -87890,16 +87991,8 @@ def _onboard_route_guide_service_response(
     chain_trigger = backlog_runtime.parse_json_object(
         _row_get(backlog_policy_row, "chain_trigger_json", "{}")
     )
-    no_direct_fix = (
-        bypass_policy.get("no_direct_fix") is True
-        or chain_trigger.get("no_direct_fix") is True
-    )
-    historical_source_resume = bypass_policy.get("historical_source_resume")
-    if (
-        historical_source_resume is None
-        and chain_trigger.get("no_historical_source_resume") is True
-    ):
-        historical_source_resume = False
+    no_direct_fix = True
+    historical_source_resume = False
     record = _onboard_service_materialize_parent_record(
         conn,
         project_id=project_id,
@@ -87955,13 +88048,7 @@ def _onboard_route_guide_service_response(
         **dict(record.get("metadata") or {}),
         "route_token_issue_target_files": target_files,
         "no_direct_fix": no_direct_fix,
-        "direct_fix_policy_source": (
-            "backlog_bypass_policy"
-            if bypass_policy.get("no_direct_fix") is True
-            else "backlog_chain_trigger"
-        )
-        if no_direct_fix
-        else "",
+        "direct_fix_policy_source": "system_direct_fix_retirement_policy",
         "historical_source_resume": historical_source_resume,
         "post_reconcile_action": str(
             chain_trigger.get("after_merge") or ""
@@ -115856,7 +115943,43 @@ def handle_project_hotfix_enter(ctx: RequestContext):
 @route("POST", "/api/projects/{project_id}/direct-fix/enter")
 @route("POST", "/api/projects/{project_id}/direct-fix/start")
 def handle_project_direct_fix_enter(ctx: RequestContext):
-    """Enter direct_fix as a source-backed successor under a blocked parent."""
+    """Reject the retired direct_fix repair/back-to-parent entrypoint."""
+
+    project_id = ctx.get_project_id()
+    body = ctx.body or {}
+    backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+    return 409, {
+        "ok": False,
+        "error": "direct_fix_retired",
+        "status": "rejected",
+        "schema_version": "direct_fix_retired.v1",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "historical_evidence_readable": True,
+        "historical_execution_scheduler_eligible": False,
+        "authorizes_write": False,
+        "next_legal_action": {
+            "id": "file_fresh_bounded_row",
+            "action": "select_or_create_backlog",
+            "next_step": (
+                "File or select a fresh independently bounded row in the "
+                "current world. Never resume, return to, or retry the "
+                "historical source execution."
+            ),
+        },
+        "forbidden_backedges": [
+            "direct_fix_enter",
+            "parent_to_resume",
+            "return_to_parent",
+            "resume_original_contract",
+            "retry_source_backlog_close_after_repair",
+        ],
+    }
+
+
+def _handle_project_direct_fix_enter_legacy(ctx: RequestContext):
+    """Exercise retained historical direct_fix semantics in compatibility tests."""
+
     project_id = ctx.get_project_id()
     body = ctx.body or {}
     backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
