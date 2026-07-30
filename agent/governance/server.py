@@ -75396,6 +75396,826 @@ def _contract_runtime_trusted_merge_projection(
     return {"timeline_verified": True, **next(iter(unique.values()))}
 
 
+def _contract_runtime_shared_batch_reconcile_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    merge: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one closed batch reconcile onto an exact merged child.
+
+    The final batch reconcile is coordination-scoped by design.  It may close
+    each merged child only when the database proves the complete closed epoch,
+    ordered queue, every child's ContractRuntime QA/merge authority, and the
+    one active current-HEAD coordination reconcile.  No caller-shaped scope is
+    admitted into this projection.
+    """
+
+    from . import graph_snapshot_store
+    from .parallel_branch_runtime import (
+        get_branch_context,
+        get_branch_context_by_runtime_context_id,
+        runtime_context_id_for_branch_context,
+    )
+
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    backlog_id = str(
+        getattr(context, "backlog_id", "")
+        or record.get("backlog_id")
+        or ""
+    ).strip()
+    batch_id = str(getattr(context, "batch_id", "") or "").strip()
+    merge_queue_id = str(merge.get("merge_queue_id") or "").strip()
+    queue_item_id = str(merge.get("queue_item_id") or "").strip()
+    merged_commit = str(
+        merge.get("merged_commit_sha") or ""
+    ).strip().lower()
+    execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+    qa_time = _contract_runtime_close_authority_time_order_value(
+        merge.get("qa_acceptance_created_at")
+    )
+    merge_time = _contract_runtime_close_authority_time_order_value(
+        merge.get("merge_event_created_at")
+    )
+    if not (
+        merge.get("timeline_verified") is True
+        and merge.get("qa_contract_runtime_verified") is True
+        and merge.get("close_satisfying") is True
+        and dispatch_match
+        and all(
+            (
+                project_id,
+                execution_id,
+                backlog_id,
+                batch_id,
+                runtime_context_id,
+                task_id,
+                parent_task_id,
+                merge_queue_id,
+                queue_item_id,
+            )
+        )
+        and parent_task_id == execution_id
+        and str(getattr(context, "merge_queue_id", "") or "").strip()
+        == merge_queue_id
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit)
+        and qa_time is not None
+        and merge_time is not None
+        and qa_time <= merge_time
+    ):
+        return {}
+
+    try:
+        epoch_rows = conn.execute(
+            """
+            SELECT *
+            FROM parallel_branch_integration_epochs
+            WHERE project_id = ? AND batch_id = ?
+            LIMIT 2
+            """,
+            (project_id, batch_id),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    if len(epoch_rows) != 1:
+        return {}
+    epoch = dict(epoch_rows[0])
+    coordination_backlog_id = str(
+        epoch.get("coordination_backlog_id") or ""
+    ).strip()
+    epoch_current_head = str(
+        epoch.get("current_head") or ""
+    ).strip().lower()
+    epoch_last_merge_commit = str(
+        epoch.get("last_merge_commit") or ""
+    ).strip().lower()
+    final_snapshot_id = str(epoch.get("snapshot_id") or "").strip()
+    merged_prefix = _json_loads(epoch.get("merged_prefix_json"), [])
+    remaining = _json_loads(
+        epoch.get("remaining_queue_item_ids_json"),
+        [],
+    )
+    try:
+        merge_cursor = int(epoch.get("merge_cursor"))
+    except (TypeError, ValueError):
+        return {}
+    if not (
+        str(epoch.get("merge_queue_id") or "").strip() == merge_queue_id
+        and str(epoch.get("status") or "").strip() == "closed"
+        and str(epoch.get("reconcile_state") or "").strip() == "reconciled"
+        and coordination_backlog_id
+        and final_snapshot_id
+        and re.fullmatch(r"[0-9a-f]{7,64}", epoch_current_head)
+        and re.fullmatch(r"[0-9a-f]{7,64}", epoch_last_merge_commit)
+        and isinstance(merged_prefix, list)
+        and merged_prefix
+        and isinstance(remaining, list)
+        and not remaining
+        and not any(
+            str(epoch.get(field) or "").strip()
+            for field in (
+                "active_queue_item_id",
+                "active_task_id",
+                "active_backlog_id",
+                "active_checkpoint_id",
+                "failure_reason",
+            )
+        )
+        and str(epoch.get("closed_at") or "").strip()
+    ):
+        return {}
+
+    try:
+        queue_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM parallel_branch_merge_queue_items
+                WHERE project_id = ? AND merge_queue_id = ?
+                ORDER BY queue_index ASC, queue_item_id ASC
+                """,
+                (project_id, merge_queue_id),
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        return {}
+    queue_item_ids = [
+        str(item.get("queue_item_id") or "").strip()
+        for item in queue_rows
+    ]
+    queue_final_head = (
+        str(queue_rows[-1].get("merge_commit") or "").strip().lower()
+        if queue_rows
+        else ""
+    )
+    if not (
+        len(queue_rows) >= 2
+        and queue_item_ids
+        == [str(item or "").strip() for item in merged_prefix]
+        and merge_cursor == len(merged_prefix) == len(queue_rows)
+        and len(set(queue_item_ids)) == len(queue_item_ids)
+        and len(
+            {
+                str(item.get("task_id") or "").strip()
+                for item in queue_rows
+            }
+        )
+        == len(queue_rows)
+        and all(
+            str(item.get("status") or "").strip() == "merged"
+            and str(item.get("backlog_id") or "").strip()
+            and str(item.get("task_id") or "").strip()
+            and str(item.get("completed_at") or "").strip()
+            and re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                str(item.get("merge_commit") or "").strip().lower(),
+            )
+            and str(item.get("target_head_after_merge") or "")
+            .strip()
+            .lower()
+            == str(item.get("merge_commit") or "").strip().lower()
+            for item in queue_rows
+        )
+        and queue_final_head.startswith(epoch_current_head)
+        and queue_final_head.startswith(epoch_last_merge_commit)
+    ):
+        return {}
+    final_head = queue_final_head
+    child_queue_rows = [
+        item
+        for item in queue_rows
+        if str(item.get("queue_item_id") or "").strip() == queue_item_id
+    ]
+    if len(child_queue_rows) != 1:
+        return {}
+    child_queue = child_queue_rows[0]
+    if not (
+        str(child_queue.get("task_id") or "").strip() == task_id
+        and str(child_queue.get("backlog_id") or "").strip() == backlog_id
+        and str(child_queue.get("merge_commit") or "").strip().lower()
+        == merged_commit
+    ):
+        return {}
+
+    expected_head = str(epoch.get("base_head") or "").strip().lower()
+    child_authorities: list[dict[str, Any]] = []
+    child_merge_event_ids: list[int] = []
+    child_binding_refs: list[str] = []
+    for item in queue_rows:
+        before_head = str(
+            item.get("target_head_before_merge") or ""
+        ).strip().lower()
+        item_merge_commit = str(
+            item.get("merge_commit") or ""
+        ).strip().lower()
+        if not expected_head or before_head != expected_head:
+            return {}
+        expected_head = item_merge_commit
+
+        child_task_id = str(item.get("task_id") or "").strip()
+        child_backlog_id = str(item.get("backlog_id") or "").strip()
+        child_context = get_branch_context(
+            conn,
+            project_id,
+            child_task_id,
+        )
+        if child_context is None:
+            return {}
+        child_runtime_context_id = (
+            runtime_context_id_for_branch_context(child_context)
+        )
+        child_execution_id = str(
+            getattr(child_context, "parent_task_id", "") or ""
+        ).strip()
+        if not (
+            str(getattr(child_context, "batch_id", "") or "").strip()
+            == batch_id
+            and str(
+                getattr(child_context, "merge_queue_id", "") or ""
+            ).strip()
+            == merge_queue_id
+            and str(getattr(child_context, "backlog_id", "") or "").strip()
+            == child_backlog_id
+            and child_runtime_context_id
+            and child_execution_id
+        ):
+            return {}
+        try:
+            child_record = _contract_runtime_store(conn).get(
+                child_execution_id
+            )
+        except (ContractRuntimeError, sqlite3.Error):
+            return {}
+        if not (
+            str(child_record.get("project_id") or "").strip() == project_id
+            and str(child_record.get("backlog_id") or "").strip()
+            == child_backlog_id
+            and str(
+                child_record.get("contract_execution_id") or ""
+            ).strip()
+            == child_execution_id
+            and _is_mf_parallel_record_contract_id(
+                str(child_record.get("contract_id") or "").strip()
+            )
+        ):
+            return {}
+        child_dispatch = _contract_runtime_dispatch_line_match(
+            child_record,
+            child_context,
+        )
+        child_timeline = _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id=child_task_id,
+            backlog_id=child_backlog_id,
+        )
+        child_merge = _contract_runtime_completed_merge_authority(
+            conn,
+            project_id=project_id,
+            record=child_record,
+            context=child_context,
+            timeline_events=child_timeline,
+        )
+        child_qa_time = _contract_runtime_close_authority_time_order_value(
+            child_merge.get("qa_acceptance_created_at")
+        )
+        child_merge_time = (
+            _contract_runtime_close_authority_time_order_value(
+                child_merge.get("merge_event_created_at")
+            )
+        )
+        if not (
+            child_dispatch
+            and child_merge.get("timeline_verified") is True
+            and child_merge.get("qa_contract_runtime_verified") is True
+            and child_merge.get("close_satisfying") is True
+            and str(child_merge.get("runtime_context_id") or "").strip()
+            == child_runtime_context_id
+            and str(child_merge.get("task_id") or "").strip()
+            == child_task_id
+            and str(child_merge.get("parent_task_id") or "").strip()
+            == child_execution_id
+            and str(child_merge.get("backlog_id") or "").strip()
+            == child_backlog_id
+            and str(child_merge.get("merge_queue_id") or "").strip()
+            == merge_queue_id
+            and str(child_merge.get("queue_item_id") or "").strip()
+            == str(item.get("queue_item_id") or "").strip()
+            and str(child_merge.get("merged_commit_sha") or "")
+            .strip()
+            .lower()
+            == item_merge_commit
+            and child_qa_time is not None
+            and child_merge_time is not None
+            and child_qa_time <= child_merge_time
+            and int(child_merge.get("merge_event_id") or 0) > 0
+        ):
+            return {}
+        child_authorities.append(child_merge)
+        child_merge_event_ids.append(
+            int(child_merge.get("merge_event_id") or 0)
+        )
+        child_binding_refs.append(
+            str(child_dispatch.get("source_ref") or "").strip()
+        )
+    if expected_head != final_head:
+        return {}
+
+    try:
+        entered_rows = conn.execute(
+            """
+            SELECT *
+            FROM task_timeline_events
+            WHERE project_id = ?
+              AND backlog_id = ?
+              AND event_type = 'mf_batch_parallel.entered'
+            ORDER BY id ASC
+            """,
+            (project_id, coordination_backlog_id),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    accepted_entered_bindings = []
+    for raw_row in entered_rows:
+        row = dict(raw_row)
+        payload = _json_loads(row.get("payload_json"), {})
+        if (
+            isinstance(payload, Mapping)
+            and str(row.get("event_kind") or "").strip()
+            in {"contract_binding", "mf_batch_parallel_entered"}
+            and str(row.get("status") or "").strip()
+            in {"accepted", "passed"}
+            and _contract_runtime_close_authority_timeline_actor_role(
+                {
+                    **row,
+                    "payload": payload,
+                }
+            )
+            == "observer"
+        ):
+            accepted_entered_bindings.append((row, payload))
+    entered_candidates = [
+        (row, payload)
+        for row, payload in accepted_entered_bindings
+        if str(payload.get("batch_id") or "").strip() == batch_id
+        and str(payload.get("merge_queue_id") or "").strip()
+        == merge_queue_id
+        and str(payload.get("backlog_id") or "").strip()
+        == coordination_backlog_id
+    ]
+    if len(entered_candidates) != 1:
+        return {}
+    entered_event = entered_candidates[0][0]
+    entered_event_id = int(entered_event.get("id") or 0)
+    coordination_task_id = str(
+        entered_event.get("task_id") or ""
+    ).strip()
+    same_task_entered_bindings = [
+        (row, payload)
+        for row, payload in accepted_entered_bindings
+        if str(row.get("task_id") or "").strip() == coordination_task_id
+    ]
+    if (
+        not coordination_task_id
+        or len(same_task_entered_bindings) != 1
+        or int(same_task_entered_bindings[0][0].get("id") or 0)
+        != entered_event_id
+    ):
+        return {}
+
+    try:
+        provenance_rows = conn.execute(
+            """
+            SELECT *
+            FROM graph_current_full_reconcile_provenance
+            WHERE project_id = ? AND snapshot_id = ?
+              AND target_commit_sha = ?
+            ORDER BY provenance_id ASC
+            LIMIT 2
+            """,
+            (project_id, final_snapshot_id, final_head),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    if len(provenance_rows) != 1:
+        return {}
+    provenance = dict(provenance_rows[0])
+    reconcile_event_id = int(
+        provenance.get("reconcile_event_id") or 0
+    )
+    try:
+        reconcile_rows = conn.execute(
+            """
+            SELECT *
+            FROM task_timeline_events
+            WHERE project_id = ? AND id = ?
+            LIMIT 2
+            """,
+            (project_id, reconcile_event_id),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    if len(reconcile_rows) != 1:
+        return {}
+    reconcile_event = dict(reconcile_rows[0])
+    reconcile_payload = _json_loads(
+        reconcile_event.get("payload_json"),
+        {},
+    )
+    route_evidence = _json_loads(
+        provenance.get("route_evidence_json"),
+        {},
+    )
+    marker = _json_loads(provenance.get("marker_json"), {})
+    coordination_scope = (
+        route_evidence.get("runtime_context_scope")
+        if isinstance(route_evidence, Mapping)
+        and isinstance(
+            route_evidence.get("runtime_context_scope"),
+            Mapping,
+        )
+        else {}
+    )
+    marker_scope = (
+        marker.get("runtime_context_scope")
+        if isinstance(marker, Mapping)
+        and isinstance(marker.get("runtime_context_scope"), Mapping)
+        else {}
+    )
+    event_scope = (
+        reconcile_payload.get("runtime_context_scope")
+        if isinstance(reconcile_payload, Mapping)
+        and isinstance(
+            reconcile_payload.get("runtime_context_scope"),
+            Mapping,
+        )
+        else {}
+    )
+    coordination_runtime_context_id = str(
+        coordination_scope.get("runtime_context_id") or ""
+    ).strip()
+    coordination_parent_task_id = str(
+        coordination_scope.get("parent_task_id") or ""
+    ).strip()
+    coordination_contract_execution_id = str(
+        coordination_scope.get("contract_execution_id") or ""
+    ).strip()
+    scope_identity = {
+        field: str(coordination_scope.get(field) or "").strip()
+        for field in (
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "parent_task_id",
+            "runtime_context_id",
+            "merge_queue_id",
+            "contract_execution_id",
+        )
+        if str(coordination_scope.get(field) or "").strip()
+    }
+    coordination_scope_claimed = bool(
+        coordination_scope or marker_scope or event_scope
+    )
+    coordination_context = (
+        get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            coordination_runtime_context_id,
+        )
+        if coordination_runtime_context_id
+        else None
+    )
+    route_token_scope = (
+        route_evidence.get("route_token_scope")
+        if isinstance(route_evidence, Mapping)
+        and isinstance(route_evidence.get("route_token_scope"), Mapping)
+        else {}
+    )
+    idempotency_scope = (
+        route_evidence.get("idempotency_scope")
+        if isinstance(route_evidence, Mapping)
+        and isinstance(route_evidence.get("idempotency_scope"), Mapping)
+        else {}
+    )
+    marker_route_evidence = (
+        marker.get("route_evidence")
+        if isinstance(marker, Mapping)
+        and isinstance(marker.get("route_evidence"), Mapping)
+        else {}
+    )
+    legacy_task_scope = {
+        "project_id": project_id,
+        "backlog_id": coordination_backlog_id,
+        "task_id": coordination_task_id,
+    }
+    scoped_coordination_verified = bool(
+        coordination_scope_claimed
+        and coordination_context is not None
+        and scope_identity
+        and {
+            field: str(marker_scope.get(field) or "").strip()
+            for field in scope_identity
+        }
+        == scope_identity
+        and {
+            field: str(event_scope.get(field) or "").strip()
+            for field in scope_identity
+        }
+        == scope_identity
+        and scope_identity.get("project_id") == project_id
+        and scope_identity.get("backlog_id")
+        == coordination_backlog_id
+        and scope_identity.get("task_id") == coordination_task_id
+        and scope_identity.get("merge_queue_id") == merge_queue_id
+        and str(getattr(coordination_context, "task_id", "") or "").strip()
+        == coordination_task_id
+        and str(
+            getattr(coordination_context, "backlog_id", "") or ""
+        ).strip()
+        == coordination_backlog_id
+        and str(
+            getattr(coordination_context, "merge_queue_id", "") or ""
+        ).strip()
+        == merge_queue_id
+        and str(
+            getattr(coordination_context, "batch_id", "") or ""
+        ).strip()
+        == batch_id
+    )
+    task_only_coordination_verified = bool(
+        not coordination_scope_claimed
+        and not scope_identity
+        and {
+            str(field): str(value or "").strip()
+            for field, value in route_token_scope.items()
+        }
+        == legacy_task_scope
+        and {
+            str(field): str(value or "").strip()
+            for field, value in idempotency_scope.items()
+        }
+        == legacy_task_scope
+        and dict(marker_route_evidence) == dict(route_evidence)
+        and not any(
+            str(route_evidence.get(field) or "").strip()
+            for field in (
+                "runtime_context_id",
+                "parent_task_id",
+                "merge_queue_id",
+                "contract_execution_id",
+            )
+        )
+    )
+    reconcile_time = _contract_runtime_close_authority_time_order_value(
+        reconcile_event.get("created_at")
+    )
+    if not (
+        (
+            scoped_coordination_verified
+            or task_only_coordination_verified
+        )
+        and str(reconcile_event.get("backlog_id") or "").strip()
+        == coordination_backlog_id
+        and str(reconcile_event.get("task_id") or "").strip()
+        == coordination_task_id
+        and str(reconcile_event.get("event_type") or "").strip()
+        == "graph.reconcile"
+        and str(reconcile_event.get("event_kind") or "").strip()
+        == "reconcile"
+        and str(reconcile_event.get("phase") or "").strip() == "reconcile"
+        and str(reconcile_event.get("status") or "").strip() == "passed"
+        and str(reconcile_event.get("commit_sha") or "").strip().lower()
+        == final_head
+        and str(reconcile_event.get("created_at") or "").strip()
+        == str(provenance.get("reconcile_event_created_at") or "").strip()
+        and reconcile_payload.get("current_full_reconcile") is True
+        and str(reconcile_payload.get("reconcile_mode") or "").strip()
+        == "current_full"
+        and reconcile_payload.get("canonical_head_verified") is True
+        and reconcile_payload.get("active_snapshot_verified") is True
+        and reconcile_payload.get("graph_reconciled") is True
+        and _contract_runtime_close_authority_timeline_actor_role(
+            {
+                **reconcile_event,
+                "payload": reconcile_payload,
+            }
+        )
+        == "observer"
+        and entered_event_id > 0
+        and reconcile_event_id > max(child_merge_event_ids)
+        and reconcile_time is not None
+        and all(
+            reconcile_time
+            >= _contract_runtime_close_authority_time_order_value(
+                child.get("merge_event_created_at")
+            )
+            for child in child_authorities
+        )
+    ):
+        return {}
+
+    root = project_service.resolve_project_root(
+        project_id,
+        None,
+        fallback_self=True,
+    )
+    canonical_head = (
+        _git_head_commit(Path(root)).strip().lower() if root else ""
+    )
+    if not (
+        root
+        and canonical_head == final_head
+        and all(
+            _git_commit_is_ancestor(
+                Path(root),
+                str(child.get("merged_commit_sha") or "")
+                .strip()
+                .lower(),
+                final_head,
+            )
+            for child in child_authorities
+        )
+    ):
+        return {}
+
+    state = graph_snapshot_store.current_full_reconcile_state(
+        conn,
+        project_id,
+        merged_commit,
+        current_canonical_commit_sha=canonical_head,
+        reconcile_target_commit_sha=final_head,
+        qa_event_id=int(merge.get("qa_event_id") or 0),
+        qa_event_created_at=str(merge.get("qa_event_created_at") or ""),
+        qa_source_ref=str(merge.get("qa_source_ref") or ""),
+        qa_acceptance_created_at=str(
+            merge.get("qa_acceptance_created_at") or ""
+        ),
+        qa_acceptance_revision=int(
+            merge.get("qa_acceptance_revision") or 0
+        ),
+        qa_contract_runtime_verified=True,
+        merge_event_id=int(merge.get("merge_event_id") or 0),
+        merge_event_created_at=str(merge.get("merge_event_created_at") or ""),
+        reconcile_event_id=reconcile_event_id,
+        reconcile_event_created_at=str(
+            reconcile_event.get("created_at") or ""
+        ),
+        expected_contract_execution_id=(
+            coordination_contract_execution_id
+        ),
+        expected_task_id=coordination_task_id,
+        expected_runtime_context_id=coordination_runtime_context_id,
+        expected_parent_task_id=coordination_parent_task_id,
+        expected_merge_queue_id=(
+            merge_queue_id if scoped_coordination_verified else ""
+        ),
+        trusted_contract_execution_lineage_verified=False,
+        reconcile_task_id=coordination_task_id,
+        reconcile_runtime_context_id=coordination_runtime_context_id,
+        allow_taskless=task_only_coordination_verified,
+    )
+    active_snapshot_commit = str(
+        state.get("active_snapshot_commit") or ""
+    ).strip().lower()
+    shared_verified = bool(
+        state.get("db_verified") is True
+        and state.get("active_snapshot_verified") is True
+        and state.get(
+            "active_snapshot_current_full_reconcile_verified"
+        )
+        is True
+        and state.get("reconcile_snapshot_verified") is True
+        and state.get("provenance_scope_verified") is True
+        and state.get("durable_order_verified") is True
+        and str(state.get("active_snapshot_id") or "").strip()
+        == final_snapshot_id
+        and str(state.get("reconcile_snapshot_id") or "").strip()
+        == final_snapshot_id
+        and active_snapshot_commit == final_head
+    )
+    if not shared_verified:
+        return {}
+
+    shared_binding = {
+        "schema_version": (
+            "contract_runtime.shared_batch_final_reconcile_authority.v1"
+        ),
+        "source": (
+            "parallel_branch_integration_epochs+"
+            "parallel_branch_merge_queue_items+"
+            "contract_runtime_executions.completed_lines+"
+            "graph_current_full_reconcile_provenance"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "project_id": project_id,
+        "batch_id": batch_id,
+        "merge_queue_id": merge_queue_id,
+        "epoch_id": str(epoch.get("epoch_id") or "").strip(),
+        "coordination_backlog_id": coordination_backlog_id,
+        "coordination_task_id": coordination_task_id,
+        "coordination_runtime_context_id": (
+            coordination_runtime_context_id
+        ),
+        "coordination_contract_execution_id": (
+            coordination_contract_execution_id
+        ),
+        "batch_enter_event_ref": f"timeline:{entered_event_id}",
+        "final_reconcile_event_ref": f"timeline:{reconcile_event_id}",
+        "final_head_commit": final_head,
+        "active_snapshot_id": final_snapshot_id,
+        "ordered_queue_item_ids": queue_item_ids,
+        "child_contract_dispatch_refs": child_binding_refs,
+        "all_children_contract_qa_verified": True,
+        "all_children_merged": True,
+        "closed_epoch_verified": True,
+        "final_snapshot_verified": True,
+        "strict_child_qa_merge_reconcile_order_verified": True,
+        "child_reconcile_required": False,
+    }
+    shared_binding["authority_hash"] = stable_sha256(shared_binding)
+    authority = {
+        **dict(state),
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "server_derived": True,
+        "timeline_verified": True,
+        "authority_verified": True,
+        "close_satisfying": True,
+        "db_verified": True,
+        "live_verified": True,
+        "canonical_head_verified": True,
+        "active_snapshot_verified": True,
+        "active_snapshot_matches_canonical_head": True,
+        "graph_reconciled": True,
+        "provenance_scope_verified": True,
+        "contract_execution_scope_verified": True,
+        "task_scope_verified": True,
+        "runtime_context_scope_verified": True,
+        "parent_task_scope_verified": True,
+        "merge_queue_scope_verified": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "merge_queue_id": merge_queue_id,
+        "merged_commit_sha": merged_commit,
+        "reconciled_commit_sha": final_head,
+        "reconcile_provenance_target_commit": final_head,
+        "current_canonical_commit_sha": canonical_head,
+        "canonical_head_commit": canonical_head,
+        "canonical_head_equals_merged_commit": (
+            canonical_head == merged_commit
+        ),
+        "canonical_head_equals_reconciled_commit": True,
+        "reconciled_commit_is_ancestor_of_canonical_head": True,
+        "target_project_root": str(Path(root).resolve()),
+        "merge_source_ref": str(merge.get("merge_source_ref") or ""),
+        "merge_event_id": int(merge.get("merge_event_id") or 0),
+        "merge_event_created_at": str(
+            merge.get("merge_event_created_at") or ""
+        ),
+        "merge_projection_verified": True,
+        "dispatch_lineage_verified": True,
+        "contract_runtime_dispatch_source_ref": str(
+            dispatch_match.get("source_ref") or ""
+        ),
+        "qa_source_ref": str(merge.get("qa_source_ref") or ""),
+        "qa_acceptance_ref": str(
+            merge.get("qa_acceptance_ref") or ""
+        ),
+        "qa_acceptance_revision": int(
+            merge.get("qa_acceptance_revision") or 0
+        ),
+        "qa_acceptance_created_at": str(
+            merge.get("qa_acceptance_created_at") or ""
+        ),
+        "qa_contract_runtime_verified": True,
+        "reconcile_source_ref": f"timeline:{reconcile_event_id}",
+        "reconcile_event_id": reconcile_event_id,
+        "reconcile_event_created_at": str(
+            reconcile_event.get("created_at") or ""
+        ),
+        "reconcile_task_id": coordination_task_id,
+        "reconcile_runtime_context_id": (
+            coordination_runtime_context_id
+        ),
+        "shared_batch_reconcile_authority": shared_binding,
+        "identity_mismatches": [],
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 def _contract_runtime_completed_merge_reconcile_authority(
     conn,
     *,
@@ -75472,7 +76292,14 @@ def _contract_runtime_completed_merge_reconcile_authority(
         server_bound_supplemental_related_task_ids=server_bound_root_task_ids,
     )
     if not reconcile_event:
-        return trusted_merge
+        shared = _contract_runtime_shared_batch_reconcile_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+            context=context,
+            merge=trusted_merge,
+        )
+        return {**trusted_merge, **shared} if shared else trusted_merge
 
     reconcile_scope = _contract_runtime_projection_timeline_scope_values(
         reconcile_event
@@ -78987,8 +79814,20 @@ def _contract_runtime_reconcile_record_authority(
             "merge_queue_scope",
         ],
     }
+    shared_batch_authority = (
+        merge
+        if isinstance(
+            merge.get("shared_batch_reconcile_authority"),
+            Mapping,
+        )
+        and _contract_runtime_current_full_reconcile_activation_verified(
+            merge
+        )
+        else {}
+    )
     current_full_authority = (
-        _contract_runtime_current_full_reconcile_authority_from_merge(
+        shared_batch_authority
+        or _contract_runtime_current_full_reconcile_authority_from_merge(
             conn,
             project_id=project_id,
             record=record,
@@ -97877,9 +98716,30 @@ def _contract_runtime_bind_close_reconcile_authority(
                         source_line_index=source_line_index,
                     )
                 )
+    shared_batch_authority = (
+        merge
+        if isinstance(
+            merge.get("shared_batch_reconcile_authority"),
+            Mapping,
+        )
+        and _contract_runtime_current_full_reconcile_activation_verified(
+            merge
+        )
+        and (
+            not reconcile
+            or (
+                int(reconcile.get("reconcile_event_id") or 0)
+                == int(merge.get("reconcile_event_id") or 0)
+                and str(reconcile.get("reconcile_source_ref") or "")
+                == str(merge.get("reconcile_source_ref") or "")
+            )
+        )
+        else {}
+    )
     if reconcile_lines:
         authority = (
-            _contract_runtime_current_full_reconcile_authority_from_merge(
+            shared_batch_authority
+            or _contract_runtime_current_full_reconcile_authority_from_merge(
                 conn,
                 project_id=project_id,
                 record=projected,
