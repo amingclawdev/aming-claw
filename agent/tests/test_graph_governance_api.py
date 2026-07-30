@@ -7992,6 +7992,8 @@ def _shared_batch_reconcile_authority_fixture(
     nested_enter_queue_plan: bool = False,
     service_enter_task: bool = False,
     task_only_reconcile_task: str = "enter",
+    shared_file: bool = False,
+    batch_parented_children: bool = False,
 ) -> dict[str, Any]:
     batch_id = "batch-shared-final-reconcile"
     batch_enter_task_id = (
@@ -8040,7 +8042,11 @@ def _shared_batch_reconcile_authority_fixture(
     base_head = _init_test_git_repo(root)
     child_commits = []
     for index in range(1, 3):
-        path = root / f"child-{index}.txt"
+        path = (
+            root / "shared-child.txt"
+            if shared_file
+            else root / f"child-{index}.txt"
+        )
         path.write_text(f"child {index}\n", encoding="utf-8")
         subprocess.run(["git", "add", path.name], cwd=root, check=True)
         subprocess.run(
@@ -8052,6 +8058,11 @@ def _shared_batch_reconcile_authority_fixture(
         )
         child_commits.append(batch_jobs.git_commit(root))
     final_head = child_commits[-1]
+    child_parent_task_ids = (
+        (batch_id, batch_id)
+        if batch_parented_children
+        else child_executions
+    )
 
     child_contexts = []
     for index in range(2):
@@ -8062,7 +8073,7 @@ def _shared_batch_reconcile_authority_fixture(
                     project_id=PID,
                     batch_id=batch_id,
                     backlog_id=child_backlogs[index],
-                    parent_task_id=child_executions[index],
+                    parent_task_id=child_parent_task_ids[index],
                     task_id=child_tasks[index],
                     runtime_context_id=child_runtime_ids[index],
                     branch_ref=f"refs/heads/codex/{child_tasks[index]}",
@@ -8359,7 +8370,7 @@ def _shared_batch_reconcile_authority_fixture(
             "close_satisfying": True,
             "runtime_context_id": child_runtime_ids[index],
             "task_id": child_tasks[index],
-            "parent_task_id": child_executions[index],
+            "parent_task_id": child_parent_task_ids[index],
             "backlog_id": child_backlogs[index],
             "merge_queue_id": merge_queue_id,
             "queue_item_id": queue_item_ids[index],
@@ -8386,6 +8397,14 @@ def _shared_batch_reconcile_authority_fixture(
         def get(self, execution_id):
             return records[execution_id]
 
+        def list_by_backlog(self, *, project_id, backlog_id):
+            return [
+                record
+                for record in records.values()
+                if record["project_id"] == project_id
+                and record["backlog_id"] == backlog_id
+            ]
+
     monkeypatch.setattr(
         server,
         "_contract_runtime_store",
@@ -8395,10 +8414,21 @@ def _shared_batch_reconcile_authority_fixture(
         server,
         "_contract_runtime_dispatch_line_match",
         lambda child_record, child_context: {
+            "schema_version": "contract_runtime.dispatch_line_match.v1",
+            "contract_id": str(child_record.get("contract_id") or ""),
+            "contract_execution_id": child_record["contract_execution_id"],
+            "runtime_context_id": child_context.runtime_context_id,
+            "task_id": child_context.task_id,
+            "parent_task_id": child_context.parent_task_id,
+            "line_index": 0,
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "evidence_kind": "dispatch_bounded_worker",
+            "actor_role": "observer",
             "source_ref": (
                 f"contract_runtime:"
-                f"{child_record['contract_execution_id']}:completed_lines:1"
-            )
+                f"{child_record['contract_execution_id']}:completed_lines:0"
+            ),
         },
     )
     monkeypatch.setattr(
@@ -8427,6 +8457,14 @@ def _shared_batch_reconcile_authority_fixture(
         "snapshot_id": snapshot_id,
         "final_head": final_head,
         "child_tasks": child_tasks,
+        "child_backlogs": child_backlogs,
+        "child_executions": child_executions,
+        "child_runtime_ids": child_runtime_ids,
+        "child_parent_task_ids": child_parent_task_ids,
+        "child_contexts": tuple(child_contexts),
+        "child_commits": tuple(child_commits),
+        "records": records,
+        "authorities": authorities,
         "queue_item_ids": queue_item_ids,
         "reconcile_event": reconcile_event,
         "root": root,
@@ -8531,6 +8569,279 @@ def test_mf_batch_final_reconcile_is_shared_child_close_authority(
         "merged_commit_sha"
     ]
     assert bridge["reconciled_commit"] == fixture["final_head"]
+
+
+def test_batch_parented_durable_merges_bind_dispatch_before_final_reconcile(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+        nested_enter_queue_plan=True,
+        service_enter_task=True,
+        task_only_reconcile_task="batch",
+        shared_file=True,
+        batch_parented_children=True,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_line_evidence_policy",
+        lambda *_args, **_kwargs: {
+            "allow_taskless_reconcile_only_for_explicit_shared_batch": True,
+        },
+    )
+    real_join = server._contract_runtime_completed_merge_reconcile_authority
+    merge_inputs = []
+
+    def capture_join(*args, merge, **kwargs):
+        merge_inputs.append(copy.deepcopy(merge))
+        return real_join(*args, merge=merge, **kwargs)
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_merge_reconcile_authority",
+        capture_join,
+    )
+
+    projected = []
+    for index, execution_id in enumerate(fixture["child_executions"]):
+        context = fixture["child_contexts"][index]
+        dispatch_line = {
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "actor_role": "observer",
+            "evidence_kind": "dispatch_bounded_worker",
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": fixture["batch_id"],
+            "payload": {
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": fixture["batch_id"],
+                "batch_id": fixture["batch_id"],
+                "merge_queue_id": fixture["merge_queue_id"],
+            },
+        }
+        record = {
+            **fixture["records"][execution_id],
+            "completed_lines": [dispatch_line],
+        }
+        authority = server._contract_runtime_trusted_merge_projection(
+            conn,
+            project_id=PID,
+            record=record,
+        )
+        projected.append(authority)
+
+        expected_dispatch_ref = (
+            f"contract_runtime:{execution_id}:completed_lines:0"
+        )
+        assert merge_inputs[-1]["contract_execution_id"] == execution_id
+        assert merge_inputs[-1]["runtime_context_id"] == (
+            fixture["child_runtime_ids"][index]
+        )
+        assert merge_inputs[-1]["task_id"] == fixture["child_tasks"][index]
+        assert merge_inputs[-1]["parent_task_id"] == fixture["batch_id"]
+        assert merge_inputs[-1]["dispatch_lineage_verified"] is True
+        assert merge_inputs[-1][
+            "contract_runtime_dispatch_source_ref"
+        ] == expected_dispatch_ref
+        assert server._contract_runtime_current_full_reconcile_activation_verified(
+            authority
+        ), json.dumps(authority, indent=2, sort_keys=True)
+        assert authority["contract_execution_id"] == execution_id
+        assert authority["runtime_context_id"] == (
+            fixture["child_runtime_ids"][index]
+        )
+        assert authority["task_id"] == fixture["child_tasks"][index]
+        assert authority["parent_task_id"] == fixture["batch_id"]
+        assert authority["contract_runtime_dispatch_source_ref"] == (
+            expected_dispatch_ref
+        )
+        assert authority["shared_batch_reconcile_authority"][
+            "ordered_queue_item_ids"
+        ] == list(fixture["queue_item_ids"])
+
+    assert projected[0]["contract_execution_id"] != projected[1][
+        "contract_execution_id"
+    ]
+    assert projected[0]["runtime_context_id"] != projected[1][
+        "runtime_context_id"
+    ]
+    assert fixture["child_commits"][0] != fixture["child_commits"][1]
+    assert all(
+        authority["reconciled_commit_sha"] == fixture["final_head"]
+        for authority in projected
+    )
+
+    conn.execute(
+        """
+        UPDATE parallel_branch_integration_epochs
+        SET status = 'reconcile_pending', closed_at = ''
+        WHERE project_id = ? AND batch_id = ?
+        """,
+        (PID, fixture["batch_id"]),
+    )
+    conn.commit()
+    before_final_barrier = server._contract_runtime_trusted_merge_projection(
+        conn,
+        project_id=PID,
+        record={
+            **fixture["records"][fixture["child_executions"][0]],
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch",
+                    "line_id": "observer_dispatch_bounded_workers",
+                    "actor_role": "observer",
+                    "evidence_kind": "dispatch_bounded_worker",
+                    "runtime_context_id": fixture["child_runtime_ids"][0],
+                    "task_id": fixture["child_tasks"][0],
+                    "parent_task_id": fixture["batch_id"],
+                }
+            ],
+        },
+    )
+    assert not server._contract_runtime_current_full_reconcile_activation_verified(
+        before_final_barrier
+    )
+
+
+def test_durable_merge_dispatch_enrichment_rejects_forged_scope(
+    conn,
+    monkeypatch,
+):
+    execution_id = "cex-durable-dispatch-enrichment"
+    runtime_context_id = "mfrctx-durable-dispatch-enrichment"
+    task_id = "worker-durable-dispatch-enrichment"
+    parent_task_id = "batch-durable-dispatch-enrichment"
+    context = SimpleNamespace(
+        project_id=PID,
+        backlog_id="AC-DURABLE-DISPATCH-ENRICHMENT",
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        batch_id=parent_task_id,
+        merge_queue_id="mq-durable-dispatch-enrichment",
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": context.backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+            }
+        ],
+    }
+    exact_match = {
+        "schema_version": "contract_runtime.dispatch_line_match.v1",
+        "contract_id": "mf_parallel.v2",
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "line_index": 0,
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "dispatch_bounded_worker",
+        "actor_role": "observer",
+        "source_ref": f"contract_runtime:{execution_id}:completed_lines:0",
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_line_identity",
+        lambda _record: {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "identity_status": "resolved",
+            "identity_source_line_id": "observer_dispatch_bounded_workers",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [context],
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_timeline_events",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_merge_authority",
+        lambda *_args, **_kwargs: {
+            "timeline_verified": True,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "merge_queue_id": context.merge_queue_id,
+        },
+    )
+    join_calls = []
+
+    def passthrough_join(*_args, merge, **_kwargs):
+        join_calls.append(copy.deepcopy(merge))
+        return dict(merge)
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_merge_reconcile_authority",
+        passthrough_join,
+    )
+
+    for field, forged_value in (
+        ("contract_execution_id", "cex-forged"),
+        ("runtime_context_id", "mfrctx-forged"),
+        ("task_id", "worker-forged"),
+        ("parent_task_id", "batch-forged"),
+        ("source_ref", "contract_runtime:cex-forged:completed_lines:0"),
+        ("line_id", "direct_fix_dispatch_context"),
+        ("evidence_kind", "merge"),
+        ("actor_role", "qa"),
+    ):
+        forged_match = {**exact_match, field: forged_value}
+        monkeypatch.setattr(
+            server,
+            "_contract_runtime_dispatch_line_match",
+            lambda *_args, _match=forged_match, **_kwargs: dict(_match),
+        )
+        rejected = server._contract_runtime_trusted_merge_projection(
+            conn,
+            project_id=PID,
+            record=record,
+        )
+        assert rejected["timeline_verified"] is False, field
+
+    assert join_calls == []
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dispatch_line_match",
+        lambda *_args, **_kwargs: dict(exact_match),
+    )
+    accepted = server._contract_runtime_trusted_merge_projection(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    assert accepted["dispatch_lineage_verified"] is True
+    assert accepted["contract_execution_id"] == execution_id
+    assert accepted["contract_runtime_dispatch_source_ref"] == (
+        exact_match["source_ref"]
+    )
+    assert len(join_calls) == 1
 
 
 def test_mf_batch_task_only_reconcile_accepts_short_epoch_head_prefixes(
