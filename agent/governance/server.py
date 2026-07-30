@@ -94020,6 +94020,23 @@ def _contract_runtime_close_execution_id(
     return ""
 
 
+def _contract_runtime_execution_record_exists(
+    conn,
+    contract_execution_id: str,
+) -> bool:
+    execution_id = str(contract_execution_id or "").strip()
+    if not execution_id.startswith("cex-"):
+        return False
+    try:
+        record = _contract_runtime(conn).store.get(execution_id)
+    except ContractRuntimeError:
+        return False
+    return (
+        str(record.get("contract_execution_id") or "").strip()
+        == execution_id
+    )
+
+
 def _contract_runtime_close_requested_execution_ref(body: Mapping[str, Any]) -> str:
     execution_fields = (
         *_CONTRACT_RUNTIME_EXECUTION_ID_FIELDS,
@@ -106147,12 +106164,15 @@ def _task_playback_compact_gate_response(
             events,
             contract=contract,
         )
+        close_commit = _audit_recovery_close_commit(row, query)
         projection_body = _timeline_gate_contract_runtime_projection_body(
             conn,
             project_id=project_id,
             backlog_id=backlog_id,
             query=query,
             route_gate=route_context_gate,
+            timeline_events=events,
+            close_commit=close_commit,
         )
         runtime_projection = _contract_runtime_close_authority_projection(
             conn,
@@ -106160,7 +106180,7 @@ def _task_playback_compact_gate_response(
             bug_id=backlog_id,
             body=projection_body,
             route_gate=route_context_gate,
-            close_commit=_audit_recovery_close_commit(row, projection_body),
+            close_commit=close_commit,
             timeline_events=events,
         )
         verification_events = events
@@ -113358,6 +113378,8 @@ def _timeline_gate_contract_runtime_projection_body(
     backlog_id: str,
     query: Mapping[str, Any],
     route_gate: Mapping[str, Any] | None = None,
+    timeline_events: list[dict[str, Any]] | None = None,
+    close_commit: str = "",
 ) -> dict[str, Any]:
     body = dict(query or {})
     if _contract_runtime_close_execution_id(body, conn=conn):
@@ -113450,8 +113472,35 @@ def _timeline_gate_contract_runtime_projection_body(
                 break
     if not execution_id.startswith("cex-") and route_gate_cex_execution_id:
         execution_id = route_gate_cex_execution_id
+    ignored_server_derived_execution_id = ""
+    mf_batch_parent_execution_id = ""
+    if (
+        execution_id.startswith("cex-")
+        and execution_id == current_execution_id
+        and timeline_events is not None
+        and not _contract_runtime_execution_record_exists(conn, execution_id)
+    ):
+        parent_candidate = (
+            root_execution_id
+            if root_execution_id.startswith("onboard-service-")
+            else ""
+        )
+        if parent_candidate:
+            parent_projection = _contract_runtime_mf_batch_parent_projection(
+                conn=conn,
+                project_id=project_id,
+                bug_id=backlog_id,
+                requested_execution_id=parent_candidate,
+                close_commit=str(close_commit or "").strip(),
+                timeline_events=timeline_events,
+            )
+            if parent_projection.get("accepted"):
+                ignored_server_derived_execution_id = execution_id
+                mf_batch_parent_execution_id = parent_candidate
+                execution_id = ""
     requested_execution_id = (
-        current_execution_id
+        mf_batch_parent_execution_id
+        or current_execution_id
         or root_execution_id
         or route_gate_execution_id
     )
@@ -113478,7 +113527,11 @@ def _timeline_gate_contract_runtime_projection_body(
             execution_id if execution_id.startswith("cex-") else ""
         ),
         "current_contract_execution_id": requested_execution_id,
-        "projection_source": "backlog_contract_chain_current_projection",
+        "projection_source": (
+            "source_backed_mf_batch_parent_fallback"
+            if mf_batch_parent_execution_id
+            else "backlog_contract_chain_current_projection"
+        ),
         "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
             source="contract_runtime_current_chain_projection",
             contract_execution_id=requested_execution_id or execution_id,
@@ -113486,6 +113539,18 @@ def _timeline_gate_contract_runtime_projection_body(
         "legacy_advisory": True,
         "authoritative": False,
     }
+    if ignored_server_derived_execution_id:
+        body["contract_runtime"].update(
+            {
+                "ignored_server_derived_unknown_contract_execution_id": (
+                    ignored_server_derived_execution_id
+                ),
+                "fallback_contract_execution_id": mf_batch_parent_execution_id,
+                "fallback_source": (
+                    "completed_source_backed_mf_batch_parent_projection"
+                ),
+            }
+        )
     body["contract_chain_current"] = {
         **dict(current),
         "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
