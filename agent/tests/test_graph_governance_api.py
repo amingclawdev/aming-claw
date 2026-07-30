@@ -55883,6 +55883,194 @@ def test_backlog_close_accepts_mf_batch_parent_onboard_service_authority(
     assert row["commit"] == close_commit
 
 
+def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_unknown(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-PLAYBACK-MF-BATCH-PARENT-UNKNOWN-CURRENT"
+    child_a = f"{backlog_id}-CHILD-A"
+    child_b = f"{backlog_id}-CHILD-B"
+    close_commit = "fb6275118745006c8324dfcbeecea62c39e91936"
+    for row_id in (backlog_id, child_a, child_b):
+        _insert_simple_mf_close_backlog(conn, row_id)
+    conn.execute(
+        """UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?, priority = ?
+           WHERE bug_id = ?""",
+        (
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            "P1",
+            child_a,
+        ),
+    )
+    conn.execute(
+        """UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?, priority = ?
+           WHERE bug_id = ?""",
+        (
+            json.dumps(["agent/governance/parallel_branch_runtime.py"]),
+            json.dumps(["agent/tests/test_parallel_branch_runtime.py"]),
+            "P0",
+            child_b,
+        ),
+    )
+    conn.commit()
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-playback-mf-batch-unknown-current",
+    )
+    parent_route_token_ref = "rtok-playback-mf-batch-unknown-current"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="",
+        route_token_ref=parent_route_token_ref,
+        allowed_actions=["mf_batch_parallel_enter"],
+    )
+
+    entered = server.handle_project_mf_batch_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "backlog_ids": [child_a, child_b],
+                "reason": "Build a completed source-backed batch parent fixture.",
+                "task_id": "playback-mf-batch-unknown-current",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": parent_route_token_ref,
+                "onboard_service_waiver": True,
+                "target_head_commit": close_commit,
+                "graph_snapshot_id": "snapshot-playback-mf-batch-parent",
+            },
+        )
+    )
+    parent_execution_id = entered["parent_contract_execution_id"]
+    merge_queue_id = entered["merge_queue_plan"]["merge_queue_id"]
+    queue_items = list_merge_queue_items(conn, PID, merge_queue_id)
+    upsert_merge_queue_items(
+        conn,
+        [
+            replace(
+                item,
+                status="merged",
+                merge_commit=close_commit,
+                target_head_after_merge=close_commit,
+                current_target_head=close_commit,
+            )
+            for item in queue_items
+        ],
+    )
+    now = "2026-07-30T00:00:00Z"
+    for child_id in (child_a, child_b):
+        conn.execute(
+            """UPDATE backlog_bugs
+               SET status = 'FIXED', "commit" = ?, fixed_at = ?, updated_at = ?
+               WHERE bug_id = ?""",
+            (close_commit, now, now, child_id),
+        )
+    conn.execute(
+        """UPDATE backlog_bugs
+           SET "commit" = ?, updated_at = ?
+           WHERE bug_id = ?""",
+        (close_commit, now, backlog_id),
+    )
+    conn.commit()
+
+    stale_execution_id = "cex-playback-stale-unknown-current"
+
+    def stale_current_projection(
+        _conn,
+        *,
+        project_id,
+        backlog_id,
+        rebuild_if_missing=False,
+        **_kwargs,
+    ):
+        return {
+            "schema_version": "backlog_contract_chain_current.v1",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "current_contract_execution_id": stale_execution_id,
+            "root_contract_execution_id": parent_execution_id,
+            "active_child_contract_execution_id": stale_execution_id,
+            "active_chain": {
+                "execution_ids": [parent_execution_id, stale_execution_id],
+            },
+            "readiness_state": "contract_complete",
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": "backlog_contract_chain_current",
+        }
+
+    server._timeline_warm_cache_clear()
+    with monkeypatch.context() as scoped_patch:
+        scoped_patch.setattr(
+            server,
+            "read_backlog_contract_chain_current",
+            stale_current_projection,
+        )
+        timeline_events = task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            limit=50,
+        )
+        projection_body = server._timeline_gate_contract_runtime_projection_body(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            query={},
+            timeline_events=timeline_events,
+            close_commit=close_commit,
+        )
+        assert projection_body["current_contract_execution_id"] == (
+            parent_execution_id
+        )
+        assert projection_body["contract_runtime"][
+            "ignored_server_derived_unknown_contract_execution_id"
+        ] == stale_execution_id
+
+        compact = server.handle_task_timeline_list(
+            _ctx(
+                {"project_id": PID},
+                query={
+                    "backlog_id": backlog_id,
+                    "limit": "50",
+                    "playback_bootstrap": "compact",
+                },
+            )
+        )
+
+        assert compact["backlog_timeline_gate"]["ok"] is True
+        assert compact["backlog_timeline_gate"]["can_close"] is True
+        assert compact["playback_bootstrap"]["shared_computation"][
+            "timeline_gate"
+        ] is True
+
+        server._timeline_warm_cache_clear()
+        with pytest.raises(GovernanceError) as exc:
+            server.handle_task_timeline_list(
+                _ctx(
+                    {"project_id": PID},
+                    query={
+                        "backlog_id": backlog_id,
+                        "limit": "50",
+                        "playback_bootstrap": "compact",
+                        "contract_execution_id": (
+                            "cex-explicit-arbitrary-unknown"
+                        ),
+                    },
+                )
+            )
+
+    assert exc.value.code == "contract_runtime_close_authority_rejected"
+    assert (
+        exc.value.details["contract_execution_id"]
+        == "cex-explicit-arbitrary-unknown"
+    )
+
+
 def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     conn,
     monkeypatch,
