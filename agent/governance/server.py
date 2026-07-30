@@ -78635,6 +78635,8 @@ def _contract_runtime_completed_merge_authority(
         for line in record.get("completed_lines") or []
         if isinstance(line, Mapping)
     ]
+    if not _contract_runtime_dispatch_line_match(record, context):
+        return {}
 
     def usable_line(
         line: Mapping[str, Any],
@@ -78768,18 +78770,54 @@ def _contract_runtime_completed_merge_authority(
         )
         else {}
     )
+    durable_completed_round: dict[str, Any] = {}
+    if preliminary_durable:
+        if (
+            str(preliminary_durable.get("schema_version") or "")
+            != _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
+            or preliminary_durable.get("server_derived") is not True
+            or preliminary_durable.get("db_verified") is not True
+        ):
+            return {}
+        durable_completed_round = (
+            _contract_runtime_observer_merge_completed_round(
+                conn,
+                project_id=project_id,
+                record=record,
+                context=context,
+                branch_head=preliminary_branch_head,
+            )
+        )
+        if not durable_completed_round:
+            return {}
+        durable_round_fields = (
+            "worker_commit_completed_line_index",
+            "qa_graph_completed_line_index",
+            "qa_completed_line_index",
+            "qa_acceptance_ref",
+        )
+        if (
+            any(
+                str(preliminary_durable.get(field) or "").strip()
+                != str(durable_completed_round.get(field) or "").strip()
+                for field in durable_round_fields
+            )
+            or bool(
+                preliminary_durable.get("qa_contract_runtime_verified")
+            )
+            != bool(
+                durable_completed_round.get(
+                    "qa_contract_runtime_verified"
+                )
+            )
+        ):
+            return {}
 
     qa_acceptance: dict[str, Any] = {}
     audit_authority: dict[str, Any] = {}
     completed_round: dict[str, Any] = {}
     if durable_audit:
-        completed_round = _contract_runtime_observer_merge_completed_round(
-            conn,
-            project_id=project_id,
-            record=record,
-            context=context,
-            branch_head=preliminary_branch_head,
-        )
+        completed_round = durable_completed_round
         audit_authority = (
             dict(completed_round.get("qa_audit_only_no_pass_authority"))
             if isinstance(
@@ -78872,6 +78910,48 @@ def _contract_runtime_completed_merge_authority(
         else:
             return {}
     else:
+        if preliminary_durable:
+            if (
+                durable_completed_round.get(
+                    "qa_contract_runtime_verified"
+                )
+                is not True
+            ):
+                return {}
+            qa_graph_index = int(
+                durable_completed_round.get(
+                    "qa_graph_completed_line_index"
+                )
+                or -1
+            )
+            qa_index = int(
+                durable_completed_round.get("qa_completed_line_index")
+                or -1
+            )
+            if not (
+                0 <= qa_graph_index < qa_index < merge_line[0]
+                and qa_index < len(completed)
+            ):
+                return {}
+            qa_graph = (qa_graph_index, completed[qa_graph_index])
+            qa_verification = (qa_index, completed[qa_index])
+            qa_acceptance = _contract_runtime_completed_line_acceptance(
+                conn,
+                project_id=project_id,
+                record=record,
+                completed_line_index=qa_index,
+                expected_line=qa_verification[1],
+            )
+            if not (
+                qa_acceptance.get("db_verified") is True
+                and str(
+                    qa_acceptance.get("acceptance_ref") or ""
+                ).strip()
+                == str(
+                    preliminary_durable.get("qa_acceptance_ref") or ""
+                ).strip()
+            ):
+                return {}
         if not qa_graph or not qa_verification:
             return {}
         if not (qa_graph[0] < qa_verification[0] < merge_line[0]):

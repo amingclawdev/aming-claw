@@ -81467,6 +81467,12 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
                 "actor_role": "qa",
                 "evidence_kind": "graph_trace",
                 "payload": {
+                    # This accepted non-verdict QA graph line is intentionally
+                    # broader than the legacy completed-merge rescan helper.
+                    # The later durable observer-merge authority owns its
+                    # exact index and the accepted QA successor.
+                    "no_pass_claim": True,
+                    "overall_release_pass_claimed": False,
                     "graph_trace_evidence": {
                         "db_verified": True,
                         "verified_trace_ids": ["gqt-completed-qa"],
@@ -81829,6 +81835,120 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     assert historical_projection["runtime_context_id"] == runtime_context_id
     assert historical_projection["task_id"] == task_id
     assert historical_projection["parent_task_id"] == context.parent_task_id
+
+    durable_rescan = server._contract_runtime_completed_merge_authority(
+        conn,
+        project_id=project_id,
+        record=historical_conflict,
+        context=context,
+        timeline_events=timeline_events,
+    )
+    assert durable_rescan["timeline_verified"] is True
+    assert durable_rescan["qa_graph_completed_line_index"] == 9
+    assert durable_rescan["qa_completed_line_index"] == 10
+    assert durable_rescan["qa_acceptance_ref"] == durable_merge[
+        "qa_acceptance_ref"
+    ]
+
+    durable_drift_cases = (
+        ("qa_graph_completed_line_index", 8),
+        ("qa_completed_line_index", 9),
+        (
+            "qa_acceptance_ref",
+            "contract_runtime:tampered:revision:999",
+        ),
+        ("branch_head", "f" * 40),
+        ("db_verified", False),
+    )
+    for field, value in durable_drift_cases:
+        drifted = json.loads(json.dumps(historical_conflict))
+        drifted["completed_lines"][-1]["payload"][
+            "durable_merge_authority"
+        ][field] = value
+        assert (
+            server._contract_runtime_completed_merge_authority(
+                conn,
+                project_id=project_id,
+                record=drifted,
+                context=context,
+                timeline_events=timeline_events,
+            )
+            == {}
+        )
+
+    failed_qa = json.loads(json.dumps(historical_conflict))
+    failed_qa["completed_lines"][
+        durable_merge["qa_completed_line_index"]
+    ]["status"] = "failed"
+    assert (
+        server._contract_runtime_completed_merge_authority(
+            conn,
+            project_id=project_id,
+            record=failed_qa,
+            context=context,
+            timeline_events=timeline_events,
+        )
+        == {}
+    )
+
+    dispatch_drift = json.loads(json.dumps(historical_conflict))
+    dispatch_line = next(
+        line
+        for line in dispatch_drift["completed_lines"]
+        if line.get("line_id") == "observer_dispatch_bounded_workers"
+    )
+    dispatch_line["task_id"] = "worker-unrelated-dispatch"
+    dispatch_line["payload"]["worker_task_id"] = (
+        "worker-unrelated-dispatch"
+    )
+    assert (
+        server._contract_runtime_completed_merge_authority(
+            conn,
+            project_id=project_id,
+            record=dispatch_drift,
+            context=context,
+            timeline_events=timeline_events,
+        )
+        == {}
+    )
+
+    assert (
+        server._contract_runtime_completed_merge_authority(
+            conn,
+            project_id=project_id,
+            record=historical_conflict,
+            context=context,
+            timeline_events=[],
+        )
+        == {}
+    )
+    conn.execute(
+        """
+        UPDATE parallel_branch_merge_queue_items
+        SET status = 'queued'
+        WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (project_id, merge_queue_id, queue_item_id),
+    )
+    assert (
+        server._contract_runtime_completed_merge_authority(
+            conn,
+            project_id=project_id,
+            record=historical_conflict,
+            context=context,
+            timeline_events=timeline_events,
+        )
+        == {}
+    )
+    conn.execute(
+        """
+        UPDATE parallel_branch_merge_queue_items
+        SET status = 'merged'
+        WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (project_id, merge_queue_id, queue_item_id),
+    )
+    conn.commit()
 
     forged_durable_identity = json.loads(json.dumps(historical_conflict))
     forged_durable_identity["completed_lines"][-1]["payload"][
