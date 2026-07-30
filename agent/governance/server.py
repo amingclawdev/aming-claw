@@ -113371,6 +113371,244 @@ def handle_backlog_get(ctx: RequestContext):
         conn.close()
 
 
+def _validated_playback_legacy_contract_state_route_gate_origin(
+    *,
+    project_id: str,
+    backlog_id: str,
+    query: Mapping[str, Any],
+    current: Mapping[str, Any],
+    route_gate: Mapping[str, Any] | None,
+    timeline_events: list[dict[str, Any]] | None,
+    route_gate_execution_id: str,
+) -> dict[str, Any]:
+    """Recognize the one legacy Batch route-gate shape safe for Playback reads.
+
+    The route-gate projection is not close authority.  It only explains why a
+    stale, already-accepted ``mf_batch_parallel`` execution id may be ignored
+    while compact Playback hydrates the source-backed onboard-service parent.
+    Keep this predicate intentionally exact so mutation/close callers and
+    caller-supplied or unqualified execution references remain fail-closed.
+    """
+
+    if str(query.get("playback_bootstrap") or "").strip().lower() != "compact":
+        return {}
+    if _contract_runtime_close_requested_execution_ref(query):
+        return {}
+    if not timeline_events or not isinstance(route_gate, Mapping):
+        return {}
+    root_execution_id = str(
+        current.get("root_contract_execution_id") or ""
+    ).strip()
+    current_execution_id = str(
+        current.get("current_contract_execution_id") or ""
+    ).strip()
+    active_child_execution_id = str(
+        current.get("active_child_contract_execution_id") or ""
+    ).strip()
+    active_chain = (
+        current.get("active_chain")
+        if isinstance(current.get("active_chain"), Mapping)
+        else {}
+    )
+    active_chain_execution_ids = [
+        str(value or "").strip()
+        for value in list(active_chain.get("execution_ids") or [])
+        if str(value or "").strip()
+    ]
+    if (
+        str(current.get("schema_version") or "").strip()
+        != "backlog_contract_chain_current.v1"
+        or str(current.get("project_id") or "").strip() != project_id
+        or str(current.get("backlog_id") or "").strip() != backlog_id
+        or not root_execution_id.startswith("onboard-service-")
+        or current_execution_id != root_execution_id
+        or active_child_execution_id
+        or active_chain_execution_ids != [root_execution_id]
+    ):
+        return {}
+    if (
+        str(route_gate.get("schema_version") or "").strip()
+        != "mf_route_context_consumption_gate.v1"
+        or route_gate.get("passed") is not True
+        or str(route_gate.get("status") or "").strip() != "passed"
+        or route_gate.get("same_route_identity") is not True
+    ):
+        return {}
+    checks = (
+        route_gate.get("checks")
+        if isinstance(route_gate.get("checks"), Mapping)
+        else {}
+    )
+    if (
+        checks.get("route_context_present") is not True
+        or checks.get("same_route_identity") is not True
+    ):
+        return {}
+
+    policy = (
+        route_gate.get("contract_close_gate_policy")
+        if isinstance(route_gate.get("contract_close_gate_policy"), Mapping)
+        else {}
+    )
+    lane = (
+        policy.get("active_lane_contract")
+        if isinstance(policy.get("active_lane_contract"), Mapping)
+        else {}
+    )
+    active_execution = (
+        lane.get("active_contract_execution")
+        if isinstance(lane.get("active_contract_execution"), Mapping)
+        else {}
+    )
+    next_action = (
+        lane.get("next_legal_action")
+        if isinstance(lane.get("next_legal_action"), Mapping)
+        else {}
+    )
+    contract_chain_id = str(lane.get("contract_chain_id") or "").strip()
+    projection_watermark = active_execution.get("projection_watermark")
+    try:
+        projection_watermark_id = int(projection_watermark)
+    except (TypeError, ValueError):
+        return {}
+    route_token_ref = str(
+        active_execution.get("route_token_ref") or ""
+    ).strip()
+    prompt_contract_id = str(
+        active_execution.get("prompt_contract_id") or ""
+    ).strip()
+    if (
+        str(policy.get("schema_version") or "").strip()
+        != "contract_close_gate_policy_projection.v1"
+        or str(lane.get("schema_version") or "").strip()
+        != "contract_lane_execution.v1"
+        or str(lane.get("role") or "").strip() != "root"
+        or str(lane.get("source") or "").strip() != "contract_state"
+        or str(lane.get("backlog_id") or "").strip() != backlog_id
+        or not contract_chain_id.startswith("cchain-")
+        or str(lane.get("contract_id") or "").strip() != "mf_batch_parallel"
+        or str(lane.get("contract_template_id") or "").strip()
+        != "mf_batch_parallel.v1"
+        or str(lane.get("contract_execution_id") or "").strip()
+        != route_gate_execution_id
+        or str(lane.get("state") or "").strip() != "accepted"
+        or str(active_execution.get("schema_version") or "").strip()
+        != "active_contract_execution.v1"
+        or str(active_execution.get("project_id") or "").strip() != project_id
+        or str(active_execution.get("backlog_id") or "").strip() != backlog_id
+        or str(active_execution.get("contract_execution_id") or "").strip()
+        != route_gate_execution_id
+        or str(active_execution.get("contract_id") or "").strip()
+        != "mf_batch_parallel"
+        or str(active_execution.get("contract_template_id") or "").strip()
+        != "mf_batch_parallel.v1"
+        or str(active_execution.get("state") or "").strip() != "accepted"
+        or str(active_execution.get("contract_chain_id") or "").strip()
+        != contract_chain_id
+        or projection_watermark_id <= 0
+        or not str(active_execution.get("route_identity_hash") or "").startswith(
+            "sha256:"
+        )
+        or not route_token_ref.startswith("rtok-")
+        or not prompt_contract_id.startswith("rprompt-")
+        or not str(
+            active_execution.get("visible_injection_manifest_hash") or ""
+        ).startswith("sha256:")
+    ):
+        return {}
+    if (
+        str(next_action.get("source") or "").strip() != "contract_state"
+        or str(next_action.get("contract_chain_id") or "").strip()
+        != contract_chain_id
+        or str(next_action.get("contract_execution_id") or "").strip()
+        != route_gate_execution_id
+        or str(next_action.get("backlog_id") or "").strip() != backlog_id
+        or str(next_action.get("route_token_ref") or "").strip()
+        != route_token_ref
+        or next_action.get("projection_watermark") != projection_watermark
+    ):
+        return {}
+
+    route_identity = (
+        route_gate.get("route_identity")
+        if isinstance(route_gate.get("route_identity"), Mapping)
+        else {}
+    )
+    route_id = str(route_identity.get("route_id") or "").strip()
+    route_context_hash = str(
+        route_identity.get("route_context_hash") or ""
+    ).strip()
+    prompt_contract_hash = str(
+        route_identity.get("prompt_contract_hash") or ""
+    ).strip()
+    if (
+        not route_id.startswith("route-")
+        or not route_context_hash.startswith("sha256:")
+        or str(route_identity.get("prompt_contract_id") or "").strip()
+        != prompt_contract_id
+        or not prompt_contract_hash.startswith("sha256:")
+    ):
+        return {}
+
+    evidence_events = (
+        route_gate.get("evidence_events")
+        if isinstance(route_gate.get("evidence_events"), Mapping)
+        else {}
+    )
+    route_context_events = list(evidence_events.get("route_context") or [])
+    route_evidence = next(
+        (
+            event
+            for event in route_context_events
+            if isinstance(event, Mapping)
+            and event.get("id") == projection_watermark
+            and str(event.get("event_kind") or "").strip()
+            == "route_token_gate"
+            and str(event.get("phase") or "").strip() == "route_gate"
+            and str(event.get("status") or "").strip() == "accepted"
+        ),
+        None,
+    )
+    timeline_route_event = next(
+        (
+            event
+            for event in timeline_events
+            if isinstance(event, Mapping)
+            and event.get("id") == projection_watermark
+            and str(event.get("event_kind") or "").strip()
+            == "route_token_gate"
+            and str(event.get("phase") or "").strip() == "route_gate"
+            and str(event.get("status") or "").strip() == "accepted"
+        ),
+        None,
+    )
+    if route_evidence is None or timeline_route_event is None:
+        return {}
+
+    return {
+        "schema_version": (
+            "playback_legacy_contract_state_route_gate_origin.v1"
+        ),
+        "validated": True,
+        "source": "legacy_contract_state_route_gate",
+        "authoritative": False,
+        "close_authority": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": route_gate_execution_id,
+        "contract_id": "mf_batch_parallel",
+        "contract_template_id": "mf_batch_parallel.v1",
+        "state": "accepted",
+        "contract_chain_id": contract_chain_id,
+        "projection_watermark": projection_watermark_id,
+        "route_event_id": projection_watermark_id,
+        "route_id": route_id,
+        "route_context_hash": route_context_hash,
+        "prompt_contract_id": prompt_contract_id,
+        "prompt_contract_hash": prompt_contract_hash,
+    }
+
+
 def _timeline_gate_contract_runtime_projection_body(
     conn,
     *,
@@ -113445,6 +113683,19 @@ def _timeline_gate_contract_runtime_projection_body(
     route_gate_cex_execution_id = (
         route_gate_execution_id if route_gate_execution_id.startswith("cex-") else ""
     )
+    validated_legacy_route_gate_origin = (
+        _validated_playback_legacy_contract_state_route_gate_origin(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            query=body,
+            current=current,
+            route_gate=route_gate,
+            timeline_events=timeline_events,
+            route_gate_execution_id=route_gate_cex_execution_id,
+        )
+        if route_gate_cex_execution_id
+        else {}
+    )
     execution_id = current_execution_id
     execution_id_source = "current_contract_execution_id"
     if (
@@ -113482,12 +113733,22 @@ def _timeline_gate_contract_runtime_projection_body(
     mf_batch_parent_execution_id = ""
     if (
         execution_id.startswith("cex-")
-        and execution_id_source
-        in {
-            "current_contract_execution_id",
-            "active_child_contract_execution_id",
-            "active_chain",
-        }
+        and (
+            execution_id_source
+            in {
+                "current_contract_execution_id",
+                "active_child_contract_execution_id",
+                "active_chain",
+            }
+            or (
+                execution_id_source == "route_gate"
+                and bool(validated_legacy_route_gate_origin)
+                and execution_id
+                == validated_legacy_route_gate_origin.get(
+                    "contract_execution_id"
+                )
+            )
+        )
         and timeline_events is not None
         and not _contract_runtime_execution_record_exists(conn, execution_id)
     ):
@@ -113565,6 +113826,10 @@ def _timeline_gate_contract_runtime_projection_body(
                 ),
             }
         )
+        if validated_legacy_route_gate_origin:
+            body["contract_runtime"][
+                "validated_legacy_contract_state_origin"
+            ] = dict(validated_legacy_route_gate_origin)
     body["contract_chain_current"] = {
         **dict(current),
         "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
