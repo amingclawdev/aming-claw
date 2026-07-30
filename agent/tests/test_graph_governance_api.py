@@ -7988,6 +7988,7 @@ def _shared_batch_reconcile_authority_fixture(
     monkeypatch,
     *,
     coordination_runtime_scope: bool = True,
+    short_epoch_head: bool = False,
 ) -> dict[str, Any]:
     batch_id = "batch-shared-final-reconcile"
     coordination_task_id = "batch-shared-coordination-task"
@@ -8120,14 +8121,18 @@ def _shared_batch_reconcile_authority_fixture(
             coordination_backlog_id=coordination_backlog_id,
             target_ref="refs/heads/main",
             base_head=base_head,
-            current_head=final_head,
+            current_head=(
+                final_head[:7] if short_epoch_head else final_head
+            ),
             merge_queue_id=merge_queue_id,
             merge_cursor=2,
             merged_prefix=queue_item_ids,
             remaining_queue_item_ids=(),
             reconcile_state="reconciled",
             status="closed",
-            last_merge_commit=final_head,
+            last_merge_commit=(
+                final_head[:12] if short_epoch_head else final_head
+            ),
             snapshot_id=snapshot_id,
             projection_id="projection-shared-final-reconcile",
             closed_at="2026-07-30T00:06:00Z",
@@ -8247,12 +8252,25 @@ def _shared_batch_reconcile_authority_fixture(
             "authentication_source": "test_protected_entrypoint",
             "raw_route_token_persisted": False,
             "protected_action": "graph_current_full_reconcile",
-            "task_id": coordination_task_id,
+            **(
+                {"task_id": coordination_task_id}
+                if coordination_scope
+                else {}
+            ),
             "route_token_scope": {
                 "project_id": PID,
                 "backlog_id": coordination_backlog_id,
                 "task_id": coordination_task_id,
             },
+            "idempotency_scope": (
+                coordination_scope
+                if coordination_scope
+                else {
+                    "project_id": PID,
+                    "backlog_id": coordination_backlog_id,
+                    "task_id": coordination_task_id,
+                }
+            ),
             **(
                 {
                     "runtime_context_id": coordination_runtime_id,
@@ -8355,6 +8373,8 @@ def _shared_batch_reconcile_authority_fixture(
         "context": child_contexts[0],
         "merge": current_merge,
         "batch_id": batch_id,
+        "coordination_backlog_id": coordination_backlog_id,
+        "coordination_task_id": coordination_task_id,
         "merge_queue_id": merge_queue_id,
         "snapshot_id": snapshot_id,
         "final_head": final_head,
@@ -8463,6 +8483,104 @@ def test_mf_batch_final_reconcile_is_shared_child_close_authority(
         "merged_commit_sha"
     ]
     assert bridge["reconciled_commit"] == fixture["final_head"]
+
+
+def test_mf_batch_task_only_reconcile_accepts_short_epoch_head_prefixes(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+        short_epoch_head=True,
+    )
+
+    authority = server._contract_runtime_shared_batch_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+        context=fixture["context"],
+        merge=fixture["merge"],
+    )
+
+    assert authority["reconciled_commit_sha"] == fixture["final_head"]
+    shared = authority["shared_batch_reconcile_authority"]
+    assert shared["final_head_commit"] == fixture["final_head"]
+    assert shared["coordination_runtime_context_id"] == ""
+
+
+def test_mf_batch_task_only_reconcile_rejects_ambiguous_batch_binding(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=fixture["coordination_backlog_id"],
+        task_id=fixture["coordination_task_id"],
+        event_type="mf_batch_parallel.entered",
+        event_kind="contract_binding",
+        phase="orchestration",
+        actor="observer",
+        status="accepted",
+        payload={
+            "batch_id": "batch-shared-other",
+            "merge_queue_id": "mq-shared-other",
+            "backlog_id": fixture["coordination_backlog_id"],
+        },
+    )
+    conn.commit()
+
+    authority = server._contract_runtime_shared_batch_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+        context=fixture["context"],
+        merge=fixture["merge"],
+    )
+
+    assert authority == {}
+
+
+def test_mf_batch_shared_reconcile_rejects_epoch_cursor_drift(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+    )
+    conn.execute(
+        """
+        UPDATE parallel_branch_integration_epochs
+        SET merge_cursor = 1
+        WHERE project_id = ? AND batch_id = ?
+        """,
+        (PID, fixture["batch_id"]),
+    )
+    conn.commit()
+
+    authority = server._contract_runtime_shared_batch_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+        context=fixture["context"],
+        merge=fixture["merge"],
+    )
+
+    assert authority == {}
 
 
 @pytest.mark.parametrize(

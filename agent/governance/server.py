@@ -75490,22 +75490,30 @@ def _contract_runtime_shared_batch_reconcile_authority(
     coordination_backlog_id = str(
         epoch.get("coordination_backlog_id") or ""
     ).strip()
-    final_head = str(epoch.get("current_head") or "").strip().lower()
+    epoch_current_head = str(
+        epoch.get("current_head") or ""
+    ).strip().lower()
+    epoch_last_merge_commit = str(
+        epoch.get("last_merge_commit") or ""
+    ).strip().lower()
     final_snapshot_id = str(epoch.get("snapshot_id") or "").strip()
     merged_prefix = _json_loads(epoch.get("merged_prefix_json"), [])
     remaining = _json_loads(
         epoch.get("remaining_queue_item_ids_json"),
         [],
     )
+    try:
+        merge_cursor = int(epoch.get("merge_cursor"))
+    except (TypeError, ValueError):
+        return {}
     if not (
         str(epoch.get("merge_queue_id") or "").strip() == merge_queue_id
         and str(epoch.get("status") or "").strip() == "closed"
         and str(epoch.get("reconcile_state") or "").strip() == "reconciled"
         and coordination_backlog_id
         and final_snapshot_id
-        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", final_head)
-        and str(epoch.get("last_merge_commit") or "").strip().lower()
-        == final_head
+        and re.fullmatch(r"[0-9a-f]{7,64}", epoch_current_head)
+        and re.fullmatch(r"[0-9a-f]{7,64}", epoch_last_merge_commit)
         and isinstance(merged_prefix, list)
         and merged_prefix
         and isinstance(remaining, list)
@@ -75543,10 +75551,16 @@ def _contract_runtime_shared_batch_reconcile_authority(
         str(item.get("queue_item_id") or "").strip()
         for item in queue_rows
     ]
+    queue_final_head = (
+        str(queue_rows[-1].get("merge_commit") or "").strip().lower()
+        if queue_rows
+        else ""
+    )
     if not (
         len(queue_rows) >= 2
         and queue_item_ids
         == [str(item or "").strip() for item in merged_prefix]
+        and merge_cursor == len(merged_prefix) == len(queue_rows)
         and len(set(queue_item_ids)) == len(queue_item_ids)
         and len(
             {
@@ -75570,8 +75584,11 @@ def _contract_runtime_shared_batch_reconcile_authority(
             == str(item.get("merge_commit") or "").strip().lower()
             for item in queue_rows
         )
+        and queue_final_head.startswith(epoch_current_head)
+        and queue_final_head.startswith(epoch_last_merge_commit)
     ):
         return {}
+    final_head = queue_final_head
     child_queue_rows = [
         item
         for item in queue_rows
@@ -75726,17 +75743,12 @@ def _contract_runtime_shared_batch_reconcile_authority(
         ).fetchall()
     except sqlite3.Error:
         return {}
-    entered_candidates = []
+    accepted_entered_bindings = []
     for raw_row in entered_rows:
         row = dict(raw_row)
         payload = _json_loads(row.get("payload_json"), {})
         if (
             isinstance(payload, Mapping)
-            and str(payload.get("batch_id") or "").strip() == batch_id
-            and str(payload.get("merge_queue_id") or "").strip()
-            == merge_queue_id
-            and str(payload.get("backlog_id") or "").strip()
-            == coordination_backlog_id
             and str(row.get("event_kind") or "").strip()
             in {"contract_binding", "mf_batch_parallel_entered"}
             and str(row.get("status") or "").strip()
@@ -75749,14 +75761,34 @@ def _contract_runtime_shared_batch_reconcile_authority(
             )
             == "observer"
         ):
-            entered_candidates.append(row)
+            accepted_entered_bindings.append((row, payload))
+    entered_candidates = [
+        (row, payload)
+        for row, payload in accepted_entered_bindings
+        if str(payload.get("batch_id") or "").strip() == batch_id
+        and str(payload.get("merge_queue_id") or "").strip()
+        == merge_queue_id
+        and str(payload.get("backlog_id") or "").strip()
+        == coordination_backlog_id
+    ]
     if len(entered_candidates) != 1:
         return {}
-    entered_event_id = int(entered_candidates[0].get("id") or 0)
+    entered_event = entered_candidates[0][0]
+    entered_event_id = int(entered_event.get("id") or 0)
     coordination_task_id = str(
-        entered_candidates[0].get("task_id") or ""
+        entered_event.get("task_id") or ""
     ).strip()
-    if not coordination_task_id:
+    same_task_entered_bindings = [
+        (row, payload)
+        for row, payload in accepted_entered_bindings
+        if str(row.get("task_id") or "").strip() == coordination_task_id
+    ]
+    if (
+        not coordination_task_id
+        or len(same_task_entered_bindings) != 1
+        or int(same_task_entered_bindings[0][0].get("id") or 0)
+        != entered_event_id
+    ):
         return {}
 
     try:
@@ -75867,6 +75899,23 @@ def _contract_runtime_shared_batch_reconcile_authority(
         and isinstance(route_evidence.get("route_token_scope"), Mapping)
         else {}
     )
+    idempotency_scope = (
+        route_evidence.get("idempotency_scope")
+        if isinstance(route_evidence, Mapping)
+        and isinstance(route_evidence.get("idempotency_scope"), Mapping)
+        else {}
+    )
+    marker_route_evidence = (
+        marker.get("route_evidence")
+        if isinstance(marker, Mapping)
+        and isinstance(marker.get("route_evidence"), Mapping)
+        else {}
+    )
+    legacy_task_scope = {
+        "project_id": project_id,
+        "backlog_id": coordination_backlog_id,
+        "task_id": coordination_task_id,
+    }
     scoped_coordination_verified = bool(
         coordination_scope_claimed
         and coordination_context is not None
@@ -75904,16 +75953,17 @@ def _contract_runtime_shared_batch_reconcile_authority(
     task_only_coordination_verified = bool(
         not coordination_scope_claimed
         and not scope_identity
-        and all(
-            str(route_token_scope.get(field) or "").strip() == expected
-            for field, expected in (
-                ("project_id", project_id),
-                ("backlog_id", coordination_backlog_id),
-                ("task_id", coordination_task_id),
-            )
-        )
-        and str(route_evidence.get("task_id") or "").strip()
-        == coordination_task_id
+        and {
+            str(field): str(value or "").strip()
+            for field, value in route_token_scope.items()
+        }
+        == legacy_task_scope
+        and {
+            str(field): str(value or "").strip()
+            for field, value in idempotency_scope.items()
+        }
+        == legacy_task_scope
+        and dict(marker_route_evidence) == dict(route_evidence)
         and not any(
             str(route_evidence.get(field) or "").strip()
             for field in (
