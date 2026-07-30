@@ -8713,6 +8713,143 @@ def test_mf_batch_task_only_shared_authority_is_resealed_after_enrichment(
     ] == fixture["batch_id"]
 
 
+def test_mf_batch_deferred_reconcile_receipt_binds_shared_close_authority(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+        nested_enter_queue_plan=True,
+        service_enter_task=True,
+        task_only_reconcile_task="batch",
+    )
+    shared_authority = (
+        server._contract_runtime_shared_batch_reconcile_authority(
+            conn,
+            project_id=PID,
+            record=fixture["record"],
+            context=fixture["context"],
+            merge=fixture["merge"],
+        )
+    )
+    assert server._contract_runtime_current_full_reconcile_activation_verified(
+        shared_authority
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_trusted_merge_projection",
+        lambda *_args, **_kwargs: dict(shared_authority),
+    )
+
+    deferred_authority = {
+        "schema_version": (
+            "contract_runtime.observer_reconcile_record_authority.v1"
+        ),
+        "source": "contract_runtime.server_reconcile_record_projection",
+        "server_derived": True,
+        "record_verified": True,
+        "merge_projection_verified": True,
+        "dispatch_lineage_verified": True,
+        "project_id": PID,
+        "backlog_id": fixture["record"]["backlog_id"],
+        "contract_execution_id": fixture["record"][
+            "contract_execution_id"
+        ],
+        "runtime_context_id": shared_authority["runtime_context_id"],
+        "task_id": shared_authority["task_id"],
+        "parent_task_id": shared_authority["parent_task_id"],
+        "merge_queue_id": shared_authority["merge_queue_id"],
+        "merged_commit_sha": shared_authority["merged_commit_sha"],
+        "merge_source_ref": shared_authority["merge_source_ref"],
+        "merge_event_id": shared_authority["merge_event_id"],
+        "merge_event_created_at": shared_authority[
+            "merge_event_created_at"
+        ],
+        "contract_runtime_dispatch_source_ref": shared_authority[
+            "contract_runtime_dispatch_source_ref"
+        ],
+        "reconcile_event_recorded": False,
+        "reconcile_source_ref": "",
+        "reconcile_event_id": 0,
+        "reconcile_event_created_at": "",
+        "reconcile_task_id": "",
+        "reconcile_runtime_context_id": "",
+        "close_grade_authority_deferred": True,
+    }
+    deferred_authority["authority_hash"] = server.stable_sha256(
+        deferred_authority
+    )
+    reconcile_line = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_reconcile",
+        "actor_role": "observer",
+        "evidence_kind": "reconcile",
+        "status": "passed",
+        "commit_sha": shared_authority["merged_commit_sha"],
+        "runtime_context_id": shared_authority["runtime_context_id"],
+        "task_id": shared_authority["task_id"],
+        "parent_task_id": shared_authority["parent_task_id"],
+        "merge_queue_id": shared_authority["merge_queue_id"],
+        "payload": {"reconcile_authority": deferred_authority},
+        "artifact_refs": {},
+    }
+    validation_errors: list[str] = []
+    contract_write_gate._validate_reconcile_record_evidence(
+        validation_errors,
+        reconcile_line,
+        execution_state=fixture["record"],
+        line_id="observer_reconcile",
+        policy={"authority_object_path": "payload.reconcile_authority"},
+    )
+    assert validation_errors == []
+
+    incomplete_supplement = {
+        "schema_version": (
+            "contract_runtime.current_full_reconcile_authority.v1"
+        ),
+        "source": "test_later_durable_reconcile_supplement",
+    }
+    supplement_calls = []
+
+    def later_supplement(*_args, **_kwargs):
+        supplement_calls.append(True)
+        return dict(incomplete_supplement)
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_later_durable_reconcile_supplement",
+        later_supplement,
+    )
+    record = {
+        **fixture["record"],
+        "completed_lines": [reconcile_line],
+        "runtime_guide": {"completed_lines": [reconcile_line]},
+    }
+
+    rebound_record = server._contract_runtime_bind_close_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+
+    assert supplement_calls == [True]
+    rebound = rebound_record["completed_lines"][0]["payload"][
+        "reconcile_authority"
+    ]
+    assert rebound != incomplete_supplement
+    assert server._contract_runtime_current_full_reconcile_activation_verified(
+        rebound
+    )
+    assert rebound["authority_hash"] == shared_authority["authority_hash"]
+    assert rebound["shared_batch_reconcile_authority"][
+        "coordination_reconcile_task_id"
+    ] == fixture["batch_id"]
+
+
 def test_mf_batch_task_only_reconcile_rejects_nested_queue_mismatch(
     conn,
     tmp_path,
