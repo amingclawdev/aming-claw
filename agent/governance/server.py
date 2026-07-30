@@ -99060,18 +99060,20 @@ def _contract_runtime_bind_close_reconcile_authority(
         else {}
     )
     if reconcile_lines:
-        authority = (
-            shared_batch_authority
-            or _contract_runtime_current_full_reconcile_authority_from_merge(
-                conn,
-                project_id=project_id,
-                record=projected,
-                merge=merge,
-                reconcile=reconcile,
+        if shared_batch_authority:
+            authority = shared_batch_authority
+        elif reconcile:
+            authority = (
+                _contract_runtime_current_full_reconcile_authority_from_merge(
+                    conn,
+                    project_id=project_id,
+                    record=projected,
+                    merge=merge,
+                    reconcile=reconcile,
+                )
             )
-            if reconcile
-            else incomplete_supplement
-        )
+        else:
+            authority = incomplete_supplement
     else:
         # Formal no-PASS reconcile exceptions intentionally have no persisted
         # business reconcile line.  Preserve their existing server-only close
