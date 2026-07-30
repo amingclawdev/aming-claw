@@ -80847,6 +80847,7 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
                 created_at,
             )
             for revision, completed_count, created_at in (
+                (11, 9, "2026-07-16T23:27:40Z"),
                 (12, 10, "2026-07-16T23:27:41Z"),
                 (13, 11, "2026-07-16T23:27:42Z"),
             )
@@ -81305,6 +81306,226 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     assert authority["authority_source"].startswith(
         "contract_runtime_completed_lines"
     )
+
+    # qa_graph_context is evidence, not a verdict.  The canonical batch-first
+    # line carries no_pass_claim metadata while a later independent QA line
+    # owns the exact-candidate PASS.  Preserve that durable merge authority,
+    # but require both accepted lines to remain server-authenticated and
+    # candidate-identical.
+    nonverdict_record = runtime.store.get(contract_execution_id)
+    nonverdict_graph = nonverdict_record["completed_lines"][9]
+    nonverdict_graph.update(
+        {
+            "status": "accepted",
+            "commit_sha": qa_commit,
+            "authorization_source": "qa_session_token_ref",
+            "observer_impersonation": False,
+        }
+    )
+    nonverdict_graph["payload"].update(
+        {
+            "schema_version": "mf_parallel.qa_graph_context.v1",
+            "acceptance_scope": (
+                "BM001-BM004_candidate_regression_and_acceptance_criteria"
+            ),
+            "candidate_new_graph_failures": 0,
+            "exact_candidate": True,
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+        }
+    )
+    nonverdict_graph["payload"]["graph_trace_evidence"].update(
+        {
+            "db_verified": True,
+            "candidate_commit_sha": qa_commit,
+            "identity_mismatches": [],
+            "verified_trace_ids": ["gqt-completed-qa"],
+        }
+    )
+    nonverdict_graph["qa_evidence_provenance"] = {
+        "schema_version": "qa_evidence_provenance.v1",
+        "source": "contract_runtime_qa_graph_authority_binding",
+        "server_derived": True,
+        "authorization_source": "qa_session_token_ref",
+        "evidence_owner_role": "qa",
+        "observer_impersonation": False,
+        "parent_materialization_authorized": False,
+        "authenticated_qa_binding": {
+            "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+            "server_derived": True,
+            "graph_trace_session_matched": True,
+            "qa_principal": "qa:batch-first",
+            "qa_session_id": "ses-batch-first",
+        },
+    }
+    nonverdict_qa = nonverdict_record["completed_lines"][10]
+    nonverdict_qa.update(
+        {
+            "status": "passed",
+            "commit_sha": qa_commit,
+            "authorization_source": "qa_session_token_ref",
+            "observer_impersonation": False,
+            "test_results": {
+                "status": "passed",
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+            },
+            "verification": {
+                "status": "passed",
+                "verdict": "PASS",
+                "independent": True,
+                "candidate_commit_sha": qa_commit,
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+            },
+        }
+    )
+    nonverdict_qa["payload"].update(
+        {
+            "status": "passed",
+            "verdict": "PASS",
+            "independent": True,
+            "candidate_commit_sha": qa_commit,
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "overall_release_pass_claimed": False,
+        }
+    )
+    nonverdict_qa["qa_evidence_provenance"] = {
+        "schema_version": "qa_evidence_provenance.v1",
+        "source": "contract_runtime_qa_independent_verification_binding",
+        "server_derived": True,
+        "authorization_source": "qa_session_token_ref",
+        "evidence_owner_role": "qa",
+        "observer_impersonation": False,
+        "parent_materialization_authorized": False,
+        "completion_status_gate": {
+            "schema_version": "contract_runtime.qa_completion_status_gate.v1",
+            "source": "contract_runtime_line_write_normalization",
+            "server_derived": True,
+            "top_level_status_present": True,
+            "top_level_status_passing": True,
+            "nested_payload_decision_satisfies": False,
+            "normalized_status": "passed",
+        },
+        "authenticated_qa_binding": {
+            "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+            "server_derived": True,
+            "independent_verification_session_matched": True,
+            "qa_principal": "qa:batch-first",
+            "qa_session_id": "ses-batch-first",
+        },
+    }
+    runtime.store.update(
+        contract_execution_id,
+        nonverdict_record,
+        expected_revision=int(
+            nonverdict_record["execution_state_revision"]
+        ),
+    )
+    record = runtime.store.get(contract_execution_id)
+    assert server._contract_runtime_authenticated_nonverdict_qa_graph_line(
+        record["completed_lines"][9]
+    )
+    assert server._contract_runtime_authenticated_exact_candidate_qa_pass(
+        record["completed_lines"][10],
+        candidate_commit_sha=qa_commit,
+    )
+    assert server._contract_runtime_completed_line_acceptance(
+        conn,
+        project_id=project_id,
+        record=record,
+        completed_line_index=9,
+        expected_line=record["completed_lines"][9],
+    )["db_verified"] is True
+    assert server._contract_runtime_completed_line_acceptance(
+        conn,
+        project_id=project_id,
+        record=record,
+        completed_line_index=10,
+        expected_line=record["completed_lines"][10],
+    )["db_verified"] is True
+    nonverdict_authority = (
+        server._contract_runtime_completed_merge_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+            context=context,
+            timeline_events=timeline_events,
+        )
+    )
+    assert nonverdict_authority["authority_verified"] is True
+    assert nonverdict_authority["qa_contract_runtime_verified"] is True
+    assert nonverdict_authority["no_pass_claim"] is False
+    assert nonverdict_authority["close_satisfying"] is True
+
+    def assert_nonverdict_round_denied(
+        candidate_record: dict[str, Any],
+    ) -> None:
+        with monkeypatch.context() as acceptance_patch:
+            acceptance_patch.setattr(
+                server,
+                "_contract_runtime_completed_line_acceptance",
+                lambda *_args, **_kwargs: {
+                    "db_verified": True,
+                    "acceptance_ref": (
+                        "contract_runtime:test:accepted"
+                    ),
+                },
+            )
+            assert server._contract_runtime_completed_merge_authority(
+                conn,
+                project_id=project_id,
+                record=candidate_record,
+                context=context,
+                timeline_events=timeline_events,
+            ) == {}
+
+    nonverdict_mutations: list[dict[str, Any]] = []
+    failed_qa = json.loads(json.dumps(record))
+    failed_qa["completed_lines"][10]["status"] = "failed"
+    failed_qa["completed_lines"][10]["payload"]["verdict"] = "FAIL"
+    nonverdict_mutations.append(failed_qa)
+    bypassed_graph = json.loads(json.dumps(record))
+    bypassed_graph["completed_lines"][9]["status"] = "bypassed"
+    nonverdict_mutations.append(bypassed_graph)
+    audit_only_qa = json.loads(json.dumps(record))
+    audit_only_qa["completed_lines"][10]["payload"][
+        "no_pass_claim"
+    ] = True
+    nonverdict_mutations.append(audit_only_qa)
+    candidate_failure = json.loads(json.dumps(record))
+    candidate_failure["completed_lines"][10]["test_results"]["failed"] = 1
+    nonverdict_mutations.append(candidate_failure)
+    missing_db_graph = json.loads(json.dumps(record))
+    missing_db_graph["completed_lines"][9]["payload"][
+        "graph_trace_evidence"
+    ]["db_verified"] = False
+    nonverdict_mutations.append(missing_db_graph)
+    mismatched_graph = json.loads(json.dumps(record))
+    mismatched_graph["completed_lines"][9]["payload"][
+        "graph_trace_evidence"
+    ]["identity_mismatches"] = [
+        {
+            "field": "candidate_commit_sha",
+            "expected": qa_commit,
+            "actual": "f" * 40,
+        }
+    ]
+    nonverdict_mutations.append(mismatched_graph)
+    missing_pass = json.loads(json.dumps(record))
+    missing_pass["completed_lines"][10]["payload"]["verdict"] = "unknown"
+    nonverdict_mutations.append(missing_pass)
+    caller_shaped_graph = json.loads(json.dumps(record))
+    caller_shaped_graph["completed_lines"][9][
+        "authorization_source"
+    ] = "caller"
+    nonverdict_mutations.append(caller_shaped_graph)
+    observer_verdict_graph = json.loads(json.dumps(record))
+    observer_verdict_graph["completed_lines"][9]["actor_role"] = "observer"
+    nonverdict_mutations.append(observer_verdict_graph)
+    for invalid_nonverdict_round in nonverdict_mutations:
+        assert_nonverdict_round_denied(invalid_nonverdict_round)
 
     # A no-PASS candidate result remains usable only when the canonical QA
     # lines bind exact candidate scope, DB-verified graph evidence, explicit
