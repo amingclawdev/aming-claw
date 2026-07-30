@@ -8581,6 +8581,138 @@ def test_mf_batch_task_only_reconcile_accepts_server_plan_and_batch_task(
     assert shared["coordination_task_id"] == fixture["batch_id"]
 
 
+def test_mf_batch_task_only_shared_authority_is_resealed_after_enrichment(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+        nested_enter_queue_plan=True,
+        service_enter_task=True,
+        task_only_reconcile_task="batch",
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_line_evidence_policy",
+        lambda *_args, **_kwargs: {
+            "allow_taskless_reconcile_only_for_explicit_shared_batch": True,
+        },
+    )
+
+    joined = server._contract_runtime_completed_merge_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+        context=fixture["context"],
+        timeline_events=[],
+        merge=fixture["merge"],
+    )
+
+    assert joined["queue_item_id"] == fixture["merge"]["queue_item_id"]
+    assert server._contract_runtime_current_full_reconcile_activation_verified(
+        joined
+    )
+    shared = joined["shared_batch_reconcile_authority"]
+    assert shared["coordination_runtime_context_id"] == ""
+    assert shared["coordination_contract_execution_id"] == ""
+
+    dispatch_line = {
+        "line_id": "observer_dispatch_bounded_workers",
+        "runtime_context_id": joined["runtime_context_id"],
+        "task_id": joined["task_id"],
+        "parent_task_id": joined["parent_task_id"],
+    }
+    record = {
+        **fixture["record"],
+        "completed_lines": [dispatch_line],
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [fixture["context"]],
+    )
+    trusted = server._contract_runtime_trusted_merge_projection(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+
+    assert trusted["timeline_verified"] is True
+    assert server._contract_runtime_current_full_reconcile_activation_verified(
+        trusted
+    )
+    assert trusted["authority_hash"] == server.stable_sha256(
+        {
+            key: value
+            for key, value in trusted.items()
+            if key != "authority_hash"
+        }
+    )
+
+    tampered = copy.deepcopy(trusted)
+    tampered["shared_batch_reconcile_authority"][
+        "ordered_queue_item_ids"
+    ].reverse()
+    tampered["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in tampered.items()
+            if key != "authority_hash"
+        }
+    )
+    assert not server._contract_runtime_current_full_reconcile_activation_verified(
+        tampered
+    )
+    assert not server._contract_runtime_shared_batch_reconcile_activation_verified(
+        {
+            key: value
+            for key, value in trusted.items()
+            if key != "shared_batch_reconcile_authority"
+        }
+    )
+
+    receipt = server._contract_runtime_reconcile_record_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    reconcile_line = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_reconcile",
+        "evidence_kind": "reconcile",
+        "actor_role": "observer",
+        "status": "passed",
+        "commit_sha": fixture["merge"]["merged_commit_sha"],
+        "runtime_context_id": trusted["runtime_context_id"],
+        "task_id": trusted["task_id"],
+        "parent_task_id": trusted["parent_task_id"],
+        "merge_queue_id": trusted["merge_queue_id"],
+        "payload": {"reconcile_authority": receipt},
+        "artifact_refs": {
+            "reconcile_event_ref": trusted["reconcile_source_ref"],
+        },
+    }
+    record["completed_lines"].append(reconcile_line)
+    rebound_record = server._contract_runtime_bind_close_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    rebound = rebound_record["completed_lines"][-1]["payload"][
+        "reconcile_authority"
+    ]
+    assert server._contract_runtime_current_full_reconcile_activation_verified(
+        rebound
+    )
+    assert rebound["shared_batch_reconcile_authority"][
+        "coordination_reconcile_task_id"
+    ] == fixture["batch_id"]
+
+
 def test_mf_batch_task_only_reconcile_rejects_nested_queue_mismatch(
     conn,
     tmp_path,

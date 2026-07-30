@@ -75250,18 +75250,33 @@ def _contract_runtime_trusted_merge_projection(
                     timeline_events=timeline_events,
                     merge=contract_runtime_merge,
                 )
-                candidates.append(
-                    {
-                        **trusted,
-                        "contract_execution_id": str(
-                            record.get("contract_execution_id") or ""
-                        ).strip(),
-                        "contract_runtime_dispatch_source_ref": str(
-                            dispatch_match.get("source_ref") or ""
-                        ),
-                        "dispatch_lineage_verified": bool(dispatch_match),
-                    }
-                )
+                enriched = {
+                    **trusted,
+                    "contract_execution_id": str(
+                        record.get("contract_execution_id") or ""
+                    ).strip(),
+                    "contract_runtime_dispatch_source_ref": str(
+                        dispatch_match.get("source_ref") or ""
+                    ),
+                    "dispatch_lineage_verified": bool(dispatch_match),
+                }
+                if (
+                    isinstance(
+                        trusted.get("shared_batch_reconcile_authority"),
+                        Mapping,
+                    )
+                    and _contract_runtime_current_full_reconcile_activation_verified(
+                        trusted
+                    )
+                ):
+                    enriched["authority_hash"] = stable_sha256(
+                        {
+                            key: value
+                            for key, value in enriched.items()
+                            if key != "authority_hash"
+                        }
+                    )
+                candidates.append(enriched)
                 continue
             projected_lines = _contract_runtime_projection_post_worker_lines(
                 conn=conn,
@@ -76415,7 +76430,17 @@ def _contract_runtime_completed_merge_reconcile_authority(
             context=context,
             merge=trusted_merge,
         )
-        return {**trusted_merge, **shared} if shared else trusted_merge
+        if not shared:
+            return trusted_merge
+        enriched = {**trusted_merge, **shared}
+        enriched["authority_hash"] = stable_sha256(
+            {
+                key: value
+                for key, value in enriched.items()
+                if key != "authority_hash"
+            }
+        )
+        return enriched
 
     reconcile_scope = _contract_runtime_projection_timeline_scope_values(
         reconcile_event
@@ -79826,6 +79851,102 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
     return authority
 
 
+def _contract_runtime_shared_batch_reconcile_activation_verified(
+    authority: Mapping[str, Any],
+) -> bool:
+    shared = authority.get("shared_batch_reconcile_authority")
+    if not isinstance(shared, Mapping):
+        return False
+    unsigned_shared = {
+        key: value
+        for key, value in shared.items()
+        if key != "authority_hash"
+    }
+    ordered_queue_item_ids = shared.get("ordered_queue_item_ids")
+    child_dispatch_refs = shared.get("child_contract_dispatch_refs")
+    coordination_runtime_context_id = str(
+        shared.get("coordination_runtime_context_id") or ""
+    ).strip()
+    coordination_contract_execution_id = str(
+        shared.get("coordination_contract_execution_id") or ""
+    ).strip()
+    required_true_fields = (
+        "all_children_contract_qa_verified",
+        "all_children_merged",
+        "closed_epoch_verified",
+        "final_snapshot_verified",
+        "strict_child_qa_merge_reconcile_order_verified",
+    )
+    return bool(
+        str(shared.get("schema_version") or "")
+        == "contract_runtime.shared_batch_final_reconcile_authority.v1"
+        and str(shared.get("source") or "")
+        == (
+            "parallel_branch_integration_epochs+"
+            "parallel_branch_merge_queue_items+"
+            "contract_runtime_executions.completed_lines+"
+            "graph_current_full_reconcile_provenance"
+        )
+        and shared.get("server_derived") is True
+        and shared.get("db_verified") is True
+        and all(shared.get(field) is True for field in required_true_fields)
+        and shared.get("child_reconcile_required") is False
+        and all(
+            str(shared.get(field) or "").strip()
+            for field in (
+                "project_id",
+                "batch_id",
+                "merge_queue_id",
+                "epoch_id",
+                "coordination_backlog_id",
+                "coordination_task_id",
+                "batch_enter_task_id",
+                "coordination_reconcile_task_id",
+                "batch_enter_event_ref",
+                "final_reconcile_event_ref",
+                "final_head_commit",
+                "active_snapshot_id",
+            )
+        )
+        and bool(coordination_runtime_context_id)
+        == bool(coordination_contract_execution_id)
+    ) and bool(
+        isinstance(ordered_queue_item_ids, list)
+        and len(ordered_queue_item_ids) >= 2
+        and all(
+            str(queue_item_id or "").strip()
+            for queue_item_id in ordered_queue_item_ids
+        )
+        and len(set(ordered_queue_item_ids)) == len(ordered_queue_item_ids)
+        and isinstance(child_dispatch_refs, list)
+        and len(child_dispatch_refs) == len(ordered_queue_item_ids)
+        and all(
+            str(dispatch_ref or "").strip()
+            for dispatch_ref in child_dispatch_refs
+        )
+        and str(shared.get("batch_enter_event_ref") or "").startswith(
+            "timeline:"
+        )
+        and str(shared.get("final_reconcile_event_ref") or "").startswith(
+            "timeline:"
+        )
+        and str(shared.get("project_id") or "").strip()
+        == str(authority.get("project_id") or "").strip()
+        and str(shared.get("merge_queue_id") or "").strip()
+        == str(authority.get("merge_queue_id") or "").strip()
+        and str(shared.get("final_head_commit") or "").strip().lower()
+        == str(authority.get("reconciled_commit_sha") or "").strip().lower()
+        and str(shared.get("active_snapshot_id") or "").strip()
+        == str(authority.get("active_snapshot_id") or "").strip()
+        and str(shared.get("active_snapshot_id") or "").strip()
+        == str(authority.get("reconcile_snapshot_id") or "").strip()
+        and str(shared.get("final_reconcile_event_ref") or "").strip()
+        == str(authority.get("reconcile_source_ref") or "").strip()
+        and str(shared.get("authority_hash") or "")
+        == stable_sha256(unsigned_shared)
+    )
+
+
 def _contract_runtime_current_full_reconcile_activation_verified(
     authority: Mapping[str, Any],
 ) -> bool:
@@ -79877,6 +79998,12 @@ def _contract_runtime_current_full_reconcile_activation_verified(
         == canonical_head
         and str(authority.get("reconcile_source_ref") or "").startswith(
             "timeline:"
+        )
+        and (
+            "shared_batch_reconcile_authority" not in authority
+            or _contract_runtime_shared_batch_reconcile_activation_verified(
+                authority
+            )
         )
         and str(authority.get("authority_hash") or "")
         == stable_sha256(
