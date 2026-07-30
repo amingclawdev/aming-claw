@@ -75179,7 +75179,62 @@ def _contract_runtime_trusted_merge_projection(
     project_id: str,
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
-    expected_identity = _contract_runtime_server_line_identity(record)
+    # Transient post-worker projection rows are read-model evidence, not
+    # canonical line identity.  When they are present, resolve the canonical
+    # record from the ContractRuntime store; caller-copyable projection
+    # markers can never authorize filtering a persisted line.
+    transient_projection_present = any(
+        isinstance(line, Mapping)
+        and isinstance(line.get("payload"), Mapping)
+        and str(line.get("payload", {}).get("schema_version") or "")
+        == "mf_parallel.runtime_context_post_worker_line_projection.v1"
+        and line.get("payload", {}).get(
+            "projection_persists_completed_line"
+        )
+        is False
+        for line in record.get("completed_lines") or []
+    )
+    projection_record = dict(record)
+    if transient_projection_present:
+        execution_id = str(
+            record.get("contract_execution_id") or ""
+        ).strip()
+        try:
+            stored_record = _contract_runtime_store(conn).get(
+                execution_id
+            )
+        except (ContractRuntimeError, KeyError, TypeError, ValueError):
+            stored_record = {}
+        canonical_scope_verified = bool(
+            stored_record
+            and execution_id
+            and str(
+                stored_record.get("contract_execution_id") or ""
+            ).strip()
+            == execution_id
+            and str(stored_record.get("project_id") or "").strip()
+            == str(record.get("project_id") or "").strip()
+            and str(stored_record.get("backlog_id") or "").strip()
+            == str(record.get("backlog_id") or "").strip()
+        )
+        if not canonical_scope_verified:
+            return {
+                "timeline_verified": False,
+                "identity_mismatches": [
+                    {
+                        "field": "transient_projection_canonical_record",
+                        "expected": (
+                            "one DB-backed ContractRuntime record with exact "
+                            "project/backlog/execution scope"
+                        ),
+                        "actual": "missing_or_scope_mismatch",
+                    }
+                ],
+            }
+        projection_record = dict(stored_record)
+    expected_identity = _contract_runtime_server_line_identity(
+        projection_record
+    )
     if expected_identity.get("identity_status") == "ambiguous":
         return {
             "timeline_verified": False,
@@ -75198,7 +75253,7 @@ def _contract_runtime_trusted_merge_projection(
     candidates: list[dict[str, Any]] = []
     dispatch_lines = [
         line
-        for line in record.get("completed_lines") or []
+        for line in projection_record.get("completed_lines") or []
         if isinstance(line, Mapping)
         and str(line.get("line_id") or "").strip()
         == "observer_dispatch_bounded_workers"
@@ -75207,11 +75262,14 @@ def _contract_runtime_trusted_merge_projection(
         contexts = _contract_runtime_contexts_for_dispatch_line(
             conn,
             project_id=project_id,
-            record=record,
+            record=projection_record,
             line=dispatch_line,
         )
         for context in contexts:
-            dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+            dispatch_match = _contract_runtime_dispatch_line_match(
+                projection_record,
+                context,
+            )
             runtime_context_id, task_id, parent_task_id = (
                 _contract_runtime_context_identity(context)
             )
@@ -75223,7 +75281,7 @@ def _contract_runtime_trusted_merge_projection(
                 continue
             backlog_id = str(
                 getattr(context, "backlog_id", "")
-                or record.get("backlog_id")
+                or projection_record.get("backlog_id")
                 or ""
             )
             timeline_events = _runtime_context_service_timeline_events(
@@ -75236,7 +75294,7 @@ def _contract_runtime_trusted_merge_projection(
                 _contract_runtime_completed_merge_authority(
                     conn,
                     project_id=project_id,
-                    record=record,
+                    record=projection_record,
                     context=context,
                     timeline_events=timeline_events,
                 )
@@ -75245,7 +75303,7 @@ def _contract_runtime_trusted_merge_projection(
                 trusted = _contract_runtime_completed_merge_reconcile_authority(
                     conn,
                     project_id=project_id,
-                    record=record,
+                    record=projection_record,
                     context=context,
                     timeline_events=timeline_events,
                     merge=contract_runtime_merge,
@@ -75253,7 +75311,8 @@ def _contract_runtime_trusted_merge_projection(
                 enriched = {
                     **trusted,
                     "contract_execution_id": str(
-                        record.get("contract_execution_id") or ""
+                        projection_record.get("contract_execution_id")
+                        or ""
                     ).strip(),
                     "contract_runtime_dispatch_source_ref": str(
                         dispatch_match.get("source_ref") or ""
@@ -75278,10 +75337,14 @@ def _contract_runtime_trusted_merge_projection(
                     )
                 candidates.append(enriched)
                 continue
+            # A read-model record may already contain transient post-worker
+            # lines.  Recompute that projection from the canonical completed
+            # lines so those unpersisted lines cannot impersonate accepted
+            # ContractRuntime evidence or suppress the DB-backed projection.
             projected_lines = _contract_runtime_projection_post_worker_lines(
                 conn=conn,
                 project_id=project_id,
-                record=record,
+                record=projection_record,
                 context=context,
                 timeline_events=timeline_events,
             )
@@ -75388,7 +75451,10 @@ def _contract_runtime_trusted_merge_projection(
                             getattr(context, "merge_queue_id", "") or ""
                         ).strip(),
                         "contract_execution_id": str(
-                            record.get("contract_execution_id") or ""
+                            projection_record.get(
+                                "contract_execution_id"
+                            )
+                            or ""
                         ).strip(),
                         "contract_runtime_dispatch_source_ref": str(
                             dispatch_match.get("source_ref") or ""
@@ -98932,6 +98998,16 @@ def _contract_runtime_bind_close_reconcile_authority(
         source_artifact_ref = str(
             artifact_refs.get("reconcile_event_ref") or ""
         ).strip()
+        projected_source_ref = str(
+            source_line.get("_source_ref")
+            or source_payload.get("source_ref")
+            or ""
+        ).strip()
+        projected_artifact_refs = {
+            str(artifact_refs.get(field) or "").strip()
+            for field in ("source_ref", "timeline_event_ref")
+            if str(artifact_refs.get(field) or "").strip()
+        }
         expected_source_ref = (
             f"timeline:{source_event_id}" if source_event_id > 0 else ""
         )
@@ -98949,6 +99025,21 @@ def _contract_runtime_bind_close_reconcile_authority(
                 ("task_id", merge.get("task_id")),
                 ("parent_task_id", merge.get("parent_task_id")),
                 ("merge_queue_id", merge.get("merge_queue_id")),
+            )
+        )
+        projected_identity_matches = all(
+            str(source_authority.get(field) or "").strip()
+            == str(expected or "").strip()
+            for field, expected in (
+                ("project_id", project_id),
+                ("backlog_id", projected.get("backlog_id")),
+                (
+                    "contract_execution_id",
+                    projected.get("contract_execution_id"),
+                ),
+                ("runtime_context_id", merge.get("runtime_context_id")),
+                ("task_id", merge.get("task_id")),
+                ("parent_task_id", merge.get("parent_task_id")),
             )
         )
         merge_matches = bool(
@@ -99049,6 +99140,87 @@ def _contract_runtime_bind_close_reconcile_authority(
                         source_line_index=source_line_index,
                     )
                 )
+        elif (
+            str(source_authority.get("schema_version") or "")
+            == "graph_snapshot_store.current_full_reconcile_state.v1"
+            and str(source_authority.get("source") or "")
+            == "graph_snapshot_store.current_full_reconcile_state"
+            and source_authority.get("server_derived") is True
+            and _contract_runtime_close_authority_hash_matches(
+                source_authority
+            )
+            and _contract_runtime_line_status_passes(source_line)
+            and str(source_line.get("actor_role") or "").strip()
+            == "observer"
+            and str(source_payload.get("schema_version") or "")
+            == "mf_parallel.runtime_context_post_worker_line_projection.v1"
+            and str(source_payload.get("source") or "")
+            == "runtime_context_post_worker_timeline_evidence"
+            and source_payload.get("source_backed") is True
+            and source_payload.get("projection_persists_completed_line")
+            is False
+            and source_payload.get("observer_authored_worker_backfill")
+            is False
+            and merge.get("timeline_verified") is True
+            and merge.get("authority_verified") is True
+            and merge.get("qa_contract_runtime_verified") is True
+            and merge.get("dispatch_lineage_verified") is True
+            and str(
+                merge.get("contract_runtime_dispatch_source_ref") or ""
+            ).strip().startswith("contract_runtime:")
+            and str(merge.get("merge_queue_id") or "").strip()
+            and projected_identity_matches
+            and merge_matches
+            and source_event_id
+            > _contract_runtime_close_authority_positive_int(
+                merge.get("merge_event_id")
+            )
+            and source_event_ref == expected_source_ref
+            and projected_source_ref == expected_source_ref
+            and (
+                not source_artifact_ref
+                or source_artifact_ref == expected_source_ref
+            )
+            and (
+                not projected_artifact_refs
+                or projected_artifact_refs == {expected_source_ref}
+            )
+            and _contract_runtime_close_authority_positive_int(
+                source_payload.get("source_event_id")
+            )
+            == source_event_id
+            and str(
+                source_payload.get("source_event_created_at") or ""
+            ).strip()
+            == str(
+                source_authority.get("reconcile_event_created_at") or ""
+            ).strip()
+        ):
+            # Runtime-context projection may already carry a full close-grade
+            # authority.  Treat it only as an immutable event-identity hint:
+            # the close binder must re-derive the effective authority from
+            # the trusted merge and current database state below.  This keeps
+            # close/current parity without admitting caller-shaped authority.
+            reconcile = {
+                "reconcile_event_id": source_event_id,
+                "reconcile_event_created_at": str(
+                    source_authority.get("reconcile_event_created_at")
+                    or ""
+                ).strip(),
+                "reconcile_source_ref": source_event_ref,
+                "reconcile_task_id": str(
+                    source_authority.get("reconcile_task_id") or ""
+                ).strip(),
+                "reconcile_runtime_context_id": str(
+                    source_authority.get(
+                        "reconcile_runtime_context_id"
+                    )
+                    or ""
+                ).strip(),
+                "allow_taskless_reconcile": bool(
+                    merge.get("allow_taskless_reconcile")
+                ),
+            }
     shared_batch_authority = (
         merge
         if isinstance(
