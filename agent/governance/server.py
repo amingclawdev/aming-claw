@@ -103616,6 +103616,125 @@ def _contract_runtime_close_authority_projection(
     }
 
 
+def _terminal_fixed_read_only_close_authority_projection(
+    conn,
+    *,
+    project_id: str,
+    bug_id: str,
+    backlog_status: str,
+    body: Mapping[str, Any],
+    route_gate: Mapping[str, Any] | None,
+    close_commit: str,
+    timeline_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Keep terminal history readable without weakening mutable close gates."""
+
+    try:
+        return _contract_runtime_close_authority_projection(
+            conn,
+            project_id=project_id,
+            bug_id=bug_id,
+            body=body,
+            route_gate=route_gate,
+            close_commit=close_commit,
+            timeline_events=timeline_events,
+        )
+    except GovernanceError as exc:
+        stale = exc.__cause__
+        if (
+            str(backlog_status or "").strip().upper() != "FIXED"
+            or exc.code != "contract_runtime_close_authority_rejected"
+            or not isinstance(stale, StalePinnedContractExecutionError)
+        ):
+            raise
+
+    contract_execution_id = str(
+        stale.record.get("contract_execution_id")
+        or _contract_runtime_close_execution_id(body, conn=conn)
+        or ""
+    ).strip()
+    degradation = {
+        "schema_version": (
+            "contract_runtime.terminal_read_only_definition_drift.v1"
+        ),
+        "status": "historical_pinned_definition_drift",
+        "public_safe": True,
+        "read_only": True,
+        "terminal_backlog_status": "FIXED",
+        "authoritative": False,
+        "close_authority": False,
+        "can_close": False,
+        "no_pass_claim": True,
+        "pass_synthesized": False,
+        "waiver_synthesized": False,
+        "row_reopen_allowed": False,
+        "runtime_state_mutated": False,
+        "backlog_state_mutated": False,
+        "mutable_paths_remain_fail_closed": True,
+        "historical_execution_preserved": True,
+    }
+    diagnostics = {
+        "schema_version": (
+            "contract_runtime.terminal_read_only_public_diagnostics.v1"
+        ),
+        "source_of_authority": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SOURCE,
+        "authority_decision_source": (
+            _CONTRACT_RUNTIME_CLOSE_AUTHORITY_DECISION_SOURCE
+        ),
+        "project_id": project_id,
+        "backlog_id": bug_id,
+        "contract_execution_id": contract_execution_id,
+        "status": "historical_pinned_definition_drift",
+        "public_safe": True,
+        "authoritative": False,
+        "close_authority": False,
+        "can_close": False,
+        "expected_actual_definition_hashes_omitted": True,
+        "terminal_read_only_degradation": dict(degradation),
+        "message": (
+            "Historical close authority is unavailable because the terminal "
+            "execution's pinned definition drifted. Playback remains readable; "
+            "this diagnostic cannot reopen the row or authorize a mutable action."
+        ),
+    }
+    return {
+        **_contract_runtime_close_authority_payload_fields(),
+        "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+        "accepted": False,
+        "status": "historical_pinned_definition_drift",
+        "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+            source="terminal_fixed_read_only_definition_drift",
+            contract_execution_id=contract_execution_id,
+        ),
+        "legacy_advisory": True,
+        "authoritative": False,
+        "projection_authoritative": False,
+        "contract_execution_id": contract_execution_id,
+        "projected_events": [],
+        "public_safe_diagnostics": diagnostics,
+        "terminal_read_only_degradation": degradation,
+    }
+
+
+def _terminal_read_only_degraded_verification(
+    verification: Mapping[str, Any],
+    runtime_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    degradation = runtime_projection.get("terminal_read_only_degradation")
+    if not isinstance(degradation, Mapping) or not degradation:
+        return dict(verification)
+    return {
+        **dict(verification),
+        "passed": False,
+        "can_close": False,
+        "status": "historical_close_authority_unavailable",
+        "terminal_read_only_degradation": dict(degradation),
+        "public_safe_diagnostics": dict(
+            runtime_projection.get("public_safe_diagnostics") or {}
+        ),
+    }
+
+
 def _trusted_contract_runtime_actor_role_from_context(
     ctx: RequestContext,
     conn,
@@ -106261,10 +106380,11 @@ def _task_playback_compact_gate_response(
             timeline_events=events,
             close_commit=close_commit,
         )
-        runtime_projection = _contract_runtime_close_authority_projection(
+        runtime_projection = _terminal_fixed_read_only_close_authority_projection(
             conn,
             project_id=project_id,
             bug_id=backlog_id,
+            backlog_status=_row_get(row, "status", ""),
             body=projection_body,
             route_gate=route_context_gate,
             close_commit=close_commit,
@@ -106296,6 +106416,10 @@ def _task_playback_compact_gate_response(
                 verification,
                 runtime_projection,
             )
+        verification = _terminal_read_only_degraded_verification(
+            verification,
+            runtime_projection,
+        )
     else:
         verification = {
             "schema_version": "mf_close_timeline_gate.v1",
@@ -106382,6 +106506,16 @@ def _task_playback_compact_gate_response(
     result["fixed_close_waiver_alert"] = fixed_close_alert
     if fixed_close_alert.get("alert"):
         result["governance_alert"] = fixed_close_alert
+    terminal_read_diagnostic = runtime_projection.get(
+        "terminal_read_only_degradation"
+    )
+    if isinstance(terminal_read_diagnostic, Mapping) and terminal_read_diagnostic:
+        result["terminal_read_only_degradation"] = dict(
+            terminal_read_diagnostic
+        )
+        result["public_safe_diagnostics"] = dict(
+            runtime_projection.get("public_safe_diagnostics") or {}
+        )
     return result
 
 
@@ -114074,10 +114208,11 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                 backlog_id=bug_id,
                 query=ctx.query,
             )
-            runtime_projection = _contract_runtime_close_authority_projection(
+            runtime_projection = _terminal_fixed_read_only_close_authority_projection(
                 conn,
                 project_id=pid,
                 bug_id=bug_id,
+                backlog_status=_row_get(row, "status", ""),
                 body=projection_body,
                 route_gate=route_context_gate,
                 close_commit=_audit_recovery_close_commit(row, projection_body),
@@ -114120,6 +114255,10 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                         for key, value in runtime_projection.items()
                         if key != "projected_events"
                     }
+            verification = _terminal_read_only_degraded_verification(
+                verification,
+                runtime_projection,
+            )
         else:
             repair_reason = {
                 "code": "timeline_gate_not_applicable",
@@ -114207,6 +114346,19 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             "authoritative": False,
             "event_count": len(events),
         }
+        terminal_read_diagnostic = runtime_projection.get(
+            "terminal_read_only_degradation"
+        )
+        if (
+            isinstance(terminal_read_diagnostic, Mapping)
+            and terminal_read_diagnostic
+        ):
+            result["terminal_read_only_degradation"] = dict(
+                terminal_read_diagnostic
+            )
+            result["public_safe_diagnostics"] = dict(
+                runtime_projection.get("public_safe_diagnostics") or {}
+            )
         if audit_archive:
             result["audit_archive"] = audit_archive
             audit_close_gate = _json_object_field(audit_archive.get("audit_close_gate"))

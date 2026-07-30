@@ -70705,6 +70705,129 @@ def test_contract_runtime_recovery_is_observer_admin_evidence_action():
     )
 
 
+def test_terminal_timeline_gate_degrades_stale_pin_but_mutable_projection_rejects(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-TERMINAL-TIMELINE-GATE-STALE-PIN"
+    execution_id = "cex-terminal-timeline-gate-stale-pin"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'FIXED' WHERE bug_id = ?",
+        (backlog_id,),
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="terminal-timeline-gate-history",
+        event_type="worker.progress",
+        event_kind="implementation_progress",
+        phase="implementation",
+        actor="mf_sub",
+        status="accepted",
+        payload={"historical": True},
+        post_commit_hooks=False,
+    )
+    conn.commit()
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel",
+        "version": "v2",
+        "revision": "rev6",
+        "definition_hash": _fake_sha("terminal-historical-definition"),
+        "instruction_bundle_hash": _fake_sha("terminal-historical-instructions"),
+    }
+    stale = server.StalePinnedContractExecutionError(
+        "definition_hash",
+        _fake_sha("terminal-historical-definition"),
+        _fake_sha("terminal-current-definition"),
+        record=record,
+    )
+
+    class Store:
+        def get(self, _execution_id):
+            return dict(record)
+
+    class Runtime:
+        store = Store()
+
+        def current_guide(self, _execution_id, *, actor_role=None):
+            raise stale
+
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: Runtime())
+    server._timeline_warm_cache_clear()
+    gate = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={
+                "contract_execution_id": execution_id,
+                "view": "compact",
+                "include_events": "true",
+            },
+        )
+    )
+
+    assert gate["ok"] is True
+    assert gate["can_close"] is False
+    assert gate["event_count"] == 1
+    assert len(gate["events"]) == 1
+    diagnostic = gate["terminal_read_only_degradation"]
+    assert diagnostic["status"] == "historical_pinned_definition_drift"
+    assert diagnostic["authoritative"] is False
+    assert diagnostic["close_authority"] is False
+    assert diagnostic["can_close"] is False
+    assert diagnostic["pass_synthesized"] is False
+    assert diagnostic["waiver_synthesized"] is False
+    assert diagnostic["row_reopen_allowed"] is False
+    assert diagnostic["runtime_state_mutated"] is False
+    assert diagnostic["backlog_state_mutated"] is False
+    assert diagnostic["mutable_paths_remain_fail_closed"] is True
+
+    body = {"contract_execution_id": execution_id}
+    with pytest.raises(GovernanceError) as mutable:
+        server._contract_runtime_close_authority_projection(
+            conn,
+            project_id=PID,
+            bug_id=backlog_id,
+            body=body,
+            route_gate={},
+            close_commit="",
+            timeline_events=[],
+        )
+    assert mutable.value.code == "contract_runtime_close_authority_rejected"
+    assert mutable.value.__cause__ is stale
+
+    with pytest.raises(GovernanceError) as nonterminal_read:
+        server._terminal_fixed_read_only_close_authority_projection(
+            conn,
+            project_id=PID,
+            bug_id=backlog_id,
+            backlog_status="MF_IN_PROGRESS",
+            body=body,
+            route_gate={},
+            close_commit="",
+            timeline_events=[],
+        )
+    assert nonterminal_read.value.code == (
+        "contract_runtime_close_authority_rejected"
+    )
+    assert conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone()["status"] == "FIXED"
+    assert conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM task_timeline_events
+        WHERE project_id = ? AND backlog_id = ?
+        """,
+        (PID, backlog_id),
+    ).fetchone()["count"] == 1
+
+
 def test_mf_parallel_enter_uses_completed_onboard_recovery_parent(conn):
     backlog_id = "AC-MF-PARALLEL-RECOVERY-PARENT"
     _insert_source_backed_onboarding_backlog(conn, backlog_id)
