@@ -72208,6 +72208,65 @@ def _contract_runtime_dispatch_line_match(
     return {}
 
 
+def _contract_runtime_verified_dispatch_lineage(
+    record: Mapping[str, Any] | None,
+    context,
+    dispatch_match: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the exact server-derived execution/dispatch binding.
+
+    A RuntimeContext parent may be a shared batch id rather than the child
+    ContractRuntime execution id.  Keep those identities distinct and admit
+    lineage only when the persisted dispatch line matches the complete
+    runtime/task/parent tuple and its source ref names that exact completed
+    line.
+    """
+
+    if not isinstance(record, Mapping) or not isinstance(
+        dispatch_match, Mapping
+    ):
+        return {}
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    dispatch_line_index = dispatch_match.get("line_index")
+    dispatch_source_ref = str(
+        dispatch_match.get("source_ref") or ""
+    ).strip()
+    if not (
+        execution_id
+        and all((runtime_context_id, task_id, parent_task_id))
+        and isinstance(dispatch_line_index, int)
+        and dispatch_source_ref
+        == (
+            f"contract_runtime:{execution_id}:"
+            f"completed_lines:{dispatch_line_index}"
+        )
+        and str(
+            dispatch_match.get("contract_execution_id") or ""
+        ).strip()
+        == execution_id
+        and str(dispatch_match.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(dispatch_match.get("task_id") or "").strip() == task_id
+        and str(dispatch_match.get("parent_task_id") or "").strip()
+        == parent_task_id
+        and str(dispatch_match.get("line_id") or "").strip()
+        == "observer_dispatch_bounded_workers"
+        and str(dispatch_match.get("evidence_kind") or "").strip()
+        == "dispatch_bounded_worker"
+        and str(dispatch_match.get("actor_role") or "").strip()
+        == "observer"
+    ):
+        return {}
+    return {
+        "contract_execution_id": execution_id,
+        "contract_runtime_dispatch_source_ref": dispatch_source_ref,
+        "dispatch_lineage_verified": True,
+    }
+
+
 def _contract_runtime_observer_merge_bound_root_task_ids(
     record: Mapping[str, Any] | None,
     context,
@@ -75300,25 +75359,34 @@ def _contract_runtime_trusted_merge_projection(
                 )
             )
             if contract_runtime_merge:
+                dispatch_lineage = (
+                    _contract_runtime_verified_dispatch_lineage(
+                        projection_record,
+                        context,
+                        dispatch_match,
+                    )
+                )
+                if not dispatch_lineage:
+                    continue
+                trusted_merge = {
+                    **contract_runtime_merge,
+                    **dispatch_lineage,
+                }
+                trusted_merge["authority_hash"] = stable_sha256(
+                    {
+                        key: value
+                        for key, value in trusted_merge.items()
+                        if key != "authority_hash"
+                    }
+                )
                 trusted = _contract_runtime_completed_merge_reconcile_authority(
                     conn,
                     project_id=project_id,
                     record=projection_record,
                     context=context,
                     timeline_events=timeline_events,
-                    merge=contract_runtime_merge,
+                    merge=trusted_merge,
                 )
-                enriched = {
-                    **trusted,
-                    "contract_execution_id": str(
-                        projection_record.get("contract_execution_id")
-                        or ""
-                    ).strip(),
-                    "contract_runtime_dispatch_source_ref": str(
-                        dispatch_match.get("source_ref") or ""
-                    ),
-                    "dispatch_lineage_verified": bool(dispatch_match),
-                }
                 if (
                     isinstance(
                         trusted.get("shared_batch_reconcile_authority"),
@@ -75328,14 +75396,14 @@ def _contract_runtime_trusted_merge_projection(
                         trusted
                     )
                 ):
-                    enriched["authority_hash"] = stable_sha256(
+                    trusted["authority_hash"] = stable_sha256(
                         {
                             key: value
-                            for key, value in enriched.items()
+                            for key, value in trusted.items()
                             if key != "authority_hash"
                         }
                     )
-                candidates.append(enriched)
+                candidates.append(trusted)
                 continue
             # A read-model record may already contain transient post-worker
             # lines.  Recompute that projection from the canonical completed
@@ -75720,7 +75788,7 @@ def _contract_runtime_shared_batch_reconcile_authority(
                 queue_item_id,
             )
         )
-        and parent_task_id == execution_id
+        and parent_task_id in {execution_id, batch_id}
         and str(getattr(context, "merge_queue_id", "") or "").strip()
         == merge_queue_id
         and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit)
@@ -75892,7 +75960,7 @@ def _contract_runtime_shared_batch_reconcile_authority(
         child_runtime_context_id = (
             runtime_context_id_for_branch_context(child_context)
         )
-        child_execution_id = str(
+        child_parent_task_id = str(
             getattr(child_context, "parent_task_id", "") or ""
         ).strip()
         if not (
@@ -75905,32 +75973,86 @@ def _contract_runtime_shared_batch_reconcile_authority(
             and str(getattr(child_context, "backlog_id", "") or "").strip()
             == child_backlog_id
             and child_runtime_context_id
-            and child_execution_id
+            and child_parent_task_id
         ):
             return {}
+        store = _contract_runtime_store(conn)
         try:
-            child_record = _contract_runtime_store(conn).get(
-                child_execution_id
+            candidate_records = store.list_by_backlog(
+                project_id=project_id,
+                backlog_id=child_backlog_id,
             )
-        except (ContractRuntimeError, sqlite3.Error):
+        except (ContractRuntimeError, sqlite3.Error, TypeError, ValueError):
             return {}
-        if not (
-            str(child_record.get("project_id") or "").strip() == project_id
-            and str(child_record.get("backlog_id") or "").strip()
-            == child_backlog_id
-            and str(
-                child_record.get("contract_execution_id") or ""
+        exact_child_records: list[
+            tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]
+        ] = []
+        for candidate_record in candidate_records:
+            if not isinstance(candidate_record, Mapping):
+                continue
+            candidate_execution_id = str(
+                candidate_record.get("contract_execution_id") or ""
             ).strip()
-            == child_execution_id
-            and _is_mf_parallel_record_contract_id(
-                str(child_record.get("contract_id") or "").strip()
+            if not (
+                candidate_execution_id
+                and str(
+                    candidate_record.get("project_id") or ""
+                ).strip()
+                == project_id
+                and str(
+                    candidate_record.get("backlog_id") or ""
+                ).strip()
+                == child_backlog_id
+                and _is_mf_parallel_record_contract_id(
+                    str(
+                        candidate_record.get("contract_id") or ""
+                    ).strip()
+                )
+            ):
+                continue
+            candidate_dispatch = _contract_runtime_dispatch_line_match(
+                candidate_record,
+                child_context,
             )
+            candidate_lineage = (
+                _contract_runtime_verified_dispatch_lineage(
+                    candidate_record,
+                    child_context,
+                    candidate_dispatch,
+                )
+            )
+            if candidate_lineage:
+                exact_child_records.append(
+                    (
+                        candidate_record,
+                        candidate_dispatch,
+                        candidate_lineage,
+                    )
+                )
+        if len(exact_child_records) != 1:
+            return {}
+        child_record, child_dispatch, child_dispatch_lineage = (
+            exact_child_records[0]
+        )
+        child_execution_id = str(
+            child_dispatch_lineage.get("contract_execution_id") or ""
+        ).strip()
+        child_dispatch_source_ref = str(
+            child_dispatch_lineage.get(
+                "contract_runtime_dispatch_source_ref"
+            )
+            or ""
+        ).strip()
+        if (
+            child_task_id == task_id
+            and child_execution_id != execution_id
         ):
             return {}
-        child_dispatch = _contract_runtime_dispatch_line_match(
-            child_record,
-            child_context,
-        )
+        if (
+            child_parent_task_id != batch_id
+            and child_parent_task_id != child_execution_id
+        ):
+            return {}
         child_timeline = _runtime_context_service_timeline_events(
             conn,
             project_id=project_id,
@@ -75962,7 +76084,7 @@ def _contract_runtime_shared_batch_reconcile_authority(
             and str(child_merge.get("task_id") or "").strip()
             == child_task_id
             and str(child_merge.get("parent_task_id") or "").strip()
-            == child_execution_id
+            == child_parent_task_id
             and str(child_merge.get("backlog_id") or "").strip()
             == child_backlog_id
             and str(child_merge.get("merge_queue_id") or "").strip()
@@ -75984,7 +76106,7 @@ def _contract_runtime_shared_batch_reconcile_authority(
             int(child_merge.get("merge_event_id") or 0)
         )
         child_binding_refs.append(
-            str(child_dispatch.get("source_ref") or "").strip()
+            child_dispatch_source_ref
         )
     if expected_head != final_head:
         return {}
