@@ -77634,6 +77634,157 @@ def _contract_runtime_server_derived_observer_merge_no_pass_line(
     )
 
 
+def _contract_runtime_authenticated_nonverdict_qa_graph_line(
+    line: Mapping[str, Any],
+) -> bool:
+    """Recognize accepted QA graph evidence whose no-PASS flag is metadata.
+
+    ``qa_graph_context`` is not a verdict-bearing line.  Some canonical graph
+    writes therefore carry ``no_pass_claim=true`` while deferring the actual
+    candidate decision to the later independent QA line.  Admit only the
+    server-bound, exact-candidate, DB-verified graph shape here; merge
+    authority separately requires this exact line's durable acceptance and a
+    later authenticated exact-candidate QA PASS.
+    """
+
+    payload = (
+        line.get("payload")
+        if isinstance(line.get("payload"), Mapping)
+        else {}
+    )
+    graph_evidence = (
+        payload.get("graph_trace_evidence")
+        if isinstance(payload.get("graph_trace_evidence"), Mapping)
+        else {}
+    )
+    commit_sha = str(line.get("commit_sha") or "").strip().lower()
+    graph_commit = str(
+        graph_evidence.get("candidate_commit_sha")
+        or graph_evidence.get("candidate_commit")
+        or ""
+    ).strip().lower()
+    identity_mismatches = graph_evidence.get("identity_mismatches")
+    verified_trace_ids = (
+        graph_evidence.get("verified_trace_ids")
+        or graph_evidence.get("trace_ids")
+    )
+    verdict_fields = (
+        "verdict",
+        "decision",
+        "result",
+        "qa_status",
+        "qa_decision",
+        "verification_status",
+        "verification_decision",
+    )
+    return bool(
+        str(line.get("line_id") or "").strip() == "qa_graph_context"
+        and str(line.get("actor_role") or "").strip() == "qa"
+        and str(line.get("evidence_kind") or "").strip() == "graph_trace"
+        and str(line.get("status") or "").strip().lower()
+        in _CONTRACT_RUNTIME_QA_PASSING_STATUSES
+        and str(payload.get("schema_version") or "")
+        in {
+            "mf_parallel.qa_graph_context.v1",
+            "qa_graph_context.v1",
+        }
+        and payload.get("no_pass_claim") is True
+        and payload.get("overall_release_pass_claimed") is False
+        and payload.get("exact_candidate") is True
+        and payload.get("candidate_new_graph_failures") == 0
+        and not any(
+            str(container.get(field) or "").strip()
+            for container in (line, payload)
+            for field in verdict_fields
+        )
+        and line.get("observer_impersonation") is False
+        and _contract_runtime_authenticated_qa_provenance(line)
+        and not _contract_runtime_value_reports_failed_qa(line)
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha)
+        and graph_commit == commit_sha
+        and graph_evidence.get("db_verified") is True
+        and isinstance(identity_mismatches, list)
+        and not identity_mismatches
+        and isinstance(verified_trace_ids, list)
+        and bool(verified_trace_ids)
+        and all(str(trace_id or "").strip() for trace_id in verified_trace_ids)
+    )
+
+
+def _contract_runtime_authenticated_exact_candidate_qa_pass(
+    line: Mapping[str, Any],
+    *,
+    candidate_commit_sha: str,
+) -> bool:
+    """Require the verdict-bearing QA successor for a non-verdict graph line."""
+
+    payload = (
+        line.get("payload")
+        if isinstance(line.get("payload"), Mapping)
+        else {}
+    )
+    verification = (
+        line.get("verification")
+        if isinstance(line.get("verification"), Mapping)
+        else {}
+    )
+    test_results = (
+        line.get("test_results")
+        if isinstance(line.get("test_results"), Mapping)
+        else {}
+    )
+    expected_commit = str(candidate_commit_sha or "").strip().lower()
+    line_commit = str(line.get("commit_sha") or "").strip().lower()
+    candidate_commits = [
+        str(source.get("candidate_commit_sha") or "").strip().lower()
+        for source in (payload, verification)
+        if str(source.get("candidate_commit_sha") or "").strip()
+    ]
+    return bool(
+        str(line.get("line_id") or "").strip()
+        == "qa_independent_verification"
+        and str(line.get("actor_role") or "").strip() == "qa"
+        and str(line.get("evidence_kind") or "").strip()
+        == "independent_verification"
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_commit)
+        and line_commit == expected_commit
+        and candidate_commits
+        and all(commit == expected_commit for commit in candidate_commits)
+        and str(line.get("status") or "").strip().lower()
+        in _CONTRACT_RUNTIME_QA_PASSING_STATUSES
+        and str(payload.get("status") or "").strip().lower()
+        in _CONTRACT_RUNTIME_QA_PASSING_STATUSES
+        and str(payload.get("verdict") or "").strip().lower()
+        in _CONTRACT_RUNTIME_QA_PASSING_STATUSES
+        and str(verification.get("status") or "").strip().lower()
+        in _CONTRACT_RUNTIME_QA_PASSING_STATUSES
+        and str(verification.get("verdict") or "").strip().lower()
+        in _CONTRACT_RUNTIME_QA_PASSING_STATUSES
+        and payload.get("independent") is True
+        and verification.get("independent") is True
+        and not any(
+            source.get("no_pass_claim") is True
+            or source.get("no_pass") is True
+            for source in (line, payload, verification, test_results)
+        )
+        and all(
+            source.get("candidate_new_failures") is None
+            or source.get("candidate_new_failures") == 0
+            for source in (line, payload, verification, test_results)
+        )
+        and all(
+            source.get("candidate_specific_issues") is None
+            or source.get("candidate_specific_issues") == []
+            for source in (line, payload, verification, test_results)
+        )
+        and line.get("observer_impersonation") is False
+        and _contract_runtime_authenticated_qa_provenance(line)
+        and _contract_runtime_authenticated_qa_pass_has_only_baseline_observations(
+            line
+        )
+    )
+
+
 def _contract_runtime_completed_merge_authority(
     conn,
     *,
@@ -77685,9 +77836,17 @@ def _contract_runtime_completed_merge_authority(
                         allow_missing_top_level_status=True,
                     )
                     if line_id == "observer_merge"
-                    else _contract_runtime_candidate_scoped_no_pass_line(
-                        line,
-                        record=record,
+                    else (
+                        _contract_runtime_candidate_scoped_no_pass_line(
+                            line,
+                            record=record,
+                        )
+                        or (
+                            line_id == "qa_graph_context"
+                            and _contract_runtime_authenticated_nonverdict_qa_graph_line(
+                                line
+                            )
+                        )
                     )
                 )
             )
@@ -77890,6 +78049,48 @@ def _contract_runtime_completed_merge_authority(
             return {}
         if not (qa_graph[0] < qa_verification[0] < merge_line[0]):
             return {}
+        nonverdict_qa_graph = (
+            _contract_runtime_authenticated_nonverdict_qa_graph_line(
+                qa_graph[1]
+            )
+            and not _contract_runtime_candidate_scoped_no_pass_line(
+                qa_graph[1],
+                record=record,
+            )
+        )
+        if nonverdict_qa_graph:
+            graph_acceptance = _contract_runtime_completed_line_acceptance(
+                conn,
+                project_id=project_id,
+                record=record,
+                completed_line_index=qa_graph[0],
+                expected_line=qa_graph[1],
+            )
+            graph_payload = (
+                qa_graph[1].get("payload")
+                if isinstance(qa_graph[1].get("payload"), Mapping)
+                else {}
+            )
+            graph_evidence = (
+                graph_payload.get("graph_trace_evidence")
+                if isinstance(
+                    graph_payload.get("graph_trace_evidence"),
+                    Mapping,
+                )
+                else {}
+            )
+            if (
+                graph_acceptance.get("db_verified") is not True
+                or not _contract_runtime_authenticated_exact_candidate_qa_pass(
+                    qa_verification[1],
+                    candidate_commit_sha=str(
+                        graph_evidence.get("candidate_commit_sha")
+                        or graph_evidence.get("candidate_commit")
+                        or ""
+                    ),
+                )
+            ):
+                return {}
         if (
             not _contract_runtime_line_status_passes(qa_verification[1])
             or _contract_runtime_line_reports_disqualifying_failed_qa(
@@ -78069,7 +78270,15 @@ def _contract_runtime_completed_merge_authority(
         return {}
 
     no_pass_lines = [merge_line[1]]
-    if qa_graph:
+    if qa_graph and not (
+        _contract_runtime_authenticated_nonverdict_qa_graph_line(
+            qa_graph[1]
+        )
+        and not _contract_runtime_candidate_scoped_no_pass_line(
+            qa_graph[1],
+            record=record,
+        )
+    ):
         no_pass_lines.append(qa_graph[1])
     if qa_verification:
         no_pass_lines.append(qa_verification[1])
@@ -78221,6 +78430,9 @@ def _contract_runtime_completed_line_acceptance(
         _contract_runtime_candidate_scoped_no_pass_line(
             canonical_line,
             record=record,
+        )
+        or _contract_runtime_authenticated_nonverdict_qa_graph_line(
+            canonical_line
         )
         or (
             allow_missing_observer_merge_status
