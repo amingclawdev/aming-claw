@@ -13407,11 +13407,32 @@ def integration_epoch_resume_payload(
         )
     action_id = "resume_batch_merge"
     action_backlog_id = epoch.active_backlog_id
+    action_task_id = epoch.active_task_id
+    action_input: dict[str, Any] = {}
     child_backlog_ids: tuple[str, ...] = ()
     pending_child_backlog_ids: tuple[str, ...] = ()
     if epoch.status == INTEGRATION_EPOCH_RECONCILE_PENDING:
         action_id = "final_batch_reconcile"
         action_backlog_id = epoch.coordination_backlog_id
+        action_task_id = epoch.batch_id
+        action_input = {
+            "project_id": epoch.project_id,
+            "backlog_id": epoch.coordination_backlog_id,
+            "task_id": epoch.batch_id,
+            "target_commit_sha": epoch.current_head,
+            "activate": True,
+            "require_clean": True,
+            "semantic_use_ai": False,
+            "semantic_enrich": False,
+            "enqueue_stale": False,
+            "notes_extra": {
+                "integration_epoch_authority": {
+                    "batch_id": epoch.batch_id,
+                    "epoch_id": epoch.epoch_id,
+                    "merge_queue_id": epoch.merge_queue_id,
+                },
+            },
+        }
     elif epoch.status == INTEGRATION_EPOCH_RECONCILED:
         child_backlog_ids = integration_epoch_child_backlog_ids(conn, epoch)
         child_statuses: dict[str, str] = {}
@@ -13453,7 +13474,7 @@ def integration_epoch_resume_payload(
         "target_ref": epoch.target_ref,
         "merge_queue_id": epoch.merge_queue_id,
         "queue_item_id": epoch.active_queue_item_id,
-        "task_id": epoch.active_task_id,
+        "task_id": action_task_id,
         "backlog_id": action_backlog_id,
         "checkpoint_id": epoch.active_checkpoint_id,
         "merge_cursor": epoch.merge_cursor,
@@ -13466,9 +13487,15 @@ def integration_epoch_resume_payload(
         "backlog_close_independent": True,
         "required_tool": (
             "graph_current_full_reconcile"
-            if epoch.status == INTEGRATION_EPOCH_RECONCILED
+            if epoch.status
+            in {
+                INTEGRATION_EPOCH_RECONCILE_PENDING,
+                INTEGRATION_EPOCH_RECONCILED,
+            }
             else ""
         ),
+        "action_input": action_input,
+        "action_input_copy_safe": bool(action_input),
         "idempotent_replay_required": (
             epoch.status == INTEGRATION_EPOCH_RECONCILED
         ),

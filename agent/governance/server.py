@@ -75608,6 +75608,7 @@ def _contract_runtime_shared_batch_reconcile_authority(
     if len(epoch_rows) != 1:
         return {}
     epoch = dict(epoch_rows[0])
+    epoch_id = str(epoch.get("epoch_id") or "").strip()
     coordination_backlog_id = str(
         epoch.get("coordination_backlog_id") or ""
     ).strip()
@@ -75629,6 +75630,7 @@ def _contract_runtime_shared_batch_reconcile_authority(
         return {}
     if not (
         str(epoch.get("merge_queue_id") or "").strip() == merge_queue_id
+        and epoch_id
         and str(epoch.get("status") or "").strip() == "closed"
         and str(epoch.get("reconcile_state") or "").strip() == "reconciled"
         and coordination_backlog_id
@@ -76043,6 +76045,9 @@ def _contract_runtime_shared_batch_reconcile_authority(
         "backlog_id": coordination_backlog_id,
         "task_id": reconcile_task_id,
     }
+    deterministic_final_reconcile_task_id = (
+        f"{epoch_id}:final-reconcile"
+    )
     scoped_coordination_verified = bool(
         coordination_scope_claimed
         and coordination_context is not None
@@ -76081,7 +76086,12 @@ def _contract_runtime_shared_batch_reconcile_authority(
     task_only_coordination_verified = bool(
         not coordination_scope_claimed
         and not scope_identity
-        and reconcile_task_id in {batch_enter_task_id, batch_id}
+        and reconcile_task_id
+        in {
+            batch_enter_task_id,
+            batch_id,
+            deterministic_final_reconcile_task_id,
+        }
         and {
             str(field): str(value or "").strip()
             for field, value in route_token_scope.items()

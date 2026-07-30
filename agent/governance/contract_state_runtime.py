@@ -367,6 +367,35 @@ def integration_epoch_resume_projection(
         action_id = "final_batch_reconcile"
     else:
         action_id = "finalize_reconciled_batch_epoch"
+    batch_id = str(epoch.get("batch_id") or "")
+    epoch_id = str(epoch.get("epoch_id") or "")
+    merge_queue_id = str(epoch.get("merge_queue_id") or "")
+    action_task_id = str(epoch.get("active_task_id") or "")
+    action_backlog_id = str(epoch.get("active_backlog_id") or "")
+    action_input: dict[str, Any] = {}
+    if status == "reconcile_pending":
+        action_task_id = batch_id
+        action_backlog_id = str(
+            epoch.get("coordination_backlog_id") or ""
+        )
+        action_input = {
+            "project_id": str(epoch.get("project_id") or ""),
+            "backlog_id": action_backlog_id,
+            "task_id": batch_id,
+            "target_commit_sha": str(epoch.get("current_head") or ""),
+            "activate": True,
+            "require_clean": True,
+            "semantic_use_ai": False,
+            "semantic_enrich": False,
+            "enqueue_stale": False,
+            "notes_extra": {
+                "integration_epoch_authority": {
+                    "batch_id": batch_id,
+                    "epoch_id": epoch_id,
+                    "merge_queue_id": merge_queue_id,
+                },
+            },
+        }
     return {
         "schema_version": INTEGRATION_EPOCH_RESUME_SCHEMA_VERSION,
         "next_legal_action": {
@@ -374,19 +403,21 @@ def integration_epoch_resume_projection(
             "line_id": action_id,
             "source": "durable_integration_epoch",
             "precedence": "active_integration_epoch",
-            "batch_id": str(epoch.get("batch_id") or ""),
-            "epoch_id": str(epoch.get("epoch_id") or ""),
+            "batch_id": batch_id,
+            "epoch_id": epoch_id,
             "target_ref": str(epoch.get("target_ref") or ""),
-            "merge_queue_id": str(epoch.get("merge_queue_id") or ""),
+            "merge_queue_id": merge_queue_id,
             "queue_item_id": str(epoch.get("active_queue_item_id") or ""),
-            "task_id": str(epoch.get("active_task_id") or ""),
-            "backlog_id": str(epoch.get("active_backlog_id") or ""),
+            "task_id": action_task_id,
+            "backlog_id": action_backlog_id,
             "checkpoint_id": str(epoch.get("active_checkpoint_id") or ""),
             "required_tool": (
                 "graph_current_full_reconcile"
-                if status == "reconciled"
+                if status in {"reconcile_pending", "reconciled"}
                 else ""
             ),
+            "action_input": action_input,
+            "action_input_copy_safe": bool(action_input),
             "idempotent_replay_required": status == "reconciled",
             "backlog_close_required_for_epoch_release": False,
             "position_skippable": False,
