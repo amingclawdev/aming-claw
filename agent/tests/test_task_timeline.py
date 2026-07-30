@@ -15023,6 +15023,110 @@ class TestTaskTimeline(unittest.TestCase):
             newest["id"],
         )
 
+    def test_terminal_playback_keeps_bounded_history_when_pinned_definition_is_stale(
+        self,
+    ):
+        from agent.governance import server, task_timeline
+
+        backlog_id = "AC-PLAYBACK-TERMINAL-STALE-PIN"
+        execution_id = "cex-playback-terminal-stale-pin"
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, mf_type,
+                bypass_policy_json, created_at, updated_at)
+               VALUES (?, ?, 'FIXED', 'P0', 'chain_rescue', ?, ?, ?)""",
+            (
+                backlog_id,
+                "Terminal stale pinned Playback fixture",
+                '{"mf_type":"chain_rescue"}',
+                "2026-07-30T00:00:00Z",
+                "2026-07-30T00:00:00Z",
+            ),
+        )
+        recorded = [
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id=backlog_id,
+                task_id=f"terminal-playback-{index:02d}",
+                event_type="worker.progress",
+                event_kind="implementation_progress",
+                phase="implementation",
+                actor="mf_sub",
+                status="accepted",
+                payload={"frame": index},
+                post_commit_hooks=False,
+            )
+            for index in range(21)
+        ]
+        self.conn.commit()
+        record = {
+            "project_id": "proj",
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "contract_id": "mf_parallel",
+            "version": "v2",
+            "revision": "rev6",
+            "definition_hash": _fake_sha("historical-definition"),
+            "instruction_bundle_hash": _fake_sha("historical-instructions"),
+        }
+        stale = server.StalePinnedContractExecutionError(
+            "definition_hash",
+            _fake_sha("historical-definition"),
+            _fake_sha("current-definition"),
+            record=record,
+        )
+
+        class Store:
+            def get(self, _execution_id):
+                return dict(record)
+
+        class Runtime:
+            store = Store()
+
+            def current_guide(self, _execution_id, *, actor_role=None):
+                raise stale
+
+        server._timeline_warm_cache_clear()
+        with mock.patch.object(
+            server,
+            "_contract_runtime",
+            return_value=Runtime(),
+        ):
+            response = server.handle_task_timeline_list(
+                _ctx(
+                    {
+                        "backlog_id": backlog_id,
+                        "contract_execution_id": execution_id,
+                        "limit": "50",
+                        "playback_bootstrap": "compact",
+                    }
+                )
+            )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["count"], 21)
+        self.assertEqual(len(response["events"]), 21)
+        self.assertEqual(
+            [event["id"] for event in response["events"]],
+            [event["id"] for event in reversed(recorded)],
+        )
+        gate = response["backlog_timeline_gate"]
+        self.assertFalse(gate["can_close"])
+        self.assertFalse(gate["terminal_read_only_degradation"]["authoritative"])
+        self.assertFalse(gate["terminal_read_only_degradation"]["close_authority"])
+        self.assertFalse(
+            gate["terminal_read_only_degradation"]["row_reopen_allowed"]
+        )
+        self.assertTrue(
+            gate["terminal_read_only_degradation"][
+                "mutable_paths_remain_fail_closed"
+            ]
+        )
+        serialized = json.dumps(response, sort_keys=True)
+        self.assertNotIn(stale.expected, serialized)
+        self.assertNotIn(stale.actual, serialized)
+
     def test_public_timeline_search_uses_fts_keyset_without_hot_pollution(self):
         from agent.governance import server, task_timeline
 
