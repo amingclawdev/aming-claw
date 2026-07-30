@@ -113446,6 +113446,7 @@ def _timeline_gate_contract_runtime_projection_body(
         route_gate_execution_id if route_gate_execution_id.startswith("cex-") else ""
     )
     execution_id = current_execution_id
+    execution_id_source = "current_contract_execution_id"
     if (
         not execution_id.startswith("cex-")
         and route_gate_cex_execution_id
@@ -113455,10 +113456,13 @@ def _timeline_gate_contract_runtime_projection_body(
         )
     ):
         execution_id = route_gate_cex_execution_id
+        execution_id_source = "route_gate"
     if not execution_id.startswith("cex-"):
         execution_id = str(
             current.get("active_child_contract_execution_id") or ""
         ).strip()
+        if execution_id:
+            execution_id_source = "active_child_contract_execution_id"
     if not execution_id.startswith("cex-"):
         active_chain = (
             current.get("active_chain")
@@ -113469,14 +113473,21 @@ def _timeline_gate_contract_runtime_projection_body(
             candidate_id = str(candidate or "").strip()
             if candidate_id.startswith("cex-"):
                 execution_id = candidate_id
+                execution_id_source = "active_chain"
                 break
     if not execution_id.startswith("cex-") and route_gate_cex_execution_id:
         execution_id = route_gate_cex_execution_id
+        execution_id_source = "route_gate"
     ignored_server_derived_execution_id = ""
     mf_batch_parent_execution_id = ""
     if (
         execution_id.startswith("cex-")
-        and execution_id == current_execution_id
+        and execution_id_source
+        in {
+            "current_contract_execution_id",
+            "active_child_contract_execution_id",
+            "active_chain",
+        }
         and timeline_events is not None
         and not _contract_runtime_execution_record_exists(conn, execution_id)
     ):
@@ -113548,6 +113559,9 @@ def _timeline_gate_contract_runtime_projection_body(
                 "fallback_contract_execution_id": mf_batch_parent_execution_id,
                 "fallback_source": (
                     "completed_source_backed_mf_batch_parent_projection"
+                ),
+                "ignored_server_derived_execution_id_source": (
+                    execution_id_source
                 ),
             }
         )

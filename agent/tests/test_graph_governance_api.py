@@ -55976,39 +55976,69 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
            WHERE bug_id = ?""",
         (close_commit, now, backlog_id),
     )
+    for index in range(3):
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=f"playback-mf-batch-history-{index + 1}",
+            event_type="worker.progress",
+            event_kind="implementation_progress",
+            phase="implementation",
+            actor="mf_sub",
+            status="accepted",
+            payload={"history_frame": index + 1},
+        )
     conn.commit()
 
-    stale_execution_id = "cex-playback-stale-unknown-current"
+    stale_current_execution_id = "cex-playback-stale-unknown-current"
 
-    def stale_current_projection(
-        _conn,
+    def current_projection(
         *,
-        project_id,
-        backlog_id,
-        rebuild_if_missing=False,
-        **_kwargs,
+        current_execution_id,
+        active_child_execution_id="",
+        active_chain_execution_ids=(),
     ):
-        return {
-            "schema_version": "backlog_contract_chain_current.v1",
-            "project_id": project_id,
-            "backlog_id": backlog_id,
-            "current_contract_execution_id": stale_execution_id,
-            "root_contract_execution_id": parent_execution_id,
-            "active_child_contract_execution_id": stale_execution_id,
-            "active_chain": {
-                "execution_ids": [parent_execution_id, stale_execution_id],
-            },
-            "readiness_state": "contract_complete",
-            "source_of_authority": "contract_runtime",
-            "authority_decision_source": "backlog_contract_chain_current",
-        }
+        def read_current(
+            _conn,
+            *,
+            project_id,
+            backlog_id,
+            rebuild_if_missing=False,
+            **_kwargs,
+        ):
+            return {
+                "schema_version": "backlog_contract_chain_current.v1",
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "current_contract_execution_id": current_execution_id,
+                "root_contract_execution_id": parent_execution_id,
+                "active_child_contract_execution_id": (
+                    active_child_execution_id
+                ),
+                "active_chain": {
+                    "execution_ids": list(active_chain_execution_ids),
+                },
+                "readiness_state": "contract_complete",
+                "source_of_authority": "contract_runtime",
+                "authority_decision_source": "backlog_contract_chain_current",
+            }
+
+        return read_current
 
     server._timeline_warm_cache_clear()
     with monkeypatch.context() as scoped_patch:
         scoped_patch.setattr(
             server,
             "read_backlog_contract_chain_current",
-            stale_current_projection,
+            current_projection(
+                current_execution_id=stale_current_execution_id,
+                active_child_execution_id=stale_current_execution_id,
+                active_chain_execution_ids=(
+                    parent_execution_id,
+                    stale_current_execution_id,
+                ),
+            ),
         )
         timeline_events = task_timeline.list_events(
             conn,
@@ -56029,7 +56059,10 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
         )
         assert projection_body["contract_runtime"][
             "ignored_server_derived_unknown_contract_execution_id"
-        ] == stale_execution_id
+        ] == stale_current_execution_id
+        assert projection_body["contract_runtime"][
+            "ignored_server_derived_execution_id_source"
+        ] == "current_contract_execution_id"
 
         compact = server.handle_task_timeline_list(
             _ctx(
@@ -56047,6 +56080,155 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
         assert compact["playback_bootstrap"]["shared_computation"][
             "timeline_gate"
         ] is True
+        assert compact["count"] == 4
+        assert len(compact["events"]) == 4
+
+        stale_active_child_execution_id = (
+            "cex-playback-stale-unknown-active-child"
+        )
+
+        scoped_patch.setattr(
+            server,
+            "read_backlog_contract_chain_current",
+            current_projection(
+                current_execution_id=parent_execution_id,
+                active_child_execution_id=stale_active_child_execution_id,
+                active_chain_execution_ids=(parent_execution_id,),
+            ),
+        )
+        active_child_body = (
+            server._timeline_gate_contract_runtime_projection_body(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                query={},
+                timeline_events=timeline_events,
+                close_commit=close_commit,
+            )
+        )
+        assert active_child_body["current_contract_execution_id"] == (
+            parent_execution_id
+        )
+        assert active_child_body["contract_runtime"][
+            "ignored_server_derived_unknown_contract_execution_id"
+        ] == stale_active_child_execution_id
+        assert active_child_body["contract_runtime"][
+            "ignored_server_derived_execution_id_source"
+        ] == "active_child_contract_execution_id"
+
+        stale_active_chain_execution_id = (
+            "cex-playback-stale-unknown-active-chain"
+        )
+
+        scoped_patch.setattr(
+            server,
+            "read_backlog_contract_chain_current",
+            current_projection(
+                current_execution_id=parent_execution_id,
+                active_chain_execution_ids=(
+                    parent_execution_id,
+                    stale_active_chain_execution_id,
+                ),
+            ),
+        )
+        active_chain_body = (
+            server._timeline_gate_contract_runtime_projection_body(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                query={},
+                timeline_events=timeline_events,
+                close_commit=close_commit,
+            )
+        )
+        assert active_chain_body["current_contract_execution_id"] == (
+            parent_execution_id
+        )
+        assert active_chain_body["contract_runtime"][
+            "ignored_server_derived_unknown_contract_execution_id"
+        ] == stale_active_chain_execution_id
+        assert active_chain_body["contract_runtime"][
+            "ignored_server_derived_execution_id_source"
+        ] == "active_chain"
+
+        real_route_gate_verification = (
+            task_timeline.mf_route_context_gate_verification
+        )
+        scoped_patch.setattr(
+            task_timeline,
+            "mf_route_context_gate_verification",
+            lambda *_args, **_kwargs: {
+                "schema_version": "mf_route_context_consumption_gate.v1",
+                "passed": True,
+                "status": "passed",
+            },
+        )
+        server._timeline_warm_cache_clear()
+        active_chain_compact = server.handle_task_timeline_list(
+            _ctx(
+                {"project_id": PID},
+                query={
+                    "backlog_id": backlog_id,
+                    "limit": "50",
+                    "playback_bootstrap": "compact",
+                },
+            )
+        )
+        assert active_chain_compact["backlog_timeline_gate"]["ok"] is True
+        assert active_chain_compact["backlog_timeline_gate"][
+            "can_close"
+        ] is True
+        assert active_chain_compact["count"] == 4
+        assert len(active_chain_compact["events"]) == 4
+        scoped_patch.setattr(
+            task_timeline,
+            "mf_route_context_gate_verification",
+            real_route_gate_verification,
+        )
+
+        unknown_route_gate_execution_id = (
+            "cex-explicit-route-gate-arbitrary-unknown"
+        )
+        route_gate_body = (
+            server._timeline_gate_contract_runtime_projection_body(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                query={},
+                route_gate={
+                    "contract_execution_id": (
+                        unknown_route_gate_execution_id
+                    )
+                },
+                timeline_events=timeline_events,
+                close_commit=close_commit,
+            )
+        )
+        assert route_gate_body["contract_execution_id"] == (
+            unknown_route_gate_execution_id
+        )
+        assert (
+            "ignored_server_derived_unknown_contract_execution_id"
+            not in route_gate_body["contract_runtime"]
+        )
+        with pytest.raises(GovernanceError) as route_gate_exc:
+            server._contract_runtime_close_authority_projection(
+                conn,
+                project_id=PID,
+                bug_id=backlog_id,
+                body=route_gate_body,
+                route_gate={
+                    "contract_execution_id": (
+                        unknown_route_gate_execution_id
+                    )
+                },
+                close_commit=close_commit,
+                timeline_events=timeline_events,
+            )
+        assert (
+            route_gate_exc.value.details["contract_execution_id"]
+            == unknown_route_gate_execution_id
+        )
 
         server._timeline_warm_cache_clear()
         with pytest.raises(GovernanceError) as exc:
