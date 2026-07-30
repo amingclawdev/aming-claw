@@ -113429,8 +113429,6 @@ def _validated_playback_legacy_contract_state_route_gate_origin(
     if (
         str(route_gate.get("schema_version") or "").strip()
         != "mf_route_context_consumption_gate.v1"
-        or route_gate.get("passed") is not True
-        or str(route_gate.get("status") or "").strip() != "passed"
         or route_gate.get("same_route_identity") is not True
     ):
         return {}
@@ -113439,10 +113437,55 @@ def _validated_playback_legacy_contract_state_route_gate_origin(
         if isinstance(route_gate.get("checks"), Mapping)
         else {}
     )
-    if (
-        checks.get("route_context_present") is not True
-        or checks.get("same_route_identity") is not True
-    ):
+    passed_route_gate = (
+        route_gate.get("passed") is True
+        and str(route_gate.get("status") or "").strip() == "passed"
+        and checks.get("route_context_present") is True
+        and checks.get("same_route_identity") is True
+    )
+    advisory_required_requirement_ids = [
+        "route_context",
+        "route_action_precheck",
+        "bounded_implementation_worker_dispatch",
+        "mf_subagent_startup",
+        "independent_verification_lane",
+    ]
+    advisory_present_requirement_ids = [
+        "route_context",
+        "route_action_precheck",
+    ]
+    advisory_missing_requirement_ids = [
+        "bounded_implementation_worker_dispatch",
+        "mf_subagent_startup",
+        "independent_verification_lane",
+    ]
+    advisory_failed_route_gate = (
+        route_gate.get("passed") is False
+        and str(route_gate.get("status") or "").strip() == "failed"
+        and route_gate.get("required_requirement_ids")
+        == advisory_required_requirement_ids
+        and route_gate.get("present_requirement_ids")
+        == advisory_present_requirement_ids
+        and route_gate.get("missing_requirement_ids")
+        == advisory_missing_requirement_ids
+        and checks.get("route_context_present") is True
+        and checks.get("route_action_precheck_present") is True
+        and checks.get("bounded_implementation_worker_dispatch_present")
+        is False
+        and checks.get("mf_subagent_startup_present") is False
+        and checks.get("bounded_worker_not_applicable_by_contract") is False
+        and checks.get("independent_verification_required") is True
+        and checks.get("independent_verification_lane_present") is False
+        and checks.get("independent_verification_replaced_by_contract_gate")
+        is False
+        and checks.get("architecture_review_required") is False
+        and checks.get("architecture_review_lane_present") is False
+        and checks.get("same_route_identity") is True
+        and checks.get("same_optional_route_id") is True
+        and checks.get("same_optional_prompt_contract_hash") is True
+        and checks.get("route_identity_cleanup_applied") is False
+    )
+    if not passed_route_gate and not advisory_failed_route_gate:
         return {}
 
     policy = (
@@ -113606,6 +113649,11 @@ def _validated_playback_legacy_contract_state_route_gate_origin(
         "route_context_hash": route_context_hash,
         "prompt_contract_id": prompt_contract_id,
         "prompt_contract_hash": prompt_contract_hash,
+        "replaced_advisory_requirement_ids": (
+            list(advisory_missing_requirement_ids)
+            if advisory_failed_route_gate
+            else []
+        ),
     }
 
 

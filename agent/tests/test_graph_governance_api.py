@@ -55890,7 +55890,7 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
     backlog_id = "AC-PLAYBACK-MF-BATCH-PARENT-UNKNOWN-CURRENT"
     child_a = f"{backlog_id}-CHILD-A"
     child_b = f"{backlog_id}-CHILD-B"
-    close_commit = "fb6275118745006c8324dfcbeecea62c39e91936"
+    close_commit = "44895dcb7daeaf3b9dd18016c980c7cf54439ef4"
     for row_id in (backlog_id, child_a, child_b):
         _insert_simple_mf_close_backlog(conn, row_id)
     conn.execute(
@@ -55976,6 +55976,24 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
            WHERE bug_id = ?""",
         (close_commit, now, backlog_id),
     )
+    current_timeline_id = int(
+        conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_timeline_events"
+        ).fetchone()[0]
+    )
+    for filler_event_id in range(current_timeline_id + 1, 41):
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=child_a,
+            task_id=f"unrelated-filler-{filler_event_id}",
+            event_type="worker.progress",
+            event_kind="implementation_progress",
+            phase="implementation",
+            actor="mf_sub",
+            status="accepted",
+            payload={"unrelated_filler": filler_event_id},
+        )
     for index in range(3):
         is_route_gate = index == 2
         task_timeline.record_event(
@@ -56198,6 +56216,7 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
             if event["event_kind"] == "route_token_gate"
         )
         route_context_event_id = route_context_event["id"]
+        assert route_context_event_id == 43
         route_context_hash = (
             "sha256:e1f12a21e5db6aed0f9a0a3ed6f1642939e9c4cdd14c6a672"
             "d02bd3a4eefec98"
@@ -56339,6 +56358,7 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
             "route_context_hash": route_context_hash,
             "prompt_contract_id": prompt_contract_id,
             "prompt_contract_hash": prompt_contract_hash,
+            "replaced_advisory_requirement_ids": [],
         }
 
         scoped_patch.setattr(
@@ -56363,6 +56383,97 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
         ] is True
         assert legacy_route_compact["count"] == 4
         assert len(legacy_route_compact["events"]) == 4
+
+        advisory_failed_route_gate = copy.deepcopy(legacy_route_gate)
+        advisory_failed_route_gate.update(
+            {
+                "passed": False,
+                "status": "failed",
+                "required_requirement_ids": [
+                    "route_context",
+                    "route_action_precheck",
+                    "bounded_implementation_worker_dispatch",
+                    "mf_subagent_startup",
+                    "independent_verification_lane",
+                ],
+                "present_requirement_ids": [
+                    "route_context",
+                    "route_action_precheck",
+                ],
+                "missing_requirement_ids": [
+                    "bounded_implementation_worker_dispatch",
+                    "mf_subagent_startup",
+                    "independent_verification_lane",
+                ],
+            }
+        )
+        advisory_failed_route_gate["checks"] = {
+            "route_context_present": True,
+            "route_action_precheck_present": True,
+            "bounded_implementation_worker_dispatch_present": False,
+            "mf_subagent_startup_present": False,
+            "bounded_worker_not_applicable_by_contract": False,
+            "independent_verification_required": True,
+            "independent_verification_lane_present": False,
+            "independent_verification_replaced_by_contract_gate": False,
+            "architecture_review_required": False,
+            "architecture_review_lane_present": False,
+            "same_route_identity": True,
+            "same_optional_route_id": True,
+            "same_optional_prompt_contract_hash": True,
+            "route_identity_cleanup_applied": False,
+        }
+        advisory_failed_body = (
+            server._timeline_gate_contract_runtime_projection_body(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                query={"playback_bootstrap": "compact"},
+                route_gate=advisory_failed_route_gate,
+                timeline_events=timeline_events,
+                close_commit=close_commit,
+            )
+        )
+        advisory_failed_runtime = advisory_failed_body["contract_runtime"]
+        assert advisory_failed_runtime[
+            "ignored_server_derived_unknown_contract_execution_id"
+        ] == legacy_route_gate_execution_id
+        assert advisory_failed_runtime[
+            "ignored_server_derived_execution_id_source"
+        ] == "route_gate"
+        advisory_origin = advisory_failed_runtime[
+            "validated_legacy_contract_state_origin"
+        ]
+        assert advisory_origin["authoritative"] is False
+        assert advisory_origin["close_authority"] is False
+        assert advisory_origin["replaced_advisory_requirement_ids"] == [
+            "bounded_implementation_worker_dispatch",
+            "mf_subagent_startup",
+            "independent_verification_lane",
+        ]
+
+        scoped_patch.setattr(
+            task_timeline,
+            "mf_route_context_gate_verification",
+            lambda *_args, **_kwargs: advisory_failed_route_gate,
+        )
+        server._timeline_warm_cache_clear()
+        advisory_failed_compact = server.handle_task_timeline_list(
+            _ctx(
+                {"project_id": PID},
+                query={
+                    "backlog_id": backlog_id,
+                    "limit": "50",
+                    "playback_bootstrap": "compact",
+                },
+            )
+        )
+        assert advisory_failed_compact["backlog_timeline_gate"]["ok"] is True
+        assert advisory_failed_compact["backlog_timeline_gate"][
+            "can_close"
+        ] is True
+        assert advisory_failed_compact["count"] == 4
+        assert len(advisory_failed_compact["events"]) == 4
 
         rejected_legacy_shapes = []
         wrong_template = copy.deepcopy(legacy_route_gate)
@@ -56393,6 +56504,40 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
             "active_lane_contract"
         ]["active_contract_execution"]["projection_watermark"] += 1
         rejected_legacy_shapes.append(wrong_watermark)
+        extra_advisory_requirement = copy.deepcopy(
+            advisory_failed_route_gate
+        )
+        extra_advisory_requirement["required_requirement_ids"].append(
+            "architecture_review_lane"
+        )
+        extra_advisory_requirement["missing_requirement_ids"].append(
+            "architecture_review_lane"
+        )
+        rejected_legacy_shapes.append(extra_advisory_requirement)
+        missing_route_requirement = copy.deepcopy(
+            advisory_failed_route_gate
+        )
+        missing_route_requirement["required_requirement_ids"].remove(
+            "route_action_precheck"
+        )
+        missing_route_requirement["present_requirement_ids"].remove(
+            "route_action_precheck"
+        )
+        rejected_legacy_shapes.append(missing_route_requirement)
+        missing_route_action_precheck = copy.deepcopy(
+            advisory_failed_route_gate
+        )
+        missing_route_action_precheck["checks"][
+            "route_action_precheck_present"
+        ] = False
+        rejected_legacy_shapes.append(missing_route_action_precheck)
+        mismatched_optional_route_identity = copy.deepcopy(
+            advisory_failed_route_gate
+        )
+        mismatched_optional_route_identity["checks"][
+            "same_optional_route_id"
+        ] = False
+        rejected_legacy_shapes.append(mismatched_optional_route_identity)
         for rejected_route_gate in rejected_legacy_shapes:
             rejected_body = (
                 server._timeline_gate_contract_runtime_projection_body(
