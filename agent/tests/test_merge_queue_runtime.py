@@ -2968,9 +2968,30 @@ def test_final_reconcile_accepts_active_snapshot_when_semantic_projection_is_ski
     )
     pending = get_active_integration_epoch(conn, PROJECT_ID, merge_queue_id=queue_id)
     assert pending is not None
-    assert integration_epoch_resume_payload(conn, pending)["id"] == (
-        "final_batch_reconcile"
-    )
+    resume = integration_epoch_resume_payload(conn, pending)
+    assert resume["id"] == "final_batch_reconcile"
+    assert resume["required_tool"] == "graph_current_full_reconcile"
+    assert resume["task_id"] == batch_id
+    assert resume["backlog_id"] == "AC-BATCH-PARENT"
+    assert resume["action_input_copy_safe"] is True
+    assert resume["action_input"] == {
+        "project_id": PROJECT_ID,
+        "backlog_id": "AC-BATCH-PARENT",
+        "task_id": batch_id,
+        "target_commit_sha": "final-head",
+        "activate": True,
+        "require_clean": True,
+        "semantic_use_ai": False,
+        "semantic_enrich": False,
+        "enqueue_stale": False,
+        "notes_extra": {
+            "integration_epoch_authority": {
+                "batch_id": batch_id,
+                "epoch_id": pending.epoch_id,
+                "merge_queue_id": queue_id,
+            },
+        },
+    }
 
     recorded = record_merge_queue_graph_epoch_after_reconcile(
         conn,

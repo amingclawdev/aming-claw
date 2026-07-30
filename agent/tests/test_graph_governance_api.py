@@ -8001,6 +8001,14 @@ def _shared_batch_reconcile_authority_fixture(
     )
     if task_only_reconcile_task == "batch":
         coordination_task_id = batch_id
+    elif task_only_reconcile_task == "epoch":
+        coordination_task_id = (
+            "epoch-shared-final-reconcile:final-reconcile"
+        )
+    elif task_only_reconcile_task == "wrong_epoch":
+        coordination_task_id = (
+            "epoch-unrelated-final-reconcile:final-reconcile"
+        )
     elif task_only_reconcile_task == "arbitrary":
         coordination_task_id = "caller-shaped-reconcile-alias"
     else:
@@ -8581,6 +8589,36 @@ def test_mf_batch_task_only_reconcile_accepts_server_plan_and_batch_task(
     assert shared["coordination_task_id"] == fixture["batch_id"]
 
 
+def test_mf_batch_task_only_reconcile_accepts_exact_epoch_final_task(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+        nested_enter_queue_plan=True,
+        service_enter_task=True,
+        task_only_reconcile_task="epoch",
+    )
+
+    authority = server._contract_runtime_shared_batch_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+        context=fixture["context"],
+        merge=fixture["merge"],
+    )
+
+    shared = authority["shared_batch_reconcile_authority"]
+    assert shared["epoch_id"] == "epoch-shared-final-reconcile"
+    assert shared["coordination_reconcile_task_id"] == (
+        "epoch-shared-final-reconcile:final-reconcile"
+    )
+
+
 def test_mf_batch_task_only_shared_authority_is_resealed_after_enrichment(
     conn,
     tmp_path,
@@ -8958,6 +8996,32 @@ def test_mf_batch_task_only_reconcile_rejects_arbitrary_task_alias(
         nested_enter_queue_plan=True,
         service_enter_task=True,
         task_only_reconcile_task="arbitrary",
+    )
+
+    authority = server._contract_runtime_shared_batch_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+        context=fixture["context"],
+        merge=fixture["merge"],
+    )
+
+    assert authority == {}
+
+
+def test_mf_batch_task_only_reconcile_rejects_other_epoch_final_task(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+        nested_enter_queue_plan=True,
+        service_enter_task=True,
+        task_only_reconcile_task="wrong_epoch",
     )
 
     authority = server._contract_runtime_shared_batch_reconcile_authority(

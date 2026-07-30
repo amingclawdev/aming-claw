@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
 
+from agent.governance.contract_state_runtime import (
+    integration_epoch_resume_projection,
+)
 from agent.governance.contracts import ContractDefinitionRegistry
 
 
@@ -148,7 +151,7 @@ def test_registry_materializes_reconcile_route_guidance_into_read_model():
     ]
 
 
-def test_registry_preserves_active_rev3_pin_when_rev4_becomes_latest():
+def test_registry_preserves_active_rev3_pin_when_later_revision_is_latest():
     registry = ContractDefinitionRegistry()
     pinned = registry.get("mf_parallel.v2", version="v2", revision="rev3")
     latest = registry.get("mf_parallel.v2", version="v2")
@@ -159,6 +162,66 @@ def test_registry_preserves_active_rev3_pin_when_rev4_becomes_latest():
     assert pinned["source_sha256"] == (
         "sha256:f0d9e997649e9ccd1bc46aaced8191b3506a9cd9b0d2f6588c0d52211b9dde22"
     )
-    assert latest["revision"] == "rev4"
-    assert latest["metadata"]["previous_revision"] == "mf_parallel.v2.rev3"
+    assert latest["revision"] == "rev7"
+    assert latest["metadata"]["previous_revision"] == "mf_parallel.v2.rev6"
     assert latest["definition_hash"] != pinned["definition_hash"]
+
+
+def test_reconcile_pending_epoch_projects_copy_safe_batch_task_input():
+    projection = integration_epoch_resume_projection(
+        {
+            "project_id": "aming-claw",
+            "status": "reconcile_pending",
+            "batch_id": "batch-happy-path",
+            "epoch_id": "epoch-happy-path",
+            "coordination_backlog_id": "AC-BATCH-PARENT",
+            "target_ref": "refs/heads/main",
+            "current_head": "a" * 40,
+            "merge_queue_id": "mq-happy-path",
+            "active_task_id": "",
+            "active_backlog_id": "",
+        }
+    )
+
+    action = projection["next_legal_action"]
+    assert action["id"] == "final_batch_reconcile"
+    assert action["required_tool"] == "graph_current_full_reconcile"
+    assert action["task_id"] == "batch-happy-path"
+    assert action["backlog_id"] == "AC-BATCH-PARENT"
+    assert action["action_input_copy_safe"] is True
+    assert action["action_input"] == {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-BATCH-PARENT",
+        "task_id": "batch-happy-path",
+        "target_commit_sha": "a" * 40,
+        "activate": True,
+        "require_clean": True,
+        "semantic_use_ai": False,
+        "semantic_enrich": False,
+        "enqueue_stale": False,
+        "notes_extra": {
+            "integration_epoch_authority": {
+                "batch_id": "batch-happy-path",
+                "epoch_id": "epoch-happy-path",
+                "merge_queue_id": "mq-happy-path",
+            },
+        },
+    }
+
+
+def test_non_reconcile_epoch_does_not_project_reconcile_action_input():
+    projection = integration_epoch_resume_projection(
+        {
+            "status": "merge_in_doubt",
+            "batch_id": "batch-happy-path",
+            "epoch_id": "epoch-happy-path",
+            "merge_queue_id": "mq-happy-path",
+            "active_task_id": "task-row-2",
+            "active_backlog_id": "AC-BATCH-ROW-2",
+        }
+    )
+
+    action = projection["next_legal_action"]
+    assert action["id"] == "resume_batch_merge"
+    assert action["action_input"] == {}
+    assert action["action_input_copy_safe"] is False
