@@ -81675,6 +81675,153 @@ def test_context_local_rework_receipt_rejects_noncanonical_backfill(
     ) == {}
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_event_id"),
+    [
+        ("canonical", 701),
+        ("wrong_event_kind", 0),
+        ("wrong_event_type", 0),
+        ("stale_session_ref", 0),
+        ("wrong_fence", 0),
+        ("wrong_runtime", 0),
+        ("wrong_task", 0),
+        ("wrong_parent", 0),
+        ("ambiguous_receipts", 0),
+        ("idempotent_receipt", 702),
+    ],
+)
+def test_context_local_rework_startup_requires_exact_canonical_receipt_identity(
+    conn,
+    monkeypatch,
+    mutation,
+    expected_event_id,
+):
+    context, record, marker, command, route_identity = (
+        _context_local_rework_receipt_fixture()
+    )
+    record["completed_lines"].append(
+        {
+            "stage_id": "worker_startup",
+            "line_id": "worker_startup",
+            "actor_role": "mf_sub",
+            "evidence_kind": "mf_subagent_startup",
+            "line_instance_id": "runtime_context:mfrctx-prior-worker",
+            "payload": {
+                "runtime_context_id": "mfrctx-prior-worker",
+                "task_id": "prior-worker-task",
+            },
+        }
+    )
+    session_ref = runtime_context_session_token_ref(context)
+    fence_hash = runtime_context_secret_hash(context.fence_token)
+    event_payload = {
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "worker_role": "mf_sub",
+        "authorization_source": "runtime_context_copy_safe_worker_proof",
+        "session_token_ref": session_ref,
+        "fence_token_hash": fence_hash,
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        "read_receipt_hash": "sha256:canonical-context-local-read",
+        "contract_runtime_canonical_line": {
+            "accepted": True,
+            "status": "context_local_receipt_after_prior_contract_line",
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "contract_runtime_mutated": False,
+            "duplicate_contract_line_submitted": False,
+        },
+    }
+    event = {
+        "id": 701,
+        "event_type": "mf_subagent_read_receipt",
+        "event_kind": "contract_context_read_receipt",
+        "status": "accepted",
+        "payload": event_payload,
+    }
+    events = [event]
+    if mutation == "wrong_event_kind":
+        event["event_kind"] = "mf_subagent_read_receipt"
+    elif mutation == "wrong_event_type":
+        event["event_type"] = "contract_context_read_receipt"
+    elif mutation == "stale_session_ref":
+        event_payload["session_token_ref"] = "wstok-stale"
+    elif mutation == "wrong_fence":
+        event_payload["fence_token_hash"] = "sha256:wrong-fence"
+    elif mutation == "wrong_runtime":
+        event_payload["runtime_context_id"] = "mfrctx-wrong"
+    elif mutation == "wrong_task":
+        event_payload["task_id"] = "wrong-task"
+    elif mutation == "wrong_parent":
+        event_payload["parent_task_id"] = "cex-wrong-parent"
+    elif mutation in {"ambiguous_receipts", "idempotent_receipt"}:
+        duplicate = copy.deepcopy(event)
+        duplicate["id"] = 702
+        if mutation == "ambiguous_receipts":
+            duplicate["payload"]["read_receipt_hash"] = (
+                "sha256:conflicting-context-local-read"
+            )
+        events.append(duplicate)
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dispatch_identity_resolution",
+        lambda _record, _context: {
+            "accepted": True,
+            "reconstructable": True,
+            "observer_command_id": command["command_id"],
+        },
+    )
+    monkeypatch.setattr(
+        observer_session,
+        "get_command",
+        lambda *args, **kwargs: command,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_route_identity",
+        lambda _conn, _context: route_identity,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_timeline_events",
+        lambda *args, **kwargs: events,
+    )
+
+    result = server._runtime_context_context_local_setup_authority(
+        conn,
+        project_id=PID,
+        context=context,
+        record=record,
+        stage_id="worker_startup",
+        line_id="worker_startup",
+        evidence_kind="mf_subagent_startup",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.parent_task_id,
+            "worker_role": "mf_sub",
+            "actor_role": "mf_sub",
+            "observer_impersonation": False,
+        },
+        failed_qa_rejoin_contexts=[marker],
+    )
+
+    if not expected_event_id:
+        assert result == {}
+        return
+    assert result["accepted"] is True
+    assert result["status"] == (
+        "context_local_startup_after_prior_contract_line"
+    )
+    assert result["local_read_receipt"]["event_id"] == expected_event_id
+    assert result["local_read_receipt"]["source"] == (
+        "task_timeline.contract_context_read_receipt"
+    )
+
+
 def test_fresh_failed_qa_context_read_receipt_persists_and_startup_discovers_it(
     conn,
     monkeypatch,
@@ -81966,6 +82113,8 @@ def test_fresh_failed_qa_context_read_receipt_persists_and_startup_discovers_it(
                 ),
                 "target_project_root": str(target_root),
                 "actor": fresh_context.worker_slot_id,
+                "event_type": "mf_subagent_read_receipt",
+                "event_kind": "contract_context_read_receipt",
                 "read_receipt_hash": "sha256:context-local-rework-fresh-read",
                 "launch_text_hash": "sha256:context-local-rework-fresh-launch",
             },
@@ -81991,7 +82140,7 @@ def test_fresh_failed_qa_context_read_receipt_persists_and_startup_discovers_it(
         conn,
         PID,
         task_id=fresh_context.task_id,
-        event_kind="mf_subagent_read_receipt",
+        event_kind="contract_context_read_receipt",
     )
     assert len(fresh_read_events) == 1
     assert fresh_read_events[0]["payload"]["contract_runtime_canonical_line"][

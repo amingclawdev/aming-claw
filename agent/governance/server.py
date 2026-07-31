@@ -37259,6 +37259,7 @@ def _runtime_context_context_local_setup_authority(
             task_id=task_id,
             backlog_id=backlog_id,
         )
+        local_read_receipt_candidates: list[dict[str, Any]] = []
         for event in reversed(timeline_events):
             if not isinstance(event, Mapping):
                 continue
@@ -37276,8 +37277,10 @@ def _runtime_context_context_local_setup_authority(
                 else {}
             )
             if (
-                str(event.get("event_kind") or "").strip()
+                str(event.get("event_type") or "").strip()
                 != "mf_subagent_read_receipt"
+                or str(event.get("event_kind") or "").strip()
+                != "contract_context_read_receipt"
                 or str(event.get("status") or "").strip().lower()
                 not in {"ok", "accepted", "passed", "succeeded"}
                 or str(event_payload.get("runtime_context_id") or "").strip()
@@ -37307,18 +37310,31 @@ def _runtime_context_context_local_setup_authority(
                 is not False
             ):
                 continue
-            local_read_receipt = {
-                "event_id": int(event.get("id") or 0),
-                "event_ref": f"timeline:{int(event.get('id') or 0)}",
-                "read_receipt_hash": str(
-                    event_payload.get("read_receipt_hash") or ""
-                ),
-                "session_token_ref": expected_session_token_ref,
-                "fence_token_hash": expected_fence_token_hash,
-                "source": "task_timeline.mf_subagent_read_receipt",
-                "authenticated": True,
+            local_read_receipt_candidates.append(
+                {
+                    "event_id": int(event.get("id") or 0),
+                    "event_ref": f"timeline:{int(event.get('id') or 0)}",
+                    "read_receipt_hash": str(
+                        event_payload.get("read_receipt_hash") or ""
+                    ),
+                    "session_token_ref": expected_session_token_ref,
+                    "fence_token_hash": expected_fence_token_hash,
+                    "source": "task_timeline.contract_context_read_receipt",
+                    "authenticated": True,
+                }
+            )
+        receipt_identity_count = len(
+            {
+                (
+                    str(item.get("read_receipt_hash") or ""),
+                    str(item.get("session_token_ref") or ""),
+                    str(item.get("fence_token_hash") or ""),
+                )
+                for item in local_read_receipt_candidates
             }
-            break
+        )
+        if receipt_identity_count == 1:
+            local_read_receipt = local_read_receipt_candidates[0]
         if not local_read_receipt.get("event_id"):
             return {}
 
