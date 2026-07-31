@@ -27572,13 +27572,140 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
     expected_fence_token_hash = runtime_context_secret_hash(
         str(getattr(context, "fence_token", "") or "")
     )
+    successor_contract_evidence = (
+        _runtime_context_failed_qa_revision_contract_runtime_evidence(
+            conn,
+            project_id=str(getattr(context, "project_id", "") or ""),
+            context=context,
+        )
+    )
+    successor_dispatch_authority = (
+        successor_contract_evidence.get(
+            "successor_dispatch_revision_authority"
+        )
+        if isinstance(
+            successor_contract_evidence.get(
+                "successor_dispatch_revision_authority"
+            ),
+            Mapping,
+        )
+        else {}
+    )
     if (
         not runtime_context_id
         or not task_id
         or expected_attempt <= 1
-        or expected_retry_round <= 0
+        or (expected_retry_round <= 0 and not successor_dispatch_authority)
     ):
         return {}
+    expected_route_identity = _runtime_context_latest_route_identity(conn, context)
+
+    def _matches_preserved_auth_only(event: Mapping[str, Any]) -> bool:
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        route_identity = (
+            payload.get("route_identity")
+            if isinstance(payload.get("route_identity"), Mapping)
+            else {}
+        )
+        return bool(
+            str(event.get("status") or "").strip().lower()
+            in {"accepted", "passed", "succeeded"}
+            and (
+                str(event.get("event_type") or "").strip().lower()
+                == "observer.runtime_context_session_token_rejoin"
+                or (
+                    str(event.get("event_kind") or "").strip().lower()
+                    == "observer_command"
+                    and str(payload.get("action") or "").strip()
+                    == "runtime_context_session_token_rejoin"
+                )
+            )
+            and not _truthy_flag(payload.get("revision_rejoin_applied"))
+            and not _truthy_flag(payload.get("reopen_for_revision"))
+            and str(payload.get("runtime_context_id") or "").strip()
+            == runtime_context_id
+            and str(payload.get("task_id") or "").strip() == task_id
+            and str(payload.get("parent_task_id") or "").strip()
+            == parent_task_id
+            and int(payload.get("attempt") or 0) == expected_attempt
+            and int(payload.get("retry_round") or 0) == expected_retry_round
+            and str(payload.get("worker_id") or "").strip()
+            == expected_worker_id
+            and str(
+                payload.get("worker_slot_id") or payload.get("worker_id") or ""
+            ).strip()
+            == expected_worker_slot_id
+            and str(payload.get("fence_token_hash") or "").strip()
+            == expected_fence_token_hash
+            and str(payload.get("session_token_ref") or "").strip()
+            == active_session_token_ref
+            and str(
+                event.get("backlog_id") or payload.get("backlog_id") or ""
+            ).strip()
+            == backlog_id
+            and bool(expected_route_identity)
+            and not _runtime_context_route_identity_mismatch_fields(
+                expected_route_identity,
+                route_identity,
+            )
+        )
+
+    preserved_auth_only_events = [
+        event
+        for event in timeline_events
+        if isinstance(event, Mapping) and _matches_preserved_auth_only(event)
+    ]
+    preserved_auth_only_event_id = (
+        int(preserved_auth_only_events[0].get("id") or 0)
+        if successor_dispatch_authority
+        and len(preserved_auth_only_events) == 1
+        else 0
+    )
+    if preserved_auth_only_event_id:
+        for later in timeline_events:
+            if (
+                not isinstance(later, Mapping)
+                or int(later.get("id") or 0) <= preserved_auth_only_event_id
+            ):
+                continue
+            later_payload = (
+                later.get("payload")
+                if isinstance(later.get("payload"), Mapping)
+                else {}
+            )
+            if str(
+                later.get("task_id") or later_payload.get("task_id") or ""
+            ).strip() != task_id:
+                continue
+            later_kind = str(later.get("event_kind") or "").strip().lower()
+            later_type = str(later.get("event_type") or "").strip().lower()
+            later_status = str(later.get("status") or "").strip().lower()
+            if later_status not in {
+                "accepted",
+                "ok",
+                "pass",
+                "passed",
+                "succeeded",
+                "success",
+            }:
+                continue
+            if later_kind == "worker_commit" or later_type in {
+                "mf_subagent.worker_commit",
+                "runtime_context.worker_commit",
+            }:
+                preserved_auth_only_event_id = 0
+                break
+            if later_kind in {
+                "independent_verification",
+                "qa_review",
+                "qa_verification",
+            }:
+                preserved_auth_only_event_id = 0
+                break
     active_timeline_failed_qa = (
         _runtime_context_authenticated_failed_qa_timeline_boundary(
             conn=conn,
@@ -27681,10 +27808,14 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             ).strip()
             == event_ref
         )
+        preserved_auth_only_successor_authority = bool(
+            preserved_auth_only_event_id == event_id
+        )
         if not (
             timeline_reopen_authority
             or contract_runtime_reopen_authority
             or composed_timeline_reopen_authority
+            or preserved_auth_only_successor_authority
         ):
             continue
         if str(payload.get("runtime_context_id") or "").strip() != runtime_context_id:
@@ -27708,7 +27839,10 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             event_context_status != "worktree_ready"
             and not (
                 event_context_status == "running"
-                and contract_runtime_reopen_authority
+                and (
+                    contract_runtime_reopen_authority
+                    or preserved_auth_only_successor_authority
+                )
             )
         ):
             continue
@@ -27760,10 +27894,15 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             contract_runtime_reopen_authority
             and not canonical_timeline_reopen_authority
         )
+        effective_successor_dispatch_authority = bool(
+            preserved_auth_only_successor_authority
+            and successor_dispatch_authority
+        )
         if not (
             canonical_timeline_reopen_authority
             or legacy_timeline_reopen_authority
             or effective_contract_runtime_reopen_authority
+            or effective_successor_dispatch_authority
         ):
             continue
         route_identity = (
@@ -27782,6 +27921,7 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
         )
         marker_contract_execution_id = str(
             contract_runtime_failed_qa.get("contract_execution_id")
+            or successor_contract_evidence.get("contract_execution_id")
             or contract_runtime_worker_sequence.get("contract_execution_id")
             or ""
         ).strip()
@@ -27792,7 +27932,9 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             ).strip()
         if not failed_qa_source_ref:
             failed_qa_source_ref = str(
-                contract_runtime_failed_qa.get("failed_qa_source_ref") or ""
+                contract_runtime_failed_qa.get("failed_qa_source_ref")
+                or successor_contract_evidence.get("failed_qa_source_ref")
+                or ""
             ).strip()
         return {
             "schema_version": "contract_runtime.failed_qa_revision_rejoin_marker.v1",
@@ -27825,7 +27967,10 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
                 if canonical_timeline_reopen_authority
                 else (
                     "contract_runtime_completed_lines"
-                    if effective_contract_runtime_reopen_authority
+                    if (
+                        effective_contract_runtime_reopen_authority
+                        or effective_successor_dispatch_authority
+                    )
                     else ""
                 )
             ),
@@ -27844,6 +27989,11 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             "route_token_ref": route_token_ref,
             "route_identity_rebound": bool(payload.get("route_identity_rebound")),
             "evidence_backfill": False,
+            "successor_dispatch_revision_authority": dict(
+                successor_dispatch_authority
+            )
+            if effective_successor_dispatch_authority
+            else {},
             "session_token_ref_rotation": {
                 "schema_version": (
                     "contract_runtime.failed_qa_rejoin_session_ref_rotation.v1"
@@ -28374,6 +28524,158 @@ def _runtime_context_failed_qa_accepted_line_binding(
     return binding
 
 
+def _runtime_context_failed_qa_successor_dispatch_revision_authority(
+    record: Mapping[str, Any],
+    *,
+    failed_line: Mapping[str, Any],
+    context: Any,
+    dispatch_match: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind an old failed-QA line to one exact replacement dispatch."""
+
+    selected = _contract_runtime_current_dispatch_authority_line(record)
+    failed_index = int(failed_line.get("_completed_line_index") or -1)
+    dispatch_index = int(dispatch_match.get("line_index") or -1)
+    selected_index = int(selected.get("completed_line_index") or -1)
+    payload = (
+        selected.get("payload")
+        if isinstance(selected.get("payload"), Mapping)
+        else {}
+    )
+    revision = (
+        payload.get("failed_qa_rework_dispatch_revision")
+        if isinstance(payload.get("failed_qa_rework_dispatch_revision"), Mapping)
+        else {}
+    )
+    authority = (
+        payload.get("failed_qa_rework_dispatch_revision_authority")
+        if isinstance(
+            payload.get("failed_qa_rework_dispatch_revision_authority"), Mapping
+        )
+        else {}
+    )
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    if (
+        selected.get("status") != "selected"
+        or failed_index < 0
+        or dispatch_index <= failed_index
+        or selected_index != dispatch_index
+        or str(dispatch_match.get("source_ref") or "").strip()
+        != f"contract_runtime:{contract_execution_id}:completed_lines:{dispatch_index}"
+        or revision.get("append_only_history_preserved") is not True
+        or revision.get("timeline_projection_authoritative") is not False
+        or int(revision.get("failed_qa_completed_line_index") or -1)
+        != failed_index
+        or str(revision.get("runtime_context_id") or "").strip()
+        != runtime_context_id
+        or str(revision.get("task_id") or "").strip() != task_id
+        or authority.get("server_derived") is not True
+        or str(authority.get("source") or "").strip()
+        != "parallel_branch_allocate_failed_qa_rework"
+        or str(authority.get("contract_execution_id") or "").strip()
+        != contract_execution_id
+        or int(authority.get("failed_qa_completed_line_index") or -1)
+        != failed_index
+        or str(authority.get("runtime_context_id") or "").strip()
+        != runtime_context_id
+        or str(authority.get("task_id") or "").strip() != task_id
+    ):
+        return {}
+
+    failed_runtime_context_id = _timeline_first_deep_text(
+        failed_line, "runtime_context_id"
+    )
+    failed_task_id = _timeline_first_deep_text(failed_line, "task_id")
+    failed_parent_task_id = _timeline_first_deep_text(
+        failed_line, "parent_task_id"
+    )
+    failed_commit = str(
+        failed_line.get("commit_sha")
+        or _timeline_first_deep_text(failed_line, "candidate_commit_sha")
+        or _timeline_first_deep_text(failed_line, "candidate_commit")
+        or ""
+    ).strip()
+    if (
+        not failed_runtime_context_id
+        or not failed_task_id
+        or not failed_parent_task_id
+        or not parent_task_id
+        or parent_task_id != contract_execution_id
+        or failed_parent_task_id != parent_task_id
+        or failed_runtime_context_id == runtime_context_id
+        or failed_task_id == task_id
+        or not re.fullmatch(r"[0-9a-f]{40,64}", failed_commit)
+    ):
+        return {}
+
+    previous_implementation: Mapping[str, Any] | None = None
+    previous_index = -1
+    for index in range(failed_index - 1, -1, -1):
+        line = (record.get("completed_lines") or [])[index]
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() != "worker_implementation":
+            continue
+        if (
+            _timeline_first_deep_text(line, "runtime_context_id")
+            != failed_runtime_context_id
+            or _timeline_first_deep_text(line, "task_id") != failed_task_id
+            or _timeline_first_deep_text(line, "parent_task_id")
+            != failed_parent_task_id
+        ):
+            continue
+        previous_implementation = line
+        previous_index = index
+        break
+    superseded_commit_authority = (
+        _runtime_context_superseded_implementation_commit_authority(
+            record,
+            implementation=previous_implementation,
+            implementation_index=previous_index,
+            runtime_context_id=failed_runtime_context_id,
+            task_id=failed_task_id,
+        )
+    )
+    if (
+        superseded_commit_authority.get("errors")
+        or str(superseded_commit_authority.get("commit_sha") or "").strip()
+        != failed_commit
+    ):
+        return {}
+
+    binding = {
+        "schema_version": (
+            "runtime_context.failed_qa_successor_dispatch_revision_authority.v1"
+        ),
+        "source": "canonical_successor_dispatch_revision",
+        "server_derived": True,
+        "contract_execution_id": contract_execution_id,
+        "failed_qa_source_ref": (
+            f"contract_runtime:{contract_execution_id}:completed_lines:{failed_index}"
+        ),
+        "failed_qa_completed_line_index": failed_index,
+        "failed_runtime_context_id": failed_runtime_context_id,
+        "failed_task_id": failed_task_id,
+        "failed_parent_task_id": failed_parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "dispatch_source_ref": str(dispatch_match.get("source_ref") or ""),
+        "superseded_implementation_commit_authority": dict(
+            superseded_commit_authority
+        ),
+        "append_only_history_preserved": True,
+        "timeline_projection_authoritative": False,
+    }
+    binding["binding_hash"] = stable_sha256(binding)
+    return binding
+
+
 def _runtime_context_failed_qa_revision_contract_runtime_evidence(
     conn,
     *,
@@ -28435,18 +28737,28 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
         failed_line = _contract_runtime_latest_failed_qa_line(record)
         if not failed_line:
             continue
-        if not _runtime_context_failed_qa_line_matches_context(
+        successor_dispatch_revision_authority = {}
+        if _runtime_context_failed_qa_line_matches_context(
             failed_line,
             context=context,
             server_identity=dispatch_match,
         ):
-            continue
-        identity_binding = _runtime_context_failed_qa_accepted_line_binding(
-            record,
-            failed_line,
-            context=context,
-            dispatch_match=dispatch_match,
-        )
+            identity_binding = _runtime_context_failed_qa_accepted_line_binding(
+                record,
+                failed_line,
+                context=context,
+                dispatch_match=dispatch_match,
+            )
+        else:
+            successor_dispatch_revision_authority = (
+                _runtime_context_failed_qa_successor_dispatch_revision_authority(
+                    record,
+                    failed_line=failed_line,
+                    context=context,
+                    dispatch_match=dispatch_match,
+                )
+            )
+            identity_binding = dict(successor_dispatch_revision_authority)
         if not identity_binding:
             continue
         contract_execution_id = str(record.get("contract_execution_id") or "")
@@ -28493,6 +28805,9 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
                 if str(dispatch_route_identity.get(field) or "").strip()
             },
             "identity_binding": identity_binding,
+            "successor_dispatch_revision_authority": dict(
+                successor_dispatch_revision_authority
+            ),
             "runtime_context_id": _contract_runtime_context_identity(context)[0],
             "task_id": str(getattr(context, "task_id", "") or ""),
             "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
@@ -30633,10 +30948,6 @@ def _runtime_context_session_rejoin_guidance_eligibility(
         "server_derived": True,
         "context_status": status,
     }
-    if status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
-        projection.update({"eligible": True, "mode": "active_context_auth_only"})
-        return projection
-
     timeline_events = _runtime_context_service_timeline_events(
         conn,
         project_id=project_id,
@@ -30665,6 +30976,9 @@ def _runtime_context_session_rejoin_guidance_eligibility(
         context=context,
     ):
         projection.update({"eligible": True, "mode": "failed_qa_revision"})
+        return projection
+    if status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
+        projection.update({"eligible": True, "mode": "active_context_auth_only"})
         return projection
     if status != "validated":
         projection["blockers"] = ["context_status_not_rejoin_eligible"]
@@ -36051,6 +36365,43 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             "implementation revision claimed HEAD must match the clean assigned worktree HEAD"
         )
     prior_implementation_commit_authority: dict[str, Any] = {}
+    successor_marker_authority = (
+        resolved_revision_marker.get("successor_dispatch_revision_authority")
+        if isinstance(
+            resolved_revision_marker.get(
+                "successor_dispatch_revision_authority"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    if successor_marker_authority:
+        prior_implementation_commit_authority = dict(
+            successor_marker_authority.get(
+                "superseded_implementation_commit_authority"
+            )
+            if isinstance(
+                successor_marker_authority.get(
+                    "superseded_implementation_commit_authority"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        if (
+            prior_implementation_commit_authority.get("errors")
+            or not re.fullmatch(
+                r"[0-9a-f]{40,64}",
+                str(
+                    prior_implementation_commit_authority.get("commit_sha")
+                    or ""
+                ).strip(),
+            )
+        ):
+            errors.append(
+                "successor failed-QA revision requires exact superseded "
+                "implementation commit authority"
+            )
     if timeline_backed_failed_qa_revision:
         prior_implementation_commit_authority = (
             _runtime_context_superseded_implementation_commit_authority(
