@@ -67952,10 +67952,136 @@ def test_accepted_no_pass_completion_mismatch_projects_exact_failed_qa_rejoin(
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "lease_id",
+        "lease_expires_at",
+        "expected_status",
+        "expected_authorization_valid",
+        "expected_expired",
+    ),
+    [
+        (
+            "mfrlease-future",
+            "2026-07-24T03:00:00Z",
+            "active",
+            True,
+            False,
+        ),
+        (
+            "mfrlease-expired",
+            "2026-07-24T01:00:00Z",
+            "expired",
+            False,
+            True,
+        ),
+        (
+            "mfrlease-malformed",
+            "not-an-iso-timestamp",
+            "invalid",
+            False,
+            True,
+        ),
+        (
+            "mfrlease-naive",
+            "2026-07-24T03:00:00",
+            "invalid",
+            False,
+            True,
+        ),
+        (
+            "mfrlease-missing-expiry",
+            "",
+            "invalid",
+            False,
+            True,
+        ),
+        (
+            "",
+            "2026-07-24T03:00:00Z",
+            "invalid",
+            False,
+            True,
+        ),
+        ("", "", "no_lease_recorded", True, False),
+    ],
+)
+def test_failed_qa_session_lease_authorization_is_strict_and_fail_closed(
+    lease_id,
+    lease_expires_at,
+    expected_status,
+    expected_authorization_valid,
+    expected_expired,
+):
+    context = BranchTaskRuntimeContext(
+        project_id=PID,
+        backlog_id="AC-STRICT-FAILED-QA-LEASE",
+        task_id="strict-failed-qa-lease-worker",
+        parent_task_id="cex-strict-failed-qa-lease",
+        runtime_context_id="mfrctx-strict-failed-qa-lease",
+        branch_ref="refs/heads/strict-failed-qa-lease-worker",
+        status=parallel_branch_runtime.STATE_RUNNING,
+        worker_id="strict-failed-qa-lease-worker",
+        worker_slot_id="strict-failed-qa-lease-worker",
+        actual_host_worker_id="strict-failed-qa-lease-worker",
+        host_startup_id="startup-strict-failed-qa-lease",
+        host_session_id="session-strict-failed-qa-lease",
+        fence_token="fence-strict-failed-qa-lease",
+        session_token_hash=mf_subagent_session_token_hash(
+            "session-token-strict-failed-qa-lease"
+        ),
+        lease_id=lease_id,
+        lease_expires_at=lease_expires_at,
+    )
+
+    lease = parallel_branch_runtime.runtime_context_session_token_lease_view(
+        context,
+        now_iso="2026-07-24T02:00:00Z",
+    )
+    assert lease["status"] == expected_status
+    assert lease["authorization_valid"] is expected_authorization_valid
+    assert lease["expired"] is expected_expired
+    assert lease["canonical_no_lease"] is (
+        expected_status == "no_lease_recorded"
+    )
+
+    identity = (
+        parallel_branch_runtime.failed_qa_running_revision_session_identity(
+            context,
+            now_iso="2026-07-24T02:00:00Z",
+        )
+    )
+    if expected_authorization_valid:
+        assert identity
+        assert identity["session_lease_status"] == (
+            "active" if lease_id else "unleased_current"
+        )
+    else:
+        assert identity == {}
+
+
+@pytest.mark.parametrize(
+    (
+        "successful_lease_id",
+        "successful_lease_expires_at",
+        "expected_session_lease_status",
+    ),
+    [
+        ("", "", "unleased_current"),
+        (
+            "mfrlease-authoritative-future",
+            "2026-07-24T03:00:00Z",
+            "active",
+        ),
+    ],
+)
 def test_accepted_no_pass_fresh_running_rejoin_applies_revision_once(
     conn,
     monkeypatch,
     tmp_path,
+    successful_lease_id,
+    successful_lease_expires_at,
+    expected_session_lease_status,
 ):
     backlog_id = "AC-ACCEPTED-NO-PASS-REV19-REJOIN"
     target_root = tmp_path / "accepted-no-pass-rev19-rejoin"
@@ -68110,6 +68236,69 @@ def test_accepted_no_pass_fresh_running_rejoin_applies_revision_once(
         "accepted_no_pass_completion_failure"
     ] is True
 
+    # The HTTP caller does not own the rejoin authorization clock.  A real
+    # expired or structurally invalid persisted lease must remain rejected
+    # even when the request rolls ``now_iso`` backwards.
+    monkeypatch.setattr(
+        server,
+        "_utc_now",
+        lambda: "2026-07-24T02:00:00Z",
+    )
+    for lease_id, lease_expires_at in (
+        ("mfrlease-expired", "2026-07-24T01:00:00Z"),
+        ("mfrlease-malformed", "not-an-iso-timestamp"),
+        ("mfrlease-naive", "2999-07-24T01:00:00"),
+        ("mfrlease-missing-expiry", ""),
+        ("", "2999-07-24T01:00:00Z"),
+    ):
+        runtime_context = upsert_branch_context(
+            conn,
+            replace(
+                runtime_context,
+                lease_id=lease_id,
+                lease_expires_at=lease_expires_at,
+            ),
+            now_iso="2026-07-24T01:30:00Z",
+        )
+        with pytest.raises(GovernanceError) as lease_error:
+            server.handle_graph_governance_runtime_context_session_token_rejoin(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": (
+                            runtime_context.runtime_context_id
+                        ),
+                    },
+                    "coordinator",
+                    method="POST",
+                    body={
+                        "task_id": runtime_context.task_id,
+                        "parent_task_id": backlog_id,
+                        "target_project_root": str(target_root),
+                        "reason": "caller clock cannot revive invalid lease",
+                        "now_iso": "2000-01-01T00:00:00Z",
+                    },
+                )
+            )
+        assert lease_error.value.code == (
+            "runtime_context_failed_qa_running_rejoin_authority_invalid"
+        )
+        assert lease_error.value.details["fail_closed"] is True
+
+    # Canonical persisted no-lease startup compatibility is a distinct,
+    # server-proven state; malformed expiry cannot impersonate it.  The second
+    # parameter proves a genuinely future, complete lease remains authorized
+    # even when caller ``now_iso`` claims a far-future instant.
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(
+            runtime_context,
+            lease_id=successful_lease_id,
+            lease_expires_at=successful_lease_expires_at,
+        ),
+        now_iso="2026-07-24T01:31:00Z",
+    )
+
     dirty_path = target_root / "untracked-before-endpoint-rejoin.txt"
     dirty_path.write_text("dirty", encoding="utf-8")
     with pytest.raises(GovernanceError) as dirty_error:
@@ -68172,7 +68361,7 @@ def test_accepted_no_pass_fresh_running_rejoin_applies_revision_once(
     ] == "session-accepted-no-pass-rev19-worker"
     assert rejoin["failed_qa_running_revision_rejoin_authority"][
         "session_lease_status"
-    ] == "unleased_current"
+    ] == expected_session_lease_status
     assert rejoin["failed_qa_running_revision_rejoin_authority"][
         "actual_worktree_head"
     ] == worker_head_commit
@@ -68336,6 +68525,7 @@ def test_failed_qa_running_rejoin_primitive_requires_exact_typed_authority(
     assert authority.session_lease_id == context.lease_id
     assert authority.session_lease_expires_at == context.lease_expires_at
     assert authority.session_lease_status == "active"
+    assert authority.session_authorized_at.endswith("Z")
     assert authority.actual_host_worker_id == context.actual_host_worker_id
     assert authority.host_startup_id == context.host_startup_id
     assert authority.host_session_id == context.host_session_id
@@ -68382,6 +68572,16 @@ def test_failed_qa_running_rejoin_primitive_requires_exact_typed_authority(
         is None
     )
 
+    assert (
+        server._runtime_context_failed_qa_running_revision_rejoin_authority(
+            context=context,
+            evidence=failed_qa_evidence,
+            contract_execution_id=contract_execution_id,
+            route_identity=route_identity,
+            now_iso="3000-07-24T01:00:00Z",
+        )
+        is None
+    )
     with pytest.raises(BranchRuntimeFenceError):
         parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
             conn,
@@ -68406,10 +68606,13 @@ def test_failed_qa_running_rejoin_primitive_requires_exact_typed_authority(
             task_id=context.task_id,
             parent_task_id=context.parent_task_id,
             target_project_root=str(target_root),
-            reason="reject expired failed-QA worker session",
+            reason="reject forged typed authorization clock",
             now_iso="3000-07-24T01:00:00Z",
             reopen_for_revision=True,
-            failed_qa_running_revision_rejoin_authority=authority,
+            failed_qa_running_revision_rejoin_authority=replace(
+                authority,
+                session_authorized_at="3000-07-24T01:00:00Z",
+            ),
         )
 
     changed_host_session = upsert_branch_context(

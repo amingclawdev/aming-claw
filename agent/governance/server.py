@@ -30751,6 +30751,11 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
     reason = str(body.get("reason") or body.get("rejoin_reason") or "").strip()
     if not reason:
         raise ValidationError("reason is required for runtime-context session rejoin")
+    # Rejoin authorization is a server-clock decision.  ``body.now_iso`` is
+    # intentionally ignored: an HTTP caller must not revive an expired lease,
+    # reinterpret an invalid persisted expiry, or choose the replacement lease
+    # issuance time.  Tests can monkeypatch this internal clock explicitly.
+    authoritative_now_iso = _utc_now()
 
     conn = get_connection(project_id)
     try:
@@ -30965,7 +30970,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 evidence=contract_runtime_failed_qa_revision,
                 contract_execution_id=resolved_contract_execution_id,
                 route_identity=selected_route_identity,
-                now_iso=str(body.get("now_iso") or ""),
+                now_iso=authoritative_now_iso,
             )
         )
         if (
@@ -31073,7 +31078,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     conn,
                     context=context,
                     ttl_seconds=body.get("ttl_seconds"),
-                    now_iso=str(body.get("now_iso") or ""),
+                    now_iso=authoritative_now_iso,
                     authority=validated_missing_finish_rejoin_authority,
                 )
             else:
@@ -31091,7 +31096,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     ).strip(),
                     ttl_seconds=body.get("ttl_seconds"),
                     reason=reason,
-                    now_iso=str(body.get("now_iso") or ""),
+                    now_iso=authoritative_now_iso,
                     reopen_for_revision=failed_qa_reopen_for_revision,
                     failed_qa_running_revision_rejoin_authority=(
                         failed_qa_running_revision_rejoin_authority
@@ -31139,7 +31144,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         runtime_context_id=runtime_context_id,
                         task_id=task_id,
                         authority=post_qa_rejoin_retarget_authority,
-                        now_iso=str(body.get("now_iso") or ""),
+                        now_iso=authoritative_now_iso,
                     )
                 )
             except BranchRuntimeFenceError as exc:
@@ -31245,7 +31250,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     route_lineage_payload=rejoin_route_lineage_payload,
                     acceptance_status="accepted_at_rejoin",
                     route_evidence_type="resolved_active_route_token_ref_rejoin",
-                    now_iso=str(body.get("now_iso") or ""),
+                    now_iso=authoritative_now_iso,
                 )
             )
         if safe_route_identity:

@@ -864,6 +864,32 @@ def _runtime_context_parse_utc(value: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _runtime_context_parse_utc_strict(value: str) -> datetime | None:
+    """Parse an explicitly timezone-aware timestamp for auth decisions.
+
+    Persistence and display compatibility still use the permissive parser
+    above.  Lease authorization must not reinterpret a naive or malformed
+    expiry as UTC, because doing so can turn an invalid persisted lease into
+    an apparently active worker session.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    try:
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return None
+
+
 def _runtime_context_now_dt(now_iso: str = "") -> datetime:
     return _runtime_context_parse_utc(now_iso) or datetime.now(timezone.utc)
 
@@ -877,14 +903,51 @@ def runtime_context_session_token_lease_view(
     *,
     now_iso: str = "",
 ) -> dict[str, Any]:
-    now_dt = _runtime_context_now_dt(now_iso)
-    expires_dt = _runtime_context_parse_utc(context.lease_expires_at)
+    requested_now = str(now_iso or "").strip()
+    parsed_now = (
+        _runtime_context_parse_utc_strict(requested_now)
+        if requested_now
+        else datetime.now(timezone.utc)
+    )
+    clock_valid = parsed_now is not None
+    now_dt = parsed_now or datetime.now(timezone.utc)
+    lease_id = str(context.lease_id or "").strip()
+    lease_expires_at = str(context.lease_expires_at or "").strip()
+    canonical_no_lease = not lease_id and not lease_expires_at
+    has_lease = bool(lease_id or lease_expires_at)
+    expires_dt = _runtime_context_parse_utc_strict(lease_expires_at)
+    complete_lease_record = bool(lease_id and lease_expires_at)
+    lease_record_valid = bool(
+        canonical_no_lease
+        or (complete_lease_record and expires_dt is not None)
+    )
     remaining: int | None = None
-    expired = False
-    if expires_dt is not None:
+    if expires_dt is not None and clock_valid:
         remaining = int((expires_dt - now_dt).total_seconds())
-        expired = remaining <= 0
-    has_lease = bool(context.lease_id or context.lease_expires_at)
+    invalid = not clock_valid or not lease_record_valid
+    expired = bool(invalid or (remaining is not None and remaining <= 0))
+    if invalid:
+        status = "invalid"
+    elif canonical_no_lease:
+        status = "no_lease_recorded"
+    elif expired:
+        status = "expired"
+    else:
+        status = "active"
+    authorization_valid = bool(
+        clock_valid
+        and (
+            canonical_no_lease
+            or (lease_record_valid and status == "active")
+        )
+    )
+    invalid_reason = ""
+    if not clock_valid:
+        invalid_reason = "invalid_authorization_clock"
+    elif has_lease and not complete_lease_record:
+        invalid_reason = "incomplete_lease_record"
+    elif complete_lease_record and expires_dt is None:
+        invalid_reason = "invalid_lease_expiry"
     renewal_supported = bool(
         context.status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
         and context.session_token_hash
@@ -893,17 +956,19 @@ def runtime_context_session_token_lease_view(
     return {
         "schema_version": "mf_subagent_runtime_session_token_lease.v1",
         "has_lease": has_lease,
-        "lease_id": context.lease_id,
-        "lease_expires_at": context.lease_expires_at,
+        "lease_id": lease_id,
+        "lease_expires_at": lease_expires_at,
         "lease_remaining_ttl_seconds": (
             max(0, remaining) if remaining is not None else None
         ),
         "expired": expired,
-        "status": (
-            "expired"
-            if expired
-            else ("active" if has_lease else "no_lease_recorded")
-        ),
+        "status": status,
+        "authorization_valid": authorization_valid,
+        "canonical_no_lease": canonical_no_lease,
+        "lease_record_valid": lease_record_valid,
+        "expiry_valid": expires_dt is not None,
+        "clock_valid": clock_valid,
+        "invalid_reason": invalid_reason,
         "renewal_supported": renewal_supported,
         "renewal_max_ttl_seconds": MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS,
         "renewal_default_ttl_seconds": MF_SUBAGENT_SESSION_REISSUE_DEFAULT_TTL_SECONDS,
@@ -1305,6 +1370,7 @@ class FailedQaRunningRevisionRejoinAuthority:
     session_lease_id: str
     session_lease_expires_at: str
     session_lease_status: str
+    session_authorized_at: str
     actual_host_worker_id: str
     host_startup_id: str
     host_session_id: str
@@ -1333,7 +1399,8 @@ def failed_qa_running_revision_session_identity(
 
     lease = runtime_context_session_token_lease_view(context, now_iso=now_iso)
     session_token_ref = runtime_context_session_token_ref(context)
-    has_lease = lease.get("has_lease") is True
+    active_lease = str(lease.get("status") or "") == "active"
+    canonical_no_lease = lease.get("canonical_no_lease") is True
     core = {
         "session_token_ref": session_token_ref,
         "session_lease_id": str(context.lease_id or "").strip(),
@@ -1341,8 +1408,11 @@ def failed_qa_running_revision_session_identity(
             context.lease_expires_at or ""
         ).strip(),
         "session_lease_status": (
-            "active" if has_lease else "unleased_current"
+            "active" if active_lease else (
+                "unleased_current" if canonical_no_lease else ""
+            )
         ),
+        "session_authorized_at": str(lease.get("now") or "").strip(),
         "actual_host_worker_id": str(
             context.actual_host_worker_id or ""
         ).strip(),
@@ -1355,15 +1425,17 @@ def failed_qa_running_revision_session_identity(
             for field in (
                 "session_token_ref",
                 "session_lease_status",
+                "session_authorized_at",
                 "actual_host_worker_id",
                 "host_startup_id",
                 "host_session_id",
             )
         )
         or str(lease.get("session_token_ref") or "") != session_token_ref
+        or lease.get("authorization_valid") is not True
         or lease.get("expired") is not False
         or (
-            has_lease
+            active_lease
             and (
                 not core["session_lease_id"]
                 or not core["session_lease_expires_at"]
@@ -1375,13 +1447,14 @@ def failed_qa_running_revision_session_identity(
             )
         )
         or (
-            not has_lease
+            canonical_no_lease
             and (
                 core["session_lease_id"]
                 or core["session_lease_expires_at"]
                 or str(lease.get("status") or "") != "no_lease_recorded"
             )
         )
+        or not (active_lease or canonical_no_lease)
     ):
         return {}
     return {
@@ -11286,7 +11359,7 @@ def rejoin_mf_subagent_runtime_session_token(
         current_session_identity = (
             failed_qa_running_revision_session_identity(
                 context,
-                now_iso=now_iso,
+                now_iso=failed_qa_authority.session_authorized_at,
             )
         )
         if not current_session_identity:
@@ -11326,6 +11399,10 @@ def rejoin_mf_subagent_runtime_session_token(
             (
                 "session_lease_status",
                 current_session_identity["session_lease_status"],
+            ),
+            (
+                "session_authorized_at",
+                current_session_identity["session_authorized_at"],
             ),
             (
                 "actual_host_worker_id",
@@ -11496,7 +11573,13 @@ def rejoin_mf_subagent_runtime_session_token(
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     ttl = _bounded_reissue_ttl_seconds(ttl_seconds)
-    now_dt = _runtime_context_now_dt(now_iso)
+    effective_now_iso = (
+        failed_qa_authority.session_authorized_at
+        if fresh_running_failed_qa_rejoin
+        and failed_qa_authority is not None
+        else now_iso
+    )
+    now_dt = _runtime_context_now_dt(effective_now_iso)
     expires_at = _runtime_context_iso(now_dt + timedelta(seconds=ttl))
     new_token = secrets.token_urlsafe(32)
     new_hash = mf_subagent_session_token_hash(new_token)
