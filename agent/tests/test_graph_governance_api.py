@@ -42496,6 +42496,12 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
     copy_safe_body = receipt_skeleton["copy_safe_body"]
     assert copy_safe_body["canonical_event_kind"] == "contract_context_read_receipt"
     assert copy_safe_body["legacy_event_kind"] == "mf_subagent_read_receipt"
+    assert copy_safe_body["event_type"] == "mf_subagent_read_receipt"
+    assert copy_safe_body["event_kind"] == "contract_context_read_receipt"
+    assert copy_safe_body["payload"]["event_type"] == "mf_subagent_read_receipt"
+    assert copy_safe_body["payload"]["event_kind"] == (
+        "contract_context_read_receipt"
+    )
     assert copy_safe_body["actor_role"] == "mf_sub"
     assert copy_safe_body["contract_execution_id"] == "cex-empty-target-root"
     assert copy_safe_body["contract_chain_id"] == "cchain-empty-target-root"
@@ -42735,9 +42741,10 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
         conn,
         PID,
         task_id="worker-copy-safe-receipt",
-        event_kind="mf_subagent_read_receipt",
+        event_kind="contract_context_read_receipt",
     )
     assert len(events) == 1
+    assert events[0]["event_type"] == "mf_subagent_read_receipt"
     persisted_payload = events[0]["payload"]
     assert persisted_payload["target_project_root"] == str(target_root)
     assert persisted_payload["runtime_context_id"] == context.runtime_context_id
@@ -81484,6 +81491,24 @@ def test_fresh_failed_qa_rework_receipt_uses_context_local_timeline_without_resu
         _context_local_rework_receipt_fixture()
     )
     execution_id = record["contract_execution_id"]
+    # A prior receipt attempt for this reissued context may already be projected
+    # as an idempotent global line. Context-local failed-QA authority must win
+    # before that generic already-completed shortcut.
+    record["completed_lines"].append(
+        {
+            "stage_id": "worker_read",
+            "line_id": "worker_read_runtime_guide",
+            "actor_role": "mf_sub",
+            "evidence_kind": "read_receipt",
+            "line_instance_id": (
+                f"runtime_context:{context.runtime_context_id}"
+            ),
+            "payload": {
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+            },
+        }
+    )
     runtime = SimpleNamespace(
         pinned_definition_has_line=lambda _execution_id, _line_id: True,
         current_guide=lambda _execution_id, actor_role: None,

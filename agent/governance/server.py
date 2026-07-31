@@ -21209,7 +21209,8 @@ def _runtime_context_worker_recovery_payloads(
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
         "target_project_root": target_project_root,
-        "event_kind": "mf_subagent_read_receipt",
+        "event_type": "mf_subagent_read_receipt",
+        "event_kind": "contract_context_read_receipt",
         "status": "accepted",
         "read_receipt_hash": "<worker-computed-read-receipt-hash>",
         "launch_text_hash": launch_text_hash or "<launch-text-sha256-if-known>",
@@ -21239,7 +21240,8 @@ def _runtime_context_worker_recovery_payloads(
         "fence_token": fence_token_placeholder,
         "session_token_env": session_token_env,
         "fence_token_env": fence_token_env,
-        "event_kind": "mf_subagent_read_receipt",
+        "event_type": "mf_subagent_read_receipt",
+        "event_kind": "contract_context_read_receipt",
         "status": "accepted",
         "read_receipt_hash": "<worker-computed-read-receipt-hash>",
         "launch_text_hash": launch_text_hash or "<launch-text-sha256-if-known>",
@@ -37751,6 +37753,25 @@ def _runtime_context_submit_canonical_contract_line(
                     )
                 return precommit_correction
 
+    if next_line_id != line_id:
+        context_local_setup = (
+            _runtime_context_context_local_setup_authority(
+                conn,
+                project_id=project_id,
+                context=context,
+                record=stored_record,
+                stage_id=stage_id,
+                line_id=line_id,
+                evidence_kind=evidence_kind,
+                payload=canonical_payload,
+                failed_qa_rejoin_contexts=(
+                    failed_qa_rejoin_contexts or []
+                ),
+            )
+        )
+        if context_local_setup:
+            return context_local_setup
+
     for completed in record.get("completed_lines") or []:
         if not isinstance(completed, Mapping):
             continue
@@ -37791,23 +37812,6 @@ def _runtime_context_submit_canonical_contract_line(
             }
 
     if next_line_id != line_id:
-        context_local_setup = (
-            _runtime_context_context_local_setup_authority(
-                conn,
-                project_id=project_id,
-                context=context,
-                record=stored_record,
-                stage_id=stage_id,
-                line_id=line_id,
-                evidence_kind=evidence_kind,
-                payload=canonical_payload,
-                failed_qa_rejoin_contexts=(
-                    failed_qa_rejoin_contexts or []
-                ),
-            )
-        )
-        if context_local_setup:
-            return context_local_setup
         raise GovernanceError(
             "contract_runtime_canonical_line_out_of_order",
             "runtime-context facade cannot advance a non-current Contract line",
