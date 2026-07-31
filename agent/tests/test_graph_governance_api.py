@@ -83355,6 +83355,400 @@ def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage
     assert ambiguous_active.value.details["matching_completed_line_indexes"] == [4, 5]
 
 
+def _r10_incomplete_generic_finish_attestation_fixture(
+    conn,
+    tmp_path,
+    *,
+    suffix: str,
+):
+    backlog_id = f"AC-R10-INCOMPLETE-GENERIC-FINISH-{suffix.upper()}"
+    worker_task_id = f"r10-incomplete-generic-finish-{suffix}-worker"
+    fence_token = f"fence-r10-incomplete-generic-finish-{suffix}"
+    worker_token = f"token-r10-incomplete-generic-finish-{suffix}"
+    worktree = tmp_path / worker_task_id
+    head_commit = _init_test_git_repo(worktree)
+    changed_files = ["agent/governance/server.py"]
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id=f"r10-incomplete-generic-finish-{suffix}-parent",
+        worker_task_id=worker_task_id,
+        fence_token=fence_token,
+        token=worker_token,
+        worktree_path=str(worktree),
+        base_commit=head_commit,
+        owned_files=tuple(changed_files),
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    parent_task_id = runtime_context.parent_task_id or backlog_id
+    graph_trace_id = f"gqt-r10-incomplete-generic-finish-{suffix}"
+    worker_session_id = f"session-{runtime_context.task_id}"
+    implementation_event_ref = f"timeline:r10-implementation-{suffix}"
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=contract_execution_id,
+        runtime_context=runtime_context,
+        parent_task_id=parent_task_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+        implementation_event_ref=implementation_event_ref,
+        changed_files=changed_files,
+        owned_files=changed_files,
+    )
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(contract_execution_id)
+    route_identity = {
+        "route_id": f"route-r10-incomplete-generic-{suffix}",
+        "route_context_hash": _fake_sha(f"route-r10-incomplete-generic-{suffix}"),
+        "prompt_contract_id": f"rprompt-r10-incomplete-generic-{suffix}",
+        "prompt_contract_hash": _fake_sha(
+            f"prompt-r10-incomplete-generic-{suffix}"
+        ),
+        "route_token_ref": f"rtok-r10-incomplete-generic-{suffix}",
+        "visible_injection_manifest_hash": _fake_sha(
+            f"manifest-r10-incomplete-generic-{suffix}"
+        ),
+    }
+    worker_commit_line = record["completed_lines"][-1]
+    assert worker_commit_line["line_id"] == "worker_commit"
+    worker_commit_line["contract_execution_id"] = contract_execution_id
+    worker_commit_line["payload"]["contract_execution_id"] = (
+        contract_execution_id
+    )
+    for field, value in route_identity.items():
+        worker_commit_line[field] = value
+        worker_commit_line["payload"][field] = value
+    expected_revision = int(record["execution_state_revision"])
+    record["execution_state_revision"] = expected_revision + 1
+    record = runtime._record_view(
+        record,
+        actor_role="mf_sub",
+        completed_lines=record["completed_lines"],
+    )
+    runtime.store.update(
+        contract_execution_id,
+        record,
+        expected_revision=expected_revision,
+    )
+    record = runtime.store.get(contract_execution_id)
+    generic_write = server._contract_runtime_write_from_record(
+        record,
+        actor_role="mf_sub",
+        stage_id="worker_attestation",
+        line_id="worker_finish_time_attestation",
+        evidence_kind="record_finish_time_worker_attestation",
+    )
+    incomplete_payload = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "status": "passed",
+    }
+    generic_write.update(incomplete_payload)
+    generic_write["payload"] = incomplete_payload
+    generic_result = runtime.submit_line_write(
+        contract_execution_id,
+        generic_write,
+        actor_role="mf_sub",
+    )
+    assert generic_result["ok"] is True
+    assert generic_result["record"]["runtime_guide"]["next_legal_action"][
+        "line_id"
+    ] == "worker_finish_gate"
+
+    from agent.governance.parallel_branch_runtime import (
+        runtime_context_secret_hash,
+    )
+
+    session_token_ref = runtime_context_session_token_ref(runtime_context)
+    fence_token_hash = runtime_context_secret_hash(fence_token)
+    read_receipt_event_id = "5201"
+    read_receipt_hash = f"sha256:r10-incomplete-generic-read-{suffix}"
+    test_results = {
+        "status": "accepted_with_known_baseline_failure",
+        "no_pass": True,
+        "candidate_new_failures": 0,
+        "full_failed": 2,
+        "inherited_failed": 2,
+        "baseline_failed": 2,
+        "focused_passed": 7,
+        "full_passed": 701,
+        "baseline_passed": 700,
+        "command": "pytest -q focused",
+        "overall_release_pass_claimed": False,
+    }
+    public_attestation = {
+        "schema_version": "worker_transcript_self_attestation.v1",
+        "attestation_phase": "finish",
+        "status": "passed",
+        "ok": True,
+        "worker_self_attesting": True,
+        "self_attesting": True,
+        "finish_time_self_attesting": True,
+        "finish_time_blockers": [],
+        "worker_session_id": worker_session_id,
+        "filer_principal": worker_session_id,
+        "worker_transcript_ref": f"multi_agent:{worker_session_id}",
+        "harness_type": "codex",
+        "blockers": [],
+    }
+    strict_payload = {
+        "schema_version": "runtime_context.finish_time_worker_attestation.v1",
+        "action": "record_finish_time_worker_attestation",
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": backlog_id,
+        "worker_role": "mf_sub",
+        "worker_id": runtime_context.worker_id,
+        "worker_slot_id": runtime_context.worker_slot_id,
+        "worker_session_id": worker_session_id,
+        "filer_principal": worker_session_id,
+        "head_commit": head_commit,
+        "changed_files": changed_files,
+        "owned_files": changed_files,
+        "graph_trace_ids": [graph_trace_id],
+        "read_receipt_event_id": read_receipt_event_id,
+        "read_receipt_hash": read_receipt_hash,
+        "test_results": test_results,
+        "finish_time_worker_self_attestation": public_attestation,
+        "target_project_root": runtime_context.target_project_root,
+        "session_token_ref": session_token_ref,
+        "fence_token_hash": fence_token_hash,
+        "authorization_source": "runtime_context_copy_safe_worker_proof",
+        "observer_command_id": contract_execution_id,
+        "observer_impersonation": False,
+        "worker_evidence_provenance": {
+            "schema_version": "contract_runtime.worker_evidence_provenance.v1",
+            "source": "runtime_context_copy_safe_worker_proof",
+            "verified": True,
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": parent_task_id,
+            "session_token_ref": session_token_ref,
+            "fence_token_hash": fence_token_hash,
+            "worker_owned": True,
+            "observer_impersonation": False,
+        },
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        **route_identity,
+    }
+    return {
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context": runtime_context,
+        "runtime": runtime,
+        "parent_task_id": parent_task_id,
+        "head_commit": head_commit,
+        "changed_files": changed_files,
+        "worker_session_id": worker_session_id,
+        "read_receipt_event_id": read_receipt_event_id,
+        "read_receipt_hash": read_receipt_hash,
+        "test_results": test_results,
+        "strict_payload": strict_payload,
+    }
+
+
+def test_r10_generic_finish_attestation_cannot_outrun_strict_facade(conn, tmp_path):
+    backlog_id = "AC-R10-GENERIC-FINISH-FACADE-ONLY"
+    fence_token = "fence-r10-generic-finish-facade-only"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="r10-generic-finish-facade-only-parent",
+        worker_task_id="r10-generic-finish-facade-only-worker",
+        fence_token=fence_token,
+        token="token-r10-generic-finish-facade-only",
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=runtime_context.parent_task_id or backlog_id,
+        graph_trace_id="gqt-r10-generic-finish-facade-only",
+        head_commit="a" * 40,
+        implementation_event_ref="timeline:r10-generic-finish-facade-only",
+    )
+    before = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    response = server.handle_project_contract_runtime_line_write(
+        _ctx(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            method="POST",
+            body={
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": runtime_context.parent_task_id or backlog_id,
+                "worker_role": "mf_sub",
+                "fence_token": fence_token,
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "target_project_root": runtime_context.target_project_root,
+                "stage_id": "worker_attestation",
+                "line_id": "worker_finish_time_attestation",
+                "evidence_kind": "record_finish_time_worker_attestation",
+                "payload": {
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": runtime_context.parent_task_id
+                    or backlog_id,
+                    "status": "passed",
+                },
+            },
+        )
+    )
+    after = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+
+    assert response["ok"] is False
+    assert response["decision"]["errors"] == [
+        "worker_finish_time_attestation requires "
+        "runtime_context_finish_time_worker_attestation"
+    ]
+    assert after["execution_state_revision"] == before["execution_state_revision"]
+    assert after["completed_lines"] == before["completed_lines"]
+
+
+def test_r10_strict_facade_append_only_repairs_incomplete_generic_finish_line(
+    conn,
+    tmp_path,
+):
+    fixture = _r10_incomplete_generic_finish_attestation_fixture(
+        conn,
+        tmp_path,
+        suffix="positive",
+    )
+    execution_id = fixture["contract_execution_id"]
+    runtime_context = fixture["runtime_context"]
+    before = fixture["runtime"].store.get(execution_id)
+
+    repaired = server._runtime_context_submit_canonical_contract_line(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        contract_execution_id=execution_id,
+        stage_id="worker_attestation",
+        line_id="worker_finish_time_attestation",
+        evidence_kind="record_finish_time_worker_attestation",
+        payload=fixture["strict_payload"],
+    )
+
+    assert repaired["accepted"] is True
+    assert repaired["status"] == "revised_finish_attestation"
+    assert repaired["append_only_history_preserved"] is True
+    after = fixture["runtime"].store.get(execution_id)
+    assert len(after["completed_lines"]) == len(before["completed_lines"]) + 1
+    assert after["completed_lines"][-2] == before["completed_lines"][-1]
+    marker = after["completed_lines"][-1]["payload"][
+        "canonical_finish_attestation_recovery"
+    ]
+    assert marker["server_derived"] is True
+    assert marker["strict_facade_verified"] is True
+    assert marker["superseded_completed_line_index"] == len(
+        before["completed_lines"]
+    ) - 1
+    assert marker["active_worker_commit_line_index"] == len(
+        before["completed_lines"]
+    ) - 2
+
+    projected = server._runtime_context_contract_finish_attestation_projection(
+        conn,
+        context=runtime_context,
+        contract_execution_id=execution_id,
+        runtime_context_id=runtime_context.runtime_context_id,
+        parent_task_id=fixture["parent_task_id"],
+        head_commit=fixture["head_commit"],
+        changed_files=fixture["changed_files"],
+        test_results=fixture["test_results"],
+        supplied_worker_session_id=fixture["worker_session_id"],
+        supplied_filer_principal=fixture["worker_session_id"],
+        read_receipt_event_id=fixture["read_receipt_event_id"],
+        read_receipt_hash=fixture["read_receipt_hash"],
+        supplied_attestation=fixture["strict_payload"][
+            "finish_time_worker_self_attestation"
+        ],
+    )
+    assert projected["contract_runtime_source_ref"].endswith(
+        f":completed_lines:{len(after['completed_lines']) - 1}"
+    )
+    assert projected["canonical_finish_attestation_recovery"][
+        "strict_facade_verified"
+    ] is True
+
+    repeated = server._runtime_context_submit_canonical_contract_line(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        contract_execution_id=execution_id,
+        stage_id="worker_attestation",
+        line_id="worker_finish_time_attestation",
+        evidence_kind="record_finish_time_worker_attestation",
+        payload=fixture["strict_payload"],
+    )
+    assert repeated["status"] == "already_completed"
+    assert fixture["runtime"].store.get(execution_id)["completed_lines"] == after[
+        "completed_lines"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("runtime_context_id", "mfrctx-r10-cross-runtime"),
+        ("task_id", "r10-cross-task"),
+        ("parent_task_id", "r10-cross-parent"),
+        ("worker_session_id", "r10-cross-session"),
+        ("filer_principal", "r10-cross-session"),
+        ("session_token_ref", "wstok-r10-cross-session"),
+        ("fence_token_hash", "sha256:r10-cross-fence"),
+        ("head_commit", "b" * 40),
+        ("changed_files", ["agent/governance/other.py"]),
+        ("route_token_ref", "rtok-r10-cross-route"),
+        ("observer_impersonation", True),
+    ],
+)
+def test_r10_finish_attestation_recovery_rejects_cross_authority(
+    conn,
+    tmp_path,
+    field,
+    value,
+):
+    fixture = _r10_incomplete_generic_finish_attestation_fixture(
+        conn,
+        tmp_path,
+        suffix=field,
+    )
+    tampered = copy.deepcopy(fixture["strict_payload"])
+    tampered[field] = value
+    before = fixture["runtime"].store.get(fixture["contract_execution_id"])
+
+    with pytest.raises(GovernanceError) as exc:
+        server._runtime_context_submit_canonical_contract_line(
+            conn,
+            project_id=PID,
+            context=fixture["runtime_context"],
+            contract_execution_id=fixture["contract_execution_id"],
+            stage_id="worker_attestation",
+            line_id="worker_finish_time_attestation",
+            evidence_kind="record_finish_time_worker_attestation",
+            payload=tampered,
+        )
+
+    assert exc.value.code == "contract_runtime_finish_attestation_recovery_invalid"
+    after = fixture["runtime"].store.get(fixture["contract_execution_id"])
+    assert after["execution_state_revision"] == before["execution_state_revision"]
+    assert after["completed_lines"] == before["completed_lines"]
+
+
 def test_finish_gate_handler_binds_latest_canonical_attestation_round(
     conn,
     tmp_path,
