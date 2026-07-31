@@ -864,6 +864,32 @@ def _runtime_context_parse_utc(value: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _runtime_context_parse_utc_strict(value: str) -> datetime | None:
+    """Parse an explicitly timezone-aware timestamp for auth decisions.
+
+    Persistence and display compatibility still use the permissive parser
+    above.  Lease authorization must not reinterpret a naive or malformed
+    expiry as UTC, because doing so can turn an invalid persisted lease into
+    an apparently active worker session.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    try:
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return None
+
+
 def _runtime_context_now_dt(now_iso: str = "") -> datetime:
     return _runtime_context_parse_utc(now_iso) or datetime.now(timezone.utc)
 
@@ -877,14 +903,51 @@ def runtime_context_session_token_lease_view(
     *,
     now_iso: str = "",
 ) -> dict[str, Any]:
-    now_dt = _runtime_context_now_dt(now_iso)
-    expires_dt = _runtime_context_parse_utc(context.lease_expires_at)
+    requested_now = str(now_iso or "").strip()
+    parsed_now = (
+        _runtime_context_parse_utc_strict(requested_now)
+        if requested_now
+        else datetime.now(timezone.utc)
+    )
+    clock_valid = parsed_now is not None
+    now_dt = parsed_now or datetime.now(timezone.utc)
+    lease_id = str(context.lease_id or "").strip()
+    lease_expires_at = str(context.lease_expires_at or "").strip()
+    canonical_no_lease = not lease_id and not lease_expires_at
+    has_lease = bool(lease_id or lease_expires_at)
+    expires_dt = _runtime_context_parse_utc_strict(lease_expires_at)
+    complete_lease_record = bool(lease_id and lease_expires_at)
+    lease_record_valid = bool(
+        canonical_no_lease
+        or (complete_lease_record and expires_dt is not None)
+    )
     remaining: int | None = None
-    expired = False
-    if expires_dt is not None:
+    if expires_dt is not None and clock_valid:
         remaining = int((expires_dt - now_dt).total_seconds())
-        expired = remaining <= 0
-    has_lease = bool(context.lease_id or context.lease_expires_at)
+    invalid = not clock_valid or not lease_record_valid
+    expired = bool(invalid or (remaining is not None and remaining <= 0))
+    if invalid:
+        status = "invalid"
+    elif canonical_no_lease:
+        status = "no_lease_recorded"
+    elif expired:
+        status = "expired"
+    else:
+        status = "active"
+    authorization_valid = bool(
+        clock_valid
+        and (
+            canonical_no_lease
+            or (lease_record_valid and status == "active")
+        )
+    )
+    invalid_reason = ""
+    if not clock_valid:
+        invalid_reason = "invalid_authorization_clock"
+    elif has_lease and not complete_lease_record:
+        invalid_reason = "incomplete_lease_record"
+    elif complete_lease_record and expires_dt is None:
+        invalid_reason = "invalid_lease_expiry"
     renewal_supported = bool(
         context.status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
         and context.session_token_hash
@@ -893,17 +956,19 @@ def runtime_context_session_token_lease_view(
     return {
         "schema_version": "mf_subagent_runtime_session_token_lease.v1",
         "has_lease": has_lease,
-        "lease_id": context.lease_id,
-        "lease_expires_at": context.lease_expires_at,
+        "lease_id": lease_id,
+        "lease_expires_at": lease_expires_at,
         "lease_remaining_ttl_seconds": (
             max(0, remaining) if remaining is not None else None
         ),
         "expired": expired,
-        "status": (
-            "expired"
-            if expired
-            else ("active" if has_lease else "no_lease_recorded")
-        ),
+        "status": status,
+        "authorization_valid": authorization_valid,
+        "canonical_no_lease": canonical_no_lease,
+        "lease_record_valid": lease_record_valid,
+        "expiry_valid": expires_dt is not None,
+        "clock_valid": clock_valid,
+        "invalid_reason": invalid_reason,
         "renewal_supported": renewal_supported,
         "renewal_max_ttl_seconds": MF_SUBAGENT_SESSION_REISSUE_MAX_TTL_SECONDS,
         "renewal_default_ttl_seconds": MF_SUBAGENT_SESSION_REISSUE_DEFAULT_TTL_SECONDS,
@@ -1267,6 +1332,198 @@ class DependencyRevalidationQaCandidateAuthority:
     merge_conflict_verified: bool = True
     server_derived: bool = True
     caller_candidate_trusted: bool = False
+
+
+@dataclass(frozen=True)
+class FailedQaRunningRevisionRejoinAuthority:
+    """Server-derived authority for one fresh running failed-QA replacement.
+
+    A replacement worker has already recorded startup, so its branch context is
+    ``running`` instead of validated/merge-ready.  The typed authority binds an
+    immutable ContractRuntime failure and dispatch to the exact worker, fence,
+    candidate, route, and file scope; a request boolean cannot widen ordinary
+    running-session rejoin behavior.
+    """
+
+    project_id: str
+    backlog_id: str
+    task_id: str
+    parent_task_id: str
+    runtime_context_id: str
+    worker_id: str
+    worker_slot_id: str
+    fence_token_hash: str
+    candidate_commit_sha: str
+    contract_execution_id: str
+    dispatch_source_ref: str
+    failed_qa_source_ref: str
+    identity_binding_hash: str
+    route_identity_hash: str
+    branch_ref: str
+    target_project_root: str
+    worktree_path: str
+    merge_queue_id: str
+    owned_files: tuple[str, ...]
+    replacement_attempt: int
+    replacement_retry_round: int
+    session_token_ref: str
+    session_lease_id: str
+    session_lease_expires_at: str
+    session_lease_status: str
+    session_authorized_at: str
+    actual_host_worker_id: str
+    host_startup_id: str
+    host_session_id: str
+    session_identity_hash: str
+    actual_worktree_head: str
+    worktree_clean: bool
+    authority_hash: str
+    schema_version: str = (
+        "parallel_branch.failed_qa_running_revision_rejoin_authority.v1"
+    )
+    server_derived: bool = True
+    caller_claims_trusted: bool = False
+    immutable_failed_qa_verified: bool = True
+
+
+def failed_qa_running_revision_session_identity(
+    context: "BranchTaskRuntimeContext",
+    *,
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Return the canonical active worker session bound to failed-QA rejoin.
+
+    The result contains only copy-safe references and persisted host identity;
+    the raw worker token never enters the authority or its canonical hash.
+    """
+
+    lease = runtime_context_session_token_lease_view(context, now_iso=now_iso)
+    session_token_ref = runtime_context_session_token_ref(context)
+    active_lease = str(lease.get("status") or "") == "active"
+    canonical_no_lease = lease.get("canonical_no_lease") is True
+    core = {
+        "session_token_ref": session_token_ref,
+        "session_lease_id": str(context.lease_id or "").strip(),
+        "session_lease_expires_at": str(
+            context.lease_expires_at or ""
+        ).strip(),
+        "session_lease_status": (
+            "active" if active_lease else (
+                "unleased_current" if canonical_no_lease else ""
+            )
+        ),
+        "session_authorized_at": str(lease.get("now") or "").strip(),
+        "actual_host_worker_id": str(
+            context.actual_host_worker_id or ""
+        ).strip(),
+        "host_startup_id": str(context.host_startup_id or "").strip(),
+        "host_session_id": str(context.host_session_id or "").strip(),
+    }
+    if (
+        not all(
+            core[field]
+            for field in (
+                "session_token_ref",
+                "session_lease_status",
+                "session_authorized_at",
+                "actual_host_worker_id",
+                "host_startup_id",
+                "host_session_id",
+            )
+        )
+        or str(lease.get("session_token_ref") or "") != session_token_ref
+        or lease.get("authorization_valid") is not True
+        or lease.get("expired") is not False
+        or (
+            active_lease
+            and (
+                not core["session_lease_id"]
+                or not core["session_lease_expires_at"]
+                or str(lease.get("status") or "") != "active"
+                or str(lease.get("lease_id") or "")
+                != core["session_lease_id"]
+                or str(lease.get("lease_expires_at") or "")
+                != core["session_lease_expires_at"]
+            )
+        )
+        or (
+            canonical_no_lease
+            and (
+                core["session_lease_id"]
+                or core["session_lease_expires_at"]
+                or str(lease.get("status") or "") != "no_lease_recorded"
+            )
+        )
+        or not (active_lease or canonical_no_lease)
+    ):
+        return {}
+    return {
+        **core,
+        "session_identity_hash": _stable_authority_hash(core),
+    }
+
+
+def failed_qa_running_revision_clean_worktree_head(
+    context: "BranchTaskRuntimeContext",
+    *,
+    timeout_seconds: int = 5,
+) -> str:
+    """Return the clean assigned worktree HEAD or fail closed.
+
+    Rejoin is a pre-edit transition.  A missing/non-Git worktree, a path that
+    resolves below a different Git root, command failure, dirty state, or a
+    non-commit HEAD all invalidate the typed authority.
+    """
+
+    raw_worktree = str(context.worktree_path or "").strip()
+    if not raw_worktree:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    try:
+        worktree = Path(raw_worktree).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise BranchRuntimeFenceError(
+            "fence_invalidated_or_unknown"
+        ) from None
+    if not worktree.is_dir():
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    try:
+        root_proc = _git_preview_command(
+            worktree,
+            ["rev-parse", "--show-toplevel"],
+            timeout_seconds=timeout_seconds,
+        )
+        if root_proc.returncode != 0 or not root_proc.stdout.strip():
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        actual_root = Path(root_proc.stdout.strip()).expanduser().resolve(
+            strict=True
+        )
+        if actual_root != worktree:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+        status_proc = _git_preview_command(
+            worktree,
+            ["status", "--porcelain", "--untracked-files=all"],
+            timeout_seconds=timeout_seconds,
+        )
+        if status_proc.returncode != 0 or status_proc.stdout.strip():
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+        head_proc = _git_preview_command(
+            worktree,
+            ["rev-parse", "--verify", "HEAD^{commit}"],
+            timeout_seconds=timeout_seconds,
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        raise BranchRuntimeFenceError(
+            "fence_invalidated_or_unknown"
+        ) from None
+    if head_proc.returncode != 0:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    head = head_proc.stdout.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    return head
 
 
 @dataclass(frozen=True)
@@ -11055,6 +11312,9 @@ def rejoin_mf_subagent_runtime_session_token(
     reason: str = "",
     now_iso: str = "",
     reopen_for_revision: bool = False,
+    failed_qa_running_revision_rejoin_authority: (
+        FailedQaRunningRevisionRejoinAuthority | None
+    ) = None,
     post_qa_merge_conflict_rejoin_authority: (
         PostQaMergeConflictRejoinAuthority | None
     ) = None,
@@ -11077,8 +11337,150 @@ def rejoin_mf_subagent_runtime_session_token(
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if context.task_id != task:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    failed_qa_recovery_action = (
+        "mf_subagent_failed_qa_revision_rejoin_issued"
+    )
+    legacy_failed_qa_revision_rejoin = bool(
+        reopen_for_revision
+        and context.status in FAILED_QA_REVISION_REJOIN_STATES
+        and not (
+            context.status == STATE_WORKTREE_READY
+            and context.last_recovery_action == failed_qa_recovery_action
+        )
+    )
+    fresh_running_failed_qa_rejoin = False
+    failed_qa_authority = failed_qa_running_revision_rejoin_authority
+    if failed_qa_authority is not None:
+        if not isinstance(
+            failed_qa_authority,
+            FailedQaRunningRevisionRejoinAuthority,
+        ):
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        current_session_identity = (
+            failed_qa_running_revision_session_identity(
+                context,
+                now_iso=failed_qa_authority.session_authorized_at,
+            )
+        )
+        if not current_session_identity:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        actual_worktree_head = (
+            failed_qa_running_revision_clean_worktree_head(context)
+        )
+        expected_scope = (
+            ("project_id", context.project_id),
+            ("backlog_id", context.backlog_id),
+            ("task_id", context.task_id),
+            ("parent_task_id", _parent_task_id_for_context(context)),
+            ("runtime_context_id", runtime_id),
+            ("worker_id", context.worker_id),
+            ("worker_slot_id", context.worker_slot_id or context.worker_id),
+            ("fence_token_hash", runtime_context_secret_hash(context.fence_token)),
+            ("candidate_commit_sha", context.head_commit),
+            ("branch_ref", context.branch_ref),
+            (
+                "target_project_root",
+                runtime_context_effective_target_project_root(context),
+            ),
+            ("worktree_path", context.worktree_path),
+            ("merge_queue_id", context.merge_queue_id),
+            (
+                "session_token_ref",
+                current_session_identity["session_token_ref"],
+            ),
+            (
+                "session_lease_id",
+                current_session_identity["session_lease_id"],
+            ),
+            (
+                "session_lease_expires_at",
+                current_session_identity["session_lease_expires_at"],
+            ),
+            (
+                "session_lease_status",
+                current_session_identity["session_lease_status"],
+            ),
+            (
+                "session_authorized_at",
+                current_session_identity["session_authorized_at"],
+            ),
+            (
+                "actual_host_worker_id",
+                current_session_identity["actual_host_worker_id"],
+            ),
+            (
+                "host_startup_id",
+                current_session_identity["host_startup_id"],
+            ),
+            (
+                "host_session_id",
+                current_session_identity["host_session_id"],
+            ),
+            (
+                "session_identity_hash",
+                current_session_identity["session_identity_hash"],
+            ),
+            ("actual_worktree_head", actual_worktree_head),
+        )
+        authority_payload = asdict(failed_qa_authority)
+        authority_hash = str(authority_payload.pop("authority_hash") or "")
+        contract_execution_id = str(
+            failed_qa_authority.contract_execution_id or ""
+        ).strip()
+        contract_source_prefix = f"contract_runtime:{contract_execution_id}:"
+        expected_owned_files = tuple(
+            context.owned_files or context.target_files or ()
+        )
+        if (
+            any(
+                str(getattr(failed_qa_authority, field_name, "") or "").strip()
+                != str(expected_value or "").strip()
+                for field_name, expected_value in expected_scope
+            )
+            or tuple(failed_qa_authority.owned_files) != expected_owned_files
+            or context.status != STATE_RUNNING
+            or int(context.attempt or 0) <= 1
+            or int(context.retry_round or 0) != 0
+            or failed_qa_authority.replacement_attempt
+            != int(context.attempt or 0)
+            or failed_qa_authority.replacement_retry_round
+            != int(context.retry_round or 0)
+            or failed_qa_authority.schema_version
+            != "parallel_branch.failed_qa_running_revision_rejoin_authority.v1"
+            or failed_qa_authority.server_derived is not True
+            or failed_qa_authority.caller_claims_trusted is not False
+            or failed_qa_authority.immutable_failed_qa_verified is not True
+            or failed_qa_authority.worktree_clean is not True
+            or actual_worktree_head
+            != str(context.head_commit or "").strip().lower()
+            or actual_worktree_head
+            != str(failed_qa_authority.candidate_commit_sha or "")
+            .strip()
+            .lower()
+            or not re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                str(failed_qa_authority.candidate_commit_sha or ""),
+            )
+            or not contract_execution_id
+            or not str(failed_qa_authority.dispatch_source_ref).startswith(
+                contract_source_prefix
+            )
+            or not str(failed_qa_authority.failed_qa_source_ref).startswith(
+                contract_source_prefix
+            )
+            or not str(failed_qa_authority.identity_binding_hash).startswith(
+                "sha256:"
+            )
+            or not str(failed_qa_authority.route_identity_hash).startswith(
+                "sha256:"
+            )
+            or authority_hash != _stable_authority_hash(authority_payload)
+        ):
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        fresh_running_failed_qa_rejoin = bool(reopen_for_revision)
     failed_qa_revision_rejoin = bool(
-        reopen_for_revision and context.status in FAILED_QA_REVISION_REJOIN_STATES
+        legacy_failed_qa_revision_rejoin
+        or fresh_running_failed_qa_rejoin
     )
     post_qa_conflict_rejoin = False
     authority = post_qa_merge_conflict_rejoin_authority
@@ -11171,7 +11573,13 @@ def rejoin_mf_subagent_runtime_session_token(
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
     ttl = _bounded_reissue_ttl_seconds(ttl_seconds)
-    now_dt = _runtime_context_now_dt(now_iso)
+    effective_now_iso = (
+        failed_qa_authority.session_authorized_at
+        if fresh_running_failed_qa_rejoin
+        and failed_qa_authority is not None
+        else now_iso
+    )
+    now_dt = _runtime_context_now_dt(effective_now_iso)
     expires_at = _runtime_context_iso(now_dt + timedelta(seconds=ttl))
     new_token = secrets.token_urlsafe(32)
     new_hash = mf_subagent_session_token_hash(new_token)
@@ -11179,7 +11587,13 @@ def rejoin_mf_subagent_runtime_session_token(
     if post_qa_conflict_rejoin:
         recovery_action = "mf_subagent_post_qa_merge_conflict_rejoin_issued"
     elif failed_qa_revision_rejoin:
-        recovery_action = "mf_subagent_failed_qa_revision_rejoin_issued"
+        recovery_action = failed_qa_recovery_action
+    elif (
+        reopen_for_revision
+        and context.status == STATE_WORKTREE_READY
+        and context.last_recovery_action == failed_qa_recovery_action
+    ):
+        recovery_action = failed_qa_recovery_action
     else:
         recovery_action = "mf_subagent_session_token_rejoin_issued"
     saved = upsert_branch_context(
@@ -11216,6 +11630,12 @@ def rejoin_mf_subagent_runtime_session_token(
         "principal_id": saved.worker_slot_id or saved.worker_id or saved.agent_id,
         "reopen_for_revision": revision_rejoin,
         "reopen_for_failed_qa_revision": failed_qa_revision_rejoin,
+        "revision_rejoin_applied": revision_rejoin,
+        "failed_qa_running_revision_rejoin_authority": (
+            asdict(failed_qa_authority)
+            if fresh_running_failed_qa_rejoin
+            else {}
+        ),
         "reopen_for_post_qa_merge_conflict": post_qa_conflict_rejoin,
         "post_qa_merge_conflict_rejoin_authority": (
             asdict(authority) if post_qa_conflict_rejoin else {}

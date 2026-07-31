@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import fields, replace
+from dataclasses import asdict, fields, replace
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 import copy
@@ -67925,6 +67925,18 @@ def test_accepted_no_pass_completion_mismatch_projects_exact_failed_qa_rejoin(
     assert running_revision["failed_qa_source_ref"].startswith(
         "contract_runtime:"
     )
+    fresh_attempt_revision = _known_baseline_failed_qa_revision_evidence(
+        monkeypatch,
+        record,
+        status="running",
+        last_recovery_action="mf_subagent_startup_recorded",
+        attempt=2,
+        retry_round=0,
+    )
+    assert fresh_attempt_revision["status"] == "revision_required"
+    assert fresh_attempt_revision["failed_qa_source_ref"].startswith(
+        "contract_runtime:"
+    )
     assert (
         _known_baseline_failed_qa_revision_evidence(
             monkeypatch,
@@ -67940,10 +67952,136 @@ def test_accepted_no_pass_completion_mismatch_projects_exact_failed_qa_rejoin(
     )
 
 
-def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
+@pytest.mark.parametrize(
+    (
+        "lease_id",
+        "lease_expires_at",
+        "expected_status",
+        "expected_authorization_valid",
+        "expected_expired",
+    ),
+    [
+        (
+            "mfrlease-future",
+            "2026-07-24T03:00:00Z",
+            "active",
+            True,
+            False,
+        ),
+        (
+            "mfrlease-expired",
+            "2026-07-24T01:00:00Z",
+            "expired",
+            False,
+            True,
+        ),
+        (
+            "mfrlease-malformed",
+            "not-an-iso-timestamp",
+            "invalid",
+            False,
+            True,
+        ),
+        (
+            "mfrlease-naive",
+            "2026-07-24T03:00:00",
+            "invalid",
+            False,
+            True,
+        ),
+        (
+            "mfrlease-missing-expiry",
+            "",
+            "invalid",
+            False,
+            True,
+        ),
+        (
+            "",
+            "2026-07-24T03:00:00Z",
+            "invalid",
+            False,
+            True,
+        ),
+        ("", "", "no_lease_recorded", True, False),
+    ],
+)
+def test_failed_qa_session_lease_authorization_is_strict_and_fail_closed(
+    lease_id,
+    lease_expires_at,
+    expected_status,
+    expected_authorization_valid,
+    expected_expired,
+):
+    context = BranchTaskRuntimeContext(
+        project_id=PID,
+        backlog_id="AC-STRICT-FAILED-QA-LEASE",
+        task_id="strict-failed-qa-lease-worker",
+        parent_task_id="cex-strict-failed-qa-lease",
+        runtime_context_id="mfrctx-strict-failed-qa-lease",
+        branch_ref="refs/heads/strict-failed-qa-lease-worker",
+        status=parallel_branch_runtime.STATE_RUNNING,
+        worker_id="strict-failed-qa-lease-worker",
+        worker_slot_id="strict-failed-qa-lease-worker",
+        actual_host_worker_id="strict-failed-qa-lease-worker",
+        host_startup_id="startup-strict-failed-qa-lease",
+        host_session_id="session-strict-failed-qa-lease",
+        fence_token="fence-strict-failed-qa-lease",
+        session_token_hash=mf_subagent_session_token_hash(
+            "session-token-strict-failed-qa-lease"
+        ),
+        lease_id=lease_id,
+        lease_expires_at=lease_expires_at,
+    )
+
+    lease = parallel_branch_runtime.runtime_context_session_token_lease_view(
+        context,
+        now_iso="2026-07-24T02:00:00Z",
+    )
+    assert lease["status"] == expected_status
+    assert lease["authorization_valid"] is expected_authorization_valid
+    assert lease["expired"] is expected_expired
+    assert lease["canonical_no_lease"] is (
+        expected_status == "no_lease_recorded"
+    )
+
+    identity = (
+        parallel_branch_runtime.failed_qa_running_revision_session_identity(
+            context,
+            now_iso="2026-07-24T02:00:00Z",
+        )
+    )
+    if expected_authorization_valid:
+        assert identity
+        assert identity["session_lease_status"] == (
+            "active" if lease_id else "unleased_current"
+        )
+    else:
+        assert identity == {}
+
+
+@pytest.mark.parametrize(
+    (
+        "successful_lease_id",
+        "successful_lease_expires_at",
+        "expected_session_lease_status",
+    ),
+    [
+        ("", "", "unleased_current"),
+        (
+            "mfrlease-authoritative-future",
+            "2026-07-24T03:00:00Z",
+            "active",
+        ),
+    ],
+)
+def test_accepted_no_pass_fresh_running_rejoin_applies_revision_once(
     conn,
     monkeypatch,
     tmp_path,
+    successful_lease_id,
+    successful_lease_expires_at,
+    expected_session_lease_status,
 ):
     backlog_id = "AC-ACCEPTED-NO-PASS-REV19-REJOIN"
     target_root = tmp_path / "accepted-no-pass-rev19-rejoin"
@@ -67984,9 +68122,15 @@ def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
         conn,
         replace(
             runtime_context,
-            status=STATE_VALIDATED,
-            attempt=1,
+            status=parallel_branch_runtime.STATE_RUNNING,
+            last_recovery_action="mf_subagent_startup_recorded",
+            attempt=2,
             retry_round=0,
+            lease_id="",
+            lease_expires_at="",
+            actual_host_worker_id="accepted-no-pass-rev19-worker",
+            host_startup_id="startup-accepted-no-pass-rev19-worker",
+            host_session_id="session-accepted-no-pass-rev19-worker",
         ),
         now_iso="2026-07-24T01:00:00Z",
     )
@@ -68092,6 +68236,95 @@ def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
         "accepted_no_pass_completion_failure"
     ] is True
 
+    # The HTTP caller does not own the rejoin authorization clock.  A real
+    # expired or structurally invalid persisted lease must remain rejected
+    # even when the request rolls ``now_iso`` backwards.
+    monkeypatch.setattr(
+        server,
+        "_utc_now",
+        lambda: "2026-07-24T02:00:00Z",
+    )
+    for lease_id, lease_expires_at in (
+        ("mfrlease-expired", "2026-07-24T01:00:00Z"),
+        ("mfrlease-malformed", "not-an-iso-timestamp"),
+        ("mfrlease-naive", "2999-07-24T01:00:00"),
+        ("mfrlease-missing-expiry", ""),
+        ("", "2999-07-24T01:00:00Z"),
+    ):
+        runtime_context = upsert_branch_context(
+            conn,
+            replace(
+                runtime_context,
+                lease_id=lease_id,
+                lease_expires_at=lease_expires_at,
+            ),
+            now_iso="2026-07-24T01:30:00Z",
+        )
+        with pytest.raises(GovernanceError) as lease_error:
+            server.handle_graph_governance_runtime_context_session_token_rejoin(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": (
+                            runtime_context.runtime_context_id
+                        ),
+                    },
+                    "coordinator",
+                    method="POST",
+                    body={
+                        "task_id": runtime_context.task_id,
+                        "parent_task_id": backlog_id,
+                        "target_project_root": str(target_root),
+                        "reason": "caller clock cannot revive invalid lease",
+                        "now_iso": "2000-01-01T00:00:00Z",
+                    },
+                )
+            )
+        assert lease_error.value.code == (
+            "runtime_context_failed_qa_running_rejoin_authority_invalid"
+        )
+        assert lease_error.value.details["fail_closed"] is True
+
+    # Canonical persisted no-lease startup compatibility is a distinct,
+    # server-proven state; malformed expiry cannot impersonate it.  The second
+    # parameter proves a genuinely future, complete lease remains authorized
+    # even when caller ``now_iso`` claims a far-future instant.
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(
+            runtime_context,
+            lease_id=successful_lease_id,
+            lease_expires_at=successful_lease_expires_at,
+        ),
+        now_iso="2026-07-24T01:31:00Z",
+    )
+
+    dirty_path = target_root / "untracked-before-endpoint-rejoin.txt"
+    dirty_path.write_text("dirty", encoding="utf-8")
+    with pytest.raises(GovernanceError) as dirty_error:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "target_project_root": str(target_root),
+                    "reason": "reject dirty failed-QA replacement worktree",
+                    "now_iso": "2999-07-24T01:00:30Z",
+                },
+            )
+        )
+    assert dirty_error.value.code == (
+        "runtime_context_failed_qa_running_rejoin_authority_invalid"
+    )
+    assert dirty_error.value.details["fail_closed"] is True
+    dirty_path.unlink()
+
     rejoin = server.handle_graph_governance_runtime_context_session_token_rejoin(
         _ctx_with_role(
             {
@@ -68111,7 +68344,31 @@ def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
     )
 
     assert rejoin["reopen_for_revision"] is True
+    assert rejoin["revision_rejoin_applied"] is True
     assert rejoin["timeline_reopen_for_revision"] is False
+    assert rejoin["previous_status"] == parallel_branch_runtime.STATE_RUNNING
+    assert rejoin["current_status"] == STATE_WORKTREE_READY
+    assert rejoin["attempt"] == 3
+    assert rejoin["retry_round"] == 1
+    assert rejoin["failed_qa_running_revision_rejoin_authority"][
+        "server_derived"
+    ] is True
+    assert rejoin["failed_qa_running_revision_rejoin_authority"][
+        "session_token_ref"
+    ] == prior_session_ref
+    assert rejoin["failed_qa_running_revision_rejoin_authority"][
+        "host_session_id"
+    ] == "session-accepted-no-pass-rev19-worker"
+    assert rejoin["failed_qa_running_revision_rejoin_authority"][
+        "session_lease_status"
+    ] == expected_session_lease_status
+    assert rejoin["failed_qa_running_revision_rejoin_authority"][
+        "actual_worktree_head"
+    ] == worker_head_commit
+    assert "token-accepted-no-pass-rev19" not in json.dumps(
+        rejoin["failed_qa_running_revision_rejoin_authority"],
+        sort_keys=True,
+    )
     projected = rejoin["contract_runtime_failed_qa_revision"]
     assert projected["status"] == "revision_required"
     assert projected["identity_binding"][
@@ -68124,6 +68381,9 @@ def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
     assert saved is not None
     assert rejoin["session_token_ref"] != prior_session_ref
     assert runtime_context_session_token_ref(saved) == rejoin["session_token_ref"]
+    assert saved.last_recovery_action == (
+        "mf_subagent_failed_qa_revision_rejoin_issued"
+    )
     assert {
         "runtime_context_id": saved.runtime_context_id,
         "task_id": saved.task_id,
@@ -68135,6 +68395,508 @@ def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
         "target_project_root": saved.target_project_root,
         "owned_files": tuple(saved.owned_files),
     } == prior_identity
+
+    second_rejoin = (
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "target_project_root": str(target_root),
+                    "reason": "rotate auth after failed-QA revision was applied",
+                    "now_iso": "2999-07-24T01:02:00Z",
+                },
+            )
+        )
+    )
+    assert second_rejoin["reopen_for_revision"] is True
+    assert second_rejoin["revision_rejoin_applied"] is False
+    assert second_rejoin["attempt"] == 3
+    assert second_rejoin["retry_round"] == 1
+    after_second = get_branch_context(conn, PID, runtime_context.task_id)
+    assert after_second is not None
+    assert after_second.status == STATE_WORKTREE_READY
+    assert after_second.attempt == 3
+    assert after_second.retry_round == 1
+    assert after_second.last_recovery_action == (
+        "mf_subagent_failed_qa_revision_rejoin_issued"
+    )
+
+
+def test_failed_qa_running_rejoin_primitive_requires_exact_typed_authority(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "failed-qa-running-primitive"
+    candidate_commit = _init_test_git_repo(target_root)
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            backlog_id="AC-FAILED-QA-RUNNING-PRIMITIVE",
+            task_id="failed-qa-running-primitive-worker",
+            parent_task_id="cex-failed-qa-running-primitive",
+            runtime_context_id="mfrctx-failed-qa-running-primitive",
+            branch_ref="refs/heads/failed-qa-running-primitive",
+            status=parallel_branch_runtime.STATE_RUNNING,
+            last_recovery_action="mf_subagent_startup_recorded",
+            attempt=2,
+            retry_round=0,
+            worker_id="failed-qa-running-primitive-worker",
+            worker_slot_id="failed-qa-running-primitive-worker",
+            actual_host_worker_id="failed-qa-running-primitive-worker",
+            host_startup_id="startup-failed-qa-running-primitive",
+            host_session_id="session-failed-qa-running-primitive",
+            fence_token="fence-failed-qa-running-primitive",
+            target_project_root=str(target_root),
+            worktree_path=str(target_root),
+            head_commit=candidate_commit,
+            session_token_hash=mf_subagent_session_token_hash(
+                "session-token-failed-qa-running-primitive"
+            ),
+            lease_id="mfrlease-failed-qa-running-primitive",
+            lease_expires_at="2999-07-25T01:00:00Z",
+            owned_files=("agent/governance/server.py",),
+            merge_queue_id="mq-failed-qa-running-primitive",
+        ),
+    )
+    contract_execution_id = context.parent_task_id
+    dispatch_source_ref = (
+        f"contract_runtime:{contract_execution_id}:completed_lines:1"
+    )
+    identity_binding = {
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+        "fence_token_hash": runtime_context_secret_hash(context.fence_token),
+        "candidate_commit_sha": candidate_commit,
+        "dispatch_source_ref": dispatch_source_ref,
+    }
+    identity_binding["binding_hash"] = server.stable_sha256(identity_binding)
+    failed_qa_evidence = {
+        "schema_version": (
+            "runtime_context.contract_runtime_failed_qa_revision_evidence.v1"
+        ),
+        "source": "contract_runtime_completed_lines",
+        "status": "revision_required",
+        "project_id": PID,
+        "backlog_id": context.backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "dispatch_source_ref": dispatch_source_ref,
+        "failed_qa_source_ref": (
+            f"contract_runtime:{contract_execution_id}:completed_lines:10"
+        ),
+        "identity_binding": identity_binding,
+        "failed_qa_rejoin_reopened": False,
+    }
+    route_identity = {
+        "route_id": "route-failed-qa-running-primitive",
+        "route_context_hash": "sha256:" + "1" * 64,
+        "prompt_contract_id": "rprompt-failed-qa-running-primitive",
+        "prompt_contract_hash": "sha256:" + "2" * 64,
+        "route_token_ref": "rtok-failed-qa-running-primitive",
+        "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+    }
+    failed_qa_evidence["dispatch_route_identity"] = dict(route_identity)
+    authority = (
+        server._runtime_context_failed_qa_running_revision_rejoin_authority(
+            context=context,
+            evidence=failed_qa_evidence,
+            contract_execution_id=contract_execution_id,
+            route_identity=route_identity,
+        )
+    )
+    assert authority is not None
+    authority_payload = asdict(authority)
+    assert authority.session_token_ref == runtime_context_session_token_ref(
+        context
+    )
+    assert authority.session_lease_id == context.lease_id
+    assert authority.session_lease_expires_at == context.lease_expires_at
+    assert authority.session_lease_status == "active"
+    assert authority.session_authorized_at.endswith("Z")
+    assert authority.actual_host_worker_id == context.actual_host_worker_id
+    assert authority.host_startup_id == context.host_startup_id
+    assert authority.host_session_id == context.host_session_id
+    assert authority.actual_worktree_head == candidate_commit
+    assert authority.worktree_clean is True
+    assert authority.session_identity_hash.startswith("sha256:")
+    assert "session_token_hash" not in authority_payload
+    assert "session-token-failed-qa-running-primitive" not in json.dumps(
+        authority_payload,
+        sort_keys=True,
+    )
+    unhashed_authority = dict(authority_payload)
+    assert unhashed_authority.pop("authority_hash") == server.stable_sha256(
+        unhashed_authority
+    )
+    assert (
+        server._runtime_context_failed_qa_running_revision_rejoin_authority(
+            context=context,
+            evidence=failed_qa_evidence,
+            contract_execution_id="cex-wrong",
+            route_identity=route_identity,
+        )
+        is None
+    )
+    mismatched_binding = dict(identity_binding)
+    mismatched_binding["parent_task_id"] = "different-parent"
+    mismatched_binding["binding_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in mismatched_binding.items()
+            if key != "binding_hash"
+        }
+    )
+    assert (
+        server._runtime_context_failed_qa_running_revision_rejoin_authority(
+            context=context,
+            evidence={
+                **failed_qa_evidence,
+                "identity_binding": mismatched_binding,
+            },
+            contract_execution_id=contract_execution_id,
+            route_identity=route_identity,
+        )
+        is None
+    )
+
+    assert (
+        server._runtime_context_failed_qa_running_revision_rejoin_authority(
+            context=context,
+            evidence=failed_qa_evidence,
+            contract_execution_id=contract_execution_id,
+            route_identity=route_identity,
+            now_iso="3000-07-24T01:00:00Z",
+        )
+        is None
+    )
+    with pytest.raises(BranchRuntimeFenceError):
+        parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PID,
+            runtime_context_id=context.runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=context.parent_task_id,
+            target_project_root=str(target_root),
+            reason="reject forged failed-QA authority",
+            reopen_for_revision=True,
+            failed_qa_running_revision_rejoin_authority=replace(
+                authority,
+                task_id="different-worker-task",
+            ),
+        )
+
+    with pytest.raises(BranchRuntimeFenceError):
+        parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PID,
+            runtime_context_id=context.runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=context.parent_task_id,
+            target_project_root=str(target_root),
+            reason="reject forged typed authorization clock",
+            now_iso="3000-07-24T01:00:00Z",
+            reopen_for_revision=True,
+            failed_qa_running_revision_rejoin_authority=replace(
+                authority,
+                session_authorized_at="3000-07-24T01:00:00Z",
+            ),
+        )
+
+    changed_host_session = upsert_branch_context(
+        conn,
+        replace(context, host_session_id="different-host-session"),
+        now_iso="2026-07-24T01:01:00Z",
+    )
+    with pytest.raises(BranchRuntimeFenceError):
+        parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PID,
+            runtime_context_id=changed_host_session.runtime_context_id,
+            task_id=changed_host_session.task_id,
+            parent_task_id=changed_host_session.parent_task_id,
+            target_project_root=str(target_root),
+            reason="reject changed host session",
+            reopen_for_revision=True,
+            failed_qa_running_revision_rejoin_authority=authority,
+        )
+    context = upsert_branch_context(
+        conn,
+        context,
+        now_iso="2026-07-24T01:02:00Z",
+    )
+
+    dirty_path = target_root / "untracked-during-rejoin.txt"
+    dirty_path.write_text("dirty", encoding="utf-8")
+    assert (
+        server._runtime_context_failed_qa_running_revision_rejoin_authority(
+            context=context,
+            evidence=failed_qa_evidence,
+            contract_execution_id=contract_execution_id,
+            route_identity=route_identity,
+        )
+        is None
+    )
+    with pytest.raises(BranchRuntimeFenceError):
+        parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PID,
+            runtime_context_id=context.runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=context.parent_task_id,
+            target_project_root=str(target_root),
+            reason="reject dirty assigned worktree",
+            reopen_for_revision=True,
+            failed_qa_running_revision_rejoin_authority=authority,
+        )
+    dirty_path.unlink()
+
+    auth_only = parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        target_project_root=str(target_root),
+        reason="missing typed authority remains auth-only",
+        reopen_for_revision=True,
+    )
+    assert auth_only["revision_rejoin_applied"] is False
+    assert auth_only["attempt"] == 2
+    assert auth_only["retry_round"] == 0
+
+    stale_session_authority = authority
+    with pytest.raises(BranchRuntimeFenceError):
+        parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PID,
+            runtime_context_id=context.runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=context.parent_task_id,
+            target_project_root=str(target_root),
+            reason="reject authority bound to rotated session",
+            reopen_for_revision=True,
+            failed_qa_running_revision_rejoin_authority=(
+                stale_session_authority
+            ),
+        )
+    context = get_branch_context(conn, PID, context.task_id)
+    assert context is not None
+    authority = (
+        server._runtime_context_failed_qa_running_revision_rejoin_authority(
+            context=context,
+            evidence=failed_qa_evidence,
+            contract_execution_id=contract_execution_id,
+            route_identity=route_identity,
+        )
+    )
+    assert authority is not None
+    assert authority.session_token_ref == auth_only["session_token_ref"]
+
+    applied = parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        target_project_root=str(target_root),
+        reason="apply exact server-derived failed-QA authority",
+        reopen_for_revision=True,
+        failed_qa_running_revision_rejoin_authority=authority,
+    )
+    assert applied["revision_rejoin_applied"] is True
+    assert applied["reopen_for_failed_qa_revision"] is True
+    assert applied["attempt"] == 3
+    assert applied["retry_round"] == 1
+    assert applied["current_status"] == STATE_WORKTREE_READY
+    assert applied["failed_qa_running_revision_rejoin_authority"][
+        "route_identity_hash"
+    ].startswith("sha256:")
+
+    duplicate = parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        target_project_root=str(target_root),
+        reason="duplicate failed-QA authority remains auth-only",
+        reopen_for_revision=True,
+    )
+    assert duplicate["revision_rejoin_applied"] is False
+    assert duplicate["attempt"] == 3
+    assert duplicate["retry_round"] == 1
+    assert duplicate["current_status"] == STATE_WORKTREE_READY
+
+    with pytest.raises(BranchRuntimeFenceError):
+        parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PID,
+            runtime_context_id=context.runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=context.parent_task_id,
+            target_project_root=str(target_root),
+            reason="reject replayed typed authority",
+            reopen_for_revision=True,
+            failed_qa_running_revision_rejoin_authority=authority,
+        )
+
+
+def test_failed_qa_running_rejoin_authority_rejects_stale_actual_worktree_head(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "failed-qa-running-stale-worktree-head"
+    candidate_commit = _init_test_git_repo(target_root)
+    session_token_hash = mf_subagent_session_token_hash(
+        "session-token-failed-qa-running-stale-head"
+    )
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            backlog_id="AC-FAILED-QA-RUNNING-STALE-HEAD",
+            task_id="failed-qa-running-stale-head-worker",
+            parent_task_id="cex-failed-qa-running-stale-head",
+            runtime_context_id="mfrctx-failed-qa-running-stale-head",
+            branch_ref="refs/heads/failed-qa-running-stale-head",
+            status=parallel_branch_runtime.STATE_RUNNING,
+            last_recovery_action="mf_subagent_startup_recorded",
+            attempt=2,
+            retry_round=0,
+            worker_id="failed-qa-running-stale-head-worker",
+            worker_slot_id="failed-qa-running-stale-head-worker",
+            actual_host_worker_id="failed-qa-running-stale-head-worker",
+            host_startup_id="startup-failed-qa-running-stale-head",
+            host_session_id="session-failed-qa-running-stale-head",
+            fence_token="fence-failed-qa-running-stale-head",
+            target_project_root=str(target_root),
+            worktree_path=str(target_root),
+            head_commit=candidate_commit,
+            session_token_hash=session_token_hash,
+            lease_id="mfrlease-failed-qa-running-stale-head",
+            lease_expires_at="2999-07-25T01:00:00Z",
+            owned_files=("agent/governance/server.py",),
+            merge_queue_id="mq-failed-qa-running-stale-head",
+        ),
+    )
+    contract_execution_id = context.parent_task_id
+    dispatch_source_ref = (
+        f"contract_runtime:{contract_execution_id}:completed_lines:1"
+    )
+    identity_binding = {
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+        "fence_token_hash": runtime_context_secret_hash(context.fence_token),
+        "candidate_commit_sha": candidate_commit,
+        "dispatch_source_ref": dispatch_source_ref,
+    }
+    identity_binding["binding_hash"] = server.stable_sha256(
+        identity_binding
+    )
+    route_identity = {
+        "route_id": "route-failed-qa-running-stale-head",
+        "route_context_hash": "sha256:" + "4" * 64,
+        "prompt_contract_id": "rprompt-failed-qa-running-stale-head",
+        "prompt_contract_hash": "sha256:" + "5" * 64,
+        "route_token_ref": "rtok-failed-qa-running-stale-head",
+        "visible_injection_manifest_hash": "sha256:" + "6" * 64,
+    }
+    failed_qa_evidence = {
+        "schema_version": (
+            "runtime_context.contract_runtime_failed_qa_revision_evidence.v1"
+        ),
+        "source": "contract_runtime_completed_lines",
+        "status": "revision_required",
+        "project_id": PID,
+        "backlog_id": context.backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "dispatch_source_ref": dispatch_source_ref,
+        "failed_qa_source_ref": (
+            f"contract_runtime:{contract_execution_id}:completed_lines:10"
+        ),
+        "identity_binding": identity_binding,
+        "dispatch_route_identity": dict(route_identity),
+        "failed_qa_rejoin_reopened": False,
+    }
+    authority = (
+        server._runtime_context_failed_qa_running_revision_rejoin_authority(
+            context=context,
+            evidence=failed_qa_evidence,
+            contract_execution_id=contract_execution_id,
+            route_identity=route_identity,
+        )
+    )
+    assert authority is not None
+
+    non_git_root = tmp_path / "failed-qa-running-not-git"
+    non_git_root.mkdir()
+    with pytest.raises(BranchRuntimeFenceError):
+        parallel_branch_runtime.failed_qa_running_revision_clean_worktree_head(
+            replace(context, worktree_path=str(non_git_root))
+        )
+    nested_worktree_claim = target_root / "nested-claim"
+    nested_worktree_claim.mkdir()
+    with pytest.raises(BranchRuntimeFenceError):
+        parallel_branch_runtime.failed_qa_running_revision_clean_worktree_head(
+            replace(context, worktree_path=str(nested_worktree_claim))
+        )
+    nested_worktree_claim.rmdir()
+
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "advance actual head"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    actual_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert actual_head != context.head_commit
+    assert (
+        server._runtime_context_failed_qa_running_revision_rejoin_authority(
+            context=context,
+            evidence=failed_qa_evidence,
+            contract_execution_id=contract_execution_id,
+            route_identity=route_identity,
+        )
+        is None
+    )
+    with pytest.raises(BranchRuntimeFenceError):
+        parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PID,
+            runtime_context_id=context.runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=context.parent_task_id,
+            target_project_root=str(target_root),
+            reason="reject stale persisted worktree head",
+            reopen_for_revision=True,
+            failed_qa_running_revision_rejoin_authority=authority,
+        )
 
 
 @pytest.mark.parametrize(
