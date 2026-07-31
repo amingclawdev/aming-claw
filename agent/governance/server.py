@@ -28603,6 +28603,10 @@ def _runtime_context_failed_qa_successor_dispatch_revision_authority(
     if (
         not failed_runtime_context_id
         or not failed_task_id
+        or not failed_parent_task_id
+        or not parent_task_id
+        or parent_task_id != contract_execution_id
+        or failed_parent_task_id != parent_task_id
         or failed_runtime_context_id == runtime_context_id
         or failed_task_id == task_id
         or not re.fullmatch(r"[0-9a-f]{40,64}", failed_commit)
@@ -28621,6 +28625,8 @@ def _runtime_context_failed_qa_successor_dispatch_revision_authority(
             _timeline_first_deep_text(line, "runtime_context_id")
             != failed_runtime_context_id
             or _timeline_first_deep_text(line, "task_id") != failed_task_id
+            or _timeline_first_deep_text(line, "parent_task_id")
+            != failed_parent_task_id
         ):
             continue
         previous_implementation = line

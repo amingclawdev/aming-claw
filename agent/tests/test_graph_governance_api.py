@@ -41750,6 +41750,38 @@ def test_failed_qa_rejoin_consumes_exact_cross_runtime_successor_dispatch(
         ],
     )
 
+    parent_binding_cases = []
+    for line_index, parent_value, label in (
+        (failed_line_index, "wrong-parent", "failed QA wrong parent"),
+        (failed_line_index, None, "failed QA missing parent"),
+        (0, "wrong-parent", "implementation wrong parent"),
+        (0, None, "implementation missing parent"),
+    ):
+        candidate = copy.deepcopy(record)
+        if parent_value is None:
+            candidate["completed_lines"][line_index].pop("parent_task_id")
+        else:
+            candidate["completed_lines"][line_index]["parent_task_id"] = (
+                parent_value
+            )
+        parent_binding_cases.append((candidate, label))
+
+    for candidate, label in parent_binding_cases:
+        monkeypatch.setattr(
+            server,
+            "_contract_runtime_store",
+            lambda _conn, candidate=candidate: SimpleNamespace(
+                list_by_backlog=lambda **_kwargs: [candidate]
+            ),
+        )
+        assert not (
+            server._runtime_context_failed_qa_revision_contract_runtime_evidence(
+                object(),
+                project_id=PID,
+                context=context,
+            )
+        ), label
+
 
 def test_failed_qa_rejoin_guidance_prioritizes_revision_over_active_auth_only(
     monkeypatch,
