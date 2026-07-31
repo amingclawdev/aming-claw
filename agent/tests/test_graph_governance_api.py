@@ -43330,6 +43330,13 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     receipt_body["actor"] = "codex-mf-sub-observer-intervention-amendment"
     receipt_body["read_receipt_hash"] = "sha256:session-ref-receipt"
     receipt_body["launch_text_hash"] = "sha256:session-ref-launch"
+    receipt_payload = dict(receipt_body["payload"])
+    receipt_payload["contract_context_read_receipt"] = {
+        **receipt_payload["contract_context_read_receipt"],
+        "read_receipt_hash": "sha256:session-ref-receipt",
+        "receipt_hash": "sha256:session-ref-receipt",
+    }
+    receipt_body["payload"] = receipt_payload
 
     receipt_response = server.handle_graph_governance_runtime_context_read_receipt(
         _ctx(
@@ -43343,9 +43350,10 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
         conn,
         PID,
         task_id="worker-session-ref",
-        event_kind="mf_subagent_read_receipt",
+        event_kind="contract_context_read_receipt",
     )
     assert len(read_events) == 1
+    assert read_events[0]["event_type"] == "mf_subagent_read_receipt"
     assert read_events[0]["actor"] == "mf_sub"
     assert read_events[0]["payload"]["session_token_ref"] == session_ref
     assert read_events[0]["payload"]["submitted_actor"] == (
@@ -43432,9 +43440,25 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     assert startup_gate["session_token_evidence_type"] == "server_verified"
     assert startup_gate["server_issued_session_token_verified"] is True
     assert startup_gate["agent_id_match_mode"] == "initial_join_actual_host_worker"
-    assert startup_gate["actual_host_worker_id"] == "/root/alloc_root_qa"
-    assert startup_gate["semantic_role_binding"]["semantic_role"] == "mf_sub"
-    assert startup_gate["semantic_role_binding"][
+    assert "actual_host_worker_id" not in startup_gate
+    assert "semantic_role_binding" not in startup_gate
+    startup_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id="worker-session-ref",
+        event_kind="mf_subagent_startup",
+    )
+    assert len(startup_events) == 1
+    persisted_startup_gate = startup_events[0]["payload"][
+        "mf_subagent_startup_gate"
+    ]
+    assert persisted_startup_gate["actual_host_worker_id"] == (
+        "/root/alloc_root_qa"
+    )
+    assert persisted_startup_gate["semantic_role_binding"][
+        "semantic_role"
+    ] == "mf_sub"
+    assert persisted_startup_gate["semantic_role_binding"][
         "opaque_identity_is_role_bearing"
     ] is False
 
