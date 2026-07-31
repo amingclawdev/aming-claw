@@ -1301,6 +1301,16 @@ class FailedQaRunningRevisionRejoinAuthority:
     owned_files: tuple[str, ...]
     replacement_attempt: int
     replacement_retry_round: int
+    session_token_ref: str
+    session_lease_id: str
+    session_lease_expires_at: str
+    session_lease_status: str
+    actual_host_worker_id: str
+    host_startup_id: str
+    host_session_id: str
+    session_identity_hash: str
+    actual_worktree_head: str
+    worktree_clean: bool
     authority_hash: str
     schema_version: str = (
         "parallel_branch.failed_qa_running_revision_rejoin_authority.v1"
@@ -1308,6 +1318,139 @@ class FailedQaRunningRevisionRejoinAuthority:
     server_derived: bool = True
     caller_claims_trusted: bool = False
     immutable_failed_qa_verified: bool = True
+
+
+def failed_qa_running_revision_session_identity(
+    context: "BranchTaskRuntimeContext",
+    *,
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Return the canonical active worker session bound to failed-QA rejoin.
+
+    The result contains only copy-safe references and persisted host identity;
+    the raw worker token never enters the authority or its canonical hash.
+    """
+
+    lease = runtime_context_session_token_lease_view(context, now_iso=now_iso)
+    session_token_ref = runtime_context_session_token_ref(context)
+    has_lease = lease.get("has_lease") is True
+    core = {
+        "session_token_ref": session_token_ref,
+        "session_lease_id": str(context.lease_id or "").strip(),
+        "session_lease_expires_at": str(
+            context.lease_expires_at or ""
+        ).strip(),
+        "session_lease_status": (
+            "active" if has_lease else "unleased_current"
+        ),
+        "actual_host_worker_id": str(
+            context.actual_host_worker_id or ""
+        ).strip(),
+        "host_startup_id": str(context.host_startup_id or "").strip(),
+        "host_session_id": str(context.host_session_id or "").strip(),
+    }
+    if (
+        not all(
+            core[field]
+            for field in (
+                "session_token_ref",
+                "session_lease_status",
+                "actual_host_worker_id",
+                "host_startup_id",
+                "host_session_id",
+            )
+        )
+        or str(lease.get("session_token_ref") or "") != session_token_ref
+        or lease.get("expired") is not False
+        or (
+            has_lease
+            and (
+                not core["session_lease_id"]
+                or not core["session_lease_expires_at"]
+                or str(lease.get("status") or "") != "active"
+                or str(lease.get("lease_id") or "")
+                != core["session_lease_id"]
+                or str(lease.get("lease_expires_at") or "")
+                != core["session_lease_expires_at"]
+            )
+        )
+        or (
+            not has_lease
+            and (
+                core["session_lease_id"]
+                or core["session_lease_expires_at"]
+                or str(lease.get("status") or "") != "no_lease_recorded"
+            )
+        )
+    ):
+        return {}
+    return {
+        **core,
+        "session_identity_hash": _stable_authority_hash(core),
+    }
+
+
+def failed_qa_running_revision_clean_worktree_head(
+    context: "BranchTaskRuntimeContext",
+    *,
+    timeout_seconds: int = 5,
+) -> str:
+    """Return the clean assigned worktree HEAD or fail closed.
+
+    Rejoin is a pre-edit transition.  A missing/non-Git worktree, a path that
+    resolves below a different Git root, command failure, dirty state, or a
+    non-commit HEAD all invalidate the typed authority.
+    """
+
+    raw_worktree = str(context.worktree_path or "").strip()
+    if not raw_worktree:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    try:
+        worktree = Path(raw_worktree).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise BranchRuntimeFenceError(
+            "fence_invalidated_or_unknown"
+        ) from None
+    if not worktree.is_dir():
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    try:
+        root_proc = _git_preview_command(
+            worktree,
+            ["rev-parse", "--show-toplevel"],
+            timeout_seconds=timeout_seconds,
+        )
+        if root_proc.returncode != 0 or not root_proc.stdout.strip():
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        actual_root = Path(root_proc.stdout.strip()).expanduser().resolve(
+            strict=True
+        )
+        if actual_root != worktree:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+        status_proc = _git_preview_command(
+            worktree,
+            ["status", "--porcelain", "--untracked-files=all"],
+            timeout_seconds=timeout_seconds,
+        )
+        if status_proc.returncode != 0 or status_proc.stdout.strip():
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+        head_proc = _git_preview_command(
+            worktree,
+            ["rev-parse", "--verify", "HEAD^{commit}"],
+            timeout_seconds=timeout_seconds,
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        raise BranchRuntimeFenceError(
+            "fence_invalidated_or_unknown"
+        ) from None
+    if head_proc.returncode != 0:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    head = head_proc.stdout.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    return head
 
 
 @dataclass(frozen=True)
@@ -11140,6 +11283,17 @@ def rejoin_mf_subagent_runtime_session_token(
             FailedQaRunningRevisionRejoinAuthority,
         ):
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        current_session_identity = (
+            failed_qa_running_revision_session_identity(
+                context,
+                now_iso=now_iso,
+            )
+        )
+        if not current_session_identity:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        actual_worktree_head = (
+            failed_qa_running_revision_clean_worktree_head(context)
+        )
         expected_scope = (
             ("project_id", context.project_id),
             ("backlog_id", context.backlog_id),
@@ -11157,6 +11311,39 @@ def rejoin_mf_subagent_runtime_session_token(
             ),
             ("worktree_path", context.worktree_path),
             ("merge_queue_id", context.merge_queue_id),
+            (
+                "session_token_ref",
+                current_session_identity["session_token_ref"],
+            ),
+            (
+                "session_lease_id",
+                current_session_identity["session_lease_id"],
+            ),
+            (
+                "session_lease_expires_at",
+                current_session_identity["session_lease_expires_at"],
+            ),
+            (
+                "session_lease_status",
+                current_session_identity["session_lease_status"],
+            ),
+            (
+                "actual_host_worker_id",
+                current_session_identity["actual_host_worker_id"],
+            ),
+            (
+                "host_startup_id",
+                current_session_identity["host_startup_id"],
+            ),
+            (
+                "host_session_id",
+                current_session_identity["host_session_id"],
+            ),
+            (
+                "session_identity_hash",
+                current_session_identity["session_identity_hash"],
+            ),
+            ("actual_worktree_head", actual_worktree_head),
         )
         authority_payload = asdict(failed_qa_authority)
         authority_hash = str(authority_payload.pop("authority_hash") or "")
@@ -11186,6 +11373,13 @@ def rejoin_mf_subagent_runtime_session_token(
             or failed_qa_authority.server_derived is not True
             or failed_qa_authority.caller_claims_trusted is not False
             or failed_qa_authority.immutable_failed_qa_verified is not True
+            or failed_qa_authority.worktree_clean is not True
+            or actual_worktree_head
+            != str(context.head_commit or "").strip().lower()
+            or actual_worktree_head
+            != str(failed_qa_authority.candidate_commit_sha or "")
+            .strip()
+            .lower()
             or not re.fullmatch(
                 r"[0-9a-f]{40}|[0-9a-f]{64}",
                 str(failed_qa_authority.candidate_commit_sha or ""),

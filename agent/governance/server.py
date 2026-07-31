@@ -28510,12 +28510,16 @@ def _runtime_context_failed_qa_running_revision_rejoin_authority(
     evidence: Mapping[str, Any] | None,
     contract_execution_id: str,
     route_identity: Mapping[str, Any] | None,
+    now_iso: str = "",
 ):
     """Bind immutable failed-QA evidence to one fresh running replacement."""
 
     from .parallel_branch_runtime import (
+        BranchRuntimeFenceError,
         FailedQaRunningRevisionRejoinAuthority,
         STATE_RUNNING,
+        failed_qa_running_revision_clean_worktree_head,
+        failed_qa_running_revision_session_identity,
         runtime_context_secret_hash,
     )
 
@@ -28647,6 +28651,20 @@ def _runtime_context_failed_qa_running_revision_rejoin_authority(
     candidate_commit = expected_binding["candidate_commit_sha"]
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_commit):
         return None
+    session_identity = failed_qa_running_revision_session_identity(
+        context,
+        now_iso=now_iso,
+    )
+    if not session_identity:
+        return None
+    try:
+        actual_worktree_head = (
+            failed_qa_running_revision_clean_worktree_head(context)
+        )
+    except BranchRuntimeFenceError:
+        return None
+    if actual_worktree_head != candidate_commit.lower():
+        return None
     owned_files = tuple(
         str(value or "").strip()
         for value in (
@@ -28678,6 +28696,9 @@ def _runtime_context_failed_qa_running_revision_rejoin_authority(
         "owned_files": owned_files,
         "replacement_attempt": replacement_attempt,
         "replacement_retry_round": replacement_retry_round,
+        **session_identity,
+        "actual_worktree_head": actual_worktree_head,
+        "worktree_clean": True,
         "schema_version": (
             "parallel_branch.failed_qa_running_revision_rejoin_authority.v1"
         ),
@@ -30944,8 +30965,45 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 evidence=contract_runtime_failed_qa_revision,
                 contract_execution_id=resolved_contract_execution_id,
                 route_identity=selected_route_identity,
+                now_iso=str(body.get("now_iso") or ""),
             )
         )
+        if (
+            contract_runtime_failed_qa_revision
+            and str(getattr(context, "status", "") or "").strip()
+            == "running"
+            and int(getattr(context, "attempt", 0) or 0) > 1
+            and int(getattr(context, "retry_round", 0) or 0) == 0
+            and failed_qa_running_revision_rejoin_authority is None
+        ):
+            raise GovernanceError(
+                "runtime_context_failed_qa_running_rejoin_authority_invalid",
+                (
+                    "fresh running failed-QA replacement requires one active "
+                    "canonical worker session and a clean matching assigned "
+                    "worktree HEAD"
+                ),
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "contract_execution_id": resolved_contract_execution_id,
+                    "context_status": context.status,
+                    "attempt": int(context.attempt or 0),
+                    "retry_round": int(context.retry_round or 0),
+                    "expected_candidate_head": str(
+                        context.head_commit or ""
+                    ),
+                    "required_authority": (
+                        "session_bound_clean_actual_worktree_head"
+                    ),
+                    "next_legal_action": (
+                        "repair_worker_session_or_assigned_worktree_before_"
+                        "rejoin"
+                    ),
+                    "fail_closed": True,
+                },
+            )
         failed_qa_reopen_for_revision = bool(
             timeline_reopen_for_revision or contract_runtime_failed_qa_revision
         )
