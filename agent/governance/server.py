@@ -25976,6 +25976,107 @@ def _runtime_context_contract_line_execution_matches(
     return bool(expected and claimed == {expected})
 
 
+def _runtime_context_contract_active_worker_round(
+    record: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+) -> tuple[list[tuple[int, Mapping[str, Any]]], int, int, Mapping[str, Any], list[tuple[int, Mapping[str, Any]]]]:
+    """Return the active worker commit and later finish attestations."""
+
+    completed = _contract_runtime_completed_lines(record)
+    failed_qa_index = _active_failed_qa_line_index([line for _, line in completed])
+
+    def matches(line: Mapping[str, Any]) -> bool:
+        return _contract_runtime_mapping_matches_context(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+        )
+
+    commits = [
+        (index, line)
+        for index, line in completed
+        if index > failed_qa_index
+        and str(line.get("line_id") or "").strip() == "worker_commit"
+        and matches(line)
+    ]
+    commit_index, commit = commits[-1] if commits else (-1, {})
+    attestations = [
+        (index, line)
+        for index, line in completed
+        if index > commit_index
+        and str(line.get("line_id") or "").strip()
+        == "worker_finish_time_attestation"
+        and matches(line)
+    ]
+    return completed, failed_qa_index, commit_index, commit, attestations
+
+
+def _runtime_context_finish_attestation_recovery_marker(
+    line: Mapping[str, Any],
+    *,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    active_worker_commit_line_index: int,
+) -> dict[str, Any]:
+    """Return one cryptographically bound strict-facade correction marker."""
+
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    marker = (
+        payload.get("canonical_finish_attestation_recovery")
+        if isinstance(
+            payload.get("canonical_finish_attestation_recovery"),
+            Mapping,
+        )
+        else {}
+    )
+    if not marker:
+        return {}
+    canonical_payload = dict(payload)
+    canonical_payload.pop("canonical_finish_attestation_recovery", None)
+    try:
+        superseded_index = int(
+            marker.get("superseded_completed_line_index")
+        )
+        marker_commit_index = int(
+            marker.get("active_worker_commit_line_index")
+        )
+    except (TypeError, ValueError):
+        return {}
+    expected = {
+        "contract_execution_id": str(contract_execution_id or "").strip(),
+        "runtime_context_id": str(runtime_context_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "parent_task_id": str(parent_task_id or "").strip(),
+    }
+    if not (
+        str(marker.get("schema_version") or "").strip()
+        == "runtime_context.canonical_finish_attestation_recovery.v1"
+        and str(marker.get("source") or "").strip()
+        == "runtime_context_finish_time_worker_attestation"
+        and marker.get("server_derived") is True
+        and marker.get("strict_facade_verified") is True
+        and marker.get("append_only_history_preserved") is True
+        and marker.get("contract_runtime_state_transition_replayed") is False
+        and marker.get("generic_contract_runtime_submit_line_allowed") is False
+        and marker_commit_index == active_worker_commit_line_index
+        and superseded_index > active_worker_commit_line_index
+        and all(
+            str(marker.get(field) or "").strip() == value
+            for field, value in expected.items()
+        )
+        and str(marker.get("canonical_payload_hash") or "").strip()
+        == stable_sha256(canonical_payload)
+    ):
+        return {}
+    return dict(marker)
+
+
 def _runtime_context_contract_finish_attestation_projection(
     conn,
     *,
@@ -26004,43 +26105,23 @@ def _runtime_context_contract_finish_attestation_projection(
             422,
             {"contract_execution_id": contract_execution_id},
         ) from exc
-    completed_lines = _contract_runtime_completed_lines(record)
-    context_matches = [
-        (index, line)
-        for index, line in completed_lines
-        if str(line.get("line_id") or "").strip()
-        == "worker_finish_time_attestation"
-        and _contract_runtime_mapping_matches_context(
-            line,
-            runtime_context_id=runtime_context_id,
-            task_id=task_id,
-            parent_task_id=parent_task_id,
-        )
-    ]
-    failed_qa_index = _active_failed_qa_line_index(
-        [line for _, line in completed_lines]
-    )
-    context_worker_commits = [
-        (index, line)
-        for index, line in completed_lines
-        if index > failed_qa_index
-        and str(line.get("line_id") or "").strip() == "worker_commit"
-        and _contract_runtime_mapping_matches_context(
-            line,
-            runtime_context_id=runtime_context_id,
-            task_id=task_id,
-            parent_task_id=parent_task_id,
-        )
-    ]
-    active_worker_commit_index = (
-        context_worker_commits[-1][0] if context_worker_commits else -1
+    (
+        completed_lines,
+        failed_qa_index,
+        active_worker_commit_index,
+        active_worker_commit,
+        matches,
+    ) = _runtime_context_contract_active_worker_round(
+        record,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
     )
     requested_head = str(head_commit or "").strip()
     round_mismatched_fields: list[str] = []
     active_commit_session = ""
     active_commit_filer = ""
-    if context_worker_commits:
-        _, active_worker_commit = context_worker_commits[-1]
+    if active_worker_commit:
         active_commit_payload = (
             active_worker_commit.get("payload")
             if isinstance(active_worker_commit.get("payload"), Mapping)
@@ -26082,11 +26163,47 @@ def _runtime_context_contract_finish_attestation_projection(
         ):
             round_mismatched_fields.append("filer_principal")
 
-    matches = [
-        (index, line)
-        for index, line in context_matches
-        if index > active_worker_commit_index
-    ]
+    correction_matches: list[tuple[int, Mapping[str, Any], dict[str, Any]]] = []
+    for index, line in matches:
+        marker = _runtime_context_finish_attestation_recovery_marker(
+            line,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            active_worker_commit_line_index=active_worker_commit_index,
+        )
+        if marker:
+            correction_matches.append((index, line, marker))
+    canonical_recovery: dict[str, Any] = {}
+    if correction_matches:
+        correction_index, correction_line, canonical_recovery = (
+            correction_matches[0]
+        )
+        superseded_index = int(
+            canonical_recovery["superseded_completed_line_index"]
+        )
+        match_indices = [index for index, _ in matches]
+        if (
+            len(correction_matches) != 1
+            or correction_index <= superseded_index
+            or match_indices != [superseded_index, correction_index]
+        ):
+            raise GovernanceError(
+                "contract_worker_finish_attestation_ambiguous",
+                "strict facade finish-attestation recovery is missing or ambiguous",
+                422,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "matching_completed_line_indexes": match_indices,
+                    "recovery_completed_line_indexes": [
+                        index for index, _, _ in correction_matches
+                    ],
+                    "active_failed_qa_line_index": failed_qa_index,
+                    "active_worker_commit_line_index": active_worker_commit_index,
+                },
+            )
+        matches = [(correction_index, correction_line)]
     if active_worker_commit_index < 0 or not matches:
         raise GovernanceError(
             "contract_worker_finish_attestation_required",
@@ -26212,6 +26329,7 @@ def _runtime_context_contract_finish_attestation_projection(
         "read_receipt_event_id": canonical_read_id,
         "read_receipt_hash": canonical_read_hash,
         "finish_time_worker_self_attestation": attestation,
+        "canonical_finish_attestation_recovery": canonical_recovery,
     }
 
 
@@ -37386,6 +37504,395 @@ def _runtime_context_context_local_setup_authority(
     }
 
 
+def _runtime_context_finish_attestation_recovery_errors(
+    conn,
+    *,
+    context: Any,
+    contract_execution_id: str,
+    payload: Mapping[str, Any],
+    active_worker_commit: Mapping[str, Any],
+) -> list[str]:
+    """Validate a strict-facade correction against immutable lane authority."""
+
+    from .mf_subagent_contract import _finish_time_worker_attestation_gate
+    from .parallel_branch_runtime import (
+        runtime_context_secret_hash,
+        runtime_context_session_token_ref,
+    )
+
+    active_payload = (
+        active_worker_commit.get("payload")
+        if isinstance(active_worker_commit.get("payload"), Mapping)
+        else {}
+    )
+    runtime_context_id = str(getattr(context, "runtime_context_id", "") or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    latest_route_identity = _runtime_context_latest_route_identity(conn, context)
+    expected = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": str(getattr(context, "backlog_id", "") or "").strip(),
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": str(
+            getattr(context, "worker_slot_id", "") or worker_id
+        ).strip(),
+        "target_project_root": _runtime_context_effective_target_project_root(
+            context
+        ),
+        "worker_session_id": str(
+            active_payload.get("worker_session_id") or ""
+        ).strip(),
+        "filer_principal": str(
+            active_payload.get("filer_principal") or ""
+        ).strip(),
+        "session_token_ref": str(
+            active_payload.get("session_token_ref") or ""
+        ).strip(),
+        "fence_token_hash": str(
+            active_payload.get("fence_token_hash") or ""
+        ).strip(),
+        "head_commit": str(
+            active_worker_commit.get("commit_sha")
+            or active_payload.get("worker_commit_sha")
+            or active_payload.get("head_commit")
+            or ""
+        ).strip(),
+    }
+    errors = [
+        field
+        for field, value in expected.items()
+        if not value or str(payload.get(field) or "").strip() != value
+    ]
+    current_authority = {
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "fence_token_hash": runtime_context_secret_hash(
+            str(getattr(context, "fence_token", "") or "")
+        ),
+    }
+    errors.extend(
+        field
+        for field, value in current_authority.items()
+        if not value or expected[field] != value
+    )
+    if expected["filer_principal"] != expected["worker_session_id"]:
+        errors.extend(("worker_session_id", "filer_principal"))
+
+    expected_sets = {
+        "changed_files": _runtime_context_service_query_values(
+            active_payload, "changed_files"
+        ),
+        "owned_files": _runtime_context_service_query_values(
+            active_payload, "owned_files"
+        )
+        or list(
+            getattr(context, "owned_files", ())
+            or getattr(context, "target_files", ())
+            or ()
+        ),
+    }
+    errors.extend(
+        field
+        for field, values in expected_sets.items()
+        if not values
+        or not _runtime_context_same_string_set(payload.get(field), values)
+    )
+    checks = {
+        "contract_execution_id": _runtime_context_contract_line_execution_matches(
+            {"payload": payload}, contract_execution_id
+        ),
+        "observer_command_id": str(
+            payload.get("observer_command_id") or ""
+        ).strip()
+        == contract_execution_id,
+        "observer_impersonation": payload.get("observer_impersonation") is False,
+        "test_results": _runtime_context_finish_attestation_test_results_accepted(
+            payload.get("test_results")
+        ),
+        "finish_time_worker_self_attestation": bool(
+            _finish_time_worker_attestation_gate(payload).get("passed")
+        ),
+    }
+    errors.extend(field for field, passed in checks.items() if not passed)
+
+    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+        active_route_value = str(active_payload.get(field) or "").strip()
+        latest_route_value = str(latest_route_identity.get(field) or "").strip()
+        if (
+            active_route_value
+            and latest_route_value
+            and active_route_value != latest_route_value
+        ):
+            errors.append(field)
+            continue
+        expected = active_route_value or latest_route_value
+        if not expected or str(payload.get(field) or "").strip() != expected:
+            errors.append(field)
+
+    # The strict facade already verifies schema, raw-token absence, graph/read
+    # provenance, and transcript scope before invoking this internal helper.
+    return list(dict.fromkeys(errors))
+
+
+def _runtime_context_revise_incomplete_finish_attestation_lineage(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    runtime: Any,
+    record: Mapping[str, Any],
+    contract_execution_id: str,
+    stage_id: str,
+    line_id: str,
+    evidence_kind: str,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Append one strict correction for a historical incomplete generic line."""
+
+    if (
+        stage_id != "worker_attestation"
+        or line_id != "worker_finish_time_attestation"
+        or evidence_kind != "record_finish_time_worker_attestation"
+    ):
+        return {}
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_line = guide.get("next_legal_action") or {}
+    if str(next_line.get("line_id") or "").strip() != "worker_finish_gate":
+        return {}
+
+    runtime_context_id = str(getattr(context, "runtime_context_id", "") or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    completed_lines = list(record.get("completed_lines") or [])
+    failed_qa_index = _active_failed_qa_line_index(completed_lines)
+
+    def fail(
+        code: str,
+        message: str,
+        *,
+        fields: Sequence[str] = (),
+        **details: Any,
+    ) -> None:
+        raise GovernanceError(
+            code,
+            message,
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "mismatched_fields": list(fields),
+                "fail_closed": True,
+                **details,
+            },
+        )
+
+    worker_commits = [
+        (index, line)
+        for index, line in enumerate(completed_lines)
+        if index > failed_qa_index
+        and isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "worker_commit"
+        and _contract_runtime_mapping_matches_context(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+        )
+    ]
+    if not worker_commits:
+        return {}
+    active_worker_commit_index, active_worker_commit = worker_commits[-1]
+    matches = [
+        (index, line)
+        for index, line in enumerate(completed_lines)
+        if index > active_worker_commit_index
+        and isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip()
+        == "worker_finish_time_attestation"
+        and _contract_runtime_mapping_matches_context(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+        )
+    ]
+    corrections = [
+        (index, line, marker)
+        for index, line in matches
+        if (
+            marker := _runtime_context_finish_attestation_recovery_marker(
+                line,
+                contract_execution_id=contract_execution_id,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+                active_worker_commit_line_index=active_worker_commit_index,
+            )
+        )
+    ]
+    if corrections:
+        correction_index, correction_line, marker = corrections[0]
+        if (
+            len(corrections) != 1
+            or [index for index, _ in matches]
+            != [marker["superseded_completed_line_index"], correction_index]
+        ):
+            fail(
+                "contract_runtime_finish_attestation_recovery_ambiguous",
+                "strict facade finish-attestation recovery is ambiguous",
+                matching_completed_line_indexes=[index for index, _ in matches],
+            )
+        correction_payload = dict(correction_line.get("payload") or {})
+        correction_payload.pop("canonical_finish_attestation_recovery", None)
+        if stable_sha256(correction_payload) != stable_sha256(dict(payload)):
+            fail(
+                "contract_runtime_finish_attestation_recovery_invalid",
+                "strict facade finish-attestation correction is immutable",
+                fields=["canonical_payload_hash"],
+            )
+        # The ordinary duplicate branch returns already_completed.
+        return {}
+    if len(matches) != 1:
+        return {}
+
+    errors = _runtime_context_finish_attestation_recovery_errors(
+        conn,
+        context=context,
+        contract_execution_id=contract_execution_id,
+        payload=payload,
+        active_worker_commit=active_worker_commit,
+    )
+    if errors:
+        fail(
+            "contract_runtime_finish_attestation_recovery_invalid",
+            "strict facade finish-attestation recovery authority does not match the active worker round",
+            fields=errors,
+            active_worker_commit_line_index=active_worker_commit_index,
+            matching_completed_line_indexes=[index for index, _ in matches],
+            generic_contract_runtime_submit_line_allowed=False,
+        )
+
+    superseded_index, superseded_line = matches[0]
+    superseded_payload = (
+        superseded_line.get("payload")
+        if isinstance(superseded_line.get("payload"), Mapping)
+        else {}
+    )
+    existing_errors = _runtime_context_finish_attestation_recovery_errors(
+        conn,
+        context=context,
+        contract_execution_id=contract_execution_id,
+        payload=superseded_payload,
+        active_worker_commit=active_worker_commit,
+    )
+    if not existing_errors:
+        if stable_sha256(dict(superseded_payload)) == stable_sha256(dict(payload)):
+            return {}
+        fail(
+            "contract_runtime_finish_attestation_recovery_invalid",
+            "an existing strict facade finish attestation is immutable",
+            fields=["canonical_payload_hash"],
+        )
+
+    canonical_payload = dict(payload)
+    marker = {
+        "schema_version": "runtime_context.canonical_finish_attestation_recovery.v1",
+        "source": "runtime_context_finish_time_worker_attestation",
+        "server_derived": True,
+        "strict_facade_verified": True,
+        "append_only_history_preserved": True,
+        "contract_runtime_state_transition_replayed": False,
+        "generic_contract_runtime_submit_line_allowed": False,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "active_worker_commit_line_index": active_worker_commit_index,
+        "superseded_completed_line_index": superseded_index,
+        "canonical_payload_hash": stable_sha256(canonical_payload),
+        "superseded_payload_hash": stable_sha256(dict(superseded_payload)),
+    }
+    canonical_payload["canonical_finish_attestation_recovery"] = marker
+    correction_write = {
+        **canonical_payload,
+        "project_id": project_id,
+        "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+        "contract_execution_id": contract_execution_id,
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "line_instance_id": str(
+            superseded_line.get("line_instance_id") or ""
+        ),
+        "actor_role": "mf_sub",
+        "evidence_kind": evidence_kind,
+        "status": "passed",
+        "commit_sha": str(payload.get("head_commit") or ""),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "payload": canonical_payload,
+    }
+    correction_line = _line_evidence_from_write(correction_write, "mf_sub")
+    try:
+        persisted = _contract_runtime_append_completed_line_correction(
+            runtime,
+            record,
+            correction_line,
+            contract_execution_id=contract_execution_id,
+            actor_role="mf_sub",
+            expected_next_line_id="worker_finish_gate",
+        )
+    except ContractRuntimeError as exc:
+        raise GovernanceError(
+            "contract_runtime_finish_attestation_recovery_conflict",
+            str(exc),
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "fail_closed": True,
+            },
+        ) from exc
+    if not persisted:
+        fail(
+            "contract_runtime_finish_attestation_recovery_projection_invalid",
+            "strict facade correction must preserve the worker finish-gate transition",
+        )
+    current_state = _runtime_current_state_from_record(persisted)
+    return {
+        "schema_version": "runtime_context.canonical_contract_line.v1",
+        "accepted": True,
+        "status": "revised_finish_attestation",
+        "canonical": True,
+        "source_of_authority": "ContractRuntime.completed_lines",
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "evidence_kind": evidence_kind,
+        "line_instance_id": str(correction_line.get("line_instance_id") or ""),
+        "execution_state_revision": current_state.get(
+            "execution_state_revision", 0
+        ),
+        "execution_state_hash": current_state.get("execution_state_hash", ""),
+        "next_legal_action": current_state.get("next_legal_action") or {},
+        "canonical_finish_attestation_recovery": marker,
+        "append_only_history_preserved": True,
+        "contract_runtime_mutated": True,
+        "timeline_projection_authoritative": False,
+    }
+
+
 def _runtime_context_submit_canonical_contract_line(
     conn,
     *,
@@ -37568,6 +38075,29 @@ def _runtime_context_submit_canonical_contract_line(
 
     canonical_payload = dict(payload)
     canonical_payload.pop("failed_qa_revision_rejoin_marker", None)
+    finish_attestation_recovery = (
+        _runtime_context_revise_incomplete_finish_attestation_lineage(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime=runtime,
+            record=stored_record,
+            contract_execution_id=execution_id,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+            payload=canonical_payload,
+        )
+    )
+    if finish_attestation_recovery:
+        _onboard_guide_capsule_invalidate_contract_runtime_transition(
+            project_id=project_id,
+            result={
+                "ok": True,
+                "record": runtime.store.get(execution_id),
+            },
+        )
+        return finish_attestation_recovery
     revision_marker: dict[str, Any] = {}
     if use_failed_qa_rejoin_projection:
         revision_marker = next(
@@ -80383,6 +80913,44 @@ def _contract_runtime_completed_merge_authority(
     }
 
 
+def _contract_runtime_append_completed_line_correction(
+    runtime: Any,
+    record: Mapping[str, Any],
+    line: Mapping[str, Any],
+    *,
+    contract_execution_id: str,
+    actor_role: str,
+    expected_next_line_id: str,
+) -> dict[str, Any]:
+    """Append evidence without replaying an already-completed transition."""
+
+    expected_revision = int(record.get("execution_state_revision") or 1)
+    completed_lines = [*(record.get("completed_lines") or []), dict(line)]
+    candidate = {
+        **record,
+        "completed_lines": completed_lines,
+        "execution_state_revision": expected_revision + 1,
+    }
+    updated = runtime._record_view(
+        candidate,
+        actor_role=actor_role,
+        completed_lines=completed_lines,
+    )
+    next_line = (
+        updated.get("runtime_guide", {}).get("next_legal_action", {})
+        if isinstance(updated.get("runtime_guide"), Mapping)
+        else {}
+    )
+    if str(next_line.get("line_id") or "").strip() != expected_next_line_id:
+        return {}
+    runtime.store.update(
+        contract_execution_id,
+        updated,
+        expected_revision=expected_revision,
+    )
+    return runtime.store.get(contract_execution_id)
+
+
 def _contract_runtime_completed_line_acceptance(
     conn,
     *,
@@ -81669,6 +82237,45 @@ def _contract_runtime_unchanged_line_rejection(
         "execution_state_hash": str(state.get("execution_state_hash") or ""),
         "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
     }
+
+
+def _contract_runtime_finish_attestation_facade_only_rejection(
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    *,
+    actor_role: str,
+) -> dict[str, Any]:
+    """Keep strict worker finish evidence out of the generic line facade."""
+
+    if not (
+        str(actor_role or "").strip() == "mf_sub"
+        and str(record.get("contract_id") or "").strip()
+        in {"mf_parallel", "mf_parallel.v2"}
+        and str(write.get("stage_id") or "").strip() == "worker_attestation"
+        and str(write.get("line_id") or "").strip()
+        == "worker_finish_time_attestation"
+        and str(write.get("evidence_kind") or "").strip()
+        == "record_finish_time_worker_attestation"
+    ):
+        return {}
+    rejected = _contract_runtime_unchanged_line_rejection(
+        record,
+        [
+            "worker_finish_time_attestation requires "
+            "runtime_context_finish_time_worker_attestation"
+        ],
+    )
+    rejected.update(
+        {
+            "generic_contract_runtime_submit_line_allowed": False,
+            "required_facade": (
+                "runtime_context_finish_time_worker_attestation"
+            ),
+            "strict_worker_session_fence_binding_required": True,
+            "completed_line_mutated": False,
+        }
+    )
+    return rejected
 
 
 def _contract_runtime_observer_reconcile_idempotency(
@@ -119911,6 +120518,13 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                             actor_role=actor_role,
                         )
                     )
+                    finish_attestation_facade_only = (
+                        _contract_runtime_finish_attestation_facade_only_rejection(
+                            record,
+                            write,
+                            actor_role=actor_role,
+                        )
+                    )
                     if reconcile_idempotency:
                         result = reconcile_idempotency
                     elif dispatch_errors:
@@ -119918,6 +120532,8 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                             record,
                             dispatch_errors,
                         )
+                    elif finish_attestation_facade_only:
+                        result = finish_attestation_facade_only
                     elif (
                         close_authority_precheck
                         and not close_authority_precheck.get("passed")
@@ -120339,6 +120955,13 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                             actor_role=actor_role,
                         )
                     )
+                    finish_attestation_facade_only = (
+                        _contract_runtime_finish_attestation_facade_only_rejection(
+                            record,
+                            write,
+                            actor_role=actor_role,
+                        )
+                    )
                     if reconcile_idempotency:
                         result = reconcile_idempotency
                     elif dispatch_errors:
@@ -120346,6 +120969,8 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                             record,
                             dispatch_errors,
                         )
+                    elif finish_attestation_facade_only:
+                        result = finish_attestation_facade_only
                     elif (
                         close_authority_precheck
                         and not close_authority_precheck.get("passed")
