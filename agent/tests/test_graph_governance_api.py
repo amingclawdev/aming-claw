@@ -67925,6 +67925,18 @@ def test_accepted_no_pass_completion_mismatch_projects_exact_failed_qa_rejoin(
     assert running_revision["failed_qa_source_ref"].startswith(
         "contract_runtime:"
     )
+    fresh_attempt_revision = _known_baseline_failed_qa_revision_evidence(
+        monkeypatch,
+        record,
+        status="running",
+        last_recovery_action="mf_subagent_startup_recorded",
+        attempt=2,
+        retry_round=0,
+    )
+    assert fresh_attempt_revision["status"] == "revision_required"
+    assert fresh_attempt_revision["failed_qa_source_ref"].startswith(
+        "contract_runtime:"
+    )
     assert (
         _known_baseline_failed_qa_revision_evidence(
             monkeypatch,
@@ -67940,7 +67952,7 @@ def test_accepted_no_pass_completion_mismatch_projects_exact_failed_qa_rejoin(
     )
 
 
-def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
+def test_accepted_no_pass_fresh_running_rejoin_applies_revision_once(
     conn,
     monkeypatch,
     tmp_path,
@@ -67984,8 +67996,9 @@ def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
         conn,
         replace(
             runtime_context,
-            status=STATE_VALIDATED,
-            attempt=1,
+            status=parallel_branch_runtime.STATE_RUNNING,
+            last_recovery_action="mf_subagent_startup_recorded",
+            attempt=2,
             retry_round=0,
         ),
         now_iso="2026-07-24T01:00:00Z",
@@ -68111,7 +68124,15 @@ def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
     )
 
     assert rejoin["reopen_for_revision"] is True
+    assert rejoin["revision_rejoin_applied"] is True
     assert rejoin["timeline_reopen_for_revision"] is False
+    assert rejoin["previous_status"] == parallel_branch_runtime.STATE_RUNNING
+    assert rejoin["current_status"] == STATE_WORKTREE_READY
+    assert rejoin["attempt"] == 3
+    assert rejoin["retry_round"] == 1
+    assert rejoin["failed_qa_running_revision_rejoin_authority"][
+        "server_derived"
+    ] is True
     projected = rejoin["contract_runtime_failed_qa_revision"]
     assert projected["status"] == "revision_required"
     assert projected["identity_binding"][
@@ -68124,6 +68145,9 @@ def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
     assert saved is not None
     assert rejoin["session_token_ref"] != prior_session_ref
     assert runtime_context_session_token_ref(saved) == rejoin["session_token_ref"]
+    assert saved.last_recovery_action == (
+        "mf_subagent_failed_qa_revision_rejoin_issued"
+    )
     assert {
         "runtime_context_id": saved.runtime_context_id,
         "task_id": saved.task_id,
@@ -68135,6 +68159,216 @@ def test_accepted_no_pass_rev19_rejoin_rotates_only_session_ref(
         "target_project_root": saved.target_project_root,
         "owned_files": tuple(saved.owned_files),
     } == prior_identity
+
+    second_rejoin = (
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "target_project_root": str(target_root),
+                    "reason": "rotate auth after failed-QA revision was applied",
+                    "now_iso": "2999-07-24T01:02:00Z",
+                },
+            )
+        )
+    )
+    assert second_rejoin["reopen_for_revision"] is True
+    assert second_rejoin["revision_rejoin_applied"] is False
+    assert second_rejoin["attempt"] == 3
+    assert second_rejoin["retry_round"] == 1
+    after_second = get_branch_context(conn, PID, runtime_context.task_id)
+    assert after_second is not None
+    assert after_second.status == STATE_WORKTREE_READY
+    assert after_second.attempt == 3
+    assert after_second.retry_round == 1
+    assert after_second.last_recovery_action == (
+        "mf_subagent_failed_qa_revision_rejoin_issued"
+    )
+
+
+def test_failed_qa_running_rejoin_primitive_requires_exact_typed_authority(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "failed-qa-running-primitive"
+    candidate_commit = _init_test_git_repo(target_root)
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            backlog_id="AC-FAILED-QA-RUNNING-PRIMITIVE",
+            task_id="failed-qa-running-primitive-worker",
+            parent_task_id="cex-failed-qa-running-primitive",
+            runtime_context_id="mfrctx-failed-qa-running-primitive",
+            branch_ref="refs/heads/failed-qa-running-primitive",
+            status=parallel_branch_runtime.STATE_RUNNING,
+            last_recovery_action="mf_subagent_startup_recorded",
+            attempt=2,
+            retry_round=0,
+            worker_id="failed-qa-running-primitive-worker",
+            worker_slot_id="failed-qa-running-primitive-worker",
+            fence_token="fence-failed-qa-running-primitive",
+            target_project_root=str(target_root),
+            worktree_path=str(target_root),
+            head_commit=candidate_commit,
+            owned_files=("agent/governance/server.py",),
+            merge_queue_id="mq-failed-qa-running-primitive",
+        ),
+    )
+    contract_execution_id = context.parent_task_id
+    dispatch_source_ref = (
+        f"contract_runtime:{contract_execution_id}:completed_lines:1"
+    )
+    identity_binding = {
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+        "fence_token_hash": runtime_context_secret_hash(context.fence_token),
+        "candidate_commit_sha": candidate_commit,
+        "dispatch_source_ref": dispatch_source_ref,
+    }
+    identity_binding["binding_hash"] = server.stable_sha256(identity_binding)
+    failed_qa_evidence = {
+        "schema_version": (
+            "runtime_context.contract_runtime_failed_qa_revision_evidence.v1"
+        ),
+        "source": "contract_runtime_completed_lines",
+        "status": "revision_required",
+        "project_id": PID,
+        "backlog_id": context.backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "dispatch_source_ref": dispatch_source_ref,
+        "failed_qa_source_ref": (
+            f"contract_runtime:{contract_execution_id}:completed_lines:10"
+        ),
+        "identity_binding": identity_binding,
+        "failed_qa_rejoin_reopened": False,
+    }
+    route_identity = {
+        "route_id": "route-failed-qa-running-primitive",
+        "route_context_hash": "sha256:" + "1" * 64,
+        "prompt_contract_id": "rprompt-failed-qa-running-primitive",
+        "prompt_contract_hash": "sha256:" + "2" * 64,
+        "route_token_ref": "rtok-failed-qa-running-primitive",
+        "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+    }
+    failed_qa_evidence["dispatch_route_identity"] = dict(route_identity)
+    authority = (
+        server._runtime_context_failed_qa_running_revision_rejoin_authority(
+            context=context,
+            evidence=failed_qa_evidence,
+            contract_execution_id=contract_execution_id,
+            route_identity=route_identity,
+        )
+    )
+    assert authority is not None
+    assert (
+        server._runtime_context_failed_qa_running_revision_rejoin_authority(
+            context=context,
+            evidence=failed_qa_evidence,
+            contract_execution_id="cex-wrong",
+            route_identity=route_identity,
+        )
+        is None
+    )
+    mismatched_binding = dict(identity_binding)
+    mismatched_binding["parent_task_id"] = "different-parent"
+    mismatched_binding["binding_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in mismatched_binding.items()
+            if key != "binding_hash"
+        }
+    )
+    assert (
+        server._runtime_context_failed_qa_running_revision_rejoin_authority(
+            context=context,
+            evidence={
+                **failed_qa_evidence,
+                "identity_binding": mismatched_binding,
+            },
+            contract_execution_id=contract_execution_id,
+            route_identity=route_identity,
+        )
+        is None
+    )
+
+    with pytest.raises(BranchRuntimeFenceError):
+        parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PID,
+            runtime_context_id=context.runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=context.parent_task_id,
+            target_project_root=str(target_root),
+            reason="reject forged failed-QA authority",
+            reopen_for_revision=True,
+            failed_qa_running_revision_rejoin_authority=replace(
+                authority,
+                task_id="different-worker-task",
+            ),
+        )
+
+    auth_only = parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        target_project_root=str(target_root),
+        reason="missing typed authority remains auth-only",
+        reopen_for_revision=True,
+    )
+    assert auth_only["revision_rejoin_applied"] is False
+    assert auth_only["attempt"] == 2
+    assert auth_only["retry_round"] == 0
+
+    applied = parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        target_project_root=str(target_root),
+        reason="apply exact server-derived failed-QA authority",
+        reopen_for_revision=True,
+        failed_qa_running_revision_rejoin_authority=authority,
+    )
+    assert applied["revision_rejoin_applied"] is True
+    assert applied["reopen_for_failed_qa_revision"] is True
+    assert applied["attempt"] == 3
+    assert applied["retry_round"] == 1
+    assert applied["current_status"] == STATE_WORKTREE_READY
+    assert applied["failed_qa_running_revision_rejoin_authority"][
+        "route_identity_hash"
+    ].startswith("sha256:")
+
+    duplicate = parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        target_project_root=str(target_root),
+        reason="duplicate failed-QA authority remains auth-only",
+        reopen_for_revision=True,
+    )
+    assert duplicate["revision_rejoin_applied"] is False
+    assert duplicate["attempt"] == 3
+    assert duplicate["retry_round"] == 1
+    assert duplicate["current_status"] == STATE_WORKTREE_READY
 
 
 @pytest.mark.parametrize(

@@ -1270,6 +1270,47 @@ class DependencyRevalidationQaCandidateAuthority:
 
 
 @dataclass(frozen=True)
+class FailedQaRunningRevisionRejoinAuthority:
+    """Server-derived authority for one fresh running failed-QA replacement.
+
+    A replacement worker has already recorded startup, so its branch context is
+    ``running`` instead of validated/merge-ready.  The typed authority binds an
+    immutable ContractRuntime failure and dispatch to the exact worker, fence,
+    candidate, route, and file scope; a request boolean cannot widen ordinary
+    running-session rejoin behavior.
+    """
+
+    project_id: str
+    backlog_id: str
+    task_id: str
+    parent_task_id: str
+    runtime_context_id: str
+    worker_id: str
+    worker_slot_id: str
+    fence_token_hash: str
+    candidate_commit_sha: str
+    contract_execution_id: str
+    dispatch_source_ref: str
+    failed_qa_source_ref: str
+    identity_binding_hash: str
+    route_identity_hash: str
+    branch_ref: str
+    target_project_root: str
+    worktree_path: str
+    merge_queue_id: str
+    owned_files: tuple[str, ...]
+    replacement_attempt: int
+    replacement_retry_round: int
+    authority_hash: str
+    schema_version: str = (
+        "parallel_branch.failed_qa_running_revision_rejoin_authority.v1"
+    )
+    server_derived: bool = True
+    caller_claims_trusted: bool = False
+    immutable_failed_qa_verified: bool = True
+
+
+@dataclass(frozen=True)
 class PostQaMergeConflictRejoinAuthority:
     """Server-derived authority for reopening a QA-passed conflicted lane.
 
@@ -11055,6 +11096,9 @@ def rejoin_mf_subagent_runtime_session_token(
     reason: str = "",
     now_iso: str = "",
     reopen_for_revision: bool = False,
+    failed_qa_running_revision_rejoin_authority: (
+        FailedQaRunningRevisionRejoinAuthority | None
+    ) = None,
     post_qa_merge_conflict_rejoin_authority: (
         PostQaMergeConflictRejoinAuthority | None
     ) = None,
@@ -11077,8 +11121,95 @@ def rejoin_mf_subagent_runtime_session_token(
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if context.task_id != task:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    failed_qa_recovery_action = (
+        "mf_subagent_failed_qa_revision_rejoin_issued"
+    )
+    legacy_failed_qa_revision_rejoin = bool(
+        reopen_for_revision
+        and context.status in FAILED_QA_REVISION_REJOIN_STATES
+        and not (
+            context.status == STATE_WORKTREE_READY
+            and context.last_recovery_action == failed_qa_recovery_action
+        )
+    )
+    fresh_running_failed_qa_rejoin = False
+    failed_qa_authority = failed_qa_running_revision_rejoin_authority
+    if failed_qa_authority is not None:
+        if not isinstance(
+            failed_qa_authority,
+            FailedQaRunningRevisionRejoinAuthority,
+        ):
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        expected_scope = (
+            ("project_id", context.project_id),
+            ("backlog_id", context.backlog_id),
+            ("task_id", context.task_id),
+            ("parent_task_id", _parent_task_id_for_context(context)),
+            ("runtime_context_id", runtime_id),
+            ("worker_id", context.worker_id),
+            ("worker_slot_id", context.worker_slot_id or context.worker_id),
+            ("fence_token_hash", runtime_context_secret_hash(context.fence_token)),
+            ("candidate_commit_sha", context.head_commit),
+            ("branch_ref", context.branch_ref),
+            (
+                "target_project_root",
+                runtime_context_effective_target_project_root(context),
+            ),
+            ("worktree_path", context.worktree_path),
+            ("merge_queue_id", context.merge_queue_id),
+        )
+        authority_payload = asdict(failed_qa_authority)
+        authority_hash = str(authority_payload.pop("authority_hash") or "")
+        contract_execution_id = str(
+            failed_qa_authority.contract_execution_id or ""
+        ).strip()
+        contract_source_prefix = f"contract_runtime:{contract_execution_id}:"
+        expected_owned_files = tuple(
+            context.owned_files or context.target_files or ()
+        )
+        if (
+            any(
+                str(getattr(failed_qa_authority, field_name, "") or "").strip()
+                != str(expected_value or "").strip()
+                for field_name, expected_value in expected_scope
+            )
+            or tuple(failed_qa_authority.owned_files) != expected_owned_files
+            or context.status != STATE_RUNNING
+            or int(context.attempt or 0) <= 1
+            or int(context.retry_round or 0) != 0
+            or failed_qa_authority.replacement_attempt
+            != int(context.attempt or 0)
+            or failed_qa_authority.replacement_retry_round
+            != int(context.retry_round or 0)
+            or failed_qa_authority.schema_version
+            != "parallel_branch.failed_qa_running_revision_rejoin_authority.v1"
+            or failed_qa_authority.server_derived is not True
+            or failed_qa_authority.caller_claims_trusted is not False
+            or failed_qa_authority.immutable_failed_qa_verified is not True
+            or not re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                str(failed_qa_authority.candidate_commit_sha or ""),
+            )
+            or not contract_execution_id
+            or not str(failed_qa_authority.dispatch_source_ref).startswith(
+                contract_source_prefix
+            )
+            or not str(failed_qa_authority.failed_qa_source_ref).startswith(
+                contract_source_prefix
+            )
+            or not str(failed_qa_authority.identity_binding_hash).startswith(
+                "sha256:"
+            )
+            or not str(failed_qa_authority.route_identity_hash).startswith(
+                "sha256:"
+            )
+            or authority_hash != _stable_authority_hash(authority_payload)
+        ):
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        fresh_running_failed_qa_rejoin = bool(reopen_for_revision)
     failed_qa_revision_rejoin = bool(
-        reopen_for_revision and context.status in FAILED_QA_REVISION_REJOIN_STATES
+        legacy_failed_qa_revision_rejoin
+        or fresh_running_failed_qa_rejoin
     )
     post_qa_conflict_rejoin = False
     authority = post_qa_merge_conflict_rejoin_authority
@@ -11179,7 +11310,13 @@ def rejoin_mf_subagent_runtime_session_token(
     if post_qa_conflict_rejoin:
         recovery_action = "mf_subagent_post_qa_merge_conflict_rejoin_issued"
     elif failed_qa_revision_rejoin:
-        recovery_action = "mf_subagent_failed_qa_revision_rejoin_issued"
+        recovery_action = failed_qa_recovery_action
+    elif (
+        reopen_for_revision
+        and context.status == STATE_WORKTREE_READY
+        and context.last_recovery_action == failed_qa_recovery_action
+    ):
+        recovery_action = failed_qa_recovery_action
     else:
         recovery_action = "mf_subagent_session_token_rejoin_issued"
     saved = upsert_branch_context(
@@ -11216,6 +11353,12 @@ def rejoin_mf_subagent_runtime_session_token(
         "principal_id": saved.worker_slot_id or saved.worker_id or saved.agent_id,
         "reopen_for_revision": revision_rejoin,
         "reopen_for_failed_qa_revision": failed_qa_revision_rejoin,
+        "revision_rejoin_applied": revision_rejoin,
+        "failed_qa_running_revision_rejoin_authority": (
+            asdict(failed_qa_authority)
+            if fresh_running_failed_qa_rejoin
+            else {}
+        ),
         "reopen_for_post_qa_merge_conflict": post_qa_conflict_rejoin,
         "post_qa_merge_conflict_rejoin_authority": (
             asdict(authority) if post_qa_conflict_rejoin else {}

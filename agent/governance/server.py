@@ -28402,9 +28402,15 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
         context_status == STATE_RUNNING
         and revision_counters_advanced
     )
+    fresh_failed_qa_replacement_running = (
+        context_status == STATE_RUNNING
+        and int(getattr(context, "attempt", 0) or 0) > 1
+        and int(getattr(context, "retry_round", 0) or 0) == 0
+    )
     if (
         context_status not in FAILED_QA_REVISION_REJOIN_STATES
         and not failed_qa_rejoin_reopened
+        and not fresh_failed_qa_replacement_running
     ):
         return {}
     backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
@@ -28455,6 +28461,16 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
             if isinstance(failed_line.get("payload"), Mapping)
             else {}
         )
+        dispatch_payload = (
+            dispatch_match.get("payload")
+            if isinstance(dispatch_match.get("payload"), Mapping)
+            else {}
+        )
+        dispatch_route_identity = (
+            dispatch_payload.get("route_identity")
+            if isinstance(dispatch_payload.get("route_identity"), Mapping)
+            else {}
+        )
         return {
             "schema_version": (
                 "runtime_context.contract_runtime_failed_qa_revision_evidence.v1"
@@ -28471,6 +28487,11 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
             ),
             "failed_qa_source_ref": source_ref,
             "dispatch_source_ref": str(dispatch_match.get("source_ref") or ""),
+            "dispatch_route_identity": {
+                field: str(dispatch_route_identity.get(field) or "").strip()
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                if str(dispatch_route_identity.get(field) or "").strip()
+            },
             "identity_binding": identity_binding,
             "runtime_context_id": _contract_runtime_context_identity(context)[0],
             "task_id": str(getattr(context, "task_id", "") or ""),
@@ -28481,6 +28502,211 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
             "observer_authored_worker_evidence": False,
         }
     return {}
+
+
+def _runtime_context_failed_qa_running_revision_rejoin_authority(
+    *,
+    context: Any,
+    evidence: Mapping[str, Any] | None,
+    contract_execution_id: str,
+    route_identity: Mapping[str, Any] | None,
+):
+    """Bind immutable failed-QA evidence to one fresh running replacement."""
+
+    from .parallel_branch_runtime import (
+        FailedQaRunningRevisionRejoinAuthority,
+        STATE_RUNNING,
+        runtime_context_secret_hash,
+    )
+
+    proof = dict(evidence or {})
+    binding = (
+        dict(proof.get("identity_binding") or {})
+        if isinstance(proof.get("identity_binding"), Mapping)
+        else {}
+    )
+    execution_id = str(contract_execution_id or "").strip()
+    context_runtime_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    context_task_id = str(getattr(context, "task_id", "") or "").strip()
+    context_parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    context_project_id = str(
+        getattr(context, "project_id", "") or ""
+    ).strip()
+    context_backlog_id = str(
+        getattr(context, "backlog_id", "") or ""
+    ).strip()
+    replacement_attempt = int(getattr(context, "attempt", 0) or 0)
+    replacement_retry_round = int(
+        getattr(context, "retry_round", 0) or 0
+    )
+    if (
+        str(getattr(context, "status", "") or "") != STATE_RUNNING
+        or replacement_attempt <= 1
+        or replacement_retry_round != 0
+        or str(proof.get("schema_version") or "")
+        != "runtime_context.contract_runtime_failed_qa_revision_evidence.v1"
+        or str(proof.get("status") or "") != "revision_required"
+        or str(proof.get("source") or "")
+        != "contract_runtime_completed_lines"
+        or bool(proof.get("failed_qa_rejoin_reopened"))
+        or not binding
+        or not execution_id
+    ):
+        return None
+
+    expected_proof_identity = {
+        "project_id": context_project_id,
+        "backlog_id": context_backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": context_runtime_id,
+        "task_id": context_task_id,
+        "parent_task_id": context_parent_task_id,
+    }
+    if any(
+        str(proof.get(field) or "").strip() != expected
+        for field, expected in expected_proof_identity.items()
+    ):
+        return None
+
+    binding_hash = str(binding.get("binding_hash") or "").strip()
+    unhashed_binding = dict(binding)
+    unhashed_binding.pop("binding_hash", None)
+    expected_binding = {
+        "runtime_context_id": context_runtime_id,
+        "task_id": context_task_id,
+        "parent_task_id": context_parent_task_id,
+        "worker_id": str(getattr(context, "worker_id", "") or "").strip(),
+        "worker_slot_id": str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ).strip(),
+        "fence_token_hash": runtime_context_secret_hash(
+            str(getattr(context, "fence_token", "") or "")
+        ),
+        "candidate_commit_sha": str(
+            getattr(context, "head_commit", "") or ""
+        ).strip(),
+    }
+    if (
+        not binding_hash
+        or binding_hash != stable_sha256(unhashed_binding)
+        or any(
+            str(binding.get(field) or "").strip()
+            != str(value or "").strip()
+            for field, value in expected_binding.items()
+        )
+    ):
+        return None
+
+    source_prefix = f"contract_runtime:{execution_id}:"
+    dispatch_source_ref = str(
+        proof.get("dispatch_source_ref") or ""
+    ).strip()
+    failed_qa_source_ref = str(
+        proof.get("failed_qa_source_ref") or ""
+    ).strip()
+    if (
+        str(binding.get("dispatch_source_ref") or "").strip()
+        != dispatch_source_ref
+        or not dispatch_source_ref.startswith(source_prefix)
+        or not failed_qa_source_ref.startswith(source_prefix)
+    ):
+        return None
+
+    selected_route_identity = {
+        field: str((route_identity or {}).get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    dispatch_route_identity = (
+        proof.get("dispatch_route_identity")
+        if isinstance(proof.get("dispatch_route_identity"), Mapping)
+        else {}
+    )
+    safe_dispatch_route_identity = {
+        field: str(dispatch_route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    selected_complete = all(selected_route_identity.values())
+    dispatch_complete = all(safe_dispatch_route_identity.values())
+    if selected_complete and dispatch_complete and any(
+        selected_route_identity[field] != safe_dispatch_route_identity[field]
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    ):
+        return None
+    safe_route_identity = (
+        selected_route_identity
+        if selected_complete
+        else safe_dispatch_route_identity
+    )
+    if not all(safe_route_identity.values()):
+        return None
+
+    candidate_commit = expected_binding["candidate_commit_sha"]
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_commit):
+        return None
+    owned_files = tuple(
+        str(value or "").strip()
+        for value in (
+            getattr(context, "owned_files", ())
+            or getattr(context, "target_files", ())
+            or ()
+        )
+        if str(value or "").strip()
+    )
+    core = {
+        "project_id": context_project_id,
+        "backlog_id": context_backlog_id,
+        **expected_binding,
+        "contract_execution_id": execution_id,
+        "dispatch_source_ref": dispatch_source_ref,
+        "failed_qa_source_ref": failed_qa_source_ref,
+        "identity_binding_hash": binding_hash,
+        "route_identity_hash": stable_sha256(safe_route_identity),
+        "branch_ref": str(getattr(context, "branch_ref", "") or "").strip(),
+        "target_project_root": _runtime_context_effective_target_project_root(
+            context
+        ),
+        "worktree_path": str(
+            getattr(context, "worktree_path", "") or ""
+        ).strip(),
+        "merge_queue_id": str(
+            getattr(context, "merge_queue_id", "") or ""
+        ).strip(),
+        "owned_files": owned_files,
+        "replacement_attempt": replacement_attempt,
+        "replacement_retry_round": replacement_retry_round,
+        "schema_version": (
+            "parallel_branch.failed_qa_running_revision_rejoin_authority.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "immutable_failed_qa_verified": True,
+    }
+    if not all(
+        (
+            core["project_id"],
+            core["backlog_id"],
+            core["runtime_context_id"],
+            core["task_id"],
+            core["parent_task_id"],
+            core["worker_id"],
+            core["worker_slot_id"],
+            core["fence_token_hash"],
+            core["branch_ref"],
+            core["target_project_root"],
+            core["worktree_path"],
+            core["merge_queue_id"],
+            core["owned_files"],
+        )
+    ):
+        return None
+    return FailedQaRunningRevisionRejoinAuthority(
+        **core,
+        authority_hash=stable_sha256(core),
+    )
 
 
 def _runtime_context_post_qa_explicit_positive_status(
@@ -30712,6 +30938,14 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 context=context,
             )
         )
+        failed_qa_running_revision_rejoin_authority = (
+            _runtime_context_failed_qa_running_revision_rejoin_authority(
+                context=context,
+                evidence=contract_runtime_failed_qa_revision,
+                contract_execution_id=resolved_contract_execution_id,
+                route_identity=selected_route_identity,
+            )
+        )
         failed_qa_reopen_for_revision = bool(
             timeline_reopen_for_revision or contract_runtime_failed_qa_revision
         )
@@ -30801,6 +31035,9 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     reason=reason,
                     now_iso=str(body.get("now_iso") or ""),
                     reopen_for_revision=failed_qa_reopen_for_revision,
+                    failed_qa_running_revision_rejoin_authority=(
+                        failed_qa_running_revision_rejoin_authority
+                    ),
                     post_qa_merge_conflict_rejoin_authority=(
                         post_qa_merge_conflict_rejoin_authority
                     ),
@@ -30885,13 +31122,21 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 )
 
         # The branch-runtime primitive changes revision counters only when it
-        # moves a validated/merge-ready context back to worktree-ready under a
-        # server-derived failed-QA or post-QA-conflict authority. A later
-        # same-context auth-only rejoin keeps those counters stable.
+        # applies a server-derived failed-QA or post-QA-conflict transition.
+        # The response keeps the broader authority-available flags for
+        # compatibility while revision_rejoin_applied reports the exact state
+        # transition; later auth-only rejoins keep counters stable.
+        result["revision_rejoin_applied"] = bool(
+            result.get("revision_rejoin_applied")
+        )
         result["reopen_for_revision"] = reopen_for_revision
         result["reopen_for_failed_qa_revision"] = (
             failed_qa_reopen_for_revision
         )
+        if failed_qa_running_revision_rejoin_authority is not None:
+            result["failed_qa_running_revision_rejoin_authority"] = asdict(
+                failed_qa_running_revision_rejoin_authority
+            )
         result["reopen_for_post_qa_merge_conflict"] = bool(
             post_qa_merge_conflict_rejoin_authority is not None
         )
