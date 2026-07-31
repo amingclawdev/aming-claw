@@ -41550,6 +41550,247 @@ def test_failed_qa_rejoin_derives_missing_identity_only_from_exact_dispatch():
     )
 
 
+def test_failed_qa_rejoin_consumes_exact_cross_runtime_successor_dispatch(
+    monkeypatch,
+):
+    execution_id = "cex-cross-runtime-failed-qa-successor"
+    backlog_id = "AC-CROSS-RUNTIME-FAILED-QA-SUCCESSOR"
+    failed_commit = "a" * 40
+    failed_line_index = 1
+    context = SimpleNamespace(
+        project_id=PID,
+        runtime_context_id="mfrctx-cross-runtime-successor",
+        task_id="cross-runtime-successor-worker",
+        parent_task_id=execution_id,
+        root_task_id=execution_id,
+        backlog_id=backlog_id,
+        status="running",
+        attempt=2,
+        retry_round=0,
+        worker_id="cross-runtime-successor-worker",
+        worker_slot_id="cross-runtime-successor-worker",
+        fence_token="fence-cross-runtime-successor",
+        session_token_hash=mf_subagent_session_token_hash(
+            "active-cross-runtime-successor-token"
+        ),
+        target_project_root="/tmp/cross-runtime-successor",
+        worktree_path="/tmp/cross-runtime-successor",
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "contract_execution_id": execution_id,
+        "completed_lines": [
+            {
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "actor_role": "mf_sub",
+                "evidence_kind": "implementation",
+                "runtime_context_id": "mfrctx-cross-runtime-failed",
+                "task_id": "cross-runtime-failed-worker",
+                "parent_task_id": execution_id,
+                "commit_sha": failed_commit,
+            },
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "runtime_context_id": "mfrctx-cross-runtime-failed",
+                "task_id": "cross-runtime-failed-worker",
+                "parent_task_id": execution_id,
+                "commit_sha": failed_commit,
+                "payload": {"status": "failed", "verdict": "FAIL"},
+            },
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": execution_id,
+                "worker_id": context.worker_id,
+                "worker_slot_id": context.worker_slot_id,
+                "payload": {
+                    "runtime_context_id": context.runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": execution_id,
+                    "worker_id": context.worker_id,
+                    "worker_slot_id": context.worker_slot_id,
+                    "failed_qa_rework_dispatch_revision": {
+                        "failed_qa_completed_line_index": failed_line_index,
+                        "runtime_context_id": context.runtime_context_id,
+                        "task_id": context.task_id,
+                        "append_only_history_preserved": True,
+                        "timeline_projection_authoritative": False,
+                    },
+                    "failed_qa_rework_dispatch_revision_authority": {
+                        "source": "parallel_branch_allocate_failed_qa_rework",
+                        "server_derived": True,
+                        "contract_execution_id": execution_id,
+                        "failed_qa_completed_line_index": failed_line_index,
+                        "runtime_context_id": context.runtime_context_id,
+                        "task_id": context.task_id,
+                    },
+                },
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(
+            list_by_backlog=lambda **_kwargs: [record]
+        ),
+    )
+
+    evidence = (
+        server._runtime_context_failed_qa_revision_contract_runtime_evidence(
+            object(),
+            project_id=PID,
+            context=context,
+        )
+    )
+
+    authority = evidence["successor_dispatch_revision_authority"]
+    assert evidence["status"] == "revision_required"
+    assert evidence["failed_qa_source_ref"].endswith(
+        f":completed_lines:{failed_line_index}"
+    )
+    assert authority["runtime_context_id"] == context.runtime_context_id
+    assert authority["failed_runtime_context_id"] == (
+        "mfrctx-cross-runtime-failed"
+    )
+    assert authority["superseded_implementation_commit_authority"][
+        "commit_sha"
+    ] == failed_commit
+
+    route_identity = {
+        "route_id": "route-cross-runtime-successor",
+        "route_context_hash": _fake_sha("cross-runtime-successor-route"),
+        "prompt_contract_id": "rprompt-cross-runtime-successor",
+        "prompt_contract_hash": _fake_sha("cross-runtime-successor-prompt"),
+        "route_token_ref": "rtok-cross-runtime-successor",
+        "visible_injection_manifest_hash": _fake_sha(
+            "cross-runtime-successor-visible"
+        ),
+    }
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_route_identity",
+        lambda *_args, **_kwargs: dict(route_identity),
+    )
+    auth_only_event = {
+        "id": 20,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": context.task_id,
+        "event_type": "observer.runtime_context_session_token_rejoin",
+        "event_kind": "observer_command",
+        "status": "accepted",
+        "payload": {
+            "action": "runtime_context_session_token_rejoin",
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": execution_id,
+            "attempt": context.attempt,
+            "retry_round": context.retry_round,
+            "current_status": "running",
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id,
+            "fence_token_hash": runtime_context_secret_hash(
+                context.fence_token
+            ),
+            "session_token_ref": runtime_context_session_token_ref(context),
+            "revision_rejoin_applied": False,
+            "reopen_for_revision": False,
+            "route_identity": dict(route_identity),
+        },
+    }
+
+    marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=object(),
+        context=context,
+        runtime_context_id=context.runtime_context_id,
+        timeline_events=[auth_only_event],
+    )
+
+    assert marker["revision_event_ref"] == "timeline:20"
+    assert marker["failed_qa_source_ref"] == evidence["failed_qa_source_ref"]
+    assert marker["successor_dispatch_revision_authority"]["binding_hash"] == (
+        authority["binding_hash"]
+    )
+    assert marker["session_token_ref_rotation"][
+        "active_session_token_ref"
+    ] == runtime_context_session_token_ref(context)
+    assert not server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=object(),
+        context=context,
+        runtime_context_id=context.runtime_context_id,
+        timeline_events=[auth_only_event, {**auth_only_event, "id": 21}],
+    )
+    assert not server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=object(),
+        context=context,
+        runtime_context_id=context.runtime_context_id,
+        timeline_events=[
+            auth_only_event,
+            {
+                "id": 21,
+                "backlog_id": backlog_id,
+                "task_id": context.task_id,
+                "event_type": "runtime_context.worker_commit",
+                "event_kind": "worker_commit",
+                "status": "accepted",
+                "payload": {"task_id": context.task_id},
+            },
+        ],
+    )
+
+
+def test_failed_qa_rejoin_guidance_prioritizes_revision_over_active_auth_only(
+    monkeypatch,
+):
+    context = SimpleNamespace(
+        runtime_context_id="mfrctx-active-failed-qa-priority",
+        task_id="active-failed-qa-priority-worker",
+        backlog_id="AC-ACTIVE-FAILED-QA-PRIORITY",
+        status="running",
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_timeline_events",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_timeline_refs",
+        lambda *args, **kwargs: ({}, {}, {}, {}),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_failed_qa_revision_rejoin_allowed",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_failed_qa_revision_contract_runtime_evidence",
+        lambda *args, **kwargs: {"status": "revision_required"},
+    )
+
+    eligibility = server._runtime_context_session_rejoin_guidance_eligibility(
+        object(),
+        project_id=PID,
+        context=context,
+    )
+
+    assert eligibility["eligible"] is True
+    assert eligibility["mode"] == "failed_qa_revision"
+
+
 @pytest.mark.parametrize(
     ("gate_authority", "accepted"),
     [
