@@ -33,6 +33,7 @@ def test_mf_parallel_rev8_requires_both_worker_lanes_before_merge_and_final_qa()
             "parent_task_id": "cex-two-worker",
             "worker_id": "slot-a",
             "worker_slot_id": "slot-a",
+            "merge_queue_id": "mq-two-worker-a",
             "line_instance_id": "runtime_context:mfrctx-two-worker-a",
         },
         {
@@ -41,9 +42,16 @@ def test_mf_parallel_rev8_requires_both_worker_lanes_before_merge_and_final_qa()
             "parent_task_id": "cex-two-worker",
             "worker_id": "slot-b",
             "worker_slot_id": "slot-b",
+            "merge_queue_id": "mq-two-worker-b",
             "line_instance_id": "runtime_context:mfrctx-two-worker-b",
         },
     ]
+    reconcile_policy = definition["system_layer"]["graph_binding_policy"][
+        "current_full_reconcile_evidence_policy"
+    ]
+    assert reconcile_policy["qa_authority_required_before_reconcile"] is False
+    assert reconcile_policy["qa_authority_required_after_reconcile"] is True
+    assert "qa_authority_alternatives" not in reconcile_policy
     completed = [
         {
             "stage_id": "orchestration",
@@ -108,6 +116,174 @@ def test_mf_parallel_rev8_requires_both_worker_lanes_before_merge_and_final_qa()
     assert current()["line_id"] == "qa_independent_verification"
 
 
+def test_mf_parallel_rev8_reconcile_accepts_two_pre_qa_lane_merges(monkeypatch):
+    execution_id = "cex-two-worker-reconcile"
+    backlog_id = "AC-TWO-WORKER-RECONCILE"
+    dispatch_source_ref = (
+        f"contract_runtime:{execution_id}:completed_lines:0"
+    )
+    workers = [
+        {
+            "runtime_context_id": "mfrctx-reconcile-a",
+            "task_id": "reconcile-worker-a",
+            "parent_task_id": execution_id,
+            "merge_queue_id": "mq-reconcile-a",
+        },
+        {
+            "runtime_context_id": "mfrctx-reconcile-b",
+            "task_id": "reconcile-worker-b",
+            "parent_task_id": execution_id,
+            "merge_queue_id": "mq-reconcile-b",
+        },
+    ]
+    completed = [
+        {
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "actor_role": "observer",
+            "evidence_kind": "dispatch_bounded_worker",
+            "payload": {
+                "worker_count": 2,
+                "atomic_dispatch": True,
+                "bounded_workers": workers,
+            },
+        }
+    ]
+    for index, worker in enumerate(workers, start=1):
+        durable = {
+            "schema_version": (
+                "contract_runtime.observer_merge_durable_authority.v1"
+            ),
+            "server_derived": True,
+            "db_verified": True,
+            "project_id": "aming-claw",
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            **worker,
+            "merge_commit": str(index) * 40,
+            "merge_event_ref": f"timeline:{100 + index}",
+            "merge_event_id": 100 + index,
+            "merge_event_created_at": f"2026-08-01T00:00:0{index}Z",
+            "contract_runtime_dispatch_source_ref": dispatch_source_ref,
+            "pre_qa_merge_authorized": True,
+            "final_qa_required_after_reconcile": True,
+            "close_satisfying": False,
+        }
+        completed.append(
+            {
+                "stage_id": "merge",
+                "line_id": "observer_merge",
+                "line_instance_id": (
+                    f"runtime_context:{worker['runtime_context_id']}"
+                ),
+                "payload": {"durable_merge_authority": durable},
+            }
+        )
+    record = {
+        "project_id": "aming-claw",
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev8",
+        "contract_execution_id": execution_id,
+        "completed_lines": completed,
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_full_reconcile_authority_from_merge",
+        lambda *_args, **_kwargs: {},
+    )
+
+    authority = server._contract_runtime_reconcile_record_authority(
+        None,
+        project_id="aming-claw",
+        record=record,
+    )
+
+    assert authority["record_verified"] is True
+    assert authority["merge_projection_verified"] is True
+    assert authority["dispatch_lineage_verified"] is True
+    assert authority["all_lane_merges_verified"] is True
+    assert authority["lane_merge_count"] == 2
+    assert authority["lane_runtime_context_ids"] == [
+        "mfrctx-reconcile-a",
+        "mfrctx-reconcile-b",
+    ]
+    assert authority["merged_commit_sha"] == "2" * 40
+    assert authority["merge_event_id"] == 102
+    assert authority["reconcile_event_recorded"] is False
+
+    captured = {}
+
+    def enrich_reconcile(
+        _conn,
+        *,
+        project_id,
+        record,
+        context,
+        timeline_events,
+        merge,
+    ):
+        captured["resolver_merge"] = dict(merge)
+        return {
+            **merge,
+            "reconcile_source_ref": "timeline:103",
+            "reconcile_event_id": 103,
+            "reconcile_event_created_at": "2026-08-01T00:00:03Z",
+            "reconcile_task_id": context.task_id,
+            "reconcile_runtime_context_id": context.runtime_context_id,
+        }
+
+    def current_full(
+        _conn,
+        *,
+        project_id,
+        record,
+        merge,
+        reconcile,
+    ):
+        captured["current_full_merge"] = dict(merge)
+        captured["current_full_reconcile"] = dict(reconcile)
+        return {**merge, "db_verified": True}
+
+    final_worker = workers[1]
+    context = SimpleNamespace(
+        **final_worker,
+        backlog_id=backlog_id,
+        batch_id="",
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [context],
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_timeline_events",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_merge_reconcile_authority",
+        enrich_reconcile,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_full_reconcile_authority_from_merge",
+        current_full,
+    )
+
+    close_authority = server._contract_runtime_current_full_reconcile_authority(
+        None,
+        project_id="aming-claw",
+        record=record,
+    )
+
+    assert captured["resolver_merge"]["all_lane_merges_verified"] is True
+    assert captured["resolver_merge"]["close_satisfying"] is False
+    assert captured["current_full_reconcile"]["reconcile_event_id"] == 103
+    assert close_authority["db_verified"] is True
+
+
 def test_mf_parallel_rev8_failed_final_qa_routes_to_bounded_worker_fix():
     record = {
         "contract_id": "mf_parallel.v2",
@@ -148,6 +324,7 @@ def test_mf_parallel_rev8_failed_final_qa_routes_to_bounded_worker_fix():
         "return_sequence": [
             "observer_merge",
             "observer_reconcile",
+            "qa_graph_context",
             "qa_independent_verification",
         ],
     }

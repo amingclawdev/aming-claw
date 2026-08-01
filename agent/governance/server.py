@@ -67958,6 +67958,7 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
                         "return_sequence": [
                             "observer_merge",
                             "observer_reconcile",
+                            "qa_graph_context",
                             "qa_independent_verification",
                         ],
                     },
@@ -79400,6 +79401,29 @@ def _contract_runtime_observer_merge_completed_round(
         )
         if acceptance.get("db_verified") is True:
             qa_verification_lines.append((index, line, acceptance))
+    if (
+        str(record.get("revision") or "").strip() == "rev8"
+        and not qa_graph_lines
+        and not qa_verification_lines
+    ):
+        # rev8 deliberately fans in both worker lanes before canonical
+        # reconcile and final integration QA.  The durable merge binder must
+        # therefore be able to prove the worker round without inventing the
+        # later QA lines.  Older revisions retain their QA-before-merge
+        # contract below.
+        return {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "branch_head": branch_head,
+            "worker_commit_completed_line_index": worker_commit_index,
+            "qa_graph_completed_line_index": -1,
+            "qa_completed_line_index": -1,
+            "qa_acceptance_ref": "",
+            "qa_contract_runtime_verified": False,
+            "pre_qa_merge_authorized": True,
+            "final_qa_required_after_reconcile": True,
+        }
     if len(qa_graph_lines) > 1 or len(qa_verification_lines) > 1:
         return {}
     if len(qa_graph_lines) == 1 and len(qa_verification_lines) == 1:
@@ -79500,6 +79524,30 @@ def _contract_runtime_observer_merge_durable_authority(
         and str(line.get("line_id") or "").strip()
         == "observer_dispatch_bounded_workers"
     ]
+    rev8_two_worker_fanout = str(record.get("revision") or "").strip() == "rev8"
+    completed_merge_context_ids = {
+        _contract_runtime_mapping_value(line, "runtime_context_id")
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "observer_merge"
+        and _contract_runtime_mapping_value(line, "runtime_context_id")
+    }
+    dispatch_selection = _contract_runtime_current_dispatch_authority_line(
+        record
+    )
+    dispatch_index = int(
+        dispatch_selection.get("completed_line_index") or 0
+    )
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    dispatch_source_ref = (
+        f"contract_runtime:{contract_execution_id}:completed_lines:"
+        f"{dispatch_index}"
+        if dispatch_selection.get("status") == "selected"
+        and contract_execution_id
+        else ""
+    )
     candidates: list[dict[str, Any]] = []
     for dispatch_line in dispatch_lines:
         for context in _contract_runtime_contexts_for_dispatch_line(
@@ -79511,6 +79559,11 @@ def _contract_runtime_observer_merge_durable_authority(
             runtime_context_id, task_id, parent_task_id = (
                 _contract_runtime_context_identity(context)
             )
+            if (
+                rev8_two_worker_fanout
+                and runtime_context_id in completed_merge_context_ids
+            ):
+                continue
             backlog_id = str(
                 getattr(context, "backlog_id", "")
                 or record.get("backlog_id")
@@ -79645,6 +79698,7 @@ def _contract_runtime_observer_merge_durable_authority(
                     "db_verified": True,
                     "project_id": project_id,
                     "backlog_id": backlog_id,
+                    "contract_execution_id": contract_execution_id,
                     "runtime_context_id": runtime_context_id,
                     "task_id": task_id,
                     "parent_task_id": parent_task_id,
@@ -79670,15 +79724,32 @@ def _contract_runtime_observer_merge_durable_authority(
                     "qa_contract_runtime_verified": bool(
                         completed_round.get("qa_contract_runtime_verified")
                     ),
+                    "pre_qa_merge_authorized": bool(
+                        completed_round.get("pre_qa_merge_authorized")
+                    ),
+                    "final_qa_required_after_reconcile": bool(
+                        completed_round.get(
+                            "final_qa_required_after_reconcile"
+                        )
+                    ),
                     "no_pass_claim": bool(audit_authority),
                     "overall_release_pass_claimed": False,
                     "authoritative_pass_synthesized": False,
-                    "close_satisfying": False if audit_authority else True,
+                    "close_satisfying": bool(
+                        not audit_authority
+                        and completed_round.get(
+                            "pre_qa_merge_authorized"
+                        )
+                        is not True
+                    ),
                     "qa_audit_only_no_pass_authority": audit_authority,
                     "timeline_event_refs": [event_ref],
                     "merge_event_ref": event_ref,
                     "merge_event_id": event_id,
                     "merge_event_created_at": event_created_at,
+                    "contract_runtime_dispatch_source_ref": (
+                        dispatch_source_ref
+                    ),
                 }
             )
     unique = {stable_sha256(item): item for item in candidates}
@@ -81242,17 +81313,204 @@ def _contract_runtime_completed_line_acceptance(
     }
 
 
+def _contract_runtime_rev8_two_worker_merge_projection(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Join the two pre-QA lane merges to the one atomic rev8 dispatch."""
+
+    if str(record.get("revision") or "").strip() != "rev8":
+        return {}
+    dispatch_selection = _contract_runtime_current_dispatch_authority_line(
+        record
+    )
+    if dispatch_selection.get("status") != "selected":
+        return {}
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    dispatch_index = int(dispatch_selection["completed_line_index"])
+    dispatch_source_ref = (
+        f"contract_runtime:{contract_execution_id}:completed_lines:"
+        f"{dispatch_index}"
+    )
+    expected_workers = _contract_runtime_mf_parallel_bounded_workers(
+        {"payload": dispatch_selection.get("payload") or {}}
+    )
+    expected_by_runtime = {
+        str(worker.get("runtime_context_id") or "").strip(): worker
+        for worker in expected_workers
+        if str(worker.get("runtime_context_id") or "").strip()
+    }
+    if len(expected_workers) != 2 or len(expected_by_runtime) != 2:
+        return {}
+
+    completed_merge_authorities: list[dict[str, Any]] = []
+    for line in record.get("completed_lines") or []:
+        if not isinstance(line, Mapping) or str(
+            line.get("line_id") or ""
+        ).strip() != "observer_merge":
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        durable = (
+            payload.get("durable_merge_authority")
+            if isinstance(payload.get("durable_merge_authority"), Mapping)
+            else {}
+        )
+        runtime_context_id = str(
+            durable.get("runtime_context_id") or ""
+        ).strip()
+        expected_worker = expected_by_runtime.get(runtime_context_id) or {}
+        line_instance_id = str(
+            line.get("line_instance_id")
+            or payload.get("line_instance_id")
+            or ""
+        ).strip()
+        if not (
+            str(durable.get("schema_version") or "")
+            == _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
+            and durable.get("server_derived") is True
+            and durable.get("db_verified") is True
+            and durable.get("pre_qa_merge_authorized") is True
+            and durable.get("final_qa_required_after_reconcile") is True
+            and runtime_context_id
+            and line_instance_id == f"runtime_context:{runtime_context_id}"
+            and str(durable.get("contract_execution_id") or "").strip()
+            == contract_execution_id
+            and str(
+                durable.get("contract_runtime_dispatch_source_ref") or ""
+            ).strip()
+            == dispatch_source_ref
+            and str(durable.get("project_id") or "").strip()
+            == str(record.get("project_id") or "").strip()
+            and str(durable.get("backlog_id") or "").strip()
+            == str(record.get("backlog_id") or "").strip()
+            and str(durable.get("task_id") or "").strip()
+            == str(expected_worker.get("task_id") or "").strip()
+            and str(durable.get("parent_task_id") or "").strip()
+            == str(expected_worker.get("parent_task_id") or "").strip()
+            and str(durable.get("merge_queue_id") or "").strip()
+            == str(expected_worker.get("merge_queue_id") or "").strip()
+            and re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                str(durable.get("merge_commit") or "").strip().lower(),
+            )
+            and str(durable.get("merge_event_ref") or "").startswith(
+                "timeline:"
+            )
+            and int(durable.get("merge_event_id") or 0) > 0
+            and _contract_runtime_close_authority_time_order_value(
+                durable.get("merge_event_created_at")
+            )
+            is not None
+        ):
+            return {}
+        completed_merge_authorities.append(dict(durable))
+
+    authority_lane_ids = {
+        str(authority.get("runtime_context_id") or "").strip()
+        for authority in completed_merge_authorities
+    }
+    distinct_task_ids = {
+        str(authority.get("task_id") or "").strip()
+        for authority in completed_merge_authorities
+    }
+    distinct_queue_ids = {
+        str(authority.get("merge_queue_id") or "").strip()
+        for authority in completed_merge_authorities
+    }
+    event_ids = [
+        int(authority.get("merge_event_id") or 0)
+        for authority in completed_merge_authorities
+    ]
+    if not (
+        len(completed_merge_authorities) == 2
+        and authority_lane_ids == set(expected_by_runtime)
+        and len(distinct_task_ids) == 2
+        and len(distinct_queue_ids) == 2
+        and len(set(event_ids)) == 2
+    ):
+        return {}
+    final_merge = max(
+        completed_merge_authorities,
+        key=lambda authority: int(authority.get("merge_event_id") or 0),
+    )
+    return {
+        **final_merge,
+        "timeline_verified": True,
+        "authority_verified": True,
+        "dispatch_lineage_verified": True,
+        "merged_commit_sha": str(
+            final_merge.get("merge_commit") or ""
+        ).strip().lower(),
+        "merge_source_ref": str(
+            final_merge.get("merge_event_ref") or ""
+        ).strip(),
+        "contract_runtime_dispatch_source_ref": dispatch_source_ref,
+        "all_lane_merges_verified": True,
+        "lane_merge_count": 2,
+        "lane_runtime_context_ids": sorted(authority_lane_ids),
+        "lane_merge_queue_ids": sorted(distinct_queue_ids),
+    }
+
+
 def _contract_runtime_current_full_reconcile_authority(
     conn,
     *,
     project_id: str,
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
-    merge = _contract_runtime_trusted_merge_projection(
-        conn,
-        project_id=project_id,
-        record=record,
-    )
+    if str(record.get("revision") or "").strip() == "rev8":
+        merge = _contract_runtime_rev8_two_worker_merge_projection(record)
+        final_runtime_context_id = str(
+            merge.get("runtime_context_id") or ""
+        ).strip()
+        for dispatch_line in record.get("completed_lines") or []:
+            if not isinstance(dispatch_line, Mapping) or str(
+                dispatch_line.get("line_id") or ""
+            ).strip() != "observer_dispatch_bounded_workers":
+                continue
+            for context in _contract_runtime_contexts_for_dispatch_line(
+                conn,
+                project_id=project_id,
+                record=record,
+                line=dispatch_line,
+            ):
+                runtime_context_id, task_id, _parent_task_id = (
+                    _contract_runtime_context_identity(context)
+                )
+                if runtime_context_id != final_runtime_context_id:
+                    continue
+                timeline_events = _runtime_context_service_timeline_events(
+                    conn,
+                    project_id=project_id,
+                    task_id=task_id,
+                    backlog_id=str(
+                        getattr(context, "backlog_id", "")
+                        or record.get("backlog_id")
+                        or ""
+                    ),
+                )
+                merge = _contract_runtime_completed_merge_reconcile_authority(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    context=context,
+                    timeline_events=timeline_events,
+                    merge=merge,
+                )
+                break
+            if merge.get("reconcile_event_id"):
+                break
+    else:
+        merge = _contract_runtime_trusted_merge_projection(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
     return _contract_runtime_current_full_reconcile_authority_from_merge(
         conn,
         project_id=project_id,
@@ -81667,11 +81925,14 @@ def _contract_runtime_reconcile_record_authority(
     current-full verification is recomputed by close authority.
     """
 
-    merge = _contract_runtime_trusted_merge_projection(
-        conn,
-        project_id=project_id,
-        record=record,
-    )
+    if str(record.get("revision") or "").strip() == "rev8":
+        merge = _contract_runtime_rev8_two_worker_merge_projection(record)
+    else:
+        merge = _contract_runtime_trusted_merge_projection(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
     merged_commit = str(merge.get("merged_commit_sha") or "").strip().lower()
     merge_event_id = int(merge.get("merge_event_id") or 0)
     reconcile_event_id = int(merge.get("reconcile_event_id") or 0)
@@ -81739,6 +82000,16 @@ def _contract_runtime_reconcile_record_authority(
         "contract_runtime_dispatch_source_ref": str(
             merge.get("contract_runtime_dispatch_source_ref") or ""
         ).strip(),
+        "all_lane_merges_verified": bool(
+            merge.get("all_lane_merges_verified") is True
+        ),
+        "lane_merge_count": int(merge.get("lane_merge_count") or 0),
+        "lane_runtime_context_ids": list(
+            merge.get("lane_runtime_context_ids") or []
+        ),
+        "lane_merge_queue_ids": list(
+            merge.get("lane_merge_queue_ids") or []
+        ),
         "reconcile_event_recorded": reconcile_event_recorded,
         "reconcile_source_ref": (
             str(merge.get("reconcile_source_ref") or "").strip()

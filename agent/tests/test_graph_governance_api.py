@@ -7415,7 +7415,8 @@ def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path,
         assert "qa_session_id is identity only, not authentication" in path_prompt
         assert "never put it inside graph_query args" in path_prompt
         assert "Keep the raw QA token internal to managed MCP" in path_prompt
-        assert "system CLI agent service or a host-created bounded worker/subagent" in path_prompt
+        assert "host-created Codex Desktop bounded worker/subagent" in path_prompt
+        assert "do not act as the worker from the observer session or use the CLI Agent Service" in path_prompt
         assert "do not act as the worker from the observer session" in path_prompt
         assert "Do not stop after planning" in path_prompt
         assert "friction" in path_prompt
@@ -7423,12 +7424,14 @@ def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path,
     assert "observer_direct_implementation_exception" in launch_prompts["direct_main"]
     assert "mf_parallel" in launch_prompts["mf_parallel"]
     assert "runtime_context_worker_guide" in launch_prompts["mf_parallel"]
-    assert "separate CLI agent or host-created subagent" in launch_prompts["mf_parallel"]
-    assert "observer session must not act as that worker" in launch_prompts["mf_parallel"]
+    assert "separate Codex Desktop host-created subagent" in launch_prompts["mf_parallel"]
+    assert "do not use the CLI Agent Service" in launch_prompts["mf_parallel"]
+    assert "observer session must not act as either worker" in launch_prompts["mf_parallel"]
     assert "mf_batch_parallel" in launch_prompts["mf_batch_parallel"]
     assert "Row A: Today Focus" in launch_prompts["mf_batch_parallel"]
     assert "Row B: per-task reminder toggle" in launch_prompts["mf_batch_parallel"]
-    assert "separate CLI agent or host-created subagent" in launch_prompts["mf_batch_parallel"]
+    assert "separate Codex Desktop host-created subagent" in launch_prompts["mf_batch_parallel"]
+    assert "do not use the CLI Agent Service" in launch_prompts["mf_batch_parallel"]
     assert "observer session must not edit the worker worktree" in launch_prompts["mf_batch_parallel"]
     assert "runtime_context_worker_guide" in prompt
     assert "must not edit the worker worktree" in prompt
@@ -67109,26 +67112,44 @@ def test_contract_runtime_dispatch_copy_safe_body_hydrates_after_allocate_and_su
     )
     assert prefill["ok"] is True
 
-    route_token_ref = "rtok-dispatch-copy-safe-child"
-    _persist_contract_runtime_observer_route_ref(
-        conn,
-        backlog_id=backlog_id,
-        contract_execution_id=execution_id,
-        route_token_ref=route_token_ref,
-        allowed_actions=[
-            "parallel_branch_allocate",
-            "task_timeline_append",
-        ],
-    )
     profile_requirements = {
         "profile_id": "codex-mf-sub",
         "harness": "codex",
         "provider": "openai",
     }
     retry_policy = {"attempt": 1, "max_attempts": 2}
-    worktree_path = tmp_path / "workers" / worker_task_id
-    status, allocated = (
-        server.handle_graph_governance_parallel_branch_allocate(
+    lanes = [
+        {
+            "task_id": worker_task_id,
+            "worker_id": "worker-dispatch-copy-safe-a",
+            "agent_id": "host-dispatch-copy-safe-a",
+            "merge_queue_id": "mq-dispatch-copy-safe-a",
+            "route_token_ref": "rtok-dispatch-copy-safe-child-a",
+            "owned_files": ["agent/governance/server.py"],
+        },
+        {
+            "task_id": "dispatch-copy-safe-worker-b",
+            "worker_id": "worker-dispatch-copy-safe-b",
+            "agent_id": "host-dispatch-copy-safe-b",
+            "merge_queue_id": "mq-dispatch-copy-safe-b",
+            "route_token_ref": "rtok-dispatch-copy-safe-child-b",
+            "owned_files": ["agent/tests/test_graph_governance_api.py"],
+        },
+    ]
+    allocations = []
+    for lane in lanes:
+        _persist_contract_runtime_observer_route_ref(
+            conn,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            route_token_ref=lane["route_token_ref"],
+            allowed_actions=[
+                "parallel_branch_allocate",
+                "task_timeline_append",
+            ],
+        )
+        worktree_path = tmp_path / "workers" / lane["task_id"]
+        status, allocated = server.handle_graph_governance_parallel_branch_allocate(
             _ctx_with_role(
                 {"project_id": PID},
                 "observer",
@@ -67142,27 +67163,27 @@ def test_contract_runtime_dispatch_copy_safe_body_hydrates_after_allocate_and_su
                     "root_task_id": successor[
                         "root_contract_execution_id"
                     ],
-                    "task_id": worker_task_id,
-                    "worker_id": "worker-dispatch-copy-safe",
-                    "agent_id": "host-dispatch-copy-safe",
+                    "task_id": lane["task_id"],
+                    "worker_id": lane["worker_id"],
+                    "agent_id": lane["agent_id"],
                     "target_project_root": str(tmp_path),
                     "workspace_root": str(tmp_path),
                     "worktree_path": str(worktree_path),
                     "base_commit": "a" * 40,
                     "target_head_commit": "a" * 40,
-                    "merge_queue_id": "mq-dispatch-copy-safe",
-                    "owned_files": ["agent/governance/server.py"],
+                    "merge_queue_id": lane["merge_queue_id"],
+                    "owned_files": lane["owned_files"],
                     "profile_requirements": profile_requirements,
                     "retry_policy": retry_policy,
-                    "route_token_ref": route_token_ref,
+                    "route_token_ref": lane["route_token_ref"],
                     "issue_same_owner_session_token": False,
                     "create_worktree": False,
                 },
             )
         )
-    )
-    assert status == 201
-    assert allocated["ok"] is True
+        assert status == 201
+        assert allocated["ok"] is True
+        allocations.append(allocated)
 
     current = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
@@ -67176,22 +67197,49 @@ def test_contract_runtime_dispatch_copy_safe_body_hydrates_after_allocate_and_su
     assert next_action["copy_safe_dispatch_ready"] is True
     copy_body = next_action["writer_role_safe_copy_payload"]["copy_payload"]
     dispatch_body = copy_body["payload"]
-    assert dispatch_body["runtime_context_id"] == allocated["context"][
-        "runtime_context_id"
+    assert dispatch_body["schema_version"] == (
+        "mf_parallel.atomic_two_worker_dispatch.v1"
+    )
+    assert dispatch_body["worker_count"] == 2
+    assert dispatch_body["required_worker_count"] == 2
+    assert dispatch_body["atomic_dispatch"] is True
+    assert dispatch_body["all_or_nothing"] is True
+    bounded_workers = dispatch_body["bounded_workers"]
+    assert bounded_workers == copy_body["bounded_workers"]
+    assert len(bounded_workers) == 2
+    assert {
+        worker["runtime_context_id"] for worker in bounded_workers
+    } == {
+        allocation["context"]["runtime_context_id"]
+        for allocation in allocations
+    }
+    assert {worker["task_id"] for worker in bounded_workers} == {
+        lane["task_id"] for lane in lanes
+    }
+    assert {worker["worktree_path"] for worker in bounded_workers} == {
+        str(tmp_path / "workers" / lane["task_id"])
+        for lane in lanes
+    }
+    assert len({worker["branch_ref"] for worker in bounded_workers}) == 2
+    assert {worker["merge_queue_id"] for worker in bounded_workers} == {
+        lane["merge_queue_id"] for lane in lanes
+    }
+    assert {worker["route_token_ref"] for worker in bounded_workers} == {
+        lane["route_token_ref"] for lane in lanes
+    }
+    assert all(
+        worker["parent_task_id"] == execution_id
+        and worker["root_task_id"]
+        == successor["root_contract_execution_id"]
+        and worker["target_project_root"] == str(tmp_path)
+        and worker["profile_requirements"] == profile_requirements
+        and worker["retry_policy"] == retry_policy
+        for worker in bounded_workers
+    )
+    assert dispatch_body["owned_files"] == [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
     ]
-    assert dispatch_body["task_id"] == worker_task_id
-    assert dispatch_body["parent_task_id"] == execution_id
-    assert dispatch_body["root_task_id"] == successor[
-        "root_contract_execution_id"
-    ]
-    assert dispatch_body["agent_id"] == "host-dispatch-copy-safe"
-    assert dispatch_body["target_project_root"] == str(tmp_path)
-    assert dispatch_body["worktree_path"] == str(worktree_path)
-    assert dispatch_body["branch_ref"].startswith("refs/heads/")
-    assert dispatch_body["profile_requirements"] == profile_requirements
-    assert dispatch_body["retry_policy"] == retry_policy
-    assert dispatch_body["route_token_ref"] == route_token_ref
-    assert copy_body["route_token_ref"] == route_token_ref
     assert next_action["copy_safe_dispatch_payload"][
         "contract_runtime_submit_line"
     ]["copy_safe_body"] == copy_body
@@ -67206,14 +67254,13 @@ def test_contract_runtime_dispatch_copy_safe_body_hydrates_after_allocate_and_su
         ("route_token_ref", None),
     ):
         rejected_body = json.loads(json.dumps(copy_body))
+        rejected_workers = rejected_body["payload"]["bounded_workers"]
         if replacement is None:
-            rejected_body.pop(field, None)
-            rejected_body["payload"].pop(field, None)
+            rejected_workers[0].pop(field, None)
             if field == "route_token_ref":
-                rejected_body["payload"]["route_identity"].pop(field, None)
+                rejected_workers[0]["route_identity"].pop(field, None)
         else:
-            rejected_body[field] = replacement
-            rejected_body["payload"][field] = replacement
+            rejected_workers[0][field] = replacement
         rejected = server.handle_project_contract_runtime_line_write_precheck(
             _ctx_with_role(
                 {"project_id": PID, "contract_execution_id": execution_id},
