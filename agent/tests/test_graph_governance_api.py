@@ -32925,6 +32925,103 @@ def test_exact_candidate_snapshot_uses_runtime_comparison_diff_tuple(
     assert proof["comparison_base_commit_sha"] == base_commit
     assert proof["close_satisfying"] is True
 
+    no_pass_body = {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_type": "qa.independent_verification",
+        "event_kind": "independent_verification",
+        "phase": "verification",
+        "actor": "qa:exact-runtime-diff",
+        "status": "failed",
+        "commit_sha": candidate_commit,
+        "payload": {
+            "schema_version": "qa_independent_verification.v1",
+            "graph_trace_ids": [queried["trace_id"]],
+            "base_commit_sha": base_commit,
+            "candidate_commit_sha": candidate_commit,
+            "full_suite_claim": "not_claimed",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "observer_impersonation": False,
+        },
+        "artifact_refs": {
+            "external_no_pass_baseline_ledger": {
+                "schema_version": (
+                    "contract_runtime.external_no_pass_baseline_ledger.v2"
+                ),
+                "base_commit_sha": base_commit,
+                "candidate_commit_sha": candidate_commit,
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+            }
+        },
+    }
+    before_no_pass = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_kind="independent_verification",
+    )
+    no_pass_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=no_pass_body,
+    )
+    no_pass_ctx._session = dict(qa_ctx._session)
+    no_pass_result = server.handle_task_timeline_append(no_pass_ctx)
+    no_pass_proof = no_pass_result["payload"][
+        "source_backed_contract_gate_authority"
+    ]["qa_session_proof"]
+    assert no_pass_result["payload"]["base_commit_sha"] == base_commit
+    assert (
+        no_pass_result["artifact_refs"][
+            "external_no_pass_baseline_ledger"
+        ]["base_commit_sha"]
+        == base_commit
+    )
+    assert no_pass_proof["base_commit_sha"] == candidate_commit
+    assert no_pass_proof["candidate_commit_sha"] == candidate_commit
+    assert no_pass_proof["comparison_base_commit_sha"] == base_commit
+    assert no_pass_proof["audit_only"] is True
+    assert no_pass_proof["close_satisfying"] is False
+    after_no_pass = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_kind="independent_verification",
+    )
+    assert len(after_no_pass) == len(before_no_pass) + 1
+
+    forged_no_pass_body = json.loads(json.dumps(no_pass_body))
+    forged_no_pass_body["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]["base_commit_sha"] = "f" * 40
+    forged_no_pass_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=forged_no_pass_body,
+    )
+    forged_no_pass_ctx._session = dict(qa_ctx._session)
+    with pytest.raises(GovernanceError) as forged_no_pass:
+        server.handle_task_timeline_append(forged_no_pass_ctx)
+    assert forged_no_pass.value.code == "qa_graph_review_context_mismatch"
+    after_forged_no_pass = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_kind="independent_verification",
+    )
+    assert len(after_forged_no_pass) == len(after_no_pass)
+
     forged_ctx = _ctx_with_role(
         {"project_id": PID},
         "qa",
@@ -85415,6 +85512,125 @@ def test_qa_review_claims_ignore_only_payload_live_source_tuple():
         forged_audit_rejected.value.code
         == "qa_graph_review_context_mismatch"
     )
+
+
+def test_qa_review_claims_accept_exact_no_pass_comparison_namespace():
+    candidate_commit = "8b093d2de879edfa04d45398743102ba0f092ea9"
+    comparison_base_commit = "c2956b39d4584c22e0f943c8c02bb70e84091017"
+    review_context = {
+        "candidate_commit_sha": candidate_commit,
+        "base_commit_sha": candidate_commit,
+        "comparison_base_commit_sha": comparison_base_commit,
+        "graph_basis": "exact_candidate_snapshot",
+    }
+    body = {
+        "status": "failed",
+        "payload": {
+            "schema_version": "qa_independent_verification.v1",
+            "base_commit_sha": comparison_base_commit,
+            "candidate_commit_sha": candidate_commit,
+            "full_suite_claim": "not_claimed",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+        },
+        "artifact_refs": {
+            "external_no_pass_baseline_ledger": {
+                "schema_version": (
+                    "contract_runtime.external_no_pass_baseline_ledger.v2"
+                ),
+                "base_commit_sha": comparison_base_commit,
+                "candidate_commit_sha": candidate_commit,
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+            }
+        },
+    }
+
+    server._qa_validate_candidate_review_claims(body, review_context)
+
+    for container_path, field in (
+        (("payload",), "base_commit_sha"),
+        (
+            ("artifact_refs", "external_no_pass_baseline_ledger"),
+            "base_commit_sha",
+        ),
+    ):
+        forged = json.loads(json.dumps(body))
+        container = forged
+        for key in container_path:
+            container = container[key]
+        container[field] = "f" * 40
+        with pytest.raises(GovernanceError) as rejected:
+            server._qa_validate_candidate_review_claims(
+                forged,
+                review_context,
+            )
+        assert rejected.value.code == "qa_graph_review_context_mismatch"
+
+    wrong_candidate = json.loads(json.dumps(body))
+    wrong_candidate["payload"]["candidate_commit_sha"] = "e" * 40
+    wrong_candidate["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]["candidate_commit_sha"] = "e" * 40
+    with pytest.raises(GovernanceError) as candidate_rejected:
+        server._qa_validate_candidate_review_claims(
+            wrong_candidate,
+            review_context,
+        )
+    assert candidate_rejected.value.code == "qa_graph_review_context_mismatch"
+
+    passing_status = json.loads(json.dumps(body))
+    passing_status["status"] = "passed"
+    with pytest.raises(GovernanceError) as passing_status_rejected:
+        server._qa_validate_candidate_review_claims(
+            passing_status,
+            review_context,
+        )
+    assert (
+        passing_status_rejected.value.code
+        == "qa_graph_review_context_mismatch"
+    )
+
+
+def test_qa_review_claims_keep_ordinary_comparison_forgeries_fail_closed():
+    candidate_commit = "8b093d2de879edfa04d45398743102ba0f092ea9"
+    comparison_base_commit = "c2956b39d4584c22e0f943c8c02bb70e84091017"
+    review_context = {
+        "candidate_commit_sha": candidate_commit,
+        "base_commit_sha": candidate_commit,
+        "comparison_base_commit_sha": comparison_base_commit,
+        "graph_basis": "exact_candidate_snapshot",
+    }
+    forged_containers = (
+        {"payload": {"base_commit_sha": comparison_base_commit}},
+        {"verification": {"base_commit_sha": comparison_base_commit}},
+        {
+            "artifact_refs": {
+                "ordinary_report": {
+                    "base_commit_sha": comparison_base_commit,
+                }
+            }
+        },
+        {
+            "payload": {
+                "graph_review_context": {
+                    "base_commit_sha": comparison_base_commit,
+                }
+            }
+        },
+    )
+
+    for forged in forged_containers:
+        with pytest.raises(GovernanceError) as rejected:
+            server._qa_validate_candidate_review_claims(
+                forged,
+                review_context,
+            )
+        assert rejected.value.code == "qa_graph_review_context_mismatch"
 
 
 def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timeline(
