@@ -19179,7 +19179,17 @@ def _runtime_context_worker_guide_response(
         if isinstance(finish_attestation_hint.get("test_results"), Mapping)
         else {}
     )
-    if _runtime_context_finish_attestation_no_pass_results_accepted(
+    test_worker_scope = bool(worker_scope_files) and all(
+        str(path or "").startswith(("agent/tests/", "tests/"))
+        for path in worker_scope_files
+    )
+    if test_worker_scope:
+        hinted_test_results = (
+            _runtime_context_finish_attestation_project_test_results(
+                hinted_test_results
+            )
+        )
+    elif _runtime_context_finish_attestation_no_pass_results_accepted(
         hinted_test_results
     ):
         hinted_test_results = (
@@ -25564,6 +25574,11 @@ _RUNTIME_CONTEXT_FINISH_ATTESTATION_AMBIGUOUS_STATUSES = frozenset(
         "rejected",
     }
 )
+_RUNTIME_CONTEXT_FINISH_ATTESTATION_HISTORICAL_BASE_SELECTORS = frozenset(
+    {
+        "rev8_postmerge_qa_graph_binding or pre_rev8_qa_graph_binding",
+    }
+)
 _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_COUNT_FIELDS = (
     "candidate_new_failures",
     "full_failed",
@@ -25720,6 +25735,216 @@ def _runtime_context_finish_attestation_test_results_payload(
             result["passed"] = False
             result["overall_release_pass"] = False
     return result
+
+
+def _runtime_context_finish_attestation_project_test_results(
+    value: Any,
+) -> dict[str, Any]:
+    """Project truthful worker test evidence into one facade-accepted shape.
+
+    Already accepted PASS/no-PASS evidence is stable.  The only legacy worker
+    result projected here is the bounded candidate/base comparison emitted by
+    test workers: both candidate suites are green, the immutable base is
+    explicitly red with its immutable selector, and candidate-new failures are
+    exactly zero.  Missing, ambiguous, negative, contradictory, or inconsistent
+    evidence fails closed instead of synthesizing generic PASS.  Historical
+    count-only evidence is not upgraded with invented failure identities.
+    """
+
+    if not isinstance(value, Mapping) or not value:
+        return {}
+    source = dict(value)
+    if _runtime_context_finish_attestation_test_results_accepted(source):
+        if _runtime_context_finish_attestation_no_pass_results_accepted(source):
+            return _runtime_context_finish_attestation_test_results_payload(source)
+        return source
+
+    status = str(source.get("status") or "").strip().lower()
+    if status in _RUNTIME_CONTEXT_FINISH_ATTESTATION_AMBIGUOUS_STATUSES:
+        return {}
+    if any(
+        source.get(field) is True
+        for field in (
+            "passed",
+            "qa_claim",
+            "release_claim",
+            "overall_release_pass",
+            "overall_release_pass_claimed",
+            "old_world_reuse",
+        )
+    ):
+        return {}
+
+    focused = source.get("focused_candidate")
+    expanded = source.get("expanded_candidate")
+    immutable_base = source.get("immutable_base")
+    if not all(
+        isinstance(item, Mapping)
+        for item in (focused, expanded, immutable_base)
+    ):
+        return {}
+
+    immutable_base_selector = str(
+        immutable_base.get("selector") or ""
+    ).strip()
+    if (
+        str(source.get("schema_version") or "").strip()
+        != "runtime_context.worker_test_results.v1"
+        or immutable_base_selector
+        not in _RUNTIME_CONTEXT_FINISH_ATTESTATION_HISTORICAL_BASE_SELECTORS
+    ):
+        return {}
+
+    def _count(container: Mapping[str, Any], field: str) -> int | None:
+        candidate = container.get(field)
+        if not isinstance(candidate, int) or isinstance(candidate, bool):
+            return None
+        if candidate < 0:
+            return None
+        return candidate
+
+    candidate_new_failures = _count(source, "candidate_new_failures")
+    focused_failed = _count(focused, "failed")
+    focused_passed = _count(focused, "passed")
+    expanded_failed = _count(expanded, "failed")
+    expanded_passed = _count(expanded, "passed")
+    base_failed = _count(immutable_base, "failed")
+    base_passed = _count(immutable_base, "passed")
+    if any(
+        count is None
+        for count in (
+            candidate_new_failures,
+            focused_failed,
+            focused_passed,
+            expanded_failed,
+            expanded_passed,
+            base_failed,
+            base_passed,
+        )
+    ):
+        return {}
+    if (
+        candidate_new_failures != 0
+        or focused_failed != 0
+        or expanded_failed != 0
+        or focused_passed <= 0
+        or expanded_passed <= 0
+        or base_failed <= 0
+        or expanded_passed < base_passed
+    ):
+        return {}
+
+    passing_statuses = {"clean", "ok", "pass", "passed", "succeeded", "success"}
+    if (
+        str(focused.get("status") or "").strip().lower()
+        not in passing_statuses
+        or str(expanded.get("status") or "").strip().lower()
+        not in passing_statuses
+        or str(immutable_base.get("status") or "").strip().lower()
+        not in {
+            "accepted_with_known_baseline_failure",
+            "expected_red",
+            "known_baseline_failure",
+        }
+    ):
+        return {}
+
+    def _identity_set(
+        container: Mapping[str, Any],
+        *fields: str,
+    ) -> tuple[bool, frozenset[str]]:
+        found = False
+        resolved: frozenset[str] | None = None
+        for field in fields:
+            if field not in container:
+                continue
+            found = True
+            raw = container.get(field)
+            if not isinstance(raw, list):
+                return True, frozenset()
+            values = [str(item or "").strip() for item in raw]
+            if any(not item for item in values) or len(set(values)) != len(values):
+                return True, frozenset()
+            current = frozenset(values)
+            if resolved is not None and current != resolved:
+                return True, frozenset()
+            resolved = current
+        return found, resolved or frozenset()
+
+    focused_ids_present, focused_ids = _identity_set(
+        focused,
+        "failure_identities",
+        "failure_ids",
+        "failed_test_ids",
+    )
+    expanded_ids_present, expanded_ids = _identity_set(
+        expanded,
+        "failure_identities",
+        "failure_ids",
+        "failed_test_ids",
+    )
+    base_ids_present, base_ids = _identity_set(
+        immutable_base,
+        "failure_identities",
+        "failure_ids",
+        "failed_test_ids",
+    )
+    suite_ids_present = bool(
+        focused_ids_present or expanded_ids_present or base_ids_present
+    )
+    if suite_ids_present and (
+        not focused_ids_present
+        or not expanded_ids_present
+        or not base_ids_present
+        or focused_ids
+        or expanded_ids
+        or not base_ids
+        or len(base_ids) != base_failed
+    ):
+        return {}
+
+    direct_identity_groups = []
+    for fields in (
+        (
+            "candidate_failure_identities",
+            "candidate_failure_ids",
+            "full_failure_identities",
+            "full_failure_ids",
+        ),
+        ("inherited_failure_identities", "inherited_failure_ids"),
+        (
+            "base_failure_identities",
+            "base_failure_ids",
+            "baseline_failure_identities",
+            "baseline_failure_ids",
+        ),
+    ):
+        present, identities = _identity_set(source, *fields)
+        if present:
+            if not identities:
+                return {}
+            direct_identity_groups.append(identities)
+    if direct_identity_groups and (
+        len(direct_identity_groups) != 3
+        or any(group != direct_identity_groups[0] for group in direct_identity_groups)
+        or len(direct_identity_groups[0]) != base_failed
+        or (base_ids_present and direct_identity_groups[0] != base_ids)
+    ):
+        return {}
+    projected = {
+        "status": _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS,
+        "no_pass": True,
+        "candidate_new_failures": 0,
+        "full_failed": base_failed,
+        "inherited_failed": base_failed,
+        "baseline_failed": base_failed,
+        "focused_passed": focused_passed,
+        "full_passed": expanded_passed,
+        "baseline_passed": base_passed,
+    }
+    if not _runtime_context_finish_attestation_no_pass_results_accepted(projected):
+        return {}
+    return _runtime_context_finish_attestation_test_results_payload(projected)
 
 
 def _runtime_context_restore_finish_gate_no_pass_results(
