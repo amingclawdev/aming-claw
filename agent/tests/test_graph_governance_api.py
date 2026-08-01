@@ -85186,6 +85186,388 @@ def test_finish_attestation_test_results_accept_exact_no_pass_only():
     )
 
 
+def test_finish_attestation_projects_exact_r12s15_test_worker_results():
+    actual_r12s15_results = {
+        "authority": "worker_implementation_only",
+        "candidate_new_failures": 0,
+        "diff_check": "passed",
+        "expanded_candidate": {
+            "failed": 0,
+            "passed": 23,
+            "status": "passed",
+        },
+        "focused_candidate": {
+            "failed": 0,
+            "passed": 6,
+            "status": "passed",
+        },
+        "immutable_base": {
+            "failed": 2,
+            "passed": 1,
+            "selector": (
+                "rev8_postmerge_qa_graph_binding or "
+                "pre_rev8_qa_graph_binding"
+            ),
+            "status": "expected_red",
+        },
+        "old_world_reuse": False,
+        "py_compile": "passed",
+        "qa_claim": False,
+        "release_claim": False,
+        "schema_version": "runtime_context.worker_test_results.v1",
+    }
+    expected = {
+        "status": "accepted_with_known_baseline_failure",
+        "no_pass": True,
+        "candidate_new_failures": 0,
+        "full_failed": 2,
+        "inherited_failed": 2,
+        "baseline_failed": 2,
+        "focused_passed": 6,
+        "full_passed": 23,
+        "baseline_passed": 1,
+        "overall_release_pass_claimed": False,
+    }
+
+    projected = server._runtime_context_finish_attestation_project_test_results(
+        actual_r12s15_results
+    )
+
+    assert projected == expected
+    assert server._runtime_context_finish_attestation_test_results_accepted(
+        projected
+    ) is True
+    assert actual_r12s15_results["immutable_base"].get(
+        "failure_identities"
+    ) is None
+
+
+def test_finish_attestation_projection_preserves_accepted_pass_and_no_pass():
+    accepted_pass = {
+        "status": "passed",
+        "passed": True,
+        "commands": [{"command": "pytest -q focused", "status": "passed"}],
+    }
+    accepted_no_pass = {
+        "status": "accepted_with_known_baseline_failure",
+        "no_pass": True,
+        "candidate_new_failures": 0,
+        "full_failed": 2,
+        "inherited_failed": 2,
+        "baseline_failed": 2,
+        "focused_passed": 6,
+        "full_passed": 23,
+        "baseline_passed": 1,
+    }
+
+    assert server._runtime_context_finish_attestation_project_test_results(
+        accepted_pass
+    ) == accepted_pass
+    assert server._runtime_context_finish_attestation_project_test_results(
+        accepted_no_pass
+    ) == {
+        **accepted_no_pass,
+        "overall_release_pass_claimed": False,
+    }
+
+
+def test_finish_attestation_projection_requires_exact_truthful_comparison():
+    exact = {
+        "schema_version": "runtime_context.worker_test_results.v1",
+        "authority": "worker_implementation_only",
+        "candidate_new_failures": 0,
+        "expanded_candidate": {
+            "failed": 0,
+            "passed": 23,
+            "status": "passed",
+        },
+        "focused_candidate": {
+            "failed": 0,
+            "passed": 6,
+            "status": "passed",
+        },
+        "immutable_base": {
+            "failed": 2,
+            "passed": 1,
+            "selector": (
+                "rev8_postmerge_qa_graph_binding or "
+                "pre_rev8_qa_graph_binding"
+            ),
+            "status": "expected_red",
+        },
+        "old_world_reuse": False,
+        "qa_claim": False,
+        "release_claim": False,
+    }
+    rejected = []
+    for path in (
+        ("candidate_new_failures",),
+        ("focused_candidate",),
+        ("expanded_candidate",),
+        ("immutable_base",),
+        ("focused_candidate", "failed"),
+        ("focused_candidate", "passed"),
+        ("focused_candidate", "status"),
+        ("expanded_candidate", "failed"),
+        ("expanded_candidate", "passed"),
+        ("expanded_candidate", "status"),
+        ("immutable_base", "failed"),
+        ("immutable_base", "passed"),
+        ("immutable_base", "selector"),
+        ("immutable_base", "status"),
+    ):
+        candidate = copy.deepcopy(exact)
+        if len(path) == 1:
+            candidate.pop(path[0])
+        else:
+            candidate[path[0]].pop(path[1])
+        rejected.append(candidate)
+    for path, value in (
+        (("candidate_new_failures",), 1),
+        (("candidate_new_failures",), -1),
+        (("candidate_new_failures",), False),
+        (("focused_candidate", "failed"), 1),
+        (("focused_candidate", "passed"), 0),
+        (("focused_candidate", "passed"), -1),
+        (("focused_candidate", "passed"), "6"),
+        (("focused_candidate", "status"), "failed"),
+        (("expanded_candidate", "failed"), 2),
+        (("expanded_candidate", "passed"), 0),
+        (("expanded_candidate", "passed"), -1),
+        (("expanded_candidate", "status"), "blocked"),
+        (("immutable_base", "failed"), 0),
+        (("immutable_base", "failed"), -2),
+        (("immutable_base", "failed"), "2"),
+        (("immutable_base", "passed"), -1),
+        (("immutable_base", "passed"), 24),
+        (("immutable_base", "selector"), "different selector"),
+        (("immutable_base", "status"), "passed"),
+        (("qa_claim",), True),
+        (("release_claim",), True),
+        (("old_world_reuse",), True),
+        (("overall_release_pass_claimed",), True),
+        (("status",), "accepted"),
+    ):
+        candidate = copy.deepcopy(exact)
+        if len(path) == 1:
+            candidate[path[0]] = value
+        else:
+            candidate[path[0]][path[1]] = value
+        rejected.append(candidate)
+
+    assert rejected
+    assert all(
+        server._runtime_context_finish_attestation_project_test_results(
+            candidate
+        )
+        == {}
+        for candidate in rejected
+    )
+
+
+def test_finish_attestation_projection_requires_complete_coherent_identities():
+    exact = {
+        "schema_version": "runtime_context.worker_test_results.v1",
+        "candidate_new_failures": 0,
+        "focused_candidate": {
+            "failed": 0,
+            "passed": 6,
+            "status": "passed",
+            "failure_identities": [],
+        },
+        "expanded_candidate": {
+            "failed": 0,
+            "passed": 23,
+            "status": "passed",
+            "failure_identities": [],
+        },
+        "immutable_base": {
+            "failed": 2,
+            "passed": 1,
+            "selector": (
+                "rev8_postmerge_qa_graph_binding or "
+                "pre_rev8_qa_graph_binding"
+            ),
+            "status": "expected_red",
+            "failure_identities": ["base::case-a", "base::case-b"],
+        },
+        "old_world_reuse": False,
+        "qa_claim": False,
+        "release_claim": False,
+    }
+    expected = server._runtime_context_finish_attestation_project_test_results(
+        exact
+    )
+    assert expected["no_pass"] is True
+    assert server._runtime_context_finish_attestation_test_results_accepted(
+        expected
+    ) is True
+
+    incomplete = copy.deepcopy(exact)
+    incomplete["focused_candidate"].pop("failure_identities")
+    duplicate = copy.deepcopy(exact)
+    duplicate["immutable_base"]["failure_identities"] = [
+        "base::case-a",
+        "base::case-a",
+    ]
+    wrong_count = copy.deepcopy(exact)
+    wrong_count["immutable_base"]["failure_identities"] = ["base::case-a"]
+    candidate_failures = copy.deepcopy(exact)
+    candidate_failures["expanded_candidate"]["failure_identities"] = [
+        "base::case-a"
+    ]
+    incomplete_direct = {
+        **copy.deepcopy(exact),
+        "candidate_failure_identities": ["base::case-a", "base::case-b"],
+    }
+    conflicting_direct = {
+        **copy.deepcopy(exact),
+        "candidate_failure_identities": ["base::case-a", "base::case-b"],
+        "inherited_failure_identities": ["base::case-a", "base::case-b"],
+        "base_failure_identities": ["base::case-a", "base::case-c"],
+    }
+
+    assert all(
+        server._runtime_context_finish_attestation_project_test_results(
+            candidate
+        )
+        == {}
+        for candidate in (
+            incomplete,
+            duplicate,
+            wrong_count,
+            candidate_failures,
+            incomplete_direct,
+            conflicting_direct,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("worker_kind", "owned_file", "should_project"),
+    (
+        (
+            "test",
+            "agent/tests/test_graph_governance_api.py",
+            True,
+        ),
+        ("server", "agent/governance/server.py", False),
+    ),
+)
+def test_worker_guide_projects_only_test_worker_results_into_accepted_body(
+    conn,
+    tmp_path,
+    worker_kind,
+    owned_file,
+    should_project,
+):
+    backlog_id = f"AC-FINISH-RESULT-PROJECTION-{worker_kind.upper()}"
+    worker_task_id = f"finish-result-projection-{worker_kind}-worker"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    worker_fence = f"fence-{worker_task_id}"
+    worker_token = f"token-{worker_task_id}"
+    graph_trace_id = f"gqt-{worker_task_id}"
+    head_commit = hashlib.sha1(worker_task_id.encode()).hexdigest()
+    actual_r12s15_results = {
+        "authority": "worker_implementation_only",
+        "candidate_new_failures": 0,
+        "expanded_candidate": {
+            "failed": 0,
+            "passed": 23,
+            "status": "passed",
+        },
+        "focused_candidate": {
+            "failed": 0,
+            "passed": 6,
+            "status": "passed",
+        },
+        "immutable_base": {
+            "failed": 2,
+            "passed": 1,
+            "selector": (
+                "rev8_postmerge_qa_graph_binding or "
+                "pre_rev8_qa_graph_binding"
+            ),
+            "status": "expected_red",
+        },
+        "old_world_reuse": False,
+        "qa_claim": False,
+        "release_claim": False,
+        "schema_version": "runtime_context.worker_test_results.v1",
+    }
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id=f"finish-result-projection-{worker_kind}-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_root),
+        owned_files=(owned_file,),
+    )
+    evidence_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token=worker_fence,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+        include_finish_evidence=False,
+        test_results=actual_r12s15_results,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+        implementation_event_ref=f"timeline:{evidence_events['implementation']}",
+        changed_files=[owned_file],
+        owned_files=[owned_file],
+    )
+    worker_query = {
+        "parent_task_id": backlog_id,
+        "fence_token": worker_fence,
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(runtime_context),
+        "target_project_root": str(worker_root),
+    }
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            query=worker_query,
+        )
+    )
+    finish_body = guide["actionable_payloads"][
+        "finish_time_worker_attestation_submission"
+    ]["copy_safe_body"]
+    projected = finish_body["test_results"]
+
+    if should_project:
+        assert projected == (
+            server._runtime_context_finish_attestation_project_test_results(
+                actual_r12s15_results
+            )
+        )
+        assert server._runtime_context_finish_attestation_test_results_accepted(
+            projected
+        ) is True
+        assert projected["no_pass"] is True
+        assert projected["overall_release_pass_claimed"] is False
+    else:
+        assert projected == actual_r12s15_results
+        assert server._runtime_context_finish_attestation_test_results_accepted(
+            projected
+        ) is False
+
+
 def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage(
     conn,
     tmp_path,
