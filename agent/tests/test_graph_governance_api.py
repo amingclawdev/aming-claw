@@ -42718,6 +42718,765 @@ def test_qa_graph_authority_returns_all_identity_mismatches(monkeypatch):
     assert blocked.value.details["fail_closed"] is True
 
 
+def _rev8_postmerge_qa_binding_record() -> dict[str, Any]:
+    execution_id = "cex-rev8-postmerge-qa-authority"
+    backlog_id = "AC-REV8-POSTMERGE-QA-AUTHORITY"
+    workers = [
+        {
+            "runtime_context_id": "mfrctx-rev8-postmerge-server",
+            "task_id": "rev8-postmerge-server-worker",
+            "parent_task_id": execution_id,
+            "worker_id": "rev8-postmerge-server-slot",
+            "worker_slot_id": "rev8-postmerge-server-slot",
+            "merge_queue_id": "mq-rev8-postmerge-server",
+        },
+        {
+            "runtime_context_id": "mfrctx-rev8-postmerge-test",
+            "task_id": "rev8-postmerge-test-worker",
+            "parent_task_id": execution_id,
+            "worker_id": "rev8-postmerge-test-slot",
+            "worker_slot_id": "rev8-postmerge-test-slot",
+            "merge_queue_id": "mq-rev8-postmerge-test",
+        },
+    ]
+    dispatch_ref = f"contract_runtime:{execution_id}:completed_lines:0"
+    completed_lines: list[dict[str, Any]] = [
+        {
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "actor_role": "observer",
+            "evidence_kind": "dispatch_bounded_worker",
+            "payload": {
+                "worker_count": 2,
+                "atomic_dispatch": True,
+                "bounded_workers": workers,
+            },
+        }
+    ]
+    for index, worker in enumerate(workers, start=1):
+        merge_commit = str(index) * 40
+        completed_lines.append(
+            {
+                "stage_id": "merge",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge",
+                "line_instance_id": (
+                    f"runtime_context:{worker['runtime_context_id']}"
+                ),
+                "commit_sha": merge_commit,
+                "payload": {
+                    "durable_merge_authority": {
+                        "schema_version": (
+                            "contract_runtime."
+                            "observer_merge_durable_authority.v1"
+                        ),
+                        "server_derived": True,
+                        "db_verified": True,
+                        "project_id": PID,
+                        "backlog_id": backlog_id,
+                        "contract_execution_id": execution_id,
+                        **worker,
+                        "queue_item_id": f"mqitem-rev8-postmerge-{index}",
+                        "target_ref": "refs/heads/integration",
+                        "merge_commit": merge_commit,
+                        "target_head_after_merge": merge_commit,
+                        "merge_event_ref": f"timeline:{900 + index}",
+                        "merge_event_id": 900 + index,
+                        "merge_event_created_at": (
+                            f"2026-08-01T15:00:0{index}Z"
+                        ),
+                        "contract_runtime_dispatch_source_ref": dispatch_ref,
+                        "pre_qa_merge_authorized": True,
+                        "final_qa_required_after_reconcile": True,
+                        "close_satisfying": False,
+                    }
+                },
+            }
+        )
+    # The canonical observer_reconcile line is a progress receipt.  Its
+    # durable reconcile event/snapshot authority lives in DB provenance and
+    # must be joined server-side; the completed line must not invent it.
+    reconcile_receipt = {
+        "schema_version": (
+            "contract_runtime.observer_reconcile_record_authority.v1"
+        ),
+        "record_verified": True,
+        "merge_projection_verified": True,
+        "dispatch_lineage_verified": True,
+        "all_lane_merges_verified": True,
+        "lane_merge_count": 2,
+        "runtime_context_id": workers[1]["runtime_context_id"],
+        "task_id": workers[1]["task_id"],
+        "parent_task_id": execution_id,
+        "merge_queue_id": workers[1]["merge_queue_id"],
+        "merged_commit_sha": "2" * 40,
+        "reconcile_event_recorded": False,
+        "reconcile_event_id": 0,
+    }
+    reconcile_receipt["authority_hash"] = server.stable_sha256(
+        reconcile_receipt
+    )
+    completed_lines.append(
+        {
+            "stage_id": "reconcile",
+            "line_id": "observer_reconcile",
+            "actor_role": "observer",
+            "evidence_kind": "reconcile",
+            "status": "accepted",
+            "payload": {
+                "reconcile_authority": reconcile_receipt,
+            },
+        }
+    )
+    return {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev8",
+        "contract_execution_id": execution_id,
+        "completed_lines": completed_lines,
+    }
+
+
+def _rev8_postmerge_qa_binding_authority() -> dict[str, Any]:
+    final_commit = "2" * 40
+    authority = {
+        "schema_version": "contract_runtime.rev8_postmerge_qa_authority.v1",
+        "status": "verified",
+        "verified": True,
+        "fail_closed": True,
+        "source": (
+            "ContractRuntime.two_lane_merge+parallel_branch_merge_queue_items+"
+            "git_target_ref_owner+graph_current_full_reconcile_provenance"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "live_verified": True,
+        "graph_reconciled": True,
+        "active_snapshot_verified": True,
+        "project_id": PID,
+        "backlog_id": "AC-REV8-POSTMERGE-QA-AUTHORITY",
+        "contract_execution_id": "cex-rev8-postmerge-qa-authority",
+        "runtime_context_id": "mfrctx-rev8-postmerge-test",
+        "task_id": "rev8-postmerge-test-worker",
+        "parent_task_id": "cex-rev8-postmerge-qa-authority",
+        "merge_queue_id": "mq-rev8-postmerge-test",
+        "queue_item_id": "mqitem-rev8-postmerge-2",
+        "target_ref": "refs/heads/integration",
+        "candidate_commit_sha": final_commit,
+        "merged_commit_sha": final_commit,
+        "reconciled_commit_sha": final_commit,
+        "canonical_head_commit": final_commit,
+        "target_ref_head_commit": final_commit,
+        "target_ref_owner_head_commit": final_commit,
+        "target_project_root": "/tmp/rev8-final-integration-target",
+        "active_snapshot_id": "full-rev8-final-combined",
+        "active_snapshot_commit": final_commit,
+        "reconcile_snapshot_id": "full-rev8-final-combined",
+        "reconcile_source_ref": "timeline:903",
+        "reconcile_event_id": 903,
+    }
+    authority["authority_hash"] = server.stable_sha256(authority)
+    return authority
+
+
+def _rev8_postmerge_current_full_state() -> dict[str, Any]:
+    final_commit = "2" * 40
+    target_root = "/tmp/rev8-final-integration-target"
+    state = {
+        "schema_version": "graph_snapshot_store.current_full_reconcile_state.v1",
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "server_derived": True,
+        "db_verified": True,
+        "live_verified": True,
+        "canonical_head_verified": True,
+        "active_snapshot_verified": True,
+        "active_snapshot_current_full_reconcile_verified": True,
+        "active_snapshot_matches_canonical_head": True,
+        "graph_reconciled": True,
+        "provenance_verified": True,
+        "provenance_scope_verified": True,
+        "durable_order_verified": True,
+        "reconcile_snapshot_verified": True,
+        "contract_execution_scope_verified": True,
+        "task_scope_verified": True,
+        "runtime_context_scope_verified": True,
+        "parent_task_scope_verified": True,
+        "merge_queue_scope_verified": True,
+        "current_full_reconcile": True,
+        "strategy": "current_full_reconcile",
+        "active_snapshot_status": "active",
+        "project_id": PID,
+        "backlog_id": "AC-REV8-POSTMERGE-QA-AUTHORITY",
+        "contract_execution_id": "cex-rev8-postmerge-qa-authority",
+        "runtime_context_id": "mfrctx-rev8-postmerge-test",
+        "task_id": "rev8-postmerge-test-worker",
+        "parent_task_id": "cex-rev8-postmerge-qa-authority",
+        "merge_queue_id": "mq-rev8-postmerge-test",
+        "merged_commit_sha": final_commit,
+        "reconciled_commit_sha": final_commit,
+        "reconcile_provenance_target_commit": final_commit,
+        "current_canonical_commit_sha": final_commit,
+        "canonical_head_commit": final_commit,
+        "target_project_root": target_root,
+        "active_snapshot_id": "full-rev8-final-combined",
+        "active_snapshot_commit": final_commit,
+        "reconcile_snapshot_id": "full-rev8-final-combined",
+        "reconcile_source_ref": "timeline:903",
+        "reconcile_event_id": 903,
+    }
+    state["authority_hash"] = server.stable_sha256(state)
+    return state
+
+
+def _install_rev8_postmerge_qa_helper_boundaries(
+    monkeypatch,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    final_commit = "2" * 40
+    final_worker = record["completed_lines"][0]["payload"][
+        "bounded_workers"
+    ][1]
+    target_owner = Path("/tmp/rev8-final-integration-target")
+    reconcile_line = record["completed_lines"][-1]
+    reconcile_receipt = reconcile_line["payload"]["reconcile_authority"]
+    context = SimpleNamespace(
+        **final_worker,
+        backlog_id=record["backlog_id"],
+        worktree_path="/tmp/rev8-premerge-test-worker",
+    )
+    queue_item = MergeQueueItem(
+        project_id=PID,
+        merge_queue_id=final_worker["merge_queue_id"],
+        queue_item_id="mqitem-rev8-postmerge-2",
+        backlog_id=record["backlog_id"],
+        task_id=final_worker["task_id"],
+        branch_ref="refs/heads/codex/rev8-postmerge-test",
+        queue_index=2,
+        status="merged",
+        target_ref="refs/heads/integration",
+        branch_head="b" * 40,
+        merge_commit=final_commit,
+        target_head_after_merge=final_commit,
+    )
+    state = {
+        "reconcile_acceptance_verified": True,
+        "queue_items": [queue_item],
+        "target_owner": target_owner,
+        "target_owner_source": "git_worktree_target_ref_owner",
+        "target_alignment": {
+            "passed": True,
+            "head_commit": final_commit,
+            "target_commit": final_commit,
+            "index_clean": True,
+            "worktree_clean": True,
+        },
+        "reconciled_merge": {
+            "reconcile_event_id": 903,
+            "reconcile_source_ref": "timeline:903",
+        },
+        "current_full": _rev8_postmerge_current_full_state(),
+        "target_project_root_override": "",
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_line_acceptance",
+        lambda *_args, **_kwargs: {
+            "db_verified": state["reconcile_acceptance_verified"],
+            "acceptance_ref": (
+                "contract_runtime:cex-rev8-postmerge-qa-authority:revision:20"
+            ),
+            "completed_line_ref": (
+                "contract_runtime:cex-rev8-postmerge-qa-authority:"
+                f"completed_lines:{len(record['completed_lines']) - 1}"
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_reconcile_record_authority",
+        lambda *_args, **_kwargs: dict(reconcile_receipt),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [context],
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "list_merge_queue_items",
+        lambda *_args, **_kwargs: list(state["queue_items"]),
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "_git_target_ref_owning_worktree",
+        lambda *_args, **_kwargs: (
+            state["target_owner"],
+            state["target_owner_source"],
+        ),
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "_git_target_owner_alignment_evidence",
+        lambda *_args, **_kwargs: dict(state["target_alignment"]),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_timeline_events",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_merge_reconcile_authority",
+        lambda *_args, **_kwargs: dict(state["reconciled_merge"]),
+    )
+
+    def current_full(_conn, **kwargs):
+        state["target_project_root_override"] = str(
+            kwargs.get("target_project_root_override") or ""
+        )
+        return dict(state["current_full"])
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_full_reconcile_authority_from_merge",
+        current_full,
+    )
+    return state
+
+
+def test_rev8_postmerge_qa_authority_joins_progress_receipt_to_final_live_state(
+    monkeypatch,
+):
+    record = _rev8_postmerge_qa_binding_record()
+    state = _install_rev8_postmerge_qa_helper_boundaries(
+        monkeypatch,
+        record,
+    )
+
+    authority = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(),
+        project_id=PID,
+        record=record,
+    )
+
+    assert authority["verified"] is True
+    assert authority["status"] == "verified"
+    assert authority["runtime_context_id"] == "mfrctx-rev8-postmerge-test"
+    assert authority["task_id"] == "rev8-postmerge-test-worker"
+    assert authority["candidate_commit_sha"] == "2" * 40
+    assert authority["target_project_root"] == (
+        "/tmp/rev8-final-integration-target"
+    )
+    assert authority["active_snapshot_id"] == "full-rev8-final-combined"
+    assert authority["reconcile_event_id"] == 903
+    assert state["target_project_root_override"] == (
+        "/tmp/rev8-final-integration-target"
+    )
+    assert record["completed_lines"][-1]["payload"][
+        "reconcile_authority"
+    ]["reconcile_event_recorded"] is False
+    assert record["completed_lines"][-1]["payload"][
+        "reconcile_authority"
+    ]["reconcile_event_id"] == 0
+    assert authority["authority_hash"] == server.stable_sha256(
+        {key: value for key, value in authority.items() if key != "authority_hash"}
+    )
+
+
+def test_rev8_postmerge_qa_authority_fails_closed_at_each_live_boundary(
+    monkeypatch,
+):
+    record = _rev8_postmerge_qa_binding_record()
+    state = _install_rev8_postmerge_qa_helper_boundaries(
+        monkeypatch,
+        record,
+    )
+
+    state["queue_items"][0] = replace(
+        state["queue_items"][0],
+        status="merge_ready",
+    )
+    queue_blocked = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(), project_id=PID, record=record
+    )
+    assert queue_blocked["verified"] is False
+    assert queue_blocked["blocker_codes"] == [
+        "final_merge_queue_item_mismatch"
+    ]
+
+    state["queue_items"][0] = replace(
+        state["queue_items"][0],
+        status="merged",
+    )
+    state["target_alignment"]["passed"] = False
+    owner_blocked = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(), project_id=PID, record=record
+    )
+    assert owner_blocked["blocker_codes"] == [
+        "target_ref_owner_not_clean_and_aligned"
+    ]
+
+    state["target_alignment"]["passed"] = True
+    state["current_full"]["active_snapshot_commit"] = "1" * 40
+    snapshot_blocked = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(), project_id=PID, record=record
+    )
+    assert snapshot_blocked["blocker_codes"] == [
+        "current_full_active_snapshot_unverified"
+    ]
+
+    state["current_full"] = _rev8_postmerge_current_full_state()
+    state["reconcile_acceptance_verified"] = False
+    receipt_blocked = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(), project_id=PID, record=record
+    )
+    assert receipt_blocked["blocker_codes"] == [
+        "observer_reconcile_receipt_unverified"
+    ]
+
+
+def test_rev8_postmerge_qa_graph_binding_uses_final_combined_root_and_commit(
+    monkeypatch,
+):
+    record = _rev8_postmerge_qa_binding_record()
+    authority = _rev8_postmerge_qa_binding_authority()
+    captured: dict[str, Any] = {}
+    worker_commit = "b" * 40
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: dict(authority),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_line_identity",
+        lambda _record: {
+            "runtime_context_id": authority["runtime_context_id"],
+            "task_id": authority["task_id"],
+            "parent_task_id": authority["parent_task_id"],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_assigned_target_project_root",
+        lambda *_args, **_kwargs: {
+            "status": "resolved",
+            "target_project_root": "/tmp/rev8-premerge-test-worker",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_candidate_commit",
+        lambda *_args, **_kwargs: worker_commit,
+    )
+
+    def qa_graph_refs(_conn, **kwargs):
+        captured.update(kwargs)
+        return {
+            "schema_version": "qa_graph_trace_db_evidence.v1",
+            "source": "graph_query_traces",
+            "db_verified": True,
+            "trace_ids": ["gqt-rev8-final-combined"],
+            "verified_trace_ids": ["gqt-rev8-final-combined"],
+            "requested_trace_ids": ["gqt-rev8-final-combined"],
+            "missing_trace_ids": [],
+            "identity_mismatches": [],
+            "runtime_context_id": authority["runtime_context_id"],
+            "task_id": authority["task_id"],
+            "parent_task_id": authority["parent_task_id"],
+            "backlog_id": record["backlog_id"],
+            "qa_principal": "qa:rev8-final-combined",
+            "qa_session_id": "ses-rev8-final-combined",
+            "target_project_root": authority["target_project_root"],
+            "candidate_commit_sha": authority["candidate_commit_sha"],
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_qa_graph_trace_refs",
+        qa_graph_refs,
+    )
+
+    class QAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:rev8-final-combined",
+                "session_id": "ses-rev8-final-combined",
+            }
+
+    bound = server._contract_runtime_bind_qa_graph_authority(
+        QAContext(),
+        object(),
+        project_id=PID,
+        record=record,
+        write={"line_id": "qa_graph_context", "status": "accepted"},
+        body={"graph_trace_ids": ["gqt-rev8-final-combined"]},
+        policy={
+            "lookup_key_fields": ["graph_trace_ids"],
+            "authority_object_path": "payload.graph_trace_evidence",
+        },
+    )
+
+    assert captured["target_project_root"] == authority["target_project_root"]
+    assert captured["expected_candidate_commit_sha"] == (
+        authority["candidate_commit_sha"]
+    )
+    assert captured["expected_task_id"] == authority["task_id"]
+    assert captured["expected_qa_principal"] == "qa:rev8-final-combined"
+    assert captured["expected_qa_session_id"] == "ses-rev8-final-combined"
+    assert bound["commit_sha"] == authority["candidate_commit_sha"]
+    assert bound["task_id"] == authority["task_id"]
+    assert bound["runtime_context_id"] == authority["runtime_context_id"]
+    assert bound["payload"]["graph_trace_evidence"][
+        "postmerge_qa_authority"
+    ] == authority
+    assert bound["qa_evidence_provenance"]["authenticated_qa_binding"][
+        "qa_session_id"
+    ] == "ses-rev8-final-combined"
+
+
+def test_rev8_postmerge_qa_graph_binding_rejects_missing_final_authority(
+    monkeypatch,
+):
+    record = _rev8_postmerge_qa_binding_record()
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: {},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_line_identity",
+        lambda _record: {
+            "runtime_context_id": "mfrctx-rev8-postmerge-test",
+            "task_id": "rev8-postmerge-test-worker",
+            "parent_task_id": record["contract_execution_id"],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_assigned_target_project_root",
+        lambda *_args, **_kwargs: {
+            "status": "resolved",
+            "target_project_root": "/tmp/rev8-premerge-test-worker",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_candidate_commit",
+        lambda *_args, **_kwargs: "b" * 40,
+    )
+
+    class QAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:rev8-final-combined",
+                "session_id": "ses-rev8-final-combined",
+            }
+
+    with pytest.raises(GovernanceError) as blocked:
+        server._contract_runtime_bind_qa_graph_authority(
+            QAContext(),
+            object(),
+            project_id=PID,
+            record=record,
+            write={"line_id": "qa_graph_context"},
+            body={"graph_trace_ids": ["gqt-rev8-final-combined"]},
+            policy={
+                "lookup_key_fields": ["graph_trace_ids"],
+                "authority_object_path": "payload.graph_trace_evidence",
+            },
+        )
+
+    assert blocked.value.code == (
+        "contract_runtime_rev8_postmerge_qa_authority_required"
+    )
+    assert blocked.value.details["fail_closed"] is True
+
+
+def test_rev8_postmerge_qa_graph_binding_rejects_premerge_and_wrong_scope_traces(
+    monkeypatch,
+):
+    record = _rev8_postmerge_qa_binding_record()
+    authority = _rev8_postmerge_qa_binding_authority()
+    mismatches = [
+        {
+            "trace_id": "gqt-rev8-stale-worker-world",
+            "field": "candidate_commit_sha",
+            "expected": authority["candidate_commit_sha"],
+            "actual": "b" * 40,
+        },
+        {
+            "trace_id": "gqt-rev8-stale-worker-world",
+            "field": "target_project_root",
+            "expected": authority["target_project_root"],
+            "actual": "/tmp/rev8-premerge-test-worker",
+        },
+        {
+            "trace_id": "gqt-rev8-stale-worker-world",
+            "field": "task_id",
+            "expected": authority["task_id"],
+            "actual": "rev8-postmerge-server-worker",
+        },
+        {
+            "trace_id": "gqt-rev8-stale-worker-world",
+            "field": "qa_session_id",
+            "expected": "ses-rev8-final-combined",
+            "actual": "ses-stale-premerge",
+        },
+    ]
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: dict(authority),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_line_identity",
+        lambda _record: {
+            "runtime_context_id": authority["runtime_context_id"],
+            "task_id": authority["task_id"],
+            "parent_task_id": authority["parent_task_id"],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_qa_graph_trace_refs",
+        lambda *_args, **_kwargs: {
+            "schema_version": "qa_graph_trace_db_evidence.v1",
+            "db_verified": False,
+            "trace_ids": ["gqt-rev8-stale-worker-world"],
+            "requested_trace_ids": ["gqt-rev8-stale-worker-world"],
+            "identity_mismatches": mismatches,
+        },
+    )
+
+    class QAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:rev8-final-combined",
+                "session_id": "ses-rev8-final-combined",
+            }
+
+    with pytest.raises(GovernanceError) as blocked:
+        server._contract_runtime_bind_qa_graph_authority(
+            QAContext(),
+            object(),
+            project_id=PID,
+            record=record,
+            write={"line_id": "qa_graph_context"},
+            body={"graph_trace_ids": ["gqt-rev8-stale-worker-world"]},
+            policy={
+                "lookup_key_fields": ["graph_trace_ids"],
+                "authority_object_path": "payload.graph_trace_evidence",
+            },
+        )
+
+    assert blocked.value.code == (
+        "contract_runtime_qa_graph_trace_identity_mismatch"
+    )
+    assert blocked.value.details["identity_mismatches"] == mismatches
+    assert blocked.value.details["fail_closed"] is True
+
+
+def test_pre_rev8_qa_graph_binding_keeps_worker_candidate_authority(monkeypatch):
+    worker_commit = "b" * 40
+    captured: dict[str, Any] = {}
+    record = {
+        "contract_execution_id": "cex-rev7-qa-authority",
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev7",
+        "backlog_id": "AC-REV7-QA-AUTHORITY",
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: pytest.fail(
+            "rev7 must not resolve rev8 post-merge QA authority"
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_line_identity",
+        lambda _record: {
+            "runtime_context_id": "mfrctx-rev7-worker",
+            "task_id": "rev7-worker",
+            "parent_task_id": "cex-rev7-qa-authority",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_assigned_target_project_root",
+        lambda *_args, **_kwargs: {
+            "status": "resolved",
+            "target_project_root": "/tmp/rev7-worker",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_candidate_commit",
+        lambda *_args, **_kwargs: worker_commit,
+    )
+
+    def qa_graph_refs(_conn, **kwargs):
+        captured.update(kwargs)
+        return {
+            "db_verified": True,
+            "trace_ids": ["gqt-rev7-worker"],
+            "verified_trace_ids": ["gqt-rev7-worker"],
+            "identity_mismatches": [],
+            "runtime_context_id": "mfrctx-rev7-worker",
+            "task_id": "rev7-worker",
+            "parent_task_id": "cex-rev7-qa-authority",
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_qa_graph_trace_refs",
+        qa_graph_refs,
+    )
+
+    class QAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:rev7-worker",
+                "session_id": "ses-rev7-worker",
+            }
+
+    bound = server._contract_runtime_bind_qa_graph_authority(
+        QAContext(),
+        object(),
+        project_id=PID,
+        record=record,
+        write={"line_id": "qa_graph_context"},
+        body={"graph_trace_ids": ["gqt-rev7-worker"]},
+        policy={
+            "lookup_key_fields": ["graph_trace_ids"],
+            "authority_object_path": "payload.graph_trace_evidence",
+        },
+    )
+
+    assert captured["target_project_root"] == "/tmp/rev7-worker"
+    assert captured["expected_candidate_commit_sha"] == worker_commit
+    assert captured["expected_task_id"] == "rev7-worker"
+    assert bound["commit_sha"] == worker_commit
+
+
 def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_context(
     conn,
     tmp_path,
