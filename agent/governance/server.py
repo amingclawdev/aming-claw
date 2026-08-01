@@ -7969,10 +7969,16 @@ def _qa_exact_candidate_runtime_comparison_base(
         str(getattr(context, field, "") or "").strip()
         for field in ("parent_task_id", "root_task_id")
     ]
+    runtime_store = _contract_runtime_store(conn)
     for execution_id in dict.fromkeys(
         item for item in execution_ids if item
     ):
-        record = _contract_runtime_store(conn).get(execution_id)
+        try:
+            record = runtime_store.get(execution_id)
+        except ContractRuntimeError as exc:
+            if str(exc) == f"unknown contract execution: {execution_id}":
+                continue
+            raise
         if not isinstance(record, Mapping):
             continue
         if str(record.get("backlog_id") or "").strip() != backlog_id:
