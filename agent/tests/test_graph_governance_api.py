@@ -32716,6 +32716,168 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
     assert event_count == 2
 
 
+def test_exact_candidate_runtime_comparison_base_falls_through_missing_parent(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-EXACT-CANDIDATE-RUNTIME-BASE-FALLTHROUGH"
+    task_id = "exact-candidate-runtime-base-fallthrough-worker"
+    runtime_context_id = "mfrctx-exact-candidate-runtime-base-fallthrough"
+    missing_parent_id = "cex-exact-candidate-runtime-base-missing-parent"
+    root_execution_id = "cex-exact-candidate-runtime-base-root"
+    base_commit = "b" * 40
+    candidate_commit = "c" * 40
+
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=backlog_id,
+            parent_task_id=missing_parent_id,
+            root_task_id=root_execution_id,
+            branch_ref=(
+                "refs/heads/codex/exact-candidate-runtime-base-fallthrough"
+            ),
+            status=STATE_VALIDATED,
+            base_commit=base_commit,
+            target_head_commit=base_commit,
+            head_commit=candidate_commit,
+        ),
+        now_iso="2026-08-01T09:00:00Z",
+    )
+    root_record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": root_execution_id,
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "actor_role": "observer",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": missing_parent_id,
+                    "worker_role": "mf_sub",
+                },
+            },
+            {
+                "stage_id": "implementation",
+                "line_id": "worker_commit",
+                "evidence_kind": "worker_commit",
+                "commit_sha": candidate_commit,
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "commit_sha": candidate_commit,
+                    "worker_commit_sha": candidate_commit,
+                    "validated_head_commit": candidate_commit,
+                    "diff_base_commit": base_commit,
+                },
+            },
+        ],
+    }
+
+    class StubRuntimeStore:
+        def __init__(self, records=None, *, failure=None):
+            self.records = records or {}
+            self.failure = failure
+
+        def get(self, execution_id):
+            if self.failure is not None:
+                raise self.failure
+            if execution_id not in self.records:
+                raise ContractRuntimeError(
+                    f"unknown contract execution: {execution_id}"
+                )
+            return copy.deepcopy(self.records[execution_id])
+
+    proof = {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "commit_sha": candidate_commit,
+        "comparison_base_commit_sha": "f" * 40,
+        "candidate_review_context": {
+            "comparison_base_commit_sha": "f" * 40,
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: StubRuntimeStore({root_execution_id: root_record}),
+    )
+    assert server._qa_exact_candidate_runtime_comparison_base(
+        conn,
+        project_id=PID,
+        proof=proof,
+    ) == base_commit
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: StubRuntimeStore(),
+    )
+    assert server._qa_exact_candidate_runtime_comparison_base(
+        conn,
+        project_id=PID,
+        proof=proof,
+    ) == ""
+
+    record_without_candidate_authority = {
+        **root_record,
+        "completed_lines": root_record["completed_lines"][:1],
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: StubRuntimeStore(
+            {root_execution_id: record_without_candidate_authority}
+        ),
+    )
+    assert server._qa_exact_candidate_runtime_comparison_base(
+        conn,
+        project_id=PID,
+        proof=proof,
+    ) == ""
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: StubRuntimeStore(
+            failure=ContractRuntimeError(
+                "stored contract execution record is invalid JSON"
+            )
+        ),
+    )
+    with pytest.raises(
+        ContractRuntimeError,
+        match="stored contract execution record is invalid JSON",
+    ):
+        server._qa_exact_candidate_runtime_comparison_base(
+            conn,
+            project_id=PID,
+            proof=proof,
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: StubRuntimeStore(
+            failure=sqlite3.OperationalError("runtime store unavailable")
+        ),
+    )
+    with pytest.raises(sqlite3.OperationalError, match="runtime store unavailable"):
+        server._qa_exact_candidate_runtime_comparison_base(
+            conn,
+            project_id=PID,
+            proof=proof,
+        )
+
+
 def test_exact_candidate_snapshot_uses_runtime_comparison_diff_tuple(
     conn,
     tmp_path,
@@ -33079,9 +33241,18 @@ def test_exact_candidate_snapshot_uses_runtime_comparison_diff_tuple(
         },
     )
     forged_ctx._session = dict(qa_ctx._session)
+    trace_count_before_forged = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
     with pytest.raises(GovernanceError) as forged:
         server.handle_graph_governance_query(forged_ctx)
     assert forged.value.code == "qa_graph_review_context_mismatch"
+    trace_count_after_forged = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+    assert trace_count_after_forged == trace_count_before_forged
 
 
 def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
