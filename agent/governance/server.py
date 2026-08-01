@@ -15597,6 +15597,20 @@ def _runtime_context_projection_response(
         response["contract_runtime_current_state"] = dict(
             contract_runtime_projection.get("contract_runtime_current_state") or {}
         )
+        worker_implementation_evidence = dict(
+            contract_runtime_projection.get("worker_implementation_evidence")
+            or {}
+        )
+        if worker_implementation_evidence:
+            response["worker_implementation_evidence"] = dict(
+                worker_implementation_evidence
+            )
+            response["runtime_context_service"][
+                "worker_implementation_evidence"
+            ] = dict(worker_implementation_evidence)
+            source_refs["contract_runtime_worker_implementation"] = str(
+                worker_implementation_evidence.get("source") or ""
+            )
         response["contract_runtime_next_legal_action"] = dict(
             contract_runtime_projection.get("contract_runtime_next_legal_action")
             or {}
@@ -16539,6 +16553,223 @@ def _contract_runtime_active_linked_bypass_diagnostics(
     return links
 
 
+def _runtime_context_contract_runtime_worker_implementation_projection(
+    record: Mapping[str, Any],
+    implementation: Mapping[str, Any] | None,
+    lineage: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """Project exact copy-safe results from the canonical implementation line."""
+    from .parallel_branch_runtime import public_contract_revision_payload
+
+    matching_sources = []
+    for line in record.get("completed_lines") or []:
+        if (
+            not isinstance(line, Mapping)
+            or str(line.get("line_id") or "").strip()
+            != "worker_implementation"
+        ):
+            continue
+        line_payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        if all(
+            str(line.get(field) or line_payload.get(field) or "").strip()
+            == expected
+            for field, expected in (
+                ("runtime_context_id", runtime_context_id),
+                ("task_id", task_id),
+            )
+        ):
+            matching_sources.append(line)
+    selected = implementation if isinstance(implementation, Mapping) else {}
+    payload = (
+        selected.get("payload")
+        if isinstance(selected.get("payload"), Mapping)
+        else {}
+    )
+    source = "ContractRuntime.completed_lines.worker_implementation"
+    test_results = public_contract_revision_payload(
+        payload.get("test_results")
+        if isinstance(payload.get("test_results"), Mapping)
+        else {}
+    )
+    resolved_identity = {
+        field: str(
+            selected.get(field)
+            or lineage.get(field)
+            or payload.get(field)
+            or ""
+        ).strip()
+        for field in ("runtime_context_id", "task_id")
+    }
+    errors = []
+    if len(matching_sources) != 1:
+        errors.append(
+            "worker_implementation source count must be exactly one; "
+            f"found {len(matching_sources)}"
+        )
+    if not selected:
+        errors.append("canonical worker_implementation selection is missing")
+    elif len(matching_sources) == 1 and dict(selected) != dict(
+        matching_sources[0]
+    ):
+        errors.append("canonical worker_implementation selection is ambiguous")
+    if resolved_identity["runtime_context_id"] != runtime_context_id:
+        errors.append("worker_implementation runtime_context_id mismatch")
+    if resolved_identity["task_id"] != task_id:
+        errors.append("worker_implementation task_id mismatch")
+    if str(selected.get("line_id") or "").strip() != "worker_implementation":
+        errors.append("source-backed line is not worker_implementation")
+    lineage_ref = str(lineage.get("implementation_lineage_ref") or "").strip()
+    if not lineage_ref:
+        errors.append("worker_implementation lineage ref is missing")
+    if not test_results:
+        errors.append("worker_implementation test_results are missing")
+    elif not (
+        _runtime_context_finish_attestation_test_results_accepted(test_results)
+        or _runtime_context_finish_attestation_project_test_results(test_results)
+    ):
+        errors.append("worker_implementation test_results are not finish-compatible")
+    accepted = not errors
+    return {
+        "schema_version": (
+            "runtime_context.contract_runtime_worker_implementation_projection.v1"
+        ),
+        "status": "ready" if accepted else "blocked_invalid_source_evidence",
+        "accepted": accepted,
+        "fail_closed": not accepted,
+        "copy_safe": True,
+        "source": source,
+        "source_of_authority": source,
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "timeline_projection_authoritative": False,
+        "implementation_lineage_ref": lineage_ref,
+        "implementation_event_ref": str(
+            lineage.get("implementation_event_ref") or ""
+        ).strip(),
+        "line_instance_id": str(selected.get("line_instance_id") or "").strip(),
+        "matching_source_count": len(matching_sources),
+        "changed_files": list(lineage.get("changed_files") or []),
+        "graph_trace_ids": list(lineage.get("graph_trace_ids") or []),
+        "test_results": dict(test_results) if accepted else {},
+        "errors": errors,
+    }
+
+
+def _runtime_context_finish_hint_from_source_backed_implementation(
+    finish_attestation_hint: Mapping[str, Any],
+    timeline_refs: Mapping[str, Any],
+    source_projection: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Prefer canonical implementation results and fail closed on alias drift."""
+
+    hint = dict(finish_attestation_hint or {})
+    schema_version = "runtime_context.finish_hint_source_backed_resolution.v1"
+    if not source_projection:
+        return hint, {
+            "schema_version": schema_version,
+            "status": "source_backed_implementation_unavailable",
+            "accepted": False,
+            "fail_closed": False,
+            "actionable": True,
+        }
+    source_results = (
+        dict(source_projection.get("test_results") or {})
+        if isinstance(source_projection.get("test_results"), Mapping)
+        else {}
+    )
+    errors = list(source_projection.get("errors") or [])
+    if source_projection.get("accepted") is not True or not source_results:
+        errors.append("source-backed implementation is not actionable")
+    alias_present = bool(
+        timeline_refs.get("implementation_event_refs")
+        or timeline_refs.get("latest_implementation_event_ref")
+    )
+    if alias_present and not errors:
+        alias = (
+            timeline_refs.get("latest_implementation_payload")
+            if isinstance(timeline_refs.get("latest_implementation_payload"), Mapping)
+            else {}
+        )
+        expected = {
+            "runtime_context_id": str(source_projection.get("runtime_context_id") or ""),
+            "task_id": str(source_projection.get("task_id") or ""),
+            "implementation_lineage_ref": str(
+                source_projection.get("implementation_lineage_ref") or ""
+            ),
+        }
+        for field, value in expected.items():
+            if _runtime_context_non_placeholder_text(
+                _timeline_first_deep_text(alias, field)
+            ) != value:
+                errors.append(f"timeline alias {field} conflicts with source")
+        alias_results = (
+            dict(timeline_refs.get("test_results") or {})
+            if isinstance(timeline_refs.get("test_results"), Mapping)
+            else {}
+        )
+        if alias_results != source_results:
+            errors.append("timeline alias test_results conflict with source")
+        for label, keys, source_key in (
+            ("changed_files", ("changed_files", "worker_changed_files"), "changed_files"),
+            (
+                "graph_trace_ids",
+                ("graph_trace_ids", "graph_query_trace_ids", "verified_trace_ids"),
+                "graph_trace_ids",
+            ),
+        ):
+            alias_values = sorted(
+                set(_runtime_context_service_query_values(alias, *keys))
+            )
+            source_values = sorted(set(source_projection.get(source_key) or []))
+            if alias_values != source_values:
+                errors.append(f"timeline alias {label} conflict with source")
+    resolution = {
+        "schema_version": schema_version,
+        "status": (
+            "blocked_source_evidence_conflict"
+            if errors
+            else (
+                "matching_timeline_alias"
+                if alias_present
+                else "source_backed_without_timeline_alias"
+            )
+        ),
+        "accepted": not errors,
+        "fail_closed": bool(errors),
+        "actionable": not errors,
+        "source": str(source_projection.get("source") or ""),
+        "source_of_authority": str(
+            source_projection.get("source_of_authority") or ""
+        ),
+        "timeline_projection_authoritative": False,
+        "timeline_alias_status": "present" if alias_present else "absent",
+        "errors": list(dict.fromkeys(str(item) for item in errors if item)),
+    }
+    hint["source_backed_worker_implementation"] = dict(source_projection)
+    if errors:
+        hint.pop("test_results", None)
+        return hint, resolution
+    hint.update(
+        {
+            "test_results": source_results,
+            "changed_files": list(source_projection.get("changed_files") or []),
+            "graph_trace_ids": list(source_projection.get("graph_trace_ids") or []),
+            "test_results_source": str(source_projection.get("source") or ""),
+        }
+    )
+    return hint, resolution
+
+
 def _runtime_context_contract_runtime_worker_projection(
     conn,
     *,
@@ -16577,6 +16808,15 @@ def _runtime_context_contract_runtime_worker_projection(
             if canonical_implementation is not None
             else {}
         )
+        worker_implementation_projection = (
+            _runtime_context_contract_runtime_worker_implementation_projection(
+                canonical_record,
+                canonical_implementation,
+                worker_implementation_lineage,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+            )
+        )
     except ContractRuntimeError:
         return {}
     guide = (
@@ -16613,6 +16853,10 @@ def _runtime_context_contract_runtime_worker_projection(
     if worker_implementation_lineage:
         current_state["worker_implementation_lineage"] = dict(
             worker_implementation_lineage
+        )
+    if worker_implementation_projection:
+        current_state["worker_implementation_evidence"] = dict(
+            worker_implementation_projection
         )
     recovery = (
         canonical_record.get("same_lane_worker_commit_recovery")
@@ -16689,6 +16933,9 @@ def _runtime_context_contract_runtime_worker_projection(
         "worker_implementation_lineage": dict(
             worker_implementation_lineage
         ),
+        "worker_implementation_evidence": dict(
+            worker_implementation_projection
+        ),
         "contract_runtime_dispatch_identity": dict(
             contract_runtime_dispatch_identity
         ),
@@ -16726,6 +16973,9 @@ def _runtime_context_project_contract_runtime_into_worker_views(
         ),
         "worker_implementation_lineage": dict(
             projection.get("worker_implementation_lineage") or {}
+        ),
+        "worker_implementation_evidence": dict(
+            projection.get("worker_implementation_evidence") or {}
         ),
         "contract_runtime_dispatch_identity": contract_runtime_dispatch_identity,
         "timeline_projection_authoritative": False,
@@ -18640,6 +18890,22 @@ def _runtime_context_worker_guide_response(
     contract_runtime_current_state = dict(
         current_state_response.get("contract_runtime_current_state") or {}
     )
+    source_backed_worker_implementation = dict(
+        current_state_response.get("worker_implementation_evidence")
+        or contract_runtime_current_state.get("worker_implementation_evidence")
+        or {}
+    )
+    (
+        finish_attestation_hint,
+        finish_hint_source_backed_resolution,
+    ) = _runtime_context_finish_hint_from_source_backed_implementation(
+        finish_attestation_hint,
+        timeline_refs,
+        source_backed_worker_implementation,
+    )
+    finish_hint_source_backed_blocked = bool(
+        finish_hint_source_backed_resolution.get("fail_closed")
+    )
     contract_runtime_dispatch_identity = dict(
         current_state_response.get("contract_runtime_dispatch_identity")
         or contract_runtime_current_state.get("contract_runtime_dispatch_identity")
@@ -19183,7 +19449,9 @@ def _runtime_context_worker_guide_response(
         str(path or "").startswith(("agent/tests/", "tests/"))
         for path in worker_scope_files
     )
-    if test_worker_scope:
+    if finish_hint_source_backed_blocked:
+        hinted_test_results = {}
+    elif test_worker_scope:
         hinted_test_results = (
             _runtime_context_finish_attestation_project_test_results(
                 hinted_test_results
@@ -19359,12 +19627,18 @@ def _runtime_context_worker_guide_response(
         "actual_git_root": str(
             finish_attestation_hint.get("actual_git_root") or target_project_root
         ),
-        "test_results": hinted_test_results
-        or {
-            "status": "<worker-provided passed status>",
-            "passed": "<true only after worker-owned tests pass>",
-            "commands": ["<worker-owned test command evidence>"],
-        },
+        "test_results": (
+            hinted_test_results
+            or (
+                {}
+                if finish_hint_source_backed_blocked
+                else {
+                    "status": "<worker-provided passed status>",
+                    "passed": "<true only after worker-owned tests pass>",
+                    "commands": ["<worker-owned test command evidence>"],
+                }
+            )
+        ),
         **{
             field: str(route_identity.get(field) or "").strip()
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
@@ -19400,6 +19674,9 @@ def _runtime_context_worker_guide_response(
         route_identity=route_identity,
         contract_runtime_state=contract_runtime_current_state,
     )
+    finish_attestation_actionable_body = (
+        {} if finish_hint_source_backed_blocked else finish_attestation_body
+    )
     finish_attestation_submission = {
         "schema_version": (
             "runtime_context.finish_time_worker_attestation_submission.v1"
@@ -19415,12 +19692,29 @@ def _runtime_context_worker_guide_response(
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "target_project_root": target_project_root,
-        "body": finish_attestation_body,
-        "copy_safe_body": dict(finish_attestation_body),
+        "status": (
+            finish_hint_source_backed_resolution.get("status")
+            if finish_hint_source_backed_blocked
+            else "ready"
+        ),
+        "actionable": not finish_hint_source_backed_blocked,
+        "source_backed_implementation_resolution": dict(
+            finish_hint_source_backed_resolution
+        ),
+        "body": finish_attestation_actionable_body,
+        "copy_safe_body": dict(finish_attestation_actionable_body),
         "body_source": "copy_safe_body",
         "copy_rule": (
-            "POST exactly copy_safe_body to runtime_context.finish_time_worker_attestation; "
-            "do not hand-build this body or omit literal fields."
+            (
+                "Stop: source-backed implementation evidence is invalid or conflicts "
+                "with its timeline alias; no finish body is actionable."
+            )
+            if finish_hint_source_backed_blocked
+            else (
+                "POST exactly copy_safe_body to "
+                "runtime_context.finish_time_worker_attestation; do not hand-build "
+                "this body or omit literal fields."
+            )
         ),
         "required_literal_fields": {
             "harness_type": "codex",
@@ -20244,6 +20538,10 @@ def _runtime_context_worker_guide_response(
             {},
         ),
         "contract_runtime_current_state": contract_runtime_current_state,
+        "worker_implementation_evidence": source_backed_worker_implementation,
+        "finish_hint_source_backed_resolution": (
+            finish_hint_source_backed_resolution
+        ),
         "contract_runtime_dispatch_identity": contract_runtime_dispatch_identity,
         "contract_runtime_next_legal_action": contract_runtime_next_legal_action,
         "contract_runtime_authority_decision_source": (
@@ -20350,6 +20648,12 @@ def _runtime_context_worker_guide_response(
                 {},
             ),
             "contract_runtime_current_state": contract_runtime_current_state,
+            "worker_implementation_evidence": (
+                source_backed_worker_implementation
+            ),
+            "finish_hint_source_backed_resolution": (
+                finish_hint_source_backed_resolution
+            ),
             "contract_runtime_dispatch_identity": (
                 contract_runtime_dispatch_identity
             ),
@@ -25715,6 +26019,15 @@ def _runtime_context_finish_attestation_test_results_accepted(value: Any) -> boo
     ):
         return _runtime_context_finish_attestation_no_pass_results_accepted(value)
     if status in _RUNTIME_CONTEXT_FINISH_ATTESTATION_AMBIGUOUS_STATUSES:
+        return False
+    if status in {
+        "pass",
+        "passed",
+        "ok",
+        "succeeded",
+        "success",
+        "clean",
+    } and value.get("passed") is False:
         return False
     return _runtime_context_test_results_passed(value)
 
