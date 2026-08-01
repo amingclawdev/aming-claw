@@ -38091,6 +38091,7 @@ def _runtime_context_submit_canonical_contract_line(
     evidence_kind: str,
     payload: Mapping[str, Any],
     contract_execution_id: str = "",
+    completed_graph_query_read_only: bool = False,
 ) -> dict[str, Any]:
     """Advance a runtime-context Contract line in the facade transaction.
 
@@ -38490,7 +38491,16 @@ def _runtime_context_submit_canonical_contract_line(
         if context_local_setup:
             return context_local_setup
 
-    for completed in record.get("completed_lines") or []:
+    completed_line_record = (
+        stored_record
+        if (
+            completed_graph_query_read_only
+            and line_id == "worker_graph_context"
+            and evidence_kind == "graph_trace"
+        )
+        else record
+    )
+    for completed in completed_line_record.get("completed_lines") or []:
         if not isinstance(completed, Mapping):
             continue
         if str(completed.get("line_id") or "").strip() != line_id:
@@ -38511,8 +38521,114 @@ def _runtime_context_submit_canonical_contract_line(
         if (
             completed_runtime == runtime_context_id
             and completed_task == task_id
-            and next_line_id != line_id
         ):
+            if (
+                completed_graph_query_read_only
+                and line_id == "worker_graph_context"
+                and evidence_kind == "graph_trace"
+                and not use_context_projection
+            ):
+                _, audited_trace_ids = _runtime_context_graph_trace_values(
+                    canonical_payload
+                )
+                graph_trace_db_evidence = (
+                    _runtime_context_service_graph_trace_refs(
+                        conn,
+                        project_id=project_id,
+                        runtime_context_id=runtime_context_id,
+                        task_id=task_id,
+                        parent_task_id=str(
+                            canonical_payload.get("parent_task_id") or ""
+                        ).strip(),
+                        backlog_id=str(
+                            getattr(context, "backlog_id", "") or ""
+                        ).strip(),
+                        fence_token=str(
+                            getattr(context, "fence_token", "") or ""
+                        ),
+                        explicit_trace_ids=audited_trace_ids,
+                        strict_explicit_trace_ids=True,
+                    )
+                )
+                if not graph_trace_db_evidence.get("db_verified"):
+                    raise GovernanceError(
+                        "runtime_context_completed_graph_query_trace_rejected",
+                        (
+                            "completed worker graph-context reads require a "
+                            "DB-bound trace for the exact runtime lane"
+                        ),
+                        422,
+                        {
+                            "contract_execution_id": execution_id,
+                            "runtime_context_id": runtime_context_id,
+                            "task_id": task_id,
+                            "graph_trace_db_evidence": (
+                                _runtime_context_service_redact_graph_trace_refs(
+                                    graph_trace_db_evidence
+                                )
+                            ),
+                            "contract_runtime_mutated": False,
+                            "timeline_evidence_backfill_allowed": False,
+                        },
+                    )
+                current_state = _runtime_current_state_from_record(
+                    stored_record
+                )
+                redacted_graph_trace_evidence = (
+                    _runtime_context_service_redact_graph_trace_refs(
+                        graph_trace_db_evidence
+                    )
+                )
+                return {
+                    "schema_version": (
+                        "runtime_context.canonical_contract_line.v1"
+                    ),
+                    "accepted": True,
+                    "status": "already_completed_read_only",
+                    "canonical": True,
+                    "source_of_authority": "ContractRuntime.completed_lines",
+                    "contract_execution_id": execution_id,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "stage_id": stage_id,
+                    "line_id": line_id,
+                    "evidence_kind": evidence_kind,
+                    "line_instance_id": str(
+                        completed.get("line_instance_id") or ""
+                    ),
+                    "execution_state_revision": current_state.get(
+                        "execution_state_revision", 0
+                    ),
+                    "execution_state_hash": current_state.get(
+                        "execution_state_hash", ""
+                    ),
+                    "next_legal_action": (
+                        current_state.get("next_legal_action") or {}
+                    ),
+                    "read_only": True,
+                    "contract_runtime_mutated": False,
+                    "completed_lines_mutated": False,
+                    "completed_line_duplicate_created": False,
+                    "graph_trace_ids": audited_trace_ids,
+                    "graph_query_trace_ids": audited_trace_ids,
+                    "db_verified": True,
+                    "graph_trace_db_evidence": (
+                        redacted_graph_trace_evidence
+                    ),
+                    "audited_graph_read": {
+                        "schema_version": (
+                            "runtime_context.audited_graph_read.v1"
+                        ),
+                        "status": "persisted_read_only",
+                        "source_of_authority": "graph_query_traces",
+                        "graph_trace_ids": audited_trace_ids,
+                        "db_verified": True,
+                        "db_bound_for_implementation_evidence": True,
+                    },
+                    "timeline_projection_authoritative": False,
+                }
+            if next_line_id == line_id:
+                continue
             return {
                 "schema_version": "runtime_context.canonical_contract_line.v1",
                 "accepted": True,
@@ -51051,6 +51167,7 @@ def handle_graph_governance_query(ctx: RequestContext):
                             line_id="worker_graph_context",
                             evidence_kind="graph_trace",
                             payload=canonical_payload,
+                            completed_graph_query_read_only=True,
                         )
                     )
                     result["contract_runtime_canonical_line"] = canonical_line
