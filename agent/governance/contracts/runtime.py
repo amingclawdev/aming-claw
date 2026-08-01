@@ -4362,6 +4362,68 @@ def _mf_parallel_worker_commit_errors(
     if not fence_containment["ok"]:
         errors.append(f"worker_commit contains out-of-fence files: {out_of_fence!r}")
 
+    normal_target_revision: Mapping[str, Any] = {}
+    for candidate in _worker_commit_mapping_candidates(write):
+        if str(candidate.get("schema_version") or "").strip() == (
+            "runtime_context.normal_pre_qa_target_head_revision.v1"
+        ):
+            normal_target_revision = candidate
+            break
+    if normal_target_revision:
+        normal_worker_files = {
+            str(item or "").strip()
+            for item in normal_target_revision.get(
+                "worker_authored_candidate_delta_files"
+            )
+            or []
+            if str(item or "").strip()
+        }
+        normal_diff_base = str(
+            normal_target_revision.get("current_target_baseline_commit")
+            or ""
+        ).strip()
+        recorded_diff_base = _worker_commit_text(write, "diff_base_commit")
+        target_boundary_applied = bool(
+            normal_target_revision.get("target_head_boundary_applied")
+        )
+        runtime_target = str(
+            normal_target_revision.get("runtime_target_head_commit") or ""
+        ).strip()
+        if (
+            str(normal_target_revision.get("source") or "").strip()
+            != "server_revalidated_normal_pre_qa_target_head"
+            or normal_target_revision.get("server_derived") is not True
+            or normal_target_revision.get(
+                "post_qa_merge_conflict_recovery"
+            )
+            is not False
+        ):
+            errors.append(
+                "worker_commit normal pre-QA target projection requires "
+                "server-derived non-post-QA authority"
+            )
+        if normal_worker_files != changed_files:
+            errors.append(
+                "worker_commit normal pre-QA worker delta does not match "
+                "changed_files"
+            )
+        if not normal_diff_base or normal_diff_base != recorded_diff_base:
+            errors.append(
+                "worker_commit normal pre-QA target baseline does not match "
+                "diff_base_commit"
+            )
+        if target_boundary_applied and runtime_target != normal_diff_base:
+            errors.append(
+                "worker_commit applied target boundary must equal the runtime "
+                "target HEAD"
+            )
+        if normal_target_revision.get(
+            "target_baseline_changes_worker_authored"
+        ) is not False:
+            errors.append(
+                "worker_commit inherited target files cannot be worker-authored"
+            )
+
     graph_trace_ids = set(
         _worker_commit_strings(
             write,

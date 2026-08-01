@@ -12,6 +12,7 @@ from agent.governance.contracts.runtime import (
     _active_failed_qa_line,
     _contract_completion_satisfying_lines,
     _line_status_allows_contract_completion,
+    _mf_parallel_worker_commit_errors,
     _worker_commit_completed_implementation,
 )
 from agent.governance.contracts.execution_state import build_execution_state
@@ -114,6 +115,124 @@ def test_mf_parallel_rev8_requires_both_worker_lanes_before_merge_and_final_qa()
     assert current()["line_id"] == "qa_graph_context"
     finish_next()
     assert current()["line_id"] == "qa_independent_verification"
+
+
+def test_worker_commit_contract_accepts_target_relative_delta_with_inherited_projection():
+    worker_files = [
+        "agent/governance/contract_definitions/mf_parallel.v2.rev8.json",
+        "agent/governance/server.py",
+        "agent/tests/test_contract_registry.py",
+        "agent/tests/test_contract_runtime.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    inherited_file = "agent/governance/contracts/execution_state.py"
+    runtime_context_id = "mfrctx-inherited-target-worker-commit"
+    task_id = "inherited-target-worker-commit"
+    worker_id = "inherited-target-slot"
+    commit_sha = "c" * 40
+    base_commit = "a" * 40
+    target_head = "b" * 40
+    identity = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": "cex-inherited-target-worker-commit",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_id,
+        "worker_session_id": worker_id,
+        "actor_session_principal": worker_id,
+        "filer_principal": worker_id,
+        "target_project_root": "/tmp/inherited-target-worker-commit",
+        "session_token_ref": "wstok-inherited-target-worker-commit",
+        "fence_token_hash": "sha256:" + "d" * 64,
+        "worker_role": "mf_sub",
+        "evidence_owner_role": "mf_sub",
+    }
+    implementation = {
+        "line_id": "worker_implementation",
+        "actor_role": "mf_sub",
+        "evidence_kind": "implementation",
+        "status": "accepted",
+        **identity,
+        "changed_files": worker_files,
+        "graph_trace_ids": ["gqt-inherited-target-worker-commit"],
+        "payload": {
+            **identity,
+            "changed_files": worker_files,
+            "graph_trace_ids": ["gqt-inherited-target-worker-commit"],
+        },
+    }
+    record = {
+        "contract_execution_id": identity["parent_task_id"],
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [implementation],
+    }
+    normal_projection = {
+        "schema_version": (
+            "runtime_context.normal_pre_qa_target_head_revision.v1"
+        ),
+        "source": "server_revalidated_normal_pre_qa_target_head",
+        "server_derived": True,
+        "post_qa_merge_conflict_recovery": False,
+        "runtime_base_commit": base_commit,
+        "runtime_target_head_commit": target_head,
+        "current_target_baseline_commit": target_head,
+        "target_head_boundary_applied": True,
+        "target_head_boundary_reason": (
+            "runtime_target_head_is_pre_worker_ancestor"
+        ),
+        "inherited_target_head_files": [inherited_file],
+        "worker_authored_candidate_delta_files": worker_files,
+        "target_baseline_changes_worker_authored": False,
+        "base_to_target_inheritance_preserved": True,
+    }
+    worker_commit = {
+        **identity,
+        "changed_files": worker_files,
+        "commit_diff_files": worker_files,
+        "owned_files": worker_files,
+        "graph_trace_ids": ["gqt-inherited-target-worker-commit"],
+        "db_verified": True,
+        "clean_worktree": True,
+        "dirty_files": [],
+        "commit_sha": commit_sha,
+        "worker_commit_sha": commit_sha,
+        "head_commit": commit_sha,
+        "immutable_head_commit": commit_sha,
+        "validated_head_commit": commit_sha,
+        "diff_base_commit": target_head,
+        "normal_pre_qa_target_head_revision": normal_projection,
+        "observer_impersonation": False,
+    }
+    write = {
+        "stage_id": "worker_commit",
+        "line_id": "worker_commit",
+        "actor_role": "mf_sub",
+        "evidence_kind": "worker_commit",
+        "commit_sha": commit_sha,
+        "payload": worker_commit,
+    }
+
+    assert _mf_parallel_worker_commit_errors(
+        record,
+        write,
+        actor_role="mf_sub",
+    ) == ()
+
+    cumulative_regression = deepcopy(write)
+    cumulative_regression["payload"]["changed_files"] = sorted(
+        [inherited_file, *worker_files]
+    )
+    cumulative_regression["payload"]["commit_diff_files"] = sorted(
+        [inherited_file, *worker_files]
+    )
+    assert any(
+        "normal pre-QA worker delta" in error
+        for error in _mf_parallel_worker_commit_errors(
+            record,
+            cumulative_regression,
+            actor_role="mf_sub",
+        )
+    )
 
 
 def test_mf_parallel_rev8_reconcile_accepts_two_pre_qa_lane_merges(monkeypatch):

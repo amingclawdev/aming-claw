@@ -1805,6 +1805,97 @@ def test_worker_commit_revision_diff_uses_runtime_base_across_rework_commits(
     }
 
 
+def test_normal_worker_commit_uses_target_head_and_projects_inherited_base_delta(
+    tmp_path,
+):
+    worktree = tmp_path / "normal-worker-target-boundary"
+    worktree.mkdir()
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "worker@example.test"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Worker Target Test"],
+        cwd=worktree,
+        check=True,
+    )
+    (worktree / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True)
+    base_commit = batch_jobs.git_commit(worktree)
+
+    inherited_file = "agent/governance/contracts/execution_state.py"
+    inherited_path = worktree / inherited_file
+    inherited_path.parent.mkdir(parents=True, exist_ok=True)
+    inherited_path.write_text("inherited target change\n", encoding="utf-8")
+    subprocess.run(["git", "add", inherited_file], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "inherited target head"],
+        cwd=worktree,
+        check=True,
+    )
+    target_head = batch_jobs.git_commit(worktree)
+
+    worker_files = [
+        "agent/governance/contract_definitions/mf_parallel.v2.rev8.json",
+        "agent/governance/server.py",
+        "agent/tests/test_contract_registry.py",
+        "agent/tests/test_contract_runtime.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    for relative_path in worker_files:
+        path = worktree / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"worker authored {relative_path}\n", encoding="utf-8")
+    subprocess.run(["git", "add", *worker_files], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "worker candidate"],
+        cwd=worktree,
+        check=True,
+    )
+    worker_head = batch_jobs.git_commit(worktree)
+    context = SimpleNamespace(
+        base_commit=base_commit,
+        target_head_commit=target_head,
+    )
+
+    cumulative = server._runtime_context_worker_commit_revision_diff(
+        str(worktree),
+        worker_head,
+        base_commit=base_commit,
+    )
+    revision = server._runtime_context_normal_worker_commit_revision_diff(
+        context,
+        str(worktree),
+        worker_head,
+    )
+
+    assert cumulative["changed_files"] == sorted([inherited_file, *worker_files])
+    assert revision["base_commit"] == target_head
+    assert revision["parent_commit"] == target_head
+    assert revision["changed_files"] == sorted(worker_files)
+    assert revision["inherited_target_head_files"] == [inherited_file]
+    projection = revision["normal_pre_qa_target_head_revision"]
+    assert projection["server_derived"] is True
+    assert projection["post_qa_merge_conflict_recovery"] is False
+    assert projection["runtime_base_commit"] == base_commit
+    assert projection["runtime_target_head_commit"] == target_head
+    assert projection["current_target_baseline_commit"] == target_head
+    assert projection["target_head_boundary_applied"] is True
+    assert projection["inherited_target_head_files"] == [inherited_file]
+    assert projection["worker_authored_candidate_delta_files"] == sorted(
+        worker_files
+    )
+    assert projection["target_baseline_changes_worker_authored"] is False
+    assert server._runtime_context_worker_commit_diff_matches(
+        revision["changed_files"],
+        worker_files,
+        worker_files,
+    )
+
+
 def test_materialized_authority_revision_separates_inherited_and_authored_files(
     conn,
     tmp_path,

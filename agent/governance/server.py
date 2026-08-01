@@ -38689,6 +38689,168 @@ def _runtime_context_worker_commit_revision_diff(
     }
 
 
+def _runtime_context_normal_worker_commit_revision_diff(
+    context: Any,
+    worktree_path: str,
+    head_commit: str,
+) -> dict[str, Any]:
+    """Separate inherited target-HEAD files from a normal worker delta.
+
+    A newly dispatched or expanded worker may inherit an immutable target HEAD
+    that is ahead of the runtime base.  Those base-to-target files belong to
+    the target baseline, while only target-to-current files are worker-authored.
+    This is ordinary pre-QA authority; it does not open or emulate the post-QA
+    merge-conflict recovery path.
+
+    Historical contexts sometimes collapsed ``target_head_commit`` into the
+    worker's current HEAD.  They retain the runtime-base boundary because that
+    value cannot serve as a pre-worker target boundary.
+    """
+
+    from . import batch_jobs
+
+    runtime_base = str(getattr(context, "base_commit", "") or "").strip()
+    runtime_target = str(
+        getattr(context, "target_head_commit", "") or ""
+    ).strip()
+    head = str(head_commit or "").strip()
+    selected_diff_base = runtime_base
+    target_boundary_applied = False
+    boundary_reason = "runtime_target_head_missing_use_runtime_base"
+
+    if runtime_target:
+        if not re.fullmatch(r"[0-9a-f]{40,64}", runtime_target):
+            raise GovernanceError(
+                "worker_commit_target_revision_boundary_invalid",
+                "normal worker_commit requires an immutable target HEAD boundary",
+                422,
+                {
+                    "runtime_base_commit": runtime_base,
+                    "runtime_target_head_commit": runtime_target,
+                    "head_commit": head,
+                    "fail_closed": True,
+                },
+            )
+        try:
+            resolved_target = batch_jobs.git_commit(
+                worktree_path,
+                ref=runtime_target,
+            )
+        except Exception as exc:
+            raise GovernanceError(
+                "worker_commit_target_revision_boundary_unresolved",
+                "normal worker_commit could not resolve the runtime target HEAD",
+                422,
+                {
+                    "runtime_base_commit": runtime_base,
+                    "runtime_target_head_commit": runtime_target,
+                    "head_commit": head,
+                    "fail_closed": True,
+                },
+            ) from exc
+        if resolved_target != runtime_target:
+            raise GovernanceError(
+                "worker_commit_target_revision_boundary_unresolved",
+                "normal worker_commit target HEAD did not resolve immutably",
+                422,
+                {
+                    "runtime_target_head_commit": runtime_target,
+                    "resolved_target_head_commit": resolved_target,
+                    "fail_closed": True,
+                },
+            )
+        if runtime_target == head and runtime_target != runtime_base:
+            boundary_reason = "legacy_runtime_target_head_equals_worker_head"
+        else:
+            if not _git_commit_is_ancestor(
+                Path(worktree_path),
+                runtime_base,
+                runtime_target,
+            ):
+                raise GovernanceError(
+                    "worker_commit_target_revision_boundary_unresolved",
+                    "runtime base is not an ancestor of the assigned target HEAD",
+                    422,
+                    {
+                        "runtime_base_commit": runtime_base,
+                        "runtime_target_head_commit": runtime_target,
+                        "head_commit": head,
+                        "fail_closed": True,
+                    },
+                )
+            if not _git_commit_is_ancestor(
+                Path(worktree_path),
+                runtime_target,
+                head,
+            ):
+                raise GovernanceError(
+                    "worker_commit_target_revision_boundary_unresolved",
+                    "assigned target HEAD is not an ancestor of worker HEAD",
+                    422,
+                    {
+                        "runtime_base_commit": runtime_base,
+                        "runtime_target_head_commit": runtime_target,
+                        "head_commit": head,
+                        "next_legal_action": "rebase_worker_on_assigned_target",
+                        "fail_closed": True,
+                    },
+                )
+            selected_diff_base = runtime_target
+            target_boundary_applied = True
+            boundary_reason = (
+                "runtime_target_head_equals_runtime_base"
+                if runtime_target == runtime_base
+                else "runtime_target_head_is_pre_worker_ancestor"
+            )
+
+    revision_diff = _runtime_context_worker_commit_revision_diff(
+        worktree_path,
+        head,
+        base_commit=selected_diff_base,
+    )
+    inherited_target_head_files = (
+        batch_jobs.git_changed_files(
+            worktree_path,
+            base_ref=runtime_base,
+            head_ref=selected_diff_base,
+        )
+        if target_boundary_applied and selected_diff_base != runtime_base
+        else []
+    )
+    worker_authored_files = sorted(
+        set(revision_diff.get("changed_files") or [])
+    )
+    normal_revision = {
+        "schema_version": (
+            "runtime_context.normal_pre_qa_target_head_revision.v1"
+        ),
+        "source": "server_revalidated_normal_pre_qa_target_head",
+        "server_derived": True,
+        "post_qa_merge_conflict_recovery": False,
+        "runtime_base_commit": runtime_base,
+        "runtime_target_head_commit": runtime_target,
+        "current_target_baseline_commit": selected_diff_base,
+        "target_head_boundary_applied": target_boundary_applied,
+        "target_head_boundary_reason": boundary_reason,
+        "inherited_target_head_files": sorted(
+            set(inherited_target_head_files)
+        ),
+        "worker_authored_candidate_delta_files": worker_authored_files,
+        "target_baseline_changes_worker_authored": False,
+        "base_to_target_inheritance_preserved": target_boundary_applied,
+    }
+    return {
+        **revision_diff,
+        "runtime_base_commit": runtime_base,
+        "runtime_target_head_commit": runtime_target,
+        "inherited_target_head_files": list(
+            normal_revision["inherited_target_head_files"]
+        ),
+        "worker_authored_candidate_delta_files": worker_authored_files,
+        "normal_pre_qa_target_head_revision": normal_revision,
+    }
+
+
 def _runtime_context_worker_commit_diff_matches(
     commit_diff_files: list[str],
     implementation_files: list[str],
@@ -38922,6 +39084,14 @@ def _runtime_context_contract_worker_commit_projection(
         "runtime_context.canonical_same_lane_repair_head_revision.v2",
         "runtime_context.canonical_same_lane_repair_head_revision.v3",
     }
+    normal_target_revision = (
+        payload.get("normal_pre_qa_target_head_revision")
+        if isinstance(
+            payload.get("normal_pre_qa_target_head_revision"),
+            Mapping,
+        )
+        else {}
+    )
     allocated_owned_files = sorted(
         set(
             getattr(context, "owned_files", ())
@@ -39022,6 +39192,74 @@ def _runtime_context_contract_worker_commit_projection(
             errors.append(
                 "ContractRuntime post-QA target-baseline authority drifted"
             )
+    if normal_target_revision:
+        normal_target_boundary_applied = bool(
+            normal_target_revision.get("target_head_boundary_applied")
+        )
+        normal_runtime_base = str(
+            normal_target_revision.get("runtime_base_commit") or ""
+        ).strip()
+        normal_runtime_target = str(
+            normal_target_revision.get("runtime_target_head_commit") or ""
+        ).strip()
+        normal_inherited_files = sorted(
+            set(
+                normal_target_revision.get("inherited_target_head_files")
+                or []
+            )
+        )
+        expected_inherited_files = (
+            batch_jobs.git_changed_files(
+                worktree_path,
+                base_ref=normal_runtime_base,
+                head_ref=recorded_diff_base,
+            )
+            if normal_target_boundary_applied
+            and normal_runtime_base != recorded_diff_base
+            else []
+        )
+        if (
+            str(normal_target_revision.get("schema_version") or "").strip()
+            != "runtime_context.normal_pre_qa_target_head_revision.v1"
+            or str(normal_target_revision.get("source") or "").strip()
+            != "server_revalidated_normal_pre_qa_target_head"
+            or normal_target_revision.get("server_derived") is not True
+            or normal_target_revision.get(
+                "post_qa_merge_conflict_recovery"
+            )
+            is not False
+            or normal_runtime_base
+            != str(getattr(context, "base_commit", "") or "").strip()
+            or str(
+                normal_target_revision.get(
+                    "current_target_baseline_commit"
+                )
+                or ""
+            ).strip()
+            != recorded_diff_base
+            or (
+                normal_target_boundary_applied
+                and normal_runtime_target != recorded_diff_base
+            )
+            or sorted(
+                set(
+                    normal_target_revision.get(
+                        "worker_authored_candidate_delta_files"
+                    )
+                    or []
+                )
+            )
+            != sorted(set(recorded_files))
+            or normal_inherited_files
+            != sorted(set(expected_inherited_files))
+            or normal_target_revision.get(
+                "target_baseline_changes_worker_authored"
+            )
+            is not False
+        ):
+            errors.append(
+                "ContractRuntime normal pre-QA target-baseline authority drifted"
+            )
     if (
         allocated_owned_files
         and sorted(set(recorded_owned_files)) != allocated_owned_files
@@ -39086,6 +39324,9 @@ def _runtime_context_contract_worker_commit_projection(
             else {}
         ),
         "worker_session_id": str(payload.get("worker_session_id") or ""),
+        "normal_pre_qa_target_head_revision": (
+            dict(normal_target_revision) if normal_target_revision else {}
+        ),
         "changed_files": recorded_files,
         "commit_diff_files": recorded_diff_files,
         "owned_files": recorded_owned_files,
@@ -39336,10 +39577,10 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
                 "changed_files": same_lane_recovery.get("changed_files") or [],
             }
             if post_qa_target_baseline_recovery
-            else _runtime_context_worker_commit_revision_diff(
+            else _runtime_context_normal_worker_commit_revision_diff(
+                context,
                 worktree_path,
                 actual_head,
-                base_commit=str(context.base_commit or ""),
             )
         )
         commit_parent_sha = str(revision_diff["parent_commit"])
@@ -39442,6 +39683,10 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             "raw_session_token_persisted": False,
             "raw_fence_token_persisted": False,
         }
+        if not post_qa_target_baseline_recovery:
+            payload["normal_pre_qa_target_head_revision"] = dict(
+                revision_diff.get("normal_pre_qa_target_head_revision") or {}
+            )
         if implementation_event_ref:
             payload["implementation_event_ref"] = implementation_event_ref
             payload["implementation_timeline_alias"] = dict(
@@ -39494,10 +39739,10 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
                 )
             )
         else:
-            second_revision_diff = _runtime_context_worker_commit_revision_diff(
+            second_revision_diff = _runtime_context_normal_worker_commit_revision_diff(
+                context,
                 worktree_path,
                 second_head,
-                base_commit=str(context.base_commit or ""),
             )
             recovery_state_changed = False
         second_diff_files = list(second_revision_diff["changed_files"])
@@ -39508,6 +39753,13 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             or str(second_revision_diff["parent_commit"]) != commit_parent_sha
             or str(second_revision_diff["base_commit"]) != diff_base_commit
             or sorted(second_diff_files) != sorted(commit_diff_files)
+            or (
+                not post_qa_target_baseline_recovery
+                and second_revision_diff.get(
+                    "normal_pre_qa_target_head_revision"
+                )
+                != revision_diff.get("normal_pre_qa_target_head_revision")
+            )
         ):
             raise GovernanceError(
                 "worker_commit_state_changed_during_validation",
@@ -39762,7 +40014,11 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "owned_changed_files",
             "worker_changed_files",
         )
-        if claimed_changed and set(claimed_changed) != set(changed_files):
+        if (
+            claimed_changed
+            and not canonical_worker_commit_required
+            and set(claimed_changed) != set(changed_files)
+        ):
             raise ValidationError("changed_files do not match assigned worktree diff")
         test_results = (
             body.get("test_results") if isinstance(body.get("test_results"), Mapping) else {}
@@ -39842,6 +40098,8 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
                 actual_head=actual_head,
                 source="runtime_context.finish_time_worker_attestation.legacy",
             )
+        if claimed_changed and set(claimed_changed) != set(changed_files):
+            raise ValidationError("changed_files do not match assigned worktree diff")
 
         graph_trace_ids = _runtime_context_service_dedupe(
             _runtime_context_service_query_values(
@@ -41960,7 +42218,11 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                     )
                     actual_changed_files = _runtime_context_finish_changed_files(
                         worktree_path,
-                        base_commit=str(context.base_commit or ""),
+                        base_commit=str(
+                            finish_order_projection.get("diff_base_commit")
+                            or context.base_commit
+                            or ""
+                        ),
                         head_commit=validated_head,
                         canonical_worker_commit_required=(
                             canonical_worker_commit_required
