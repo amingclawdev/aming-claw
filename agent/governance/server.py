@@ -1961,8 +1961,8 @@ def _demo_launch_prompt_common_lines() -> list[str]:
         "1. Worker evidence belongs to the worker, not the observer.",
         "2. A bounded mf_sub worker must read runtime_context_worker_guide, submit read receipt, prove startup, query graph, implement, run tests, and submit implementation/finish evidence from the same live worker session.",
         "3. If worker raw host envelope env values are missing, use the runtime-context rejoin host envelope flow; never paste or persist raw session/fence tokens.",
-        "4. For any worker implementation, the observer must use the system CLI agent service or a host-created bounded worker/subagent; do not act as the worker from the observer session.",
-        "5. In mf_parallel and mf_batch_parallel, the observer must launch or hand off to a separate CLI agent or host-created subagent before any worker worktree edit.",
+        "4. For any worker implementation, the observer must use a host-created Codex Desktop bounded worker/subagent; do not act as the worker from the observer session or use the CLI Agent Service.",
+        "5. In mf_parallel and mf_batch_parallel, the observer must launch or hand off to separate Codex Desktop subagents before any worker worktree edit.",
         "6. The observer must not edit the worker worktree, run worker-owned tests/browser smoke, or submit worker-owned implementation evidence, finish attestation, or finish gate.",
         "7. If no separate worker agent capacity exists, record capacity friction instead of doing the worker work from the observer session.",
         "8. Run independent QA from a distinct verifier lane/session where possible, with its own graph queries and verifier-authored evidence.",
@@ -1996,20 +1996,22 @@ def _build_demo_launch_prompts(environment: Mapping[str, Any]) -> list[dict[str,
         {
             "id": "mf_parallel",
             "label": "MF Parallel",
-            "description": "Single-backlog mf_parallel path with bounded worker lane(s).",
+            "description": "Single-backlog mf_parallel path with exactly two bounded Codex Desktop workers.",
             "path_lines": [
                 "Path-specific route:",
                 "Use mf_parallel for exactly one backlog row covering the Today Focus and reminder visual planner board.",
                 "",
                 "Parallel implementation shape:",
-                "Create exactly one backlog row for that requirement, then use bounded mf_sub worker lanes where safe:",
+                "Create exactly one backlog row for that requirement, then dispatch exactly two Codex Desktop bounded mf_sub workers in parallel:",
                 "- Focus/UI lane: src/app.js, index.html, styles.css, tests/planner.test.mjs",
                 "- Reminder/domain lane: src/reminders.js, tests/reminders.test.mjs",
-                "- If shared-file or dependency conflicts appear, record the observer decision and keep the row single-scope.",
+                "- The two workers must have distinct RuntimeContexts/worktrees/branches and disjoint owned_files fences; do not collapse the lanes into one worker.",
+                "- If shared-file or dependency conflicts appear, record the observer decision and stop at the contract gate rather than collapsing the fanout.",
                 "",
-                "Observer starts the mf_parallel contract through onboard_route_guide/mf_parallel_enter, scopes with rg + graph, dispatches the bounded worker, then waits for worker-owned read/startup/graph/implementation/finish evidence.",
-                "The bounded worker must be a separate CLI agent or host-created subagent using the runtime envelope; the observer session must not act as that worker.",
-                "Use the merge materialize/apply route exactly as the current guide states. If token scope, merge queue, or finish gate rejects, stop and summarize friction.",
+                "Observer starts the mf_parallel contract through onboard_route_guide/mf_parallel_enter, scopes with rg + graph, atomically dispatches both bounded workers, then waits for both lanes' worker-owned read/startup/graph/implementation/commit/finish evidence.",
+                "Each bounded worker must be a separate Codex Desktop host-created subagent using its own runtime envelope; do not use the CLI Agent Service and the observer session must not act as either worker.",
+                "After both finish gates pass, merge both durable queue items, reconcile the final canonical HEAD, then dispatch a fresh independent QA session against that canonical HEAD/reconciled graph.",
+                "If final QA returns NO-PASS, start the bounded worker-fix successor from the QA finding and repeat merge/reconcile/fresh QA. If token scope, merge queue, or finish gate rejects, stop and summarize friction.",
             ],
         },
         {
@@ -2025,7 +2027,7 @@ def _build_demo_launch_prompts(environment: Mapping[str, Any]) -> list[dict[str,
                 "- Row B: per-task reminder toggle defaulting off and reminder tests.",
                 "",
                 "The batch observer must run rg + graph before selecting row scopes. Each row observer/worker repeats graph queries with its own identity before implementation.",
-                "For every row lane, the row observer must launch or hand off to a separate CLI agent or host-created subagent as the bounded worker; the observer session must not edit the worker worktree or submit worker-owned evidence.",
+                "For every row lane, the row observer must launch or hand off to a separate Codex Desktop host-created subagent as the bounded worker; do not use the CLI Agent Service, and the observer session must not edit the worker worktree or submit worker-owned evidence.",
                 "Land row commits through the batch merge queue in the order returned by runtime guidance; do not bypass merge materialize/apply when gates are healthy.",
                 "If a shared test file or merge queue mismatch appears, record the batch friction and stop rather than silently converting the work into a single-row or direct_main flow.",
             ],
@@ -67410,106 +67412,161 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         ):
             continue
         candidates.append((context, revision_payload))
-    if len(candidates) != 1:
-        return projected, {}
-
-    context, revision_payload = candidates[0]
-    revision_body = (
-        dict(revision_payload.get("payload") or {})
-        if isinstance(revision_payload.get("payload"), Mapping)
-        else {}
+    policy = _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+    required_worker_count = _contract_runtime_mf_parallel_required_worker_count(
+        record
     )
-    route_identity = _parallel_branch_runtime_contract_route_identity(
-        revision_payload
-    )
-    profile_requirements = (
-        dict(revision_body.get("profile_requirements") or {})
-        if isinstance(revision_body.get("profile_requirements"), Mapping)
-        else {}
-    )
-    retry_policy = (
-        dict(revision_body.get("retry_policy") or {})
-        if isinstance(revision_body.get("retry_policy"), Mapping)
-        else {}
-    )
-    branch_ref = str(getattr(context, "branch_ref", "") or "").strip()
-    if branch_ref and not branch_ref.startswith("refs/"):
-        branch_ref = f"refs/heads/{branch_ref}"
-    worker_id = str(
-        getattr(context, "worker_id", "")
-        or getattr(context, "worker_slot_id", "")
-        or ""
-    ).strip()
-    worker_slot_id = str(
-        getattr(context, "worker_slot_id", "")
-        or getattr(context, "worker_id", "")
-        or ""
-    ).strip()
-    dispatch_owned_files = sorted(
-        set(
-            getattr(context, "owned_files", ())
-            or getattr(context, "target_files", ())
-            or ()
+    candidates.sort(
+        key=lambda item: (
+            str(getattr(item[0], "task_id", "") or ""),
+            runtime_context_id_for_branch_context(item[0]),
         )
     )
+    if len(candidates) != required_worker_count:
+        return projected, {
+            "schema_version": (
+                "contract_runtime.mf_parallel_dispatch_copy_safe_projection.v2"
+            ),
+            "status": "blocked_worker_count_mismatch",
+            "required_worker_count": required_worker_count,
+            "persisted_worker_count": len(candidates),
+            "atomic_dispatch_required": required_worker_count > 1,
+            "copy_safe_body_available": False,
+        }
+
+    all_owned_files = sorted(
+        {
+            path
+            for context, _revision_payload in candidates
+            for path in (
+                getattr(context, "owned_files", ())
+                or getattr(context, "target_files", ())
+                or ()
+            )
+        }
+    )
+    acceptance_bodies = [
+        dict(revision_payload.get("payload") or {})
+        for _context, revision_payload in candidates
+        if isinstance(revision_payload.get("payload"), Mapping)
+    ]
+    reported_acceptance = _ACCEPTANCE_SCOPE_REPORT_UNSET
+    reported_values = [
+        body.get("acceptance_criteria")
+        for body in acceptance_bodies
+        if "acceptance_criteria" in body
+    ]
+    if reported_values and all(
+        value == reported_values[0] for value in reported_values[1:]
+    ):
+        reported_acceptance = reported_values[0]
     acceptance_scope_criteria, acceptance_scope_closure = (
         _require_backlog_acceptance_file_fence_closure(
             conn,
             project_id=project_id,
             backlog_id=backlog_id,
-            task_id=str(getattr(context, "task_id", "") or "").strip(),
-            allowed_files=dispatch_owned_files,
+            task_id=execution_id,
+            allowed_files=all_owned_files,
             actor_role="observer",
-            reported_acceptance_criteria=(
-                revision_body.get("acceptance_criteria")
-                if "acceptance_criteria" in revision_body
-                else _ACCEPTANCE_SCOPE_REPORT_UNSET
-            ),
+            reported_acceptance_criteria=reported_acceptance,
             implementation_started=False,
         )
     )
-    dispatch_payload = {
-        "schema_version": "mf_parallel.dispatch_bounded_worker.v1",
-        "runtime_context_id": runtime_context_id_for_branch_context(context),
-        "task_id": str(getattr(context, "task_id", "") or "").strip(),
-        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
-        "root_task_id": str(
-            getattr(context, "root_task_id", "") or execution_id
-        ).strip(),
-        "worker_role": "mf_sub",
-        "worker_id": worker_id,
-        "worker_slot_id": worker_slot_id,
-        "agent_id": str(
-            getattr(context, "agent_id", "")
-            or getattr(context, "allocation_owner", "")
-            or worker_id
-        ).strip(),
-        "observer_command_id": execution_id,
-        "target_project_root": runtime_context_effective_target_project_root(
-            context
-        ),
-        "worktree_path": str(
-            getattr(context, "worktree_path", "") or ""
-        ).strip(),
-        "branch_ref": branch_ref,
-        "base_commit": str(
-            getattr(context, "base_commit", "") or ""
-        ).strip(),
-        "target_head_commit": str(
-            getattr(context, "target_head_commit", "") or ""
-        ).strip(),
-        "merge_queue_id": str(
-            getattr(context, "merge_queue_id", "") or ""
-        ).strip(),
-        "owned_files": dispatch_owned_files,
-        "acceptance_criteria": acceptance_scope_criteria,
-        "acceptance_scope_closure": acceptance_scope_closure,
-        "profile_requirements": profile_requirements,
-        "retry_policy": retry_policy,
-        "route_identity": dict(route_identity),
-        **dict(route_identity),
-    }
-    policy = _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+
+    dispatch_payloads: list[dict[str, Any]] = []
+    for context, revision_payload in candidates:
+        revision_body = (
+            dict(revision_payload.get("payload") or {})
+            if isinstance(revision_payload.get("payload"), Mapping)
+            else {}
+        )
+        route_identity = _parallel_branch_runtime_contract_route_identity(
+            revision_payload
+        )
+        profile_requirements = (
+            dict(revision_body.get("profile_requirements") or {})
+            if isinstance(revision_body.get("profile_requirements"), Mapping)
+            else {}
+        )
+        retry_policy = (
+            dict(revision_body.get("retry_policy") or {})
+            if isinstance(revision_body.get("retry_policy"), Mapping)
+            else {}
+        )
+        branch_ref = str(getattr(context, "branch_ref", "") or "").strip()
+        if branch_ref and not branch_ref.startswith("refs/"):
+            branch_ref = f"refs/heads/{branch_ref}"
+        worker_id = str(
+            getattr(context, "worker_id", "")
+            or getattr(context, "worker_slot_id", "")
+            or ""
+        ).strip()
+        worker_slot_id = str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ).strip()
+        dispatch_owned_files = sorted(
+            set(
+                getattr(context, "owned_files", ())
+                or getattr(context, "target_files", ())
+                or ()
+            )
+        )
+        dispatch_payloads.append(
+            {
+                "schema_version": "mf_parallel.dispatch_bounded_worker.v2",
+                "line_instance_id": (
+                    "runtime_context:"
+                    + runtime_context_id_for_branch_context(context)
+                ),
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    context
+                ),
+                "task_id": str(
+                    getattr(context, "task_id", "") or ""
+                ).strip(),
+                "parent_task_id": _runtime_context_mf_sub_parent_task_id(
+                    context
+                ),
+                "root_task_id": str(
+                    getattr(context, "root_task_id", "") or execution_id
+                ).strip(),
+                "worker_role": "mf_sub",
+                "worker_id": worker_id,
+                "worker_slot_id": worker_slot_id,
+                "agent_id": str(
+                    getattr(context, "agent_id", "")
+                    or getattr(context, "allocation_owner", "")
+                    or worker_id
+                ).strip(),
+                "observer_command_id": execution_id,
+                "target_project_root": (
+                    runtime_context_effective_target_project_root(context)
+                ),
+                "worktree_path": str(
+                    getattr(context, "worktree_path", "") or ""
+                ).strip(),
+                "branch_ref": branch_ref,
+                "base_commit": str(
+                    getattr(context, "base_commit", "") or ""
+                ).strip(),
+                "target_head_commit": str(
+                    getattr(context, "target_head_commit", "") or ""
+                ).strip(),
+                "merge_queue_id": str(
+                    getattr(context, "merge_queue_id", "") or ""
+                ).strip(),
+                "owned_files": dispatch_owned_files,
+                "acceptance_criteria": acceptance_scope_criteria,
+                "acceptance_scope_closure": acceptance_scope_closure,
+                "profile_requirements": profile_requirements,
+                "retry_policy": retry_policy,
+                "route_identity": dict(route_identity),
+                **dict(route_identity),
+            }
+        )
+
     required_fields = _runtime_context_service_dedupe(
         [
             *policy.get("required_dispatch_fields", []),
@@ -67517,29 +67574,51 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         ]
     )
     missing_fields = [
-        field
+        f"worker[{index}].{field}"
+        for index, dispatch_payload in enumerate(dispatch_payloads, start=1)
         for field in required_fields
         if dispatch_payload.get(field) in (None, "", [], {})
     ]
     if missing_fields:
         return projected, {
             "schema_version": (
-                "contract_runtime.mf_parallel_dispatch_copy_safe_projection.v1"
+                "contract_runtime.mf_parallel_dispatch_copy_safe_projection.v2"
             ),
             "status": "blocked_incomplete_persisted_authority",
             "missing_fields": sorted(set(missing_fields)),
-            "runtime_context_id": dispatch_payload["runtime_context_id"],
+            "runtime_context_ids": [
+                payload["runtime_context_id"] for payload in dispatch_payloads
+            ],
             "source_of_authority": (
                 "RuntimeContext+ContractRevision+observer_route_token_refs"
             ),
             "copy_safe_body_available": False,
         }
 
-    copy_payload.update(dispatch_payload)
-    copy_payload["payload"] = dict(dispatch_payload)
+    if required_worker_count == 1:
+        dispatch_payload = dispatch_payloads[0]
+        copy_payload.update(dispatch_payload)
+        copy_payload["payload"] = dict(dispatch_payload)
+        next_action.update(dispatch_payload)
+    else:
+        atomic_payload = {
+            "schema_version": "mf_parallel.atomic_two_worker_dispatch.v1",
+            "bounded_workers": dispatch_payloads,
+            "worker_count": required_worker_count,
+            "required_worker_count": required_worker_count,
+            "atomic_dispatch": True,
+            "all_or_nothing": True,
+            "owned_files": all_owned_files,
+            "acceptance_criteria": acceptance_scope_criteria,
+            "acceptance_scope_closure": acceptance_scope_closure,
+        }
+        copy_payload["bounded_workers"] = dispatch_payloads
+        copy_payload["worker_count"] = required_worker_count
+        copy_payload["atomic_dispatch"] = True
+        copy_payload["payload"] = atomic_payload
+        next_action.update(atomic_payload)
     safe_copy["copy_payload"] = copy_payload
     guide["writer_role_safe_copy_payload"] = safe_copy
-    next_action.update(dispatch_payload)
     next_action["writer_role_safe_copy_payload"] = dict(safe_copy)
     next_action["copy_safe_dispatch_ready"] = True
     next_action["dispatch_copy_safe_body_source"] = (
@@ -67548,11 +67627,16 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
     guide["next_legal_action"] = next_action
     projection = {
         "schema_version": (
-            "contract_runtime.mf_parallel_dispatch_copy_safe_projection.v1"
+            "contract_runtime.mf_parallel_dispatch_copy_safe_projection.v2"
         ),
         "status": "ready",
-        "runtime_context_id": dispatch_payload["runtime_context_id"],
-        "task_id": dispatch_payload["task_id"],
+        "worker_count": len(dispatch_payloads),
+        "required_worker_count": required_worker_count,
+        "atomic_dispatch": required_worker_count > 1,
+        "runtime_context_ids": [
+            payload["runtime_context_id"] for payload in dispatch_payloads
+        ],
+        "task_ids": [payload["task_id"] for payload in dispatch_payloads],
         "source_of_authority": (
             "RuntimeContext+ContractRevision+observer_route_token_refs"
         ),
@@ -67842,6 +67926,43 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
     bridge_guidance = _contract_runtime_mf_sub_host_bridge_guidance(guide)
     if bridge_guidance:
         current_state["mf_sub_host_bridge_guidance"] = bridge_guidance
+    if (
+        _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+        and str(record.get("revision") or "").strip() == "rev8"
+    ):
+        failed_qa_line = _contract_runtime_latest_failed_qa_line(record)
+        if failed_qa_line and not _runtime_record_is_complete(record):
+            failed_index = int(
+                failed_qa_line.get("_completed_line_index") or 0
+            )
+            failed_source_ref = (
+                f"contract_runtime:{record.get('contract_execution_id', '')}:"
+                f"completed_lines:{failed_index}"
+            )
+            current_state.update(
+                {
+                    "status": "blocked",
+                    "readiness_state": "failed_qa_worker_fix_required",
+                    "next_legal_action": {
+                        "id": "enter_direct_fix_successor",
+                        "action": "enter_direct_fix_successor",
+                        "owner_role": "observer",
+                        "recommended_successor_contract_id": (
+                            DIRECT_FIX_CONTRACT_ID
+                        ),
+                        "failed_qa_source_ref": failed_source_ref,
+                        "bounded_worker_fix_required": True,
+                        "fresh_qa_session_required": True,
+                        "return_sequence": [
+                            "observer_merge",
+                            "observer_reconcile",
+                            "qa_independent_verification",
+                        ],
+                    },
+                }
+            )
     return current_state
 
 
@@ -81774,6 +81895,35 @@ def _contract_runtime_mf_parallel_dispatch_authority_policy(
     return dict(policy)
 
 
+def _contract_runtime_mf_parallel_required_worker_count(
+    record: Mapping[str, Any],
+) -> int:
+    """Return the pinned atomic fanout cardinality (legacy revisions default to one)."""
+
+    policy = _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+    try:
+        count = int(policy.get("required_worker_count") or 1)
+    except (TypeError, ValueError):
+        count = 1
+    return max(1, count)
+
+
+def _contract_runtime_mf_parallel_bounded_workers(
+    value: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Read one atomic dispatch's lane payloads without inventing identities."""
+
+    payload = (
+        value.get("payload")
+        if isinstance(value.get("payload"), Mapping)
+        else value
+    )
+    workers = payload.get("bounded_workers")
+    if not isinstance(workers, list):
+        return []
+    return [dict(worker) for worker in workers if isinstance(worker, Mapping)]
+
+
 def _contract_runtime_is_policy_bound_mf_parallel_dispatch(
     record: Mapping[str, Any],
     write: Mapping[str, Any],
@@ -81804,6 +81954,7 @@ def _contract_runtime_bind_mf_parallel_dispatch_authority(
     project_id: str,
     record: Mapping[str, Any],
     write: Mapping[str, Any],
+    _required_worker_count_override: int | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Bind a policy-enabled dispatch to persisted worker and route authority."""
 
@@ -81831,17 +81982,218 @@ def _contract_runtime_bind_mf_parallel_dispatch_authority(
         if isinstance(effective.get("payload"), Mapping)
         else {}
     )
+    required_worker_count = (
+        int(_required_worker_count_override)
+        if _required_worker_count_override is not None
+        else _contract_runtime_mf_parallel_required_worker_count(record)
+    )
+    raw_bounded_workers = payload.get("bounded_workers")
+    if (
+        required_worker_count > 1
+        and _required_worker_count_override is None
+    ):
+        if (
+            not isinstance(raw_bounded_workers, list)
+            or len(raw_bounded_workers) != required_worker_count
+            or any(
+                not isinstance(worker, Mapping)
+                for worker in raw_bounded_workers
+            )
+        ):
+            return effective, [
+                "mf_parallel policy-bound dispatch must atomically identify "
+                f"exactly {required_worker_count} bounded workers"
+            ]
+
+        lane_authority_fields = {
+            *required_dispatch_fields,
+            *required_child_route_fields,
+            "runtime_context_id",
+            "task_id",
+            "worker_task_id",
+            "parent_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "worker_role",
+            "role",
+            "target_project_root",
+            "project_root",
+            "repo_root",
+            "worktree_path",
+            "worker_worktree_path",
+            "assigned_worktree",
+            "branch_ref",
+            "branch",
+            "base_commit",
+            "target_head_commit",
+            "merge_queue_id",
+            "route_identity",
+            "child_route_lineage",
+        }
+        canonical_workers: list[dict[str, Any]] = []
+        lane_errors: list[str] = []
+        for index, worker in enumerate(raw_bounded_workers, start=1):
+            lane_payload = dict(worker)
+            lane_payload["bounded_workers"] = [dict(worker)]
+            lane_write = {
+                key: value
+                for key, value in effective.items()
+                if key not in lane_authority_fields and key != "payload"
+            }
+            lane_write.update(dict(worker))
+            lane_write["payload"] = lane_payload
+            bound_lane, errors = (
+                _contract_runtime_bind_mf_parallel_dispatch_authority(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    write=lane_write,
+                    _required_worker_count_override=1,
+                )
+            )
+            if errors:
+                lane_errors.extend(
+                    f"bounded worker {index}: {error}" for error in errors
+                )
+                continue
+            bound_payload = (
+                bound_lane.get("payload")
+                if isinstance(bound_lane.get("payload"), Mapping)
+                else {}
+            )
+            bound_workers = bound_payload.get("bounded_workers")
+            if (
+                not isinstance(bound_workers, list)
+                or len(bound_workers) != 1
+                or not isinstance(bound_workers[0], Mapping)
+            ):
+                lane_errors.append(
+                    f"bounded worker {index}: canonical lane binding missing"
+                )
+                continue
+            canonical_worker = dict(bound_workers[0])
+            canonical_worker["line_instance_id"] = (
+                "runtime_context:"
+                + str(canonical_worker.get("runtime_context_id") or "")
+            )
+            canonical_workers.append(canonical_worker)
+        if lane_errors:
+            return effective, list(dict.fromkeys(lane_errors))
+
+        distinct_fields = [
+            str(field or "").strip()
+            for field in authority_policy.get("distinct_identity_fields") or []
+            if str(field or "").strip()
+        ]
+        if not distinct_fields:
+            distinct_fields = [
+                "runtime_context_id",
+                "task_id",
+                "worker_id",
+                "worker_slot_id",
+                "worktree_path",
+                "branch_ref",
+                "merge_queue_id",
+            ]
+        for field in distinct_fields:
+            values = [
+                str(worker.get(field) or "").strip()
+                for worker in canonical_workers
+            ]
+            if any(not value for value in values) or len(set(values)) != len(
+                values
+            ):
+                lane_errors.append(
+                    "atomic bounded workers require distinct " + field
+                )
+
+        owned_by_worker = [
+            set(
+                _runtime_context_service_query_values(
+                    worker,
+                    "owned_files",
+                    "target_files",
+                )
+            )
+            for worker in canonical_workers
+        ]
+        overlap = sorted(
+            {
+                path
+                for left_index, left in enumerate(owned_by_worker)
+                for right in owned_by_worker[left_index + 1 :]
+                for path in left.intersection(right)
+            }
+        )
+        if overlap:
+            lane_errors.append(
+                "atomic bounded workers require disjoint owned_files: "
+                + ", ".join(overlap)
+            )
+        if lane_errors:
+            return effective, list(dict.fromkeys(lane_errors))
+
+        canonical_workers.sort(
+            key=lambda worker: (
+                str(worker.get("task_id") or ""),
+                str(worker.get("runtime_context_id") or ""),
+            )
+        )
+        aggregate_payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in lane_authority_fields
+            and key != "bounded_workers"
+        }
+        aggregate_payload.update(
+            {
+                "schema_version": (
+                    "mf_parallel.atomic_two_worker_dispatch.v1"
+                ),
+                "bounded_workers": canonical_workers,
+                "worker_count": len(canonical_workers),
+                "required_worker_count": required_worker_count,
+                "atomic_dispatch": True,
+                "all_or_nothing": True,
+                "owned_files": sorted(
+                    set().union(*owned_by_worker)
+                    if owned_by_worker
+                    else set()
+                ),
+                "dispatch_ticket_authority": {
+                    "schema_version": (
+                        "mf_parallel.atomic_dispatch_ticket_authority.v1"
+                    ),
+                    "source": "observer_route_token_refs",
+                    "server_resolved_child_route_identity": True,
+                    "runtime_context_bound": True,
+                    "all_workers_bound": True,
+                    "atomic_dispatch": True,
+                    "required_worker_count": required_worker_count,
+                    "observer_impersonation_explicit": True,
+                },
+                "observer_impersonation": False,
+            }
+        )
+        effective["bounded_workers"] = canonical_workers
+        effective["worker_count"] = len(canonical_workers)
+        effective["atomic_dispatch"] = True
+        effective["observer_impersonation"] = False
+        effective["payload"] = aggregate_payload
+        return effective, []
+
     errors: list[str] = []
     bounded_worker: dict[str, Any] = {}
-    bounded_workers = payload.get("bounded_workers")
+    bounded_workers = raw_bounded_workers
     if bounded_workers is not None:
         if (
             not isinstance(bounded_workers, list)
-            or len(bounded_workers) != 1
+            or len(bounded_workers) != required_worker_count
             or not isinstance(bounded_workers[0], Mapping)
         ):
             errors.append(
-                "mf_parallel policy-bound dispatch must identify exactly one bounded worker"
+                "mf_parallel policy-bound dispatch must identify exactly "
+                f"{required_worker_count} bounded worker"
             )
         else:
             bounded_worker = dict(bounded_workers[0])
@@ -93948,6 +94300,7 @@ def _mf_parallel_successor_runtime_enter(
     route_token_ref: str,
     reason: str,
     contract_execution_id: str = "",
+    contract_revision: str = "",
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime = _contract_runtime(conn)
@@ -94031,6 +94384,11 @@ def _mf_parallel_successor_runtime_enter(
             project_id=project_id,
             backlog_id=backlog_id,
             actor_role=actor_role,
+            **(
+                {"version": "v2", "revision": contract_revision}
+                if contract_revision
+                else {}
+            ),
             contract_execution_id=successor_execution_id,
             parent_contract_execution_id=parent_execution_id,
             root_contract_execution_id=root_execution_id,
@@ -101384,6 +101742,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             record.get("contract_execution_id") or ""
         ).strip()
 
+    rev8_two_worker_fanout = str(record.get("revision") or "").strip() == "rev8"
     strict_temporal_order = bool(
         str(record.get("version") or "").strip()
         and str(record.get("revision") or "").strip()
@@ -101459,6 +101818,15 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             "missing_id": "contract_runtime.worker_commit",
         }
     found: dict[str, dict[str, Any]] = {}
+    lane_lines: dict[str, dict[str, dict[str, Any]]] = {
+        line_id: {}
+        for line_id in (
+            "worker_implementation",
+            "worker_commit",
+            "worker_finish_gate",
+            "observer_merge",
+        )
+    }
     rejected_by_requirement: dict[str, list[dict[str, Any]]] = {
         key: [] for key in required_specs
     }
@@ -101502,11 +101870,50 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                 })
                 continue
             found[requirement_id] = line
+            if line_id in lane_lines:
+                payload = (
+                    line.get("payload")
+                    if isinstance(line.get("payload"), Mapping)
+                    else {}
+                )
+                runtime_context_id = str(
+                    line.get("runtime_context_id")
+                    or payload.get("runtime_context_id")
+                    or ""
+                ).strip()
+                line_instance_id = str(
+                    line.get("line_instance_id")
+                    or payload.get("line_instance_id")
+                    or ""
+                ).strip()
+                if (
+                    runtime_context_id
+                    and line_instance_id == f"runtime_context:{runtime_context_id}"
+                ):
+                    lane_lines[line_id][runtime_context_id] = line
 
     missing: list[str] = []
     for requirement_id, spec in required_specs.items():
         if requirement_id not in found:
             missing.append(str(spec["missing_id"]))
+
+    expected_lane_ids: list[str] = []
+    if rev8_two_worker_fanout:
+        dispatch_selection = _contract_runtime_current_dispatch_authority_line(record)
+        if dispatch_selection.get("status") == "selected":
+            expected_lane_ids = sorted(
+                str(worker.get("runtime_context_id") or "").strip()
+                for worker in _contract_runtime_mf_parallel_bounded_workers(
+                    {"payload": dispatch_selection.get("payload") or {}}
+                )
+                if str(worker.get("runtime_context_id") or "").strip()
+            )
+        if len(expected_lane_ids) != 2:
+            missing.append("contract_runtime.dispatch.exactly_two_worker_lanes")
+        for line_id, instances in lane_lines.items():
+            absent = sorted(set(expected_lane_ids) - set(instances))
+            if absent:
+                missing.append(f"contract_runtime.{line_id}.all_worker_lanes")
 
     reconcile_bypass = formal_bypass_authorities.get(
         "observer_reconcile", {}
@@ -101554,28 +101961,52 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                 "contract_runtime.worker_finish_after_implementation",
             )
         )
-    ordering_pairs.extend([
-        (
-            "worker_finish_gate",
-            "qa_independent_verification",
-            "contract_runtime.qa_after_worker_finish",
-        ),
-        (
-            "qa_independent_verification",
-            "observer_merge",
-            "contract_runtime.merge_after_qa",
-        ),
-        (
-            "observer_merge",
-            "observer_reconcile",
-            "contract_runtime.reconcile_after_merge",
-        ),
-        (
-            "observer_reconcile",
-            "observer_close_ready",
-            "contract_runtime.close_ready_after_reconcile",
-        ),
-    ])
+    if rev8_two_worker_fanout:
+        ordering_pairs.extend([
+            (
+                "worker_finish_gate",
+                "observer_merge",
+                "contract_runtime.merge_after_all_worker_finish",
+            ),
+            (
+                "observer_merge",
+                "observer_reconcile",
+                "contract_runtime.reconcile_after_all_merges",
+            ),
+            (
+                "observer_reconcile",
+                "qa_independent_verification",
+                "contract_runtime.qa_after_reconcile",
+            ),
+            (
+                "qa_independent_verification",
+                "observer_close_ready",
+                "contract_runtime.close_ready_after_final_qa",
+            ),
+        ])
+    else:
+        ordering_pairs.extend([
+            (
+                "worker_finish_gate",
+                "qa_independent_verification",
+                "contract_runtime.qa_after_worker_finish",
+            ),
+            (
+                "qa_independent_verification",
+                "observer_merge",
+                "contract_runtime.merge_after_qa",
+            ),
+            (
+                "observer_merge",
+                "observer_reconcile",
+                "contract_runtime.reconcile_after_merge",
+            ),
+            (
+                "observer_reconcile",
+                "observer_close_ready",
+                "contract_runtime.close_ready_after_reconcile",
+            ),
+        ])
     ordering_diagnostics: list[dict[str, Any]] = []
     for before, after, missing_id in ordering_pairs:
         before_line = found.get(before)
@@ -101583,6 +102014,8 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         if not before_line or not after_line:
             continue
         strict_pair = bool(
+            not rev8_two_worker_fanout
+            and
             strict_temporal_order
             and (before, after)
             in {
@@ -101615,13 +102048,62 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         if not bool(ordering.get("passed")):
             missing.append(missing_id)
 
+    lane_ordering_diagnostics: list[dict[str, Any]] = []
+    if rev8_two_worker_fanout:
+        for runtime_context_id in expected_lane_ids:
+            for before, after, missing_id in (
+                (
+                    "worker_implementation",
+                    "worker_commit",
+                    "contract_runtime.worker_commit_after_implementation",
+                ),
+                (
+                    "worker_commit",
+                    "worker_finish_gate",
+                    "contract_runtime.worker_finish_after_worker_commit",
+                ),
+                (
+                    "worker_finish_gate",
+                    "observer_merge",
+                    "contract_runtime.merge_after_worker_finish",
+                ),
+            ):
+                before_line = lane_lines[before].get(runtime_context_id)
+                after_line = lane_lines[after].get(runtime_context_id)
+                if not before_line or not after_line:
+                    continue
+                diagnostic = _contract_runtime_mf_parallel_ordering_diagnostic(
+                    before=before,
+                    after=after,
+                    missing_id=missing_id,
+                    before_line=before_line,
+                    after_line=after_line,
+                )
+                diagnostic["runtime_context_id"] = runtime_context_id
+                lane_ordering_diagnostics.append(diagnostic)
+                if not diagnostic.get("passed"):
+                    missing.append(
+                        f"{missing_id}.runtime_context:{runtime_context_id}"
+                    )
+
     server_lineage_diagnostics: list[dict[str, Any]] = []
     if (
         "qa_independent_verification" in found
         and "observer_merge" in found
         and reconcile_authority_line
     ):
-        for before, after, missing_id in (
+        lineage_pairs = (
+            (
+                "observer_merge",
+                "observer_reconcile",
+                "contract_runtime.reconcile_after_merge",
+            ),
+            (
+                "observer_reconcile",
+                "qa_independent_verification",
+                "contract_runtime.qa_after_reconcile",
+            ),
+        ) if rev8_two_worker_fanout else (
             (
                 "qa_independent_verification",
                 "observer_merge",
@@ -101632,9 +102114,25 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                 "observer_reconcile",
                 "contract_runtime.reconcile_after_merge",
             ),
-        ):
-            server_lineage_diagnostics.append(
-                _contract_runtime_mf_parallel_server_temporal_ordering_diagnostic(
+        )
+        for before, after, missing_id in lineage_pairs:
+            if rev8_two_worker_fanout:
+                server_lineage_diagnostics.append(
+                    _contract_runtime_mf_parallel_ordering_diagnostic(
+                        before=before,
+                        after=after,
+                        missing_id=missing_id,
+                        before_line=found[before],
+                        after_line=(
+                            reconcile_authority_line
+                            if after == "observer_reconcile"
+                            else found[after]
+                        ),
+                    )
+                )
+            else:
+                server_lineage_diagnostics.append(
+                    _contract_runtime_mf_parallel_server_temporal_ordering_diagnostic(
                     before=before,
                     after=after,
                     missing_id=missing_id,
@@ -101647,8 +102145,8 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                     qa_line=found["qa_independent_verification"],
                     merge_line=found["observer_merge"],
                     reconcile_line=reconcile_authority_line,
+                    )
                 )
-            )
     bypass_reconcile_diagnostic = (
         _contract_runtime_mf_parallel_reconcile_close_diagnostic(
             record,
@@ -102038,6 +102536,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             for requirement_id, line in found.items()
         },
         "ordering_diagnostics": ordering_diagnostics,
+        "lane_ordering_diagnostics": lane_ordering_diagnostics,
         "rejected_evidence_by_requirement": {
             key: value for key, value in rejected_by_requirement.items() if value
         },
@@ -110894,6 +111393,41 @@ def _contract_runtime_dispatch_ticket_authority(
             ),
         }
 
+    bounded_workers = _contract_runtime_mf_parallel_bounded_workers(
+        {"payload": payload}
+    )
+    if bounded_workers:
+        next_runtime_context_id = str(
+            actual_next.get("runtime_context_id") or ""
+        ).strip()
+        next_task_id = str(actual_next.get("task_id") or "").strip()
+        matching_workers = [
+            worker
+            for worker in bounded_workers
+            if (
+                (
+                    next_runtime_context_id
+                    and str(worker.get("runtime_context_id") or "").strip()
+                    == next_runtime_context_id
+                )
+                or (
+                    not next_runtime_context_id
+                    and next_task_id
+                    and str(worker.get("task_id") or "").strip()
+                    == next_task_id
+                )
+            )
+        ]
+        if len(matching_workers) != 1:
+            return {
+                "status": "invalid",
+                "error": (
+                    "atomic mf_parallel dispatch cannot resolve the active "
+                    "worker line instance"
+                ),
+            }
+        payload = dict(matching_workers[0])
+
     dispatch_runtime_context_id = str(
         line.get("runtime_context_id") or payload.get("runtime_context_id") or ""
     ).strip()
@@ -111070,12 +111604,16 @@ def _contract_runtime_dispatch_ticket_authority(
                 + ", ".join(sorted(set(conflicts)))
             ),
         }
+    source_ref = (
+        f"contract_runtime:{record.get('contract_execution_id', '')}:"
+        f"completed_lines:{dispatch_index}"
+    )
+    line_instance_id = str(payload.get("line_instance_id") or "").strip()
+    if line_instance_id:
+        source_ref += f":{line_instance_id}"
     return {
         "status": "projected",
-        "source_ref": (
-            f"contract_runtime:{record.get('contract_execution_id', '')}:"
-            f"completed_lines:{dispatch_index}"
-        ),
+        "source_ref": source_ref,
         "next_legal_action": action,
     }
 
@@ -111096,6 +111634,19 @@ def _contract_runtime_qa_ticket_authority(
     if selected.get("status") != "selected":
         return selected
     dispatch = selected["payload"]
+    bounded_workers = _contract_runtime_mf_parallel_bounded_workers(
+        {"payload": dispatch}
+    )
+    atomic_fanout = len(bounded_workers) > 1
+    if atomic_fanout:
+        bounded_workers = sorted(
+            bounded_workers,
+            key=lambda worker: (
+                str(worker.get("runtime_context_id") or ""),
+                str(worker.get("task_id") or ""),
+            ),
+        )
+        dispatch = dict(bounded_workers[0])
     profile = dispatch.get("profile_requirements")
     profile = dict(profile) if isinstance(profile, Mapping) else {}
     profile.pop("profile_id", None)
@@ -111110,8 +111661,13 @@ def _contract_runtime_qa_ticket_authority(
         }
     )
     worker_task_id = str(dispatch.get("task_id") or "").strip()
-    qa_task_id = "qa-{}".format(worker_task_id)
-    qa_identity = "qa:{}".format(worker_task_id)
+    if atomic_fanout:
+        execution_id = str(record.get("contract_execution_id") or "").strip()
+        qa_task_id = "qa-integration-{}".format(execution_id)
+        qa_identity = "qa:integration:{}".format(execution_id)
+    else:
+        qa_task_id = "qa-{}".format(worker_task_id)
+        qa_identity = "qa:{}".format(worker_task_id)
     projected = dict(dispatch)
     route_identity = (
         dispatch.get("route_identity")
@@ -111144,6 +111700,74 @@ def _contract_runtime_qa_ticket_authority(
             },
         }
     )
+    if atomic_fanout:
+        reconcile_lines = [
+            line
+            for _index, line in _contract_runtime_completed_lines(record)
+            if (
+                str(line.get("line_id") or "").strip()
+                == "observer_reconcile"
+                and _contract_runtime_line_status_passes(line)
+            )
+        ]
+        reconcile_line = reconcile_lines[-1] if reconcile_lines else {}
+        reconcile_payload = (
+            reconcile_line.get("payload")
+            if isinstance(reconcile_line.get("payload"), Mapping)
+            else {}
+        )
+        reconcile_authority = (
+            reconcile_payload.get("reconcile_authority")
+            if isinstance(reconcile_payload.get("reconcile_authority"), Mapping)
+            else {}
+        )
+        canonical_commit = str(
+            reconcile_authority.get("canonical_head_commit")
+            or reconcile_authority.get("reconciled_commit_sha")
+            or reconcile_payload.get("commit_sha")
+            or reconcile_line.get("commit_sha")
+            or ""
+        ).strip()
+        target_project_root = str(
+            dispatch.get("target_project_root")
+            or dispatch.get("project_root")
+            or dispatch.get("repo_root")
+            or ""
+        ).strip()
+        for worker_field in (
+            "runtime_context_id",
+            "worktree_path",
+            "branch_ref",
+            "branch",
+            "merge_queue_id",
+        ):
+            projected.pop(worker_field, None)
+        projected.update(
+            {
+                "target_project_root": target_project_root,
+                "project_root": target_project_root,
+                "source_runtime_context_ids": [
+                    str(worker.get("runtime_context_id") or "")
+                    for worker in bounded_workers
+                ],
+                "source_worker_task_ids": [
+                    str(worker.get("task_id") or "")
+                    for worker in bounded_workers
+                ],
+                "source_merge_queue_ids": [
+                    str(worker.get("merge_queue_id") or "")
+                    for worker in bounded_workers
+                ],
+                "postmerge_canonical_qa": True,
+                "graph_basis": "reconciled_canonical_head",
+                "independent_qa_required": True,
+                "canonical_candidate_commit": canonical_commit,
+                "candidate_commit": canonical_commit,
+                "reconcile_source_ref": str(
+                    reconcile_line.get("_source_ref") or ""
+                ),
+            }
+        )
     return {
         "status": "projected",
         "next_legal_action": projected,
@@ -117723,6 +118347,11 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
     actor = str(body.get("actor") or "api").strip()
     body_role_claim = str(body.get("actor_role") or body.get("role") or "").strip()
     contract_execution_id = str(body.get("contract_execution_id") or "").strip()
+    contract_revision = str(
+        body.get("contract_revision")
+        or body.get("pinned_contract_revision")
+        or ""
+    ).strip()
     owned_files = body.get("owned_files") if isinstance(body.get("owned_files"), list) else []
     target_files = body.get("target_files") if isinstance(body.get("target_files"), list) else []
     worker_fence = (
@@ -117939,6 +118568,7 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             route_token_ref=route_token_ref,
             reason=reason,
             contract_execution_id=contract_execution_id,
+            contract_revision=contract_revision,
             metadata=metadata,
         )
         payload = {

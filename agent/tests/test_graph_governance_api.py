@@ -49713,6 +49713,7 @@ def _start_completed_source_backed_mf_parallel_close_authority_chain(
                 "reason": "Human approved source-backed parallel repair.",
                 "backlog_id": backlog_id,
                 "task_id": f"{route_label}-parent",
+                "contract_revision": "rev6",
                 "route_token_ref": route_identity["route_token_ref"],
                 "worker_fence": {
                     "fence_token": f"fence-{backlog_id.lower()}",
@@ -50262,6 +50263,7 @@ def test_mf_parallel_close_authority_honors_missing_finish_and_reconcile_bypasse
                 ),
                 "backlog_id": repair_diagnostic_id,
                 "task_id": "missing-reconcile-related-repair-parent",
+                "contract_revision": "rev6",
                 "route_token_ref": repair_route_identity[
                     "route_token_ref"
                 ],
@@ -54337,6 +54339,7 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
                 "reason": "Human approved source-backed parallel repair.",
                 "backlog_id": backlog_id,
                 "task_id": task_id,
+                "contract_revision": "rev7",
                 "route_token_ref": route_identity["route_token_ref"],
                 "worker_fence": {
                     "fence_token": fence_token,
@@ -55366,6 +55369,7 @@ def test_mf_parallel_projection_accepts_source_backed_dispatch_without_worker_ro
                 "reason": "Human approved source-backed parallel repair.",
                 "backlog_id": backlog_id,
                 "task_id": task_id,
+                "contract_revision": "rev7",
                 "route_token_ref": route_identity["route_token_ref"],
                 "worker_fence": {
                     "fence_token": fence_token,
@@ -76009,7 +76013,7 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     worktree_path: str | None = None,
     target_project_root: str | None = None,
     submit_dispatch: bool = True,
-    pinned_revision: str = "",
+    pinned_revision: str = "rev7",
     contract_execution_id: str = "",
     base_commit: str = "",
     owned_files: tuple[str, ...] = ("agent/governance/server.py",),
@@ -76898,6 +76902,7 @@ def test_source_backed_mf_parallel_dispatch_issues_ticket_only_before_worker_rea
         token=worker_token,
         worktree_path=str(worktree),
         target_project_root=str(tmp_path),
+        pinned_revision="rev6",
     )
     route_identity = {
         "route_id": f"route-{worker_task_id}",
@@ -90538,6 +90543,7 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
                 "reason": "Human approved parallel worker repair.",
                 "backlog_id": backlog_id,
                 "task_id": task_id,
+                "contract_revision": "rev7",
                 "route_token_ref": route_identity["route_token_ref"],
                 "worker_fence": {
                     "fence_token": "fence-contract-startup-bridge",
@@ -94722,9 +94728,15 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_bounded_worker_list(co
                 "route_token_ref": "rtok-mf-parallel-list-root",
                 "worker_fence": {
                     "fence_token": "fence-parallel-list",
-                    "owned_files": ["agent/governance/server.py"],
+                    "owned_files": [
+                        "agent/governance/server.py",
+                        "agent/governance/contracts/execution_state.py",
+                    ],
                 },
-                "owned_files": ["agent/governance/server.py"],
+                "owned_files": [
+                    "agent/governance/server.py",
+                    "agent/governance/contracts/execution_state.py",
+                ],
             },
         )
     )
@@ -94760,6 +94772,38 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_bounded_worker_list(co
         route_label="parallel-list-dispatch-worker",
         route_task_id=result["contract_execution_id"],
     )
+    second_runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id="parallel-list-dispatch-worker-b",
+        fence_token="fence-parallel-list-b",
+        token="parallel-list-dispatch-worker-token-b",
+        base_commit="base-parallel-list-dispatch-worker",
+        target_head_commit="head-parallel-list-dispatch-worker",
+        merge_queue_id="mq-parallel-list-dispatch-worker-b",
+        owned_files=("agent/governance/contracts/execution_state.py",),
+    )
+    second_dispatch_payload = _mf_parallel_rev3_worker_dispatch_payload(
+        conn,
+        backlog_id=backlog_id,
+        runtime_context=second_runtime_context,
+        route_label="parallel-list-dispatch-worker-b",
+        route_task_id=result["contract_execution_id"],
+    )
+    dispatch_payloads = sorted(
+        [dispatch_payload, second_dispatch_payload],
+        key=lambda item: item["runtime_context_id"],
+    )
+    contexts_by_id = {
+        runtime_context.runtime_context_id: (
+            runtime_context,
+            "fence-parallel-list",
+        ),
+        second_runtime_context.runtime_context_id: (
+            second_runtime_context,
+            "fence-parallel-list-b",
+        ),
+    }
     dispatch = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
@@ -94769,31 +94813,53 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_bounded_worker_list(co
                 "stage_id": "dispatch",
                 "line_id": "observer_dispatch_bounded_workers",
                 "evidence_kind": "dispatch_bounded_worker",
-                "payload": {"bounded_workers": [dispatch_payload]},
+                "payload": {"bounded_workers": dispatch_payloads},
             },
         )
     )
     assert dispatch["ok"] is True
+    record = server._contract_runtime(conn).store.get(
+        result["contract_execution_id"]
+    )
+    active_runtime_context_id = record["runtime_guide"]["next_legal_action"][
+        "runtime_context_id"
+    ]
+    active_payload = next(
+        item
+        for item in dispatch_payloads
+        if item["runtime_context_id"] == active_runtime_context_id
+    )
+    active_context, active_fence_token = contexts_by_id[
+        active_payload["runtime_context_id"]
+    ]
 
     worker_read = server.handle_project_contract_runtime_line_write(
         _ctx(
             {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
             method="POST",
             body={
-                "runtime_context_id": runtime_context.runtime_context_id,
-                "task_id": runtime_context.task_id,
+                "runtime_context_id": active_context.runtime_context_id,
+                "task_id": active_context.task_id,
                 "parent_task_id": backlog_id,
                 "worker_role": "mf_sub",
-                "fence_token": "fence-parallel-list",
-                "session_token_ref": runtime_context_session_token_ref(runtime_context),
-                "target_project_root": "/tmp/parallel-list-dispatch-worker",
+                "fence_token": active_fence_token,
+                "session_token_ref": runtime_context_session_token_ref(
+                    active_context
+                ),
+                "target_project_root": active_payload["target_project_root"],
                 "stage_id": "worker_read",
                 "line_id": "worker_read_runtime_guide",
                 "evidence_kind": "read_receipt",
+                "read_receipt_hash": _fake_sha(
+                    "parallel-list-dispatch-worker-read"
+                ),
                 "payload": {
                     "schema_version": "mf_parallel.worker_read_receipt.v1",
-                    "runtime_context_id": runtime_context.runtime_context_id,
-                    "task_id": runtime_context.task_id,
+                    "runtime_context_id": active_context.runtime_context_id,
+                    "task_id": active_context.task_id,
+                    "read_receipt_hash": _fake_sha(
+                        "parallel-list-dispatch-worker-read"
+                    ),
                 },
             },
         )
@@ -94829,6 +94895,7 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_default_worker_role(co
                 "reason": "Human approved parallel worker repair.",
                 "backlog_id": backlog_id,
                 "task_id": task_id,
+                "contract_revision": "rev7",
                 "route_token_ref": "rtok-mf-parallel-default-worker-role-root",
                 "worker_fence": {
                     "fence_token": "fence-default-worker-role",
@@ -94909,10 +94976,16 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_default_worker_role(co
                 "stage_id": "worker_read",
                 "line_id": "worker_read_runtime_guide",
                 "evidence_kind": "read_receipt",
+                "read_receipt_hash": _fake_sha(
+                    "parallel-default-worker-role-read"
+                ),
                 "payload": {
                     "schema_version": "mf_parallel.worker_read_receipt.v1",
                     "runtime_context_id": runtime_context.runtime_context_id,
                     "task_id": runtime_context.task_id,
+                    "read_receipt_hash": _fake_sha(
+                        "parallel-default-worker-role-read"
+                    ),
                 },
             },
         )
@@ -94948,6 +95021,7 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_worker_task_alias(conn
                 "reason": "Human approved parallel worker repair.",
                 "backlog_id": backlog_id,
                 "task_id": task_id,
+                "contract_revision": "rev7",
                 "route_token_ref": "rtok-mf-parallel-worker-task-alias-root",
                 "worker_fence": {
                     "fence_token": "fence-worker-task-alias",
@@ -95023,10 +95097,16 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_worker_task_alias(conn
                 "stage_id": "worker_read",
                 "line_id": "worker_read_runtime_guide",
                 "evidence_kind": "read_receipt",
+                "read_receipt_hash": _fake_sha(
+                    "parallel-worker-task-alias-read"
+                ),
                 "payload": {
                     "schema_version": "mf_parallel.worker_read_receipt.v1",
                     "runtime_context_id": runtime_context.runtime_context_id,
                     "task_id": runtime_context.task_id,
+                    "read_receipt_hash": _fake_sha(
+                        "parallel-worker-task-alias-read"
+                    ),
                 },
             },
         )
@@ -95063,8 +95143,9 @@ def test_mf_parallel_dispatch_rejects_source_backed_payload_without_task_parent_
                 "actor": "operator",
                 "reason": "Human approved parallel worker repair.",
                 "backlog_id": backlog_id,
-                "task_id": task_id,
-                "route_token_ref": "rtok-mf-parallel-source-backed-root",
+                    "task_id": task_id,
+                    "contract_revision": "rev7",
+                    "route_token_ref": "rtok-mf-parallel-source-backed-root",
                 "worker_fence": {
                     "fence_token": "fence-source-backed-dispatch",
                     "owned_files": ["agent/governance/server.py"],
@@ -95201,8 +95282,9 @@ def test_mf_parallel_worker_read_rejects_runtime_context_only_in_non_dispatch_li
                 "actor": "operator",
                 "reason": "Human approved parallel worker repair.",
                 "backlog_id": backlog_id,
-                "task_id": task_id,
-                "route_token_ref": "rtok-mf-parallel-non-dispatch-root",
+                    "task_id": task_id,
+                    "contract_revision": "rev7",
+                    "route_token_ref": "rtok-mf-parallel-non-dispatch-root",
                 "worker_fence": {
                     "fence_token": "fence-non-dispatch",
                     "owned_files": ["agent/governance/server.py"],
@@ -95304,8 +95386,9 @@ def test_mf_parallel_worker_read_rejects_dispatch_parent_task_mismatch(conn):
                 "actor": "operator",
                 "reason": "Human approved parallel worker repair.",
                 "backlog_id": backlog_id,
-                "task_id": "parallel-dispatch-parent-task",
-                "route_token_ref": "rtok-mf-parallel-dispatch-parent-root",
+                    "task_id": "parallel-dispatch-parent-task",
+                    "contract_revision": "rev7",
+                    "route_token_ref": "rtok-mf-parallel-dispatch-parent-root",
                 "worker_fence": {
                     "fence_token": "fence-dispatch-parent",
                     "owned_files": ["agent/governance/server.py"],
@@ -99185,6 +99268,166 @@ def test_qa_ticket_resolver_projects_contract_runtime_qa_authority(monkeypatch):
         "on_crash": "retry_same_profile",
         "successor_required": True,
     }
+
+
+def test_rev8_qa_ticket_targets_reconciled_canonical_head_not_worker_lane():
+    route_identity = {
+        "route_id": "route-two-worker-qa",
+        "route_context_hash": _fake_sha("route-two-worker-qa"),
+        "prompt_contract_id": "prompt-two-worker-qa",
+        "prompt_contract_hash": _fake_sha("prompt-two-worker-qa"),
+        "route_token_ref": "rtref-two-worker-qa",
+        "visible_injection_manifest_hash": _fake_sha("manifest-two-worker-qa"),
+    }
+    workers = [
+        {
+            "runtime_context_id": "mfrctx-two-worker-a",
+            "task_id": "two-worker-a",
+            "worker_id": "worker-a",
+            "worker_slot_id": "slot-a",
+            "target_project_root": "/tmp/two-worker",
+            "worktree_path": "/tmp/two-worker/.worktrees/a",
+            "branch_ref": "refs/heads/a",
+            "merge_queue_id": "mq-a",
+            "route_identity": route_identity,
+            "profile_requirements": {"harness": "codex"},
+        },
+        {
+            "runtime_context_id": "mfrctx-two-worker-b",
+            "task_id": "two-worker-b",
+            "worker_id": "worker-b",
+            "worker_slot_id": "slot-b",
+            "target_project_root": "/tmp/two-worker",
+            "worktree_path": "/tmp/two-worker/.worktrees/b",
+            "branch_ref": "refs/heads/b",
+            "merge_queue_id": "mq-b",
+            "route_identity": route_identity,
+            "profile_requirements": {"harness": "codex"},
+        },
+    ]
+    record = {
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev8",
+        "contract_execution_id": "cex-two-worker-qa",
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "actor_role": "observer",
+                "payload": {"bounded_workers": workers},
+            },
+            {
+                "stage_id": "observer_reconcile",
+                "line_id": "observer_reconcile",
+                "evidence_kind": "reconcile",
+                "actor_role": "observer",
+                "status": "passed",
+                "payload": {
+                    "reconcile_authority": {
+                        "canonical_head_commit": "c" * 40,
+                    }
+                },
+            },
+        ],
+    }
+    current_state = {
+        "next_legal_action": {
+            "owner_role": "qa",
+            "stage_id": "qa_graph_context",
+            "line_id": "qa_graph_context",
+            "evidence_kind": "graph_trace",
+        }
+    }
+
+    projected = server._contract_runtime_qa_ticket_authority(
+        record, current_state
+    )
+
+    assert projected["status"] == "projected"
+    action = projected["next_legal_action"]
+    assert action["postmerge_canonical_qa"] is True
+    assert action["graph_basis"] == "reconciled_canonical_head"
+    assert action["candidate_commit"] == "c" * 40
+    assert action["source_runtime_context_ids"] == [
+        "mfrctx-two-worker-a",
+        "mfrctx-two-worker-b",
+    ]
+    assert action["source_merge_queue_ids"] == ["mq-a", "mq-b"]
+    assert "runtime_context_id" not in action
+    assert "worktree_path" not in action
+    assert "branch_ref" not in action
+
+
+def test_daily_planner_mf_parallel_prompt_requires_two_desktop_workers():
+    prompt = next(
+        item["prompt"]
+        for item in server._build_demo_launch_prompts({})
+        if item["id"] == "mf_parallel"
+    )
+
+    assert "dispatch exactly two Codex Desktop bounded mf_sub workers" in prompt
+    assert "distinct RuntimeContexts/worktrees/branches" in prompt
+    assert "do not collapse the lanes into one worker" in prompt
+    assert "do not use the CLI Agent Service" in prompt
+    assert "merge both durable queue items" in prompt
+    assert "fresh independent QA session" in prompt
+
+
+@pytest.mark.parametrize("worker_count", [0, 1, 3])
+def test_rev8_dispatch_rejects_non_two_atomic_cardinality_without_mutation(
+    worker_count,
+):
+    record = {
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev8",
+        "contract_execution_id": "cex-two-worker-cardinality",
+    }
+    write = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "dispatch_bounded_worker",
+        "payload": {"bounded_workers": [{} for _ in range(worker_count)]},
+    }
+
+    effective, errors = (
+        server._contract_runtime_bind_mf_parallel_dispatch_authority(
+            None,
+            project_id=PID,
+            record=record,
+            write=write,
+        )
+    )
+
+    assert effective == write
+    assert errors == [
+        "mf_parallel policy-bound dispatch must atomically identify "
+        "exactly 2 bounded workers"
+    ]
+
+
+def test_mf_parallel_rev8_definition_orders_fan_in_before_final_qa():
+    definition = server._contract_runtime_definition_for_record(
+        {
+            "contract_id": "mf_parallel.v2",
+            "version": "v2",
+            "revision": "rev8",
+        }
+    )
+    policy = definition["system_layer"]["dispatch_ticket_authority_policy"]
+    stage_ids = [
+        stage["stage_id"] for stage in definition["rule_layer"]["stages"]
+    ]
+
+    assert policy["required_worker_count"] == 2
+    assert policy["atomic_dispatch_required"] is True
+    assert stage_ids.index("observer_lane_merge") < stage_ids.index(
+        "observer_reconcile"
+    ) < stage_ids.index("qa_graph_context") < stage_ids.index("qa")
+    assert definition["system_layer"]["qa_no_pass_successor_policy"][
+        "successor_contract_id"
+    ] == "direct_fix"
 
 
 @pytest.mark.parametrize(

@@ -76,7 +76,9 @@ def build_execution_state(
     return state
 
 
-_MF_PARALLEL_CONTRACT_IDS = frozenset({"mf_parallel", "mf_parallel.v1"})
+_MF_PARALLEL_CONTRACT_IDS = frozenset(
+    {"mf_parallel", "mf_parallel.v1", "mf_parallel.v2"}
+)
 _MF_PARALLEL_WORKER_DISPATCH_LINE = (
     "dispatch",
     "observer_dispatch_bounded_workers",
@@ -86,6 +88,19 @@ _MF_PARALLEL_WORKER_LIST_KEYS = (
     "bounded_workers",
     "worker_contexts",
     "lanes",
+)
+_MF_PARALLEL_LANE_LINE_IDS = frozenset(
+    {
+        "worker_read_runtime_guide",
+        "worker_startup",
+        "worker_graph_context",
+        "worker_implementation",
+        "worker_commit",
+        "worker_finish_time_attestation",
+        "worker_finish_gate",
+        "worker_review_ready_handoff",
+        "observer_merge",
+    }
 )
 
 
@@ -114,19 +129,22 @@ def _line_instances_for(
     line: Mapping[str, Any],
     completed_lines: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, str]]:
-    if not _is_mf_parallel_worker_line(definition, line):
+    if not _is_mf_parallel_lane_line(definition, line):
         return [{}]
     instances = _mf_parallel_worker_instances(completed_lines)
     return instances or [{}]
 
 
-def _is_mf_parallel_worker_line(
+def _is_mf_parallel_lane_line(
     definition: Mapping[str, Any],
     line: Mapping[str, Any],
 ) -> bool:
     contract_id = str(definition.get("contract_id") or "")
     if contract_id not in _MF_PARALLEL_CONTRACT_IDS:
         return False
+    line_id = str(line.get("line_id") or "").strip()
+    if line_id in _MF_PARALLEL_LANE_LINE_IDS:
+        return True
     owner_role = str(line.get("owner_role") or "").strip().lower().replace("-", "_")
     allowed_roles = {
         str(item or "").strip().lower().replace("-", "_")

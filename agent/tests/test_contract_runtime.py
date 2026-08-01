@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from agent.governance import parallel_branch_runtime, server
@@ -12,6 +14,143 @@ from agent.governance.contracts.runtime import (
     _line_status_allows_contract_completion,
     _worker_commit_completed_implementation,
 )
+from agent.governance.contracts.execution_state import build_execution_state
+
+
+def test_mf_parallel_rev8_requires_both_worker_lanes_before_merge_and_final_qa():
+    definition = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "governance"
+            / "contract_definitions"
+            / "mf_parallel.v2.rev8.json"
+        ).read_text()
+    )
+    workers = [
+        {
+            "runtime_context_id": "mfrctx-two-worker-a",
+            "task_id": "two-worker-a",
+            "parent_task_id": "cex-two-worker",
+            "worker_id": "slot-a",
+            "worker_slot_id": "slot-a",
+            "line_instance_id": "runtime_context:mfrctx-two-worker-a",
+        },
+        {
+            "runtime_context_id": "mfrctx-two-worker-b",
+            "task_id": "two-worker-b",
+            "parent_task_id": "cex-two-worker",
+            "worker_id": "slot-b",
+            "worker_slot_id": "slot-b",
+            "line_instance_id": "runtime_context:mfrctx-two-worker-b",
+        },
+    ]
+    completed = [
+        {
+            "stage_id": "orchestration",
+            "line_id": "observer_prefill_child_contracts",
+        },
+        {
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "payload": {
+                "worker_count": 2,
+                "atomic": True,
+                "bounded_workers": workers,
+            },
+        },
+    ]
+
+    def current():
+        return build_execution_state(
+            definition,
+            project_id="aming-claw",
+            backlog_id="AC-TWO-WORKER",
+            contract_execution_id="cex-two-worker",
+            actor_role="observer",
+            completed_lines=completed,
+        )["next_action"]
+
+    def finish_next():
+        action = current()
+        completed.append(
+            {
+                "stage_id": action["stage_id"],
+                "line_id": action["line_id"],
+                "line_instance_id": action.get("line_instance_id", ""),
+                "runtime_context_id": action.get("runtime_context_id", ""),
+            }
+        )
+        return action
+
+    assert current()["runtime_context_id"] == "mfrctx-two-worker-a"
+    first = finish_next()
+    assert first["line_id"] == "worker_read_runtime_guide"
+    assert current()["runtime_context_id"] == "mfrctx-two-worker-b"
+
+    while current()["line_id"] != "worker_finish_gate":
+        finish_next()
+    assert current()["runtime_context_id"] == "mfrctx-two-worker-a"
+    finish_next()
+    assert current()["line_id"] == "worker_finish_gate"
+    assert current()["runtime_context_id"] == "mfrctx-two-worker-b"
+    finish_next()
+
+    assert current()["line_id"] == "observer_merge"
+    assert current()["runtime_context_id"] == "mfrctx-two-worker-a"
+    finish_next()
+    assert current()["line_id"] == "observer_merge"
+    assert current()["runtime_context_id"] == "mfrctx-two-worker-b"
+    finish_next()
+    assert current()["line_id"] == "observer_reconcile"
+    finish_next()
+    assert current()["line_id"] == "qa_graph_context"
+    finish_next()
+    assert current()["line_id"] == "qa_independent_verification"
+
+
+def test_mf_parallel_rev8_failed_final_qa_routes_to_bounded_worker_fix():
+    record = {
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev8",
+        "contract_execution_id": "cex-two-worker-failed-qa",
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "owner_role": "qa",
+            }
+        },
+        "completed_lines": [
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "payload": {"status": "failed", "verdict": "FAIL"},
+            }
+        ],
+    }
+
+    state = server._runtime_current_state_from_record(record)
+
+    assert state["readiness_state"] == "failed_qa_worker_fix_required"
+    assert state["next_legal_action"] == {
+        "id": "enter_direct_fix_successor",
+        "action": "enter_direct_fix_successor",
+        "owner_role": "observer",
+        "recommended_successor_contract_id": "direct_fix",
+        "failed_qa_source_ref": (
+            "contract_runtime:cex-two-worker-failed-qa:completed_lines:0"
+        ),
+        "bounded_worker_fix_required": True,
+        "fresh_qa_session_required": True,
+        "return_sequence": [
+            "observer_merge",
+            "observer_reconcile",
+            "qa_independent_verification",
+        ],
+    }
 
 
 def _accepted_no_pass_line(*, reported_baseline_failed: int) -> dict:
