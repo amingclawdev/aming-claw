@@ -21351,10 +21351,10 @@ def _runtime_context_worker_recovery_payloads(
         f"{runtime_context_id}/session-token/rejoin"
     )
     normalized_agent_id = str(agent_id or worker_slot_id or worker_id or "").strip()
+    allocated_governed_worker_id = str(worker_id or worker_slot_id or "").strip()
     normalized_allocation_owner = str(
         allocation_owner or normalized_agent_id or worker_slot_id or worker_id or ""
     ).strip()
-    normalized_actual_host_worker_id = str(actual_host_worker_id or "").strip()
     normalized_worker_session_id = str(worker_session_id or "").strip()
     normalized_worker_transcript_ref = str(worker_transcript_ref or "").strip()
     normalized_worker_transcript_path = str(worker_transcript_path or "").strip()
@@ -21418,10 +21418,10 @@ def _runtime_context_worker_recovery_payloads(
         "schema_version": "runtime_context.worker_identity_pointers.v1",
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
-        "agent_id": normalized_agent_id,
+        "agent_id": allocated_governed_worker_id,
         "allocation_owner": normalized_allocation_owner,
         "observer_allocation_owner": normalized_allocation_owner,
-        "actual_host_worker_id": normalized_actual_host_worker_id,
+        "actual_host_worker_id": allocated_governed_worker_id,
         "worker_session_id": normalized_worker_session_id,
         "worker_transcript_ref": normalized_worker_transcript_ref,
         "worker_transcript_path": normalized_worker_transcript_path,
@@ -21442,45 +21442,46 @@ def _runtime_context_worker_recovery_payloads(
             "task_id",
             "parent_task_id",
             "worker_role",
+            "agent_id",
+            "actual_host_worker_id",
             "session_token or session_token_ref",
             "fence_token",
             "target_project_root",
         ],
         "opaque_identity_fields": [
-            "actual_host_worker_id",
             "worker_session_id",
             "filer_principal",
             "host_session_id",
         ],
         "opaque_identity_is_role_bearing": False,
-        "actual_host_worker_id": normalized_actual_host_worker_id,
+        "agent_id": allocated_governed_worker_id,
+        "actual_host_worker_id": allocated_governed_worker_id,
         "worker_session_id": normalized_worker_session_id,
+        "desktop_worker_session_identity_is_independent": True,
     }
     actual_host_identity_binding = {
         "schema_version": "runtime_context.actual_host_identity_binding.v1",
         "required_before_initial_join_when_agent_id_is_placeholder": True,
+        "allocated_governed_worker_id": allocated_governed_worker_id,
+        "allocated_governed_worker_identity_source": (
+            "runtime_context.worker_id_then_worker_slot_id"
+        ),
         "placeholder_agent_id": normalized_agent_id,
         "allocation_owner": normalized_allocation_owner,
-        "actual_host_worker_id": normalized_actual_host_worker_id,
+        "actual_host_worker_id": allocated_governed_worker_id,
         "worker_session_id": normalized_worker_session_id,
+        "desktop_worker_session_identity_is_independent": True,
         "binding_fields": [
             "agent_id",
             "actual_host_worker_id",
             "worker_session_id",
         ],
         "copy_safe_body_overrides_before_submit": {
-            "agent_id": (
-                normalized_actual_host_worker_id
-                or "<actual host-created worker/session id>"
-            ),
-            "actual_host_worker_id": (
-                normalized_actual_host_worker_id
-                or "<actual host-created worker/session id>"
-            ),
+            "agent_id": allocated_governed_worker_id,
+            "actual_host_worker_id": allocated_governed_worker_id,
             "worker_session_id": (
                 normalized_worker_session_id
-                or normalized_actual_host_worker_id
-                or "<actual host worker session id>"
+                or "<actual Desktop/Codex worker session id>"
             ),
         },
         "then": (
@@ -21490,7 +21491,8 @@ def _runtime_context_worker_recovery_payloads(
         ),
         "security_boundary": {
             "worker_may_self_widen_identity": False,
-            "observer_may_bind_only_host_created_worker_identity": True,
+            "observer_must_preserve_allocated_governed_worker_identity": True,
+            "observer_may_record_independent_desktop_worker_session": True,
             "raw_tokens_persisted_to_timeline": False,
         },
     }
@@ -21512,9 +21514,9 @@ def _runtime_context_worker_recovery_payloads(
             "target_project_root": target_project_root,
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
-            "agent_id": normalized_agent_id,
+            "agent_id": allocated_governed_worker_id,
             "allocation_owner": normalized_allocation_owner,
-            "actual_host_worker_id": normalized_actual_host_worker_id,
+            "actual_host_worker_id": allocated_governed_worker_id,
             "worker_session_id": normalized_worker_session_id,
             **safe_route_identity,
             "reason": "<operator reason: host adapter needs first worker auth env>",
@@ -21532,9 +21534,9 @@ def _runtime_context_worker_recovery_payloads(
             "target_project_root": target_project_root,
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
-            "agent_id": normalized_agent_id,
+            "agent_id": allocated_governed_worker_id,
             "allocation_owner": normalized_allocation_owner,
-            "actual_host_worker_id": normalized_actual_host_worker_id,
+            "actual_host_worker_id": allocated_governed_worker_id,
             "worker_session_id": normalized_worker_session_id,
             **safe_route_identity,
             "reason": "<operator reason: host adapter needs first worker auth env>",
@@ -21545,7 +21547,8 @@ def _runtime_context_worker_recovery_payloads(
             "mf_subagent_startup",
         ],
         "required_before_worker_evidence": [
-            "replace placeholder agent_id/actual_host_worker_id with the real host-created worker id",
+            "preserve the allocated governed worker id in agent_id/actual_host_worker_id",
+            "record the independent Desktop/Codex task identity only as worker_session_id/host_session_id/transcript/filer principal",
             "inject host_envelope env into the real mf_sub worker",
             "worker submits read receipt",
             "worker records startup",
@@ -21577,9 +21580,9 @@ def _runtime_context_worker_recovery_payloads(
             "target_project_root": target_project_root,
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
-            "agent_id": normalized_actual_host_worker_id or normalized_agent_id,
+            "agent_id": allocated_governed_worker_id,
             "allocation_owner": normalized_allocation_owner,
-            "actual_host_worker_id": normalized_actual_host_worker_id,
+            "actual_host_worker_id": allocated_governed_worker_id,
             "worker_session_id": normalized_worker_session_id,
             "host_startup_id": normalized_host_startup_id,
             "host_session_id": normalized_host_session_id,
@@ -21599,9 +21602,9 @@ def _runtime_context_worker_recovery_payloads(
             "target_project_root": target_project_root,
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
-            "agent_id": normalized_actual_host_worker_id or normalized_agent_id,
+            "agent_id": allocated_governed_worker_id,
             "allocation_owner": normalized_allocation_owner,
-            "actual_host_worker_id": normalized_actual_host_worker_id,
+            "actual_host_worker_id": allocated_governed_worker_id,
             "worker_session_id": normalized_worker_session_id,
             "host_startup_id": normalized_host_startup_id,
             "host_session_id": normalized_host_session_id,
@@ -21896,7 +21899,7 @@ def _runtime_context_worker_recovery_payloads(
         "worker_role": "mf_sub",
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
-        "agent_id": normalized_agent_id or "<assigned worker agent_id>",
+        "agent_id": allocated_governed_worker_id or "<allocated governed worker id>",
         "allocation_owner": normalized_allocation_owner or "<allocation owner>",
         "observer_allocation_owner": (
             normalized_allocation_owner or "<allocation owner>"
@@ -21933,8 +21936,7 @@ def _runtime_context_worker_recovery_payloads(
         "harness_type": "codex",
         "filer_principal": "<actual worker principal filing startup>",
         "actual_host_worker_id": (
-            normalized_actual_host_worker_id
-            or "<actual host-created worker/session id>"
+            allocated_governed_worker_id or "<allocated governed worker id>"
         ),
         "host_startup_id": normalized_host_startup_id or "<host startup event/thread id>",
         "host_session_id": normalized_host_session_id or "<host session id>",
@@ -21959,10 +21961,10 @@ def _runtime_context_worker_recovery_payloads(
             "worker_role": "mf_sub",
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
-            "agent_id": normalized_agent_id,
+            "agent_id": allocated_governed_worker_id,
             "allocation_owner": normalized_allocation_owner,
             "observer_allocation_owner": normalized_allocation_owner,
-            "actual_host_worker_id": normalized_actual_host_worker_id,
+            "actual_host_worker_id": allocated_governed_worker_id,
             "worker_session_id": normalized_worker_session_id,
             "host_startup_id": normalized_host_startup_id,
             "host_session_id": normalized_host_session_id,
@@ -22429,10 +22431,10 @@ def _runtime_context_worker_recovery_payloads(
         "worker_role": "mf_sub",
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
-        "agent_id": normalized_agent_id,
+        "agent_id": allocated_governed_worker_id,
         "allocation_owner": normalized_allocation_owner,
         "observer_allocation_owner": normalized_allocation_owner,
-        "actual_host_worker_id": normalized_actual_host_worker_id,
+        "actual_host_worker_id": allocated_governed_worker_id,
         "worker_session_id": normalized_worker_session_id,
         "host_startup_id": normalized_host_startup_id,
         "host_session_id": normalized_host_session_id,
@@ -27558,6 +27560,7 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
             get_branch_context_by_runtime_context_id,
             initial_join_mf_subagent_runtime_session_token,
             runtime_context_id_for_branch_context,
+            validate_initial_join_mf_subagent_host_identity,
         )
         from .permissions import require_operator_capability, session_role
         from . import task_timeline
@@ -27657,6 +27660,73 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                         "fail_closed": True,
                     },
                 )
+        try:
+            validate_initial_join_mf_subagent_host_identity(
+                context,
+                agent_id=str(
+                    body.get("agent_id") or body.get("host_agent_id") or ""
+                ).strip(),
+                actual_host_worker_id=str(
+                    body.get("actual_host_worker_id")
+                    or body.get("host_worker_id")
+                    or ""
+                ).strip(),
+                now_iso=str(body.get("now_iso") or ""),
+            )
+        except BranchRuntimeFenceError as exc:
+            initial_join_error = str(exc) or "fence_invalidated_or_unknown"
+            expected_worker_id = str(
+                context.worker_id or context.worker_slot_id or ""
+            ).strip()
+            requested_agent_id = str(
+                body.get("agent_id") or body.get("host_agent_id") or ""
+            ).strip()
+            requested_actual_host_worker_id = str(
+                body.get("actual_host_worker_id")
+                or body.get("host_worker_id")
+                or requested_agent_id
+                or ""
+            ).strip()
+            if initial_join_error == (
+                "runtime_context_initial_join_host_identity_mismatch"
+            ):
+                raise GovernanceError(
+                    initial_join_error,
+                    "runtime-context initial join host identity does not match the allocated governed worker",
+                    403,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": context.task_id,
+                        "expected_actual_host_worker_id": expected_worker_id,
+                        "actual_host_worker_id": requested_actual_host_worker_id,
+                        "requested_agent_id": requested_agent_id,
+                        "persisted_actual_host_worker_id": str(
+                            context.actual_host_worker_id or ""
+                        ).strip(),
+                        "worker_session_id_is_independent": True,
+                        "mutation_performed": False,
+                        "fail_closed": True,
+                    },
+                ) from exc
+            if initial_join_error == (
+                "runtime_context_initial_join_active_lease_exists"
+            ):
+                raise GovernanceError(
+                    initial_join_error,
+                    "runtime-context initial join cannot rotate an active initial-join lease; use the existing host envelope",
+                    409,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": context.task_id,
+                        "expected_actual_host_worker_id": expected_worker_id,
+                        "actual_host_worker_id": requested_actual_host_worker_id,
+                        "next_legal_action": "use_existing_initial_join_host_envelope",
+                        "credential_rotated": False,
+                        "mutation_performed": False,
+                        "fail_closed": True,
+                    },
+                ) from exc
+            raise
         try:
             result = initial_join_mf_subagent_runtime_session_token(
                 conn,
