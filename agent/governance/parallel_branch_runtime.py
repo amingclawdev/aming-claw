@@ -11799,6 +11799,71 @@ def retarget_post_qa_rejoin_runtime_authority(
     }
 
 
+def validate_initial_join_mf_subagent_host_identity(
+    context: BranchTaskRuntimeContext,
+    *,
+    agent_id: str = "",
+    actual_host_worker_id: str = "",
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Validate the immutable governed worker binding before initial join.
+
+    The Desktop session id is deliberately not part of this equality check: it
+    identifies the live host session, while ``actual_host_worker_id`` identifies
+    the already allocated governed worker.  Keeping those namespaces separate
+    lets a real Desktop task path own the session without replacing the worker
+    identity recorded by allocation.
+    """
+
+    expected_worker_id = str(
+        context.worker_id or context.worker_slot_id or ""
+    ).strip()
+    requested_agent_id = str(agent_id or "").strip()
+    requested_actual_host_worker_id = str(
+        actual_host_worker_id or requested_agent_id or ""
+    ).strip()
+    persisted_actual_host_worker_id = str(
+        context.actual_host_worker_id or ""
+    ).strip()
+    identity_mismatches: list[str] = []
+    if not expected_worker_id:
+        identity_mismatches.append("missing_governed_worker_id")
+    if requested_actual_host_worker_id != expected_worker_id:
+        identity_mismatches.append("actual_host_worker_id")
+    if requested_agent_id and requested_agent_id != expected_worker_id:
+        identity_mismatches.append("agent_id")
+    if (
+        persisted_actual_host_worker_id
+        and persisted_actual_host_worker_id != expected_worker_id
+    ):
+        identity_mismatches.append("persisted_actual_host_worker_id")
+    if identity_mismatches:
+        raise BranchRuntimeFenceError(
+            "runtime_context_initial_join_host_identity_mismatch"
+        )
+
+    lease = runtime_context_session_token_lease_view(context, now_iso=now_iso)
+    active_initial_join_lease = bool(
+        context.last_recovery_action == "mf_subagent_initial_join_issued"
+        and lease.get("status") == "active"
+        and lease.get("authorization_valid") is True
+        and lease.get("expired") is False
+    )
+    if active_initial_join_lease:
+        raise BranchRuntimeFenceError(
+            "runtime_context_initial_join_active_lease_exists"
+        )
+
+    return {
+        "expected_worker_id": expected_worker_id,
+        "requested_agent_id": requested_agent_id,
+        "requested_actual_host_worker_id": requested_actual_host_worker_id,
+        "persisted_actual_host_worker_id": persisted_actual_host_worker_id,
+        "desktop_session_identity_independent": True,
+        "active_initial_join_lease": False,
+    }
+
+
 def initial_join_mf_subagent_runtime_session_token(
     conn: sqlite3.Connection,
     *,
@@ -11860,16 +11925,23 @@ def initial_join_mf_subagent_runtime_session_token(
         if allowed_parent_ids and parent not in allowed_parent_ids:
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
+    host_identity = validate_initial_join_mf_subagent_host_identity(
+        context,
+        agent_id=agent_id,
+        actual_host_worker_id=actual_host_worker_id,
+        now_iso=now_iso,
+    )
+
     ttl = _bounded_reissue_ttl_seconds(ttl_seconds)
     now_dt = _runtime_context_now_dt(now_iso)
     expires_at = _runtime_context_iso(now_dt + timedelta(seconds=ttl))
     new_token = secrets.token_urlsafe(32)
     new_hash = mf_subagent_session_token_hash(new_token)
     lease_id = "mfrlease-" + uuid.uuid4().hex[:16]
-    requested_agent_id = str(agent_id or "").strip()
+    requested_agent_id = str(host_identity["requested_agent_id"])
     requested_actual_host_worker_id = str(
-        actual_host_worker_id or requested_agent_id or ""
-    ).strip()
+        host_identity["requested_actual_host_worker_id"]
+    )
     requested_worker_session_id = str(worker_session_id or "").strip()
     requested_host_startup_id = str(host_startup_id or "").strip()
     requested_host_session_id = str(
@@ -16062,20 +16134,22 @@ def _startup_refusal_timeline_event(
             next_action["join_before_parallel_branch_startup"] = join_before_startup
             next_action["session_token_evidence_type"] = token_evidence_type
         if str(result.get("blocker_id") or "") == "agent_id_mismatch":
-            host_worker_id = (
-                agent_id
-                if agent_id and agent_id != allocation_owner
-                else actual_host_worker_id
-            )
-            worker_session = worker_session_id or host_worker_id
+            allocated_governed_worker_id = str(
+                (context.worker_id if context is not None else "")
+                or (context.worker_slot_id if context is not None else "")
+                or payload.get("worker_id")
+                or payload.get("worker_slot_id")
+                or ""
+            ).strip()
+            worker_session = worker_session_id
             join_before_startup = {
                 "schema_version": "mf_subagent_startup_actual_host_bind_before_retry.v1",
                 "action": "request_runtime_context_initial_join_host_envelope",
                 "tool": "runtime_context_session_token_initial_join",
                 "reason": (
                     "startup agent_id differs from allocation_owner because the "
-                    "preallocated lane used a placeholder; bind the real host "
-                    "worker id before retrying startup"
+                    "startup payload did not preserve the allocated governed "
+                    "worker identity; restore that identity before retrying startup"
                 ),
                 "path": (
                     "/api/graph-governance/{project_id}/runtime-contexts/"
@@ -16102,13 +16176,17 @@ def _startup_refusal_timeline_event(
                         or (context.worker_id if context is not None else "")
                         or ""
                     ).strip(),
-                    "agent_id": host_worker_id or "<actual host-created worker/session id>",
+                    "agent_id": (
+                        allocated_governed_worker_id
+                        or "<allocated governed worker id>"
+                    ),
                     "allocation_owner": allocation_owner,
                     "actual_host_worker_id": (
-                        host_worker_id or "<actual host-created worker/session id>"
+                        allocated_governed_worker_id
+                        or "<allocated governed worker id>"
                     ),
                     "worker_session_id": (
-                        worker_session or "<actual host worker session id>"
+                        worker_session or "<actual Desktop/Codex worker session id>"
                     ),
                     **route_identity,
                     "reason": (
@@ -16122,9 +16200,12 @@ def _startup_refusal_timeline_event(
                     "tool": "parallel_branch_startup",
                     "copyable_retry_payload": {
                         **retry_template,
-                        "agent_id": host_worker_id or retry_template.get("agent_id", ""),
+                        "agent_id": (
+                            allocated_governed_worker_id
+                            or retry_template.get("agent_id", "")
+                        ),
                         "actual_host_worker_id": (
-                            host_worker_id
+                            allocated_governed_worker_id
                             or retry_template.get("actual_host_worker_id", "")
                         ),
                         "worker_session_id": (
@@ -16137,6 +16218,8 @@ def _startup_refusal_timeline_event(
                 },
                 "security_boundary": {
                     "session_token_ref_alone_authorizes_identity_binding": False,
+                    "observer_must_preserve_allocated_governed_worker_identity": True,
+                    "desktop_worker_session_identity_is_independent": True,
                     "observer_authors_worker_evidence": False,
                     "raw_tokens_persisted_to_timeline": False,
                 },
@@ -16146,13 +16229,16 @@ def _startup_refusal_timeline_event(
                     "action": "request_runtime_context_initial_join_host_envelope",
                     "tool": "runtime_context_session_token_initial_join",
                     "description": (
-                        "Bind the real host-created worker id to the runtime "
-                        "context, inject the returned host envelope into that "
+                        "Restore the allocated governed worker id in agent_id and "
+                        "actual_host_worker_id, record the Desktop/Codex session "
+                        "independently, inject the returned host envelope into that "
                         "same worker, then retry startup from the worker."
                     ),
                     "join_before_parallel_branch_startup": join_before_startup,
                     "startup_retry_after_join": join_before_startup["then"],
-                    "agent_id_match_mode": "blocked_without_actual_host_binding",
+                    "agent_id_match_mode": (
+                        "retry_with_allocated_governed_worker_identity"
+                    ),
                 }
             )
         next_action.update(
