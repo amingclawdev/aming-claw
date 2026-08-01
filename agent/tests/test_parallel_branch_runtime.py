@@ -1178,7 +1178,8 @@ def test_mf_sub_startup_accepts_initial_join_bound_actual_host_worker(
     )
     _insert_startup_graph_trace(conn)
 
-    actual_worker_id = "019f2aae-4097-73c0-9d55-e3934c85bc3c"
+    governed_worker_id = context.worker_id
+    desktop_session_id = "/root/ac_initial_join_test_worker"
     initial_join = initial_join_mf_subagent_runtime_session_token(
         conn,
         project_id=PROJECT_ID,
@@ -1186,17 +1187,25 @@ def test_mf_sub_startup_accepts_initial_join_bound_actual_host_worker(
         task_id="mf-sub-startup",
         parent_task_id="parent-startup",
         target_project_root=str(worktree),
-        agent_id=actual_worker_id,
-        actual_host_worker_id=actual_worker_id,
-        worker_session_id=actual_worker_id,
+        agent_id=governed_worker_id,
+        actual_host_worker_id=governed_worker_id,
+        worker_session_id=desktop_session_id,
+        host_session_id=desktop_session_id,
         reason="host envelope required for actual Codex subagent startup",
         now_iso=NOW,
     )
 
     saved_after_join = get_branch_context(conn, PROJECT_ID, "mf-sub-startup")
     assert saved_after_join is not None
-    assert saved_after_join.actual_host_worker_id == actual_worker_id
-    assert initial_join["host_envelope"]["actual_host_worker_id"] == actual_worker_id
+    assert saved_after_join.actual_host_worker_id == governed_worker_id
+    assert saved_after_join.host_session_id == desktop_session_id
+    assert initial_join["host_envelope"]["actual_host_worker_id"] == (
+        governed_worker_id
+    )
+    assert initial_join["host_envelope"]["worker_session_id"] == (
+        desktop_session_id
+    )
+    assert initial_join["host_envelope"]["principal_id"] == governed_worker_id
 
     result = record_mf_subagent_startup(
         conn,
@@ -1204,11 +1213,13 @@ def test_mf_sub_startup_accepts_initial_join_bound_actual_host_worker(
         task_id="mf-sub-startup",
         payload=_startup_payload(
             str(worktree),
-            agent_id=actual_worker_id,
-            actual_host_worker_id=actual_worker_id,
-            worker_session_id=actual_worker_id,
-            worker_transcript_ref=f"multi_agent:{actual_worker_id}",
-            filer_principal=actual_worker_id,
+            agent_id=governed_worker_id,
+            actual_host_worker_id=governed_worker_id,
+            worker_session_id=desktop_session_id,
+            worker_transcript_ref=f"codex:{desktop_session_id}",
+            worker_transcript_path="",
+            filer_principal=desktop_session_id,
+            host_session_id=desktop_session_id,
             session_token="",
             session_token_ref=initial_join["session_token_ref"],
         ),
@@ -1218,14 +1229,133 @@ def test_mf_sub_startup_accepts_initial_join_bound_actual_host_worker(
     assert result["ok"] is True
     gate = result["startup_gate"]
     assert gate["allocation_owner"] == "pending-codex-subagent"
-    assert gate["agent_id"] == actual_worker_id
-    assert gate["actual_host_worker_id"] == actual_worker_id
+    assert gate["agent_id"] == governed_worker_id
+    assert gate["actual_host_worker_id"] == governed_worker_id
+    assert gate["worker_session_id"] == desktop_session_id
     assert gate["agent_id_match_mode"] == "initial_join_actual_host_worker"
     assert gate["session_token_evidence_type"] == "server_verified_ref"
     assert gate["server_issued_session_token_verified"] is True
 
 
-def test_mf_sub_startup_rejects_initial_join_bound_worker_replay_by_other_agent(
+def test_initial_join_rejects_unallocated_host_identity_and_active_duplicate(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-initial-join-host-parity"
+    worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-initial-join-host-parity",
+        root_task_id="parent-initial-join-host-parity",
+        stage_task_id="mf-sub-initial-join-host-parity",
+        backlog_id="BUG-INITIAL-JOIN-HOST-PARITY",
+        worker_id="worker-initial-join-host-parity",
+        worker_slot_id="worker-initial-join-host-parity",
+        agent_id="pending-codex-subagent",
+        allocation_owner="pending-codex-subagent",
+        branch_ref="refs/heads/codex/mf-sub-initial-join-host-parity",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-initial-join-host-parity",
+        worktree_path=str(worktree),
+        target_project_root=str(worktree),
+        base_commit=base_commit,
+        head_commit=head_commit,
+        target_head_commit="target-initial-join-host-parity",
+        merge_queue_id="mq-initial-join-host-parity",
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+
+    common = {
+        "project_id": PROJECT_ID,
+        "runtime_context_id": branch_runtime_context_id(
+            PROJECT_ID,
+            "mf-sub-initial-join-host-parity",
+        ),
+        "task_id": "mf-sub-initial-join-host-parity",
+        "parent_task_id": "parent-initial-join-host-parity",
+        "target_project_root": str(worktree),
+        "worker_session_id": "/root/ac_initial_join_test_worker",
+        "reason": "fresh Desktop host identity must preserve allocation",
+        "now_iso": NOW,
+    }
+    before = get_branch_context(
+        conn,
+        PROJECT_ID,
+        "mf-sub-initial-join-host-parity",
+    )
+    assert before is not None
+    for overrides in (
+        {
+            "agent_id": context.worker_id,
+            "actual_host_worker_id": "/root/ac_initial_join_test_worker",
+        },
+        {
+            "agent_id": "/root/ac_initial_join_test_worker",
+            "actual_host_worker_id": context.worker_id,
+        },
+    ):
+        with pytest.raises(
+            BranchRuntimeFenceError,
+            match="runtime_context_initial_join_host_identity_mismatch",
+        ):
+            initial_join_mf_subagent_runtime_session_token(
+                conn,
+                **common,
+                **overrides,
+            )
+        assert get_branch_context(
+            conn,
+            PROJECT_ID,
+            "mf-sub-initial-join-host-parity",
+        ) == before
+
+    issued = initial_join_mf_subagent_runtime_session_token(
+        conn,
+        **common,
+        agent_id=context.worker_id,
+        actual_host_worker_id=context.worker_id,
+    )
+    accepted = get_branch_context(
+        conn,
+        PROJECT_ID,
+        "mf-sub-initial-join-host-parity",
+    )
+    assert accepted is not None
+    assert accepted.actual_host_worker_id == context.worker_id
+    assert accepted.host_session_id == "/root/ac_initial_join_test_worker"
+    assert issued["host_envelope"]["worker_session_id"] == (
+        "/root/ac_initial_join_test_worker"
+    )
+    accepted_ref = issued["session_token_ref"]
+    accepted_lease = accepted.lease_id
+    accepted_hash = accepted.session_token_hash
+
+    with pytest.raises(
+        BranchRuntimeFenceError,
+        match="runtime_context_initial_join_active_lease_exists",
+    ):
+        initial_join_mf_subagent_runtime_session_token(
+            conn,
+            **{
+                **common,
+                "worker_session_id": "/root/another_desktop_session",
+            },
+            agent_id=context.worker_id,
+            actual_host_worker_id=context.worker_id,
+        )
+    after_duplicate = get_branch_context(
+        conn,
+        PROJECT_ID,
+        "mf-sub-initial-join-host-parity",
+    )
+    assert after_duplicate is not None
+    assert after_duplicate.lease_id == accepted_lease
+    assert after_duplicate.session_token_hash == accepted_hash
+    assert runtime_context_session_token_ref(after_duplicate) == accepted_ref
+
+
+def test_mf_sub_startup_keeps_governed_worker_and_desktop_session_namespaces(
     tmp_path,
 ) -> None:
     conn = _runtime_conn()
@@ -1268,8 +1398,8 @@ def test_mf_sub_startup_rejects_initial_join_bound_worker_replay_by_other_agent(
     )
     _insert_startup_graph_trace(conn)
 
-    bound_worker_id = "019f-bound-worker"
-    replay_worker_id = "019f-replay-worker"
+    governed_worker_id = context.worker_id
+    desktop_session_id = "/root/bound_initial_join_worker"
     initial_join = initial_join_mf_subagent_runtime_session_token(
         conn,
         project_id=PROJECT_ID,
@@ -1277,9 +1407,10 @@ def test_mf_sub_startup_rejects_initial_join_bound_worker_replay_by_other_agent(
         task_id="mf-sub-startup",
         parent_task_id="parent-startup",
         target_project_root=str(worktree),
-        agent_id=bound_worker_id,
-        actual_host_worker_id=bound_worker_id,
-        worker_session_id=bound_worker_id,
+        agent_id=governed_worker_id,
+        actual_host_worker_id=governed_worker_id,
+        worker_session_id=desktop_session_id,
+        host_session_id=desktop_session_id,
         reason="host envelope required for actual Codex subagent startup",
         now_iso=NOW,
     )
@@ -1290,28 +1421,29 @@ def test_mf_sub_startup_rejects_initial_join_bound_worker_replay_by_other_agent(
         task_id="mf-sub-startup",
         payload=_startup_payload(
             str(worktree),
-            agent_id=replay_worker_id,
-            actual_host_worker_id=replay_worker_id,
-            worker_session_id=replay_worker_id,
-            worker_transcript_ref=f"multi_agent:{replay_worker_id}",
-            filer_principal=replay_worker_id,
+            agent_id=governed_worker_id,
+            actual_host_worker_id=governed_worker_id,
+            worker_session_id=desktop_session_id,
+            worker_transcript_ref=f"codex:{desktop_session_id}",
+            worker_transcript_path="",
+            filer_principal=desktop_session_id,
+            host_session_id=desktop_session_id,
             session_token="",
             session_token_ref=initial_join["session_token_ref"],
         ),
         now_iso=NOW,
     )
 
-    assert result["ok"] is False
-    assert result["blocker_id"] == "agent_id_mismatch"
-    refusal = result["timeline_event"]["payload"]["mf_subagent_startup_refusal"]
-    assert refusal["agent_id"] == replay_worker_id
-    assert refusal["actual_host_worker_id"] == replay_worker_id
-    saved_after_replay = get_branch_context(conn, PROJECT_ID, "mf-sub-startup")
-    assert saved_after_replay is not None
-    assert saved_after_replay.actual_host_worker_id == bound_worker_id
-    assert refusal["next_action"]["action"] == (
-        "request_runtime_context_initial_join_host_envelope"
-    )
+    assert result["ok"] is True
+    gate = result["startup_gate"]
+    assert gate["agent_id"] == governed_worker_id
+    assert gate["actual_host_worker_id"] == governed_worker_id
+    assert gate["worker_session_id"] == desktop_session_id
+    assert gate["agent_id_match_mode"] == "initial_join_actual_host_worker"
+    saved_after_startup = get_branch_context(conn, PROJECT_ID, "mf-sub-startup")
+    assert saved_after_startup is not None
+    assert saved_after_startup.actual_host_worker_id == governed_worker_id
+    assert saved_after_startup.host_session_id == desktop_session_id
 
 
 def _runtime_projection_context(**overrides: object) -> BranchTaskRuntimeContext:

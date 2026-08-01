@@ -36999,6 +36999,76 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
         "runtime_context_initial_join_route_identity_mismatch"
     )
 
+    governed_worker_id = context.worker_id
+    desktop_session_id = "/root/ac_initial_join_test_worker"
+    before_context = get_branch_context(
+        conn,
+        PID,
+        "worker-runtime-initial-join",
+    )
+    before_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        context.runtime_context_id,
+    )
+    before_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="AC-RUNTIME-TOKEN-INITIAL-JOIN",
+    )
+    for identity_updates in (
+        {
+            "agent_id": governed_worker_id,
+            "actual_host_worker_id": desktop_session_id,
+        },
+        {
+            "agent_id": desktop_session_id,
+            "actual_host_worker_id": governed_worker_id,
+        },
+    ):
+        with pytest.raises(GovernanceError) as wrong_host_identity:
+            server.handle_graph_governance_runtime_context_session_token_initial_join(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": context.runtime_context_id,
+                    },
+                    "coordinator",
+                    method="POST",
+                    body={
+                        "task_id": "worker-runtime-initial-join",
+                        "parent_task_id": "parent-runtime-initial-join",
+                        "target_project_root": str(target_root),
+                        **route_identity,
+                        **identity_updates,
+                        "worker_session_id": desktop_session_id,
+                        "host_session_id": desktop_session_id,
+                        "reason": "reject a Daily Planner event 14/16 host-id override",
+                        "now_iso": "2026-06-21T18:00:00Z",
+                    },
+                )
+            )
+        assert wrong_host_identity.value.code == (
+            "runtime_context_initial_join_host_identity_mismatch"
+        )
+        assert wrong_host_identity.value.details["mutation_performed"] is False
+        assert wrong_host_identity.value.details["fail_closed"] is True
+        assert get_branch_context(
+            conn,
+            PID,
+            "worker-runtime-initial-join",
+        ) == before_context
+        assert get_latest_branch_contract_revision(
+            conn,
+            PID,
+            context.runtime_context_id,
+        ) == before_revision
+        assert task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id="AC-RUNTIME-TOKEN-INITIAL-JOIN",
+        ) == before_events
+
     result = server.handle_graph_governance_runtime_context_session_token_initial_join(
         _ctx_with_role(
             {"project_id": PID, "runtime_context_id": context.runtime_context_id},
@@ -37009,6 +37079,10 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
                 "parent_task_id": "parent-runtime-initial-join",
                 "target_project_root": str(target_root),
                 **route_identity,
+                "agent_id": governed_worker_id,
+                "actual_host_worker_id": governed_worker_id,
+                "worker_session_id": desktop_session_id,
+                "host_session_id": desktop_session_id,
                 "reason": "host adapter needs first worker auth env",
                 "ttl_seconds": 1200,
                 "now_iso": "2026-06-21T18:00:00Z",
@@ -37027,7 +37101,10 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
     assert host_envelope["worker_role"] == "mf_sub"
     assert host_envelope["worker_id"] == "worker-runtime-initial-join"
     assert host_envelope["worker_slot_id"] == "slot-runtime-initial-join"
-    assert host_envelope["principal_id"] == "slot-runtime-initial-join"
+    assert host_envelope["principal_id"] == governed_worker_id
+    assert host_envelope["actual_host_worker_id"] == governed_worker_id
+    assert host_envelope["worker_session_id"] == desktop_session_id
+    assert host_envelope["host_session_id"] == desktop_session_id
     assert host_envelope["session_token_ref"] == result["session_token_ref"]
     assert host_envelope["branch_ref"] == (
         "refs/heads/codex/worker-runtime-initial-join"
@@ -37072,6 +37149,67 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
     assert result["session_token"] not in serialized_event
     assert "fence-runtime-initial-join" not in serialized_event
     assert "AMING_WORKER_SESSION_TOKEN" in serialized_event
+
+    accepted_context = get_branch_context(
+        conn,
+        PID,
+        "worker-runtime-initial-join",
+    )
+    assert accepted_context is not None
+    accepted_lease_id = accepted_context.lease_id
+    accepted_session_hash = accepted_context.session_token_hash
+    accepted_session_ref = result["session_token_ref"]
+    with pytest.raises(GovernanceError) as duplicate_join:
+        server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": "worker-runtime-initial-join",
+                    "parent_task_id": "parent-runtime-initial-join",
+                    "target_project_root": str(target_root),
+                    **route_identity,
+                    "agent_id": governed_worker_id,
+                    "actual_host_worker_id": governed_worker_id,
+                    "worker_session_id": "/root/duplicate_desktop_session",
+                    "host_session_id": "/root/duplicate_desktop_session",
+                    "reason": "duplicate join must reuse the active host envelope",
+                    "ttl_seconds": 1200,
+                    "now_iso": "2026-06-21T18:00:01Z",
+                },
+            )
+        )
+    assert duplicate_join.value.code == (
+        "runtime_context_initial_join_active_lease_exists"
+    )
+    assert duplicate_join.value.details["credential_rotated"] is False
+    assert duplicate_join.value.details["mutation_performed"] is False
+    after_duplicate = get_branch_context(
+        conn,
+        PID,
+        "worker-runtime-initial-join",
+    )
+    assert after_duplicate is not None
+    assert after_duplicate.lease_id == accepted_lease_id
+    assert after_duplicate.session_token_hash == accepted_session_hash
+    assert runtime_context_session_token_ref(after_duplicate) == accepted_session_ref
+    assert len(
+        [
+            event
+            for event in task_timeline.list_events(
+                conn,
+                PID,
+                backlog_id="AC-RUNTIME-TOKEN-INITIAL-JOIN",
+                event_kind="observer_command",
+            )
+            if (event.get("payload") or {}).get("action")
+            == "runtime_context_session_token_initial_join"
+        ]
+    ) == 1
 
     with pytest.raises(GovernanceError) as rejoin_without_lineage:
         server.handle_graph_governance_runtime_context_session_token_rejoin(
@@ -37242,6 +37380,9 @@ def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_
                 "parent_task_id": "parent-runtime-initial-join-renewed",
                 "target_project_root": str(target_root),
                 **renewed_identity,
+                "agent_id": context.worker_id,
+                "actual_host_worker_id": context.worker_id,
+                "worker_session_id": "/root/renewed_route_desktop_worker",
                 "reason": "host adapter needs first worker auth env after observer renewal",
                 "ttl_seconds": 1200,
                 "now_iso": "2099-07-07T18:00:00Z",
@@ -37431,6 +37572,9 @@ def test_runtime_context_session_token_initial_join_accepts_parent_scope_renewal
                 "parent_task_id": parent_task_id,
                 "target_project_root": str(target_root),
                 **renewed_identity,
+                "agent_id": context.worker_id,
+                "actual_host_worker_id": context.worker_id,
+                "worker_session_id": "/root/parent_scope_desktop_worker",
                 "reason": "host adapter needs first worker auth env after parent-scope observer renewal",
                 "ttl_seconds": 1200,
                 "now_iso": request_now.isoformat().replace("+00:00", "Z"),
@@ -37650,6 +37794,9 @@ def test_runtime_context_initial_join_accepts_registry_verified_superseded_ref_t
                 "parent_task_id": parent_task_id,
                 "target_project_root": str(target_root),
                 **renewed_identity,
+                "agent_id": context.worker_id,
+                "actual_host_worker_id": context.worker_id,
+                "worker_session_id": "/root/two_hop_desktop_worker",
                 "reason": (
                     "host adapter uses registry-verified two-hop recovery for "
                     "the superseded runtime route ref"
@@ -44476,14 +44623,14 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     assert rejoin_submission["security_boundary"][
         "session_token_ref_alone_authorizes_writes"
     ] is False
-    assert rejoin_submission["copy_safe_body"]["agent_id"] == "agent-session-ref"
+    assert rejoin_submission["copy_safe_body"]["agent_id"] == "worker-session-ref"
     assert rejoin_submission["copy_safe_body"]["allocation_owner"] == (
         "agent-session-ref"
     )
     initial_join_submission = worker_guide["actionable_payloads"][
         "session_token_initial_join_submission"
     ]
-    assert initial_join_submission["copy_safe_body"]["agent_id"] == "agent-session-ref"
+    assert initial_join_submission["copy_safe_body"]["agent_id"] == "worker-session-ref"
     assert initial_join_submission["copy_safe_body"]["allocation_owner"] == (
         "agent-session-ref"
     )
@@ -44494,14 +44641,15 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     ] is True
     assert identity_binding["copy_safe_body_overrides_before_submit"][
         "actual_host_worker_id"
-    ] == "<actual host-created worker/session id>"
+    ] == "worker-session-ref"
+    assert identity_binding["desktop_worker_session_identity_is_independent"] is True
     startup_skeleton = worker_guide["startup_facade_payload_skeleton"]
     assert startup_skeleton["body_source"] == "copy_safe_body"
     startup_copy = startup_skeleton["copy_safe_body"]
-    assert startup_copy["agent_id"] == "agent-session-ref"
+    assert startup_copy["agent_id"] == "worker-session-ref"
     assert startup_copy["allocation_owner"] == "agent-session-ref"
     assert startup_copy["observer_allocation_owner"] == "agent-session-ref"
-    assert startup_copy["worker_identity_pointers"]["agent_id"] == "agent-session-ref"
+    assert startup_copy["worker_identity_pointers"]["agent_id"] == "worker-session-ref"
     assert startup_copy["worker_identity_pointers"]["allocation_owner"] == (
         "agent-session-ref"
     )
@@ -44585,13 +44733,15 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     assert "raw-session-ref" not in persisted_receipt
     assert "fence-session-ref" not in persisted_receipt
 
-    actual_worker_id = "/root/alloc_root_qa"
+    governed_worker_id = context.worker_id
+    desktop_session_id = "/root/alloc_root_qa"
     initial_join_body = dict(initial_join_submission["copy_safe_body"])
     initial_join_body.update(
         {
-            "agent_id": actual_worker_id,
-            "actual_host_worker_id": actual_worker_id,
-            "worker_session_id": actual_worker_id,
+            "agent_id": governed_worker_id,
+            "actual_host_worker_id": governed_worker_id,
+            "worker_session_id": desktop_session_id,
+            "host_session_id": desktop_session_id,
         }
     )
     initial_join_body["reason"] = "host envelope required before startup retry"
@@ -44607,7 +44757,9 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     assert initial_join["status"] == "session_token_initial_join_issued"
     host_envelope = initial_join["host_envelope"]
     assert host_envelope["session_token_ref"] == initial_join["session_token_ref"]
-    assert host_envelope["actual_host_worker_id"] == actual_worker_id
+    assert host_envelope["actual_host_worker_id"] == governed_worker_id
+    assert host_envelope["worker_session_id"] == desktop_session_id
+    assert host_envelope["host_session_id"] == desktop_session_id
 
     startup_body = dict(worker_guide["startup_facade_payload_skeleton"]["body"])
     startup_body.update(
@@ -44615,12 +44767,13 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
             "session_token": initial_join["session_token"],
             "session_token_ref": initial_join["session_token_ref"],
             "fence_token": "fence-session-ref",
-            "agent_id": actual_worker_id,
-            "actual_host_worker_id": host_envelope["principal_id"],
-            "worker_session_id": host_envelope["principal_id"],
-            "worker_transcript_ref": f"multi_agent:{host_envelope['principal_id']}",
+            "agent_id": governed_worker_id,
+            "actual_host_worker_id": governed_worker_id,
+            "worker_session_id": desktop_session_id,
+            "host_session_id": desktop_session_id,
+            "worker_transcript_ref": f"codex:{desktop_session_id}",
             "harness_type": "codex",
-            "filer_principal": host_envelope["principal_id"],
+            "filer_principal": desktop_session_id,
             "observer_command_id": "cmd-session-ref",
             "actual_cwd": str(target_root),
             "actual_git_root": str(target_root),
@@ -44661,8 +44814,9 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
         "mf_subagent_startup_gate"
     ]
     assert persisted_startup_gate["actual_host_worker_id"] == (
-        "/root/alloc_root_qa"
+        governed_worker_id
     )
+    assert persisted_startup_gate["worker_session_id"] == desktop_session_id
     assert persisted_startup_gate["semantic_role_binding"][
         "semantic_role"
     ] == "mf_sub"
@@ -84629,6 +84783,63 @@ def test_failed_qa_fresh_allocate_appends_dispatch_then_initial_join_receipt_sta
     assert resolved_dispatch["runtime_context_id"] == fresh_context_id
     assert resolved_dispatch["source_ref"] == revision["source_ref"]
 
+    before_rejected_join_record = copy.deepcopy(
+        server._contract_runtime_store(conn).get(contract_execution_id)
+    )
+    before_rejected_join_context = get_branch_context(
+        conn,
+        PID,
+        fresh_task_id,
+    )
+    before_rejected_join_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+    )
+    with pytest.raises(GovernanceError) as rejected_host_override:
+        server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": fresh_task_id,
+                    "parent_task_id": contract_execution_id,
+                    "target_project_root": str(target_root),
+                    "agent_id": "/root/failed_qa_fresh_dispatch_worker",
+                    "actual_host_worker_id": (
+                        "/root/failed_qa_fresh_dispatch_worker"
+                    ),
+                    "worker_session_id": (
+                        "/root/failed_qa_fresh_dispatch_worker"
+                    ),
+                    "reason": (
+                        "Daily Planner event 14/16 host path cannot replace "
+                        "the governed worker"
+                    ),
+                    **route_identity,
+                },
+            )
+        )
+    assert rejected_host_override.value.code == (
+        "runtime_context_initial_join_host_identity_mismatch"
+    )
+    assert rejected_host_override.value.details["mutation_performed"] is False
+    assert server._contract_runtime_store(conn).get(contract_execution_id) == (
+        before_rejected_join_record
+    )
+    assert get_branch_context(conn, PID, fresh_task_id) == (
+        before_rejected_join_context
+    )
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+    ) == before_rejected_join_events
+
     joined = (
         server.handle_graph_governance_runtime_context_session_token_initial_join(
             _ctx_with_role(
@@ -84642,12 +84853,13 @@ def test_failed_qa_fresh_allocate_appends_dispatch_then_initial_join_receipt_sta
                     "task_id": fresh_task_id,
                     "parent_task_id": contract_execution_id,
                     "target_project_root": str(target_root),
-                    "agent_id": "host-failed-qa-fresh-dispatch",
-                    "actual_host_worker_id": (
-                        "host-failed-qa-fresh-dispatch"
-                    ),
+                    "agent_id": fresh_context.worker_id,
+                    "actual_host_worker_id": fresh_context.worker_id,
                     "worker_session_id": (
-                        "session-failed-qa-fresh-dispatch"
+                        "/root/failed_qa_fresh_dispatch_worker"
+                    ),
+                    "host_session_id": (
+                        "/root/failed_qa_fresh_dispatch_worker"
                     ),
                     "reason": (
                         "fresh failed-QA scope requires first worker host envelope"
