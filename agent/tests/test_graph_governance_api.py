@@ -44285,6 +44285,548 @@ def test_mf_sub_graph_query_valid_active_identity_succeeds_and_records_trace_con
     assert "fence-worker-valid" not in json.dumps(trace, sort_keys=True)
 
 
+def _install_mf_sub_multitrace_contract_runtime(
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    suffix,
+):
+    execution_id = f"cex-mf-sub-multitrace-{suffix}"
+    backlog_id = f"AC-MF-SUB-MULTITRACE-{suffix.upper()}"
+    target_root = tmp_path / f"mf-sub-multitrace-{suffix}"
+    target_root.mkdir()
+    _activate_basic_graph(conn, f"full-mf-sub-multitrace-{suffix}")
+
+    lanes = []
+    for index, owned_file in enumerate(
+        (
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ),
+        start=1,
+    ):
+        task_id = f"mf-sub-multitrace-{suffix}-worker-{index}"
+        token = f"mf-sub-multitrace-{suffix}-session-{index}"
+        context = _insert_mf_parallel_source_backed_runtime_context(
+            conn,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_task_id=execution_id,
+            fence_token=f"fence-{task_id}",
+            token=token,
+            worktree_path=str(target_root / f"lane-{index}"),
+            target_project_root=str(target_root),
+            base_commit="a" * 40,
+            target_head_commit="a" * 40,
+            merge_queue_id=f"mq-{task_id}",
+            owned_files=(owned_file,),
+        )
+        route_identity = {
+            "route_id": f"route-{task_id}",
+            "route_context_hash": _fake_sha(f"route:{task_id}"),
+            "prompt_contract_id": f"rprompt-{task_id}",
+            "prompt_contract_hash": _fake_sha(f"prompt:{task_id}"),
+            "route_token_ref": f"rtok-{task_id}",
+            "visible_injection_manifest_hash": _fake_sha(
+                f"visible:{task_id}"
+            ),
+        }
+        append_branch_contract_revision(
+            conn,
+            context,
+            revision_id=f"crev-{task_id}",
+            payload={
+                "contract_execution_id": execution_id,
+                "successor_contract_execution_id": execution_id,
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": execution_id,
+                "target_files": [owned_file],
+            },
+            route_identity=route_identity,
+        )
+        lanes.append(
+            {
+                "context": context,
+                "token": token,
+                "route_identity": route_identity,
+            }
+        )
+    conn.commit()
+
+    def next_action(lane, *, stage_id, line_id, evidence_kind):
+        context = lane["context"]
+        guide_hash = _fake_sha(
+            f"guide:{suffix}:{context.runtime_context_id}:{line_id}"
+        )
+        return {
+            "id": line_id,
+            "action": (
+                "record_graph_trace"
+                if line_id == "worker_graph_context"
+                else "record_implementation"
+            ),
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "actor_role": "mf_sub",
+            "owner_role": "mf_sub",
+            "evidence_kind": evidence_kind,
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": execution_id,
+            "lane_id": context.worker_slot_id,
+            "worker_slot_id": context.worker_slot_id,
+            "line_instance_id": (
+                f"runtime_context:{context.runtime_context_id}"
+            ),
+            "writer_role_safe_copy_payload": {
+                "copy_payload": {
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "contract_execution_id": execution_id,
+                    "definition_hash": _fake_sha(
+                        f"definition:{suffix}"
+                    ),
+                    "instruction_bundle_hash": _fake_sha(
+                        f"instructions:{suffix}"
+                    ),
+                    "execution_state_revision": 6,
+                    "runtime_guide_hash": guide_hash,
+                    "stage_id": stage_id,
+                    "line_id": line_id,
+                    "actor_role": "mf_sub",
+                    "evidence_kind": evidence_kind,
+                    "line_instance_id": (
+                        f"runtime_context:{context.runtime_context_id}"
+                    ),
+                    "runtime_context_id": context.runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": execution_id,
+                    "worker_role": "mf_sub",
+                    "lane_id": context.worker_slot_id,
+                    "worker_slot_id": context.worker_slot_id,
+                }
+            },
+        }
+
+    lane_one_graph = next_action(
+        lanes[0],
+        stage_id="worker_context",
+        line_id="worker_graph_context",
+        evidence_kind="graph_trace",
+    )
+    lane_two_graph = next_action(
+        lanes[1],
+        stage_id="worker_context",
+        line_id="worker_graph_context",
+        evidence_kind="graph_trace",
+    )
+    lane_one_implementation = next_action(
+        lanes[0],
+        stage_id="worker_implementation",
+        line_id="worker_implementation",
+        evidence_kind="implementation",
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev8",
+        "definition_hash": _fake_sha(f"definition:{suffix}"),
+        "instruction_bundle_hash": _fake_sha(f"instructions:{suffix}"),
+        "execution_state_revision": 6,
+        "execution_state": {
+            "execution_state_revision": 6,
+            "execution_state_hash": _fake_sha(f"state:{suffix}:6"),
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": lane_one_graph[
+                "writer_role_safe_copy_payload"
+            ]["copy_payload"]["runtime_guide_hash"],
+            "next_legal_action": lane_one_graph,
+        },
+        "completed_lines": [
+            {
+                "stage_id": stage_id,
+                "line_id": line_id,
+                "actor_role": "mf_sub",
+                "evidence_kind": evidence_kind,
+                "runtime_context_id": lane["context"].runtime_context_id,
+                "task_id": lane["context"].task_id,
+                "parent_task_id": execution_id,
+                "line_instance_id": (
+                    f"runtime_context:{lane['context'].runtime_context_id}"
+                ),
+                "payload": {
+                    "runtime_context_id": (
+                        lane["context"].runtime_context_id
+                    ),
+                    "task_id": lane["context"].task_id,
+                    "parent_task_id": execution_id,
+                },
+            }
+            for stage_id, line_id, evidence_kind in (
+                ("worker_read", "worker_read_runtime_guide", "read_receipt"),
+                ("worker_startup", "worker_startup", "mf_subagent_startup"),
+            )
+            for lane in lanes
+        ],
+    }
+
+    class FakeStore:
+        def get(self, requested_execution_id):
+            assert requested_execution_id == execution_id
+            return record
+
+        def list_by_backlog(self, *, project_id, backlog_id):
+            assert project_id == PID
+            assert backlog_id == record["backlog_id"]
+            return [record]
+
+    class FakeRuntime:
+        store = FakeStore()
+
+        @staticmethod
+        def pinned_definition_has_line(requested_execution_id, line_id):
+            assert requested_execution_id == execution_id
+            return line_id in {
+                "worker_graph_context",
+                "worker_implementation",
+            }
+
+        @staticmethod
+        def current_guide(requested_execution_id, actor_role):
+            assert requested_execution_id == execution_id
+            assert actor_role == "mf_sub"
+            return record["runtime_guide"]
+
+        @staticmethod
+        def submit_line_write(
+            requested_execution_id,
+            write,
+            *,
+            actor_role,
+            **_kwargs,
+        ):
+            assert requested_execution_id == execution_id
+            assert actor_role == "mf_sub"
+            expected = record["runtime_guide"]["next_legal_action"]
+            if (
+                write.get("line_id") != expected.get("line_id")
+                or write.get("runtime_context_id")
+                != expected.get("runtime_context_id")
+                or write.get("task_id") != expected.get("task_id")
+            ):
+                return {
+                    "ok": False,
+                    "decision": {
+                        "errors": [
+                            "runtime_context canonical line is out of order"
+                        ]
+                    },
+                }
+            completed = {
+                **copy.deepcopy(write),
+                "status": "accepted",
+                "line_instance_id": expected["line_instance_id"],
+            }
+            record["completed_lines"].append(completed)
+            revision = int(record["execution_state_revision"]) + 1
+            record["execution_state_revision"] = revision
+            record["execution_state"] = {
+                "execution_state_revision": revision,
+                "execution_state_hash": _fake_sha(
+                    f"state:{suffix}:{revision}"
+                ),
+            }
+            next_line = (
+                lane_two_graph
+                if expected["runtime_context_id"]
+                == lanes[0]["context"].runtime_context_id
+                else lane_one_implementation
+            )
+            record["runtime_guide"] = {
+                "runtime_guide_hash": next_line[
+                    "writer_role_safe_copy_payload"
+                ]["copy_payload"]["runtime_guide_hash"],
+                "next_legal_action": next_line,
+            }
+            return {"ok": True, "record": record}
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: runtime)
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_resolve_contract_execution_identity",
+        lambda *_args, **_kwargs: (
+            {"contract_execution_id": execution_id},
+            {
+                "status": "resolved_revision_contract_execution_id",
+                "contract_execution_id": execution_id,
+                "fail_closed": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda *_args, **kwargs: (kwargs["record"], {}),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_recovery_details",
+        lambda *_args, **_kwargs: {
+            "next_legal_action": "run_worker_graph_query",
+            "ordered_worker_sequence_verified": True,
+        },
+    )
+    return {
+        "execution_id": execution_id,
+        "backlog_id": backlog_id,
+        "target_root": str(target_root),
+        "lanes": lanes,
+        "record": record,
+    }
+
+
+def _mf_sub_multitrace_query_body(fixture, lane_index, *, tool, args=None):
+    lane = fixture["lanes"][lane_index]
+    context = lane["context"]
+    return {
+        "snapshot_id": "active",
+        "tool": tool,
+        "args": dict(args or {}),
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": fixture["execution_id"],
+        "worker_role": "mf_sub",
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+        "fence_token": context.fence_token,
+        "session_token": lane["token"],
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "target_project_root": fixture["target_root"],
+        **lane["route_identity"],
+    }
+
+
+def test_mf_sub_graph_query_after_completed_lane_persists_read_only_traces(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    fixture = _install_mf_sub_multitrace_contract_runtime(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="read-only",
+    )
+    record = fixture["record"]
+
+    first = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=_mf_sub_multitrace_query_body(
+                fixture,
+                0,
+                tool="function_index",
+                args={"query": "handle_graph_governance_query"},
+            ),
+        )
+    )
+
+    assert first["ok"] is True
+    assert first["contract_runtime_canonical_line"]["status"] == "completed"
+    lane_two_next = copy.deepcopy(
+        first["contract_runtime_canonical_line"]["next_legal_action"]
+    )
+    assert lane_two_next["runtime_context_id"] == (
+        fixture["lanes"][1]["context"].runtime_context_id
+    )
+    revision_after_first = record["execution_state_revision"]
+    state_hash_after_first = record["execution_state"]["execution_state_hash"]
+    completed_count_after_first = len(record["completed_lines"])
+
+    read_only_results = []
+    for tool, args in (
+        ("query_schema", {}),
+        (
+            "function_index",
+            {"query": "_runtime_context_submit_canonical_contract_line"},
+        ),
+    ):
+        result = server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body=_mf_sub_multitrace_query_body(
+                    fixture,
+                    0,
+                    tool=tool,
+                    args=args,
+                ),
+            )
+        )
+        read_only_results.append(result)
+        canonical = result["contract_runtime_canonical_line"]
+        assert result["ok"] is True
+        assert canonical["status"] == "already_completed_read_only"
+        assert canonical["read_only"] is True
+        assert canonical["contract_runtime_mutated"] is False
+        assert canonical["completed_lines_mutated"] is False
+        assert canonical["completed_line_duplicate_created"] is False
+        assert canonical["graph_trace_ids"] == [result["trace_id"]]
+        assert canonical["graph_query_trace_ids"] == [result["trace_id"]]
+        assert canonical["db_verified"] is True
+        assert canonical["graph_trace_db_evidence"]["db_verified"] is True
+        assert canonical["execution_state_revision"] == revision_after_first
+        assert canonical["execution_state_hash"] == state_hash_after_first
+        assert canonical["next_legal_action"] == lane_two_next
+        audited = canonical["audited_graph_read"]
+        assert audited == {
+            "schema_version": "runtime_context.audited_graph_read.v1",
+            "status": "persisted_read_only",
+            "source_of_authority": "graph_query_traces",
+            "graph_trace_ids": [result["trace_id"]],
+            "db_verified": True,
+            "db_bound_for_implementation_evidence": True,
+        }
+        persisted = server.handle_graph_governance_query_trace_get(
+            _ctx_with_role(
+                {"project_id": PID, "trace_id": result["trace_id"]},
+                "mf_sub",
+            )
+        )["trace"]
+        assert persisted["status"] == "complete"
+        assert persisted["runtime_context_id"] == (
+            fixture["lanes"][0]["context"].runtime_context_id
+        )
+        assert persisted["task_id"] == (
+            fixture["lanes"][0]["context"].task_id
+        )
+        assert persisted["parent_task_id"] == fixture["execution_id"]
+        assert persisted["query_source"] == "mf_subagent"
+        assert persisted["query_purpose"] == "subagent_context_build"
+
+    assert len({first["trace_id"], *(item["trace_id"] for item in read_only_results)}) == 3
+    assert record["execution_state_revision"] == revision_after_first
+    assert record["execution_state"]["execution_state_hash"] == state_hash_after_first
+    persisted_next = record["runtime_guide"]["next_legal_action"]
+    assert persisted_next["line_id"] == lane_two_next["line_id"]
+    assert persisted_next["runtime_context_id"] == (
+        lane_two_next["runtime_context_id"]
+    )
+    assert persisted_next["task_id"] == lane_two_next["task_id"]
+    assert len(record["completed_lines"]) == completed_count_after_first
+    lane_one_graph_lines = [
+        line
+        for line in record["completed_lines"]
+        if line.get("line_id") == "worker_graph_context"
+        and line.get("runtime_context_id")
+        == fixture["lanes"][0]["context"].runtime_context_id
+    ]
+    assert len(lane_one_graph_lines) == 1
+
+    lane_two = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=_mf_sub_multitrace_query_body(
+                fixture,
+                1,
+                tool="function_index",
+                args={"query": "handle_graph_governance_query"},
+            ),
+        )
+    )
+    assert lane_two["ok"] is True
+    assert lane_two["contract_runtime_canonical_line"]["status"] == "completed"
+    assert lane_two["contract_runtime_canonical_line"]["next_legal_action"][
+        "runtime_context_id"
+    ] == fixture["lanes"][0]["context"].runtime_context_id
+    graph_lines = [
+        line
+        for line in record["completed_lines"]
+        if line.get("line_id") == "worker_graph_context"
+    ]
+    assert len(graph_lines) == 2
+    assert {
+        line["runtime_context_id"] for line in graph_lines
+    } == {
+        lane["context"].runtime_context_id for lane in fixture["lanes"]
+    }
+
+
+@pytest.mark.parametrize(
+    "identity_mutation",
+    ("runtime_context_id", "task_id", "route_identity"),
+)
+def test_mf_sub_multitrace_graph_query_identity_mismatch_fails_before_trace(
+    conn,
+    monkeypatch,
+    tmp_path,
+    identity_mutation,
+):
+    fixture = _install_mf_sub_multitrace_contract_runtime(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"identity-{identity_mutation}",
+    )
+    body = _mf_sub_multitrace_query_body(
+        fixture,
+        0,
+        tool="function_index",
+        args={"query": "handle_graph_governance_query"},
+    )
+    if identity_mutation == "runtime_context_id":
+        body["runtime_context_id"] = "mfrctx-forged-multitrace"
+    elif identity_mutation == "task_id":
+        body["task_id"] = "forged-multitrace-task"
+    else:
+        body["route_context_hash"] = _fake_sha(
+            "forged-multitrace-route"
+        )
+    graph_query_trace.ensure_schema(conn)
+    trace_count_before = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body=body,
+            )
+        )
+
+    assert exc_info.value.status in {403, 409, 422}
+    assert exc_info.value.code in {
+        "fence_invalidated_or_unknown",
+        "route_identity_mismatch",
+        "runtime_context_not_found",
+        "runtime_context_route_identity_mismatch",
+        "worker_graph_query_identity_mismatch",
+    }
+    trace_count_after = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+    assert trace_count_after == trace_count_before
+
+
 def test_mf_sub_graph_query_accepts_target_project_with_governance_fence(conn, tmp_path):
     target_project_id = "target-graph-project"
     target_root = tmp_path / "target-graph-project"
