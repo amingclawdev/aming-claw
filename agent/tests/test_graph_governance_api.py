@@ -14791,6 +14791,13 @@ def test_runtime_context_implementation_evidence_rejects_empty_or_fake_graph_tra
     fence_token = "fence-runtime-implementation-graph"
     worktree = tmp_path / "runtime-implementation-graph-worker"
     worktree.mkdir()
+    target_commit = "1" * 40
+    active_snapshot_id = "full-runtime-implementation-graph"
+    _activate_basic_graph(
+        conn,
+        active_snapshot_id,
+        commit_sha=target_commit,
+    )
     context = upsert_branch_context(
         conn,
         BranchTaskRuntimeContext(
@@ -14813,8 +14820,9 @@ def test_runtime_context_implementation_evidence_rejects_empty_or_fake_graph_tra
             branch_ref="refs/heads/codex/runtime-implementation-graph",
             worktree_id="wt-runtime-implementation-graph",
             worktree_path=str(worktree),
-            base_commit="base-implementation-graph",
-            target_head_commit="target-implementation-graph",
+            base_commit=target_commit,
+            head_commit=target_commit,
+            target_head_commit=target_commit,
             merge_queue_id="mq-runtime-implementation-graph",
             status=STATE_WORKTREE_READY,
             lease_expires_at="2999-01-01T00:00:00Z",
@@ -14902,6 +14910,7 @@ def test_runtime_context_implementation_evidence_rejects_empty_or_fake_graph_tra
         conn,
         trace_id=trace_id,
         parent_task_id=parent_task_id,
+        snapshot_id=active_snapshot_id,
         runtime_context_id=context.runtime_context_id,
         task_id=worker_task_id,
         worker_role="mf_sub",
@@ -21358,6 +21367,13 @@ def test_runtime_context_close_gate_projects_a4_lineage_graph_traces(conn):
 
 
 def test_runtime_context_graph_trace_projection_excludes_sibling_mf_sub_rows(conn):
+    target_commit = "2" * 40
+    active_snapshot_id = "full-runtime-shared-active"
+    _activate_basic_graph(
+        conn,
+        active_snapshot_id,
+        commit_sha=target_commit,
+    )
     context = upsert_branch_context(
         conn,
         BranchTaskRuntimeContext(
@@ -21374,10 +21390,10 @@ def test_runtime_context_graph_trace_projection_excludes_sibling_mf_sub_rows(con
             target_project_id=PID,
             branch_ref="refs/heads/codex/runtime-task-a",
             worktree_path="/repo/.worktrees/runtime-task-a",
-            base_commit="base-a",
-            head_commit="head-a",
-            target_head_commit="target-a",
-            snapshot_id="scope-shared",
+            base_commit=target_commit,
+            head_commit=target_commit,
+            target_head_commit=target_commit,
+            snapshot_id=active_snapshot_id,
             projection_id="semproj-shared",
             merge_queue_id="mq-shared",
             checkpoint_id="ckpt-a",
@@ -21391,6 +21407,7 @@ def test_runtime_context_graph_trace_projection_excludes_sibling_mf_sub_rows(con
         conn,
         trace_id="gqt-current-runtime",
         parent_task_id="AC-RUNTIME-SHARED",
+        snapshot_id=active_snapshot_id,
         runtime_context_id=context.runtime_context_id,
         task_id="runtime-task-a",
         worker_role="mf_sub",
@@ -21402,6 +21419,7 @@ def test_runtime_context_graph_trace_projection_excludes_sibling_mf_sub_rows(con
         conn,
         trace_id="gqt-current-task",
         parent_task_id="AC-RUNTIME-SHARED",
+        snapshot_id=active_snapshot_id,
         runtime_context_id=context.runtime_context_id,
         task_id="runtime-task-a",
         worker_role="mf_sub",
@@ -21413,6 +21431,7 @@ def test_runtime_context_graph_trace_projection_excludes_sibling_mf_sub_rows(con
         conn,
         trace_id="gqt-current-fence",
         parent_task_id="AC-RUNTIME-SHARED",
+        snapshot_id=active_snapshot_id,
         runtime_context_id=context.runtime_context_id,
         task_id="runtime-task-a",
         worker_role="mf_sub",
@@ -21424,6 +21443,7 @@ def test_runtime_context_graph_trace_projection_excludes_sibling_mf_sub_rows(con
         conn,
         trace_id="gqt-current-run",
         parent_task_id="AC-RUNTIME-SHARED",
+        snapshot_id=active_snapshot_id,
         runtime_context_id=context.runtime_context_id,
         task_id="runtime-task-a",
         worker_role="mf_sub",
@@ -21435,6 +21455,7 @@ def test_runtime_context_graph_trace_projection_excludes_sibling_mf_sub_rows(con
         conn,
         trace_id="gqt-sibling",
         parent_task_id="AC-RUNTIME-SHARED",
+        snapshot_id=active_snapshot_id,
         runtime_context_id="mfrctx-sibling",
         task_id="runtime-task-b",
         worker_role="mf_sub",
@@ -44467,7 +44488,20 @@ def _install_mf_sub_multitrace_contract_runtime(
     backlog_id = f"AC-MF-SUB-MULTITRACE-{suffix.upper()}"
     target_root = tmp_path / f"mf-sub-multitrace-{suffix}"
     target_root.mkdir()
-    _activate_basic_graph(conn, f"full-mf-sub-multitrace-{suffix}")
+    target_commit = "a" * 40
+    active_snapshot_id = f"full-mf-sub-multitrace-{suffix}"
+    _activate_basic_graph(
+        conn,
+        active_snapshot_id,
+        commit_sha=target_commit,
+    )
+    (target_root / "graph_query_fixture.py").write_text(
+        "def handle_graph_governance_query():\n"
+        "    return True\n\n"
+        "def _runtime_context_submit_canonical_contract_line():\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
 
     lanes = []
     for index, owned_file in enumerate(
@@ -44488,8 +44522,8 @@ def _install_mf_sub_multitrace_contract_runtime(
             token=token,
             worktree_path=str(target_root / f"lane-{index}"),
             target_project_root=str(target_root),
-            base_commit="a" * 40,
-            target_head_commit="a" * 40,
+            base_commit=target_commit,
+            target_head_commit=target_commit,
             merge_queue_id=f"mq-{task_id}",
             owned_files=(owned_file,),
         )
@@ -44758,6 +44792,8 @@ def _install_mf_sub_multitrace_contract_runtime(
         "execution_id": execution_id,
         "backlog_id": backlog_id,
         "target_root": str(target_root),
+        "target_commit": target_commit,
+        "active_snapshot_id": active_snapshot_id,
         "lanes": lanes,
         "record": record,
     }
@@ -44786,6 +44822,205 @@ def _mf_sub_multitrace_query_body(fixture, lane_index, *, tool, args=None):
     }
 
 
+def _mf_sub_multitrace_contract_state(record):
+    return {
+        "execution_state_revision": record["execution_state_revision"],
+        "execution_state_hash": record["execution_state"][
+            "execution_state_hash"
+        ],
+        "next_legal_action": copy.deepcopy(
+            record["runtime_guide"]["next_legal_action"]
+        ),
+        "completed_line_count": len(record["completed_lines"]),
+    }
+
+
+def _assert_mf_sub_graph_query_rejected_without_contract_progress(
+    conn,
+    *,
+    fixture,
+    lane_index,
+    result,
+    before,
+):
+    record = fixture["record"]
+    lane = fixture["lanes"][lane_index]
+    context = lane["context"]
+    trace_id = result["trace_id"]
+    canonical = result.get("contract_runtime_canonical_line") or {}
+
+    assert canonical.get("status") not in {
+        "completed",
+        "already_completed",
+        "already_completed_read_only",
+    }
+    assert canonical.get("accepted") is not True
+    assert canonical.get("contract_runtime_mutated") is not True
+    assert record["execution_state_revision"] == before[
+        "execution_state_revision"
+    ]
+    assert record["execution_state"]["execution_state_hash"] == before[
+        "execution_state_hash"
+    ]
+    assert record["runtime_guide"]["next_legal_action"] == before[
+        "next_legal_action"
+    ]
+    assert len(record["completed_lines"]) == before["completed_line_count"]
+    assert not any(
+        line.get("line_id") == "worker_graph_context"
+        and line.get("runtime_context_id") == context.runtime_context_id
+        for line in record["completed_lines"]
+    )
+
+    graph_evidence = server._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=fixture["execution_id"],
+        backlog_id=fixture["backlog_id"],
+        fence_token=context.fence_token,
+        explicit_trace_ids=[trace_id],
+        strict_explicit_trace_ids=True,
+    )
+    assert graph_evidence["db_verified"] is False
+    assert graph_evidence["verified_trace_ids"] == []
+    assert graph_evidence["trace_ids"] == []
+
+
+def test_mf_sub_failed_graph_query_is_audited_without_canonical_progress(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    fixture = _install_mf_sub_multitrace_contract_runtime(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="failed-query",
+    )
+    before = _mf_sub_multitrace_contract_state(fixture["record"])
+    body = _mf_sub_multitrace_query_body(
+        fixture,
+        0,
+        tool="function_index",
+        args={},
+    )
+    # Preserve the real R12S13 malformed shape: query was present, but outside
+    # args.query, so the traced query must fail and remain audit-only.
+    body["query"] = "_runtime_context_submit_canonical_contract_line"
+
+    result = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=body,
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["result"]["ok"] is False
+    assert result["result_count"] == 0
+    assert result["result"].get("error")
+    persisted = server.handle_graph_governance_query_trace_get(
+        _ctx_with_role(
+            {"project_id": PID, "trace_id": result["trace_id"]},
+            "mf_sub",
+        )
+    )["trace"]
+    assert persisted["status"] == "failed"
+    assert persisted["snapshot_id"] == fixture["active_snapshot_id"]
+    _assert_mf_sub_graph_query_rejected_without_contract_progress(
+        conn,
+        fixture=fixture,
+        lane_index=0,
+        result=result,
+        before=before,
+    )
+
+
+@pytest.mark.parametrize("mismatch", ("snapshot", "graph_commit"))
+def test_mf_sub_complete_graph_trace_requires_current_snapshot_and_commit(
+    conn,
+    monkeypatch,
+    tmp_path,
+    mismatch,
+):
+    fixture = _install_mf_sub_multitrace_contract_runtime(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"{mismatch}-mismatch",
+    )
+    body = _mf_sub_multitrace_query_body(
+        fixture,
+        0,
+        tool="query_schema",
+        args={},
+    )
+    if mismatch == "snapshot":
+        stale_snapshot_id = f"{fixture['active_snapshot_id']}-stale"
+        _activate_basic_graph(
+            conn,
+            stale_snapshot_id,
+            commit_sha=fixture["target_commit"],
+        )
+        store.activate_graph_snapshot(
+            conn,
+            PID,
+            fixture["active_snapshot_id"],
+        )
+        conn.commit()
+        body["snapshot_id"] = stale_snapshot_id
+    else:
+        mismatched_snapshot_id = (
+            f"{fixture['active_snapshot_id']}-wrong-commit"
+        )
+        _activate_basic_graph(
+            conn,
+            mismatched_snapshot_id,
+            commit_sha="b" * 40,
+        )
+    before = _mf_sub_multitrace_contract_state(fixture["record"])
+
+    result = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=body,
+        )
+    )
+
+    # The graph read itself succeeded, but the combined facade must report the
+    # canonical-gate rejection rather than presenting the call as accepted.
+    assert result["ok"] is False
+    assert result.get("error")
+    assert result["result"]["ok"] is True
+    assert result["result_count"] > 0
+    persisted = server.handle_graph_governance_query_trace_get(
+        _ctx_with_role(
+            {"project_id": PID, "trace_id": result["trace_id"]},
+            "mf_sub",
+        )
+    )["trace"]
+    assert persisted["status"] == "complete"
+    if mismatch == "snapshot":
+        assert persisted["snapshot_id"] != fixture["active_snapshot_id"]
+    else:
+        active = store.get_active_graph_snapshot(conn, PID)
+        assert active["snapshot_id"] == persisted["snapshot_id"]
+        assert active["commit_sha"] != fixture["target_commit"]
+    _assert_mf_sub_graph_query_rejected_without_contract_progress(
+        conn,
+        fixture=fixture,
+        lane_index=0,
+        result=result,
+        before=before,
+    )
+
+
 def test_mf_sub_graph_query_after_completed_lane_persists_read_only_traces(
     conn,
     monkeypatch,
@@ -44807,13 +45042,15 @@ def test_mf_sub_graph_query_after_completed_lane_persists_read_only_traces(
             body=_mf_sub_multitrace_query_body(
                 fixture,
                 0,
-                tool="function_index",
-                args={"query": "handle_graph_governance_query"},
+                tool="query_schema",
+                args={},
             ),
         )
     )
 
     assert first["ok"] is True
+    assert first["result"]["ok"] is True
+    assert first["result_count"] > 0
     assert first["contract_runtime_canonical_line"]["status"] == "completed"
     lane_two_next = copy.deepcopy(
         first["contract_runtime_canonical_line"]["next_legal_action"]
@@ -44828,10 +45065,7 @@ def test_mf_sub_graph_query_after_completed_lane_persists_read_only_traces(
     read_only_results = []
     for tool, args in (
         ("query_schema", {}),
-        (
-            "function_index",
-            {"query": "_runtime_context_submit_canonical_contract_line"},
-        ),
+        ("list_tools", {}),
     ):
         result = server.handle_graph_governance_query(
             _ctx_with_role(
@@ -44849,6 +45083,8 @@ def test_mf_sub_graph_query_after_completed_lane_persists_read_only_traces(
         read_only_results.append(result)
         canonical = result["contract_runtime_canonical_line"]
         assert result["ok"] is True
+        assert result["result"]["ok"] is True
+        assert result["result_count"] > 0
         assert canonical["status"] == "already_completed_read_only"
         assert canonical["read_only"] is True
         assert canonical["contract_runtime_mutated"] is False
@@ -44914,12 +45150,14 @@ def test_mf_sub_graph_query_after_completed_lane_persists_read_only_traces(
             body=_mf_sub_multitrace_query_body(
                 fixture,
                 1,
-                tool="function_index",
-                args={"query": "handle_graph_governance_query"},
+                tool="query_schema",
+                args={},
             ),
         )
     )
     assert lane_two["ok"] is True
+    assert lane_two["result"]["ok"] is True
+    assert lane_two["result_count"] > 0
     assert lane_two["contract_runtime_canonical_line"]["status"] == "completed"
     assert lane_two["contract_runtime_canonical_line"]["next_legal_action"][
         "runtime_context_id"
@@ -99563,6 +99801,13 @@ def test_finish_gate_db_graph_trace_evidence_carries_fence_token(conn):
     worktree_path = "/tmp/nonexistent-fence-token-db-trace"
     branch_ref = "refs/heads/f2/fence-token-db-trace"
     trace_id = "gqt-fence-token-db-trace"
+    target_commit = "3" * 40
+    active_snapshot_id = "full-fence-token-db-trace"
+    _activate_basic_graph(
+        conn,
+        active_snapshot_id,
+        commit_sha=target_commit,
+    )
 
     context = upsert_branch_context(
         conn,
@@ -99575,9 +99820,9 @@ def test_finish_gate_db_graph_trace_evidence_carries_fence_token(conn):
             status="worktree_ready",
             fence_token=fence_token,
             worktree_path=worktree_path,
-            base_commit="base-fence-token-db",
-            head_commit="base-fence-token-db",
-            target_head_commit="target-fence-token-db",
+            base_commit=target_commit,
+            head_commit=target_commit,
+            target_head_commit=target_commit,
             merge_queue_id="mergeq-fence-token-db",
         ),
         now_iso="2026-06-14T09:30:00Z",
@@ -99605,6 +99850,7 @@ def test_finish_gate_db_graph_trace_evidence_carries_fence_token(conn):
         conn,
         trace_id=trace_id,
         parent_task_id=parent_task_id,
+        snapshot_id=active_snapshot_id,
         runtime_context_id=runtime_context_id_for_branch_context(context),
         task_id=task_id,
         worker_role="mf_sub",
