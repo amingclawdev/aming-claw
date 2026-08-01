@@ -14199,6 +14199,18 @@ def _runtime_context_test_results_from_tests(value: Any) -> dict[str, Any]:
     }
 
 
+def _runtime_context_expected_graph_commit(
+    context: Any,
+) -> tuple[str, str]:
+    """Return the runtime-owned commit that graph context must describe."""
+
+    for field in ("target_head_commit", "base_commit", "head_commit"):
+        commit = str(getattr(context, field, "") or "").strip().lower()
+        if commit:
+            return commit, f"runtime_context.{field}"
+    return "", ""
+
+
 def _runtime_context_service_graph_trace_refs(
     conn,
     *,
@@ -14224,6 +14236,25 @@ def _runtime_context_service_graph_trace_refs(
             return str(row["trace_id"] or "").strip()
         return str(row[0] or "").strip()
 
+    from .parallel_branch_runtime import (
+        get_branch_context_by_runtime_context_id,
+    )
+
+    runtime_context = (
+        get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            runtime_context_id,
+        )
+        if runtime_context_id
+        else None
+    )
+    expected_graph_commit, expected_graph_commit_source = (
+        _runtime_context_expected_graph_commit(runtime_context)
+        if runtime_context is not None
+        else ("", "")
+    )
+
     rows: list[Any] = []
     try:
         if requested_trace_ids:
@@ -14231,13 +14262,23 @@ def _runtime_context_service_graph_trace_refs(
             rows.extend(
                 conn.execute(
                     f"""
-                    SELECT trace_id, query_source, query_purpose, worker_role,
-                           parent_task_id, task_id, runtime_context_id, run_id,
-                           fence_token
-                    FROM graph_query_traces
-                    WHERE project_id = ?
-                      AND trace_id IN ({explicit_clause})
-                    ORDER BY created_at DESC, trace_id DESC
+                    SELECT t.trace_id, t.query_source, t.query_purpose,
+                           t.worker_role, t.parent_task_id, t.task_id,
+                           t.runtime_context_id, t.run_id, t.fence_token,
+                           t.status, t.snapshot_id,
+                           s.commit_sha AS snapshot_commit_sha,
+                           r.snapshot_id AS active_snapshot_id,
+                           r.commit_sha AS active_commit_sha
+                    FROM graph_query_traces t
+                    LEFT JOIN graph_snapshots s
+                      ON s.project_id = t.project_id
+                     AND s.snapshot_id = t.snapshot_id
+                    LEFT JOIN graph_snapshot_refs r
+                      ON r.project_id = t.project_id
+                     AND r.ref_name = 'active'
+                    WHERE t.project_id = ?
+                      AND t.trace_id IN ({explicit_clause})
+                    ORDER BY t.created_at DESC, t.trace_id DESC
                     """,
                     (project_id, *tuple(requested_trace_ids)),
                 ).fetchall()
@@ -14249,22 +14290,32 @@ def _runtime_context_service_graph_trace_refs(
                 current_run_id_like = f"mf_subagent:{task_id}:fence:{fence_hash}%"
             contextual_rows = conn.execute(
                 f"""
-                SELECT trace_id, query_source, query_purpose, worker_role,
-                       parent_task_id, task_id, runtime_context_id, run_id,
-                       fence_token
-                FROM graph_query_traces
-                WHERE project_id = ?
+                SELECT t.trace_id, t.query_source, t.query_purpose,
+                       t.worker_role, t.parent_task_id, t.task_id,
+                       t.runtime_context_id, t.run_id, t.fence_token,
+                       t.status, t.snapshot_id,
+                       s.commit_sha AS snapshot_commit_sha,
+                       r.snapshot_id AS active_snapshot_id,
+                       r.commit_sha AS active_commit_sha
+                FROM graph_query_traces t
+                LEFT JOIN graph_snapshots s
+                  ON s.project_id = t.project_id
+                 AND s.snapshot_id = t.snapshot_id
+                LEFT JOIN graph_snapshot_refs r
+                  ON r.project_id = t.project_id
+                 AND r.ref_name = 'active'
+                WHERE t.project_id = ?
                   AND (
-                    (? != '' AND runtime_context_id = ?)
-                    OR (? != '' AND task_id = ?)
-                    OR (? != '' AND fence_token = ?)
+                    (? != '' AND t.runtime_context_id = ?)
+                    OR (? != '' AND t.task_id = ?)
+                    OR (? != '' AND t.fence_token = ?)
                     OR (
-                      query_source = 'mf_subagent'
+                      t.query_source = 'mf_subagent'
                       AND ? != ''
-                      AND run_id LIKE ?
+                      AND t.run_id LIKE ?
                     )
-                )
-                ORDER BY created_at DESC, trace_id DESC
+                  )
+                ORDER BY t.created_at DESC, t.trace_id DESC
                 LIMIT 20
                 """,
                 (
@@ -14310,6 +14361,17 @@ def _runtime_context_service_graph_trace_refs(
             "task_id": _row_text("task_id", 5),
             "runtime_context_id": _row_text("runtime_context_id", 6),
             "fence_token": _row_text("fence_token", 8),
+            "status": _row_text("status", 9).lower(),
+            "snapshot_id": _row_text("snapshot_id", 10),
+            "snapshot_commit_sha": _row_text(
+                "snapshot_commit_sha",
+                11,
+            ).lower(),
+            "active_snapshot_id": _row_text("active_snapshot_id", 12),
+            "active_commit_sha": _row_text(
+                "active_commit_sha",
+                13,
+            ).lower(),
         }
         expected = {
             "query_source": "mf_subagent",
@@ -14341,6 +14403,26 @@ def _runtime_context_service_graph_trace_refs(
                     "actual": fields["query_purpose"],
                 }
             )
+        authority_expected = {
+            "status": "complete",
+            "active_snapshot_id": fields["snapshot_id"],
+            "active_commit_sha": expected_graph_commit,
+            "snapshot_commit_sha": expected_graph_commit,
+        }
+        for field, expected_value in authority_expected.items():
+            actual_value = fields[field]
+            if not expected_value or actual_value != expected_value:
+                trace_mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": field,
+                        "expected": (
+                            expected_value
+                            or "runtime-context expected graph commit"
+                        ),
+                        "actual": actual_value,
+                    }
+                )
         if trace_mismatches:
             identity_mismatches.extend(trace_mismatches)
             continue
@@ -14390,6 +14472,10 @@ def _runtime_context_service_graph_trace_refs(
             "task_id": task_id,
             "parent_task_id": parent_task_id,
             "backlog_id": backlog_id,
+            "complete_trace_required": True,
+            "active_snapshot_required": True,
+            "expected_graph_commit": expected_graph_commit,
+            "expected_graph_commit_source": expected_graph_commit_source,
         },
     }
 
@@ -50785,6 +50871,361 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
         conn.close()
 
 
+def _runtime_context_mf_sub_graph_query_canonical_eligibility(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+) -> dict[str, Any]:
+    """Classify whether this graph query owns a pinned canonical line.
+
+    Legacy/runtime-only contexts may query and audit graph state, but there is
+    no ContractRuntime line for them to advance.  Classify those compatibility
+    paths before applying the canonical advancement gate so the gate cannot
+    turn a successful read-only query into a failure.
+    """
+
+    revision_payload = _runtime_context_latest_contract_revision_payload(
+        conn,
+        context,
+    )
+    contract_identity = _runtime_context_contract_execution_identity(
+        revision_payload,
+    )
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    resolved_identity, resolution = (
+        _runtime_context_resolve_contract_execution_identity(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            contract_identity=contract_identity,
+        )
+    )
+    execution_id = str(
+        resolved_identity.get("contract_execution_id") or ""
+    ).strip()
+    resolution_status = str(resolution.get("status") or "").strip()
+    if not execution_id and resolution_status != (
+        "ambiguous_active_source_backed_worker_lineage"
+    ):
+        return {
+            "schema_version": (
+                "runtime_context.mf_sub_graph_query_canonical_eligibility.v1"
+            ),
+            "canonical_gate_required": False,
+            "status": "compatibility_no_contract_execution",
+            "canonical": False,
+            "line_id": "worker_graph_context",
+            "contract_execution_resolution": resolution,
+        }
+
+    if execution_id:
+        try:
+            line_pinned = _contract_runtime(conn).pinned_definition_has_line(
+                execution_id,
+                "worker_graph_context",
+            )
+        except ContractRuntimeError:
+            # A source-backed but unavailable execution must continue into the
+            # strict path, where the canonical submitter reports its authority
+            # failure instead of being mislabeled as compatibility mode.
+            line_pinned = True
+        if not line_pinned:
+            return {
+                "schema_version": (
+                    "runtime_context.mf_sub_graph_query_canonical_eligibility.v1"
+                ),
+                "canonical_gate_required": False,
+                "status": "compatibility_line_not_pinned",
+                "canonical": False,
+                "contract_execution_id": execution_id,
+                "line_id": "worker_graph_context",
+                "contract_execution_resolution": resolution,
+            }
+
+    return {
+        "schema_version": (
+            "runtime_context.mf_sub_graph_query_canonical_eligibility.v1"
+        ),
+        "canonical_gate_required": True,
+        "status": "source_backed_canonical_line",
+        "canonical": True,
+        "contract_execution_id": execution_id,
+        "line_id": "worker_graph_context",
+        "contract_execution_resolution": resolution,
+    }
+
+
+def _runtime_context_mf_sub_graph_query_canonical_gate(
+    conn,
+    *,
+    project_id: str,
+    snapshot_id: str,
+    query_result: Any,
+    context: Any,
+) -> dict[str, Any]:
+    """Verify one completed graph read before it may advance ContractRuntime."""
+
+    def reject(
+        error: str,
+        message: str,
+        **details: Any,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": (
+                "runtime_context.mf_sub_graph_query_canonical_gate.v1"
+            ),
+            "ok": False,
+            "status": "rejected",
+            "error": error,
+            "message": message,
+            "fail_closed": True,
+            "canonical_line_allowed": False,
+            "contract_runtime_mutated": False,
+            "completed_lines_mutated": False,
+            "verified_projection_allowed": False,
+            "finish_projection_allowed": False,
+            "close_projection_allowed": False,
+            **details,
+        }
+
+    if not isinstance(query_result, Mapping):
+        return reject(
+            "mf_sub_graph_query_result_malformed",
+            "mf_sub canonical graph context requires a mapping query result",
+            query_result_type=type(query_result).__name__,
+        )
+    inner_result = query_result.get("result")
+    if query_result.get("ok") is not True:
+        return reject(
+            "mf_sub_graph_query_failed",
+            "failed graph queries cannot advance worker_graph_context",
+            original_query_failure_preserved=True,
+        )
+    if not isinstance(inner_result, Mapping) or not inner_result:
+        return reject(
+            "mf_sub_graph_query_inner_result_malformed",
+            (
+                "mf_sub canonical graph context requires a non-empty "
+                "mapping inner result"
+            ),
+            inner_result_type=type(inner_result).__name__,
+        )
+    if inner_result.get("ok") is not True:
+        return reject(
+            "mf_sub_graph_query_inner_result_failed",
+            "failed inner graph-query results cannot advance worker_graph_context",
+            original_query_failure_preserved=True,
+        )
+
+    graph_trace_id = str(query_result.get("trace_id") or "").strip()
+    if not graph_trace_id:
+        return reject(
+            "mf_sub_graph_query_trace_id_missing",
+            "mf_sub canonical graph context requires a persisted trace id",
+        )
+
+    from . import graph_query_trace, graph_snapshot_store
+
+    try:
+        trace_response = graph_query_trace.get_trace(
+            conn,
+            project_id,
+            graph_trace_id,
+        )
+    except (KeyError, TypeError, ValueError, sqlite3.Error) as exc:
+        return reject(
+            "mf_sub_graph_query_trace_unavailable",
+            "mf_sub canonical graph context requires a DB-backed trace",
+            graph_trace_id=graph_trace_id,
+            trace_error=str(exc),
+        )
+    if not isinstance(trace_response, Mapping):
+        return reject(
+            "mf_sub_graph_query_trace_malformed",
+            "DB graph trace lookup did not return a mapping response",
+            graph_trace_id=graph_trace_id,
+            trace_response_type=type(trace_response).__name__,
+        )
+    trace = (
+        trace_response.get("trace")
+        if isinstance(trace_response.get("trace"), Mapping)
+        else {}
+    )
+    if trace_response.get("ok") is not True or not trace:
+        return reject(
+            "mf_sub_graph_query_trace_malformed",
+            "DB graph trace lookup did not return a complete trace record",
+            graph_trace_id=graph_trace_id,
+        )
+    persisted_trace_id = str(trace.get("trace_id") or "").strip()
+    if persisted_trace_id != graph_trace_id:
+        return reject(
+            "mf_sub_graph_query_trace_identity_mismatch",
+            "returned graph trace id does not match the persisted trace",
+            graph_trace_id=graph_trace_id,
+            persisted_trace_id=persisted_trace_id,
+        )
+    trace_status = str(trace.get("status") or "").strip().lower()
+    if trace_status != "complete":
+        return reject(
+            "mf_sub_graph_query_trace_not_complete",
+            "only COMPLETE DB graph traces may advance worker_graph_context",
+            graph_trace_id=graph_trace_id,
+            trace_status=trace_status,
+        )
+    trace_events = trace.get("events")
+    trace_seq = query_result.get("seq")
+    if (
+        not isinstance(trace_events, Sequence)
+        or isinstance(trace_events, (str, bytes))
+        or not trace_events
+        or not any(
+            isinstance(event, Mapping) and event.get("seq") == trace_seq
+            for event in trace_events
+        )
+    ):
+        return reject(
+            "mf_sub_graph_query_trace_event_missing",
+            "completed graph trace does not contain the returned query event",
+            graph_trace_id=graph_trace_id,
+            trace_seq=trace_seq,
+        )
+
+    resolved_snapshot_id = str(snapshot_id or "").strip()
+    trace_snapshot_id = str(trace.get("snapshot_id") or "").strip()
+    if not resolved_snapshot_id or trace_snapshot_id != resolved_snapshot_id:
+        return reject(
+            "mf_sub_graph_query_trace_snapshot_mismatch",
+            "graph trace snapshot does not match the resolved query snapshot",
+            graph_trace_id=graph_trace_id,
+            expected_snapshot_id=resolved_snapshot_id,
+            actual_snapshot_id=trace_snapshot_id,
+        )
+
+    try:
+        active_ref = conn.execute(
+            """
+            SELECT snapshot_id, commit_sha
+            FROM graph_snapshot_refs
+            WHERE project_id = ? AND ref_name = 'active'
+            """,
+            (project_id,),
+        ).fetchone()
+        active_snapshot = graph_snapshot_store.get_active_graph_snapshot(
+            conn,
+            project_id,
+        )
+        queried_snapshot = graph_snapshot_store.get_graph_snapshot(
+            conn,
+            project_id,
+            resolved_snapshot_id,
+        )
+    except (KeyError, TypeError, ValueError, sqlite3.Error) as exc:
+        return reject(
+            "mf_sub_graph_query_active_snapshot_unavailable",
+            "current active graph authority could not be resolved",
+            graph_trace_id=graph_trace_id,
+            snapshot_id=resolved_snapshot_id,
+            snapshot_error=str(exc),
+        )
+    if not active_ref or not active_snapshot or not queried_snapshot:
+        return reject(
+            "mf_sub_graph_query_active_snapshot_missing",
+            "canonical graph context requires an active graph snapshot binding",
+            graph_trace_id=graph_trace_id,
+            snapshot_id=resolved_snapshot_id,
+        )
+
+    active_ref_snapshot_id = str(active_ref["snapshot_id"] or "").strip()
+    active_snapshot_id = str(active_snapshot.get("snapshot_id") or "").strip()
+    active_ref_commit = str(active_ref["commit_sha"] or "").strip().lower()
+    active_snapshot_commit = str(
+        active_snapshot.get("commit_sha") or ""
+    ).strip().lower()
+    queried_snapshot_commit = str(
+        queried_snapshot.get("commit_sha") or ""
+    ).strip().lower()
+    expected_runtime_commit, expected_runtime_commit_source = (
+        _runtime_context_expected_graph_commit(context)
+    )
+    if (
+        not active_ref_snapshot_id
+        or active_ref_snapshot_id != resolved_snapshot_id
+        or active_snapshot_id != resolved_snapshot_id
+    ):
+        return reject(
+            "mf_sub_graph_query_nonactive_snapshot",
+            "worker_graph_context requires the current active graph snapshot",
+            graph_trace_id=graph_trace_id,
+            expected_active_snapshot_id=active_ref_snapshot_id,
+            active_snapshot_id=active_snapshot_id,
+            query_snapshot_id=resolved_snapshot_id,
+        )
+    if (
+        not expected_runtime_commit
+        or not active_ref_commit
+        or not active_snapshot_commit
+        or not queried_snapshot_commit
+        or len(
+            {
+                active_ref_commit,
+                active_snapshot_commit,
+                queried_snapshot_commit,
+                expected_runtime_commit,
+            }
+        )
+        != 1
+    ):
+        return reject(
+            "mf_sub_graph_query_active_commit_mismatch",
+            (
+                "query snapshot is not bound to the current expected active "
+                "graph commit"
+            ),
+            graph_trace_id=graph_trace_id,
+            snapshot_id=resolved_snapshot_id,
+            expected_active_graph_commit=active_ref_commit,
+            active_snapshot_commit=active_snapshot_commit,
+            query_snapshot_commit=queried_snapshot_commit,
+            expected_runtime_context_commit=expected_runtime_commit,
+            expected_runtime_context_commit_source=(
+                expected_runtime_commit_source
+            ),
+        )
+
+    return {
+        "schema_version": (
+            "runtime_context.mf_sub_graph_query_canonical_gate.v1"
+        ),
+        "ok": True,
+        "status": "verified",
+        "fail_closed": True,
+        "canonical_line_allowed": True,
+        "graph_trace_id": graph_trace_id,
+        "trace_status": trace_status,
+        "trace_complete": True,
+        "trace_snapshot_id": trace_snapshot_id,
+        "snapshot_id": resolved_snapshot_id,
+        "expected_active_snapshot_id": active_ref_snapshot_id,
+        "expected_active_graph_commit": active_ref_commit,
+        "expected_runtime_context_commit": expected_runtime_commit,
+        "expected_runtime_context_commit_source": (
+            expected_runtime_commit_source
+        ),
+        "snapshot_commit": queried_snapshot_commit,
+        "source_of_authority": (
+            "graph_query_traces+graph_query_events+graph_snapshot_refs+"
+            "graph_snapshots"
+        ),
+    }
+
+
 @route("POST", "/api/graph-governance/{project_id}/query")
 def handle_graph_governance_query(ctx: RequestContext):
     """Run one graph query and append it to an auditable trace."""
@@ -51076,6 +51517,88 @@ def handle_graph_governance_query(ctx: RequestContext):
                             404,
                             {"runtime_context_id": runtime_context_id},
                         )
+                    canonical_eligibility = (
+                        _runtime_context_mf_sub_graph_query_canonical_eligibility(
+                            conn,
+                            project_id=project_id,
+                            context=runtime_context,
+                        )
+                    )
+                    result["mf_sub_graph_query_canonical_eligibility"] = (
+                        canonical_eligibility
+                    )
+                    if not canonical_eligibility.get(
+                        "canonical_gate_required"
+                    ):
+                        result["contract_runtime_canonical_line"] = {
+                            "schema_version": (
+                                "runtime_context.canonical_contract_line.v1"
+                            ),
+                            "accepted": False,
+                            "status": canonical_eligibility.get("status"),
+                            "canonical": False,
+                            "contract_execution_id": (
+                                canonical_eligibility.get(
+                                    "contract_execution_id"
+                                )
+                                or ""
+                            ),
+                            "line_id": "worker_graph_context",
+                            "contract_execution_resolution": (
+                                canonical_eligibility.get(
+                                    "contract_execution_resolution"
+                                )
+                                or {}
+                            ),
+                        }
+                        conn.commit()
+                        return result
+                    canonical_graph_gate = (
+                        _runtime_context_mf_sub_graph_query_canonical_gate(
+                            conn,
+                            project_id=project_id,
+                            snapshot_id=snapshot_id,
+                            query_result=result,
+                            context=runtime_context,
+                        )
+                    )
+                    result["mf_sub_graph_query_canonical_gate"] = (
+                        canonical_graph_gate
+                    )
+                    if not canonical_graph_gate.get("ok"):
+                        if result.get("ok") is True:
+                            result["ok"] = False
+                            result["error"] = str(
+                                canonical_graph_gate.get("error")
+                                or "mf_sub_graph_query_canonical_gate_rejected"
+                            )
+                        result["contract_runtime_canonical_line"] = {
+                            "schema_version": (
+                                "runtime_context.canonical_contract_line.v1"
+                            ),
+                            "accepted": False,
+                            "status": "graph_query_canonical_gate_rejected",
+                            "canonical": False,
+                            "source_of_authority": (
+                                canonical_graph_gate.get("source_of_authority")
+                                or "graph_query_canonical_gate"
+                            ),
+                            "runtime_context_id": runtime_context_id,
+                            "task_id": runtime_context.task_id,
+                            "stage_id": "worker_context",
+                            "line_id": "worker_graph_context",
+                            "evidence_kind": "graph_trace",
+                            "fail_closed": True,
+                            "contract_runtime_mutated": False,
+                            "completed_lines_mutated": False,
+                            "verified_projection_allowed": False,
+                            "finish_projection_allowed": False,
+                            "close_projection_allowed": False,
+                            "timeline_evidence_backfill_allowed": False,
+                            "graph_query_canonical_gate": canonical_graph_gate,
+                        }
+                        conn.commit()
+                        return result
                     trace_payload = (
                         result.get("trace")
                         if isinstance(result.get("trace"), Mapping)
@@ -51141,6 +51664,38 @@ def handle_graph_governance_query(ctx: RequestContext):
                         "graph_trace_evidence": {
                             "db_verified": True,
                             "graph_trace_ids": [graph_trace_id],
+                            "trace_status": canonical_graph_gate.get(
+                                "trace_status"
+                            ),
+                            "trace_complete": canonical_graph_gate.get(
+                                "trace_complete"
+                            ),
+                            "snapshot_id": canonical_graph_gate.get(
+                                "snapshot_id"
+                            ),
+                            "snapshot_commit": canonical_graph_gate.get(
+                                "snapshot_commit"
+                            ),
+                            "expected_active_snapshot_id": (
+                                canonical_graph_gate.get(
+                                    "expected_active_snapshot_id"
+                                )
+                            ),
+                            "expected_active_graph_commit": (
+                                canonical_graph_gate.get(
+                                    "expected_active_graph_commit"
+                                )
+                            ),
+                            "expected_runtime_context_commit": (
+                                canonical_graph_gate.get(
+                                    "expected_runtime_context_commit"
+                                )
+                            ),
+                            "expected_runtime_context_commit_source": (
+                                canonical_graph_gate.get(
+                                    "expected_runtime_context_commit_source"
+                                )
+                            ),
                             "query_source": "mf_subagent",
                             "query_purpose": str(
                                 body.get("query_purpose") or ""
