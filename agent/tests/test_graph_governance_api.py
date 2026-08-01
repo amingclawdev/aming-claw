@@ -11837,11 +11837,12 @@ def test_parallel_branch_allocate_rejects_coordinator_route_ref_before_write(
     assert get_branch_context(conn, PID, body["task_id"]) is None
 
 
-def test_parallel_branch_allocate_includes_backlog_test_files_in_worker_scope(
+def test_parallel_branch_allocate_preserves_legacy_single_worker_test_file_scope(
     conn,
     tmp_path,
 ):
     backlog_id = "AC-ALLOCATE-CONTRACT-TEST-SCOPE"
+    contract_execution_id = "cex-allocate-test-scope"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     conn.execute(
         """
@@ -11869,6 +11870,47 @@ def test_parallel_branch_allocate_includes_backlog_test_files_in_worker_scope(
             backlog_id,
         ),
     )
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-allocate-test-scope-root",
+            },
+        )
+    )
+    parent = _complete_source_backed_onboarding(
+        conn,
+        started["contract_execution_id"],
+    )
+    server._contract_runtime(conn).start_execution(
+        server.MF_PARALLEL_CONTRACT_ID,
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=contract_execution_id,
+        version="v2",
+        revision="rev7",
+        parent_contract_execution_id=parent["contract_execution_id"],
+        root_contract_execution_id=(
+            parent.get("root_contract_execution_id")
+            or parent["contract_execution_id"]
+        ),
+        contract_chain_id=parent["contract_chain_id"],
+        role_binding={
+            "observer": "observer",
+            "mf_sub": "mf_sub",
+            "qa": "qa",
+            "binding_source": "rev7_single_worker_regression",
+        },
+        backlog_lineage={
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": "allocate-test-scope-parent",
+        },
+    )
     conn.commit()
 
     workspace = tmp_path / "workers"
@@ -11877,7 +11919,7 @@ def test_parallel_branch_allocate_includes_backlog_test_files_in_worker_scope(
     _persist_parallel_allocate_route_ref(
         conn,
         backlog_id=backlog_id,
-        contract_execution_id="cex-allocate-test-scope",
+        contract_execution_id=contract_execution_id,
         route_id="route-allocate-test-scope",
         route_context_hash="sha256:route-allocate-test-scope",
         prompt_contract_id="rprompt-allocate-test-scope",
@@ -11893,7 +11935,7 @@ def test_parallel_branch_allocate_includes_backlog_test_files_in_worker_scope(
                 "task_id": "allocate-test-scope-task",
                 "parent_task_id": backlog_id,
                 "backlog_id": backlog_id,
-                "contract_execution_id": "cex-allocate-test-scope",
+                "contract_execution_id": contract_execution_id,
                 "observer_command_id": "cmd-allocate-test-scope",
                 "workspace_root": str(workspace),
                 "worktree_path": str(worktree),
@@ -67251,14 +67293,40 @@ def test_contract_runtime_dispatch_projects_canonical_allocation_payload():
     )
 
 
-def test_contract_runtime_dispatch_copy_safe_body_hydrates_after_allocate_and_submits_unchanged(
+def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_union(
     conn,
     tmp_path,
 ):
     backlog_id = "AC-MF-PARALLEL-DISPATCH-COPY-SAFE"
     parent_task_id = "dispatch-copy-safe-parent"
     worker_task_id = "dispatch-copy-safe-worker"
+    server_file = "agent/governance/server.py"
+    test_file = "agent/tests/test_graph_governance_api.py"
+    row_files = [server_file, test_file]
+    row_acceptance = [
+        {
+            "id": "AC-REV8-ATOMIC-ROW-UNION",
+            "required_scope": {
+                "kind": "files",
+                "files": row_files,
+            },
+        }
+    ]
     _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?, acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps([server_file]),
+            json.dumps([test_file]),
+            json.dumps(row_acceptance),
+            backlog_id,
+        ),
+    )
+    conn.commit()
     started = server.handle_project_onboard_contract_start(
         _ctx_with_role(
             {"project_id": PID},
@@ -67281,7 +67349,7 @@ def test_contract_runtime_dispatch_copy_safe_body_hydrates_after_allocate_and_su
                 "task_id": parent_task_id,
                 "reason": "Exercise the post-allocation copy-safe dispatch body.",
                 "route_token_ref": "rtok-dispatch-copy-safe-root",
-                "owned_files": ["agent/governance/server.py"],
+                "owned_files": row_files,
             },
         )
     )
@@ -67313,7 +67381,7 @@ def test_contract_runtime_dispatch_copy_safe_body_hydrates_after_allocate_and_su
             "agent_id": "host-dispatch-copy-safe-a",
             "merge_queue_id": "mq-dispatch-copy-safe-a",
             "route_token_ref": "rtok-dispatch-copy-safe-child-a",
-            "owned_files": ["agent/governance/server.py"],
+            "owned_files": [server_file],
         },
         {
             "task_id": "dispatch-copy-safe-worker-b",
@@ -67321,7 +67389,7 @@ def test_contract_runtime_dispatch_copy_safe_body_hydrates_after_allocate_and_su
             "agent_id": "host-dispatch-copy-safe-b",
             "merge_queue_id": "mq-dispatch-copy-safe-b",
             "route_token_ref": "rtok-dispatch-copy-safe-child-b",
-            "owned_files": ["agent/tests/test_graph_governance_api.py"],
+            "owned_files": [test_file],
         },
     ]
     allocations = []
@@ -67371,6 +67439,21 @@ def test_contract_runtime_dispatch_copy_safe_body_hydrates_after_allocate_and_su
         )
         assert status == 201
         assert allocated["ok"] is True
+        assert allocated["context"]["owned_files"] == lane["owned_files"]
+        assert allocated["context"]["target_files"] == lane["owned_files"]
+        lane_closure = allocated["acceptance_scope_closure"]
+        assert lane_closure["schema_version"] == (
+            "mf_parallel.rev8_per_lane_acceptance_authority.v1"
+        )
+        assert lane_closure["scope_mode"] == (
+            "mf_parallel_rev8_per_lane_allocation"
+        )
+        assert lane_closure["lane_authority_files"] == lane["owned_files"]
+        assert lane_closure["row_declared_files"] == row_files
+        assert lane_closure[
+            "row_union_closure_deferred_to_atomic_dispatch"
+        ] is True
+        assert lane_closure["full_row_file_union_required_per_lane"] is False
         allocations.append(allocated)
 
     current = server.handle_project_contract_runtime_current_state(
@@ -67415,6 +67498,16 @@ def test_contract_runtime_dispatch_copy_safe_body_hydrates_after_allocate_and_su
     assert {worker["route_token_ref"] for worker in bounded_workers} == {
         lane["route_token_ref"] for lane in lanes
     }
+    assert {
+        tuple(worker["owned_files"]) for worker in bounded_workers
+    } == {(server_file,), (test_file,)}
+    assert all(
+        worker["acceptance_scope_closure"]["scope_mode"]
+        == "mf_parallel_rev8_atomic_persisted_lane_union"
+        and worker["acceptance_scope_closure"]["atomic_union_authoritative"]
+        is True
+        for worker in bounded_workers
+    )
     assert all(
         worker["parent_task_id"] == execution_id
         and worker["root_task_id"]
@@ -67424,10 +67517,21 @@ def test_contract_runtime_dispatch_copy_safe_body_hydrates_after_allocate_and_su
         and worker["retry_policy"] == retry_policy
         for worker in bounded_workers
     )
-    assert dispatch_body["owned_files"] == [
-        "agent/governance/server.py",
-        "agent/tests/test_graph_governance_api.py",
-    ]
+    assert dispatch_body["owned_files"] == row_files
+    assert dispatch_body["acceptance_criteria"] == row_acceptance
+    row_union_closure = dispatch_body["acceptance_scope_closure"]
+    assert row_union_closure["schema_version"] == (
+        "mf_parallel.rev8_atomic_acceptance_union.v1"
+    )
+    assert row_union_closure["scope_mode"] == (
+        "mf_parallel_rev8_atomic_persisted_lane_union"
+    )
+    assert row_union_closure["accepted"] is True
+    assert row_union_closure["minted_fence_files"] == row_files
+    assert row_union_closure["persisted_lane_file_union"] == row_files
+    assert row_union_closure["atomic_union_authoritative"] is True
+    assert row_union_closure["row_declared_files"] == row_files
+    assert row_union_closure["evaluated_before_allocation_or_dispatch"] is True
     assert next_action["copy_safe_dispatch_payload"][
         "contract_runtime_submit_line"
     ]["copy_safe_body"] == copy_body
@@ -99726,6 +99830,226 @@ def test_daily_planner_mf_parallel_prompt_requires_two_desktop_workers():
     assert "do not use the CLI Agent Service" in prompt
     assert "merge both durable queue items" in prompt
     assert "fresh independent QA session" in prompt
+
+
+def _rev8_atomic_dispatch_binding_fixture(
+    conn,
+    *,
+    suffix: str,
+    lane_files: tuple[tuple[str, ...], tuple[str, ...]],
+    row_files: tuple[str, ...] = (),
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    backlog_id = f"AC-REV8-ATOMIC-DISPATCH-{suffix.upper()}"
+    execution_id = f"cex-rev8-atomic-dispatch-{suffix}"
+    effective_row_files = tuple(row_files) or tuple(
+        sorted({path for files in lane_files for path in files})
+    )
+    criteria = [
+        {
+            "id": f"AC-REV8-ATOMIC-{suffix.upper()}",
+            "required_scope": {
+                "kind": "files",
+                "files": list(effective_row_files),
+            },
+        }
+    ]
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?, acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(list(effective_row_files)),
+            json.dumps([]),
+            json.dumps(criteria),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    workers: list[dict[str, Any]] = []
+    for lane, owned_files in zip(("a", "b"), lane_files):
+        task_id = f"rev8-{suffix}-worker-{lane}"
+        runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+            conn,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_task_id=execution_id,
+            fence_token=f"fence-{task_id}",
+            token=f"token-{task_id}",
+            worktree_path=f"/tmp/{task_id}",
+            target_project_root="/tmp/rev8-atomic-dispatch",
+            base_commit="a" * 40,
+            target_head_commit="a" * 40,
+            merge_queue_id=f"mq-{task_id}",
+            owned_files=owned_files,
+        )
+        workers.append(
+            _mf_parallel_rev3_worker_dispatch_payload(
+                conn,
+                backlog_id=backlog_id,
+                runtime_context=runtime_context,
+                route_label=task_id,
+                route_task_id=execution_id,
+                parent_task_id=execution_id,
+            )
+        )
+
+    return (
+        {
+            "contract_id": "mf_parallel.v2",
+            "version": "v2",
+            "revision": "rev8",
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+        },
+        {
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "evidence_kind": "dispatch_bounded_worker",
+            "payload": {
+                "bounded_workers": workers,
+                "worker_count": 2,
+                "acceptance_criteria": criteria,
+            },
+        },
+    )
+
+
+def test_rev8_atomic_dispatch_accepts_exactly_two_distinct_disjoint_lanes(conn):
+    server_file = "agent/governance/server.py"
+    test_file = "agent/tests/test_graph_governance_api.py"
+    record, write = _rev8_atomic_dispatch_binding_fixture(
+        conn,
+        suffix="two-distinct",
+        lane_files=((server_file,), (test_file,)),
+    )
+
+    effective, errors = server._contract_runtime_bind_mf_parallel_dispatch_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        write=write,
+    )
+
+    assert errors == []
+    payload = effective["payload"]
+    assert payload["worker_count"] == 2
+    assert payload["required_worker_count"] == 2
+    assert payload["atomic_dispatch"] is True
+    assert payload["all_or_nothing"] is True
+    assert payload["owned_files"] == [server_file, test_file]
+    assert {
+        tuple(worker["owned_files"])
+        for worker in payload["bounded_workers"]
+    } == {(server_file,), (test_file,)}
+    assert len(
+        {
+            worker["runtime_context_id"]
+            for worker in payload["bounded_workers"]
+        }
+    ) == 2
+
+
+def test_rev8_atomic_dispatch_rejects_overlapping_lane_fences_before_dispatch(conn):
+    shared_file = "agent/governance/server.py"
+    record, write = _rev8_atomic_dispatch_binding_fixture(
+        conn,
+        suffix="overlap",
+        lane_files=((shared_file,), (shared_file,)),
+    )
+
+    effective, errors = server._contract_runtime_bind_mf_parallel_dispatch_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        write=write,
+    )
+
+    assert effective == write
+    assert errors == [
+        "atomic bounded workers require disjoint owned_files: " + shared_file
+    ]
+
+
+def test_rev8_atomic_dispatch_rejects_missing_row_union_before_dispatch(conn):
+    server_file = "agent/governance/server.py"
+    test_file = "agent/tests/test_graph_governance_api.py"
+    omitted_file = "agent/governance/mcp_server.py"
+    record, write = _rev8_atomic_dispatch_binding_fixture(
+        conn,
+        suffix="missing-union",
+        lane_files=((server_file,), (test_file,)),
+        row_files=(server_file, test_file, omitted_file),
+    )
+
+    effective, errors = server._contract_runtime_bind_mf_parallel_dispatch_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        write=write,
+    )
+
+    assert effective == write
+    assert errors == ["acceptance_required_files_outside_minted_fence"]
+
+
+def test_rev8_atomic_dispatch_rejects_client_acceptance_rewrite_before_dispatch(conn):
+    server_file = "agent/governance/server.py"
+    test_file = "agent/tests/test_graph_governance_api.py"
+    record, write = _rev8_atomic_dispatch_binding_fixture(
+        conn,
+        suffix="acceptance-rewrite",
+        lane_files=((server_file,), (test_file,)),
+    )
+    write["payload"]["acceptance_criteria"] = [
+        {
+            "id": "AC-CALLER-REWRITTEN",
+            "required_scope": {
+                "kind": "files",
+                "files": [server_file],
+            },
+        }
+    ]
+
+    effective, errors = server._contract_runtime_bind_mf_parallel_dispatch_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        write=write,
+    )
+
+    assert effective == write
+    assert errors == [
+        "request_acceptance_scope_differs_from_backlog_authority"
+    ]
+
+
+def test_rev8_atomic_dispatch_rejects_duplicate_child_route_before_dispatch(conn):
+    server_file = "agent/governance/server.py"
+    test_file = "agent/tests/test_graph_governance_api.py"
+    record, write = _rev8_atomic_dispatch_binding_fixture(
+        conn,
+        suffix="duplicate-route",
+        lane_files=((server_file,), (test_file,)),
+    )
+    first, second = write["payload"]["bounded_workers"]
+    second["route_identity"] = dict(first["route_identity"])
+
+    effective, errors = server._contract_runtime_bind_mf_parallel_dispatch_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        write=write,
+    )
+
+    assert effective == write
+    assert errors == [
+        "atomic bounded workers require distinct route_token_ref"
+    ]
 
 
 @pytest.mark.parametrize("worker_count", [0, 1, 3])
