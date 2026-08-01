@@ -8486,6 +8486,17 @@ _QA_IMMUTABLE_EXTERNAL_AUDIT_SCOPES = {
     "external_audit_only",
     "immutable_external_audit",
 }
+_QA_EXTERNAL_NO_PASS_COMPARISON_PAYLOAD_SCHEMAS = {
+    "mf_parallel.qa_independent_verification.v1",
+    "qa_independent_verification.v1",
+}
+_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_SCHEMA = (
+    "contract_runtime.external_no_pass_baseline_ledger.v2"
+)
+_QA_EXTERNAL_NO_PASS_COMPARISON_PATHS = {
+    ("payload",),
+    ("artifact_refs", "external_no_pass_baseline_ledger"),
+}
 
 
 def _qa_is_immutable_external_audit_subtree(
@@ -8517,9 +8528,11 @@ def _qa_review_claim_containers(
     value: Any,
     *,
     _path: tuple[str, ...] = (),
-) -> list[Mapping[str, Any]]:
+) -> list[tuple[tuple[str, ...], Mapping[str, Any]]]:
     if isinstance(value, Mapping):
-        result: list[Mapping[str, Any]] = [value]
+        result: list[tuple[tuple[str, ...], Mapping[str, Any]]] = [
+            (_path, value)
+        ]
         for key, child in value.items():
             child_path = (*_path, str(key or "").strip())
             if _qa_is_immutable_external_audit_subtree(child_path, child):
@@ -8536,17 +8549,126 @@ def _qa_review_claim_containers(
     return []
 
 
+def _qa_external_no_pass_comparison_tuple(
+    body: Mapping[str, Any],
+) -> dict[str, str]:
+    """Return the narrow no-PASS base/candidate comparison namespace.
+
+    The graph snapshot base remains candidate-scoped for an exact-candidate
+    graph.  A separately reproduced non-green baseline may name an ancestor
+    only when the canonical QA payload and its v2 external ledger agree.  The
+    caller still has to match this tuple to the server-derived review context.
+    """
+
+    payload = body.get("payload")
+    artifact_refs = body.get("artifact_refs")
+    ledger = (
+        artifact_refs.get("external_no_pass_baseline_ledger")
+        if isinstance(artifact_refs, Mapping)
+        else None
+    )
+    if not isinstance(payload, Mapping) or not isinstance(ledger, Mapping):
+        return {}
+    payload_schema = str(payload.get("schema_version") or "").strip()
+    ledger_schema = str(ledger.get("schema_version") or "").strip()
+    payload_issue_claims = payload.get("candidate_specific_issues")
+    ledger_issue_claims = ledger.get("candidate_specific_issues")
+    if (
+        payload_schema not in _QA_EXTERNAL_NO_PASS_COMPARISON_PAYLOAD_SCHEMAS
+        or ledger_schema != _QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_SCHEMA
+        or str(body.get("status") or "").strip().lower()
+        not in {"failed", "fail", "rejected", "blocked"}
+        or payload.get("no_pass_claim") is not True
+        or payload.get("overall_release_pass_claimed") is not False
+        or str(payload.get("full_suite_claim") or "").strip()
+        != "not_claimed"
+        or type(payload.get("candidate_new_failures")) is not int
+        or payload.get("candidate_new_failures") != 0
+        or not isinstance(payload_issue_claims, list)
+        or bool(payload_issue_claims)
+        or ledger.get("no_pass_claim") is not True
+        or ledger.get("overall_release_pass_claimed") is not False
+        or type(ledger.get("candidate_new_failures")) is not int
+        or ledger.get("candidate_new_failures") != 0
+        or not isinstance(ledger_issue_claims, list)
+        or bool(ledger_issue_claims)
+    ):
+        return {}
+    payload_base = str(payload.get("base_commit_sha") or "").strip().lower()
+    payload_candidate = str(
+        payload.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    ledger_base = str(ledger.get("base_commit_sha") or "").strip().lower()
+    ledger_candidate = str(
+        ledger.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    if not (
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", payload_base)
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", payload_candidate)
+        and payload_base == ledger_base
+        and payload_candidate == ledger_candidate
+        and payload_base != payload_candidate
+    ):
+        return {}
+    return {
+        "base_commit_sha": payload_base,
+        "candidate_commit_sha": payload_candidate,
+    }
+
+
 def _qa_validate_candidate_review_claims(
     body: Mapping[str, Any],
     review_context: Mapping[str, Any],
 ) -> None:
     containers = _qa_review_claim_containers(body)
     mismatches: list[dict[str, Any]] = []
+    comparison_tuple = _qa_external_no_pass_comparison_tuple(body)
+    comparison_base = str(
+        comparison_tuple.get("base_commit_sha") or ""
+    ).strip().lower()
+    if comparison_tuple:
+        expected_comparison_base = str(
+            review_context.get("comparison_base_commit_sha") or ""
+        ).strip().lower()
+        expected_candidate = str(
+            review_context.get("candidate_commit_sha") or ""
+        ).strip().lower()
+        for field, expected, actual in (
+            (
+                "comparison_base_commit_sha",
+                expected_comparison_base,
+                comparison_base,
+            ),
+            (
+                "candidate_commit_sha",
+                expected_candidate,
+                comparison_tuple["candidate_commit_sha"],
+            ),
+        ):
+            if actual != expected:
+                mismatches.append(
+                    {
+                        "field": field,
+                        "expected": expected,
+                        "actual": actual,
+                        "claim_namespace": (
+                            "external_no_pass_baseline_comparison"
+                        ),
+                    }
+                )
     for field, field_aliases in _QA_REVIEW_CLAIM_ALIASES.items():
         expected = review_context.get(field)
-        for container in containers:
+        for path, container in containers:
             for alias in field_aliases:
                 if alias not in container:
+                    continue
+                if (
+                    comparison_tuple
+                    and path in _QA_EXTERNAL_NO_PASS_COMPARISON_PATHS
+                    and field == "base_commit_sha"
+                    and str(container.get(alias) or "").strip().lower()
+                    == comparison_base
+                ):
                     continue
                 supplied = container.get(alias)
                 if field == "changed_files":
