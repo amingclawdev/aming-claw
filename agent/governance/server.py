@@ -12081,6 +12081,40 @@ def _parallel_branch_allocate_row_test_files(
     return _string_list_field(_row_get(row, "test_files", ""))
 
 
+def _parallel_branch_allocate_mf_parallel_rev8_record(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve an allocation's exact rev8 parent without guessing from a row."""
+
+    observer_command_id = str(body.get("observer_command_id") or "").strip()
+    execution_id = _runtime_context_public_text(
+        body.get("contract_execution_id"),
+        body.get("successor_contract_execution_id"),
+        body.get("current_contract_execution_id"),
+        observer_command_id if observer_command_id.startswith("cex-") else "",
+    )
+    if not execution_id:
+        return {}
+    try:
+        record = _contract_runtime_store(conn).get(execution_id)
+    except ContractRuntimeError:
+        return {}
+    if (
+        not _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+        or str(record.get("revision") or "").strip() != "rev8"
+        or str(record.get("project_id") or "").strip() != str(project_id)
+        or str(record.get("backlog_id") or "").strip() != str(backlog_id)
+    ):
+        return {}
+    return dict(record)
+
+
 def _parallel_branch_allocate_should_persist_contract_revision(
     body: Mapping[str, Any],
     *,
@@ -12660,18 +12694,32 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         str(ctx.body.get("backlog_id") or ""),
     )
     conn = get_connection(project_id)
+    rev8_allocation_record = _parallel_branch_allocate_mf_parallel_rev8_record(
+        conn,
+        project_id=project_id,
+        backlog_id=str(ctx.body.get("backlog_id") or ""),
+        body=ctx.body or {},
+    )
     if request_file_fence_explicit:
         if not request_owned_files:
             request_owned_files = list(request_target_files)
         if not request_target_files:
             request_target_files = list(request_owned_files)
         if request_owned_files or request_target_files:
-            request_owned_files = _runtime_context_public_file_values(
-                [*request_owned_files, *backlog_test_files]
-            )
-            request_target_files = _runtime_context_public_file_values(
-                [*request_target_files, *backlog_test_files]
-            )
+            if rev8_allocation_record:
+                request_owned_files = _runtime_context_public_file_values(
+                    request_owned_files
+                )
+                request_target_files = _runtime_context_public_file_values(
+                    request_target_files
+                )
+            else:
+                request_owned_files = _runtime_context_public_file_values(
+                    [*request_owned_files, *backlog_test_files]
+                )
+                request_target_files = _runtime_context_public_file_values(
+                    [*request_target_files, *backlog_test_files]
+                )
     else:
         _, row_declared_files = _backlog_acceptance_scope_authority(
             conn,
@@ -12803,23 +12851,39 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 if "acceptance" in ctx.body
                 else _ACCEPTANCE_SCOPE_REPORT_UNSET
             )
-        (
-            acceptance_scope_criteria,
-            acceptance_scope_closure,
-        ) = _require_backlog_acceptance_file_fence_closure(
-            conn,
-            project_id=project_id,
-            backlog_id=str(ctx.body.get("backlog_id") or ""),
-            task_id=task_id,
-            allowed_files=(
-                request_owned_files or request_target_files
-                if request_file_fence_explicit
-                else _ACCEPTANCE_FILE_FENCE_UNSET
-            ),
-            actor_role=str(ctx.body.get("caller_role") or "observer"),
-            reported_acceptance_criteria=reported_acceptance,
-            implementation_started=acceptance_implementation_started,
-        )
+        if rev8_allocation_record:
+            (
+                acceptance_scope_criteria,
+                acceptance_scope_closure,
+            ) = _require_mf_parallel_rev8_lane_acceptance_authority(
+                conn,
+                project_id=project_id,
+                backlog_id=str(ctx.body.get("backlog_id") or ""),
+                task_id=task_id,
+                lane_files=request_owned_files or request_target_files,
+                file_fence_explicit=request_file_fence_explicit,
+                actor_role=str(ctx.body.get("caller_role") or "observer"),
+                reported_acceptance_criteria=reported_acceptance,
+                implementation_started=acceptance_implementation_started,
+            )
+        else:
+            (
+                acceptance_scope_criteria,
+                acceptance_scope_closure,
+            ) = _require_backlog_acceptance_file_fence_closure(
+                conn,
+                project_id=project_id,
+                backlog_id=str(ctx.body.get("backlog_id") or ""),
+                task_id=task_id,
+                allowed_files=(
+                    request_owned_files or request_target_files
+                    if request_file_fence_explicit
+                    else _ACCEPTANCE_FILE_FENCE_UNSET
+                ),
+                actor_role=str(ctx.body.get("caller_role") or "observer"),
+                reported_acceptance_criteria=reported_acceptance,
+                implementation_started=acceptance_implementation_started,
+            )
         effective_body = _parallel_branch_allocate_effective_route_body(
             conn,
             project_id=project_id,
@@ -67717,6 +67781,153 @@ def _contract_runtime_authoritative_runtime_context_projection(
     }
 
 
+def _contract_runtime_acceptance_criteria_claims(
+    value: Any,
+    *,
+    depth: int = 0,
+) -> list[Any]:
+    """Collect explicit client acceptance claims from a bounded JSON payload."""
+
+    if depth > 6:
+        return []
+    claims: list[Any] = []
+    if isinstance(value, Mapping):
+        if "acceptance_criteria" in value:
+            claims.append(value.get("acceptance_criteria"))
+        for child in value.values():
+            if isinstance(child, (Mapping, list, tuple)):
+                claims.extend(
+                    _contract_runtime_acceptance_criteria_claims(
+                        child,
+                        depth=depth + 1,
+                    )
+                )
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            claims.extend(
+                _contract_runtime_acceptance_criteria_claims(
+                    child,
+                    depth=depth + 1,
+                )
+            )
+    return claims
+
+
+def _contract_runtime_mf_parallel_rev8_atomic_acceptance_gate(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    lane_owned_files: Sequence[Sequence[str]],
+    acceptance_claim_source: Any,
+) -> tuple[list[Any], dict[str, Any], list[str]]:
+    """Close row acceptance only over the persisted two-lane file union."""
+
+    from .contract_state_runtime import acceptance_file_fence_closure_gate
+
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    criteria, row_files = _backlog_acceptance_scope_authority(conn, backlog_id)
+    normalized_lanes = [
+        _runtime_context_public_file_values(list(files))
+        for files in lane_owned_files
+    ]
+    persisted_union = sorted(
+        set().union(*(set(files) for files in normalized_lanes))
+        if normalized_lanes
+        else set()
+    )
+    gate = acceptance_file_fence_closure_gate(
+        criteria,
+        persisted_union,
+        authority_source=f"backlog_bugs:{backlog_id}:acceptance_criteria",
+        actor_role="observer",
+        implementation_started=False,
+    )
+    errors = list(gate.get("errors") or [])
+    claims = _contract_runtime_acceptance_criteria_claims(
+        acceptance_claim_source
+    )
+    authority_mismatch = False
+    for claim in claims:
+        claim_gate = acceptance_file_fence_closure_gate(
+            criteria,
+            persisted_union,
+            authority_source=f"backlog_bugs:{backlog_id}:acceptance_criteria",
+            actor_role="observer",
+            reported_acceptance_criteria=claim,
+            implementation_started=False,
+        )
+        if claim_gate.get("authority_mismatch"):
+            authority_mismatch = True
+            errors.extend(claim_gate.get("errors") or [])
+    errors = list(dict.fromkeys(str(error) for error in errors if str(error)))
+    accepted = not errors
+    gate.update(
+        {
+            "schema_version": "mf_parallel.rev8_atomic_acceptance_union.v1",
+            "accepted": accepted,
+            "passed": accepted,
+            "status": "passed" if accepted else "blocked",
+            "errors": errors,
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": execution_id,
+            "scope_mode": "mf_parallel_rev8_atomic_persisted_lane_union",
+            "row_declared_files": row_files,
+            "persisted_lane_count": len(normalized_lanes),
+            "persisted_lane_owned_files": normalized_lanes,
+            "persisted_lane_file_union": persisted_union,
+            "minted_fence_files": persisted_union,
+            "file_fence_source": "persisted_runtime_context_lane_union",
+            "authority_mismatch": authority_mismatch,
+            "row_union_closure_deferred_to_atomic_dispatch": False,
+            "atomic_union_authoritative": True,
+            "client_acceptance_rewrite_allowed": False,
+            "evaluated_before_allocation_or_dispatch": True,
+        }
+    )
+    return criteria, gate, errors
+
+
+def _contract_runtime_mf_parallel_atomic_lane_errors(
+    workers: Sequence[Mapping[str, Any]],
+    *,
+    distinct_fields: Sequence[str],
+) -> list[str]:
+    """Validate exact lane identities and disjoint worker-owned file fences."""
+
+    errors: list[str] = []
+    for field in distinct_fields:
+        values = [str(worker.get(field) or "").strip() for worker in workers]
+        if any(not value for value in values) or len(set(values)) != len(values):
+            errors.append("atomic bounded workers require distinct " + field)
+    owned_by_worker = [
+        set(
+            _runtime_context_service_query_values(
+                worker,
+                "owned_files",
+                "target_files",
+            )
+        )
+        for worker in workers
+    ]
+    overlap = sorted(
+        {
+            path
+            for left_index, left in enumerate(owned_by_worker)
+            for right in owned_by_worker[left_index + 1 :]
+            for path in left.intersection(right)
+        }
+    )
+    if overlap:
+        errors.append(
+            "atomic bounded workers require disjoint owned_files: "
+            + ", ".join(overlap)
+        )
+    return list(dict.fromkeys(errors))
+
+
 def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
     conn,
     *,
@@ -67818,44 +68029,136 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
             "copy_safe_body_available": False,
         }
 
+    lane_owned_files = [
+        _runtime_context_public_file_values(
+            list(getattr(context, "owned_files", ()) or ())
+            or list(getattr(context, "target_files", ()) or ())
+        )
+        for context, _revision_payload in candidates
+    ]
     all_owned_files = sorted(
-        {
-            path
-            for context, _revision_payload in candidates
-            for path in (
-                getattr(context, "owned_files", ())
-                or getattr(context, "target_files", ())
-                or ()
-            )
-        }
+        set().union(*(set(files) for files in lane_owned_files))
+        if lane_owned_files
+        else set()
     )
     acceptance_bodies = [
         dict(revision_payload.get("payload") or {})
         for _context, revision_payload in candidates
         if isinstance(revision_payload.get("payload"), Mapping)
     ]
-    reported_acceptance = _ACCEPTANCE_SCOPE_REPORT_UNSET
-    reported_values = [
-        body.get("acceptance_criteria")
-        for body in acceptance_bodies
-        if "acceptance_criteria" in body
-    ]
-    if reported_values and all(
-        value == reported_values[0] for value in reported_values[1:]
-    ):
-        reported_acceptance = reported_values[0]
-    acceptance_scope_criteria, acceptance_scope_closure = (
-        _require_backlog_acceptance_file_fence_closure(
+    if required_worker_count > 1:
+        candidate_worker_authority: list[dict[str, Any]] = []
+        for (context, revision_payload), owned_files in zip(
+            candidates,
+            lane_owned_files,
+        ):
+            route_identity = _parallel_branch_runtime_contract_route_identity(
+                revision_payload
+            )
+            candidate_worker_authority.append(
+                {
+                    "runtime_context_id": runtime_context_id_for_branch_context(
+                        context
+                    ),
+                    "task_id": str(
+                        getattr(context, "task_id", "") or ""
+                    ).strip(),
+                    "worker_id": str(
+                        getattr(context, "worker_id", "")
+                        or getattr(context, "worker_slot_id", "")
+                        or ""
+                    ).strip(),
+                    "worker_slot_id": str(
+                        getattr(context, "worker_slot_id", "")
+                        or getattr(context, "worker_id", "")
+                        or ""
+                    ).strip(),
+                    "worktree_path": str(
+                        getattr(context, "worktree_path", "") or ""
+                    ).strip(),
+                    "branch_ref": str(
+                        getattr(context, "branch_ref", "") or ""
+                    ).strip(),
+                    "merge_queue_id": str(
+                        getattr(context, "merge_queue_id", "") or ""
+                    ).strip(),
+                    "route_token_ref": str(
+                        route_identity.get("route_token_ref") or ""
+                    ).strip(),
+                    "owned_files": list(owned_files),
+                    "target_files": list(owned_files),
+                }
+            )
+        distinct_fields = [
+            str(field or "").strip()
+            for field in policy.get("distinct_identity_fields") or []
+            if str(field or "").strip()
+        ]
+        if "route_token_ref" not in distinct_fields:
+            distinct_fields.append("route_token_ref")
+        lane_errors = _contract_runtime_mf_parallel_atomic_lane_errors(
+            candidate_worker_authority,
+            distinct_fields=distinct_fields,
+        )
+        if lane_errors:
+            return projected, {
+                "schema_version": (
+                    "contract_runtime.mf_parallel_dispatch_copy_safe_projection.v2"
+                ),
+                "status": "blocked_atomic_lane_authority",
+                "errors": lane_errors,
+                "required_worker_count": required_worker_count,
+                "persisted_worker_count": len(candidates),
+                "atomic_dispatch_required": True,
+                "copy_safe_body_available": False,
+            }
+        (
+            acceptance_scope_criteria,
+            acceptance_scope_closure,
+            acceptance_errors,
+        ) = _contract_runtime_mf_parallel_rev8_atomic_acceptance_gate(
             conn,
             project_id=project_id,
-            backlog_id=backlog_id,
-            task_id=execution_id,
-            allowed_files=all_owned_files,
-            actor_role="observer",
-            reported_acceptance_criteria=reported_acceptance,
-            implementation_started=False,
+            record=record,
+            lane_owned_files=lane_owned_files,
+            acceptance_claim_source=acceptance_bodies,
         )
-    )
+        if acceptance_errors:
+            return projected, {
+                "schema_version": (
+                    "contract_runtime.mf_parallel_dispatch_copy_safe_projection.v2"
+                ),
+                "status": "blocked_atomic_acceptance_union",
+                "errors": acceptance_errors,
+                "acceptance_scope_closure": acceptance_scope_closure,
+                "required_worker_count": required_worker_count,
+                "persisted_worker_count": len(candidates),
+                "atomic_dispatch_required": True,
+                "copy_safe_body_available": False,
+            }
+    else:
+        reported_acceptance = _ACCEPTANCE_SCOPE_REPORT_UNSET
+        reported_values = [
+            body.get("acceptance_criteria")
+            for body in acceptance_bodies
+            if "acceptance_criteria" in body
+        ]
+        if reported_values and all(
+            value == reported_values[0] for value in reported_values[1:]
+        ):
+            reported_acceptance = reported_values[0]
+        acceptance_scope_criteria, acceptance_scope_closure = (
+            _require_backlog_acceptance_file_fence_closure(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=execution_id,
+                allowed_files=all_owned_files,
+                actor_role="observer",
+                reported_acceptance_criteria=reported_acceptance,
+                implementation_started=False,
+            )
+        )
 
     dispatch_payloads: list[dict[str, Any]] = []
     for context, revision_payload in candidates:
@@ -67942,6 +68245,7 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
                     getattr(context, "merge_queue_id", "") or ""
                 ).strip(),
                 "owned_files": dispatch_owned_files,
+                "target_files": dispatch_owned_files,
                 "acceptance_criteria": acceptance_scope_criteria,
                 "acceptance_scope_closure": acceptance_scope_closure,
                 "profile_requirements": profile_requirements,
@@ -67993,6 +68297,7 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
             "atomic_dispatch": True,
             "all_or_nothing": True,
             "owned_files": all_owned_files,
+            "target_files": all_owned_files,
             "acceptance_criteria": acceptance_scope_criteria,
             "acceptance_scope_closure": acceptance_scope_closure,
         }
@@ -82731,6 +83036,12 @@ def _contract_runtime_bind_mf_parallel_dispatch_authority(
                 "runtime_context:"
                 + str(canonical_worker.get("runtime_context_id") or "")
             )
+            canonical_lane_files = _runtime_context_service_query_values(
+                canonical_worker,
+                "owned_files",
+            )
+            canonical_worker["owned_files"] = canonical_lane_files
+            canonical_worker["target_files"] = canonical_lane_files
             canonical_workers.append(canonical_worker)
         if lane_errors:
             return effective, list(dict.fromkeys(lane_errors))
@@ -82750,43 +83061,42 @@ def _contract_runtime_bind_mf_parallel_dispatch_authority(
                 "branch_ref",
                 "merge_queue_id",
             ]
-        for field in distinct_fields:
-            values = [
-                str(worker.get(field) or "").strip()
-                for worker in canonical_workers
-            ]
-            if any(not value for value in values) or len(set(values)) != len(
-                values
-            ):
-                lane_errors.append(
-                    "atomic bounded workers require distinct " + field
-                )
+        if "route_token_ref" not in distinct_fields:
+            distinct_fields.append("route_token_ref")
 
         owned_by_worker = [
-            set(
-                _runtime_context_service_query_values(
-                    worker,
-                    "owned_files",
-                    "target_files",
-                )
-            )
+            set(_runtime_context_service_query_values(worker, "owned_files"))
             for worker in canonical_workers
         ]
-        overlap = sorted(
-            {
-                path
-                for left_index, left in enumerate(owned_by_worker)
-                for right in owned_by_worker[left_index + 1 :]
-                for path in left.intersection(right)
-            }
-        )
-        if overlap:
-            lane_errors.append(
-                "atomic bounded workers require disjoint owned_files: "
-                + ", ".join(overlap)
+        lane_errors.extend(
+            _contract_runtime_mf_parallel_atomic_lane_errors(
+                canonical_workers,
+                distinct_fields=distinct_fields,
             )
+        )
         if lane_errors:
             return effective, list(dict.fromkeys(lane_errors))
+
+        (
+            acceptance_scope_criteria,
+            acceptance_scope_closure,
+            acceptance_errors,
+        ) = _contract_runtime_mf_parallel_rev8_atomic_acceptance_gate(
+            conn,
+            project_id=project_id,
+            record=record,
+            lane_owned_files=[sorted(files) for files in owned_by_worker],
+            acceptance_claim_source=effective,
+        )
+        if acceptance_errors:
+            return effective, acceptance_errors
+        for canonical_worker in canonical_workers:
+            canonical_worker["acceptance_criteria"] = list(
+                acceptance_scope_criteria
+            )
+            canonical_worker["acceptance_scope_closure"] = dict(
+                acceptance_scope_closure
+            )
 
         canonical_workers.sort(
             key=lambda worker: (
@@ -82814,6 +83124,15 @@ def _contract_runtime_bind_mf_parallel_dispatch_authority(
                     set().union(*owned_by_worker)
                     if owned_by_worker
                     else set()
+                ),
+                "target_files": sorted(
+                    set().union(*owned_by_worker)
+                    if owned_by_worker
+                    else set()
+                ),
+                "acceptance_criteria": list(acceptance_scope_criteria),
+                "acceptance_scope_closure": dict(
+                    acceptance_scope_closure
                 ),
                 "dispatch_ticket_authority": {
                     "schema_version": (
@@ -84539,6 +84858,95 @@ def _require_backlog_acceptance_file_fence_closure(
             (
                 "acceptance criteria are not authoritatively closed by the "
                 "minted target_files/owned_files fence"
+            ),
+            422,
+            gate,
+        )
+    return criteria, gate
+
+
+def _require_mf_parallel_rev8_lane_acceptance_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    lane_files: Sequence[str],
+    file_fence_explicit: bool,
+    actor_role: str,
+    reported_acceptance_criteria: Any = _ACCEPTANCE_SCOPE_REPORT_UNSET,
+    implementation_started: bool = False,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Validate one rev8 lane while deferring full closure to atomic fan-in."""
+
+    from .contract_state_runtime import acceptance_file_fence_closure_gate
+
+    criteria, row_files = _backlog_acceptance_scope_authority(conn, backlog_id)
+    lane_authority_files = _runtime_context_public_file_values(list(lane_files))
+    reported = (
+        None
+        if reported_acceptance_criteria is _ACCEPTANCE_SCOPE_REPORT_UNSET
+        else reported_acceptance_criteria
+    )
+    # Row authority proves that the canonical acceptance declaration itself is
+    # structurally closed.  A single lane is intentionally not required to own
+    # every file; that proof belongs to the one atomic persisted-lane union.
+    gate = acceptance_file_fence_closure_gate(
+        criteria,
+        row_files,
+        authority_source=f"backlog_bugs:{backlog_id}:acceptance_criteria",
+        actor_role=actor_role,
+        reported_acceptance_criteria=reported,
+        implementation_started=bool(implementation_started),
+    )
+    lane_files_outside_row_authority = (
+        sorted(set(lane_authority_files) - set(row_files))
+        if row_files
+        else []
+    )
+    errors = list(gate.get("errors") or [])
+    if not file_fence_explicit or not lane_authority_files:
+        errors.append("mf_parallel_rev8_lane_file_fence_required")
+    if lane_files_outside_row_authority:
+        errors.append("mf_parallel_rev8_lane_files_outside_row_authority")
+    errors = list(dict.fromkeys(errors))
+    accepted = not errors
+    gate.update(
+        {
+            "schema_version": (
+                "mf_parallel.rev8_per_lane_acceptance_authority.v1"
+            ),
+            "accepted": accepted,
+            "passed": accepted,
+            "status": "passed" if accepted else "blocked",
+            "errors": errors,
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "scope_mode": "mf_parallel_rev8_per_lane_allocation",
+            "row_declared_files": row_files,
+            "row_file_authority_available": bool(row_files),
+            "lane_authority_files": lane_authority_files,
+            "minted_fence_files": lane_authority_files,
+            "file_fence_input_omitted": not file_fence_explicit,
+            "file_fence_source": "caller_proposed_per_lane",
+            "lane_files_outside_row_authority": (
+                lane_files_outside_row_authority
+            ),
+            "full_row_file_union_required_per_lane": False,
+            "row_union_closure_deferred_to_atomic_dispatch": True,
+            "atomic_union_required_files": list(
+                gate.get("required_file_union") or []
+            ),
+            "evaluated_before_allocation_or_dispatch": True,
+        }
+    )
+    if not accepted:
+        raise GovernanceError(
+            "acceptance_file_fence_closure_failed",
+            (
+                "rev8 per-lane authority is invalid; full row acceptance "
+                "closure remains deferred to atomic dispatch"
             ),
             422,
             gate,
