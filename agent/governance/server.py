@@ -77726,6 +77726,324 @@ def _contract_runtime_bind_qa_independent_verification_authority(
     )
 
 
+def _contract_runtime_rev8_postmerge_qa_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve the one combined rev8 target allowed to enter final QA.
+
+    Worker task/session identity remains bound to the final merge lane.  The
+    graph candidate and execution root, however, come from the durable target
+    ref owner after both lane merges and current-full reconcile.  This keeps a
+    final QA session out of both the last worker worktree and a detached
+    registered project root.
+    """
+
+    if str(record.get("revision") or "").strip() != "rev8":
+        return {}
+
+    def blocked(*codes: str) -> dict[str, Any]:
+        return {
+            "schema_version": (
+                "contract_runtime.rev8_postmerge_qa_authority.v1"
+            ),
+            "status": "blocked",
+            "verified": False,
+            "server_derived": True,
+            "fail_closed": True,
+            "blocker_codes": [code for code in codes if code],
+        }
+
+    merge = _contract_runtime_rev8_two_worker_merge_projection(record)
+    merged_commit = str(
+        merge.get("merged_commit_sha") or ""
+    ).strip().lower()
+    runtime_context_id = str(
+        merge.get("runtime_context_id") or ""
+    ).strip()
+    task_id = str(merge.get("task_id") or "").strip()
+    parent_task_id = str(merge.get("parent_task_id") or "").strip()
+    merge_queue_id = str(
+        merge.get("merge_queue_id") or ""
+    ).strip()
+    queue_item_id = str(merge.get("queue_item_id") or "").strip()
+    if not (
+        merge.get("timeline_verified") is True
+        and merge.get("authority_verified") is True
+        and merge.get("dispatch_lineage_verified") is True
+        and merge.get("all_lane_merges_verified") is True
+        and int(merge.get("lane_merge_count") or 0) == 2
+        and runtime_context_id
+        and task_id
+        and parent_task_id
+        and merge_queue_id
+        and queue_item_id
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit)
+    ):
+        return blocked("two_lane_merge_projection_unverified")
+
+    reconcile_lines = [
+        (index, line)
+        for index, line in enumerate(record.get("completed_lines") or [])
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "observer_reconcile"
+        and str(line.get("actor_role") or "").strip() == "observer"
+        and str(line.get("evidence_kind") or "").strip() == "reconcile"
+    ]
+    if len(reconcile_lines) != 1:
+        return blocked("observer_reconcile_line_not_unique")
+    reconcile_line_index, reconcile_line = reconcile_lines[0]
+    reconcile_acceptance = _contract_runtime_completed_line_acceptance(
+        conn,
+        project_id=project_id,
+        record=record,
+        completed_line_index=reconcile_line_index,
+        expected_line=reconcile_line,
+    )
+    persisted_reconcile_receipt = (
+        _contract_runtime_close_authority_payload_mapping(
+            reconcile_line,
+            "reconcile_authority",
+        )
+    )
+    expected_reconcile_receipt = _contract_runtime_reconcile_record_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+    )
+    if not (
+        reconcile_acceptance.get("db_verified") is True
+        and persisted_reconcile_receipt.get("record_verified") is True
+        and _contract_runtime_close_authority_hash_matches(
+            persisted_reconcile_receipt
+        )
+        and stable_sha256(persisted_reconcile_receipt)
+        == stable_sha256(expected_reconcile_receipt)
+        and str(
+            persisted_reconcile_receipt.get("merged_commit_sha") or ""
+        ).strip().lower()
+        == merged_commit
+        and str(
+            persisted_reconcile_receipt.get("runtime_context_id") or ""
+        ).strip()
+        == runtime_context_id
+        and str(persisted_reconcile_receipt.get("task_id") or "").strip()
+        == task_id
+        and str(
+            persisted_reconcile_receipt.get("parent_task_id") or ""
+        ).strip()
+        == parent_task_id
+        and str(
+            persisted_reconcile_receipt.get("merge_queue_id") or ""
+        ).strip()
+        == merge_queue_id
+    ):
+        return blocked("observer_reconcile_receipt_unverified")
+
+    matching_contexts: dict[str, Any] = {}
+    for dispatch_line in record.get("completed_lines") or []:
+        if not isinstance(dispatch_line, Mapping) or str(
+            dispatch_line.get("line_id") or ""
+        ).strip() != "observer_dispatch_bounded_workers":
+            continue
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=dispatch_line,
+        ):
+            identity = _contract_runtime_context_identity(context)
+            if identity != (runtime_context_id, task_id, parent_task_id):
+                continue
+            matching_contexts[runtime_context_id] = context
+    if len(matching_contexts) != 1:
+        return blocked("final_merge_runtime_context_unresolved")
+    context = next(iter(matching_contexts.values()))
+
+    from .parallel_branch_runtime import (
+        _git_target_owner_alignment_evidence,
+        _git_target_ref_owning_worktree,
+        list_merge_queue_items,
+    )
+
+    queue_matches = [
+        item
+        for item in list_merge_queue_items(
+            conn,
+            project_id,
+            merge_queue_id,
+        )
+        if str(item.task_id or "").strip() == task_id
+    ]
+    if len(queue_matches) != 1:
+        return blocked("final_merge_queue_item_not_unique")
+    queue_item = queue_matches[0]
+    target_ref = str(queue_item.target_ref or "").strip()
+    if not (
+        str(queue_item.queue_item_id or "").strip() == queue_item_id
+        and str(queue_item.backlog_id or "").strip()
+        == str(record.get("backlog_id") or "").strip()
+        and str(queue_item.merge_queue_id or "").strip() == merge_queue_id
+        and str(queue_item.status or "").strip() == "merged"
+        and target_ref
+        and str(queue_item.merge_commit or "").strip().lower()
+        == merged_commit
+        and str(queue_item.target_head_after_merge or "").strip().lower()
+        == merged_commit
+    ):
+        return blocked("final_merge_queue_item_mismatch")
+
+    worker_root = str(getattr(context, "worktree_path", "") or "").strip()
+    if not worker_root:
+        return blocked("final_merge_worker_root_missing")
+    target_owner, target_owner_source = _git_target_ref_owning_worktree(
+        Path(worker_root),
+        target_ref=target_ref,
+        timeout_seconds=10,
+    )
+    if target_owner is None:
+        return blocked("target_ref_owner_unresolved")
+    target_alignment = _git_target_owner_alignment_evidence(
+        target_owner,
+        target_ref=target_ref,
+        merge_commit=merged_commit,
+        timeout_seconds=10,
+    )
+    if not (
+        target_owner_source == "git_worktree_target_ref_owner"
+        and target_alignment.get("passed") is True
+        and str(target_alignment.get("head_commit") or "").strip().lower()
+        == merged_commit
+        and str(target_alignment.get("target_commit") or "").strip().lower()
+        == merged_commit
+        and target_alignment.get("index_clean") is True
+        and target_alignment.get("worktree_clean") is True
+    ):
+        return blocked("target_ref_owner_not_clean_and_aligned")
+
+    timeline_events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=str(record.get("backlog_id") or ""),
+    )
+    reconciled_merge = _contract_runtime_completed_merge_reconcile_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        context=context,
+        timeline_events=timeline_events,
+        merge=merge,
+    )
+    if not (
+        int(reconciled_merge.get("reconcile_event_id") or 0)
+        > int(merge.get("merge_event_id") or 0)
+        and str(reconciled_merge.get("reconcile_source_ref") or "").startswith(
+            "timeline:"
+        )
+    ):
+        return blocked("postmerge_reconcile_event_unverified")
+    current_full = _contract_runtime_current_full_reconcile_authority_from_merge(
+        conn,
+        project_id=project_id,
+        record=record,
+        merge=merge,
+        reconcile=reconciled_merge,
+        target_project_root_override=str(target_owner),
+    )
+    if not (
+        _contract_runtime_current_full_reconcile_activation_verified(current_full)
+        and str(current_full.get("merged_commit_sha") or "").strip().lower()
+        == merged_commit
+        and str(current_full.get("reconciled_commit_sha") or "").strip().lower()
+        == merged_commit
+        and str(current_full.get("active_snapshot_commit") or "").strip().lower()
+        == merged_commit
+        and str(current_full.get("target_project_root") or "").strip()
+        == str(target_owner)
+        and str(current_full.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(current_full.get("task_id") or "").strip() == task_id
+        and str(current_full.get("parent_task_id") or "").strip()
+        == parent_task_id
+        and str(current_full.get("merge_queue_id") or "").strip()
+        == merge_queue_id
+    ):
+        return blocked("current_full_active_snapshot_unverified")
+
+    authority = {
+        "schema_version": "contract_runtime.rev8_postmerge_qa_authority.v1",
+        "source": (
+            "ContractRuntime.two_lane_merge+"
+            "parallel_branch_merge_queue_items+git_target_ref_owner+"
+            "graph_current_full_reconcile_provenance"
+        ),
+        "status": "verified",
+        "verified": True,
+        "server_derived": True,
+        "db_verified": True,
+        "live_verified": True,
+        "graph_reconciled": True,
+        "active_snapshot_verified": True,
+        "fail_closed": True,
+        "project_id": project_id,
+        "backlog_id": str(record.get("backlog_id") or ""),
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": queue_item_id,
+        "target_ref": target_ref,
+        "target_project_root": str(target_owner),
+        "target_root_source": target_owner_source,
+        "candidate_commit_sha": merged_commit,
+        "merged_commit_sha": merged_commit,
+        "reconciled_commit_sha": str(
+            current_full.get("reconciled_commit_sha") or ""
+        ),
+        "canonical_head_commit": str(
+            current_full.get("canonical_head_commit") or ""
+        ),
+        "target_ref_head_commit": str(
+            target_alignment.get("target_commit") or ""
+        ),
+        "target_ref_owner_head_commit": str(
+            target_alignment.get("head_commit") or ""
+        ),
+        "merge_source_ref": str(merge.get("merge_source_ref") or ""),
+        "merge_event_id": int(merge.get("merge_event_id") or 0),
+        "reconcile_source_ref": str(
+            current_full.get("reconcile_source_ref") or ""
+        ),
+        "reconcile_event_id": int(
+            current_full.get("reconcile_event_id") or 0
+        ),
+        "active_snapshot_id": str(
+            current_full.get("active_snapshot_id") or ""
+        ),
+        "active_snapshot_commit": str(
+            current_full.get("active_snapshot_commit") or ""
+        ),
+        "reconcile_snapshot_id": str(
+            current_full.get("reconcile_snapshot_id") or ""
+        ),
+        "reconcile_acceptance_ref": str(
+            reconcile_acceptance.get("acceptance_ref") or ""
+        ),
+        "reconcile_completed_line_ref": str(
+            reconcile_acceptance.get("completed_line_ref") or ""
+        ),
+        "blocker_codes": [],
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 def _contract_runtime_bind_qa_graph_authority(
     ctx: RequestContext,
     conn,
@@ -77738,12 +78056,66 @@ def _contract_runtime_bind_qa_graph_authority(
 ) -> dict[str, Any]:
     requested_trace_ids = _contract_runtime_requested_trace_ids(body, policy)
     identity = _contract_runtime_server_line_identity(record)
-    assigned_root = _contract_runtime_assigned_target_project_root(
-        conn,
-        project_id=project_id,
-        record=record,
-        identity=identity,
+    rev8_postmerge_qa = bool(
+        str(record.get("revision") or "").strip() == "rev8"
+        and str(write.get("line_id") or "").strip() == "qa_graph_context"
     )
+    postmerge_authority = (
+        _contract_runtime_rev8_postmerge_qa_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
+        if rev8_postmerge_qa
+        else {}
+    )
+    if rev8_postmerge_qa and postmerge_authority.get("verified") is not True:
+        raise GovernanceError(
+            "contract_runtime_rev8_postmerge_qa_authority_required",
+            (
+                "rev8 final QA requires one verified combined merge target, "
+                "current-full reconcile, and active graph snapshot"
+            ),
+            409,
+            {
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "line_id": str(write.get("line_id") or ""),
+                "authority_status": str(
+                    postmerge_authority.get("status") or "missing"
+                ),
+                "blocker_codes": list(
+                    postmerge_authority.get("blocker_codes") or []
+                ),
+                "fail_closed": True,
+            },
+        )
+    if postmerge_authority.get("verified") is True:
+        identity = {
+            "runtime_context_id": str(
+                postmerge_authority.get("runtime_context_id") or ""
+            ),
+            "task_id": str(postmerge_authority.get("task_id") or ""),
+            "parent_task_id": str(
+                postmerge_authority.get("parent_task_id") or ""
+            ),
+            "identity_status": "resolved",
+            "identity_source_line_id": "observer_reconcile",
+        }
+        assigned_root = {
+            "status": "resolved",
+            "target_project_root": str(
+                postmerge_authority.get("target_project_root") or ""
+            ),
+        }
+    else:
+        assigned_root = _contract_runtime_assigned_target_project_root(
+            conn,
+            project_id=project_id,
+            record=record,
+            identity=identity,
+        )
     canonical_target_project_root = str(
         assigned_root.get("target_project_root") or ""
     ).strip()
@@ -77777,11 +78149,15 @@ def _contract_runtime_bind_qa_graph_authority(
                 "authority_source": "authenticated_qa_session",
             },
         )
-    expected_candidate_commit = _contract_runtime_server_candidate_commit(
-        conn,
-        project_id=project_id,
-        record=record,
-    )
+    expected_candidate_commit = str(
+        postmerge_authority.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    if not expected_candidate_commit:
+        expected_candidate_commit = _contract_runtime_server_candidate_commit(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
     if not re.fullmatch(
         r"[0-9a-f]{40}|[0-9a-f]{64}", expected_candidate_commit
     ):
@@ -77882,6 +78258,8 @@ def _contract_runtime_bind_qa_graph_authority(
             ),
         }
     )
+    if postmerge_authority.get("verified") is True:
+        evidence["postmerge_qa_authority"] = dict(postmerge_authority)
     evidence["authority_hash"] = stable_sha256(evidence)
 
     authority_key = str(policy.get("authority_object_path") or "").split(".", 1)[-1]
@@ -82894,16 +83272,21 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
     record: Mapping[str, Any],
     merge: Mapping[str, Any],
     reconcile: Mapping[str, Any] | None = None,
+    target_project_root_override: str = "",
 ) -> dict[str, Any]:
     from . import graph_snapshot_store
 
     merged_commit = str(merge.get("merged_commit_sha") or "").strip().lower()
     reconcile = reconcile if isinstance(reconcile, Mapping) else {}
-    root = project_service.resolve_project_root(
-        project_id,
-        None,
-        fallback_self=True,
-    )
+    root = str(target_project_root_override or "").strip()
+    if root:
+        root = str(Path(root).resolve())
+    else:
+        root = project_service.resolve_project_root(
+            project_id,
+            None,
+            fallback_self=True,
+        )
     target_project_root = str(Path(root).resolve()) if root else ""
     canonical_head_commit = (
         _git_head_commit(Path(root)).strip().lower() if root else ""
