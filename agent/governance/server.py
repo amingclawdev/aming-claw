@@ -21370,6 +21370,11 @@ def _runtime_context_worker_recovery_payloads(
         not rejoin_eligibility
         or rejoin_eligibility.get("eligible") is True
     )
+    pre_lineage_bootstrap_recovery = bool(
+        rejoin_eligibility.get("eligible") is True
+        and rejoin_eligibility.get("mode")
+        == "pre_lineage_bootstrap_auth_only"
+    )
     normalized_branch_ref = str(branch_ref or "").strip()
     normalized_base_commit = str(base_commit or "").strip()
     normalized_target_head_commit = str(target_head_commit or "").strip()
@@ -21411,7 +21416,9 @@ def _runtime_context_worker_recovery_payloads(
         ),
         "before_protected_write": [
             "verify AMING_WORKER_SESSION_TOKEN and AMING_WORKER_FENCE_TOKEN are present in the live worker environment",
-            "if raw auth is missing before read receipt or startup, request runtime_context session-token initial-join and inject the returned host_envelope into the real mf_sub worker",
+            "if raw auth is missing before read receipt or startup and no accepted initial join exists, request runtime_context session-token initial-join",
+            "parse MCP CallToolResult content[0].text and retain host_envelope.env process-locally in that same invocation before any protected write",
+            "if the active initial-join envelope was lost before read/startup, use the advertised one-shot pre-lineage rejoin; if that replacement is lost, stop without retry",
             "if raw auth is missing after read receipt and startup, request runtime_context session-token rejoin and inject the returned host_envelope into the real mf_sub worker",
         ],
         "missing_auth_next_legal_action_after_startup": (
@@ -21554,10 +21561,17 @@ def _runtime_context_worker_recovery_payloads(
         "required_before_worker_evidence": [
             "preserve the allocated governed worker id in agent_id/actual_host_worker_id",
             "record the independent Desktop/Codex task identity only as worker_session_id/host_session_id/transcript/filer principal",
+            "parse MCP CallToolResult content[0].text and extract host_envelope.env in the same invocation",
+            "retain raw env only in process-local memory and never print, message, or persist it",
             "inject host_envelope env into the real mf_sub worker",
             "worker submits read receipt",
             "worker records startup",
         ],
+        "bounded_loss_policy": (
+            "if the first envelope is lost, use the single advertised "
+            "pre-lineage rejoin; if that replacement is lost, stop without "
+            "retry or worker-evidence synthesis"
+        ),
         "worker_identity_pointers": dict(worker_identity_pointers),
         "actual_host_identity_binding": dict(actual_host_identity_binding),
         "security_boundary": {
@@ -21591,6 +21605,7 @@ def _runtime_context_worker_recovery_payloads(
             "worker_session_id": normalized_worker_session_id,
             "host_startup_id": normalized_host_startup_id,
             "host_session_id": normalized_host_session_id,
+            "session_token_ref": session_token_ref_placeholder,
             **safe_route_identity,
             "reason": "<operator reason: live worker lost raw auth env>",
             "ttl_seconds": 3600,
@@ -21613,14 +21628,28 @@ def _runtime_context_worker_recovery_payloads(
             "worker_session_id": normalized_worker_session_id,
             "host_startup_id": normalized_host_startup_id,
             "host_session_id": normalized_host_session_id,
+            "session_token_ref": session_token_ref_placeholder,
             **safe_route_identity,
             "reason": "<operator reason: live worker lost raw auth env>",
             "ttl_seconds": 3600,
         },
-        "required_existing_lineage": [
-            "mf_subagent_read_receipt",
-            "mf_subagent_startup",
-        ],
+        "pre_lineage_bootstrap_recovery": pre_lineage_bootstrap_recovery,
+        "required_existing_lineage": (
+            []
+            if pre_lineage_bootstrap_recovery
+            else [
+                "mf_subagent_read_receipt",
+                "mf_subagent_startup",
+            ]
+        ),
+        "one_shot_recovery_contract": {
+            "parse_mcp_content_text_in_same_call": True,
+            "inject_host_envelope_env_process_locally": True,
+            "if_replacement_envelope_lost": (
+                "stop_without_retry_or_second_rejoin"
+            ),
+            "worker_evidence_synthesized": False,
+        },
         "security_boundary": {
             "session_token_ref_alone_authorizes_writes": False,
             "raw_tokens_persisted_to_timeline": False,
@@ -23579,9 +23608,15 @@ def _runtime_context_worker_recovery_details(
         )
         session_token_initial_join_submission: dict[str, Any] = {}
         session_token_rejoin_submission: dict[str, Any] = {}
+        pre_lineage_bootstrap_recovery = bool(
+            missing_worker_lineage
+            and session_token_rejoin_eligibility.get("eligible") is True
+            and session_token_rejoin_eligibility.get("mode")
+            == "pre_lineage_bootstrap_auth_only"
+        )
         if auth_material_missing:
             diagnostics["reason"] = "worker_auth_material_missing"
-            if missing_worker_lineage:
+            if missing_worker_lineage and not pre_lineage_bootstrap_recovery:
                 next_legal_action = "request_runtime_context_initial_join_host_envelope"
                 recovery_action_id = "request_runtime_context_initial_join_host_envelope"
                 session_token_initial_join_submission = {
@@ -23621,10 +23656,22 @@ def _runtime_context_worker_recovery_details(
                     ),
                     "missing_lineage": list(missing_worker_lineage),
                     "required_before_worker_evidence": [
+                        (
+                            "parse MCP CallToolResult content[0].text JSON and "
+                            "extract host_envelope.env in the same invocation"
+                        ),
+                        (
+                            "retain raw env only in process-local memory; never "
+                            "print, message, or persist it"
+                        ),
                         "inject host_envelope env into the real mf_sub worker",
                         "worker submits read receipt",
                         "worker records startup",
                     ],
+                    "bounded_loss_policy": (
+                        "if the replacement envelope is lost, stop without "
+                        "retrying initial_join or synthesizing worker evidence"
+                    ),
                     "security_boundary": {
                         "session_token_ref_alone_authorizes_writes": False,
                         "raw_tokens_persisted_to_timeline": False,
@@ -23641,6 +23688,9 @@ def _runtime_context_worker_recovery_details(
                 expected_host_session_id = str(
                     getattr(context, "host_session_id", "") or ""
                 ).strip()
+                rejoin_contract_execution_id = str(
+                    contract_runtime_sequence.get("contract_execution_id") or ""
+                ).strip()
                 session_token_rejoin_submission = {
                     "schema_version": "runtime_context.session_token_rejoin_submission.v1",
                     "action": "request_runtime_context_rejoin_host_envelope",
@@ -23653,6 +23703,15 @@ def _runtime_context_worker_recovery_details(
                         "runtime_context_id": expected_runtime_context_id,
                         "task_id": str(getattr(context, "task_id", "") or ""),
                         "parent_task_id": expected_parent_task_id,
+                        **(
+                            {
+                                "contract_execution_id": (
+                                    rejoin_contract_execution_id
+                                )
+                            }
+                            if rejoin_contract_execution_id
+                            else {}
+                        ),
                         "target_project_root": expected_target_root,
                         "worker_id": expected_worker_id,
                         "worker_slot_id": expected_worker_slot_id,
@@ -23663,6 +23722,9 @@ def _runtime_context_worker_recovery_details(
                             getattr(context, "host_startup_id", "") or ""
                         ),
                         "host_session_id": expected_host_session_id,
+                        "session_token_ref": (
+                            runtime_context_session_token_ref(context)
+                        ),
                         **safe_route_identity,
                         "reason": "<operator reason: host worker session lost raw auth env>",
                         "ttl_seconds": 3600,
@@ -23671,6 +23733,15 @@ def _runtime_context_worker_recovery_details(
                         "runtime_context_id": expected_runtime_context_id,
                         "task_id": str(getattr(context, "task_id", "") or ""),
                         "parent_task_id": expected_parent_task_id,
+                        **(
+                            {
+                                "contract_execution_id": (
+                                    rejoin_contract_execution_id
+                                )
+                            }
+                            if rejoin_contract_execution_id
+                            else {}
+                        ),
                         "target_project_root": expected_target_root,
                         "worker_id": expected_worker_id,
                         "worker_slot_id": expected_worker_slot_id,
@@ -23681,14 +23752,32 @@ def _runtime_context_worker_recovery_details(
                             getattr(context, "host_startup_id", "") or ""
                         ),
                         "host_session_id": expected_host_session_id,
+                        "session_token_ref": (
+                            runtime_context_session_token_ref(context)
+                        ),
                         **safe_route_identity,
                         "reason": "<operator reason: host worker session lost raw auth env>",
                         "ttl_seconds": 3600,
                     },
-                    "required_existing_lineage": [
-                        "mf_subagent_read_receipt",
-                        "mf_subagent_startup",
-                    ],
+                    "pre_lineage_bootstrap_recovery": (
+                        pre_lineage_bootstrap_recovery
+                    ),
+                    "required_existing_lineage": (
+                        []
+                        if pre_lineage_bootstrap_recovery
+                        else [
+                            "mf_subagent_read_receipt",
+                            "mf_subagent_startup",
+                        ]
+                    ),
+                    "one_shot_recovery_contract": {
+                        "parse_mcp_content_text_in_same_call": True,
+                        "inject_host_envelope_env_process_locally": True,
+                        "if_replacement_envelope_lost": (
+                            "stop_without_retry_or_second_rejoin"
+                        ),
+                        "worker_evidence_synthesized": False,
+                    },
                     "security_boundary": {
                         "session_token_ref_alone_authorizes_writes": False,
                         "raw_tokens_persisted_to_timeline": False,
@@ -31943,6 +32032,328 @@ def _runtime_context_rotate_validated_missing_finish_auth(
     }
 
 
+def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    runtime_context_id: str,
+    body: Mapping[str, Any],
+    contract_execution_id: str,
+    route_identity: Mapping[str, Any],
+    timeline_events: Sequence[Mapping[str, Any]],
+    effective_read_receipt_ref: str = "",
+    effective_startup_ref: str = "",
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Derive the one-shot authority for a lost initial-join envelope.
+
+    This recovery is deliberately narrower than ordinary rejoin.  It only
+    rotates auth while the first accepted initial-join lease is still active
+    and no worker evidence exists.  All identity comes from durable runtime,
+    route, contract, and canonical initial-join audit state; the caller cannot
+    use this path to choose a new worker identity or synthesize lineage.
+    """
+
+    from .parallel_branch_runtime import (
+        runtime_context_id_for_branch_context,
+        runtime_context_session_token_lease_view,
+        runtime_context_session_token_ref,
+    )
+
+    runtime_id = str(runtime_context_id or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    target_project_root = _runtime_context_effective_target_project_root(context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id or ""
+    ).strip()
+    actual_host_worker_id = str(
+        getattr(context, "actual_host_worker_id", "") or ""
+    ).strip()
+    host_startup_id = str(
+        getattr(context, "host_startup_id", "") or ""
+    ).strip()
+    host_session_id = str(
+        getattr(context, "host_session_id", "") or ""
+    ).strip()
+    lease = runtime_context_session_token_lease_view(context, now_iso=now_iso)
+    active_session_token_ref = runtime_context_session_token_ref(context)
+    errors: list[str] = []
+
+    if effective_read_receipt_ref or effective_startup_ref:
+        errors.append("worker_lineage_already_exists")
+    if str(getattr(context, "last_recovery_action", "") or "").strip() != (
+        "mf_subagent_initial_join_issued"
+    ):
+        errors.append("last_recovery_action_not_initial_join")
+    if not (
+        lease.get("status") == "active"
+        and lease.get("authorization_valid") is True
+        and lease.get("expired") is False
+        and lease.get("lease_record_valid") is True
+        and active_session_token_ref
+    ):
+        errors.append("active_initial_join_lease_required")
+
+    accepted_initial_join_audits: list[Mapping[str, Any]] = []
+    for event in timeline_events:
+        if not isinstance(event, Mapping):
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        if not (
+            str(event.get("event_type") or "").strip()
+            == "observer.runtime_context_session_token_initial_join"
+            and str(event.get("event_kind") or "").strip() == "observer_command"
+            and str(event.get("phase") or "").strip()
+            == "runtime_context_initial_join"
+            and str(event.get("status") or "").strip().lower() == "accepted"
+            and str(payload.get("action") or "").strip()
+            == "runtime_context_session_token_initial_join"
+            and str(event.get("task_id") or payload.get("task_id") or "").strip()
+            == task_id
+            and str(
+                event.get("backlog_id") or payload.get("backlog_id") or ""
+            ).strip()
+            == backlog_id
+            and str(payload.get("runtime_context_id") or "").strip()
+            == runtime_id
+        ):
+            continue
+        accepted_initial_join_audits.append(event)
+    if len(accepted_initial_join_audits) != 1:
+        errors.append("exactly_one_accepted_initial_join_audit_required")
+    initial_join_audit = (
+        accepted_initial_join_audits[0] if len(accepted_initial_join_audits) == 1 else {}
+    )
+    initial_join_payload = (
+        initial_join_audit.get("payload")
+        if isinstance(initial_join_audit.get("payload"), Mapping)
+        else {}
+    )
+    worker_session_id = str(
+        initial_join_payload.get("worker_session_id") or ""
+    ).strip()
+
+    persisted_runtime_id = runtime_context_id_for_branch_context(context)
+    expected_request_identity = {
+        "runtime_context_id": persisted_runtime_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "target_project_root": target_project_root,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": actual_host_worker_id,
+        "actual_host_worker_id": actual_host_worker_id,
+        "worker_session_id": worker_session_id,
+        "host_session_id": host_session_id,
+        "session_token_ref": active_session_token_ref,
+        "contract_execution_id": str(contract_execution_id or "").strip(),
+    }
+    for field, expected in expected_request_identity.items():
+        actual = str(body.get(field) or "").strip()
+        if not expected:
+            errors.append(f"persisted_{field}_missing")
+        elif actual != expected:
+            errors.append(f"{field}_mismatch_or_missing")
+
+    if not runtime_id or runtime_id != persisted_runtime_id:
+        errors.append("runtime_context_identity_mismatch")
+    if not project_id or str(getattr(context, "project_id", "") or "").strip() != project_id:
+        errors.append("project_identity_mismatch")
+
+    expected_audit_identity = {
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": actual_host_worker_id,
+        "actual_host_worker_id": actual_host_worker_id,
+        "worker_session_id": worker_session_id,
+        "host_session_id": host_session_id,
+        "session_token_ref": active_session_token_ref,
+    }
+    for field, expected in expected_audit_identity.items():
+        if not expected or str(initial_join_payload.get(field) or "").strip() != expected:
+            errors.append(f"initial_join_audit_{field}_mismatch")
+    request_host_startup_id = str(
+        body.get("host_startup_id") or ""
+    ).strip()
+    audited_host_startup_id = str(
+        initial_join_payload.get("host_startup_id") or ""
+    ).strip()
+    host_startup_identity = (
+        host_startup_id,
+        request_host_startup_id,
+        audited_host_startup_id,
+    )
+    if any(host_startup_identity) and len(set(host_startup_identity)) != 1:
+        errors.append("host_startup_id_conflict")
+    if not (
+        initial_join_payload.get("host_envelope_returned") is True
+        and initial_join_payload.get("raw_session_token_persisted") is False
+        and initial_join_payload.get("raw_fence_token_persisted_to_timeline")
+        is False
+    ):
+        errors.append("initial_join_audit_privacy_or_delivery_proof_invalid")
+    audited_lease = (
+        initial_join_payload.get("session_token_lease")
+        if isinstance(initial_join_payload.get("session_token_lease"), Mapping)
+        else {}
+    )
+    if (
+        not audited_lease
+        or str(audited_lease.get("lease_id") or "").strip()
+        != str(lease.get("lease_id") or "").strip()
+        or str(audited_lease.get("lease_expires_at") or "").strip()
+        != str(lease.get("lease_expires_at") or "").strip()
+    ):
+        errors.append("initial_join_audit_lease_mismatch")
+
+    canonical_route_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    audited_route_identity = (
+        initial_join_payload.get("route_identity")
+        if isinstance(initial_join_payload.get("route_identity"), Mapping)
+        else {}
+    )
+    for field, expected in canonical_route_identity.items():
+        if not expected:
+            errors.append(f"canonical_route_{field}_missing")
+            continue
+        if str(body.get(field) or "").strip() != expected:
+            errors.append(f"request_route_{field}_mismatch_or_missing")
+        if str(audited_route_identity.get(field) or "").strip() != expected:
+            errors.append(f"initial_join_audit_route_{field}_mismatch")
+
+    errors = list(dict.fromkeys(errors))
+    authority = {
+        "schema_version": (
+            "runtime_context.pre_lineage_bootstrap_rejoin_authority.v1"
+        ),
+        "eligible": not errors,
+        "status": "eligible" if not errors else "blocked",
+        "server_derived": True,
+        "auth_only": True,
+        "one_shot": True,
+        "worker_evidence_synthesized": False,
+        "attempt_retry_counters_may_change": False,
+        "project_id": project_id,
+        "runtime_context_id": runtime_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": str(contract_execution_id or "").strip(),
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "actual_host_worker_id": actual_host_worker_id,
+        "worker_session_id": worker_session_id,
+        "host_startup_id": host_startup_id,
+        "host_session_id": host_session_id,
+        "target_project_root": target_project_root,
+        "session_token_ref": active_session_token_ref,
+        "initial_join_audit_event_ref": (
+            f"timeline:{initial_join_audit.get('id', '')}"
+            if initial_join_audit
+            else ""
+        ),
+        "route_identity": canonical_route_identity,
+        "lease": {
+            "lease_id": str(lease.get("lease_id") or ""),
+            "lease_expires_at": str(lease.get("lease_expires_at") or ""),
+            "status": str(lease.get("status") or ""),
+            "authorization_valid": lease.get("authorization_valid") is True,
+            "expired": lease.get("expired") is True,
+        },
+        "errors": errors,
+        "fail_closed": bool(errors),
+        "next_legal_action": (
+            "rotate_pre_lineage_auth_once_then_parse_content_text_same_call"
+            if not errors
+            else "stop_and_repair_pre_lineage_rejoin_authority"
+        ),
+    }
+    return authority
+
+
+def _runtime_context_pre_lineage_guidance_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    timeline_events: Sequence[Mapping[str, Any]],
+    contract_runtime_sequence: Mapping[str, Any],
+    effective_read_receipt_ref: str,
+    effective_startup_ref: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run the same authority gate with server-projected copy-safe identity."""
+
+    from .parallel_branch_runtime import runtime_context_session_token_ref
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    contract_identity, resolution = _runtime_context_source_backed_contract_identity(
+        conn,
+        project_id=project_id,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        task_id=str(getattr(context, "task_id", "") or "").strip(),
+    )
+    contract_execution_id = str(
+        contract_runtime_sequence.get("contract_execution_id")
+        or contract_identity.get("contract_execution_id")
+        or ""
+    ).strip()
+    route_identity = _runtime_context_latest_route_identity(conn, context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    actual_host_worker_id = str(
+        getattr(context, "actual_host_worker_id", "") or ""
+    ).strip()
+    host_session_id = str(getattr(context, "host_session_id", "") or "").strip()
+    body = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": str(getattr(context, "task_id", "") or "").strip(),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "target_project_root": _runtime_context_effective_target_project_root(context),
+        "worker_id": worker_id,
+        "worker_slot_id": str(
+            getattr(context, "worker_slot_id", "") or worker_id
+        ).strip(),
+        "agent_id": actual_host_worker_id,
+        "actual_host_worker_id": actual_host_worker_id,
+        "worker_session_id": host_session_id,
+        "host_startup_id": str(
+            getattr(context, "host_startup_id", "") or ""
+        ).strip(),
+        "host_session_id": host_session_id,
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "contract_execution_id": contract_execution_id,
+        **{
+            field: str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        },
+    }
+    return (
+        _runtime_context_pre_lineage_bootstrap_rejoin_authority(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            body=body,
+            contract_execution_id=contract_execution_id,
+            route_identity=route_identity,
+            timeline_events=timeline_events,
+            effective_read_receipt_ref=effective_read_receipt_ref,
+            effective_startup_ref=effective_startup_ref,
+        ),
+        resolution,
+    )
+
+
 def _runtime_context_session_rejoin_guidance_eligibility(
     conn,
     *,
@@ -31951,7 +32362,9 @@ def _runtime_context_session_rejoin_guidance_eligibility(
 ) -> dict[str, Any]:
     """Project whether the advertised rejoin action can pass current gates."""
 
-    from .parallel_branch_runtime import ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
+    from .parallel_branch_runtime import (
+        ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
+    )
 
     status = str(getattr(context, "status", "") or "").strip()
     projection = {
@@ -31976,6 +32389,74 @@ def _runtime_context_session_rejoin_guidance_eligibility(
             timeline_events=timeline_events,
         )
     )
+    contract_runtime_sequence = (
+        _runtime_context_contract_runtime_worker_sequence_evidence(
+            conn,
+            project_id=project_id,
+            context=context,
+        )
+    )
+    effective_read_receipt_ref = str(
+        timeline_refs.get("read_receipt_event_ref")
+        or contract_runtime_sequence.get("read_receipt_ref")
+        or ""
+    )
+    effective_startup_ref = str(
+        timeline_refs.get("startup_event_ref")
+        or contract_runtime_sequence.get("startup_ref")
+        or ""
+    )
+    missing_lineage = [
+        item
+        for item, present in (
+            ("mf_subagent_read_receipt", effective_read_receipt_ref),
+            ("mf_subagent_startup", effective_startup_ref),
+        )
+        if not present
+    ]
+    if (
+        len(missing_lineage) == 2
+        and str(getattr(context, "last_recovery_action", "") or "").strip()
+        == "mf_subagent_initial_join_issued"
+    ):
+        authority, contract_resolution = (
+            _runtime_context_pre_lineage_guidance_authority(
+                conn,
+                project_id=project_id,
+                context=context,
+                timeline_events=timeline_events,
+                contract_runtime_sequence=contract_runtime_sequence,
+                effective_read_receipt_ref=effective_read_receipt_ref,
+                effective_startup_ref=effective_startup_ref,
+            )
+        )
+        eligible = authority.get("eligible") is True
+        projection.update(
+            {
+                "eligible": eligible,
+                "mode": (
+                    "pre_lineage_bootstrap_auth_only" if eligible else "blocked"
+                ),
+                "authority": authority,
+                "contract_execution_resolution": contract_resolution,
+                "blockers": list(authority.get("errors") or []),
+            }
+        )
+        if eligible:
+            projection["required_response_handling"] = {
+                "parse_mcp_content_text_in_same_call": True,
+                "inject_host_envelope_env_process_locally": True,
+                "if_replacement_envelope_lost": (
+                    "stop_without_retry_or_second_rejoin"
+                ),
+            }
+        return projection
+    if missing_lineage:
+        projection["blockers"] = [
+            "runtime_context_rejoin_requires_existing_worker_lineage",
+            *missing_lineage,
+        ]
+        return projection
     if _runtime_context_failed_qa_revision_rejoin_allowed(
         conn=conn,
         context=context,
@@ -32161,18 +32642,6 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             )
             if not present
         ]
-        if missing_lineage:
-            raise GovernanceError(
-                "runtime_context_rejoin_requires_existing_worker_lineage",
-                "runtime-context session rejoin requires existing worker read receipt and startup evidence",
-                409,
-                {
-                    "runtime_context_id": runtime_context_id,
-                    "task_id": context.task_id,
-                    "missing_lineage": missing_lineage,
-                    "fail_closed": True,
-                },
-            )
         expected_route_identity = _runtime_context_latest_route_identity(conn, context)
         contract_execution_identity = _runtime_context_contract_execution_identity(
             _runtime_context_latest_contract_revision_payload(conn, context)
@@ -32278,6 +32747,49 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         selected_route_identity = (
             resolved_route_identity if resolved_route_identity else expected_route_identity
         )
+        pre_lineage_bootstrap_rejoin_authority: dict[str, Any] = {}
+        if missing_lineage:
+            pre_lineage_bootstrap_rejoin_authority = (
+                _runtime_context_pre_lineage_bootstrap_rejoin_authority(
+                    conn,
+                    project_id=project_id,
+                    context=context,
+                    runtime_context_id=runtime_context_id,
+                    body=body,
+                    contract_execution_id=resolved_contract_execution_id,
+                    route_identity=selected_route_identity,
+                    timeline_events=timeline_events,
+                    effective_read_receipt_ref=effective_read_receipt_ref,
+                    effective_startup_ref=effective_startup_ref,
+                    now_iso=authoritative_now_iso,
+                )
+            )
+            if pre_lineage_bootstrap_rejoin_authority.get("eligible") is not True:
+                raise GovernanceError(
+                    "runtime_context_rejoin_requires_existing_worker_lineage",
+                    (
+                        "runtime-context session rejoin requires existing worker "
+                        "lineage unless the one-shot pre-lineage bootstrap "
+                        "authority is server-verified"
+                    ),
+                    409,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": context.task_id,
+                        "missing_lineage": missing_lineage,
+                        "contract_execution_resolution": dict(
+                            contract_execution_resolution
+                        ),
+                        "pre_lineage_bootstrap_rejoin_authority": (
+                            pre_lineage_bootstrap_rejoin_authority
+                        ),
+                        "next_legal_action": (
+                            "stop_and_repair_pre_lineage_rejoin_authority"
+                        ),
+                        "mutation_performed": False,
+                        "fail_closed": True,
+                    },
+                )
         timeline_reopen_for_revision = _runtime_context_failed_qa_revision_rejoin_allowed(
             conn=conn,
             context=context,
@@ -32461,6 +32973,18 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 },
             ) from exc
 
+        if pre_lineage_bootstrap_rejoin_authority.get("eligible") is True and (
+            int(result.get("attempt") or 0) != int(context.attempt or 0)
+            or int(result.get("retry_round") or 0)
+            != int(context.retry_round or 0)
+        ):
+            raise GovernanceError(
+                "runtime_context_pre_lineage_bootstrap_rejoin_counter_drift",
+                "pre-lineage auth-only recovery changed attempt or retry counters",
+                409,
+                {"mutation_performed": False, "fail_closed": True},
+            )
+
         post_qa_rejoin_retarget_result: dict[str, Any] = {}
         if post_qa_rejoin_retarget_authority is not None:
             try:
@@ -32538,6 +33062,13 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             result["validated_missing_finish_rejoin_authority"] = dict(
                 validated_missing_finish_rejoin_authority
             )
+        if pre_lineage_bootstrap_rejoin_authority:
+            result["pre_lineage_bootstrap_rejoin_authority"] = dict(
+                pre_lineage_bootstrap_rejoin_authority
+            )
+            result["pre_lineage_bootstrap_recovery"] = bool(
+                pre_lineage_bootstrap_rejoin_authority.get("eligible") is True
+            )
         if post_qa_merge_conflict_rejoin_diagnostics:
             result["post_qa_merge_conflict_rejoin_diagnostics"] = dict(
                 post_qa_merge_conflict_rejoin_diagnostics
@@ -32567,6 +33098,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "validated_missing_finish_auth_only_rejoin"
             )
             is not True
+            and result.get("pre_lineage_bootstrap_recovery") is not True
         ):
             renewed_contract_revision = (
                 _runtime_context_append_resolved_route_ref_contract_revision(
@@ -32600,6 +33132,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     "validated_missing_finish_auth_only_rejoin"
                 )
                 is not True
+                and result.get("pre_lineage_bootstrap_recovery") is not True
             )
             result["route_identity_verified"] = True
             result["previous_route_identity"] = _route_identity_public_summary(
@@ -32698,6 +33231,13 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "validated_missing_finish_rejoin_authority": (
                     validated_missing_finish_rejoin_authority
                 ),
+                "pre_lineage_bootstrap_recovery": bool(
+                    result.get("pre_lineage_bootstrap_recovery") is True
+                ),
+                "pre_lineage_bootstrap_rejoin_authority": (
+                    pre_lineage_bootstrap_rejoin_authority
+                ),
+                "worker_evidence_synthesized": False,
                 "runtime_context_id": runtime_context_id_for_branch_context(context),
                 "route_identity_source": safe_route_source,
                 "route_identity_rebound": bool(
@@ -32706,6 +33246,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         "validated_missing_finish_auth_only_rejoin"
                     )
                     is not True
+                    and result.get("pre_lineage_bootstrap_recovery") is not True
                 ),
                 "route_identity_verified": bool(resolved_route_identity),
             }
