@@ -3689,19 +3689,19 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
     assert "restart_or_refresh_mcp_session" in status["recommended_actions"]
 
 
-def test_managed_qa_timeline_ref_schema_bump_marks_pre_ref_client_stale():
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-07-19.3"
-    assert "qa_session_token_ref" in _tool_properties("task_timeline_append")
+def test_bypass_graph_trace_schema_bump_marks_prior_client_stale():
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-02.1"
+    assert "graph_trace_ids" in _tool_properties("contract_runtime_bypass_line")
 
     compatibility = mcp_tool_schema_compatibility(
-        loaded_schema_version="2026-07-16.1",
+        loaded_schema_version="2026-07-19.3",
         server_schema_version=MCP_TOOL_SCHEMA_VERSION,
         minimum_client_schema_version=MCP_TOOL_SCHEMA_VERSION,
     )
 
-    assert compatibility["loaded_client_tool_schema_version"] == "2026-07-16.1"
-    assert compatibility["server_tool_schema_version"] == "2026-07-19.3"
-    assert compatibility["minimum_client_tool_schema_version"] == "2026-07-19.3"
+    assert compatibility["loaded_client_tool_schema_version"] == "2026-07-19.3"
+    assert compatibility["server_tool_schema_version"] == "2026-08-02.1"
+    assert compatibility["minimum_client_tool_schema_version"] == "2026-08-02.1"
     assert compatibility["client_schema_fresh"] is False
     assert compatibility["stale_client_possible"] is True
 
