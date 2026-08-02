@@ -340,6 +340,83 @@ def test_contract_runtime_timeout_schema_bounds_match_across_mcp_entrypoints():
     assert timeout_schemas[0] == timeout_schemas[1]
 
 
+def test_governance_mcp_bypass_schema_and_dispatch_preserve_graph_trace_ids(
+    monkeypatch,
+):
+    bypass_tool = next(
+        tool
+        for tool in governance_mcp_server.TOOLS
+        if tool["name"] == "contract_runtime_bypass_line"
+    )
+    schema = bypass_tool["inputSchema"]
+    assert schema["properties"]["graph_trace_ids"] == {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": (
+            "Canonical graph-query trace ids forwarded unchanged to the "
+            "ContractRuntime bypass facade; evidence_refs are descriptive "
+            "only and are never converted into graph authority."
+        ),
+    }
+    assert "graph_trace_ids" not in schema["required"]
+
+    calls = []
+
+    def fake_http(method, path, body=None, *, gov_token="", timeout_seconds=None):
+        calls.append((method, path, body, gov_token, timeout_seconds))
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_http_with_optional_gov_token",
+        fake_http,
+    )
+    common = {
+        "project_id": "aming-claw",
+        "contract_execution_id": "cex-bypass-stdio",
+        "bypass_identity": "bypass-stdio",
+        "stage_id": "worker",
+        "line_id": "worker_commit",
+        "execution_state_revision": 13,
+        "classification": "runtime_blocker",
+        "reason": "Current line is blocked by the runtime contract.",
+        "decision": "waive_current_line_no_pass",
+        "evidence_refs": ["timeline:event-1"],
+    }
+    graph_trace_ids = ["gqt-current-full-source", "gqt-current-full-callers"]
+
+    assert governance_mcp_server._dispatch_tool(
+        "contract_runtime_bypass_line",
+        {**common, "graph_trace_ids": graph_trace_ids},
+    ) == {"ok": True}
+    assert governance_mcp_server._dispatch_tool(
+        "contract_runtime_bypass_line",
+        common,
+    ) == {"ok": True}
+
+    expected_body = {
+        key: value for key, value in common.items() if key != "project_id"
+    }
+    expected_body.pop("contract_execution_id")
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-runtime/cex-bypass-stdio/line-bypasses",
+            {**expected_body, "graph_trace_ids": graph_trace_ids},
+            "",
+            None,
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-runtime/cex-bypass-stdio/line-bypasses",
+            expected_body,
+            "",
+            None,
+        ),
+    ]
+    assert "graph_trace_ids" not in calls[1][2]
+
+
 def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
@@ -349,7 +426,7 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert stderr == ""
     tools = responses[0]["result"]["tools"]
     schema_meta = responses[0]["result"]["_meta"]["aming_claw_tool_schema"]
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-07-19.3"
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-02.1"
     assert schema_meta["loaded_client_tool_schema_version"] == (
         MCP_TOOL_SCHEMA_VERSION
     )
