@@ -3460,7 +3460,7 @@ def test_worker_commit_bypass_continues_only_from_exact_audited_implementation_b
     conn,
     tmp_path,
 ):
-    case = _worker_commit_after_implementation_bypass_case(
+    case = _live_worker_commit_after_implementation_bypass_case(
         conn,
         tmp_path,
         suffix="positive",
