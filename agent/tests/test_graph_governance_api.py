@@ -2688,7 +2688,9 @@ def test_same_lane_worker_commit_recovery_requires_bounded_descendant_and_reopen
     )
 
 
-def test_worker_commit_bypass_continuation_preserves_current_candidate_without_pass(monkeypatch):
+def test_worker_commit_bypass_continuation_rejects_unaudited_normal_implementation(
+    monkeypatch,
+):
     candidate_commit, old_commit, base_commit = "b" * 40, "a" * 40, "c" * 40
     runtime_context_id = "mfrctx-worker-commit-bypass"
     task_id = "worker-commit-bypass-task"
@@ -2754,12 +2756,15 @@ def test_worker_commit_bypass_continuation_preserves_current_candidate_without_p
         None, project_id=PID, record=record, request=bypass
     )
 
-    assert authority["server_derived"] is authority["db_verified"] is True
-    assert authority["no_pass_claim"] is True
-    assert authority["commit_sha"] == candidate_commit
-    assert authority["changed_files"] == ["owned.py"]
-    assert authority["diff_base_commit"] == base_commit
-    assert server._contract_runtime_server_candidate_commit(None, project_id=PID, record=record) == candidate_commit
+    assert authority == {}
+    assert (
+        server._contract_runtime_server_candidate_commit(
+            None,
+            project_id=PID,
+            record=record,
+        )
+        == old_commit
+    )
 
     forged = json.loads(json.dumps(record))
     forged["completed_lines"][-1]["payload"]["evidence_refs"] = [f"commit:{'f' * 40}"]
@@ -2769,7 +2774,9 @@ def test_worker_commit_bypass_continuation_preserves_current_candidate_without_p
     assert server._contract_runtime_server_candidate_commit(None, project_id=PID, record=forged) == old_commit
 
 
-def test_worker_commit_bypass_uses_clean_diff_when_historical_lineage_is_stale(monkeypatch):
+def test_worker_commit_bypass_rejects_stale_normal_implementation_without_audited_bypass(
+    monkeypatch,
+):
     candidate_commit, historical_commit, base_commit = "d" * 40, "a" * 40, "c" * 40
     runtime_context_id = "mfrctx-worker-commit-stale"
     task_id = "worker-commit-stale-task"
@@ -2835,11 +2842,7 @@ def test_worker_commit_bypass_uses_clean_diff_when_historical_lineage_is_stale(m
         request=request,
     )
 
-    assert authority["server_derived"] is True
-    assert authority["historical_lineage_stale"] is True
-    assert authority["commit_sha"] == candidate_commit
-    assert authority["changed_files"] == ["owned.py"]
-    assert authority["no_pass_claim"] is True
+    assert authority == {}
 
     context.owned_files = ("different.py",)
     assert server._contract_runtime_worker_commit_bypass_continuation_authority(
@@ -2848,6 +2851,449 @@ def test_worker_commit_bypass_uses_clean_diff_when_historical_lineage_is_stale(m
         record=record,
         request=request,
     ) == {}
+
+
+def _worker_commit_after_implementation_bypass_case(
+    conn,
+    tmp_path,
+    *,
+    suffix: str,
+) -> dict[str, Any]:
+    backlog_id = f"AC-WORKER-IMPLEMENTATION-BYPASS-{suffix.upper()}"
+    diagnostic_id = f"AC-CONTRACT-LINE-BYPASS-{suffix.upper()}"
+    execution_id = f"cex-worker-implementation-bypass-{suffix}"
+    task_id = f"worker-implementation-bypass-{suffix}"
+    runtime_context_id = f"mfrctx-worker-implementation-bypass-{suffix}"
+    worktree = tmp_path / suffix
+    base_commit = _init_test_git_repo(worktree, filename="owned.py")
+    (worktree / "owned.py").write_text(
+        "real bounded implementation after the no-PASS line\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "owned.py"], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "real bounded implementation"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(worktree)
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_task_id=execution_id,
+            root_task_id=backlog_id,
+            runtime_context_id=runtime_context_id,
+            branch_ref=f"refs/heads/codex/{task_id}",
+            status=STATE_WORKTREE_READY,
+            worker_id=task_id,
+            worker_slot_id=task_id,
+            target_project_root=str(worktree),
+            worktree_path=str(worktree),
+            base_commit=base_commit,
+            head_commit=candidate_commit,
+            owned_files=("owned.py",),
+        ),
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    implementation_bypass = _record_formal_no_pass_close_bypass(
+        conn,
+        record={"backlog_id": backlog_id, "contract_execution_id": execution_id},
+        line_id="worker_implementation",
+        diagnostic_id=diagnostic_id,
+        revision=7,
+        task_id=task_id,
+        actor="mf_sub",
+        stage_id="worker_implementation",
+    )
+    events = task_timeline.list_events(conn, PID, task_id=task_id, limit=10)
+    source_event = next(
+        event for event in events if event["event_type"] == "contract_line_bypass"
+    )
+    diagnostic_event = next(
+        event
+        for event in events
+        if event["event_type"] == "contract_line_bypass_diagnostic_linked"
+    )
+    dispatch = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "actor_role": "observer",
+        "evidence_kind": "dispatch_bounded_worker",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": execution_id,
+        "payload": {
+            "worker_role": "mf_sub",
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": execution_id,
+        },
+    }
+    implementation_bypass.update(
+        {
+            "line_instance_id": f"runtime_context:{runtime_context_id}",
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": execution_id,
+        }
+    )
+    implementation_bypass["payload"].update(
+        {
+            "blocked_owner_role": "mf_sub",
+            "blocked_evidence_kind": "implementation",
+            "evidence_refs": [
+                f"timeline:{source_event['id']}",
+                f"timeline:{diagnostic_event['id']}",
+                f"backlog:{diagnostic_id}",
+            ],
+        }
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "execution_state_revision": 8,
+        "completed_lines": [dispatch, implementation_bypass],
+        "execution_state": {
+            "next_legal_action": {
+                "stage_id": "worker_commit",
+                "line_id": "worker_commit",
+                "owner_role": "mf_sub",
+                "evidence_kind": "worker_commit",
+            }
+        },
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": "worker_commit",
+                "line_id": "worker_commit",
+                "owner_role": "mf_sub",
+                "evidence_kind": "worker_commit",
+            }
+        },
+        "historical_non_schedulable": False,
+        "historical_execution_resume_allowed": True,
+    }
+    request = {
+        "stage_id": "worker_commit",
+        "line_id": "worker_commit",
+        "actor_role": "mf_sub",
+        "evidence_kind": "contract_line_bypass",
+        "status": "waived",
+        "no_pass_claim": True,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": execution_id,
+        "commit_sha": candidate_commit,
+        "changed_files": ["owned.py"],
+        "diff_base_commit": base_commit,
+        "evidence_refs": [
+            f"commit:{candidate_commit}",
+            f"timeline:{source_event['id']}",
+            f"timeline:{diagnostic_event['id']}",
+        ],
+    }
+    return {
+        "backlog_id": backlog_id,
+        "diagnostic_id": diagnostic_id,
+        "execution_id": execution_id,
+        "task_id": task_id,
+        "runtime_context_id": runtime_context_id,
+        "context": context,
+        "worktree": worktree,
+        "base_commit": base_commit,
+        "candidate_commit": candidate_commit,
+        "source_event": source_event,
+        "diagnostic_event": diagnostic_event,
+        "record": record,
+        "request": request,
+    }
+
+
+def test_worker_commit_bypass_continues_only_from_exact_audited_implementation_bypass(
+    conn,
+    tmp_path,
+):
+    case = _worker_commit_after_implementation_bypass_case(
+        conn,
+        tmp_path,
+        suffix="positive",
+    )
+    assert not any(
+        line.get("evidence_kind") == "implementation"
+        for line in case["record"]["completed_lines"]
+    )
+    assert (
+        server._worker_commit_completed_implementation(
+            case["record"],
+            runtime_context_id=case["runtime_context_id"],
+            task_id=case["task_id"],
+        )
+        is None
+    )
+
+    authority = server._contract_runtime_worker_commit_bypass_continuation_authority(
+        conn,
+        project_id=PID,
+        record=case["record"],
+        request=case["request"],
+    )
+
+    assert "bypass_identity" not in case["request"]
+    assert authority["server_derived"] is authority["db_verified"] is True
+    assert authority["no_pass_claim"] is True
+    assert authority["authoritative_pass_synthesized"] is False
+    assert authority["source_worker_implementation_line_passed"] is False
+    assert authority["normal_implementation_line_required"] is False
+    assert authority["source_worker_implementation_bypass_verified"] is True
+    assert authority["current_worker_commit_next_action_verified"] is True
+    assert authority["unique_dispatch_runtime_context_verified"] is True
+    assert authority["source_worker_implementation_line_instance_id"] == (
+        f"runtime_context:{case['runtime_context_id']}"
+    )
+    assert authority["source_diagnostic_status"] == "OPEN"
+    assert authority["source_diagnostic_backlog_id"] == case["diagnostic_id"]
+    assert authority["source_bypass_event_ref"] == (
+        f"timeline:{case['source_event']['id']}"
+    )
+    assert authority["source_diagnostic_event_ref"] == (
+        f"timeline:{case['diagnostic_event']['id']}"
+    )
+    assert authority["runtime_context_id"] == case["runtime_context_id"]
+    assert authority["task_id"] == case["task_id"]
+    assert authority["commit_sha"] == case["candidate_commit"]
+    assert authority["diff_base_commit"] == case["base_commit"]
+    assert authority["changed_files"] == ["owned.py"]
+    assert authority["owned_files"] == ["owned.py"]
+    assert authority["clean_worktree"] is True
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "missing_dispatch",
+        "wrong_dispatch_lane",
+        "ambiguous_dispatch_lane",
+        "caller_only_commit_ref",
+        "missing_diagnostic",
+        "closed_diagnostic",
+        "mismatched_diagnostic",
+        "missing_source_audit",
+        "missing_diagnostic_audit",
+        "duplicate_source_audit",
+        "mismatched_audit",
+        "dirty_worktree",
+        "out_of_scope_diff",
+        "wrong_commit",
+        "wrong_files",
+        "wrong_base",
+        "historical_execution",
+    ],
+)
+def test_worker_commit_bypass_continuation_rejects_unverified_source_or_candidate_zero_write(
+    conn,
+    tmp_path,
+    variant,
+):
+    case = _worker_commit_after_implementation_bypass_case(
+        conn,
+        tmp_path,
+        suffix=variant,
+    )
+    record, request = case["record"], case["request"]
+    if variant == "missing_dispatch":
+        record["completed_lines"].pop(0)
+    elif variant == "wrong_dispatch_lane":
+        record["completed_lines"][0]["payload"]["task_id"] = "wrong-task"
+        record["completed_lines"][0]["task_id"] = "wrong-task"
+    elif variant == "ambiguous_dispatch_lane":
+        second = replace(
+            case["context"],
+            runtime_context_id=case["runtime_context_id"] + "-second",
+            task_id=case["task_id"] + "-second",
+            worker_id=case["task_id"] + "-second",
+            worker_slot_id=case["task_id"] + "-second",
+            branch_ref=f"refs/heads/codex/{case['task_id']}-second",
+        )
+        upsert_branch_context(conn, second)
+        second_dispatch = copy.deepcopy(record["completed_lines"][0])
+        for target in (second_dispatch, second_dispatch["payload"]):
+            target["runtime_context_id"] = second.runtime_context_id
+            target["task_id"] = second.task_id
+        record["completed_lines"].insert(1, second_dispatch)
+    elif variant == "caller_only_commit_ref":
+        record["completed_lines"] = record["completed_lines"][:1]
+    elif variant == "missing_diagnostic":
+        conn.execute(
+            "DELETE FROM backlog_bugs WHERE bug_id = ?",
+            (case["diagnostic_id"],),
+        )
+    elif variant == "closed_diagnostic":
+        conn.execute(
+            "UPDATE backlog_bugs SET status = 'WAIVED' WHERE bug_id = ?",
+            (case["diagnostic_id"],),
+        )
+    elif variant == "mismatched_diagnostic":
+        conn.execute(
+            "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+            (
+                json.dumps({"source_backlog_id": "AC-WRONG", "line_id": "worker_implementation"}),
+                case["diagnostic_id"],
+            ),
+        )
+    elif variant in {"missing_source_audit", "missing_diagnostic_audit"}:
+        event = (
+            case["source_event"]
+            if variant == "missing_source_audit"
+            else case["diagnostic_event"]
+        )
+        conn.execute("DELETE FROM task_timeline_events WHERE id = ?", (event["id"],))
+    elif variant == "duplicate_source_audit":
+        duplicate = case["source_event"]
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=case["backlog_id"],
+            task_id=case["task_id"],
+            event_type=duplicate["event_type"],
+            event_kind=duplicate["event_kind"],
+            phase=duplicate["phase"],
+            actor=duplicate["actor"],
+            status=duplicate["status"],
+            decision=duplicate["decision"],
+            correlation_id=duplicate["correlation_id"],
+            payload=duplicate["payload"],
+        )
+    elif variant == "mismatched_audit":
+        bad_payload = {**case["source_event"]["payload"], "task_id": "wrong-task"}
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (json.dumps(bad_payload), case["source_event"]["id"]),
+        )
+    elif variant == "dirty_worktree":
+        (case["worktree"] / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+    elif variant == "out_of_scope_diff":
+        (case["worktree"] / "outside.py").write_text("outside\n", encoding="utf-8")
+        subprocess.run(["git", "add", "outside.py"], cwd=case["worktree"], check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "out of scope"],
+            cwd=case["worktree"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        request["commit_sha"] = batch_jobs.git_commit(case["worktree"])
+        request["evidence_refs"][0] = f"commit:{request['commit_sha']}"
+        request["changed_files"] = ["outside.py", "owned.py"]
+    elif variant == "wrong_commit":
+        request["commit_sha"] = "f" * 40
+        request["evidence_refs"][0] = f"commit:{'f' * 40}"
+    elif variant == "wrong_files":
+        request["changed_files"] = ["wrong.py"]
+    elif variant == "wrong_base":
+        case["context"] = upsert_branch_context(
+            conn,
+            replace(case["context"], base_commit=case["candidate_commit"]),
+        )
+    elif variant == "historical_execution":
+        record["historical_non_schedulable"] = True
+        record["historical_execution_resume_allowed"] = False
+    conn.commit()
+    before_record = server.stable_sha256(record)
+    before_request = server.stable_sha256(request)
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=case["task_id"],
+        limit=1000,
+    )
+
+    assert server._contract_runtime_worker_commit_bypass_continuation_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        request=request,
+    ) == {}
+    assert server.stable_sha256(record) == before_record
+    assert server.stable_sha256(request) == before_request
+    assert get_branch_context(conn, PID, case["task_id"]) == before_context
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=case["task_id"],
+        limit=1000,
+    ) == before_events
+
+
+def test_worker_commit_line_bypass_forwards_server_derived_no_pass_continuation(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _worker_commit_after_implementation_bypass_case(
+        conn,
+        tmp_path,
+        suffix="line-bypass-path",
+    )
+    captured: dict[str, Any] = {}
+
+    class FakeRuntime:
+        store = SimpleNamespace(get=lambda _execution_id: case["record"])
+
+        def bypass_current_line(self, _execution_id, body, **_kwargs):
+            captured.update(body)
+            return {"ok": False, "decision": {"errors": ["bounded-test-stop"]}}
+
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: FakeRuntime())
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_effective_actor_role",
+        lambda *_args, **_kwargs: "mf_sub",
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda _conn, **kwargs: (kwargs["record"], {}),
+    )
+    response = server.handle_project_contract_runtime_line_bypass(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": case["execution_id"],
+            },
+            "coordinator",
+            method="POST",
+            body={
+                **case["request"],
+                "bypass_identity": (
+                    f"bypass:{case['execution_id']}:revision-8:"
+                    "worker_commit:worker_commit"
+                ),
+                "execution_state_revision": 8,
+                "runtime_guide_hash": "sha256:worker-commit-bypass-guide",
+                "diagnostic_backlog_id": (
+                    "AC-CONTRACT-LINE-BYPASS-WORKER-COMMIT-PATH"
+                ),
+                "classification": "system_logic",
+                "reason": "continue the prior audited no-PASS implementation line",
+            },
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["decision"]["errors"] == ["bounded-test-stop"]
+    continuation = captured["continuation_authority"]
+    assert continuation["server_derived"] is True
+    assert continuation["no_pass_claim"] is True
+    assert continuation["authoritative_pass_synthesized"] is False
+    assert continuation["source_worker_implementation_bypass_verified"] is True
+    assert continuation["commit_sha"] == case["candidate_commit"]
 
 
 def test_generic_timeline_path_cannot_author_contract_worker_commit():
@@ -37399,6 +37845,7 @@ def _pre_lineage_rejoin_body(case: Mapping[str, Any]) -> dict[str, Any]:
         "worker_session_id": case["worker_session_id"],
         "host_startup_id": case["host_startup_id"],
         "host_session_id": case["worker_session_id"],
+        "session_token_ref": runtime_context_session_token_ref(case["context"]),
         **case["route_identity"],
         "reason": "same Desktop worker lost the accepted envelope before lineage",
         "ttl_seconds": 3600,
@@ -37409,8 +37856,9 @@ def _pre_lineage_rejoin(
     case: Mapping[str, Any],
     *,
     body_updates: Mapping[str, Any] | None = None,
+    body_override: Mapping[str, Any] | None = None,
 ):
-    body = _pre_lineage_rejoin_body(case)
+    body = dict(body_override or _pre_lineage_rejoin_body(case))
     body.update(dict(body_updates or {}))
     return server.handle_graph_governance_runtime_context_session_token_rejoin(
         _ctx_with_role(
@@ -37596,6 +38044,8 @@ def test_runtime_context_pre_lineage_rejoin_rotates_auth_once_without_state_or_e
             "visible_injection_manifest_hash",
             "sha256:wrong-pre-lineage-visible",
         ),
+        ("session_token_ref", "wstok-wrong-pre-lineage-ref"),
+        ("__ref_only__", ""),
     ],
 )
 def test_runtime_context_pre_lineage_rejoin_identity_route_and_contract_drift_is_zero_write(
@@ -37619,8 +38069,23 @@ def test_runtime_context_pre_lineage_rejoin_identity_route_and_contract_drift_is
     )
     before_events = _pre_lineage_case_events(conn, case)
 
+    ref_only_body = None
+    if field == "__ref_only__":
+        ref_only_body = {
+            "task_id": case["task_id"],
+            "parent_task_id": case["parent_task_id"],
+            "target_project_root": str(case["target_root"]),
+            "session_token_ref": runtime_context_session_token_ref(
+                case["context"]
+            ),
+            "reason": "a copy-safe ref alone must not authorize rotation",
+        }
     with pytest.raises(GovernanceError) as drift:
-        _pre_lineage_rejoin(case, body_updates={field: bad_value})
+        _pre_lineage_rejoin(
+            case,
+            body_updates={} if ref_only_body else {field: bad_value},
+            body_override=ref_only_body,
+        )
 
     assert drift.value.code in {
         "runtime_context_pre_lineage_rejoin_identity_mismatch",
@@ -37678,11 +38143,21 @@ def test_runtime_context_pre_lineage_rejoin_invalid_lease_or_state_is_zero_write
         tmp_path,
         suffix=suffix,
     )
-    mutated = upsert_branch_context(
-        conn,
-        replace(case["context"], **context_updates),
-        now_iso="2099-08-02T01:00:00Z",
-    )
+    if context_updates == {"session_token_hash": ""}:
+        conn.execute(
+            "UPDATE parallel_branch_runtime_contexts "
+            "SET session_token_hash = '' WHERE project_id = ? AND task_id = ?",
+            (PID, case["task_id"]),
+        )
+        conn.commit()
+        mutated = get_branch_context(conn, PID, case["task_id"])
+        assert mutated is not None and not mutated.session_token_hash
+    else:
+        mutated = upsert_branch_context(
+            conn,
+            replace(case["context"], **context_updates),
+            now_iso="2099-08-02T01:00:00Z",
+        )
     case["context"] = mutated
     before_events = _pre_lineage_case_events(conn, case)
 
@@ -52661,6 +53136,9 @@ def _record_formal_no_pass_close_bypass(
     line_id: str,
     diagnostic_id: str,
     revision: int,
+    task_id: str = "",
+    actor: str = "observer",
+    stage_id: str = "",
 ) -> dict:
     backlog_id = record["backlog_id"]
     execution_id = record["contract_execution_id"]
@@ -52678,13 +53156,14 @@ def _record_formal_no_pass_close_bypass(
         "no_pass_claim": True,
     }
     line = {
-        "stage_id": (
+        "stage_id": stage_id
+        or (
             "worker_finish"
             if line_id == "worker_finish_gate"
             else "observer_integration"
         ),
         "line_id": line_id,
-        "actor_role": "observer",
+        "actor_role": actor,
         "evidence_kind": "contract_line_bypass",
         "status": "waived",
         "no_pass_claim": True,
@@ -52722,11 +53201,11 @@ def _record_formal_no_pass_close_bypass(
         conn,
         project_id=PID,
         backlog_id=backlog_id,
-        task_id=f"{backlog_id.lower()}-worker",
+        task_id=task_id or f"{backlog_id.lower()}-worker",
         event_type="contract_line_bypass",
         event_kind="record_blocker",
         phase="contract_runtime_bypass",
-        actor="observer",
+        actor=actor,
         status="proceeded_with_exception",
         decision="linked_open_diagnostic_no_pass",
         correlation_id=correlation_id,
@@ -52736,11 +53215,11 @@ def _record_formal_no_pass_close_bypass(
         conn,
         project_id=PID,
         backlog_id=diagnostic_id,
-        task_id=f"{backlog_id.lower()}-worker",
+        task_id=task_id or f"{backlog_id.lower()}-worker",
         event_type="contract_line_bypass_diagnostic_linked",
         event_kind="record_blocker",
         phase="contract_runtime_bypass",
-        actor="observer",
+        actor=actor,
         status="open",
         decision="keep_open_until_block_repaired",
         correlation_id=correlation_id,
