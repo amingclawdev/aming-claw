@@ -18,7 +18,7 @@ from agent.tests.fixtures.parallel_project import (
     create_pb001_restart_fixture_project,
 )
 from agent.governance.db import SCHEMA_VERSION, _ensure_schema
-from agent.governance import graph_query_trace
+from agent.governance import graph_query_trace, parallel_branch_runtime
 from agent.governance.contract_state_runtime import build_contract_state_projection
 from agent.governance.mf_subagent_contract import (
     MfSubagentContractError,
@@ -123,6 +123,112 @@ PB001_BRANCH_NAMES = {
     "T4": "codex/PB001-T4-dashboard-read-model",
     "T5": "codex/PB001-T5-chain-adapter",
 }
+
+
+def _batch_read_model_planned_item_and_contexts(
+    *,
+    context_count: int = 1,
+    context_batch_id: str = "mf-batch-parallel-no-runtime",
+    context_merge_queue_id: str = "mq-no-runtime",
+    context_ref_name: str = "main",
+) -> tuple[MergeQueueItem, list[BranchTaskRuntimeContext]]:
+    batch_id = "mf-batch-parallel-no-runtime"
+    backlog_id = "AC-BATCH-NO-RUNTIME-ROW-1"
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id="mq-no-runtime",
+        queue_item_id="mqitem-no-runtime-1",
+        backlog_id=backlog_id,
+        task_id=f"{batch_id}:row:1",
+        branch_ref="",
+        queue_index=1,
+        status="planned",
+        target_ref="refs/heads/main",
+    )
+    contexts = [
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=context_batch_id,
+            backlog_id=backlog_id,
+            task_id=f"cex-no-runtime-{index}",
+            branch_ref=f"refs/heads/codex/cex-no-runtime-{index}",
+            status=STATE_WORKTREE_READY,
+            merge_queue_id=context_merge_queue_id,
+            ref_name=context_ref_name,
+        )
+        for index in range(1, context_count + 1)
+    ]
+    return item, contexts
+
+
+def test_batch_planned_item_binding_without_runtime_uses_exact_unique_identity() -> None:
+    item, contexts = _batch_read_model_planned_item_and_contexts()
+
+    bindings = (
+        parallel_branch_runtime._read_model_batch_planned_item_context_bindings(
+            [item],
+            project_id=PROJECT_ID,
+            batch_id="mf-batch-parallel-no-runtime",
+            merge_queue_id="mq-no-runtime",
+            active_target_ref="refs/heads/main",
+            contexts=contexts,
+            batch_runtime=None,
+        )
+    )
+
+    assert bindings == {item.task_id: contexts[0]}
+
+
+@pytest.mark.parametrize(
+    ("case", "requested_batch_id", "context_kwargs"),
+    [
+        (
+            "standalone",
+            "",
+            {},
+        ),
+        (
+            "wrong_batch",
+            "mf-batch-parallel-no-runtime",
+            {"context_batch_id": "mf-batch-parallel-other"},
+        ),
+        (
+            "wrong_queue",
+            "mf-batch-parallel-no-runtime",
+            {"context_merge_queue_id": "mq-other"},
+        ),
+        (
+            "wrong_target",
+            "mf-batch-parallel-no-runtime",
+            {"context_ref_name": "develop"},
+        ),
+        (
+            "ambiguous_contexts",
+            "mf-batch-parallel-no-runtime",
+            {"context_count": 2},
+        ),
+    ],
+)
+def test_batch_planned_item_binding_without_runtime_fails_closed(
+    case: str,
+    requested_batch_id: str,
+    context_kwargs: dict[str, object],
+) -> None:
+    item, contexts = _batch_read_model_planned_item_and_contexts(**context_kwargs)
+
+    bindings = (
+        parallel_branch_runtime._read_model_batch_planned_item_context_bindings(
+            [item],
+            project_id=PROJECT_ID,
+            batch_id=requested_batch_id,
+            merge_queue_id="mq-no-runtime",
+            active_target_ref="refs/heads/main",
+            contexts=contexts,
+            batch_runtime=None,
+        )
+    )
+
+    assert bindings == {}, case
 
 
 def test_generation_restart_requires_signed_governance_failure_disposition() -> None:

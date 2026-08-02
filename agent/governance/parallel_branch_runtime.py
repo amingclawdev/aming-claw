@@ -12738,6 +12738,7 @@ def _read_model_batch_planned_item_context_bindings(
     items: Sequence[MergeQueueItem],
     *,
     project_id: str,
+    batch_id: str,
     merge_queue_id: str,
     active_target_ref: str,
     contexts: Sequence[BranchTaskRuntimeContext],
@@ -12752,20 +12753,55 @@ def _read_model_batch_planned_item_context_bindings(
     the operator sees recovery state instead of a guessed identity.
     """
 
-    if batch_runtime is None or batch_runtime.batch_id == "":
+    runtime_batch_id = (
+        str(batch_runtime.batch_id or "").strip()
+        if batch_runtime is not None
+        else ""
+    )
+    requested_batch_id = str(batch_id or "").strip()
+    if (
+        runtime_batch_id
+        and requested_batch_id
+        and runtime_batch_id != requested_batch_id
+    ):
+        return {}
+    active_batch_id = runtime_batch_id or requested_batch_id
+    if not active_batch_id:
         return {}
 
     batch_items_by_task = _batch_items_by_task_id(batch_runtime)
+    planned_task_prefix = f"{active_batch_id}:row:"
+    normalized_active_target_ref = _read_model_normalized_target_ref(
+        active_target_ref
+    )
     durable_task_ids = {item.task_id for item in items}
     planned_by_backlog: dict[str, list[MergeQueueItem]] = {}
     for item in items:
         batch_item = batch_items_by_task.get(item.task_id)
+        durable_batch_plan_identity = (
+            batch_item is not None
+            if batch_runtime is not None
+            else (
+                item.task_id.startswith(planned_task_prefix)
+                and item.queue_index > 0
+                and _queue_index_from_task_id(item.task_id) == item.queue_index
+            )
+        )
+        strict_target_matches = True
+        if batch_runtime is None:
+            strict_target_matches = bool(normalized_active_target_ref) and (
+                _read_model_normalized_target_ref(item.target_ref)
+                == normalized_active_target_ref
+            )
         if (
             _normalize_merge_queue_status(item.status) != "planned"
-            or batch_item is None
+            or item.merge_queue_id != merge_queue_id
+            or not durable_batch_plan_identity
             or not item.backlog_id
+            or not strict_target_matches
             or (
-                batch_item.merge_queue_id
+                batch_item is not None
+                and batch_item.merge_queue_id
                 and batch_item.merge_queue_id != merge_queue_id
             )
         ):
@@ -12774,13 +12810,21 @@ def _read_model_batch_planned_item_context_bindings(
 
     contexts_by_backlog: dict[str, list[BranchTaskRuntimeContext]] = {}
     for context in contexts:
+        strict_context_target_matches = True
+        if batch_runtime is None:
+            strict_context_target_matches = (
+                bool(normalized_active_target_ref)
+                and _read_model_normalized_target_ref(context.ref_name)
+                == normalized_active_target_ref
+            )
         if (
             context.project_id != project_id
-            or context.batch_id != batch_runtime.batch_id
+            or context.batch_id != active_batch_id
             or context.merge_queue_id != merge_queue_id
             or not context.backlog_id
             or not context.branch_ref
             or context.task_id in durable_task_ids
+            or not strict_context_target_matches
             or not _context_matches_read_model_target_ref(
                 context,
                 active_target_ref=active_target_ref,
@@ -12830,6 +12874,7 @@ def _recover_read_model_merge_queue_items(
     items: list[MergeQueueItem],
     *,
     project_id: str,
+    batch_id: str,
     merge_queue_id: str,
     target_ref: str,
     contexts: Sequence[BranchTaskRuntimeContext],
@@ -12845,6 +12890,7 @@ def _recover_read_model_merge_queue_items(
     planned_item_bindings = _read_model_batch_planned_item_context_bindings(
         items,
         project_id=project_id,
+        batch_id=batch_id,
         merge_queue_id=merge_queue_id,
         active_target_ref=active_target_ref,
         contexts=contexts,
@@ -22276,6 +22322,7 @@ def build_parallel_branch_read_model_from_db(
         queue_items = _recover_read_model_merge_queue_items(
             queue_items,
             project_id=project_id,
+            batch_id=batch_id,
             merge_queue_id=queue_id,
             target_ref=target_ref,
             contexts=contexts,
