@@ -4522,8 +4522,35 @@ def _persist_ac8_worker_commit_graph_epoch_bypass_case(
         tmp_path,
         suffix=suffix,
     )
-    guide = case["record"]["runtime_guide"]
-    revision = int(case["record"]["execution_state_revision"])
+    runtime = server._contract_runtime(conn)
+    authoritative_record = runtime.store.get(case["execution_id"])
+    recovery_record, recovery_projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=authoritative_record,
+            actor_role="observer",
+        )
+    )
+    assert recovery_projection
+    # bypass_current_line validates the guide produced by projected_record,
+    # before the reader-only same-lane recovery hash overlay is applied.
+    gate_record = runtime.projected_record(
+        case["execution_id"],
+        actor_role="observer",
+        completed_lines=recovery_projection["projected_completed_lines"],
+        projection=recovery_projection,
+    )
+    reader_guide = recovery_record["runtime_guide"]
+    assert reader_guide["next_legal_action"]["line_id"] == "worker_commit"
+    bypass_guidance = reader_guide["line_bypass_guidance"]
+    writer_body = bypass_guidance["create_new_copy_safe_body"]
+    writer_guide_hash = str(writer_body["runtime_guide_hash"] or "").strip()
+    assert writer_guide_hash
+    assert writer_guide_hash == gate_record["runtime_guide"][
+        "runtime_guide_hash"
+    ]
+    revision = int(authoritative_record["execution_state_revision"])
     diagnostic_id = f"AC-CONTRACT-LINE-AC8-{suffix.upper()}"
     response = server.handle_project_contract_runtime_line_bypass(
         _ctx_with_role(
@@ -4540,7 +4567,7 @@ def _persist_ac8_worker_commit_graph_epoch_bypass_case(
                     "worker_commit"
                 ),
                 "execution_state_revision": revision,
-                "runtime_guide_hash": guide["runtime_guide_hash"],
+                "runtime_guide_hash": writer_guide_hash,
                 "diagnostic_backlog_id": diagnostic_id,
                 "classification": "system_logic",
                 "reason": "AC8 exact graph-epoch transition is unsatisfiable normally",
@@ -4791,6 +4818,24 @@ def test_worker_commit_bypass_v3_rejects_unproven_epoch_or_lane_zero_write(
     conn.commit()
 
     runtime = server._contract_runtime(conn)
+    if variant in {
+        "ambiguous_dispatch_lane",
+        "active_failed_qa",
+        "ambiguous_implementation",
+        "missing_prior_worker_commit",
+    }:
+        authoritative_record = runtime.store.get(case["execution_id"])
+        record["execution_state_revision"] = int(
+            authoritative_record["execution_state_revision"]
+        )
+        runtime.store.update(
+            case["execution_id"],
+            record,
+            expected_revision=int(
+                authoritative_record["execution_state_revision"]
+            ),
+        )
+        record = runtime.store.get(case["execution_id"])
     stored_before = runtime.store.get(case["execution_id"])
     revision_before = int(stored_before["execution_state_revision"])
     stored_hash_before = server.stable_sha256(stored_before)
