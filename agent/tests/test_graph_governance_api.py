@@ -4064,7 +4064,7 @@ def test_worker_commit_line_bypass_forwards_server_derived_no_pass_continuation(
     monkeypatch,
     tmp_path,
 ):
-    case = _worker_commit_after_implementation_bypass_case(
+    case = _live_worker_commit_after_implementation_bypass_case(
         conn,
         tmp_path,
         suffix="line-bypass-path",
