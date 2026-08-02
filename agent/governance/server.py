@@ -78974,13 +78974,7 @@ def _contract_runtime_canonical_owned_file_provenance(
     repository_root: str,
     persisted: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Prove that a deployed canonical commit carried the exact owned blobs.
-
-    A later governance repair may legitimately change the same runtime file.
-    In that case an accepted post-deploy QA event may pin the earlier combined
-    candidate that carried the worker's exact blob, but only while that pinned
-    commit remains an ancestor of the supplied canonical commit.
-    """
+    """Prove exact owned-blob equality at the pinned canonical commit."""
 
     candidate_commit = str(candidate_commit_sha or "").strip().lower()
     canonical_commit = str(canonical_commit_sha or "").strip().lower()
@@ -79028,6 +79022,9 @@ def _contract_runtime_canonical_owned_file_provenance(
     candidate_blobs = blob_oids(candidate_commit)
     if not candidate_blobs:
         return {}
+    canonical_blobs = blob_oids(canonical_commit)
+    if canonical_blobs != candidate_blobs:
+        return {}
     persisted_value = persisted if isinstance(persisted, Mapping) else {}
     persisted_current_full = (
         persisted_value.get("current_full_provenance")
@@ -79052,78 +79049,6 @@ def _contract_runtime_canonical_owned_file_provenance(
     )
     if not current_full_provenance:
         return {}
-    canonical_blobs = blob_oids(canonical_commit)
-    provenance_commit = canonical_commit
-    provenance_event_ref = ""
-    source = "canonical_commit_owned_blob_match"
-    if canonical_blobs != candidate_blobs:
-        pinned_provenance_commit = str(
-            persisted_value.get("provenance_commit_sha") or ""
-        ).strip().lower()
-        pinned_event_ref = str(
-            persisted_value.get("provenance_event_ref") or ""
-        ).strip()
-        backlog_id = str(record.get("backlog_id") or "").strip()
-        execution_id = str(
-            record.get("contract_execution_id") or ""
-        ).strip()
-        candidates: list[tuple[int, str, str]] = []
-        for event in _runtime_context_service_timeline_events(
-            conn,
-            project_id=project_id,
-            task_id="",
-            backlog_id=backlog_id,
-        ):
-            if not isinstance(event, Mapping):
-                continue
-            event_id = _contract_runtime_projection_timeline_event_id(event)
-            event_ref = f"timeline:{event_id}" if event_id > 0 else ""
-            event_type = str(event.get("event_type") or "").strip().lower()
-            event_status = str(
-                event.get("status") or event.get("decision") or ""
-            ).strip().lower()
-            event_task_id = str(event.get("task_id") or "").strip()
-            event_commit = str(event.get("commit_sha") or "").strip().lower()
-            if not (
-                event_ref
-                and event_type == "qa.postdeploy_independent_verification"
-                and event_status
-                in {
-                    "accepted",
-                    "ok",
-                    "pass",
-                    "passed",
-                    "succeeded",
-                    "success",
-                }
-                and _contract_runtime_projection_timeline_actor_role(event)
-                == "qa"
-                and event_task_id == execution_id
-                and re.fullmatch(
-                    r"[0-9a-f]{40}|[0-9a-f]{64}",
-                    event_commit,
-                )
-                and _runtime_context_service_graph_trace_values_from_event(
-                    event
-                )
-                and _git_commit_is_ancestor(
-                    root,
-                    event_commit,
-                    canonical_commit,
-                )
-                and blob_oids(event_commit) == candidate_blobs
-            ):
-                continue
-            if pinned_provenance_commit and (
-                event_commit != pinned_provenance_commit
-                or event_ref != pinned_event_ref
-            ):
-                continue
-            candidates.append((event_id, event_commit, event_ref))
-        if len(candidates) != 1:
-            return {}
-        _event_id, provenance_commit, provenance_event_ref = candidates[0]
-        source = "postdeploy_qa_owned_blob_carrier+git_ancestry"
 
     proof = {
         "schema_version": (
@@ -79131,17 +79056,12 @@ def _contract_runtime_canonical_owned_file_provenance(
         ),
         "verified": True,
         "server_derived": True,
-        "source": source,
+        "source": "canonical_commit_owned_blob_match",
         "candidate_commit_sha": candidate_commit,
         "canonical_commit_sha": canonical_commit,
         "owned_files": normalized_owned_files,
         "blob_oids": candidate_blobs,
-        "provenance_commit_sha": provenance_commit,
-        "provenance_event_ref": provenance_event_ref,
-        "current_canonical_commit_contains_candidate_blobs": (
-            canonical_blobs == candidate_blobs
-        ),
-        "canonical_history_contains_trusted_candidate_blobs": True,
+        "current_canonical_commit_contains_candidate_blobs": True,
         "current_full_provenance": current_full_provenance,
     }
     if isinstance(persisted, Mapping) and stable_sha256(persisted) != stable_sha256(
