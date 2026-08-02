@@ -2688,9 +2688,7 @@ def test_same_lane_worker_commit_recovery_requires_bounded_descendant_and_reopen
     )
 
 
-def test_worker_commit_bypass_continuation_rejects_unaudited_normal_implementation(
-    monkeypatch,
-):
+def test_worker_commit_bypass_continuation_preserves_current_candidate_without_pass(monkeypatch):
     candidate_commit, old_commit, base_commit = "b" * 40, "a" * 40, "c" * 40
     runtime_context_id = "mfrctx-worker-commit-bypass"
     task_id = "worker-commit-bypass-task"
@@ -2756,15 +2754,12 @@ def test_worker_commit_bypass_continuation_rejects_unaudited_normal_implementati
         None, project_id=PID, record=record, request=bypass
     )
 
-    assert authority == {}
-    assert (
-        server._contract_runtime_server_candidate_commit(
-            None,
-            project_id=PID,
-            record=record,
-        )
-        == old_commit
-    )
+    assert authority["server_derived"] is authority["db_verified"] is True
+    assert authority["no_pass_claim"] is True
+    assert authority["commit_sha"] == candidate_commit
+    assert authority["changed_files"] == ["owned.py"]
+    assert authority["diff_base_commit"] == base_commit
+    assert server._contract_runtime_server_candidate_commit(None, project_id=PID, record=record) == candidate_commit
 
     forged = json.loads(json.dumps(record))
     forged["completed_lines"][-1]["payload"]["evidence_refs"] = [f"commit:{'f' * 40}"]
@@ -2774,9 +2769,7 @@ def test_worker_commit_bypass_continuation_rejects_unaudited_normal_implementati
     assert server._contract_runtime_server_candidate_commit(None, project_id=PID, record=forged) == old_commit
 
 
-def test_worker_commit_bypass_rejects_stale_normal_implementation_without_audited_bypass(
-    monkeypatch,
-):
+def test_worker_commit_bypass_uses_clean_diff_when_historical_lineage_is_stale(monkeypatch):
     candidate_commit, historical_commit, base_commit = "d" * 40, "a" * 40, "c" * 40
     runtime_context_id = "mfrctx-worker-commit-stale"
     task_id = "worker-commit-stale-task"
@@ -2842,7 +2835,11 @@ def test_worker_commit_bypass_rejects_stale_normal_implementation_without_audite
         request=request,
     )
 
-    assert authority == {}
+    assert authority["server_derived"] is True
+    assert authority["historical_lineage_stale"] is True
+    assert authority["commit_sha"] == candidate_commit
+    assert authority["changed_files"] == ["owned.py"]
+    assert authority["no_pass_claim"] is True
 
     context.owned_files = ("different.py",)
     assert server._contract_runtime_worker_commit_bypass_continuation_authority(
@@ -38502,7 +38499,7 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
             )
         )
     assert rejoin_without_lineage.value.code == (
-        "runtime_context_pre_lineage_rejoin_identity_mismatch"
+        "runtime_context_pre_lineage_rejoin_route_identity_mismatch"
     )
 
 
