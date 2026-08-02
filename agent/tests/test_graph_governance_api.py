@@ -2906,11 +2906,16 @@ def _worker_commit_after_implementation_bypass_case(
         line_id="worker_implementation",
         diagnostic_id=diagnostic_id,
         revision=7,
-        task_id=task_id,
+        task_id=execution_id,
         actor="observer",
         stage_id="worker_implementation",
     )
-    events = task_timeline.list_events(conn, PID, task_id=task_id, limit=10)
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=execution_id,
+        limit=10,
+    )
     source_event = next(
         event for event in events if event["event_type"] == "contract_line_bypass"
     )
@@ -3008,6 +3013,7 @@ def _worker_commit_after_implementation_bypass_case(
         "diagnostic_id": diagnostic_id,
         "execution_id": execution_id,
         "task_id": task_id,
+        "audit_task_id": execution_id,
         "runtime_context_id": runtime_context_id,
         "context": context,
         "worktree": worktree,
@@ -3018,6 +3024,47 @@ def _worker_commit_after_implementation_bypass_case(
         "record": record,
         "request": request,
     }
+
+
+def _assert_worker_commit_bypass_continuation_v2(
+    authority: dict[str, Any],
+    case: dict[str, Any],
+) -> None:
+    assert authority["schema_version"] == (
+        "contract_runtime.worker_commit_bypass_continuation.v2"
+    )
+    assert authority["server_derived"] is authority["db_verified"] is True
+    assert authority["authorization_scope"] == "worker_commit_bypass_only"
+    assert authority["no_pass_claim"] is True
+    assert authority["authoritative_pass_synthesized"] is False
+    assert authority["implementation_pass_claimed"] is False
+    assert authority["runtime_context_id"] == case["runtime_context_id"]
+    assert authority["task_id"] == case["task_id"]
+    assert authority["commit_sha"] == case["candidate_commit"]
+    assert authority["diff_base_commit"] == case["base_commit"]
+    assert authority["changed_files"] == ["owned.py"]
+    assert authority["owned_files"] == ["owned.py"]
+    assert authority["clean_worktree"] is True
+    anchor = authority["implementation_bypass_anchor"]
+    assert anchor["schema_version"] == (
+        "contract_runtime.worker_implementation_bypass_continuation_anchor.v1"
+    )
+    assert anchor["server_derived"] is anchor["db_verified"] is True
+    assert anchor["no_pass_claim"] is True
+    assert anchor["authoritative_pass_synthesized"] is False
+    assert anchor["contract_execution_id"] == case["execution_id"]
+    assert anchor["line_instance_id"] == (
+        f"runtime_context:{case['runtime_context_id']}"
+    )
+    assert anchor["implementation_bypass_diagnostic_id"] == (
+        case["diagnostic_id"]
+    )
+    assert anchor["implementation_bypass_source_event_ref"] == (
+        f"timeline:{case['source_event']['id']}"
+    )
+    assert anchor["implementation_bypass_diagnostic_event_ref"] == (
+        f"timeline:{case['diagnostic_event']['id']}"
+    )
 
 
 def _persist_worker_commit_bypass_current_projection(
@@ -3439,32 +3486,7 @@ def test_worker_commit_bypass_continues_only_from_exact_audited_implementation_b
     )
 
     assert "bypass_identity" not in case["request"]
-    assert authority["server_derived"] is authority["db_verified"] is True
-    assert authority["no_pass_claim"] is True
-    assert authority["authoritative_pass_synthesized"] is False
-    assert authority["source_worker_implementation_line_passed"] is False
-    assert authority["normal_implementation_line_required"] is False
-    assert authority["source_worker_implementation_bypass_verified"] is True
-    assert authority["current_worker_commit_next_action_verified"] is True
-    assert authority["unique_dispatch_runtime_context_verified"] is True
-    assert authority["source_worker_implementation_line_instance_id"] == (
-        f"runtime_context:{case['runtime_context_id']}"
-    )
-    assert authority["source_diagnostic_status"] == "OPEN"
-    assert authority["source_diagnostic_backlog_id"] == case["diagnostic_id"]
-    assert authority["source_bypass_event_ref"] == (
-        f"timeline:{case['source_event']['id']}"
-    )
-    assert authority["source_diagnostic_event_ref"] == (
-        f"timeline:{case['diagnostic_event']['id']}"
-    )
-    assert authority["runtime_context_id"] == case["runtime_context_id"]
-    assert authority["task_id"] == case["task_id"]
-    assert authority["commit_sha"] == case["candidate_commit"]
-    assert authority["diff_base_commit"] == case["base_commit"]
-    assert authority["changed_files"] == ["owned.py"]
-    assert authority["owned_files"] == ["owned.py"]
-    assert authority["clean_worktree"] is True
+    _assert_worker_commit_bypass_continuation_v2(authority, case)
 
 
 def test_worker_commit_bypass_continues_from_real_legacy_shape_observer_bypass(
@@ -3497,26 +3519,250 @@ def test_worker_commit_bypass_continues_from_real_legacy_shape_observer_bypass(
         "task_id",
         "parent_task_id",
     }.intersection(case["request"])
-    assert authority["server_derived"] is authority["db_verified"] is True
-    assert authority["no_pass_claim"] is True
-    assert authority["authoritative_pass_synthesized"] is False
-    assert authority["source_worker_implementation_line_passed"] is False
-    assert authority["source_worker_implementation_bypass_verified"] is True
-    assert authority["current_worker_commit_next_action_verified"] is True
-    assert authority["unique_dispatch_runtime_context_verified"] is True
-    assert authority["runtime_context_id"] == case["runtime_context_id"]
-    assert authority["task_id"] == case["task_id"]
-    assert authority["commit_sha"] == case["candidate_commit"]
-    assert authority["diff_base_commit"] == case["base_commit"]
-    assert authority["changed_files"] == ["owned.py"]
-    assert authority["owned_files"] == ["owned.py"]
-    assert authority["clean_worktree"] is True
-    assert authority["source_bypass_event_ref"] == (
-        f"timeline:{case['source_event']['id']}"
+    _assert_worker_commit_bypass_continuation_v2(authority, case)
+
+
+def _persisted_worker_commit_bypass_case(
+    conn,
+    tmp_path,
+    *,
+    suffix: str,
+) -> dict[str, Any]:
+    case = _live_worker_commit_after_implementation_bypass_case(
+        conn,
+        tmp_path,
+        suffix=suffix,
     )
-    assert authority["source_diagnostic_event_ref"] == (
-        f"timeline:{case['diagnostic_event']['id']}"
+    guide = case["record"]["runtime_guide"]
+    revision = int(case["record"]["execution_state_revision"])
+    worker_commit_diagnostic_id = (
+        f"AC-CONTRACT-LINE-WORKER-COMMIT-BYPASS-{suffix.upper()}"
     )
+    response = server.handle_project_contract_runtime_line_bypass(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": case["execution_id"],
+            },
+            "observer",
+            method="POST",
+            body={
+                **case["request"],
+                "actor_role": "observer",
+                "bypass_identity": (
+                    f"bypass:{case['execution_id']}:revision-{revision}:"
+                    "worker_commit"
+                ),
+                "execution_state_revision": revision,
+                "runtime_guide_hash": guide["runtime_guide_hash"],
+                "diagnostic_backlog_id": worker_commit_diagnostic_id,
+                "classification": "system_logic",
+                "reason": (
+                    "persist the exact audited no-PASS worker_commit "
+                    "continuation"
+                ),
+                "decision": "continue_with_audited_exception",
+            },
+        )
+    )
+    assert response["ok"] is True, json.dumps(response, indent=2, sort_keys=True)
+    written_line = response["written_line"]
+    assert written_line["line_id"] == "worker_commit"
+    assert written_line["actor_role"] == "observer"
+    assert written_line["evidence_kind"] == "contract_line_bypass"
+    assert written_line["status"] == "waived"
+    assert written_line["no_pass_claim"] is True
+    assert written_line["payload"]["no_pass_claim"] is True
+    continuation = written_line["payload"]["continuation_authority"]
+    _assert_worker_commit_bypass_continuation_v2(continuation, case)
+    projected_next = response["runtime_guide"]["next_legal_action"]
+    assert projected_next is not None
+    assert projected_next["line_id"] != "worker_commit"
+
+    persisted_record = server._contract_runtime(conn).store.get(
+        case["execution_id"]
+    )
+    persisted_worker_commit = next(
+        line
+        for line in reversed(persisted_record["completed_lines"])
+        if line.get("line_id") == "worker_commit"
+    )
+    assert persisted_worker_commit == written_line
+    case.update(
+        {
+            "record": persisted_record,
+            "worker_commit_bypass": persisted_worker_commit,
+            "worker_commit_diagnostic_id": worker_commit_diagnostic_id,
+            "worker_commit_response": response,
+        }
+    )
+    return case
+
+
+def test_persisted_worker_commit_bypass_remains_revalidated_no_pass_candidate_authority(
+    conn,
+    tmp_path,
+):
+    case = _persisted_worker_commit_bypass_case(
+        conn,
+        tmp_path,
+        suffix="post-write-positive",
+    )
+    record = case["record"]
+    candidate_commit = server._contract_runtime_server_candidate_commit(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    candidate_base = server._contract_runtime_server_candidate_base_commit(
+        conn,
+        project_id=PID,
+        record=record,
+        expected_candidate_commit=candidate_commit,
+    )
+    actual_line, actual_payload = server._runtime_context_actual_worker_commit_line(
+        conn,
+        contract_execution_id=case["execution_id"],
+        runtime_context_id=case["runtime_context_id"],
+        task_id=case["task_id"],
+    )
+
+    assert candidate_commit == case["candidate_commit"]
+    assert candidate_base == case["base_commit"]
+    assert actual_line["evidence_kind"] == "contract_line_bypass"
+    assert actual_line["status"] == "waived"
+    assert actual_line["no_pass_claim"] is True
+    assert actual_line["commit_sha"] == case["candidate_commit"]
+    assert actual_payload["schema_version"] == (
+        "contract_runtime.worker_commit_bypass_continuation.v2"
+    )
+    assert actual_payload["no_pass_claim"] is True
+    assert actual_payload["authoritative_pass_synthesized"] is False
+    assert actual_payload["implementation_pass_claimed"] is False
+    assert not any(
+        line.get("line_id") == "worker_commit"
+        and line.get("evidence_kind") == "worker_commit"
+        for line in record["completed_lines"]
+    )
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "forged_embedded_server_derived",
+        "mismatched_commit",
+        "mismatched_base",
+        "mismatched_diagnostic",
+        "missing_audit",
+        "superseded_active_chain",
+    ],
+)
+def test_persisted_worker_commit_bypass_rejects_tampered_continuation_authority(
+    conn,
+    tmp_path,
+    variant,
+):
+    case = _persisted_worker_commit_bypass_case(
+        conn,
+        tmp_path,
+        suffix=f"post-write-{variant}",
+    )
+    runtime = server._contract_runtime(conn)
+    forged = copy.deepcopy(case["record"])
+    worker_commit = next(
+        line
+        for line in reversed(forged["completed_lines"])
+        if line.get("line_id") == "worker_commit"
+    )
+    worker_payload = worker_commit["payload"]
+    continuation = worker_payload["continuation_authority"]
+    persist_forged_record = True
+    if variant == "forged_embedded_server_derived":
+        worker_payload["continuation_authority"] = {"server_derived": True}
+    elif variant == "mismatched_commit":
+        worker_commit["commit_sha"] = "f" * 40
+        continuation["commit_sha"] = "f" * 40
+        continuation["worker_commit_sha"] = "f" * 40
+    elif variant == "mismatched_base":
+        continuation["diff_base_commit"] = "f" * 40
+    elif variant == "mismatched_diagnostic":
+        implementation_bypass = next(
+            line
+            for line in forged["completed_lines"]
+            if line.get("line_id") == "worker_implementation"
+            and line.get("evidence_kind") == "contract_line_bypass"
+        )
+        implementation_bypass["payload"]["diagnostic_backlog_id"] = (
+            "AC-WRONG-POST-WRITE-DIAGNOSTIC"
+        )
+    elif variant == "missing_audit":
+        persist_forged_record = False
+        conn.execute(
+            "DELETE FROM task_timeline_events WHERE id = ?",
+            (case["source_event"]["id"],),
+        )
+    elif variant == "superseded_active_chain":
+        persist_forged_record = False
+    if persist_forged_record:
+        runtime.store.update(
+            case["execution_id"],
+            forged,
+            expected_revision=int(case["record"]["execution_state_revision"]),
+        )
+    else:
+        forged = runtime.store.get(case["execution_id"])
+    if variant == "superseded_active_chain":
+        current_execution_id = f"{case['execution_id']}-current-successor"
+        root_execution_id = str(
+            case["projection"]["root_contract_execution_id"]
+        )
+        projection = _persist_worker_commit_bypass_current_projection(
+            conn,
+            backlog_id=case["backlog_id"],
+            execution_id=case["execution_id"],
+            current_execution_id=current_execution_id,
+            active_child_execution_id=current_execution_id,
+            active_execution_ids=[
+                root_execution_id,
+                case["execution_id"],
+                current_execution_id,
+            ],
+        )
+        assert projection["degraded"] is False
+        assert case["execution_id"] in projection["active_chain"]["execution_ids"]
+        assert projection["current_contract_execution_id"] != case["execution_id"]
+    conn.commit()
+
+    persisted_worker_commit = next(
+        line
+        for line in reversed(forged["completed_lines"])
+        if line.get("line_id") == "worker_commit"
+    )
+    assert server._contract_runtime_worker_commit_bypass_continuation_authority(
+        conn,
+        project_id=PID,
+        record=forged,
+        request=persisted_worker_commit,
+    ) == {}
+    assert server._contract_runtime_server_candidate_commit(
+        conn,
+        project_id=PID,
+        record=forged,
+    ) == ""
+    assert server._contract_runtime_server_candidate_base_commit(
+        conn,
+        project_id=PID,
+        record=forged,
+        expected_candidate_commit=case["candidate_commit"],
+    ) == ""
+    with pytest.raises(GovernanceError) as rejected:
+        server._runtime_context_actual_worker_commit_line(
+            conn,
+            contract_execution_id=case["execution_id"],
+            runtime_context_id=case["runtime_context_id"],
+            task_id=case["task_id"],
+        )
+    assert rejected.value.code == "contract_worker_commit_required"
 
 
 @pytest.mark.parametrize(
@@ -3600,7 +3846,7 @@ def test_worker_commit_bypass_continuation_rejects_unverified_source_or_candidat
             conn,
             project_id=PID,
             backlog_id=case["backlog_id"],
-            task_id=case["task_id"],
+            task_id=case["audit_task_id"],
             event_type=duplicate["event_type"],
             event_kind=duplicate["event_kind"],
             phase=duplicate["phase"],
@@ -3704,7 +3950,7 @@ def test_worker_commit_bypass_continuation_rejects_unverified_source_or_candidat
     before_events = task_timeline.list_events(
         conn,
         PID,
-        task_id=case["task_id"],
+        task_id=case["audit_task_id"],
         limit=1000,
     )
 
@@ -3720,7 +3966,7 @@ def test_worker_commit_bypass_continuation_rejects_unverified_source_or_candidat
     assert task_timeline.list_events(
         conn,
         PID,
-        task_id=case["task_id"],
+        task_id=case["audit_task_id"],
         limit=1000,
     ) == before_events
 
@@ -3785,11 +4031,7 @@ def test_worker_commit_line_bypass_forwards_server_derived_no_pass_continuation(
     assert response["ok"] is False
     assert response["decision"]["errors"] == ["bounded-test-stop"]
     continuation = captured["continuation_authority"]
-    assert continuation["server_derived"] is True
-    assert continuation["no_pass_claim"] is True
-    assert continuation["authoritative_pass_synthesized"] is False
-    assert continuation["source_worker_implementation_bypass_verified"] is True
-    assert continuation["commit_sha"] == case["candidate_commit"]
+    _assert_worker_commit_bypass_continuation_v2(continuation, case)
     assert captured["effective_actor_role"] == "observer"
 
 
@@ -53680,8 +53922,8 @@ def _record_formal_no_pass_close_bypass(
         """
         INSERT INTO backlog_bugs (
           bug_id, title, status, chain_trigger_json, bypass_policy_json,
-          created_at, updated_at
-        ) VALUES (?, ?, 'OPEN', ?, ?, ?, ?)
+          mf_type, created_at, updated_at
+        ) VALUES (?, ?, 'OPEN', ?, ?, 'chain_rescue', ?, ?)
         """,
         (
             diagnostic_id,
