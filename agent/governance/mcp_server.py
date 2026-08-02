@@ -689,15 +689,6 @@ def _contract_runtime_bypass_line_schema_properties() -> dict[str, Any]:
         "reason": {"type": "string"},
         "decision": {"type": "string"},
         "evidence_refs": {"type": "array", "items": {"type": "string"}},
-        "graph_trace_ids": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": (
-                "Canonical graph-query trace ids forwarded unchanged to the "
-                "ContractRuntime bypass facade; evidence_refs are descriptive "
-                "only and are never converted into graph authority."
-            ),
-        },
         "task_id": {"type": "string"},
         "phase": {"type": "string"},
         "commit_sha": {"type": "string"},
