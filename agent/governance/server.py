@@ -81846,15 +81846,38 @@ def _contract_runtime_rev8_postmerge_qa_authority(
     ):
         return blocked("required_lane_merge_projection_unverified")
 
+    merge_completed_line_index_value = merge.get(
+        "merge_completed_line_index"
+    )
+    dispatch_completed_line_index_value = merge.get(
+        "dispatch_completed_line_index"
+    )
+    merge_completed_line_index = (
+        int(merge_completed_line_index_value)
+        if isinstance(merge_completed_line_index_value, int)
+        and not isinstance(merge_completed_line_index_value, bool)
+        else -1
+    )
+    dispatch_completed_line_index = (
+        int(dispatch_completed_line_index_value)
+        if isinstance(dispatch_completed_line_index_value, int)
+        and not isinstance(dispatch_completed_line_index_value, bool)
+        else -1
+    )
     reconcile_lines = [
         (index, line)
         for index, line in enumerate(record.get("completed_lines") or [])
         if isinstance(line, Mapping)
+        and index > dispatch_completed_line_index
         and str(line.get("line_id") or "").strip() == "observer_reconcile"
         and str(line.get("actor_role") or "").strip() == "observer"
         and str(line.get("evidence_kind") or "").strip() == "reconcile"
     ]
-    if len(reconcile_lines) != 1:
+    if (
+        dispatch_completed_line_index < 0
+        or merge_completed_line_index <= dispatch_completed_line_index
+        or len(reconcile_lines) != 1
+    ):
         return blocked("observer_reconcile_line_not_unique")
     reconcile_line_index, reconcile_line = reconcile_lines[0]
     reconcile_acceptance = _contract_runtime_completed_line_acceptance(
@@ -81876,7 +81899,8 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         record=record,
     )
     if not (
-        reconcile_acceptance.get("db_verified") is True
+        reconcile_line_index > merge_completed_line_index
+        and reconcile_acceptance.get("db_verified") is True
         and persisted_reconcile_receipt.get("record_verified") is True
         and _contract_runtime_close_authority_hash_matches(
             persisted_reconcile_receipt
@@ -87172,11 +87196,19 @@ def _contract_runtime_rev8_two_worker_merge_projection(
     ):
         return {}
 
-    completed_merge_authorities: list[dict[str, Any]] = []
-    for line in record.get("completed_lines") or []:
+    completed_merge_authorities: list[tuple[int, dict[str, Any]]] = []
+    for line_index, line in enumerate(record.get("completed_lines") or []):
         if not isinstance(line, Mapping) or str(
             line.get("line_id") or ""
         ).strip() != "observer_merge":
+            continue
+        # ContractRuntime history is append-only.  Once rev9 selects a
+        # failed-QA rework dispatch, merges from the initial two-lane
+        # generation remain before that dispatch and are historical evidence,
+        # not candidates for the current generation.  Everything after the
+        # selected dispatch remains fail-closed below, including duplicates or
+        # a merge carrying mixed dispatch/runtime identity.
+        if line_index <= dispatch_index:
             continue
         payload = (
             line.get("payload")
@@ -87236,23 +87268,23 @@ def _contract_runtime_rev8_two_worker_merge_projection(
             is not None
         ):
             return {}
-        completed_merge_authorities.append(dict(durable))
+        completed_merge_authorities.append((line_index, dict(durable)))
 
     authority_lane_ids = {
         str(authority.get("runtime_context_id") or "").strip()
-        for authority in completed_merge_authorities
+        for _line_index, authority in completed_merge_authorities
     }
     distinct_task_ids = {
         str(authority.get("task_id") or "").strip()
-        for authority in completed_merge_authorities
+        for _line_index, authority in completed_merge_authorities
     }
     distinct_queue_ids = {
         str(authority.get("merge_queue_id") or "").strip()
-        for authority in completed_merge_authorities
+        for _line_index, authority in completed_merge_authorities
     }
     event_ids = [
         int(authority.get("merge_event_id") or 0)
-        for authority in completed_merge_authorities
+        for _line_index, authority in completed_merge_authorities
     ]
     if not (
         len(completed_merge_authorities) == required_worker_count
@@ -87262,9 +87294,9 @@ def _contract_runtime_rev8_two_worker_merge_projection(
         and len(set(event_ids)) == required_worker_count
     ):
         return {}
-    final_merge = max(
+    final_merge_index, final_merge = max(
         completed_merge_authorities,
-        key=lambda authority: int(authority.get("merge_event_id") or 0),
+        key=lambda item: int(item[1].get("merge_event_id") or 0),
     )
     return {
         **final_merge,
@@ -87278,6 +87310,8 @@ def _contract_runtime_rev8_two_worker_merge_projection(
             final_merge.get("merge_event_ref") or ""
         ).strip(),
         "contract_runtime_dispatch_source_ref": dispatch_source_ref,
+        "dispatch_completed_line_index": dispatch_index,
+        "merge_completed_line_index": final_merge_index,
         "all_lane_merges_verified": True,
         "lane_merge_count": required_worker_count,
         "required_worker_count": required_worker_count,

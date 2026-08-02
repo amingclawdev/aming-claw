@@ -631,11 +631,27 @@ def test_mf_parallel_rev9_failed_final_qa_routes_to_same_contract_worker_fix():
     }
 
 
-def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation():
+def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation(
+    monkeypatch,
+):
     contract_execution_id = "cex-rev9-single-worker-fix"
     rework_runtime_context_id = "mfrctx-rev9-single-worker-fix"
     rework_task_id = "rev9-single-worker-fix"
-    failed_qa_index = 1
+    failed_qa_index = 4
+    initial_workers = [
+        {
+            "runtime_context_id": "mfrctx-initial-a",
+            "task_id": "initial-worker-a",
+            "parent_task_id": contract_execution_id,
+            "merge_queue_id": "mq-initial-a",
+        },
+        {
+            "runtime_context_id": "mfrctx-initial-b",
+            "task_id": "initial-worker-b",
+            "parent_task_id": contract_execution_id,
+            "merge_queue_id": "mq-initial-b",
+        },
+    ]
     rework_revision = {
         "append_only_history_preserved": True,
         "timeline_projection_authoritative": False,
@@ -665,10 +681,62 @@ def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation()
                 "evidence_kind": "dispatch_bounded_worker",
                 "actor_role": "observer",
                 "payload": {
-                    "bounded_workers": [
-                        {"runtime_context_id": "mfrctx-initial-a"},
-                        {"runtime_context_id": "mfrctx-initial-b"},
-                    ]
+                    "bounded_workers": initial_workers,
+                },
+            },
+            *[
+                {
+                    "stage_id": "observer_lane_merge",
+                    "line_id": "observer_merge",
+                    "evidence_kind": "merge",
+                    "actor_role": "observer",
+                    "runtime_context_id": worker["runtime_context_id"],
+                    "line_instance_id": (
+                        f"runtime_context:{worker['runtime_context_id']}"
+                    ),
+                    "payload": {
+                        "line_instance_id": (
+                            f"runtime_context:{worker['runtime_context_id']}"
+                        ),
+                        "durable_merge_authority": {
+                            "schema_version": (
+                                server._CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
+                            ),
+                            "server_derived": True,
+                            "db_verified": True,
+                            "pre_qa_merge_authorized": True,
+                            "final_qa_required_after_reconcile": True,
+                            "project_id": "aming-claw",
+                            "backlog_id": "AC-REV9-SINGLE-WORKER-FIX",
+                            "contract_execution_id": contract_execution_id,
+                            **worker,
+                            "queue_item_id": f"mqi-initial-{index}",
+                            "contract_runtime_dispatch_source_ref": (
+                                f"contract_runtime:{contract_execution_id}:"
+                                "completed_lines:0"
+                            ),
+                            "merge_commit": str(index) * 40,
+                            "merge_event_ref": f"timeline:{100 + index}",
+                            "merge_event_id": 100 + index,
+                            "merge_event_created_at": (
+                                f"2026-08-02T11:00:0{index}Z"
+                            ),
+                        },
+                    },
+                }
+                for index, worker in enumerate(initial_workers, start=1)
+            ],
+            {
+                "stage_id": "reconcile",
+                "line_id": "observer_reconcile",
+                "evidence_kind": "reconcile",
+                "actor_role": "observer",
+                "status": "accepted",
+                "payload": {
+                    "reconcile_authority": {
+                        "record_verified": True,
+                        "merged_commit_sha": "2" * 40,
+                    }
                 },
             },
             {
@@ -702,7 +770,7 @@ def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation()
 
     selected = server._contract_runtime_current_dispatch_authority_line(record)
     assert selected["status"] == "selected"
-    assert selected["completed_line_index"] == 2
+    assert selected["completed_line_index"] == 5
     assert (
         server._contract_runtime_mf_parallel_current_generation_worker_count(
             record
@@ -748,7 +816,7 @@ def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation()
                     "queue_item_id": "mqi-rev9-single-worker-fix",
                     "contract_runtime_dispatch_source_ref": (
                         f"contract_runtime:{contract_execution_id}:"
-                        "completed_lines:2"
+                        "completed_lines:5"
                     ),
                     "merge_commit": "a" * 40,
                     "merge_event_ref": "timeline:123",
@@ -765,6 +833,47 @@ def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation()
     assert merge["all_lane_merges_verified"] is True
     assert merge["required_worker_count"] == 1
     assert merge["runtime_context_id"] == rework_runtime_context_id
+    assert merge["dispatch_completed_line_index"] == 5
+    assert merge["merge_completed_line_index"] == 6
+
+    current_reconcile_receipt = {
+        "record_verified": True,
+        "merged_commit_sha": "a" * 40,
+        "runtime_context_id": rework_runtime_context_id,
+        "task_id": rework_task_id,
+        "parent_task_id": contract_execution_id,
+        "merge_queue_id": "mq-rev9-single-worker-fix",
+    }
+    current_reconcile_receipt["authority_hash"] = server.stable_sha256(
+        current_reconcile_receipt
+    )
+    record["completed_lines"].append(
+        {
+            "stage_id": "reconcile",
+            "line_id": "observer_reconcile",
+            "evidence_kind": "reconcile",
+            "actor_role": "observer",
+            "status": "accepted",
+            "payload": {
+                "reconcile_authority": current_reconcile_receipt,
+            },
+        }
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_line_acceptance",
+        lambda *_args, **_kwargs: {"db_verified": True},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_reconcile_record_authority",
+        lambda *_args, **_kwargs: current_reconcile_receipt,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [],
+    )
 
     qa_authority = server._contract_runtime_rev8_postmerge_qa_authority(
         None,
@@ -773,7 +882,7 @@ def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation()
     )
     assert qa_authority["verified"] is False
     assert qa_authority["blocker_codes"] == [
-        "observer_reconcile_line_not_unique"
+        "final_merge_runtime_context_unresolved"
     ]
 
 
