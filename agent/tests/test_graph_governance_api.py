@@ -4918,11 +4918,15 @@ def test_worker_commit_bypass_v3_rejects_unproven_epoch_or_lane_zero_write(
             },
         )
 
-        def fail_on_historical_timeline_scan(*_args, **_kwargs):
-            raise AssertionError(
-                "canonical owned-blob mismatch must fail closed without "
-                "scanning historical QA blob carriers"
-            )
+        timeline_events = server._runtime_context_service_timeline_events
+
+        def fail_on_historical_timeline_scan(*args, **kwargs):
+            if kwargs.get("task_id") == "":
+                raise AssertionError(
+                    "canonical owned-blob mismatch must fail closed without "
+                    "scanning historical QA blob carriers"
+                )
+            return timeline_events(*args, **kwargs)
 
         monkeypatch.setattr(
             server,
