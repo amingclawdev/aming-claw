@@ -4385,6 +4385,332 @@ def _worker_implementation_lineage(
     return lineage
 
 
+_WORKER_IMPLEMENTATION_FINISH_PASS_STATUSES = frozenset(
+    {"pass", "passed", "ok", "succeeded", "success", "clean"}
+)
+_WORKER_IMPLEMENTATION_FINISH_AMBIGUOUS_STATUSES = frozenset(
+    {
+        "accepted",
+        "blocked",
+        "error",
+        "errored",
+        "fail",
+        "failed",
+        "failure",
+        "partial_sibling_blocked",
+        "rejected",
+    }
+)
+_WORKER_IMPLEMENTATION_NO_PASS_STATUS = "accepted_with_known_baseline_failure"
+_WORKER_IMPLEMENTATION_UNRELATED_BLOCK_STATUS = (
+    "passed_with_unrelated_system_block_recorded"
+)
+_WORKER_IMPLEMENTATION_NO_PASS_COUNT_FIELDS = (
+    "candidate_new_failures",
+    "full_failed",
+    "inherited_failed",
+    "baseline_failed",
+    "focused_passed",
+    "full_passed",
+    "baseline_passed",
+)
+_WORKER_IMPLEMENTATION_HISTORICAL_BASE_SELECTORS = frozenset(
+    {"rev8_postmerge_qa_graph_binding or pre_rev8_qa_graph_binding"}
+)
+
+
+def _worker_implementation_legacy_results_finish_compatible(value: Any) -> bool:
+    """Validate the one bounded candidate/base result accepted by the facade."""
+
+    if not isinstance(value, Mapping) or not value:
+        return False
+    if (
+        str(value.get("schema_version") or "").strip()
+        != "runtime_context.worker_test_results.v1"
+        or str(value.get("status") or "").strip().lower()
+        in _WORKER_IMPLEMENTATION_FINISH_AMBIGUOUS_STATUSES
+        or any(
+            value.get(field) is True
+            for field in (
+                "passed",
+                "qa_claim",
+                "release_claim",
+                "overall_release_pass",
+                "overall_release_pass_claimed",
+                "old_world_reuse",
+            )
+        )
+    ):
+        return False
+    focused = value.get("focused_candidate")
+    expanded = value.get("expanded_candidate")
+    immutable_base = value.get("immutable_base")
+    if not all(
+        isinstance(item, Mapping)
+        for item in (focused, expanded, immutable_base)
+    ):
+        return False
+    if (
+        str(immutable_base.get("selector") or "").strip()
+        not in _WORKER_IMPLEMENTATION_HISTORICAL_BASE_SELECTORS
+    ):
+        return False
+
+    def _count(container: Mapping[str, Any], field: str) -> int | None:
+        candidate = container.get(field)
+        if (
+            not isinstance(candidate, int)
+            or isinstance(candidate, bool)
+            or candidate < 0
+        ):
+            return None
+        return candidate
+
+    candidate_new_failures = _count(value, "candidate_new_failures")
+    focused_failed = _count(focused, "failed")
+    focused_passed = _count(focused, "passed")
+    expanded_failed = _count(expanded, "failed")
+    expanded_passed = _count(expanded, "passed")
+    base_failed = _count(immutable_base, "failed")
+    base_passed = _count(immutable_base, "passed")
+    counts = (
+        candidate_new_failures,
+        focused_failed,
+        focused_passed,
+        expanded_failed,
+        expanded_passed,
+        base_failed,
+        base_passed,
+    )
+    if any(count is None for count in counts):
+        return False
+    if (
+        candidate_new_failures != 0
+        or focused_failed != 0
+        or expanded_failed != 0
+        or focused_passed <= 0
+        or expanded_passed <= 0
+        or base_failed <= 0
+        or expanded_passed < base_passed
+    ):
+        return False
+    if (
+        str(focused.get("status") or "").strip().lower()
+        not in _WORKER_IMPLEMENTATION_FINISH_PASS_STATUSES
+        or str(expanded.get("status") or "").strip().lower()
+        not in _WORKER_IMPLEMENTATION_FINISH_PASS_STATUSES
+        or str(immutable_base.get("status") or "").strip().lower()
+        not in {
+            "accepted_with_known_baseline_failure",
+            "expected_red",
+            "known_baseline_failure",
+        }
+    ):
+        return False
+
+    def _identity_set(
+        container: Mapping[str, Any],
+        *fields: str,
+    ) -> tuple[bool, frozenset[str]]:
+        found = False
+        resolved: frozenset[str] | None = None
+        for field in fields:
+            if field not in container:
+                continue
+            found = True
+            raw = container.get(field)
+            if not isinstance(raw, list):
+                return True, frozenset()
+            values = [str(item or "").strip() for item in raw]
+            if any(not item for item in values) or len(set(values)) != len(values):
+                return True, frozenset()
+            current = frozenset(values)
+            if resolved is not None and current != resolved:
+                return True, frozenset()
+            resolved = current
+        return found, resolved or frozenset()
+
+    focused_ids_present, focused_ids = _identity_set(
+        focused,
+        "failure_identities",
+        "failure_ids",
+        "failed_test_ids",
+    )
+    expanded_ids_present, expanded_ids = _identity_set(
+        expanded,
+        "failure_identities",
+        "failure_ids",
+        "failed_test_ids",
+    )
+    base_ids_present, base_ids = _identity_set(
+        immutable_base,
+        "failure_identities",
+        "failure_ids",
+        "failed_test_ids",
+    )
+    if (
+        focused_ids_present or expanded_ids_present or base_ids_present
+    ) and (
+        not focused_ids_present
+        or not expanded_ids_present
+        or not base_ids_present
+        or focused_ids
+        or expanded_ids
+        or not base_ids
+        or len(base_ids) != base_failed
+    ):
+        return False
+
+    direct_identity_groups = []
+    for fields in (
+        (
+            "candidate_failure_identities",
+            "candidate_failure_ids",
+            "full_failure_identities",
+            "full_failure_ids",
+        ),
+        ("inherited_failure_identities", "inherited_failure_ids"),
+        (
+            "base_failure_identities",
+            "base_failure_ids",
+            "baseline_failure_identities",
+            "baseline_failure_ids",
+        ),
+    ):
+        present, identities = _identity_set(value, *fields)
+        if present:
+            if not identities:
+                return False
+            direct_identity_groups.append(identities)
+    return not direct_identity_groups or bool(
+        len(direct_identity_groups) == 3
+        and all(group == direct_identity_groups[0] for group in direct_identity_groups)
+        and len(direct_identity_groups[0]) == base_failed
+        and (not base_ids_present or direct_identity_groups[0] == base_ids)
+    )
+
+
+def _worker_implementation_test_results_finish_compatible(value: Any) -> bool:
+    """Validate the exact result shapes that can drive the finish contract.
+
+    The runtime deliberately does not reinterpret an intermediate lane state as
+    a test verdict.  In particular, a sibling that has not merged yet belongs
+    in implementation risk/summary evidence, not in ``test_results``.
+    """
+
+    if not isinstance(value, Mapping) or not value:
+        return False
+    status = str(value.get("status") or "").strip().lower()
+    if status == _WORKER_IMPLEMENTATION_UNRELATED_BLOCK_STATUS:
+        if (
+            ("no_pass" in value and value.get("no_pass") is not True)
+            or ("passed" in value and value.get("passed") is not False)
+            or (
+                "overall_release_pass" in value
+                and value.get("overall_release_pass") is not False
+            )
+            or (
+                "overall_release_pass_claimed" in value
+                and value.get("overall_release_pass_claimed") is not False
+            )
+        ):
+            return False
+        required_passed = value.get("required_passed")
+        unrelated_blocks = value.get("unrelated_system_blocks")
+        tests = value.get("tests")
+        if (
+            not isinstance(required_passed, int)
+            or isinstance(required_passed, bool)
+            or required_passed <= 0
+            or not isinstance(unrelated_blocks, int)
+            or isinstance(unrelated_blocks, bool)
+            or unrelated_blocks <= 0
+            or not isinstance(tests, list)
+            or not tests
+        ):
+            return False
+        passed_count = 0
+        blocked_count = 0
+        for test in tests:
+            if (
+                not isinstance(test, Mapping)
+                or not str(test.get("name") or "").strip()
+                or not str(test.get("command") or "").strip()
+            ):
+                return False
+            test_status = str(test.get("status") or "").strip().lower()
+            if test_status in _WORKER_IMPLEMENTATION_FINISH_PASS_STATUSES:
+                passed_count += 1
+            elif test_status == "blocked_unrelated" and str(
+                test.get("detail") or ""
+            ).strip():
+                blocked_count += 1
+            else:
+                return False
+        return bool(
+            passed_count == required_passed
+            and blocked_count == unrelated_blocks
+            and len(tests) == passed_count + blocked_count
+        )
+    if status == _WORKER_IMPLEMENTATION_NO_PASS_STATUS or value.get("no_pass") is True:
+        if (
+            status != _WORKER_IMPLEMENTATION_NO_PASS_STATUS
+            or value.get("no_pass") is not True
+            or ("passed" in value and value.get("passed") is not False)
+            or (
+                "overall_release_pass" in value
+                and value.get("overall_release_pass") is not False
+            )
+            or (
+                "overall_release_pass_claimed" in value
+                and value.get("overall_release_pass_claimed") is not False
+            )
+        ):
+            return False
+        counts: dict[str, int] = {}
+        for field in _WORKER_IMPLEMENTATION_NO_PASS_COUNT_FIELDS:
+            count = value.get(field)
+            if not isinstance(count, int) or isinstance(count, bool):
+                return False
+            counts[field] = count
+        return bool(
+            counts["candidate_new_failures"] == 0
+            and counts["full_failed"] > 0
+            and counts["full_failed"]
+            == counts["inherited_failed"]
+            == counts["baseline_failed"]
+            and counts["focused_passed"] > 0
+            and counts["full_passed"] >= counts["baseline_passed"] >= 0
+        )
+    if status in _WORKER_IMPLEMENTATION_FINISH_AMBIGUOUS_STATUSES:
+        return False
+    if status in _WORKER_IMPLEMENTATION_FINISH_PASS_STATUSES:
+        return value.get("passed") is not False
+    return value.get("passed") is True
+
+
+def _worker_commit_has_finish_compatible_implementation_results(
+    implementation: Mapping[str, Any],
+) -> bool:
+    payload = (
+        implementation.get("payload")
+        if isinstance(implementation.get("payload"), Mapping)
+        else {}
+    )
+    test_results = (
+        payload.get("test_results")
+        if isinstance(payload.get("test_results"), Mapping)
+        else (
+            implementation.get("test_results")
+            if isinstance(implementation.get("test_results"), Mapping)
+            else {}
+        )
+    )
+    if _worker_implementation_test_results_finish_compatible(test_results):
+        return True
+    return _worker_implementation_legacy_results_finish_compatible(test_results)
+
+
 def _mf_parallel_worker_commit_errors(
     record: Mapping[str, Any],
     write: Mapping[str, Any],
@@ -4553,6 +4879,13 @@ def _mf_parallel_worker_commit_errors(
             record,
             implementation,
         )
+        if not _worker_commit_has_finish_compatible_implementation_results(
+            implementation
+        ):
+            errors.append(
+                "worker_commit requires canonical worker_implementation "
+                "finish-compatible test_results"
+            )
         supplied_lineage_ref = _worker_commit_text(
             write,
             "implementation_lineage_ref",

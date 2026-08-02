@@ -1451,6 +1451,7 @@ def _worker_commit_contract_proof():
                     **identity,
                     "graph_trace_ids": ["gqt-worker-commit"],
                     "changed_files": ["agent/governance/server.py"],
+                    "test_results": {"status": "passed", "passed": True},
                 },
             }
         ],
@@ -17614,6 +17615,50 @@ def test_runtime_context_implementation_route_ref_resolves_active_contract_execu
     assert captured["resolved"]["scope"]["task_id"] == contract_execution_id
 
 
+def test_runtime_context_implementation_evidence_rejects_invalid_test_results_before_db(
+    monkeypatch,
+):
+    def reject_db_access(_project_id):
+        raise AssertionError("invalid test_results must be rejected before DB access")
+
+    monkeypatch.setattr(server, "get_connection", reject_db_access)
+
+    with pytest.raises(GovernanceError) as invalid_results:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": "mfrctx-invalid-implementation-results",
+                },
+                method="POST",
+                body={
+                    "task_id": "worker-invalid-implementation-results",
+                    "test_results": {
+                        "status": "partial_sibling_blocked",
+                        "passed": True,
+                        "focused_pytest": "blocked_by_unmerged_sibling_task",
+                        "planner_only_probe": "passed",
+                        "git_diff_check": "passed",
+                    },
+                },
+            )
+        )
+
+    assert invalid_results.value.code == (
+        "worker_implementation_test_results_not_finish_compatible"
+    )
+    assert invalid_results.value.details["zero_db_access"] is True
+    assert invalid_results.value.details["zero_contract_runtime_write"] is True
+    assert invalid_results.value.details["zero_timeline_write"] is True
+    assert invalid_results.value.details["same_input_retry_required"] is True
+    assert invalid_results.value.details["next_legal_action"] == (
+        "correct_test_results_and_retry_same_implementation_input"
+    )
+    assert invalid_results.value.details["copy_safe_test_results_guide"][
+        "parallel_sibling_dependency"
+    ]["partial_sibling_blocked_is_finish_compatible"] is False
+
+
 def test_runtime_context_implementation_evidence_rejects_empty_or_fake_graph_trace_ids(
     conn,
     tmp_path,
@@ -22170,6 +22215,12 @@ def test_runtime_context_implementation_evidence_recovery_body_uses_canonical_ro
     worktree = tmp_path / "runtime-impl-worker-worktree"
     canonical_root.mkdir()
     worktree.mkdir()
+    target_commit = "2" * 40
+    _activate_basic_graph(
+        conn,
+        "full-runtime-impl-canonical-root",
+        commit_sha=target_commit,
+    )
     context = upsert_branch_context(
         conn,
         BranchTaskRuntimeContext(
@@ -22185,6 +22236,9 @@ def test_runtime_context_implementation_evidence_recovery_body_uses_canonical_ro
             worker_slot_id="slot-impl-canonical-root",
             branch_ref="refs/heads/codex/runtime-impl-canonical-root-task",
             worktree_path=str(worktree),
+            base_commit=target_commit,
+            head_commit=target_commit,
+            target_head_commit=target_commit,
             status=STATE_WORKTREE_READY,
             fence_token="fence-impl-canonical-root",
             session_token_hash=mf_subagent_session_token_hash(
@@ -22261,6 +22315,7 @@ def test_runtime_context_implementation_evidence_recovery_body_uses_canonical_ro
         conn,
         trace_id=graph_trace_id,
         parent_task_id=context.root_task_id,
+        snapshot_id="full-runtime-impl-canonical-root",
         runtime_context_id=context.runtime_context_id,
         task_id=context.task_id,
         worker_role="mf_sub",
@@ -77550,6 +77605,7 @@ def test_mf_parallel_qa_pass_with_linked_open_graph_diagnostic_advances_merge(
         graph_trace_id=graph_trace_id,
         head_commit=head_commit,
         implementation_event_ref=f"timeline:{evidence_events['implementation']}",
+        test_results=no_pass_test_results,
     )
     runtime = server._contract_runtime(conn)
     current = server.handle_project_contract_runtime_current_state(
@@ -81537,6 +81593,17 @@ def _record_mf_parallel_contract_runtime_worker_prefix(
     owned_files: list[str] | None = None,
     test_results: dict[str, Any] | None = None,
 ) -> None:
+    if test_results is None:
+        test_results = {
+            "status": "passed",
+            "passed": True,
+            "commands": [
+                {
+                    "command": "pytest -q test-fixture-worker-prefix",
+                    "status": "passed",
+                }
+            ],
+        }
     implementation, worker_commit = _mf_parallel_worker_proof_payloads(
         runtime_context,
         parent_task_id=parent_task_id,
@@ -81623,7 +81690,9 @@ def _record_mf_parallel_runtime_context_worker_evidence(
     head_commit: str,
     include_finish_evidence: bool = True,
     test_results: dict[str, Any] | None = None,
+    changed_files: list[str] | None = None,
 ) -> dict[str, int]:
+    changed_files = list(changed_files or ["agent/governance/server.py"])
     parent_task_id = runtime_context.parent_task_id or backlog_id
     _insert_mf_sub_graph_query_trace(
         conn,
@@ -81699,7 +81768,7 @@ def _record_mf_parallel_runtime_context_worker_evidence(
             "task_id": runtime_context.task_id,
             "parent_task_id": parent_task_id,
             "worker_role": "mf_sub",
-            "changed_files": ["agent/governance/server.py"],
+            "changed_files": changed_files,
             "graph_trace_ids": [graph_trace_id],
             "head_commit": head_commit,
             "test_results": (
@@ -89386,6 +89455,7 @@ def test_worker_guide_projects_only_test_worker_results_into_accepted_body(
         head_commit=head_commit,
         include_finish_evidence=False,
         test_results=actual_r12s15_results,
+        changed_files=[owned_file],
     )
     _record_mf_parallel_contract_runtime_worker_prefix(
         conn,
@@ -89397,6 +89467,7 @@ def test_worker_guide_projects_only_test_worker_results_into_accepted_body(
         implementation_event_ref=f"timeline:{evidence_events['implementation']}",
         changed_files=[owned_file],
         owned_files=[owned_file],
+        test_results=actual_r12s15_results,
     )
     worker_query = {
         "parent_task_id": backlog_id,
@@ -89416,9 +89487,14 @@ def test_worker_guide_projects_only_test_worker_results_into_accepted_body(
             query=worker_query,
         )
     )
-    finish_body = guide["actionable_payloads"][
+    finish_submission = guide["actionable_payloads"][
         "finish_time_worker_attestation_submission"
-    ]["copy_safe_body"]
+    ]
+    source_resolution = finish_submission[
+        "source_backed_implementation_resolution"
+    ]
+    assert finish_submission["actionable"] is True, source_resolution.get("errors")
+    finish_body = finish_submission["copy_safe_body"]
     projected = finish_body["test_results"]
 
     if should_project:
@@ -97886,6 +97962,7 @@ def test_mf_parallel_inflight_no_pass_finish_uses_contract_dispatch_without_back
         graph_trace_id=graph_trace_id,
         head_commit=head_commit,
         implementation_event_ref=f"timeline:{evidence_events['implementation']}",
+        test_results=no_pass_test_results,
     )
     conn.execute(
         "DELETE FROM task_timeline_events "

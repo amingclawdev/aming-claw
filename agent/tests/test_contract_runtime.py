@@ -282,6 +282,7 @@ def test_worker_commit_contract_accepts_target_relative_delta_with_inherited_pro
             **identity,
             "changed_files": worker_files,
             "graph_trace_ids": ["gqt-inherited-target-worker-commit"],
+            "test_results": {"status": "passed", "passed": True},
         },
     }
     record = {
@@ -337,6 +338,58 @@ def test_worker_commit_contract_accepts_target_relative_delta_with_inherited_pro
 
     assert _mf_parallel_worker_commit_errors(
         record,
+        write,
+        actor_role="mf_sub",
+    ) == ()
+
+    invalid_source = deepcopy(record)
+    invalid_source["completed_lines"][0]["payload"]["test_results"] = {
+        "status": "partial_sibling_blocked",
+        "passed": True,
+        "focused_pytest": "blocked_by_unmerged_sibling_task",
+        "planner_only_probe": "passed",
+        "git_diff_check": "passed",
+    }
+    assert any(
+        "finish-compatible test_results" in error
+        for error in _mf_parallel_worker_commit_errors(
+            invalid_source,
+            write,
+            actor_role="mf_sub",
+        )
+    )
+
+    legacy_candidate_comparison = deepcopy(record)
+    legacy_candidate_comparison["completed_lines"][0]["payload"][
+        "test_results"
+    ] = {
+        "schema_version": "runtime_context.worker_test_results.v1",
+        "candidate_new_failures": 0,
+        "focused_candidate": {
+            "status": "passed",
+            "failed": 0,
+            "passed": 6,
+        },
+        "expanded_candidate": {
+            "status": "passed",
+            "failed": 0,
+            "passed": 23,
+        },
+        "immutable_base": {
+            "status": "expected_red",
+            "failed": 2,
+            "passed": 1,
+            "selector": (
+                "rev8_postmerge_qa_graph_binding or "
+                "pre_rev8_qa_graph_binding"
+            ),
+        },
+        "qa_claim": False,
+        "release_claim": False,
+        "old_world_reuse": False,
+    }
+    assert _mf_parallel_worker_commit_errors(
+        legacy_candidate_comparison,
         write,
         actor_role="mf_sub",
     ) == ()
