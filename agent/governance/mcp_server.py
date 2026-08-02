@@ -1311,6 +1311,60 @@ SERVER_VERSION = "1.0.0"
 # ---------------------------------------------------------------------------
 # Tool definitions
 # ---------------------------------------------------------------------------
+_BACKLOG_ACCEPTANCE_CRITERION_ITEM_SCHEMA = {
+    "anyOf": [
+        {"type": "string"},
+        {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Stable acceptance criterion identifier.",
+                },
+                "description": {"type": "string"},
+                "text": {"type": "string"},
+                "required_scope": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": [
+                                "files",
+                                "nodes",
+                                "files_and_nodes",
+                                "verification_only_external_dependency",
+                                "unresolved",
+                            ],
+                        },
+                        "files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "node_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "nodes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "dependency_id": {"type": "string"},
+                        "dependency_ref": {"type": "string"},
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["id", "required_scope"],
+            "additionalProperties": True,
+        },
+    ],
+    "description": (
+        "Legacy free-text criterion or structured criterion with a stable id "
+        "and required_scope for acceptance/file-fence closure."
+    ),
+}
+
 TOOLS: list[dict] = [
     {
         "name": "gov_node_list",
@@ -1498,7 +1552,10 @@ TOOLS: list[dict] = [
                 "priority": {"type": "string"},
                 "target_files": {"type": "array", "items": {"type": "string"}},
                 "test_files": {"type": "array", "items": {"type": "string"}},
-                "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                "acceptance_criteria": {
+                    "type": "array",
+                    "items": _BACKLOG_ACCEPTANCE_CRITERION_ITEM_SCHEMA,
+                },
                 "chain_task_id": {"type": "string"},
                 "commit": {"type": "string"},
                 "discovered_at": {"type": "string"},

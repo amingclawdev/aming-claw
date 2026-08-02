@@ -426,7 +426,7 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert stderr == ""
     tools = responses[0]["result"]["tools"]
     schema_meta = responses[0]["result"]["_meta"]["aming_claw_tool_schema"]
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-02.1"
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-02.2"
     assert schema_meta["loaded_client_tool_schema_version"] == (
         MCP_TOOL_SCHEMA_VERSION
     )
@@ -470,6 +470,26 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
         properties = tool_by_name[tool_name]["inputSchema"]["properties"]
         assert "backlog_id" in properties
         assert "qa_session_token_ref" in properties
+
+
+def test_mcp_stdio_backlog_upsert_schema_exposes_structured_acceptance_scope():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
+    item_schema = tools["backlog_upsert"]["inputSchema"]["properties"][
+        "acceptance_criteria"
+    ]["items"]
+    variants = item_schema["anyOf"]
+    assert {variant["type"] for variant in variants} == {"string", "object"}
+    object_schema = next(
+        variant for variant in variants if variant["type"] == "object"
+    )
+    assert object_schema["required"] == ["id", "required_scope"]
+    assert object_schema["properties"]["required_scope"]["required"] == ["kind"]
 
 
 def test_runtime_context_finish_time_worker_attestation_schema_requires_harness_type():

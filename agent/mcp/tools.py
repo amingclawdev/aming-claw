@@ -1303,6 +1303,60 @@ def _parallel_branch_merge_queue_materialize_body(args: dict) -> dict:
 # Tool schema definitions (per MCP spec)
 # ---------------------------------------------------------------------------
 
+_BACKLOG_ACCEPTANCE_CRITERION_ITEM_SCHEMA = {
+    "anyOf": [
+        {"type": "string"},
+        {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Stable acceptance criterion identifier.",
+                },
+                "description": {"type": "string"},
+                "text": {"type": "string"},
+                "required_scope": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": [
+                                "files",
+                                "nodes",
+                                "files_and_nodes",
+                                "verification_only_external_dependency",
+                                "unresolved",
+                            ],
+                        },
+                        "files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "node_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "nodes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "dependency_id": {"type": "string"},
+                        "dependency_ref": {"type": "string"},
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["id", "required_scope"],
+            "additionalProperties": True,
+        },
+    ],
+    "description": (
+        "Legacy free-text criterion or structured criterion with a stable id "
+        "and required_scope for acceptance/file-fence closure."
+    ),
+}
+
 TOOLS: list[dict] = [
     # --- Task Management ---
     {
@@ -2007,7 +2061,10 @@ TOOLS: list[dict] = [
                 "priority": {"type": "string"},
                 "target_files": {"type": "array", "items": {"type": "string"}},
                 "test_files": {"type": "array", "items": {"type": "string"}},
-                "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                "acceptance_criteria": {
+                    "type": "array",
+                    "items": _BACKLOG_ACCEPTANCE_CRITERION_ITEM_SCHEMA,
+                },
                 "details_md": {"type": "string"},
                 "commit": {"type": "string"},
                 "fixed_at": {"type": "string"},

@@ -709,6 +709,90 @@ def _dispatcher(recorder: _Recorder, manager: _Recorder | None = None) -> ToolDi
     )
 
 
+def test_backlog_upsert_accepts_structured_acceptance_scope_without_breaking_strings():
+    for registry in (governance_mcp_server.TOOLS, mcp_tools.TOOLS):
+        tool = next(item for item in registry if item["name"] == "backlog_upsert")
+        item_schema = tool["inputSchema"]["properties"]["acceptance_criteria"][
+            "items"
+        ]
+        variants = item_schema["anyOf"]
+        assert {variant["type"] for variant in variants} == {"string", "object"}
+        object_schema = next(
+            variant for variant in variants if variant["type"] == "object"
+        )
+        assert object_schema["required"] == ["id", "required_scope"]
+        scope_schema = object_schema["properties"]["required_scope"]
+        assert scope_schema["required"] == ["kind"]
+        assert {"files", "nodes", "files_and_nodes"}.issubset(
+            scope_schema["properties"]["kind"]["enum"]
+        )
+
+    structured = {
+        "id": "AC-DEMO-FOCUS-001",
+        "description": "Render the Today Focus card.",
+        "required_scope": {
+            "kind": "files",
+            "files": ["src/app.js"],
+        },
+    }
+
+    class _RoundTripRecorder(_Recorder):
+        acceptance_criteria: list = []
+
+        def api(
+            self,
+            method: str,
+            url: str,
+            data: dict | None = None,
+            timeout: int = 15,
+        ) -> dict:
+            self.calls.append((method, url, data, timeout))
+            if method == "POST":
+                self.acceptance_criteria = list(
+                    (data or {}).get("acceptance_criteria") or []
+                )
+                return {"ok": True}
+            return {
+                "ok": True,
+                "bug": {"acceptance_criteria": self.acceptance_criteria},
+            }
+
+    recorder = _RoundTripRecorder()
+    dispatcher = _dispatcher(recorder)
+    dispatcher.dispatch(
+        "backlog_upsert",
+        {
+            "project_id": "daily-planner-lite-fresh",
+            "bug_id": "AC-DEMO-STRUCTURED-ACCEPTANCE",
+            "acceptance_criteria": ["Legacy free text remains accepted.", structured],
+        },
+    )
+    fetched = dispatcher.dispatch(
+        "backlog_get",
+        {
+            "project_id": "daily-planner-lite-fresh",
+            "bug_id": "AC-DEMO-STRUCTURED-ACCEPTANCE",
+        },
+    )
+    assert fetched["bug"]["acceptance_criteria"] == [
+        "Legacy free text remains accepted.",
+        structured,
+    ]
+    assert isinstance(fetched["bug"]["acceptance_criteria"][1], dict)
+
+    from agent.governance.contract_state_runtime import (
+        acceptance_file_fence_closure_gate,
+    )
+
+    closure = acceptance_file_fence_closure_gate(
+        [structured],
+        ["src/app.js"],
+    )
+    assert closure["accepted"] is True
+    assert closure["criterion_ids"] == ["AC-DEMO-FOCUS-001"]
+    assert closure["required_file_union"] == ["src/app.js"]
+
+
 def test_active_mcp_exposes_backlog_and_graph_governance_tools():
     names = _tool_names()
 
@@ -3689,8 +3773,8 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
     assert "restart_or_refresh_mcp_session" in status["recommended_actions"]
 
 
-def test_bypass_graph_trace_schema_bump_marks_prior_client_stale():
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-02.1"
+def test_current_mcp_schema_bump_marks_prior_client_stale():
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-02.2"
     assert "graph_trace_ids" in _tool_properties("contract_runtime_bypass_line")
 
     compatibility = mcp_tool_schema_compatibility(
@@ -3700,8 +3784,8 @@ def test_bypass_graph_trace_schema_bump_marks_prior_client_stale():
     )
 
     assert compatibility["loaded_client_tool_schema_version"] == "2026-07-19.3"
-    assert compatibility["server_tool_schema_version"] == "2026-08-02.1"
-    assert compatibility["minimum_client_tool_schema_version"] == "2026-08-02.1"
+    assert compatibility["server_tool_schema_version"] == "2026-08-02.2"
+    assert compatibility["minimum_client_tool_schema_version"] == "2026-08-02.2"
     assert compatibility["client_schema_fresh"] is False
     assert compatibility["stale_client_possible"] is True
 
