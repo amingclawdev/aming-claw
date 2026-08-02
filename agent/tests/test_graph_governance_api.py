@@ -4139,6 +4139,706 @@ def test_generic_timeline_path_cannot_author_contract_worker_commit():
     assert rejected.value.code == "contract_worker_commit_facade_required"
 
 
+def _ac8_worker_commit_graph_epoch_recovery_case(
+    conn,
+    tmp_path,
+    *,
+    suffix: str,
+) -> dict[str, Any]:
+    """Build the exact AC8 old-worker-epoch -> active-graph-epoch deadlock."""
+
+    backlog_id = f"AC-WORKER-COMMIT-GRAPH-EPOCH-{suffix.upper()}"
+    parent_task_id = f"ac8-parent-{suffix}"
+    task_id = f"ac8-worker-{suffix}"
+    fence_token = f"fence-ac8-{suffix}"
+    worktree = tmp_path / f"ac8-{suffix}"
+    base_commit = _init_test_git_repo(worktree)
+    owned_path = "agent/governance/server.py"
+    owned = worktree / owned_path
+    owned.parent.mkdir(parents=True, exist_ok=True)
+    owned.write_text("normal implementation on the worker epoch\n", encoding="utf-8")
+    subprocess.run(["git", "add", owned_path], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "ac8 normal worker implementation"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    earlier_worker_commit = batch_jobs.git_commit(worktree)
+    owned.write_text("bounded repair after the worker epoch moved\n", encoding="utf-8")
+    subprocess.run(["git", "add", owned_path], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "ac8 bounded worker repair"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(worktree)
+    candidate_blob_oid = subprocess.run(
+        ["git", "rev-parse", f"{candidate_commit}:{owned_path}"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    # The deployed combined candidate is deliberately a sibling, not an ancestor
+    # of the worker commit. Its exact owned-file blob is nevertheless identical.
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", f"canonical-{suffix}", base_commit],
+        cwd=worktree,
+        check=True,
+    )
+    owned.parent.mkdir(parents=True, exist_ok=True)
+    owned.write_text("bounded repair after the worker epoch moved\n", encoding="utf-8")
+    canonical_only = worktree / "agent/tests/canonical_combined.py"
+    canonical_only.parent.mkdir(parents=True, exist_ok=True)
+    canonical_only.write_text("canonical combined lane\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", owned_path, "agent/tests/canonical_combined.py"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "ac8 deployed combined candidate"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    canonical_commit = batch_jobs.git_commit(worktree)
+    canonical_blob_oid = subprocess.run(
+        ["git", "rev-parse", f"{canonical_commit}:{owned_path}"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert canonical_blob_oid == candidate_blob_oid
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", candidate_commit, canonical_commit],
+        cwd=worktree,
+        check=False,
+    ).returncode != 0
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", canonical_commit, candidate_commit],
+        cwd=worktree,
+        check=False,
+    ).returncode != 0
+    subprocess.run(
+        ["git", "checkout", "-q", "--detach", candidate_commit],
+        cwd=worktree,
+        check=True,
+    )
+
+    successor, context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id=parent_task_id,
+        worker_task_id=task_id,
+        fence_token=fence_token,
+        token=f"session-ac8-{suffix}",
+        worktree_path=str(worktree),
+        target_project_root=str(worktree),
+        base_commit=base_commit,
+        owned_files=(owned_path,),
+        parent_task_is_contract_execution=True,
+    )
+    execution_id = successor["contract_execution_id"]
+    old_snapshot_id = f"scope-ac8-worker-epoch-{suffix}"
+    old_trace_id = f"gqt-ac8-old-{suffix}"
+    _activate_basic_graph(conn, old_snapshot_id, commit_sha=earlier_worker_commit)
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=old_trace_id,
+        parent_task_id=execution_id,
+        snapshot_id=old_snapshot_id,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        worker_role="mf_sub",
+        fence_token=fence_token,
+        run_id=_mf_sub_run_id(context.task_id, fence_token),
+        created_at="2026-08-02T00:00:00Z",
+    )
+    implementation_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=context.task_id,
+        event_type="mf.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        status="passed",
+        actor="mf_sub:runtime-context-worker",
+        commit_sha=earlier_worker_commit,
+        payload={
+            "action": "record_implementation_evidence",
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": execution_id,
+            "worker_role": "mf_sub",
+            "changed_files": [owned_path],
+            "graph_trace_ids": [old_trace_id],
+            "head_commit": earlier_worker_commit,
+            "test_results": {"passed": True},
+        },
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=execution_id,
+        runtime_context=context,
+        parent_task_id=execution_id,
+        graph_trace_id=old_trace_id,
+        head_commit=earlier_worker_commit,
+        implementation_event_ref=f"timeline:{implementation_event['id']}",
+        changed_files=[owned_path],
+        owned_files=[owned_path],
+    )
+    runtime = server._contract_runtime(conn)
+    canonical_prefix = runtime.store.get(execution_id)
+    prefix_implementation = next(
+        line
+        for line in reversed(canonical_prefix["completed_lines"])
+        if line.get("line_id") == "worker_implementation"
+    )
+    prefix_lineage = _worker_implementation_lineage(
+        canonical_prefix,
+        prefix_implementation,
+    )
+    prefix_worker_commit = next(
+        line
+        for line in reversed(canonical_prefix["completed_lines"])
+        if line.get("line_id") == "worker_commit"
+    )
+    prefix_worker_commit["payload"]["implementation_lineage_ref"] = (
+        prefix_lineage["implementation_lineage_ref"]
+    )
+    prefix_worker_commit["payload"]["diff_base_commit"] = base_commit
+    runtime.store.update(
+        execution_id,
+        canonical_prefix,
+        expected_revision=int(canonical_prefix["execution_state_revision"]),
+    )
+    context = upsert_branch_context(
+        conn,
+        replace(context, head_commit=candidate_commit),
+    )
+
+    active_snapshot_id = f"full-ac8-postdeploy-{suffix}"
+    fresh_trace_id = f"gqt-ac8-fresh-{suffix}"
+    _activate_basic_graph(conn, active_snapshot_id, commit_sha=canonical_commit)
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=fresh_trace_id,
+        parent_task_id=execution_id,
+        snapshot_id=active_snapshot_id,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        worker_role="mf_sub",
+        fence_token=fence_token,
+        run_id=_mf_sub_run_id(context.task_id, fence_token),
+        created_at="2026-08-02T01:00:00Z",
+    )
+    current_full_authority = _record_test_current_full_reconcile_authority(
+        conn,
+        backlog_id=backlog_id,
+        task_id=context.task_id,
+        contract_execution_id=execution_id,
+        runtime_context_id=context.runtime_context_id,
+        target_project_root=str(worktree),
+        snapshot_id=active_snapshot_id,
+        commit_sha=canonical_commit,
+        qa_graph_trace_id=fresh_trace_id,
+        qa_commit_sha=canonical_commit,
+        merged_commit_sha=canonical_commit,
+        parent_task_id=execution_id,
+        merge_queue_id=context.merge_queue_id,
+    )
+    projection = _persist_worker_commit_bypass_current_projection(
+        conn,
+        backlog_id=backlog_id,
+        execution_id=execution_id,
+    )
+    stored = runtime.store.get(execution_id)
+    same_lane_recovery = server._runtime_context_same_lane_worker_commit_recovery(
+        stored,
+        context,
+    )
+    assert same_lane_recovery["status"] == "eligible", same_lane_recovery.get(
+        "errors"
+    )
+    record, context_projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=stored,
+            actor_role="observer",
+        )
+    )
+    assert context_projection
+    next_action = record["runtime_guide"]["next_legal_action"]
+    assert next_action["line_id"] == "worker_commit"
+    line_instance_id = f"runtime_context:{context.runtime_context_id}"
+    implementation = next(
+        line
+        for line in reversed(record["completed_lines"])
+        if line.get("line_id") == "worker_implementation"
+    )
+    implementation_lineage = _worker_implementation_lineage(
+        record,
+        implementation,
+    )
+    request = {
+        "stage_id": "worker_commit",
+        "line_id": "worker_commit",
+        "line_instance_id": line_instance_id,
+        "actor_role": "observer",
+        "evidence_kind": "contract_line_bypass",
+        "status": "waived",
+        "no_pass_claim": True,
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": execution_id,
+        "commit_sha": candidate_commit,
+        "changed_files": [owned_path],
+        "owned_files": [owned_path],
+        "diff_base_commit": base_commit,
+        "graph_trace_ids": [fresh_trace_id],
+        "evidence_refs": [f"commit:{candidate_commit}"],
+    }
+    return {
+        "backlog_id": backlog_id,
+        "execution_id": execution_id,
+        "task_id": context.task_id,
+        "runtime_context_id": context.runtime_context_id,
+        "context": context,
+        "worktree": worktree,
+        "owned_path": owned_path,
+        "base_commit": base_commit,
+        "earlier_worker_commit": earlier_worker_commit,
+        "candidate_commit": candidate_commit,
+        "canonical_commit": canonical_commit,
+        "candidate_blob_oid": candidate_blob_oid,
+        "old_snapshot_id": old_snapshot_id,
+        "active_snapshot_id": active_snapshot_id,
+        "old_trace_id": old_trace_id,
+        "fresh_trace_id": fresh_trace_id,
+        "current_full_authority": current_full_authority,
+        "same_lane_recovery": same_lane_recovery,
+        "implementation_lineage_ref": implementation_lineage[
+            "implementation_lineage_ref"
+        ],
+        "record": record,
+        "request": request,
+        "projection": projection,
+    }
+
+
+def _assert_worker_commit_bypass_continuation_v3(
+    authority: dict[str, Any],
+    case: dict[str, Any],
+) -> None:
+    assert authority["schema_version"] == (
+        "contract_runtime.worker_commit_bypass_continuation.v3"
+    )
+    assert authority["source"] == (
+        "normal_worker_implementation+prior_worker_commit+"
+        "current_graph_epoch_recovery"
+    )
+    assert authority["authorization_scope"] == "worker_commit_bypass_only"
+    assert authority["server_derived"] is authority["db_verified"] is True
+    assert authority["no_pass_claim"] is True
+    assert authority["authoritative_pass_synthesized"] is False
+    assert authority["implementation_pass_claimed"] is False
+    assert authority["runtime_context_id"] == case["runtime_context_id"]
+    assert authority["task_id"] == case["task_id"]
+    assert authority["parent_task_id"] == case["execution_id"]
+    assert authority["line_instance_id"] == (
+        f"runtime_context:{case['runtime_context_id']}"
+    )
+    assert authority["commit_sha"] == case["candidate_commit"]
+    assert authority["worker_commit_sha"] == case["candidate_commit"]
+    assert authority["earlier_worker_commit_sha"] == (
+        case["earlier_worker_commit"]
+    )
+    assert authority["changed_files"] == [case["owned_path"]]
+    assert authority["commit_diff_files"] == [case["owned_path"]]
+    assert authority["owned_files"] == [case["owned_path"]]
+    assert authority["diff_base_commit"] == case["base_commit"]
+    assert authority["clean_worktree"] is True
+    assert authority["old_graph_trace_ids"] == [case["old_trace_id"]]
+    assert authority["fresh_graph_trace_ids"] == [case["fresh_trace_id"]]
+    assert authority["active_snapshot_id"] == case["active_snapshot_id"]
+    assert authority["implementation_lineage_ref"] == (
+        case["implementation_lineage_ref"]
+    )
+    provenance = authority["canonical_owned_file_provenance"]
+    assert provenance["schema_version"] == (
+        "contract_runtime.canonical_owned_file_provenance.v1"
+    )
+    assert provenance["verified"] is True
+    assert provenance["candidate_commit_sha"] == case["candidate_commit"]
+    assert provenance["canonical_commit_sha"] == case["canonical_commit"]
+    assert provenance["owned_files"] == [case["owned_path"]]
+    assert provenance["blob_oids"] == {
+        case["owned_path"]: case["candidate_blob_oid"]
+    }
+
+
+def test_worker_commit_bypass_v3_accepts_nonancestor_postdeploy_blob_equivalence(
+    conn,
+    tmp_path,
+):
+    case = _ac8_worker_commit_graph_epoch_recovery_case(
+        conn,
+        tmp_path,
+        suffix="nonancestor-positive",
+    )
+
+    authority = server._contract_runtime_worker_commit_bypass_continuation_authority(
+        conn,
+        project_id=PID,
+        record=case["record"],
+        request=case["request"],
+    )
+
+    _assert_worker_commit_bypass_continuation_v3(authority, case)
+    assert not any(
+        line.get("evidence_kind") == "contract_line_bypass"
+        for line in case["record"]["completed_lines"]
+    )
+
+
+def _persist_ac8_worker_commit_graph_epoch_bypass_case(
+    conn,
+    tmp_path,
+    *,
+    suffix: str,
+) -> dict[str, Any]:
+    case = _ac8_worker_commit_graph_epoch_recovery_case(
+        conn,
+        tmp_path,
+        suffix=suffix,
+    )
+    guide = case["record"]["runtime_guide"]
+    revision = int(case["record"]["execution_state_revision"])
+    diagnostic_id = f"AC-CONTRACT-LINE-AC8-{suffix.upper()}"
+    response = server.handle_project_contract_runtime_line_bypass(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": case["execution_id"],
+            },
+            "observer",
+            method="POST",
+            body={
+                **case["request"],
+                "bypass_identity": (
+                    f"bypass:{case['execution_id']}:revision-{revision}:"
+                    "worker_commit"
+                ),
+                "execution_state_revision": revision,
+                "runtime_guide_hash": guide["runtime_guide_hash"],
+                "diagnostic_backlog_id": diagnostic_id,
+                "classification": "system_logic",
+                "reason": "AC8 exact graph-epoch transition is unsatisfiable normally",
+                "decision": "continue_with_audited_exception",
+            },
+        )
+    )
+    assert response["ok"] is True, json.dumps(response, indent=2, sort_keys=True)
+    assert response["diagnostic_backlog_id"] == diagnostic_id
+    assert response["diagnostic_status"] == "OPEN"
+    assert len(response["timeline_events"]) == 2
+    assert {
+        event["event_type"] for event in response["timeline_events"]
+    } == {
+        "contract_line_bypass",
+        "contract_line_bypass_diagnostic_linked",
+    }
+    written = response["written_line"]
+    assert written["evidence_kind"] == "contract_line_bypass"
+    assert written["status"] == "waived"
+    assert written["no_pass_claim"] is True
+    _assert_worker_commit_bypass_continuation_v3(
+        written["payload"]["continuation_authority"],
+        case,
+    )
+    persisted_record = server._contract_runtime(conn).store.get(
+        case["execution_id"]
+    )
+    persisted_line = next(
+        line
+        for line in reversed(persisted_record["completed_lines"])
+        if line.get("line_id") == "worker_commit"
+    )
+    case.update(
+        {
+            "diagnostic_id": diagnostic_id,
+            "response": response,
+            "record": persisted_record,
+            "persisted_line": persisted_line,
+        }
+    )
+    return case
+
+
+def test_worker_commit_bypass_v3_persists_open_diagnostic_and_revalidates_readback(
+    conn,
+    tmp_path,
+):
+    case = _persist_ac8_worker_commit_graph_epoch_bypass_case(
+        conn,
+        tmp_path,
+        suffix="persisted-positive",
+    )
+    authority = server._contract_runtime_worker_commit_bypass_continuation_authority(
+        conn,
+        project_id=PID,
+        record=case["record"],
+        request=case["persisted_line"],
+    )
+    _assert_worker_commit_bypass_continuation_v3(authority, case)
+    assert authority["persisted_worker_commit_bypass_audit"][
+        "diagnostic_backlog_id"
+    ] == case["diagnostic_id"]
+    candidate = server._contract_runtime_server_candidate_commit(
+        conn,
+        project_id=PID,
+        record=case["record"],
+    )
+    assert candidate == case["candidate_commit"]
+    assert server._contract_runtime_server_candidate_base_commit(
+        conn,
+        project_id=PID,
+        record=case["record"],
+        expected_candidate_commit=candidate,
+    ) == case["base_commit"]
+    actual_line, actual_payload = server._runtime_context_actual_worker_commit_line(
+        conn,
+        contract_execution_id=case["execution_id"],
+        runtime_context_id=case["runtime_context_id"],
+        task_id=case["task_id"],
+    )
+    assert actual_line["status"] == "waived"
+    assert actual_line["no_pass_claim"] is True
+    assert actual_payload["schema_version"] == (
+        "contract_runtime.worker_commit_bypass_continuation.v3"
+    )
+    assert actual_payload["authoritative_pass_synthesized"] is False
+    assert actual_payload["implementation_pass_claimed"] is False
+    assert not any(
+        line.get("line_id") == "worker_commit"
+        and line.get("evidence_kind") == "worker_commit"
+        and line.get("commit_sha") == case["candidate_commit"]
+        for line in case["record"]["completed_lines"]
+    )
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "caller_only_fresh_trace",
+        "dirty_worktree",
+        "wrong_runtime_context",
+        "wrong_task",
+        "wrong_parent",
+        "wrong_line_instance",
+        "ambiguous_dispatch_lane",
+        "superseded_current_chain",
+        "old_trace_still_current",
+        "old_trace_failed",
+        "fresh_trace_failed",
+        "fresh_trace_wrong_identity",
+        "active_failed_qa",
+        "ambiguous_implementation",
+        "missing_prior_worker_commit",
+        "caller_wrong_files",
+        "missing_current_full_provenance",
+        "canonical_snapshot_provenance_mismatch",
+        "cross_lane_ac7_anchor_claim",
+    ],
+)
+def test_worker_commit_bypass_v3_rejects_unproven_epoch_or_lane_zero_write(
+    conn,
+    tmp_path,
+    variant,
+):
+    case = _ac8_worker_commit_graph_epoch_recovery_case(
+        conn,
+        tmp_path,
+        suffix=f"negative-{variant}",
+    )
+    record = copy.deepcopy(case["record"])
+    request = copy.deepcopy(case["request"])
+    if variant == "caller_only_fresh_trace":
+        conn.execute(
+            "DELETE FROM graph_query_traces WHERE trace_id = ?",
+            (case["fresh_trace_id"],),
+        )
+    elif variant == "dirty_worktree":
+        (case["worktree"] / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+    elif variant == "wrong_runtime_context":
+        request["runtime_context_id"] = "mfrctx-wrong-ac8"
+    elif variant == "wrong_task":
+        request["task_id"] = "wrong-ac8-task"
+    elif variant == "wrong_parent":
+        request["parent_task_id"] = "cex-wrong-ac8-parent"
+    elif variant == "wrong_line_instance":
+        request["line_instance_id"] = "runtime_context:mfrctx-wrong-ac8"
+    elif variant == "ambiguous_dispatch_lane":
+        dispatch = next(
+            line
+            for line in record["completed_lines"]
+            if line.get("line_id") == "observer_dispatch_bounded_workers"
+        )
+        record["completed_lines"].insert(2, copy.deepcopy(dispatch))
+    elif variant == "superseded_current_chain":
+        _persist_worker_commit_bypass_current_projection(
+            conn,
+            backlog_id=case["backlog_id"],
+            execution_id=case["execution_id"],
+            current_execution_id=f"{case['execution_id']}-successor",
+            active_child_execution_id=f"{case['execution_id']}-successor",
+            active_execution_ids=[
+                case["execution_id"],
+                f"{case['execution_id']}-successor",
+            ],
+        )
+    elif variant == "old_trace_still_current":
+        store.activate_graph_snapshot(conn, PID, case["old_snapshot_id"])
+    elif variant == "old_trace_failed":
+        conn.execute(
+            "UPDATE graph_query_traces SET status = 'failed' WHERE trace_id = ?",
+            (case["old_trace_id"],),
+        )
+    elif variant == "fresh_trace_failed":
+        conn.execute(
+            "UPDATE graph_query_traces SET status = 'failed' WHERE trace_id = ?",
+            (case["fresh_trace_id"],),
+        )
+    elif variant == "fresh_trace_wrong_identity":
+        conn.execute(
+            "UPDATE graph_query_traces SET task_id = 'wrong-ac8-task' "
+            "WHERE trace_id = ?",
+            (case["fresh_trace_id"],),
+        )
+    elif variant == "active_failed_qa":
+        record["completed_lines"].append(
+            {
+                "stage_id": "qa_independent_verification",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "payload": {"verdict": "FAIL"},
+            }
+        )
+    elif variant == "ambiguous_implementation":
+        implementation = next(
+            line
+            for line in record["completed_lines"]
+            if line.get("line_id") == "worker_implementation"
+        )
+        record["completed_lines"].insert(-1, copy.deepcopy(implementation))
+    elif variant == "missing_prior_worker_commit":
+        record["completed_lines"] = [
+            line
+            for line in record["completed_lines"]
+            if line.get("line_id") != "worker_commit"
+        ]
+    elif variant == "caller_wrong_files":
+        request["changed_files"] = ["outside.py"]
+    elif variant == "missing_current_full_provenance":
+        conn.execute(
+            "DELETE FROM graph_current_full_reconcile_provenance "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (PID, case["active_snapshot_id"]),
+        )
+    elif variant == "canonical_snapshot_provenance_mismatch":
+        conn.execute(
+            "UPDATE graph_snapshots SET commit_sha = ? "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (
+                case["earlier_worker_commit"],
+                PID,
+                case["active_snapshot_id"],
+            ),
+        )
+    elif variant == "cross_lane_ac7_anchor_claim":
+        other_runtime = "mfrctx-cross-lane-ac7"
+        record["completed_lines"].append(
+            {
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "line_instance_id": f"runtime_context:{other_runtime}",
+                "actor_role": "observer",
+                "evidence_kind": "contract_line_bypass",
+                "status": "waived",
+                "no_pass_claim": True,
+                "payload": {
+                    "blocked_evidence_kind": "implementation",
+                    "no_pass_claim": True,
+                    "runtime_context_id": other_runtime,
+                    "task_id": "cross-lane-ac7-task",
+                },
+            }
+        )
+        request["runtime_context_id"] = other_runtime
+        request["task_id"] = "cross-lane-ac7-task"
+        request["line_instance_id"] = f"runtime_context:{other_runtime}"
+    conn.commit()
+
+    runtime = server._contract_runtime(conn)
+    stored_before = runtime.store.get(case["execution_id"])
+    revision_before = int(stored_before["execution_state_revision"])
+    stored_hash_before = server.stable_sha256(stored_before)
+    record_hash_before = server.stable_sha256(record)
+    request_hash_before = server.stable_sha256(request)
+    context_before = get_branch_context(conn, PID, case["task_id"])
+    event_count_before = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    backlog_count_before = conn.execute(
+        "SELECT COUNT(*) FROM backlog_bugs"
+    ).fetchone()[0]
+    worktree_state_before = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=case["worktree"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    assert server._contract_runtime_worker_commit_bypass_continuation_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        request=request,
+    ) == {}
+
+    stored_after = runtime.store.get(case["execution_id"])
+    assert int(stored_after["execution_state_revision"]) == revision_before
+    assert server.stable_sha256(stored_after) == stored_hash_before
+    assert server.stable_sha256(record) == record_hash_before
+    assert server.stable_sha256(request) == request_hash_before
+    assert get_branch_context(conn, PID, case["task_id"]) == context_before
+    assert conn.execute("SELECT COUNT(*) FROM task_timeline_events").fetchone()[0] == (
+        event_count_before
+    )
+    assert conn.execute("SELECT COUNT(*) FROM backlog_bugs").fetchone()[0] == (
+        backlog_count_before
+    )
+    assert subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=case["worktree"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == worktree_state_before
+
+
 def test_failed_qa_route_rotation_uses_one_server_correction_identity(monkeypatch):
     """Regression for req-9b081/5ecb/6ba2: current and source refs do not deadlock."""
 
