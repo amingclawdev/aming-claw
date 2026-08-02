@@ -16708,16 +16708,21 @@ def _runtime_context_finish_hint_from_source_backed_implementation(
             ),
         }
         for field, value in expected.items():
-            if _runtime_context_non_placeholder_text(
+            alias_value = _runtime_context_non_placeholder_text(
                 _timeline_first_deep_text(alias, field)
-            ) != value:
+            )
+            if alias_value and alias_value != value:
                 errors.append(f"timeline alias {field} conflicts with source")
         alias_results = (
-            dict(timeline_refs.get("test_results") or {})
-            if isinstance(timeline_refs.get("test_results"), Mapping)
+            dict(alias.get("test_results") or {})
+            if isinstance(alias.get("test_results"), Mapping)
             else {}
         )
-        if alias_results != source_results:
+        if not alias_results:
+            alias_results = _runtime_context_test_results_from_tests(
+                alias.get("tests")
+            )
+        if alias_results and alias_results != source_results:
             errors.append("timeline alias test_results conflict with source")
         for label, keys, source_key in (
             ("changed_files", ("changed_files", "worker_changed_files"), "changed_files"),
@@ -16731,7 +16736,7 @@ def _runtime_context_finish_hint_from_source_backed_implementation(
                 set(_runtime_context_service_query_values(alias, *keys))
             )
             source_values = sorted(set(source_projection.get(source_key) or []))
-            if alias_values != source_values:
+            if alias_values and alias_values != source_values:
                 errors.append(f"timeline alias {label} conflict with source")
     resolution = {
         "schema_version": schema_version,
