@@ -3646,6 +3646,81 @@ def test_persisted_worker_commit_bypass_remains_revalidated_no_pass_candidate_au
     )
 
 
+def test_persisted_worker_commit_bypass_survives_canonical_finish_validation_only(
+    conn,
+    tmp_path,
+):
+    prewrite = _live_worker_commit_after_implementation_bypass_case(
+        conn,
+        tmp_path,
+        suffix="validated-prewrite-rejected",
+    )
+    prewrite_finished = parallel_branch_runtime.record_branch_finish_gate(
+        conn,
+        project_id=PID,
+        task_id=prewrite["task_id"],
+        checkpoint_id="ckpt-validated-prewrite-rejected",
+        fence_token="fence-validated-prewrite-rejected",
+        head_commit=prewrite["candidate_commit"],
+    )
+    assert prewrite_finished.status == STATE_VALIDATED
+    assert server._contract_runtime_worker_commit_bypass_continuation_authority(
+        conn,
+        project_id=PID,
+        record=prewrite["record"],
+        request=prewrite["request"],
+    ) == {}
+
+    case = _persisted_worker_commit_bypass_case(
+        conn,
+        tmp_path,
+        suffix="validated-post-write",
+    )
+    finished = parallel_branch_runtime.record_branch_finish_gate(
+        conn,
+        project_id=PID,
+        task_id=case["task_id"],
+        checkpoint_id="ckpt-validated-post-write",
+        fence_token="fence-validated-post-write",
+        head_commit=case["candidate_commit"],
+    )
+    assert finished.status == STATE_VALIDATED
+    assert finished.checkpoint_id == "ckpt-validated-post-write"
+    assert finished.replay_source == "mf_sub_finish_gate"
+    persisted = get_branch_context(conn, PID, case["task_id"])
+    assert persisted is not None
+    assert persisted.status == STATE_VALIDATED
+    assert persisted.head_commit == case["candidate_commit"]
+
+    record = server._contract_runtime(conn).store.get(case["execution_id"])
+    candidate_commit = server._contract_runtime_server_candidate_commit(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    assert candidate_commit == case["candidate_commit"]
+    assert server._contract_runtime_server_candidate_base_commit(
+        conn,
+        project_id=PID,
+        record=record,
+        expected_candidate_commit=candidate_commit,
+    ) == case["base_commit"]
+    actual_line, actual_payload = server._runtime_context_actual_worker_commit_line(
+        conn,
+        contract_execution_id=case["execution_id"],
+        runtime_context_id=case["runtime_context_id"],
+        task_id=case["task_id"],
+    )
+    assert actual_line["evidence_kind"] == "contract_line_bypass"
+    assert actual_line["status"] == "waived"
+    assert actual_line["no_pass_claim"] is True
+    assert actual_payload["schema_version"] == (
+        "contract_runtime.worker_commit_bypass_continuation.v2"
+    )
+    assert actual_payload["authoritative_pass_synthesized"] is False
+    assert actual_payload["implementation_pass_claimed"] is False
+
+
 @pytest.mark.parametrize(
     "variant",
     [
@@ -3655,6 +3730,7 @@ def test_persisted_worker_commit_bypass_remains_revalidated_no_pass_candidate_au
         "mismatched_diagnostic",
         "missing_audit",
         "superseded_active_chain",
+        "terminal_chain_projection",
     ],
 )
 def test_persisted_worker_commit_bypass_rejects_tampered_continuation_authority(
@@ -3701,7 +3777,10 @@ def test_persisted_worker_commit_bypass_rejects_tampered_continuation_authority(
             "DELETE FROM task_timeline_events WHERE id = ?",
             (case["source_event"]["id"],),
         )
-    elif variant == "superseded_active_chain":
+    elif variant in {
+        "superseded_active_chain",
+        "terminal_chain_projection",
+    }:
         persist_forged_record = False
     if persist_forged_record:
         runtime.store.update(
@@ -3731,6 +3810,18 @@ def test_persisted_worker_commit_bypass_rejects_tampered_continuation_authority(
         assert projection["degraded"] is False
         assert case["execution_id"] in projection["active_chain"]["execution_ids"]
         assert projection["current_contract_execution_id"] != case["execution_id"]
+    elif variant == "terminal_chain_projection":
+        projection = _persist_worker_commit_bypass_current_projection(
+            conn,
+            backlog_id=case["backlog_id"],
+            execution_id=case["execution_id"],
+            readiness_state="contract_complete",
+            active_child_execution_id="",
+            active_execution_ids=[case["execution_id"]],
+        )
+        assert projection["degraded"] is False
+        assert projection["readiness_state"] == "contract_complete"
+        assert projection["active_child_contract_execution_id"] == ""
     conn.commit()
 
     persisted_worker_commit = next(
