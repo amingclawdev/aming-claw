@@ -32217,6 +32217,7 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
         "actual_host_worker_id": actual_host_worker_id,
         "worker_session_id": worker_session_id,
         "host_session_id": host_session_id,
+        "session_token_ref": active_session_token_ref,
         "contract_execution_id": str(contract_execution_id or "").strip(),
     }
     for field, expected in expected_request_identity.items():
