@@ -4811,12 +4811,24 @@ def test_worker_commit_bypass_v3_rejects_unproven_epoch_or_lane_zero_write(
         text=True,
     ).stdout
 
-    assert server._contract_runtime_worker_commit_bypass_continuation_authority(
+    authority = server._contract_runtime_worker_commit_bypass_continuation_authority(
         conn,
         project_id=PID,
         record=record,
         request=request,
-    ) == {}
+    )
+    if variant == "active_failed_qa":
+        # AC8 must not consume a failed-QA lane, but the pre-existing v1
+        # historical-lineage recovery remains independently authorized.
+        assert authority["schema_version"] == (
+            "contract_runtime.worker_commit_bypass_continuation.v1"
+        )
+        assert authority["historical_lineage_stale"] is True
+        assert authority.get("authorization_scope") != (
+            "worker_commit_bypass_only"
+        )
+    else:
+        assert authority == {}
 
     stored_after = runtime.store.get(case["execution_id"])
     assert int(stored_after["execution_state_revision"]) == revision_before
