@@ -11071,6 +11071,508 @@ def handle_graph_governance_parallel_branches(ctx: RequestContext):
         conn.close()
 
 
+def _parallel_branch_allocate_precheck_registered_repository(
+    project_id: str,
+) -> Path:
+    """Resolve the one registered repository allowed to own worker worktrees."""
+
+    from . import batch_jobs
+
+    registered_root = project_service.resolve_project_root(
+        project_id,
+        None,
+        fallback_self=True,
+    )
+    if registered_root is None:
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_project_unregistered",
+            "parallel allocation precheck requires a registered target project",
+            422,
+            {
+                "project_id": project_id,
+                "writes_performed": False,
+                "next_legal_action": "register_or_bootstrap_target_project",
+            },
+        )
+    try:
+        return batch_jobs.repo_root(Path(registered_root).expanduser()).resolve()
+    except (OSError, subprocess.SubprocessError, batch_jobs.BatchJobError) as exc:
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_repository_unavailable",
+            "registered target project is not an available git repository",
+            422,
+            {
+                "project_id": project_id,
+                "registered_project_root": str(registered_root),
+                "reason": str(exc),
+                "writes_performed": False,
+            },
+        ) from exc
+
+
+def _parallel_branch_allocate_precheck_requested_path_diagnostics(
+    lane: Mapping[str, Any],
+    *,
+    repository_root: Path,
+    canonical_worktree_path: Path,
+) -> list[dict[str, Any]]:
+    """Describe caller paths replaced by the repository-local projection."""
+
+    diagnostics: list[dict[str, Any]] = []
+    for field in (
+        "workspace_root",
+        "repo_root_path",
+        "target_project_root",
+        "target_graph_root",
+        "worktree_root",
+        "worktree_path",
+        "worker_worktree_path",
+        "assigned_worktree",
+    ):
+        requested = str(lane.get(field) or "").strip()
+        if not requested:
+            continue
+        requested_path = Path(requested).expanduser()
+        requested_resolved = requested_path.resolve()
+        expected = (
+            canonical_worktree_path
+            if field
+            in {"worktree_path", "worker_worktree_path", "assigned_worktree"}
+            else repository_root / ".worktrees"
+            if field == "worktree_root"
+            else repository_root
+        )
+        if requested_resolved == expected.resolve():
+            continue
+        diagnostics.append(
+            {
+                "code": "caller_path_replaced_by_registered_repository_projection",
+                "field": field,
+                "requested_path": str(requested_path),
+                "canonical_path": str(expected.resolve()),
+                "materialized": False,
+            }
+        )
+    return diagnostics
+
+
+def _parallel_branch_allocate_precheck_copy_safe_body(
+    conn,
+    *,
+    project_id: str,
+    lane: Mapping[str, Any],
+    repository_root: Path,
+    default_base_commit: str,
+    default_target_head_commit: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate and project one allocation lane without persisting anything."""
+
+    from . import batch_jobs
+
+    task_id = str(lane.get("task_id") or "").strip()
+    backlog_id = str(lane.get("backlog_id") or "").strip()
+    contract_execution_id = _runtime_context_public_text(
+        lane.get("contract_execution_id"),
+        lane.get("successor_contract_execution_id"),
+        lane.get("current_contract_execution_id"),
+    )
+    route_token_ref = str(lane.get("route_token_ref") or "").strip()
+    worker_id = str(
+        lane.get("worker_id") or lane.get("worker_slot_id") or ""
+    ).strip()
+    requested_stage_type = str(lane.get("stage_type") or "mf_sub").strip()
+    if requested_stage_type != "mf_sub":
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_stage_type_invalid",
+            (
+                "the atomic two-lane precheck is only for initial mf_sub fan-out; "
+                "failed_qa_rework uses one bounded parallel_branch_allocate request"
+            ),
+            422,
+            {
+                "task_id": task_id,
+                "requested_stage_type": requested_stage_type,
+                "required_stage_type": "mf_sub",
+                "writes_performed": False,
+            },
+        )
+    owned_files = _runtime_context_public_file_values(
+        _runtime_context_service_query_values(
+            lane,
+            "owned_files",
+            "target_files",
+        )
+    )
+    missing_fields = [
+        field
+        for field, value in (
+            ("task_id", task_id),
+            ("backlog_id", backlog_id),
+            ("contract_execution_id", contract_execution_id),
+            ("route_token_ref", route_token_ref),
+            ("worker_id", worker_id),
+            ("owned_files", owned_files),
+        )
+        if not value
+    ]
+    if missing_fields:
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_lane_incomplete",
+            "parallel allocation precheck lane is incomplete",
+            422,
+            {
+                "task_id": task_id,
+                "missing_fields": missing_fields,
+                "writes_performed": False,
+            },
+        )
+
+    effective = _parallel_branch_allocate_effective_route_body(
+        conn,
+        project_id=project_id,
+        body={
+            **dict(lane),
+            "backlog_id": backlog_id,
+            "contract_execution_id": contract_execution_id,
+            "route_token_ref": route_token_ref,
+        },
+    )
+    route_identity = _parallel_branch_runtime_contract_route_identity(effective)
+
+    base_commit = str(lane.get("base_commit") or default_base_commit).strip().lower()
+    target_head_commit = str(
+        lane.get("target_head_commit") or default_target_head_commit or base_commit
+    ).strip().lower()
+    commit_verification = _parallel_branch_allocate_verify_commits(
+        project_id,
+        workspace_root=str(repository_root),
+        workspace_root_source="registered_project",
+        base_commit=base_commit,
+        target_head_commit=target_head_commit,
+    )
+
+    lane_slug = _parallel_branch_allocate_slug(
+        f"{task_id}-{worker_id}"
+    )
+    if not lane_slug:
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_lane_slug_invalid",
+            "parallel allocation task/worker identity cannot form a safe worktree name",
+            422,
+            {"task_id": task_id, "worker_id": worker_id, "writes_performed": False},
+        )
+    canonical_worktree = (repository_root / ".worktrees" / lane_slug).resolve()
+    try:
+        batch_jobs.ensure_worktree_path_safe(repository_root, canonical_worktree)
+    except batch_jobs.BatchJobError as exc:
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_worktree_unsafe",
+            str(exc),
+            422,
+            {"task_id": task_id, "writes_performed": False},
+        ) from exc
+    branch_prefix = _parallel_branch_allocate_slug(
+        lane.get("branch_prefix") or "codex"
+    ) or "codex"
+    task_slug = _parallel_branch_allocate_slug(task_id) or "task"
+    try:
+        attempt = max(1, int(lane.get("attempt") or 1))
+    except (TypeError, ValueError):
+        attempt = 1
+    attempt_suffix = f"-attempt-{attempt}" if attempt > 1 else ""
+    # Keep this projection byte-for-byte aligned with
+    # parallel_branch_runtime.plan_branch_runtime_context.  branch_ref is
+    # returned for diagnosis/copy safety even though allocate derives it again.
+    branch_ref = f"refs/heads/{branch_prefix}/{task_slug}{attempt_suffix}"
+    merge_queue_id = str(lane.get("merge_queue_id") or f"mq-{lane_slug}").strip()
+
+    stripped_fields = {
+        "project_id",
+        "workspace_root",
+        "repo_root_path",
+        "target_project_root",
+        "target_graph_root",
+        "worktree_root",
+        "worktree_path",
+        "worker_worktree_path",
+        "assigned_worktree",
+        "route_token",
+        "route_waiver",
+        "route_token_waiver",
+        "fence_token",
+        "session_token",
+        "session_token_ref",
+    }
+    copy_safe_body = {
+        key: value
+        for key, value in dict(lane).items()
+        if key not in stripped_fields and value is not None
+    }
+    copy_safe_body.update(
+        {
+            "backlog_id": backlog_id,
+            "contract_execution_id": contract_execution_id,
+            "successor_contract_execution_id": contract_execution_id,
+            "current_contract_execution_id": contract_execution_id,
+            "parent_task_id": contract_execution_id,
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "worker_slot_id": str(
+                lane.get("worker_slot_id") or worker_id
+            ).strip(),
+            "stage_type": "mf_sub",
+            "workspace_root": str(repository_root),
+            "target_project_root": str(canonical_worktree),
+            "worktree_root": str((repository_root / ".worktrees").resolve()),
+            "worktree_path": str(canonical_worktree),
+            "branch_prefix": branch_prefix,
+            "branch_ref": branch_ref,
+            "base_commit": base_commit,
+            "target_head_commit": target_head_commit,
+            "merge_queue_id": merge_queue_id,
+            "owned_files": owned_files,
+            "target_files": owned_files,
+            "route_token_ref": route_token_ref,
+            "route_identity": route_identity,
+            "create_worktree": True,
+        }
+    )
+    copy_safe_body.update(route_identity)
+    path_diagnostics = _parallel_branch_allocate_precheck_requested_path_diagnostics(
+        lane,
+        repository_root=repository_root,
+        canonical_worktree_path=canonical_worktree,
+    )
+    lane_projection = {
+        "schema_version": "parallel_branch_allocate_precheck.lane.v1",
+        "task_id": task_id,
+        "worker_id": worker_id,
+        "contract_execution_id": contract_execution_id,
+        "route_token_ref": route_token_ref,
+        "owned_files": owned_files,
+        "canonical_worktree_path": str(canonical_worktree),
+        "canonical_branch_ref": branch_ref,
+        "canonical_merge_queue_id": merge_queue_id,
+        "commit_verification": commit_verification,
+        "path_diagnostics": path_diagnostics,
+        "caller_path_projection_applied": bool(path_diagnostics),
+        "materialized": False,
+    }
+    return copy_safe_body, lane_projection
+
+
+@route(
+    "POST",
+    "/api/graph-governance/{project_id}/parallel-branches/allocation-precheck",
+)
+def handle_graph_governance_parallel_branch_allocate_precheck(
+    ctx: RequestContext,
+):
+    """Return an atomic copy-safe allocation plan with an explicit zero-write contract."""
+
+    from . import batch_jobs
+
+    project_id = ctx.get_project_id()
+    lanes = ctx.body.get("lanes")
+    if not isinstance(lanes, list):
+        raise ValidationError("lanes must be an array")
+    try:
+        expected_lane_count = int(
+            ctx.body.get("expected_lane_count")
+            or ctx.body.get("expected_worker_count")
+            or 2
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("expected_lane_count must be an integer") from exc
+    if expected_lane_count != 2 or len(lanes) != expected_lane_count:
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_lane_count_mismatch",
+            "mf_parallel allocation precheck requires exactly two atomic lanes",
+            422,
+            {
+                "required_lane_count": 2,
+                "requested_lane_count": len(lanes),
+                "writes_performed": False,
+            },
+        )
+
+    repository_root = _parallel_branch_allocate_precheck_registered_repository(
+        project_id
+    )
+    default_base_commit = str(ctx.body.get("base_commit") or "").strip().lower()
+    if not default_base_commit:
+        default_base_commit = batch_jobs.git_commit(repository_root).strip().lower()
+    default_target_head_commit = str(
+        ctx.body.get("target_head_commit") or default_base_commit
+    ).strip().lower()
+
+    shared_defaults = {
+        key: value
+        for key, value in dict(ctx.body or {}).items()
+        if key
+        not in {
+            "lanes",
+            "expected_lane_count",
+            "expected_worker_count",
+            "project_id",
+        }
+    }
+    conn = get_connection(project_id)
+    try:
+        copy_safe_bodies: list[dict[str, Any]] = []
+        lane_projections: list[dict[str, Any]] = []
+        for raw_lane in lanes:
+            if not isinstance(raw_lane, Mapping):
+                raise GovernanceError(
+                    "parallel_branch_allocate_precheck_lane_invalid",
+                    "each parallel allocation lane must be an object",
+                    422,
+                    {"writes_performed": False},
+                )
+            lane = {**shared_defaults, **dict(raw_lane)}
+            copy_safe_body, lane_projection = (
+                _parallel_branch_allocate_precheck_copy_safe_body(
+                    conn,
+                    project_id=project_id,
+                    lane=lane,
+                    repository_root=repository_root,
+                    default_base_commit=default_base_commit,
+                    default_target_head_commit=default_target_head_commit,
+                )
+            )
+            copy_safe_bodies.append(copy_safe_body)
+            lane_projections.append(lane_projection)
+
+        backlog_ids = {
+            str(body.get("backlog_id") or "").strip()
+            for body in copy_safe_bodies
+        }
+        execution_ids = {
+            str(body.get("contract_execution_id") or "").strip()
+            for body in copy_safe_bodies
+        }
+        if len(backlog_ids) != 1 or len(execution_ids) != 1:
+            raise GovernanceError(
+                "parallel_branch_allocate_precheck_atomic_scope_mismatch",
+                "atomic lanes must share one backlog and one child contract execution",
+                422,
+                {
+                    "backlog_ids": sorted(backlog_ids),
+                    "contract_execution_ids": sorted(execution_ids),
+                    "writes_performed": False,
+                },
+            )
+        backlog_id = next(iter(backlog_ids))
+        contract_execution_id = next(iter(execution_ids))
+        criteria, row_files = _backlog_acceptance_scope_authority(
+            conn,
+            backlog_id,
+        )
+        lane_owned_files = [
+            _runtime_context_public_file_values(body.get("owned_files") or [])
+            for body in copy_safe_bodies
+        ]
+        lane_files_outside_row = sorted(
+            {
+                path
+                for files in lane_owned_files
+                for path in files
+                if path not in set(row_files)
+            }
+        )
+        lane_errors = _contract_runtime_mf_parallel_atomic_lane_errors(
+            copy_safe_bodies,
+            distinct_fields=(
+                "task_id",
+                "worker_id",
+                "worker_slot_id",
+                "worktree_path",
+                "branch_ref",
+                "merge_queue_id",
+                "route_token_ref",
+            ),
+        )
+        if lane_files_outside_row:
+            lane_errors.append(
+                "atomic bounded workers contain files outside backlog authority: "
+                + ", ".join(lane_files_outside_row)
+            )
+        (
+            acceptance_scope_criteria,
+            acceptance_scope_closure,
+            acceptance_errors,
+        ) = _contract_runtime_mf_parallel_rev8_atomic_acceptance_gate(
+            conn,
+            project_id=project_id,
+            record={
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "contract_execution_id": contract_execution_id,
+            },
+            lane_owned_files=lane_owned_files,
+            acceptance_claim_source=copy_safe_bodies,
+        )
+        all_errors = list(
+            dict.fromkeys([*lane_errors, *acceptance_errors])
+        )
+        if all_errors:
+            raise GovernanceError(
+                "parallel_branch_allocate_precheck_atomic_gate_failed",
+                "atomic allocation lanes failed identity, fence, or acceptance validation",
+                422,
+                {
+                    "errors": all_errors,
+                    "acceptance_scope_closure": acceptance_scope_closure,
+                    "writes_performed": False,
+                },
+            )
+
+        for body in copy_safe_bodies:
+            body["acceptance_criteria"] = list(acceptance_scope_criteria or criteria)
+            body["allocation_precheck"] = {
+                "schema_version": "parallel_branch_allocate_precheck.receipt.v1",
+                "status": "ready",
+                "submit_unchanged": True,
+                "zero_write": True,
+            }
+        copy_safe_bodies.sort(key=lambda body: str(body.get("task_id") or ""))
+        lane_projections.sort(
+            key=lambda lane: str(lane.get("task_id") or "")
+        )
+        return {
+            "ok": True,
+            "status": "ready",
+            "schema_version": "parallel_branch_allocate_precheck.v1",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": contract_execution_id,
+            "expected_lane_count": 2,
+            "lane_count": len(copy_safe_bodies),
+            "atomic": True,
+            "submit_unchanged": True,
+            "mcp_tool": "parallel_branch_allocate",
+            "copy_safe_allocation_bodies": copy_safe_bodies,
+            "lane_projections": lane_projections,
+            "acceptance_scope_closure": acceptance_scope_closure,
+            "registered_repository_root": str(repository_root),
+            "zero_write_proof": {
+                "schema_version": "parallel_branch_allocate_precheck.zero_write.v1",
+                "writes_performed": False,
+                "runtime_context_writes": 0,
+                "worktree_materializations": 0,
+                "merge_queue_writes": 0,
+                "timeline_writes": 0,
+                "contract_runtime_writes": 0,
+                "transaction_opened": False,
+            },
+            "raw_private_context_exposed": False,
+            "raw_route_token_exposed": False,
+            "raw_fence_token_exposed": False,
+        }
+    finally:
+        conn.close()
+
+
 def _parallel_branch_allocate_requested_worktree_path(
     body: Mapping[str, Any],
 ) -> tuple[str, str]:
@@ -12115,7 +12617,7 @@ def _parallel_branch_allocate_mf_parallel_rev8_record(
         not _is_mf_parallel_record_contract_id(
             str(record.get("contract_id") or "")
         )
-        or str(record.get("revision") or "").strip() != "rev8"
+        or not _is_mf_parallel_postmerge_revision(record)
         or str(record.get("project_id") or "").strip() != str(project_id)
         or str(record.get("backlog_id") or "").strip() != str(backlog_id)
     ):
@@ -70094,10 +70596,12 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
             continue
         candidates.append((context, revision_payload))
     policy = _contract_runtime_mf_parallel_dispatch_authority_policy(record)
-    required_worker_count = _contract_runtime_mf_parallel_required_worker_count(
+    required_worker_count = (
+        _contract_runtime_mf_parallel_current_generation_worker_count(
         record,
         conn=conn,
         project_id=project_id,
+        )
     )
     candidates.sort(
         key=lambda item: (
@@ -70720,7 +71224,7 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
         _is_mf_parallel_record_contract_id(
             str(record.get("contract_id") or "")
         )
-        and str(record.get("revision") or "").strip() == "rev8"
+        and _is_mf_parallel_postmerge_revision(record)
     ):
         failed_qa_line = _contract_runtime_latest_failed_qa_line(record)
         if failed_qa_line and not _runtime_record_is_complete(record):
@@ -70731,19 +71235,51 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
                 f"contract_runtime:{record.get('contract_execution_id', '')}:"
                 f"completed_lines:{failed_index}"
             )
+            bounded_worker_fix = (
+                str(record.get("revision") or "").strip() == "rev9"
+            )
             current_state.update(
                 {
                     "status": "blocked",
                     "readiness_state": "failed_qa_worker_fix_required",
                     "next_legal_action": {
-                        "id": "enter_direct_fix_successor",
-                        "action": "enter_direct_fix_successor",
+                        "id": (
+                            "allocate_bounded_worker_fix"
+                            if bounded_worker_fix
+                            else "enter_direct_fix_successor"
+                        ),
+                        "action": (
+                            "parallel_branch_allocate"
+                            if bounded_worker_fix
+                            else "enter_direct_fix_successor"
+                        ),
                         "owner_role": "observer",
                         "recommended_successor_contract_id": (
-                            DIRECT_FIX_CONTRACT_ID
+                            MF_PARALLEL_CONTRACT_ID
+                            if bounded_worker_fix
+                            else DIRECT_FIX_CONTRACT_ID
                         ),
                         "failed_qa_source_ref": failed_source_ref,
                         "bounded_worker_fix_required": True,
+                        **(
+                            {
+                                "successor_mode": (
+                                    "same_contract_append_only_failed_qa_rework"
+                                ),
+                                "worker_fix_cardinality": 1,
+                                "allocation_precheck_required": False,
+                                "allocation_tool": "parallel_branch_allocate",
+                                "allocation_request_requirements": {
+                                    "stage_type": "failed_qa_rework",
+                                    "minimum_attempt": 2,
+                                    "failed_qa_source_ref": failed_source_ref,
+                                    "fresh_runtime_context_required": True,
+                                },
+                                "direct_fix_allowed": False,
+                            }
+                            if bounded_worker_fix
+                            else {}
+                        ),
                         "fresh_qa_session_required": True,
                         "return_sequence": [
                             "observer_merge",
@@ -81256,7 +81792,7 @@ def _contract_runtime_rev8_postmerge_qa_authority(
     registered project root.
     """
 
-    if str(record.get("revision") or "").strip() != "rev8":
+    if not _is_mf_parallel_postmerge_revision(record):
         return {}
 
     def blocked(*codes: str) -> dict[str, Any]:
@@ -81581,7 +82117,7 @@ def _contract_runtime_bind_qa_graph_authority(
     requested_trace_ids = _contract_runtime_requested_trace_ids(body, policy)
     identity = _contract_runtime_server_line_identity(record)
     rev8_postmerge_qa = bool(
-        str(record.get("revision") or "").strip() == "rev8"
+        _is_mf_parallel_postmerge_revision(record)
         and str(write.get("line_id") or "").strip() == "qa_graph_context"
     )
     postmerge_authority = (
@@ -84671,7 +85207,7 @@ def _contract_runtime_observer_merge_completed_round(
         if acceptance.get("db_verified") is True:
             qa_verification_lines.append((index, line, acceptance))
     if (
-        str(record.get("revision") or "").strip() == "rev8"
+        _is_mf_parallel_postmerge_revision(record)
         and not qa_graph_lines
         and not qa_verification_lines
     ):
@@ -84793,7 +85329,7 @@ def _contract_runtime_observer_merge_durable_authority(
         and str(line.get("line_id") or "").strip()
         == "observer_dispatch_bounded_workers"
     ]
-    rev8_two_worker_fanout = str(record.get("revision") or "").strip() == "rev8"
+    rev8_two_worker_fanout = _is_mf_parallel_postmerge_revision(record)
     completed_merge_context_ids = {
         _contract_runtime_mapping_value(line, "runtime_context_id")
         for line in record.get("completed_lines") or []
@@ -86594,7 +87130,7 @@ def _contract_runtime_rev8_two_worker_merge_projection(
     """
 
     if (
-        str(record.get("revision") or "").strip() != "rev8"
+        not _is_mf_parallel_postmerge_revision(record)
         or required_worker_count not in {1, 2}
     ):
         return {}
@@ -86614,6 +87150,15 @@ def _contract_runtime_rev8_two_worker_merge_projection(
     expected_workers = _contract_runtime_mf_parallel_bounded_workers(
         {"payload": dispatch_selection.get("payload") or {}}
     )
+    if not expected_workers:
+        rework_worker = (
+            _contract_runtime_mf_parallel_verified_rework_dispatch_worker(
+                record,
+                dispatch_selection,
+            )
+        )
+        if rework_worker:
+            expected_workers = [rework_worker]
     expected_by_runtime = {
         str(worker.get("runtime_context_id") or "").strip(): worker
         for worker in expected_workers
@@ -86745,11 +87290,11 @@ def _contract_runtime_current_full_reconcile_authority(
     project_id: str,
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
-    if str(record.get("revision") or "").strip() == "rev8":
+    if _is_mf_parallel_postmerge_revision(record):
         merge = _contract_runtime_rev8_two_worker_merge_projection(
             record,
             required_worker_count=(
-                _contract_runtime_mf_parallel_required_worker_count(
+                _contract_runtime_mf_parallel_current_generation_worker_count(
                     record,
                     conn=conn,
                     project_id=project_id,
@@ -87221,11 +87766,11 @@ def _contract_runtime_reconcile_record_authority(
     current-full verification is recomputed by close authority.
     """
 
-    if str(record.get("revision") or "").strip() == "rev8":
+    if _is_mf_parallel_postmerge_revision(record):
         merge = _contract_runtime_rev8_two_worker_merge_projection(
             record,
             required_worker_count=(
-                _contract_runtime_mf_parallel_required_worker_count(
+                _contract_runtime_mf_parallel_current_generation_worker_count(
                     record,
                     conn=conn,
                     project_id=project_id,
@@ -87683,7 +88228,7 @@ def _contract_runtime_mf_parallel_required_worker_count(
         else {}
     )
     if not selection:
-        if str(record.get("revision") or "").strip() == "rev8" and not policy:
+        if _is_mf_parallel_postmerge_revision(record) and not policy:
             return 2
         return pinned_count
     if selection.get("observer_selected") is not True:
@@ -87765,6 +88310,96 @@ def _contract_runtime_mf_parallel_required_worker_count(
     return 1
 
 
+def _contract_runtime_mf_parallel_current_generation_worker_count(
+    record: Mapping[str, Any],
+    *,
+    conn=None,
+    project_id: str = "",
+) -> int:
+    """Return cardinality for the dispatch generation that owns merge/QA.
+
+    Rev9 keeps the initial standalone fan-out at two workers, but an accepted
+    QA NO-PASS appends one server-bound ``failed_qa_rework`` dispatch to the
+    same execution.  Post-merge authority must therefore follow that verified
+    replacement generation instead of reusing the frozen initial cardinality.
+    """
+
+    initial_count = _contract_runtime_mf_parallel_required_worker_count(
+        record,
+        conn=conn,
+        project_id=project_id,
+    )
+    if str(record.get("revision") or "").strip() != "rev9":
+        return initial_count
+    selected = _contract_runtime_current_dispatch_authority_line(record)
+    if selected.get("status") != "selected":
+        return initial_count
+    if _contract_runtime_mf_parallel_verified_rework_dispatch_worker(
+        record,
+        selected,
+    ):
+        return 1
+    return initial_count
+
+
+def _contract_runtime_mf_parallel_verified_rework_dispatch_worker(
+    record: Mapping[str, Any],
+    selected: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one server-bound rev9 rework dispatch as a worker lane."""
+
+    if (
+        str(record.get("revision") or "").strip() != "rev9"
+        or selected.get("status") != "selected"
+    ):
+        return {}
+    payload = (
+        selected.get("payload")
+        if isinstance(selected.get("payload"), Mapping)
+        else {}
+    )
+    revision = (
+        payload.get("failed_qa_rework_dispatch_revision")
+        if isinstance(
+            payload.get("failed_qa_rework_dispatch_revision"), Mapping
+        )
+        else {}
+    )
+    authority = (
+        payload.get("failed_qa_rework_dispatch_revision_authority")
+        if isinstance(
+            payload.get("failed_qa_rework_dispatch_revision_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    if (
+        revision.get("append_only_history_preserved") is True
+        and revision.get("timeline_projection_authoritative") is False
+        and authority.get("server_derived") is True
+        and str(authority.get("source") or "").strip()
+        == "parallel_branch_allocate_failed_qa_rework"
+        and str(authority.get("contract_execution_id") or "").strip()
+        == str(record.get("contract_execution_id") or "").strip()
+    ):
+        workers = _contract_runtime_mf_parallel_bounded_workers(
+            {"payload": payload}
+        )
+        if len(workers) == 1:
+            return dict(workers[0])
+        if all(
+            str(payload.get(field) or "").strip()
+            for field in (
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "merge_queue_id",
+            )
+        ):
+            return dict(payload)
+    return {}
+
+
 def _contract_runtime_mf_parallel_worker_cardinality_policy(
     conn,
     *,
@@ -87790,7 +88425,7 @@ def _contract_runtime_mf_parallel_worker_cardinality_policy(
     )
     batch_child = bool(
         required_worker_count == 1
-        and str(record.get("revision") or "").strip() == "rev8"
+        and _is_mf_parallel_postmerge_revision(record)
         and selection.get("observer_selected") is True
         and isinstance(selection.get("batch_child_authority"), Mapping)
         and selection.get("batch_child_authority")
@@ -100305,10 +100940,23 @@ MF_BATCH_PARALLEL_RECORD_CONTRACT_ID = "mf_batch_parallel"
 MF_PARALLEL_RECORD_CONTRACT_IDS = frozenset(
     {MF_PARALLEL_RECORD_CONTRACT_ID, MF_PARALLEL_CONTRACT_ID}
 )
+MF_PARALLEL_POSTMERGE_REVISION_FAMILY = frozenset({"rev8", "rev9"})
 
 
 def _is_mf_parallel_record_contract_id(contract_id: str) -> bool:
     return str(contract_id or "").strip() in MF_PARALLEL_RECORD_CONTRACT_IDS
+
+
+def _is_mf_parallel_postmerge_revision(record: Mapping[str, Any]) -> bool:
+    """Keep rev9 on the complete rev8 two-lane merge/reconcile/QA runtime."""
+
+    return (
+        _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+        and str(record.get("revision") or "").strip()
+        in MF_PARALLEL_POSTMERGE_REVISION_FAMILY
+    )
 
 
 def _mf_parallel_execution_id(
@@ -107916,7 +108564,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             record.get("contract_execution_id") or ""
         ).strip()
 
-    rev8_two_worker_fanout = str(record.get("revision") or "").strip() == "rev8"
+    rev8_two_worker_fanout = _is_mf_parallel_postmerge_revision(record)
     strict_temporal_order = bool(
         str(record.get("version") or "").strip()
         and str(record.get("revision") or "").strip()
@@ -108073,17 +108721,38 @@ def _contract_runtime_mf_parallel_close_authority_gate(
 
     expected_lane_ids: list[str] = []
     if rev8_two_worker_fanout:
+        required_generation_worker_count = (
+            _contract_runtime_mf_parallel_current_generation_worker_count(
+                record,
+                conn=conn,
+                project_id=project_id,
+            )
+        )
         dispatch_selection = _contract_runtime_current_dispatch_authority_line(record)
         if dispatch_selection.get("status") == "selected":
+            dispatch_workers = _contract_runtime_mf_parallel_bounded_workers(
+                {"payload": dispatch_selection.get("payload") or {}}
+            )
+            if not dispatch_workers:
+                rework_worker = (
+                    _contract_runtime_mf_parallel_verified_rework_dispatch_worker(
+                        record,
+                        dispatch_selection,
+                    )
+                )
+                if rework_worker:
+                    dispatch_workers = [rework_worker]
             expected_lane_ids = sorted(
                 str(worker.get("runtime_context_id") or "").strip()
-                for worker in _contract_runtime_mf_parallel_bounded_workers(
-                    {"payload": dispatch_selection.get("payload") or {}}
-                )
+                for worker in dispatch_workers
                 if str(worker.get("runtime_context_id") or "").strip()
             )
-        if len(expected_lane_ids) != 2:
-            missing.append("contract_runtime.dispatch.exactly_two_worker_lanes")
+        if len(expected_lane_ids) != required_generation_worker_count:
+            missing.append(
+                "contract_runtime.dispatch.exactly_two_worker_lanes"
+                if required_generation_worker_count == 2
+                else "contract_runtime.dispatch.exactly_one_rework_worker_lane"
+            )
         for line_id, instances in lane_lines.items():
             absent = sorted(set(expected_lane_ids) - set(instances))
             if absent:
@@ -118012,7 +118681,7 @@ def _observer_runtime_text_contract_runtime_authority(
             project_id=project_id,
             record=record,
         )
-        if str(record.get("revision") or "").strip() == "rev8"
+        if _is_mf_parallel_postmerge_revision(record)
         and str(
             (current_state.get("next_legal_action") or {}).get("line_id")
             if isinstance(

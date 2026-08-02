@@ -817,6 +817,7 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "graph_query",
         "runtime_context_current",
         "runtime_context_worker_guide",
+        "parallel_branch_allocate_precheck",
         "parallel_branch_allocate",
         "parallel_branch_startup",
         "parallel_branch_checkpoint",
@@ -3278,6 +3279,11 @@ def test_active_mcp_mf_batch_parallel_enter_routes_to_runtime_facade():
 
 
 def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
+    precheck = next(
+        tool
+        for tool in TOOLS
+        if tool.get("name") == "parallel_branch_allocate_precheck"
+    )
     allocate = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_allocate")
     startup = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_startup")
     checkpoint = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_checkpoint")
@@ -3289,6 +3295,7 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         tool for tool in TOOLS if tool.get("name") == "observer_runtime_text_prepare"
     )
 
+    precheck_props = precheck["inputSchema"]["properties"]
     allocate_props = allocate["inputSchema"]["properties"]
     startup_props = startup["inputSchema"]["properties"]
     checkpoint_props = checkpoint["inputSchema"]["properties"]
@@ -3312,6 +3319,17 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
     ):
         assert key in runtime_text_props
 
+    assert precheck["inputSchema"]["required"] == ["project_id", "lanes"]
+    assert precheck_props["lanes"]["minItems"] == 2
+    assert precheck_props["lanes"]["maxItems"] == 2
+    assert {
+        "task_id",
+        "backlog_id",
+        "contract_execution_id",
+        "worker_id",
+        "route_token_ref",
+        "owned_files",
+    } == set(precheck_props["lanes"]["items"]["required"])
     assert allocate["inputSchema"]["required"] == ["project_id", "task_id"]
     for key in (
         "workspace_root",
@@ -3450,6 +3468,52 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         "startup_source",
     ):
         assert key in runtime_text_props
+
+
+def test_mcp_parallel_branch_allocate_precheck_routes_atomic_body_unchanged():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    lanes = [
+        {
+            "task_id": "precheck-a",
+            "backlog_id": "AC-PRECHECK",
+            "contract_execution_id": "cex-precheck",
+            "worker_id": "slot-a",
+            "route_token_ref": "rtok-precheck-a",
+            "owned_files": ["src/a.py"],
+        },
+        {
+            "task_id": "precheck-b",
+            "backlog_id": "AC-PRECHECK",
+            "contract_execution_id": "cex-precheck",
+            "worker_id": "slot-b",
+            "route_token_ref": "rtok-precheck-b",
+            "owned_files": ["src/b.py"],
+        },
+    ]
+
+    dispatcher.dispatch(
+        "parallel_branch_allocate_precheck",
+        {
+            "project_id": "aming-claw",
+            "expected_lane_count": 2,
+            "base_commit": "a" * 40,
+            "lanes": lanes,
+        },
+    )
+
+    assert recorder.calls[-1] == (
+        "POST",
+        (
+            "/api/graph-governance/aming-claw/parallel-branches/"
+            "allocation-precheck"
+        ),
+        {
+            "expected_lane_count": 2,
+            "base_commit": "a" * 40,
+            "lanes": lanes,
+        },
+    )
 
 
 def test_mcp_parallel_branch_tools_route_to_governance_api():

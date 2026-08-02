@@ -59,6 +59,7 @@
     "authority_source": "backlog.acceptance_criteria",
     "enforced_before": [
       "mf_parallel_successor_binding",
+      "parallel_branch_allocate_precheck",
       "parallel_branch_allocate",
       "observer_dispatch_bounded_workers"
     ],
@@ -84,10 +85,57 @@
     "copy_safe_observer_remediation_required": true,
     "bypass_allowed": false
   },
+  "allocation_precheck_policy": {
+    "schema_version": "mf_parallel.allocation_precheck_policy.v1",
+    "tool": "parallel_branch_allocate_precheck",
+    "required_before": "initial_parallel_branch_allocate",
+    "read_only": true,
+    "expected_lane_count": 2,
+    "atomic": true,
+    "submit_returned_bodies_unchanged": true,
+    "applies_to_stage_types": [
+      "mf_sub"
+    ],
+    "excluded_stage_types": [
+      "failed_qa_rework"
+    ],
+    "required_checks": [
+      "child_route_ref_matches_contract_execution",
+      "distinct_route_token_ref",
+      "distinct_lane_identity",
+      "disjoint_owned_files",
+      "acceptance_union_closed",
+      "registered_repository_root",
+      "repository_local_worktree_path"
+    ],
+    "zero_write_surfaces": [
+      "runtime_context",
+      "worktree",
+      "merge_queue",
+      "timeline",
+      "contract_runtime"
+    ],
+    "external_path_policy": "diagnose_and_project_without_materialization",
+    "drift_gym_checkpoint_policy": "read_only",
+    "raw_private_context_exposed": false
+  },
+  "failed_qa_worker_fix_policy": {
+    "schema_version": "mf_parallel.failed_qa_worker_fix_policy.v1",
+    "successor_mode": "same_contract_append_only_failed_qa_rework",
+    "worker_fix_cardinality": 1,
+    "allocation_tool": "parallel_branch_allocate",
+    "allocation_stage_type": "failed_qa_rework",
+    "minimum_attempt": 2,
+    "fresh_runtime_context_required": true,
+    "allocation_precheck_required": false,
+    "two_lane_fanout_repeated": false,
+    "direct_fix_allowed": false,
+    "fresh_qa_session_required": true
+  },
   "runtime_contract_hints": {
     "schema_version": "contract_template.runtime_hints.v1",
     "contract_definition_id": "mf_parallel.v2",
-    "contract_definition_revision": "rev7"
+    "contract_definition_revision": "rev9"
   },
   "route_topology_policy": {
     "schema_version": "route_topology_policy.v1",

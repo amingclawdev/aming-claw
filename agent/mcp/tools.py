@@ -928,6 +928,47 @@ def _parallel_branch_allocate_schema_properties() -> dict[str, Any]:
     }
 
 
+def _parallel_branch_allocate_precheck_schema_properties() -> dict[str, Any]:
+    lane_properties = {
+        key: value
+        for key, value in _parallel_branch_allocate_schema_properties().items()
+        if key != "project_id"
+    }
+    return {
+        "project_id": {"type": "string"},
+        "lanes": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "description": (
+                "Exactly two atomic mf_parallel lane requests. The read-only "
+                "precheck resolves child route refs and returns canonical "
+                "parallel_branch_allocate bodies."
+            ),
+            "items": {
+                "type": "object",
+                "properties": lane_properties,
+                "required": [
+                    "task_id",
+                    "backlog_id",
+                    "contract_execution_id",
+                    "worker_id",
+                    "route_token_ref",
+                    "owned_files",
+                ],
+            },
+        },
+        "expected_lane_count": {"type": "integer", "enum": [2]},
+        "expected_worker_count": {"type": "integer", "enum": [2]},
+        "base_commit": {"type": "string"},
+        "target_head_commit": {"type": "string"},
+        "ref_name": {"type": "string"},
+        "target_branch": {"type": "string"},
+        "profile_requirements": {"type": "object"},
+        "retry_policy": {"type": "object"},
+    }
+
+
 _MERGE_QUEUE_FLOW_VALUES = [
     "direct_fix",
     "hotfix",
@@ -3459,6 +3500,19 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "parallel_branch_allocate_precheck",
+        "description": (
+            "Read-only atomic two-lane precheck that resolves child route "
+            "identity, disjoint file fences, acceptance union, commits, and "
+            "repository-local .worktrees paths before any allocation write."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": _parallel_branch_allocate_precheck_schema_properties(),
+            "required": ["project_id", "lanes"],
+        },
+    },
+    {
         "name": "parallel_branch_allocate",
         "description": "Observer-facing wrapper to allocate/register a parallel branch runtime context before spawning a bounded worker.",
         "inputSchema": {
@@ -5496,6 +5550,19 @@ class ToolDispatcher:
                 f"/api/graph-governance/{pid}/runtime-contexts/"
                 f"{runtime_context_id}/{suffix_by_name[name]}",
                 _runtime_context_write_body(request_args),
+            )
+
+        if name == "parallel_branch_allocate_precheck":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            return self._api(
+                "POST",
+                f"/api/graph-governance/{pid}/parallel-branches/allocation-precheck",
+                body,
             )
 
         if name == "parallel_branch_allocate":

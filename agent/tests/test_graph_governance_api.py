@@ -14156,6 +14156,408 @@ def test_parallel_branch_allocate_rejects_contract_scope_mismatch_before_write(
     assert get_branch_context(conn, PID, body["task_id"]) is None
 
 
+def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unchanged(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-ALLOCATE-PRECHECK-ZERO-WRITE"
+    contract_execution_id = "cex-allocate-precheck-zero-write"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?, acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps([row_files[0]]),
+            json.dumps([row_files[1]]),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-PRECHECK-ZERO-WRITE",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": row_files,
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    for suffix in ("a", "b"):
+        _persist_contract_runtime_observer_route_ref(
+            conn,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            route_token_ref=f"rtok-allocate-precheck-{suffix}",
+            allowed_actions=["parallel_branch_allocate"],
+        )
+    conn.commit()
+
+    zero_write_tables = (
+        "parallel_branch_runtime_contexts",
+        "parallel_branch_runtime_contract_revisions",
+        "parallel_branch_merge_queue_items",
+        "task_timeline_events",
+    )
+    before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    }
+    before_total_changes = conn.total_changes
+    external_root = tmp_path / "legacy-external-world"
+    response = server.handle_graph_governance_parallel_branch_allocate_precheck(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "base_commit": candidate_commit,
+                "target_head_commit": candidate_commit,
+                "lanes": [
+                    {
+                        "task_id": "allocate-precheck-worker-a",
+                        "backlog_id": backlog_id,
+                        "contract_execution_id": contract_execution_id,
+                        "worker_id": "slot-a",
+                        "route_token_ref": "rtok-allocate-precheck-a",
+                        "owned_files": [row_files[0]],
+                        "workspace_root": str(external_root),
+                        "worktree_path": str(external_root / "worker-a"),
+                    },
+                    {
+                        "task_id": "allocate-precheck-worker-b",
+                        "backlog_id": backlog_id,
+                        "contract_execution_id": contract_execution_id,
+                        "worker_id": "slot-b",
+                        "route_token_ref": "rtok-allocate-precheck-b",
+                        "owned_files": [row_files[1]],
+                        "workspace_root": str(external_root),
+                        "worktree_path": str(external_root / "worker-b"),
+                    },
+                ],
+            },
+        )
+    )
+    after = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    }
+
+    assert response["status"] == "ready"
+    assert response["lane_count"] == 2
+    assert response["zero_write_proof"]["writes_performed"] is False
+    assert before == after
+    assert conn.total_changes == before_total_changes
+    assert not external_root.exists()
+    assert not (repository_root / ".worktrees").exists()
+    bodies = response["copy_safe_allocation_bodies"]
+    assert len(bodies) == 2
+    assert {body["route_token_ref"] for body in bodies} == {
+        "rtok-allocate-precheck-a",
+        "rtok-allocate-precheck-b",
+    }
+    assert all(
+        Path(body["worktree_path"]).parent == repository_root / ".worktrees"
+        and body["workspace_root"] == str(repository_root)
+        and body["target_project_root"] == body["worktree_path"]
+        and body["create_worktree"] is True
+        and body["allocation_precheck"]["submit_unchanged"] is True
+        and "fence_token" not in body
+        and "session_token" not in body
+        for body in bodies
+    )
+    assert response["acceptance_scope_closure"]["accepted"] is True
+    assert all(
+        lane["caller_path_projection_applied"] is True
+        and lane["materialized"] is False
+        for lane in response["lane_projections"]
+    )
+
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_allocate_mf_parallel_rev8_record",
+        lambda *_args, **_kwargs: {
+            "contract_id": "mf_parallel.v2",
+            "revision": "rev9",
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "contract_execution_id": contract_execution_id,
+        },
+    )
+    projection_by_task = {
+        lane["task_id"]: lane for lane in response["lane_projections"]
+    }
+    for copy_safe_body in bodies:
+        status, allocated = (
+            server.handle_graph_governance_parallel_branch_allocate(
+                _ctx(
+                    {"project_id": PID},
+                    method="POST",
+                    body=copy_safe_body,
+                )
+            )
+        )
+        assert status == 201
+        assert allocated["context"]["worktree_path"] == (
+            copy_safe_body["worktree_path"]
+        )
+        assert allocated["context"]["branch_ref"] == (
+            projection_by_task[copy_safe_body["task_id"]][
+                "canonical_branch_ref"
+            ]
+        )
+        assert Path(allocated["context"]["worktree_path"]).exists()
+
+
+def test_parallel_branch_allocate_precheck_fails_atomic_input_before_writes(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-ALLOCATE-PRECHECK-ATOMIC-FAIL"
+    contract_execution_id = "cex-allocate-precheck-atomic-fail"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_files = ["src/a.py", "src/b.py"]
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(row_files),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-PRECHECK-ATOMIC-FAIL",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": row_files,
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref="rtok-allocate-precheck-duplicate",
+        allowed_actions=["parallel_branch_allocate"],
+    )
+    conn.commit()
+    before = conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+    ).fetchone()[0]
+    lane = {
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "route_token_ref": "rtok-allocate-precheck-duplicate",
+        "owned_files": [row_files[0]],
+    }
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "lanes": [
+                        {**lane, "task_id": "atomic-a", "worker_id": "slot-a"},
+                        {**lane, "task_id": "atomic-b", "worker_id": "slot-b"},
+                    ],
+                },
+            )
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_precheck_atomic_gate_failed"
+    )
+    assert "distinct route_token_ref" in " ".join(
+        rejected.value.details["errors"]
+    )
+    assert any(
+        "acceptance" in error or "required" in error
+        for error in rejected.value.details["errors"]
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+    ).fetchone()[0] == before
+    assert not (repository_root / ".worktrees").exists()
+
+
+def test_parallel_branch_allocate_precheck_rejects_child_route_from_other_contract(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-ALLOCATE-PRECHECK-ROUTE-SCOPE"
+    requested_execution_id = "cex-allocate-precheck-requested"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_files = ["src/a.py", "src/b.py"]
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(row_files),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-PRECHECK-ROUTE-SCOPE",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": row_files,
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=requested_execution_id,
+        route_token_ref="rtok-allocate-precheck-route-a",
+        allowed_actions=["parallel_branch_allocate"],
+    )
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="cex-allocate-precheck-other",
+        route_token_ref="rtok-allocate-precheck-route-b",
+        allowed_actions=["parallel_branch_allocate"],
+    )
+    conn.commit()
+    before_total_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "lanes": [
+                        {
+                            "task_id": "route-scope-a",
+                            "backlog_id": backlog_id,
+                            "contract_execution_id": requested_execution_id,
+                            "worker_id": "slot-a",
+                            "route_token_ref": (
+                                "rtok-allocate-precheck-route-a"
+                            ),
+                            "owned_files": [row_files[0]],
+                        },
+                        {
+                            "task_id": "route-scope-b",
+                            "backlog_id": backlog_id,
+                            "contract_execution_id": requested_execution_id,
+                            "worker_id": "slot-b",
+                            "route_token_ref": (
+                                "rtok-allocate-precheck-route-b"
+                            ),
+                            "owned_files": [row_files[1]],
+                        },
+                    ],
+                },
+            )
+        )
+
+    assert rejected.value.code == "parallel_branch_allocate_route_token_ref_invalid"
+    assert rejected.value.details["contract_execution_id"] == requested_execution_id
+    assert conn.total_changes == before_total_changes
+    assert not (repository_root / ".worktrees").exists()
+
+
+def test_parallel_branch_allocate_precheck_rejects_failed_qa_rework_fanout(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    lane = {
+        "backlog_id": "AC-PRECHECK-FAILED-QA-REWORK",
+        "contract_execution_id": "cex-precheck-failed-qa-rework",
+        "stage_type": "failed_qa_rework",
+        "attempt": 2,
+        "owned_files": ["src/fix.py"],
+    }
+    before_total_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "lanes": [
+                        {
+                            **lane,
+                            "task_id": "failed-qa-rework-a",
+                            "worker_id": "slot-a",
+                            "route_token_ref": "rtok-failed-qa-rework-a",
+                        },
+                        {
+                            **lane,
+                            "task_id": "failed-qa-rework-b",
+                            "worker_id": "slot-b",
+                            "route_token_ref": "rtok-failed-qa-rework-b",
+                        },
+                    ],
+                },
+            )
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_precheck_stage_type_invalid"
+    )
+    assert rejected.value.details["required_stage_type"] == "mf_sub"
+    assert conn.total_changes == before_total_changes
+    assert not (repository_root / ".worktrees").exists()
+
+
 def test_parallel_branch_allocate_rejects_ref_without_allocation_action_before_write(
     conn,
     tmp_path,
@@ -72953,6 +73355,7 @@ def test_direct_fix_enter_accepts_mf_parallel_failed_qa_parent(conn):
                 "reason": "Start mf_parallel lane for failed QA direct-fix test.",
                 "backlog_id": backlog_id,
                 "task_id": "mf-parallel-failed-qa-parent",
+                "contract_revision": "rev8",
                 "route_token_ref": "rtok-mf-parallel-failed-qa-direct-fix",
                 "worker_fence": {
                     "fence_token": "fence-mf-parallel-failed-qa-direct-fix",
@@ -73104,6 +73507,7 @@ def test_direct_fix_enter_rejects_mf_parallel_when_latest_qa_passed(conn):
                 "reason": "Start mf_parallel lane for latest QA direct-fix test.",
                 "backlog_id": backlog_id,
                 "task_id": "mf-parallel-latest-qa-pass-parent",
+                "contract_revision": "rev8",
                 "route_token_ref": "rtok-mf-parallel-latest-qa-pass",
                 "worker_fence": {
                     "fence_token": "fence-mf-parallel-latest-qa-pass",
@@ -96356,6 +96760,7 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
                 "reason": "Human approved parallel worker repair.",
                 "backlog_id": backlog_id,
                 "task_id": task_id,
+                "contract_revision": "rev8",
                 "route_token_ref": "rtok-mf-parallel-root",
                 "worker_fence": {
                     "fence_token": "fence-parallel-source-backed",

@@ -1496,6 +1496,10 @@ def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields
     assert returncode == 0
     assert stderr == ""
     tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
+    precheck = tools["parallel_branch_allocate_precheck"]["inputSchema"]
+    assert precheck["required"] == ["project_id", "lanes"]
+    assert precheck["properties"]["lanes"]["minItems"] == 2
+    assert precheck["properties"]["lanes"]["maxItems"] == 2
     properties = tools["parallel_branch_allocate"]["inputSchema"]["properties"]
     assert {
         "contract_execution_id",
@@ -1710,6 +1714,61 @@ def test_governance_mcp_parallel_branch_allocate_schema_and_dispatch(monkeypatch
                 "owned_files": ["agent/governance/mcp_server.py"],
                 "target_files": ["agent/tests/test_mcp_server_stdio.py"],
             },
+        )
+    ]
+
+
+def test_governance_mcp_parallel_branch_allocate_precheck_dispatch(monkeypatch):
+    calls = []
+
+    def fake_http(method, path, body=None):
+        calls.append((method, path, body))
+        return {"ok": True, "path": path}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    tool = next(
+        item
+        for item in governance_mcp_server.TOOLS
+        if item["name"] == "parallel_branch_allocate_precheck"
+    )
+    assert tool["inputSchema"]["required"] == ["project_id", "lanes"]
+    lanes = [
+        {
+            "task_id": "precheck-a",
+            "backlog_id": "AC-PRECHECK",
+            "contract_execution_id": "cex-precheck",
+            "worker_id": "slot-a",
+            "route_token_ref": "rtok-precheck-a",
+            "owned_files": ["src/a.py"],
+        },
+        {
+            "task_id": "precheck-b",
+            "backlog_id": "AC-PRECHECK",
+            "contract_execution_id": "cex-precheck",
+            "worker_id": "slot-b",
+            "route_token_ref": "rtok-precheck-b",
+            "owned_files": ["src/b.py"],
+        },
+    ]
+
+    result = governance_mcp_server._dispatch_tool(
+        "parallel_branch_allocate_precheck",
+        {
+            "project_id": "aming-claw",
+            "expected_lane_count": 2,
+            "lanes": lanes,
+        },
+    )
+
+    assert result["ok"] is True
+    assert calls == [
+        (
+            "POST",
+            (
+                "/api/graph-governance/aming-claw/parallel-branches/"
+                "allocation-precheck"
+            ),
+            {"expected_lane_count": 2, "lanes": lanes},
         )
     ]
 

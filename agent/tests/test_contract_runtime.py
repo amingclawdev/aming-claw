@@ -117,6 +117,129 @@ def test_mf_parallel_rev8_requires_both_worker_lanes_before_merge_and_final_qa()
     assert current()["line_id"] == "qa_independent_verification"
 
 
+def test_mf_parallel_rev9_preserves_rev8_stage_machine_and_requires_allocation_precheck():
+    definitions = {}
+    for revision in ("rev8", "rev9"):
+        definitions[revision] = json.loads(
+            (
+                Path(__file__).parents[1]
+                / "governance"
+                / "contract_definitions"
+                / f"mf_parallel.v2.{revision}.json"
+            ).read_text()
+        )
+
+    rev8 = definitions["rev8"]
+    rev9 = definitions["rev9"]
+    assert [
+        (
+            stage["stage_id"],
+            [line["line_id"] for line in stage.get("lines") or []],
+        )
+        for stage in rev9["rule_layer"]["stages"]
+    ] == [
+        (
+            stage["stage_id"],
+            [line["line_id"] for line in stage.get("lines") or []],
+        )
+        for stage in rev8["rule_layer"]["stages"]
+    ]
+
+    policy = rev9["system_layer"]["allocation_precheck_policy"]
+    assert policy["enabled"] is True
+    assert policy["tool"] == "parallel_branch_allocate_precheck"
+    assert policy["required_before"] == "initial_parallel_branch_allocate"
+    assert policy["expected_lane_count"] == 2
+    assert policy["atomic"] is True
+    assert policy["read_only"] is True
+    assert policy["submit_returned_bodies_unchanged"] is True
+    assert policy["applies_to_stage_types"] == ["mf_sub"]
+    assert policy["excluded_stage_types"] == ["failed_qa_rework"]
+    assert policy["zero_write_surfaces"] == [
+        "runtime_context",
+        "worktree",
+        "merge_queue",
+        "timeline",
+        "contract_runtime",
+    ]
+    assert "direct_fix" not in {
+        successor["contract_id"] for successor in rev9["successors"]
+    }
+
+
+def test_mf_parallel_rev9_requires_two_lanes_before_merge_and_final_qa():
+    definition = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "governance"
+            / "contract_definitions"
+            / "mf_parallel.v2.rev9.json"
+        ).read_text()
+    )
+    workers = [
+        {
+            "runtime_context_id": f"mfrctx-rev9-worker-{suffix}",
+            "task_id": f"rev9-worker-{suffix}",
+            "parent_task_id": "cex-rev9-two-worker",
+            "worker_id": f"slot-{suffix}",
+            "worker_slot_id": f"slot-{suffix}",
+            "merge_queue_id": f"mq-rev9-worker-{suffix}",
+            "line_instance_id": f"runtime_context:mfrctx-rev9-worker-{suffix}",
+        }
+        for suffix in ("a", "b")
+    ]
+    completed = [
+        {
+            "stage_id": "orchestration",
+            "line_id": "observer_prefill_child_contracts",
+        },
+        {
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "payload": {
+                "worker_count": 2,
+                "atomic": True,
+                "bounded_workers": workers,
+            },
+        },
+    ]
+
+    def current():
+        return build_execution_state(
+            definition,
+            project_id="aming-claw",
+            backlog_id="AC-REV9-TWO-WORKER",
+            contract_execution_id="cex-rev9-two-worker",
+            actor_role="observer",
+            completed_lines=completed,
+        )["next_action"]
+
+    def finish_next():
+        action = current()
+        completed.append(
+            {
+                "stage_id": action["stage_id"],
+                "line_id": action["line_id"],
+                "line_instance_id": action.get("line_instance_id", ""),
+                "runtime_context_id": action.get("runtime_context_id", ""),
+            }
+        )
+        return action
+
+    while current()["line_id"] != "observer_merge":
+        finish_next()
+    assert current()["runtime_context_id"] == "mfrctx-rev9-worker-a"
+    finish_next()
+    assert current()["line_id"] == "observer_merge"
+    assert current()["runtime_context_id"] == "mfrctx-rev9-worker-b"
+    finish_next()
+    assert current()["line_id"] == "observer_reconcile"
+    finish_next()
+    assert current()["line_id"] == "qa_graph_context"
+    finish_next()
+    assert current()["line_id"] == "qa_independent_verification"
+
+
 def test_worker_commit_contract_accepts_target_relative_delta_with_inherited_projection():
     worker_files = [
         "agent/governance/contract_definitions/mf_parallel.v2.rev8.json",
@@ -447,6 +570,200 @@ def test_mf_parallel_rev8_failed_final_qa_routes_to_bounded_worker_fix():
             "qa_independent_verification",
         ],
     }
+
+
+def test_mf_parallel_rev9_failed_final_qa_routes_to_same_contract_worker_fix():
+    record = {
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev9",
+        "contract_execution_id": "cex-rev9-failed-qa",
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "owner_role": "qa",
+            }
+        },
+        "completed_lines": [
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "payload": {"status": "failed", "verdict": "FAIL"},
+            }
+        ],
+    }
+
+    state = server._runtime_current_state_from_record(record)
+
+    assert state["readiness_state"] == "failed_qa_worker_fix_required"
+    assert state["next_legal_action"] == {
+        "id": "allocate_bounded_worker_fix",
+        "action": "parallel_branch_allocate",
+        "owner_role": "observer",
+        "recommended_successor_contract_id": "mf_parallel.v2",
+        "failed_qa_source_ref": (
+            "contract_runtime:cex-rev9-failed-qa:completed_lines:0"
+        ),
+        "bounded_worker_fix_required": True,
+        "successor_mode": "same_contract_append_only_failed_qa_rework",
+        "worker_fix_cardinality": 1,
+        "allocation_precheck_required": False,
+        "allocation_tool": "parallel_branch_allocate",
+        "allocation_request_requirements": {
+            "stage_type": "failed_qa_rework",
+            "minimum_attempt": 2,
+            "failed_qa_source_ref": (
+                "contract_runtime:cex-rev9-failed-qa:completed_lines:0"
+            ),
+            "fresh_runtime_context_required": True,
+        },
+        "direct_fix_allowed": False,
+        "fresh_qa_session_required": True,
+        "return_sequence": [
+            "observer_merge",
+            "observer_reconcile",
+            "qa_graph_context",
+            "qa_independent_verification",
+        ],
+    }
+
+
+def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation():
+    contract_execution_id = "cex-rev9-single-worker-fix"
+    rework_runtime_context_id = "mfrctx-rev9-single-worker-fix"
+    rework_task_id = "rev9-single-worker-fix"
+    failed_qa_index = 1
+    rework_revision = {
+        "append_only_history_preserved": True,
+        "timeline_projection_authoritative": False,
+        "failed_qa_completed_line_index": failed_qa_index,
+        "runtime_context_id": rework_runtime_context_id,
+        "task_id": rework_task_id,
+    }
+    rework_authority = {
+        "source": "parallel_branch_allocate_failed_qa_rework",
+        "server_derived": True,
+        "contract_execution_id": contract_execution_id,
+        "failed_qa_completed_line_index": failed_qa_index,
+        "runtime_context_id": rework_runtime_context_id,
+        "task_id": rework_task_id,
+    }
+    record = {
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev9",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-REV9-SINGLE-WORKER-FIX",
+        "contract_execution_id": contract_execution_id,
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "actor_role": "observer",
+                "payload": {
+                    "bounded_workers": [
+                        {"runtime_context_id": "mfrctx-initial-a"},
+                        {"runtime_context_id": "mfrctx-initial-b"},
+                    ]
+                },
+            },
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "actor_role": "qa",
+                "status": "failed",
+                "payload": {"status": "failed", "verdict": "FAIL"},
+            },
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "actor_role": "observer",
+                "runtime_context_id": rework_runtime_context_id,
+                "task_id": rework_task_id,
+                "payload": {
+                    "runtime_context_id": rework_runtime_context_id,
+                    "task_id": rework_task_id,
+                    "parent_task_id": contract_execution_id,
+                    "merge_queue_id": "mq-rev9-single-worker-fix",
+                    "failed_qa_rework_dispatch_revision": rework_revision,
+                    "failed_qa_rework_dispatch_revision_authority": (
+                        rework_authority
+                    ),
+                },
+            },
+        ],
+    }
+
+    selected = server._contract_runtime_current_dispatch_authority_line(record)
+    assert selected["status"] == "selected"
+    assert selected["completed_line_index"] == 2
+    assert (
+        server._contract_runtime_mf_parallel_current_generation_worker_count(
+            record
+        )
+        == 1
+    )
+    assert (
+        server._contract_runtime_mf_parallel_current_generation_worker_count(
+            {**record, "revision": "rev8"}
+        )
+        == 2
+    )
+
+    record["completed_lines"].append(
+        {
+            "stage_id": "observer_lane_merge",
+            "line_id": "observer_merge",
+            "evidence_kind": "merge",
+            "actor_role": "observer",
+            "runtime_context_id": rework_runtime_context_id,
+            "line_instance_id": (
+                f"runtime_context:{rework_runtime_context_id}"
+            ),
+            "payload": {
+                "line_instance_id": (
+                    f"runtime_context:{rework_runtime_context_id}"
+                ),
+                "durable_merge_authority": {
+                    "schema_version": (
+                        server._CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
+                    ),
+                    "server_derived": True,
+                    "db_verified": True,
+                    "pre_qa_merge_authorized": True,
+                    "final_qa_required_after_reconcile": True,
+                    "project_id": "aming-claw",
+                    "backlog_id": "AC-REV9-SINGLE-WORKER-FIX",
+                    "contract_execution_id": contract_execution_id,
+                    "runtime_context_id": rework_runtime_context_id,
+                    "task_id": rework_task_id,
+                    "parent_task_id": contract_execution_id,
+                    "merge_queue_id": "mq-rev9-single-worker-fix",
+                    "contract_runtime_dispatch_source_ref": (
+                        f"contract_runtime:{contract_execution_id}:"
+                        "completed_lines:2"
+                    ),
+                    "merge_commit": "a" * 40,
+                    "merge_event_ref": "timeline:123",
+                    "merge_event_id": 123,
+                    "merge_event_created_at": "2026-08-02T12:00:00Z",
+                },
+            },
+        }
+    )
+    merge = server._contract_runtime_rev8_two_worker_merge_projection(
+        record,
+        required_worker_count=1,
+    )
+    assert merge["all_lane_merges_verified"] is True
+    assert merge["required_worker_count"] == 1
+    assert merge["runtime_context_id"] == rework_runtime_context_id
 
 
 def _accepted_no_pass_line(*, reported_baseline_failed: int) -> dict:
