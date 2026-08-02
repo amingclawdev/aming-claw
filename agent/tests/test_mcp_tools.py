@@ -2368,7 +2368,7 @@ def test_managed_mcp_contract_runtime_timeout_is_transport_only_and_exact_once(
     assert [call[4] for call in calls if call[4] is not None] == [45, 75, 75]
 
 
-def test_mcp_contract_runtime_bypass_line_routes_no_pass_payload_without_token_leak():
+def test_mcp_contract_runtime_bypass_line_schema_dispatch_and_auth_are_copy_safe():
     tool = next(
         item for item in TOOLS if item.get("name") == "contract_runtime_bypass_line"
     )
@@ -2383,16 +2383,21 @@ def test_mcp_contract_runtime_bypass_line_routes_no_pass_payload_without_token_l
         "reason",
         "decision",
     }
-    assert _tool_properties("contract_runtime_bypass_line").keys() >= {
+    properties = _tool_properties("contract_runtime_bypass_line")
+    assert properties.keys() >= {
         "runtime_guide_hash",
         "diagnostic_backlog_id",
         "diagnostic_priority",
         "evidence_refs",
+        "graph_trace_ids",
         "observer_route_token_ref",
         "observer_session_id",
         "qa_session_token",
         "qa_session_token_ref",
     }
+    assert properties["graph_trace_ids"]["type"] == "array"
+    assert properties["graph_trace_ids"]["items"] == {"type": "string"}
+    assert "graph_trace_ids" not in tool["inputSchema"]["required"]
 
     recorder = _AuthRecorder()
     dispatcher = ToolDispatcher(
@@ -2414,10 +2419,18 @@ def test_mcp_contract_runtime_bypass_line_routes_no_pass_payload_without_token_l
         "reason": "the current gate cannot advance",
         "decision": "continue with linked OPEN diagnostic",
         "evidence_refs": ["timeline-event:13901"],
+        "graph_trace_ids": ["gqt-current-full-source"],
         "qa_session_token": "gov-qa-secret",
     }
 
     dispatcher.dispatch("contract_runtime_bypass_line", body)
+    evidence_only_body = {
+        **body,
+        "bypass_identity": "bypass:cex-bypass:4",
+        "evidence_refs": ["graph-query:gqt-evidence-only"],
+    }
+    evidence_only_body.pop("graph_trace_ids")
+    dispatcher.dispatch("contract_runtime_bypass_line", evidence_only_body)
 
     assert recorder.auth_calls == [
         (
@@ -2429,9 +2442,26 @@ def test_mcp_contract_runtime_bypass_line_routes_no_pass_payload_without_token_l
                 if key not in {"project_id", "contract_execution_id", "qa_session_token"}
             },
             "gov-qa-secret",
-        )
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-runtime/cex-bypass/line-bypasses",
+            {
+                key: value
+                for key, value in evidence_only_body.items()
+                if key not in {"project_id", "contract_execution_id", "qa_session_token"}
+            },
+            "gov-qa-secret",
+        ),
     ]
-    assert "gov-qa-secret" not in json.dumps(recorder.auth_calls[0][2], sort_keys=True)
+    assert recorder.auth_calls[0][2]["graph_trace_ids"] == [
+        "gqt-current-full-source"
+    ]
+    assert "graph_trace_ids" not in recorder.auth_calls[1][2]
+    assert all(
+        "gov-qa-secret" not in json.dumps(call[2], sort_keys=True)
+        for call in recorder.auth_calls
+    )
 
 
 def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body():
@@ -3659,19 +3689,19 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
     assert "restart_or_refresh_mcp_session" in status["recommended_actions"]
 
 
-def test_managed_qa_timeline_ref_schema_bump_marks_pre_ref_client_stale():
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-07-19.3"
-    assert "qa_session_token_ref" in _tool_properties("task_timeline_append")
+def test_bypass_graph_trace_schema_bump_marks_prior_client_stale():
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-02.1"
+    assert "graph_trace_ids" in _tool_properties("contract_runtime_bypass_line")
 
     compatibility = mcp_tool_schema_compatibility(
-        loaded_schema_version="2026-07-16.1",
+        loaded_schema_version="2026-07-19.3",
         server_schema_version=MCP_TOOL_SCHEMA_VERSION,
         minimum_client_schema_version=MCP_TOOL_SCHEMA_VERSION,
     )
 
-    assert compatibility["loaded_client_tool_schema_version"] == "2026-07-16.1"
-    assert compatibility["server_tool_schema_version"] == "2026-07-19.3"
-    assert compatibility["minimum_client_tool_schema_version"] == "2026-07-19.3"
+    assert compatibility["loaded_client_tool_schema_version"] == "2026-07-19.3"
+    assert compatibility["server_tool_schema_version"] == "2026-08-02.1"
+    assert compatibility["minimum_client_tool_schema_version"] == "2026-08-02.1"
     assert compatibility["client_schema_fresh"] is False
     assert compatibility["stale_client_possible"] is True
 
