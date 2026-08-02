@@ -23680,8 +23680,13 @@ def _runtime_context_worker_recovery_details(
                     },
                 }
             elif session_token_rejoin_eligibility.get("eligible") is True:
-                next_legal_action = "request_runtime_context_rejoin_host_envelope"
-                recovery_action_id = "request_runtime_context_rejoin_host_envelope"
+                rejoin_action = (
+                    "request_runtime_context_pre_lineage_rejoin_host_envelope"
+                    if pre_lineage_bootstrap_recovery
+                    else "request_runtime_context_rejoin_host_envelope"
+                )
+                next_legal_action = rejoin_action
+                recovery_action_id = rejoin_action
                 expected_actual_host_worker_id = str(
                     getattr(context, "actual_host_worker_id", "") or ""
                 ).strip()
@@ -23691,44 +23696,26 @@ def _runtime_context_worker_recovery_details(
                 rejoin_contract_execution_id = str(
                     contract_runtime_sequence.get("contract_execution_id") or ""
                 ).strip()
+                if not rejoin_contract_execution_id:
+                    authority = (
+                        session_token_rejoin_eligibility.get("authority")
+                        if isinstance(
+                            session_token_rejoin_eligibility.get("authority"),
+                            Mapping,
+                        )
+                        else {}
+                    )
+                    rejoin_contract_execution_id = str(
+                        authority.get("contract_execution_id") or ""
+                    ).strip()
                 session_token_rejoin_submission = {
                     "schema_version": "runtime_context.session_token_rejoin_submission.v1",
-                    "action": "request_runtime_context_rejoin_host_envelope",
+                    "action": rejoin_action,
                     "method": "POST",
                     "path": (
                         "/api/graph-governance/{project_id}/runtime-contexts/"
                         "{runtime_context_id}/session-token/rejoin"
                     ),
-                    "body": {
-                        "runtime_context_id": expected_runtime_context_id,
-                        "task_id": str(getattr(context, "task_id", "") or ""),
-                        "parent_task_id": expected_parent_task_id,
-                        **(
-                            {
-                                "contract_execution_id": (
-                                    rejoin_contract_execution_id
-                                )
-                            }
-                            if rejoin_contract_execution_id
-                            else {}
-                        ),
-                        "target_project_root": expected_target_root,
-                        "worker_id": expected_worker_id,
-                        "worker_slot_id": expected_worker_slot_id,
-                        "agent_id": expected_actual_host_worker_id,
-                        "actual_host_worker_id": expected_actual_host_worker_id,
-                        "worker_session_id": expected_host_session_id,
-                        "host_startup_id": str(
-                            getattr(context, "host_startup_id", "") or ""
-                        ),
-                        "host_session_id": expected_host_session_id,
-                        "session_token_ref": (
-                            runtime_context_session_token_ref(context)
-                        ),
-                        **safe_route_identity,
-                        "reason": "<operator reason: host worker session lost raw auth env>",
-                        "ttl_seconds": 3600,
-                    },
                     "copy_safe_body": {
                         "runtime_context_id": expected_runtime_context_id,
                         "task_id": str(getattr(context, "task_id", "") or ""),
@@ -23762,6 +23749,11 @@ def _runtime_context_worker_recovery_details(
                     "pre_lineage_bootstrap_recovery": (
                         pre_lineage_bootstrap_recovery
                     ),
+                    "recovery_mode": (
+                        "pre_lineage_auth_only_once"
+                        if pre_lineage_bootstrap_recovery
+                        else "post_lineage_auth_rejoin"
+                    ),
                     "required_existing_lineage": (
                         []
                         if pre_lineage_bootstrap_recovery
@@ -23778,6 +23770,48 @@ def _runtime_context_worker_recovery_details(
                         ),
                         "worker_evidence_synthesized": False,
                     },
+                    "pre_lineage_recovery_contract": (
+                        {
+                            "schema_version": (
+                                "runtime_context.pre_lineage_recovery_contract.v1"
+                            ),
+                            "authorization": (
+                                "exactly_one_accepted_initial_join_audit"
+                            ),
+                            "max_rejoin_rotations": 1,
+                            "auth_only": True,
+                            "evidence_synthesis_allowed": False,
+                            "same_worker_and_desktop_session_required": True,
+                            "mcp_calltoolresult_content_text_parse_in_same_call_required": True,
+                            "raw_env_process_local_injection_only": True,
+                            "raw_env_persistence_allowed": False,
+                            "automatic_retry": False,
+                            "replacement_loss_action": (
+                                "stop_and_report_bounded_pre_lineage_recovery_exhausted"
+                            ),
+                        }
+                        if pre_lineage_bootstrap_recovery
+                        else {}
+                    ),
+                    "worker_instructions": (
+                        [
+                            (
+                                "Parse MCP CallToolResult content[0].text in the "
+                                "same functions.exec invocation."
+                            ),
+                            (
+                                "Inject host_envelope.env process-local only; "
+                                "do not persist, print, or message raw auth."
+                            ),
+                            (
+                                "If the replacement envelope is lost, do not "
+                                "retry; stop_and_report_bounded_pre_lineage_"
+                                "recovery_exhausted."
+                            ),
+                        ]
+                        if pre_lineage_bootstrap_recovery
+                        else []
+                    ),
                     "security_boundary": {
                         "session_token_ref_alone_authorizes_writes": False,
                         "raw_tokens_persisted_to_timeline": False,
@@ -24864,6 +24898,7 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
     context,
     expected_route_identity: Mapping[str, Any],
     contract_execution_id: str = "",
+    pre_lineage_recovery: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     route_token_ref = str(
         body.get("route_token_ref")
@@ -24904,6 +24939,8 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
                 "next_legal_action": (
                     "issue_fresh_same_scope_route_token_ref_and_retry_runtime_context_session_token_rejoin"
                 ),
+                "credential_rotated": False,
+                "mutation_performed": False,
                 "fail_closed": True,
             },
         ) from exc
@@ -24919,6 +24956,8 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
                 "next_legal_action": (
                     "issue_fresh_same_scope_route_token_ref_and_retry_runtime_context_session_token_rejoin"
                 ),
+                "credential_rotated": False,
+                "mutation_performed": False,
                 "fail_closed": True,
             },
         )
@@ -24948,7 +24987,11 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
             )
     if supplied_mismatches:
         raise GovernanceError(
-            "runtime_context_rejoin_route_identity_mismatch",
+            (
+                "runtime_context_pre_lineage_rejoin_route_identity_mismatch"
+                if pre_lineage_recovery
+                else "runtime_context_rejoin_route_identity_mismatch"
+            ),
             "runtime-context session rejoin supplied route identity does not match the resolved active route token ref",
             403,
             {
@@ -24958,6 +25001,8 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
                 "next_legal_action": (
                     "retry_runtime_context_session_token_rejoin_with_resolved_route_identity"
                 ),
+                "credential_rotated": False,
+                "mutation_performed": False,
                 "fail_closed": True,
             },
         )
@@ -32056,6 +32101,7 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
     """
 
     from .parallel_branch_runtime import (
+        ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
         runtime_context_id_for_branch_context,
         runtime_context_session_token_lease_view,
         runtime_context_session_token_ref,
@@ -32085,20 +32131,30 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
 
     if effective_read_receipt_ref or effective_startup_ref:
         errors.append("worker_lineage_already_exists")
-    if str(getattr(context, "last_recovery_action", "") or "").strip() != (
-        "mf_subagent_initial_join_issued"
-    ):
+    last_recovery_action = str(
+        getattr(context, "last_recovery_action", "") or ""
+    ).strip()
+    if last_recovery_action != "mf_subagent_initial_join_issued":
         errors.append("last_recovery_action_not_initial_join")
+    if str(getattr(context, "status", "") or "").strip() not in (
+        ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
+    ):
+        errors.append("runtime_context_not_active")
+    if not (
+        str(getattr(context, "session_token_hash", "") or "").strip()
+        and str(getattr(context, "fence_token", "") or "").strip()
+        and active_session_token_ref
+    ):
+        errors.append("initial_join_auth_binding_missing")
     if not (
         lease.get("status") == "active"
         and lease.get("authorization_valid") is True
         and lease.get("expired") is False
         and lease.get("lease_record_valid") is True
-        and active_session_token_ref
     ):
-        errors.append("active_initial_join_lease_required")
+        errors.append("initial_join_lease_not_active")
 
-    accepted_initial_join_audits: list[Mapping[str, Any]] = []
+    candidate_initial_join_audits: list[Mapping[str, Any]] = []
     for event in timeline_events:
         if not isinstance(event, Mapping):
             continue
@@ -32118,15 +32174,28 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
                 event.get("backlog_id") or payload.get("backlog_id") or ""
             ).strip()
             == backlog_id
-            and str(payload.get("runtime_context_id") or "").strip()
-            == runtime_id
         ):
             continue
-        accepted_initial_join_audits.append(event)
-    if len(accepted_initial_join_audits) != 1:
+        candidate_initial_join_audits.append(event)
+    canonical_initial_join_audits = [
+        event
+        for event in candidate_initial_join_audits
+        if str(
+            (event.get("payload") or {}).get("runtime_context_id")
+            if isinstance(event.get("payload"), Mapping)
+            else ""
+        ).strip()
+        == runtime_id
+    ]
+    if (
+        len(candidate_initial_join_audits) != 1
+        or len(canonical_initial_join_audits) != 1
+    ):
         errors.append("exactly_one_accepted_initial_join_audit_required")
     initial_join_audit = (
-        accepted_initial_join_audits[0] if len(accepted_initial_join_audits) == 1 else {}
+        candidate_initial_join_audits[0]
+        if len(candidate_initial_join_audits) == 1
+        else {}
     )
     initial_join_payload = (
         initial_join_audit.get("payload")
@@ -32139,7 +32208,6 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
 
     persisted_runtime_id = runtime_context_id_for_branch_context(context)
     expected_request_identity = {
-        "runtime_context_id": persisted_runtime_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "target_project_root": target_project_root,
@@ -32149,7 +32217,6 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
         "actual_host_worker_id": actual_host_worker_id,
         "worker_session_id": worker_session_id,
         "host_session_id": host_session_id,
-        "session_token_ref": active_session_token_ref,
         "contract_execution_id": str(contract_execution_id or "").strip(),
     }
     for field, expected in expected_request_identity.items():
@@ -32230,17 +32297,93 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
             errors.append(f"initial_join_audit_route_{field}_mismatch")
 
     errors = list(dict.fromkeys(errors))
+    audit_errors = [
+        error
+        for error in errors
+        if error == "exactly_one_accepted_initial_join_audit_required"
+        or error.startswith("initial_join_audit_")
+        or error == "host_startup_id_conflict"
+    ]
+    identity_errors = [
+        error
+        for error in errors
+        if (
+            error.endswith("_mismatch_or_missing")
+            or error
+            in {
+                "runtime_context_identity_mismatch",
+                "project_identity_mismatch",
+                "host_startup_id_conflict",
+            }
+        )
+        and not error.startswith("request_route_")
+        and not error.startswith("initial_join_audit_")
+        and error != "contract_execution_id_mismatch_or_missing"
+    ]
+    route_errors = [
+        error
+        for error in errors
+        if "route_" in error
+        and error != "target_project_root_mismatch_or_missing"
+    ]
+    contract_errors = [
+        error
+        for error in errors
+        if error == "contract_execution_id_mismatch_or_missing"
+    ]
+    if last_recovery_action in {
+        "mf_subagent_pre_lineage_session_token_rejoin_issued",
+        "mf_subagent_session_token_rejoin_issued",
+    }:
+        failure_code = "runtime_context_pre_lineage_rejoin_already_consumed"
+        failure_reason = "pre_lineage_rejoin_already_consumed"
+    elif "exactly_one_accepted_initial_join_audit_required" in errors:
+        failure_code = (
+            "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid"
+        )
+        failure_reason = "canonical_initial_join_audit_invalid"
+    elif contract_errors:
+        failure_code = (
+            "runtime_context_pre_lineage_rejoin_contract_identity_mismatch"
+        )
+        failure_reason = "contract_identity_mismatch"
+    elif route_errors:
+        failure_code = (
+            "runtime_context_pre_lineage_rejoin_route_identity_mismatch"
+        )
+        failure_reason = "route_identity_mismatch"
+    elif identity_errors:
+        failure_code = "runtime_context_pre_lineage_rejoin_identity_mismatch"
+        failure_reason = "runtime_identity_mismatch"
+    elif "runtime_context_not_active" in errors:
+        failure_code = "runtime_context_pre_lineage_rejoin_authority_invalid"
+        failure_reason = "runtime_context_not_active"
+    elif "initial_join_auth_binding_missing" in errors:
+        failure_code = "runtime_context_pre_lineage_rejoin_authority_invalid"
+        failure_reason = "initial_join_auth_binding_missing"
+    elif "initial_join_lease_not_active" in errors:
+        failure_code = "runtime_context_pre_lineage_rejoin_authority_invalid"
+        failure_reason = "initial_join_lease_not_active"
+    elif audit_errors:
+        failure_code = (
+            "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid"
+        )
+        failure_reason = "canonical_initial_join_audit_invalid"
+    else:
+        failure_code = "runtime_context_rejoin_requires_existing_worker_lineage"
+        failure_reason = "existing_worker_lineage_required"
     authority = {
-        "schema_version": (
-            "runtime_context.pre_lineage_bootstrap_rejoin_authority.v1"
-        ),
+        "schema_version": "runtime_context.pre_lineage_rejoin_authority.v1",
         "eligible": not errors,
         "status": "eligible" if not errors else "blocked",
         "server_derived": True,
+        "authorization_mode": "exactly_one_accepted_initial_join_audit",
         "auth_only": True,
         "one_shot": True,
-        "worker_evidence_synthesized": False,
-        "attempt_retry_counters_may_change": False,
+        "evidence_synthesized": False,
+        "attempt_transition_applied": False,
+        "retry_round_transition_applied": False,
+        "status_transition_applied": False,
         "project_id": project_id,
         "runtime_context_id": runtime_id,
         "task_id": task_id,
@@ -32255,11 +32398,13 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
         "host_session_id": host_session_id,
         "target_project_root": target_project_root,
         "session_token_ref": active_session_token_ref,
-        "initial_join_audit_event_ref": (
+        "initial_join_event_ref": (
             f"timeline:{initial_join_audit.get('id', '')}"
             if initial_join_audit
             else ""
         ),
+        "audit_cardinality": len(candidate_initial_join_audits),
+        "audit_valid": bool(not audit_errors),
         "route_identity": canonical_route_identity,
         "lease": {
             "lease_id": str(lease.get("lease_id") or ""),
@@ -32269,11 +32414,18 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
             "expired": lease.get("expired") is True,
         },
         "errors": errors,
+        "failure_code": failure_code if errors else "",
+        "reason": failure_reason if errors else "",
         "fail_closed": bool(errors),
         "next_legal_action": (
             "rotate_pre_lineage_auth_once_then_parse_content_text_same_call"
             if not errors
-            else "stop_and_repair_pre_lineage_rejoin_authority"
+            else (
+                "stop_and_report_bounded_pre_lineage_recovery_exhausted"
+                if failure_code
+                == "runtime_context_pre_lineage_rejoin_already_consumed"
+                else "stop_and_repair_pre_lineage_rejoin_authority"
+            )
         ),
     }
     return authority
@@ -32306,6 +32458,9 @@ def _runtime_context_pre_lineage_guidance_authority(
     contract_execution_id = str(
         contract_runtime_sequence.get("contract_execution_id")
         or contract_identity.get("contract_execution_id")
+        or _runtime_context_contract_execution_identity(
+            _runtime_context_latest_contract_revision_payload(conn, context)
+        ).get("contract_execution_id")
         or ""
     ).strip()
     route_identity = _runtime_context_latest_route_identity(conn, context)
@@ -32573,6 +32728,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             rejoin_mf_subagent_runtime_session_token,
             retarget_post_qa_rejoin_runtime_authority,
             runtime_context_id_for_branch_context,
+            upsert_branch_context,
         )
         from .permissions import require_operator_capability, session_role
         from . import task_timeline
@@ -32672,7 +32828,11 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             != canonical_contract_execution_id
         ):
             raise GovernanceError(
-                "runtime_context_rejoin_contract_execution_id_mismatch",
+                (
+                    "runtime_context_pre_lineage_rejoin_contract_identity_mismatch"
+                    if missing_lineage
+                    else "runtime_context_rejoin_contract_execution_id_mismatch"
+                ),
                 (
                     "runtime-context session rejoin contract_execution_id "
                     "does not match persisted worker dispatch lineage"
@@ -32694,6 +32854,8 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         "retry_runtime_context_session_token_rejoin_with_"
                         "canonical_contract_execution_id"
                     ),
+                    "credential_rotated": False,
+                    "mutation_performed": False,
                     "fail_closed": True,
                 },
             )
@@ -32714,6 +32876,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 context=context,
                 expected_route_identity=expected_route_identity,
                 contract_execution_id=resolved_contract_execution_id,
+                pre_lineage_recovery=bool(missing_lineage),
             )
         )
         if expected_route_identity and any(
@@ -32726,7 +32889,11 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             )
             if mismatches:
                 raise GovernanceError(
-                    "runtime_context_rejoin_route_identity_mismatch",
+                    (
+                        "runtime_context_pre_lineage_rejoin_route_identity_mismatch"
+                        if missing_lineage
+                        else "runtime_context_rejoin_route_identity_mismatch"
+                    ),
                     "runtime-context session rejoin route identity does not match the active runtime contract",
                     403,
                     {
@@ -32736,6 +32903,8 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         "next_legal_action": (
                             "retry_runtime_context_session_token_rejoin_with_current_route_identity"
                         ),
+                        "credential_rotated": False,
+                        "mutation_performed": False,
                         "fail_closed": True,
                     },
                 )
@@ -32765,8 +32934,14 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 )
             )
             if pre_lineage_bootstrap_rejoin_authority.get("eligible") is not True:
+                failure_code = str(
+                    pre_lineage_bootstrap_rejoin_authority.get(
+                        "failure_code"
+                    )
+                    or "runtime_context_rejoin_requires_existing_worker_lineage"
+                )
                 raise GovernanceError(
-                    "runtime_context_rejoin_requires_existing_worker_lineage",
+                    failure_code,
                     (
                         "runtime-context session rejoin requires existing worker "
                         "lineage unless the one-shot pre-lineage bootstrap "
@@ -32780,12 +32955,34 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         "contract_execution_resolution": dict(
                             contract_execution_resolution
                         ),
-                        "pre_lineage_bootstrap_rejoin_authority": (
+                        "pre_lineage_rejoin_authority": (
                             pre_lineage_bootstrap_rejoin_authority
                         ),
                         "next_legal_action": (
-                            "stop_and_repair_pre_lineage_rejoin_authority"
+                            pre_lineage_bootstrap_rejoin_authority.get(
+                                "next_legal_action"
+                            )
+                            or "stop_and_repair_pre_lineage_rejoin_authority"
                         ),
+                        "reason": str(
+                            pre_lineage_bootstrap_rejoin_authority.get(
+                                "reason"
+                            )
+                            or ""
+                        ),
+                        "audit_cardinality": int(
+                            pre_lineage_bootstrap_rejoin_authority.get(
+                                "audit_cardinality"
+                            )
+                            or 0
+                        ),
+                        "audit_valid": (
+                            pre_lineage_bootstrap_rejoin_authority.get(
+                                "audit_valid"
+                            )
+                            is True
+                        ),
+                        "credential_rotated": False,
                         "mutation_performed": False,
                         "fail_closed": True,
                     },
@@ -32984,6 +33181,32 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 409,
                 {"mutation_performed": False, "fail_closed": True},
             )
+        if pre_lineage_bootstrap_rejoin_authority.get("eligible") is True:
+            rotated_context = get_branch_context_by_runtime_context_id(
+                conn,
+                project_id,
+                runtime_context_id,
+            )
+            if rotated_context is None:
+                raise GovernanceError(
+                    "runtime_context_not_found",
+                    "runtime context disappeared during pre-lineage rejoin",
+                    409,
+                    {"mutation_performed": False, "fail_closed": True},
+                )
+            context = upsert_branch_context(
+                conn,
+                replace(
+                    rotated_context,
+                    last_recovery_action=(
+                        "mf_subagent_pre_lineage_session_token_rejoin_issued"
+                    ),
+                ),
+                now_iso=authoritative_now_iso,
+            )
+            result["last_recovery_action"] = (
+                "mf_subagent_pre_lineage_session_token_rejoin_issued"
+            )
 
         post_qa_rejoin_retarget_result: dict[str, Any] = {}
         if post_qa_rejoin_retarget_authority is not None:
@@ -33063,11 +33286,11 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 validated_missing_finish_rejoin_authority
             )
         if pre_lineage_bootstrap_rejoin_authority:
-            result["pre_lineage_bootstrap_rejoin_authority"] = dict(
-                pre_lineage_bootstrap_rejoin_authority
-            )
-            result["pre_lineage_bootstrap_recovery"] = bool(
+            result["pre_lineage_auth_only_rejoin"] = bool(
                 pre_lineage_bootstrap_rejoin_authority.get("eligible") is True
+            )
+            result["pre_lineage_rejoin_authority"] = dict(
+                pre_lineage_bootstrap_rejoin_authority
             )
         if post_qa_merge_conflict_rejoin_diagnostics:
             result["post_qa_merge_conflict_rejoin_diagnostics"] = dict(
@@ -33098,7 +33321,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "validated_missing_finish_auth_only_rejoin"
             )
             is not True
-            and result.get("pre_lineage_bootstrap_recovery") is not True
+            and result.get("pre_lineage_auth_only_rejoin") is not True
         ):
             renewed_contract_revision = (
                 _runtime_context_append_resolved_route_ref_contract_revision(
@@ -33132,7 +33355,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     "validated_missing_finish_auth_only_rejoin"
                 )
                 is not True
-                and result.get("pre_lineage_bootstrap_recovery") is not True
+                and result.get("pre_lineage_auth_only_rejoin") is not True
             )
             result["route_identity_verified"] = True
             result["previous_route_identity"] = _route_identity_public_summary(
@@ -33231,12 +33454,6 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "validated_missing_finish_rejoin_authority": (
                     validated_missing_finish_rejoin_authority
                 ),
-                "pre_lineage_bootstrap_recovery": bool(
-                    result.get("pre_lineage_bootstrap_recovery") is True
-                ),
-                "pre_lineage_bootstrap_rejoin_authority": (
-                    pre_lineage_bootstrap_rejoin_authority
-                ),
                 "worker_evidence_synthesized": False,
                 "runtime_context_id": runtime_context_id_for_branch_context(context),
                 "route_identity_source": safe_route_source,
@@ -33246,7 +33463,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         "validated_missing_finish_auth_only_rejoin"
                     )
                     is not True
-                    and result.get("pre_lineage_bootstrap_recovery") is not True
+                    and result.get("pre_lineage_auth_only_rejoin") is not True
                 ),
                 "route_identity_verified": bool(resolved_route_identity),
             }
@@ -77919,6 +78136,400 @@ def _contract_runtime_bind_qa_worker_identity_authority(
     return effective
 
 
+def _contract_runtime_worker_implementation_bypass_continuation_anchor(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    completed: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Join one audited implementation bypass to its current worker lane.
+
+    The bypass is not implementation PASS evidence.  It is only a durable,
+    no-PASS predecessor anchor that lets the server inspect the exact assigned
+    worktree before deciding whether the current worker_commit line may itself
+    be bypassed.  No request identity participates in lane selection.
+    """
+
+    if conn is None:
+        return {}
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    next_line = _contract_runtime_next_line(record)
+
+    def exact_claim(value: Mapping[str, Any], field: str) -> str:
+        claims = {
+            str(candidate.get(field) or "").strip()
+            for candidate in _contract_runtime_mapping_candidates(value)
+            if str(candidate.get(field) or "").strip()
+        }
+        return next(iter(claims)) if len(claims) == 1 else ""
+
+    runtime_context_id = exact_claim(next_line, "runtime_context_id")
+    task_id = exact_claim(next_line, "task_id")
+    lane_id = exact_claim(next_line, "lane_id")
+    line_instance_id = exact_claim(next_line, "line_instance_id")
+    if not (
+        execution_id
+        and backlog_id
+        and str(record.get("project_id") or "").strip() == project_id
+        and str(record.get("contract_id") or "").strip()
+        == MF_PARALLEL_CONTRACT_ID
+        and not _runtime_record_is_complete(record)
+        and str(next_line.get("stage_id") or "").strip() == "worker_commit"
+        and str(next_line.get("line_id") or "").strip() == "worker_commit"
+        and str(next_line.get("evidence_kind") or "").strip()
+        == "worker_commit"
+        and str(next_line.get("owner_role") or "").strip() == "mf_sub"
+        and runtime_context_id
+        and task_id
+        and lane_id
+        and line_instance_id == f"runtime_context:{runtime_context_id}"
+    ):
+        return {}
+
+    current_projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    active_chain = (
+        current_projection.get("active_chain")
+        if isinstance(current_projection.get("active_chain"), Mapping)
+        else {}
+    )
+    active_execution_ids = {
+        str(value or "").strip()
+        for value in active_chain.get("execution_ids") or []
+        if str(value or "").strip()
+    }
+    current_selectors = {
+        str(current_projection.get(field) or "").strip()
+        for field in (
+            "current_contract_execution_id",
+            "active_child_contract_execution_id",
+        )
+        if str(current_projection.get(field) or "").strip()
+    }
+    projected_next_line = (
+        current_projection.get("next_legal_action")
+        if isinstance(current_projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if not (
+        current_projection
+        and not bool(current_projection.get("degraded"))
+        and str(current_projection.get("projection_source") or "").strip()
+        == "backlog_contract_chain_current"
+        and str(current_projection.get("source_of_proof") or "").strip()
+        == "contract_runtime_executions.completed_lines"
+        and str(current_projection.get("project_id") or "").strip()
+        == project_id
+        and str(current_projection.get("backlog_id") or "").strip()
+        == backlog_id
+        and current_projection.get("terminal") is not True
+        and current_selectors == {execution_id}
+        and execution_id in active_execution_ids
+        and str(projected_next_line.get("line_id") or "").strip()
+        == "worker_commit"
+        and str(projected_next_line.get("stage_id") or "").strip()
+        == "worker_commit"
+    ):
+        return {}
+
+    matching_bypasses: list[tuple[int, Mapping[str, Any], Mapping[str, Any]]] = []
+    for index, line in enumerate(completed):
+        if not isinstance(line, Mapping):
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        if not (
+            str(line.get("stage_id") or "").strip()
+            == "worker_implementation"
+            and str(line.get("line_id") or "").strip()
+            == "worker_implementation"
+            and str(line.get("evidence_kind") or "").strip()
+            == "contract_line_bypass"
+            and str(line.get("actor_role") or "").strip()
+            in {"observer", "qa"}
+            and str(line.get("status") or "").strip().lower() == "waived"
+            and line.get("no_pass_claim") is True
+            and str(payload.get("schema_version") or "").strip()
+            == "contract_line_bypass.v1"
+            and payload.get("no_pass_claim") is True
+            and str(payload.get("blocked_evidence_kind") or "").strip()
+            == "implementation"
+            and str(payload.get("blocked_owner_role") or "").strip()
+            == "mf_sub"
+            and exact_claim(line, "line_instance_id") == line_instance_id
+        ):
+            continue
+        claimed_execution_ids = {
+            str(candidate.get(key) or "").strip()
+            for candidate in _contract_runtime_mapping_candidates(line)
+            for key in (
+                "contract_execution_id",
+                "successor_contract_execution_id",
+            )
+            if str(candidate.get(key) or "").strip()
+        }
+        if claimed_execution_ids and claimed_execution_ids != {execution_id}:
+            continue
+        matching_bypasses.append((index, line, payload))
+    if len(matching_bypasses) != 1:
+        return {}
+    bypass_index, bypass_line, bypass = matching_bypasses[0]
+    bypass_actor_role = str(
+        bypass_line.get("actor_role") or ""
+    ).strip()
+
+    diagnostic_id = str(
+        bypass.get("diagnostic_backlog_id") or ""
+    ).strip()
+    bypass_identity = str(bypass.get("bypass_identity") or "").strip()
+    classification = str(bypass.get("classification") or "").strip()
+    source_backlog_id = str(
+        bypass.get("source_backlog_id") or ""
+    ).strip()
+    try:
+        bypass_revision = int(
+            bypass.get("execution_state_revision") or 0
+        )
+    except (TypeError, ValueError):
+        return {}
+    if not (
+        diagnostic_id
+        and bypass_identity
+        and classification
+        and bypass_revision > 0
+        and source_backlog_id == backlog_id
+        and str(bypass.get("disposition") or "").strip()
+        == "proceeded_with_exception"
+    ):
+        return {}
+    try:
+        diagnostic = conn.execute(
+            """
+            SELECT status, mf_type, chain_trigger_json, bypass_policy_json
+            FROM backlog_bugs WHERE bug_id = ?
+            """,
+            (diagnostic_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return {}
+    if not diagnostic:
+        return {}
+    chain = backlog_runtime.parse_json_object(
+        diagnostic["chain_trigger_json"]
+    )
+    policy = backlog_runtime.parse_json_object(
+        diagnostic["bypass_policy_json"]
+    )
+    diagnostic_binding = {
+        "source_backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "line_id": "worker_implementation",
+        "execution_state_revision": bypass_revision,
+        "bypass_identity": bypass_identity,
+        "classification": classification,
+        "disposition": "proceeded_with_exception",
+        "no_pass_claim": True,
+    }
+    if not (
+        str(diagnostic["status"] or "").strip().upper() == "OPEN"
+        and str(diagnostic["mf_type"] or "").strip() == "chain_rescue"
+        and all(chain.get(key) == value for key, value in diagnostic_binding.items())
+        and all(policy.get(key) == value for key, value in diagnostic_binding.items())
+        and policy.get("keep_open") is True
+    ):
+        return {}
+
+    correlation_id = f"contract-line-bypass:{bypass_identity}"
+    source_events = [
+        event
+        for event in _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id="",
+            backlog_id=backlog_id,
+        )
+        if str(event.get("event_type") or "").strip()
+        == "contract_line_bypass"
+        and str(event.get("correlation_id") or "").strip()
+        == correlation_id
+    ]
+    diagnostic_events = [
+        event
+        for event in _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id="",
+            backlog_id=diagnostic_id,
+        )
+        if str(event.get("event_type") or "").strip()
+        == "contract_line_bypass_diagnostic_linked"
+        and str(event.get("correlation_id") or "").strip()
+        == correlation_id
+    ]
+    if len(source_events) != 1 or len(diagnostic_events) != 1:
+        return {}
+
+    def audited_event_binding(event: Mapping[str, Any]) -> tuple[Any, ...]:
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        return (
+            str(event.get("event_kind") or "").strip(),
+            str(event.get("actor") or "").strip(),
+            str(event.get("task_id") or "").strip(),
+            str(event.get("status") or "").strip(),
+            str(event.get("decision") or "").strip(),
+            str(payload.get("source_backlog_id") or "").strip(),
+            str(payload.get("contract_execution_id") or "").strip(),
+            str(payload.get("line_id") or "").strip(),
+            str(payload.get("diagnostic_backlog_id") or "").strip(),
+            str(payload.get("bypass_identity") or "").strip(),
+            str(payload.get("classification") or "").strip(),
+            str(payload.get("disposition") or "").strip(),
+            payload.get("no_pass_claim"),
+        )
+
+    expected_event_binding = (
+        "record_blocker",
+        bypass_actor_role,
+        execution_id,
+        "proceeded_with_exception",
+        "linked_open_diagnostic_no_pass",
+        backlog_id,
+        execution_id,
+        "worker_implementation",
+        diagnostic_id,
+        bypass_identity,
+        classification,
+        "proceeded_with_exception",
+        True,
+    )
+    source_event = source_events[0]
+    diagnostic_event = diagnostic_events[0]
+    source_event_id = _contract_runtime_projection_timeline_event_id(
+        source_event
+    )
+    diagnostic_event_id = _contract_runtime_projection_timeline_event_id(
+        diagnostic_event
+    )
+    diagnostic_event_binding = list(expected_event_binding)
+    diagnostic_event_binding[3] = "open"
+    diagnostic_event_binding[4] = "keep_open_until_block_repaired"
+    if not (
+        audited_event_binding(source_event) == expected_event_binding
+        and audited_event_binding(diagnostic_event)
+        == tuple(diagnostic_event_binding)
+        and 0 < source_event_id < diagnostic_event_id
+    ):
+        return {}
+
+    matching_contexts: list[Any] = []
+    matching_dispatch_indexes: list[int] = []
+    for dispatch_index, dispatch in enumerate(completed[:bypass_index]):
+        if str(dispatch.get("line_id") or "").strip() != (
+            "observer_dispatch_bounded_workers"
+        ):
+            continue
+        dispatch_matched = False
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=dispatch,
+        ):
+            context_identity = _contract_runtime_context_identity(context)
+            if context_identity[:2] != (runtime_context_id, task_id):
+                continue
+            matching_contexts.append(context)
+            dispatch_matched = True
+        if dispatch_matched:
+            matching_dispatch_indexes.append(dispatch_index)
+    if len(matching_contexts) != 1 or len(matching_dispatch_indexes) != 1:
+        return {}
+    context = matching_contexts[0]
+    context_parent_task_id = _contract_runtime_context_identity(context)[2]
+    context_lane_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    if not (
+        context_lane_id == lane_id
+        and str(getattr(context, "status", "") or "").strip()
+        in {"allocated", "worktree_ready", "running"}
+        and str(getattr(context, "backlog_id", "") or backlog_id).strip()
+        == backlog_id
+        and str(getattr(context, "fence_token", "") or "").strip()
+    ):
+        return {}
+    expected_optional_claims = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": context_parent_task_id,
+        "lane_id": lane_id,
+    }
+    for field, expected in expected_optional_claims.items():
+        claims = {
+            str(candidate.get(field) or "").strip()
+            for candidate in _contract_runtime_mapping_candidates(bypass_line)
+            if str(candidate.get(field) or "").strip()
+        }
+        if claims and claims != {expected}:
+            return {}
+    for event in (source_event, diagnostic_event):
+        for field, expected in {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "line_instance_id": line_instance_id,
+        }.items():
+            payload_claims = {
+                str(candidate.get(field) or "").strip()
+                for candidate in _contract_runtime_mapping_candidates(
+                    event.get("payload")
+                    if isinstance(event.get("payload"), Mapping)
+                    else {}
+                )
+                if str(candidate.get(field) or "").strip()
+            }
+            if payload_claims and payload_claims != {expected}:
+                return {}
+    return {
+        "schema_version": (
+            "contract_runtime.worker_implementation_bypass_continuation_anchor.v1"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+        "contract_execution_id": execution_id,
+        "backlog_id": backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": context_parent_task_id,
+        "lane_id": lane_id,
+        "line_instance_id": line_instance_id,
+        "implementation_bypass_diagnostic_id": diagnostic_id,
+        "implementation_bypass_source_event_ref": _runtime_context_event_ref(
+            source_event
+        ),
+        "implementation_bypass_diagnostic_event_ref": (
+            _runtime_context_event_ref(diagnostic_event)
+        ),
+        "context": context,
+    }
+
+
 def _contract_runtime_worker_commit_bypass_continuation_authority(
     conn,
     *,
@@ -77991,7 +78602,158 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
         implementation = candidate
         break
     if not implementation:
-        return {}
+        bypass_anchor = (
+            _contract_runtime_worker_implementation_bypass_continuation_anchor(
+                conn,
+                project_id=project_id,
+                record=record,
+                completed=completed[:stop],
+            )
+        )
+        if not bypass_anchor:
+            return {}
+        context = bypass_anchor.get("context")
+        if context is None:
+            return {}
+        runtime_context_id = str(
+            bypass_anchor.get("runtime_context_id") or ""
+        ).strip()
+        task_id = str(bypass_anchor.get("task_id") or "").strip()
+        parent_task_id = str(
+            bypass_anchor.get("parent_task_id") or ""
+        ).strip()
+        canonical_claims = {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "lane_id": str(bypass_anchor.get("lane_id") or "").strip(),
+            "line_instance_id": str(
+                bypass_anchor.get("line_instance_id") or ""
+            ).strip(),
+        }
+        for field, expected in canonical_claims.items():
+            claimed = {
+                str(candidate.get(field) or "").strip()
+                for candidate in _contract_runtime_mapping_candidates(request)
+                if str(candidate.get(field) or "").strip()
+            }
+            if claimed and claimed != {expected}:
+                return {}
+
+        worktree_path = str(
+            getattr(context, "worktree_path", "") or ""
+        ).strip()
+        base_commit = str(
+            getattr(context, "base_commit", "") or ""
+        ).strip().lower()
+        if not (
+            worktree_path
+            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base_commit)
+        ):
+            return {}
+        try:
+            if _runtime_context_git_dirty_files(worktree_path):
+                return {}
+            actual_head = _runtime_context_git_head_commit(
+                worktree_path
+            ).lower()
+            revision_diff = _runtime_context_worker_commit_revision_diff(
+                worktree_path,
+                actual_head,
+                base_commit=base_commit,
+            )
+        except (GovernanceError, ValidationError):
+            return {}
+        changed_files = sorted(
+            set(revision_diff.get("changed_files") or [])
+        )
+        owned_files = sorted(
+            set(
+                getattr(context, "owned_files", ())
+                or getattr(context, "target_files", ())
+                or ()
+            )
+        )
+        if not (
+            re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", actual_head)
+            and str(revision_diff.get("base_commit") or "").strip().lower()
+            == base_commit
+            and changed_files
+            and owned_files
+            and not (set(changed_files) - set(owned_files))
+        ):
+            return {}
+        if commit_candidates != {actual_head}:
+            return {}
+        claimed_files = sorted(
+            set(
+                _runtime_context_service_query_values(
+                    request,
+                    "changed_files",
+                    "commit_diff_files",
+                    "worker_changed_files",
+                )
+            )
+        )
+        if claimed_files and claimed_files != changed_files:
+            return {}
+        claimed_owned_files = sorted(
+            set(
+                _runtime_context_service_query_values(
+                    request,
+                    "owned_files",
+                )
+            )
+        )
+        if claimed_owned_files and claimed_owned_files != owned_files:
+            return {}
+        claimed_bases = {
+            str(candidate.get(field) or "").strip().lower()
+            for candidate in _contract_runtime_mapping_candidates(request)
+            for field in ("base_commit", "diff_base_commit")
+            if str(candidate.get(field) or "").strip()
+        }
+        if claimed_bases and claimed_bases != {base_commit}:
+            return {}
+        public_anchor = {
+            key: value
+            for key, value in bypass_anchor.items()
+            if key != "context"
+        }
+        return {
+            "schema_version": (
+                "contract_runtime.worker_commit_bypass_continuation.v2"
+            ),
+            "server_derived": True,
+            "db_verified": True,
+            "source": (
+                "audited_no_pass_worker_implementation_bypass+"
+                "runtime_context_clean_base_head_diff"
+            ),
+            "authorization_scope": "worker_commit_bypass_only",
+            "no_pass_claim": True,
+            "authoritative_pass_synthesized": False,
+            "implementation_pass_claimed": False,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "lane_id": canonical_claims["lane_id"],
+            "line_instance_id": canonical_claims["line_instance_id"],
+            "commit_sha": actual_head,
+            "worker_commit_sha": actual_head,
+            "changed_files": changed_files,
+            "commit_diff_files": changed_files,
+            "commit_parent_sha": str(
+                revision_diff.get("parent_commit") or ""
+            ).strip().lower(),
+            "diff_base_commit": base_commit,
+            "owned_files": owned_files,
+            "out_of_scope_files": [],
+            "clean_worktree": True,
+            "historical_lineage_stale": False,
+            "canonical_historical_commit_sha": "",
+            "implementation_bypass_anchor": public_anchor,
+        }
     runtime_context_id = _timeline_first_deep_text(
         implementation, "runtime_context_id"
     )
