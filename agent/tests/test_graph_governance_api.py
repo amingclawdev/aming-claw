@@ -4479,6 +4479,9 @@ def _assert_worker_commit_bypass_continuation_v3(
         "contract_runtime.canonical_owned_file_provenance.v1"
     )
     assert provenance["verified"] is True
+    assert provenance["source"] == "canonical_commit_owned_blob_match"
+    assert provenance["current_canonical_commit_contains_candidate_blobs"] is True
+    assert "provenance_event_ref" not in provenance
     assert provenance["candidate_commit_sha"] == case["candidate_commit"]
     assert provenance["canonical_commit_sha"] == case["canonical_commit"]
     assert provenance["owned_files"] == [case["owned_path"]]
@@ -4685,12 +4688,14 @@ def test_worker_commit_bypass_v3_persists_open_diagnostic_and_revalidates_readba
         "caller_wrong_files",
         "missing_current_full_provenance",
         "canonical_snapshot_provenance_mismatch",
+        "historical_qa_blob_carrier_rejected",
         "cross_lane_ac7_anchor_claim",
     ],
 )
 def test_worker_commit_bypass_v3_rejects_unproven_epoch_or_lane_zero_write(
     conn,
     tmp_path,
+    monkeypatch,
     variant,
 ):
     case = _ac8_worker_commit_graph_epoch_recovery_case(
@@ -4792,6 +4797,137 @@ def test_worker_commit_bypass_v3_rejects_unproven_epoch_or_lane_zero_write(
                 PID,
                 case["active_snapshot_id"],
             ),
+        )
+    elif variant == "historical_qa_blob_carrier_rejected":
+        stale_carrier_commit = case["canonical_commit"]
+        mismatch_branch = f"canonical-mismatch-{case['task_id']}"
+        subprocess.run(
+            [
+                "git",
+                "checkout",
+                "-q",
+                "-b",
+                mismatch_branch,
+                stale_carrier_commit,
+            ],
+            cwd=case["worktree"],
+            check=True,
+        )
+        mismatch_owned = case["worktree"] / case["owned_path"]
+        mismatch_owned.write_text(
+            "canonical runtime moved beyond the worker-owned blob\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["git", "add", case["owned_path"]],
+            cwd=case["worktree"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "move canonical owned blob"],
+            cwd=case["worktree"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        mismatch_commit = batch_jobs.git_commit(case["worktree"])
+        assert subprocess.run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                stale_carrier_commit,
+                mismatch_commit,
+            ],
+            cwd=case["worktree"],
+            check=False,
+        ).returncode == 0
+        mismatch_blob_oid = subprocess.run(
+            [
+                "git",
+                "rev-parse",
+                f"{mismatch_commit}:{case['owned_path']}",
+            ],
+            cwd=case["worktree"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert mismatch_blob_oid != case["candidate_blob_oid"]
+        subprocess.run(
+            ["git", "checkout", "-q", "--detach", case["candidate_commit"]],
+            cwd=case["worktree"],
+            check=True,
+        )
+
+        mismatch_snapshot_id = f"full-ac8-mismatch-{case['task_id']}"
+        mismatch_trace_id = f"gqt-ac8-mismatch-{case['task_id']}"
+        _activate_basic_graph(
+            conn,
+            mismatch_snapshot_id,
+            commit_sha=mismatch_commit,
+        )
+        _insert_mf_sub_graph_query_trace(
+            conn,
+            trace_id=mismatch_trace_id,
+            parent_task_id=case["execution_id"],
+            snapshot_id=mismatch_snapshot_id,
+            runtime_context_id=case["runtime_context_id"],
+            task_id=case["task_id"],
+            worker_role="mf_sub",
+            fence_token=case["context"].fence_token,
+            run_id=_mf_sub_run_id(
+                case["task_id"],
+                case["context"].fence_token,
+            ),
+            created_at="2026-08-02T02:00:00Z",
+        )
+        _record_test_current_full_reconcile_authority(
+            conn,
+            backlog_id=case["backlog_id"],
+            task_id=case["task_id"],
+            contract_execution_id=case["execution_id"],
+            runtime_context_id=case["runtime_context_id"],
+            target_project_root=str(case["worktree"]),
+            snapshot_id=mismatch_snapshot_id,
+            commit_sha=mismatch_commit,
+            qa_graph_trace_id=mismatch_trace_id,
+            qa_commit_sha=mismatch_commit,
+            merged_commit_sha=mismatch_commit,
+            parent_task_id=case["execution_id"],
+            merge_queue_id=case["context"].merge_queue_id,
+        )
+        request["graph_trace_ids"] = [mismatch_trace_id]
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=case["backlog_id"],
+            task_id=case["execution_id"],
+            event_type="qa.postdeploy_independent_verification",
+            event_kind="independent_verification",
+            phase="verification",
+            actor="qa:stale-historical-blob-carrier",
+            status="passed",
+            commit_sha=stale_carrier_commit,
+            payload={
+                "contract_execution_id": case["execution_id"],
+                "runtime_context_id": case["runtime_context_id"],
+                "task_id": case["task_id"],
+                "graph_trace_ids": [case["fresh_trace_id"]],
+                "verdict": "PASS",
+            },
+        )
+
+        def fail_on_historical_timeline_scan(*_args, **_kwargs):
+            raise AssertionError(
+                "canonical owned-blob mismatch must fail closed without "
+                "scanning historical QA blob carriers"
+            )
+
+        monkeypatch.setattr(
+            server,
+            "_runtime_context_service_timeline_events",
+            fail_on_historical_timeline_scan,
         )
     elif variant == "cross_lane_ac7_anchor_claim":
         other_runtime = "mfrctx-cross-lane-ac7"
