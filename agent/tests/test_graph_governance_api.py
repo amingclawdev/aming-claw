@@ -14266,6 +14266,7 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
     assert not (repository_root / ".worktrees").exists()
     bodies = response["copy_safe_allocation_bodies"]
     assert len(bodies) == 2
+    assert {body["project_id"] for body in bodies} == {PID}
     assert {body["route_token_ref"] for body in bodies} == {
         "rtok-allocate-precheck-a",
         "rtok-allocate-precheck-b",

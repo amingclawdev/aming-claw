@@ -11310,6 +11310,7 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
     }
     copy_safe_body.update(
         {
+            "project_id": project_id,
             "backlog_id": backlog_id,
             "contract_execution_id": contract_execution_id,
             "successor_contract_execution_id": contract_execution_id,

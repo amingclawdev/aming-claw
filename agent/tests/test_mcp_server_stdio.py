@@ -1723,6 +1723,21 @@ def test_governance_mcp_parallel_branch_allocate_precheck_dispatch(monkeypatch):
 
     def fake_http(method, path, body=None):
         calls.append((method, path, body))
+        if path.endswith("/parallel-branches/allocation-precheck"):
+            return {
+                "ok": True,
+                "copy_safe_allocation_bodies": [
+                    {
+                        "project_id": "aming-claw",
+                        "task_id": "precheck-a",
+                        "backlog_id": "AC-PRECHECK",
+                        "contract_execution_id": "cex-precheck",
+                        "worker_id": "slot-a",
+                        "route_token_ref": "rtok-precheck-a",
+                        "owned_files": ["src/a.py"],
+                    }
+                ],
+            }
         return {"ok": True, "path": path}
 
     monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
@@ -1771,6 +1786,23 @@ def test_governance_mcp_parallel_branch_allocate_precheck_dispatch(monkeypatch):
             {"expected_lane_count": 2, "lanes": lanes},
         )
     ]
+    allocation_body = result["copy_safe_allocation_bodies"][0]
+    assert allocation_body["project_id"] == "aming-claw"
+
+    governance_mcp_server._dispatch_tool(
+        "parallel_branch_allocate",
+        allocation_body,
+    )
+
+    assert calls[-1] == (
+        "POST",
+        "/api/graph-governance/aming-claw/parallel-branches/allocate",
+        {
+            key: value
+            for key, value in allocation_body.items()
+            if key != "project_id"
+        },
+    )
 
 
 def test_mcp_stdio_observer_repair_run_plan_schema_is_read_only_entrypoint():

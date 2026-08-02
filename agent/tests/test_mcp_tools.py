@@ -3471,7 +3471,27 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
 
 
 def test_mcp_parallel_branch_allocate_precheck_routes_atomic_body_unchanged():
-    recorder = _Recorder()
+    class PrecheckRecorder(_Recorder):
+        def api(self, method: str, path: str, data: dict | None = None) -> dict:
+            self.calls.append((method, path, data))
+            if path.endswith("/parallel-branches/allocation-precheck"):
+                return {
+                    "ok": True,
+                    "copy_safe_allocation_bodies": [
+                        {
+                            "project_id": "aming-claw",
+                            "task_id": "precheck-a",
+                            "backlog_id": "AC-PRECHECK",
+                            "contract_execution_id": "cex-precheck",
+                            "worker_id": "slot-a",
+                            "route_token_ref": "rtok-precheck-a",
+                            "owned_files": ["src/a.py"],
+                        }
+                    ],
+                }
+            return {"ok": True, "method": method, "path": path, "data": data}
+
+    recorder = PrecheckRecorder()
     dispatcher = _dispatcher(recorder)
     lanes = [
         {
@@ -3492,7 +3512,7 @@ def test_mcp_parallel_branch_allocate_precheck_routes_atomic_body_unchanged():
         },
     ]
 
-    dispatcher.dispatch(
+    precheck = dispatcher.dispatch(
         "parallel_branch_allocate_precheck",
         {
             "project_id": "aming-claw",
@@ -3512,6 +3532,20 @@ def test_mcp_parallel_branch_allocate_precheck_routes_atomic_body_unchanged():
             "expected_lane_count": 2,
             "base_commit": "a" * 40,
             "lanes": lanes,
+        },
+    )
+    allocation_body = precheck["copy_safe_allocation_bodies"][0]
+    assert allocation_body["project_id"] == "aming-claw"
+
+    dispatcher.dispatch("parallel_branch_allocate", allocation_body)
+
+    assert recorder.calls[-1] == (
+        "POST",
+        "/api/graph-governance/aming-claw/parallel-branches/allocate",
+        {
+            key: value
+            for key, value in allocation_body.items()
+            if key != "project_id"
         },
     )
 
