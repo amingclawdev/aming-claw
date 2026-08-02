@@ -103594,3 +103594,440 @@ def test_contract_runtime_visualization_emits_all_typed_legacy_repair_targets():
     assert not any(item["type"] == "source_missing_repair_id" for item in targets)
     assert all(item["advisory_only"] is True for item in targets)
     assert all(item["overrides_current_authority"] is False for item in targets)
+
+
+def _finish_alias_source_fixture():
+    runtime_context_id = "mfrctx-finish-alias-parity"
+    task_id = "worker-finish-alias-parity"
+    implementation_lineage_ref = (
+        "contract-runtime:worker-implementation:finish-alias-parity"
+    )
+    test_results = {
+        "status": "passed",
+        "passed": True,
+        "commands": [
+            {
+                "command": "pytest -q finish-alias-parity",
+                "status": "passed",
+            }
+        ],
+    }
+    changed_files = ["agent/governance/server.py"]
+    graph_trace_ids = ["gqt-finish-alias-parity"]
+    implementation = {
+        "line_id": "worker_implementation",
+        "line_instance_id": "line-finish-alias-parity",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "payload": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "test_results": test_results,
+        },
+    }
+    record = {
+        "contract_execution_id": "cex-finish-alias-parity",
+        "completed_lines": [implementation],
+    }
+    lineage = {
+        "implementation_event_ref": "timeline:finish-alias-parity",
+        "implementation_lineage_ref": implementation_lineage_ref,
+        "changed_files": changed_files,
+        "graph_trace_ids": graph_trace_ids,
+    }
+    projection = (
+        server._runtime_context_contract_runtime_worker_implementation_projection(
+            record,
+            implementation,
+            lineage,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        )
+    )
+    assert projection["accepted"] is True
+    return projection, {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "implementation_lineage_ref": implementation_lineage_ref,
+        "test_results": test_results,
+        "changed_files": changed_files,
+        "graph_trace_ids": graph_trace_ids,
+    }
+
+
+def _finish_alias_timeline_refs(identity):
+    alias = {
+        "runtime_context_id": identity["runtime_context_id"],
+        "task_id": identity["task_id"],
+        "implementation_lineage_ref": identity["implementation_lineage_ref"],
+        "test_results": copy.deepcopy(identity["test_results"]),
+        "changed_files": list(identity["changed_files"]),
+        "graph_trace_ids": list(identity["graph_trace_ids"]),
+    }
+    return {
+        "implementation_event_refs": ["timeline:finish-alias-parity"],
+        "latest_implementation_event_ref": "timeline:finish-alias-parity",
+        "latest_implementation_payload": alias,
+        "test_results": copy.deepcopy(identity["test_results"]),
+    }
+
+
+@pytest.mark.parametrize("alias_kind", ["absent", "matching", "legacy_incomplete"])
+def test_finish_hint_keeps_canonical_results_when_alias_is_not_conflicting(
+    alias_kind,
+):
+    projection, identity = _finish_alias_source_fixture()
+    timeline_refs = {}
+    if alias_kind == "matching":
+        timeline_refs = _finish_alias_timeline_refs(identity)
+    elif alias_kind == "legacy_incomplete":
+        timeline_refs = {
+            "implementation_event_refs": ["timeline:legacy-finish-alias"],
+            "latest_implementation_event_ref": "timeline:legacy-finish-alias",
+            "latest_implementation_payload": {
+                "action": "record_implementation_evidence",
+            },
+            # This compatibility aggregate is not a canonical-lineage-bound
+            # alias and must not replace the source-backed implementation.
+            "test_results": {"status": "failed", "passed": False},
+        }
+
+    hint, resolution = (
+        server._runtime_context_finish_hint_from_source_backed_implementation(
+            {"test_results": {"status": "failed", "passed": False}},
+            timeline_refs,
+            projection,
+        )
+    )
+
+    assert resolution["accepted"] is True
+    assert resolution["fail_closed"] is False
+    assert resolution["timeline_projection_authoritative"] is False
+    assert hint["test_results"] == identity["test_results"]
+    assert hint["changed_files"] == identity["changed_files"]
+    assert hint["graph_trace_ids"] == identity["graph_trace_ids"]
+    assert hint["test_results_source"] == projection["source_of_authority"]
+
+
+@pytest.mark.parametrize(
+    ("field", "conflicting_value", "error_fragment"),
+    [
+        ("runtime_context_id", "mfrctx-other", "runtime_context_id"),
+        ("task_id", "worker-other", "task_id"),
+        (
+            "implementation_lineage_ref",
+            "contract-runtime:worker-implementation:other",
+            "implementation_lineage_ref",
+        ),
+        (
+            "test_results",
+            {"status": "failed", "passed": False},
+            "test_results",
+        ),
+        ("changed_files", ["agent/governance/other.py"], "changed_files"),
+        ("graph_trace_ids", ["gqt-finish-alias-other"], "graph_trace_ids"),
+    ],
+)
+def test_finish_hint_fails_closed_on_explicit_alias_conflict(
+    field,
+    conflicting_value,
+    error_fragment,
+):
+    projection, identity = _finish_alias_source_fixture()
+    timeline_refs = _finish_alias_timeline_refs(identity)
+    timeline_refs["latest_implementation_payload"][field] = conflicting_value
+
+    hint, resolution = (
+        server._runtime_context_finish_hint_from_source_backed_implementation(
+            {"test_results": copy.deepcopy(identity["test_results"])},
+            timeline_refs,
+            projection,
+        )
+    )
+
+    assert resolution["accepted"] is False
+    assert resolution["fail_closed"] is True
+    assert resolution["actionable"] is False
+    assert resolution["timeline_projection_authoritative"] is False
+    assert any(error_fragment in error for error in resolution["errors"])
+    assert "test_results" not in hint
+
+
+@pytest.mark.parametrize(
+    ("case", "error_fragment"),
+    [
+        ("ambiguous", "source count must be exactly one"),
+        ("wrong_identity", "runtime_context_id mismatch"),
+        ("invalid_tests", "test_results are not finish-compatible"),
+    ],
+)
+def test_finish_hint_rejects_invalid_canonical_implementation_source(
+    case,
+    error_fragment,
+):
+    projection, identity = _finish_alias_source_fixture()
+    implementation = {
+        "line_id": "worker_implementation",
+        "line_instance_id": "line-finish-alias-invalid",
+        "runtime_context_id": identity["runtime_context_id"],
+        "task_id": identity["task_id"],
+        "payload": {
+            "runtime_context_id": identity["runtime_context_id"],
+            "task_id": identity["task_id"],
+            "test_results": copy.deepcopy(identity["test_results"]),
+        },
+    }
+    record = {
+        "contract_execution_id": "cex-finish-alias-invalid",
+        "completed_lines": [implementation],
+    }
+    if case == "ambiguous":
+        record["completed_lines"].append(
+            {**copy.deepcopy(implementation), "line_instance_id": "line-duplicate"}
+        )
+    elif case == "wrong_identity":
+        implementation["runtime_context_id"] = "mfrctx-wrong"
+        implementation["payload"]["runtime_context_id"] = "mfrctx-wrong"
+    else:
+        implementation["payload"]["test_results"] = {
+            "status": "failed",
+            "passed": False,
+        }
+    invalid = (
+        server._runtime_context_contract_runtime_worker_implementation_projection(
+            record,
+            implementation,
+            {
+                "implementation_event_ref": "timeline:finish-alias-invalid",
+                "implementation_lineage_ref": identity[
+                    "implementation_lineage_ref"
+                ],
+                "changed_files": identity["changed_files"],
+                "graph_trace_ids": identity["graph_trace_ids"],
+            },
+            runtime_context_id=identity["runtime_context_id"],
+            task_id=identity["task_id"],
+        )
+    )
+
+    assert projection["accepted"] is True
+    assert invalid["accepted"] is False
+    assert invalid["fail_closed"] is True
+    assert invalid["test_results"] == {}
+    assert any(error_fragment in error for error in invalid["errors"])
+
+
+def test_finish_attestation_facade_does_not_persist_explicit_alias_conflict(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-FINISH-ALIAS-FACADE-CONFLICT"
+    worker_task_id = "finish-alias-facade-conflict-worker"
+    worker_token = "finish-alias-facade-conflict-token"
+    worker_fence = "fence-finish-alias-facade-conflict"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    graph_trace_id = "gqt-finish-alias-facade-conflict"
+    head_commit = hashlib.sha1(b"finish-alias-facade-conflict").hexdigest()
+    test_results = {
+        "status": "passed",
+        "passed": True,
+        "commands": [
+            {
+                "command": "pytest -q finish-alias-facade-conflict",
+                "status": "passed",
+            }
+        ],
+    }
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="finish-alias-facade-conflict-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_root),
+    )
+    evidence_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token=worker_fence,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+        include_finish_evidence=False,
+        test_results=test_results,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+        implementation_event_ref=f"timeline:{evidence_events['implementation']}",
+        test_results=test_results,
+    )
+    projection = server._runtime_context_contract_runtime_worker_projection(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        context=runtime_context,
+    )
+    canonical = projection["worker_implementation_evidence"]
+    assert canonical["accepted"] is True
+    conflict = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        event_type="mf.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        status="passed",
+        actor="mf_sub:finish-alias-facade-conflict",
+        payload={
+            "action": "record_implementation_evidence",
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "implementation_lineage_ref": canonical[
+                "implementation_lineage_ref"
+            ],
+            "changed_files": list(canonical["changed_files"]),
+            "graph_trace_ids": list(canonical["graph_trace_ids"]),
+            "head_commit": head_commit,
+            "test_results": {"status": "passed", "passed": True, "total": 999},
+        },
+        commit_sha=head_commit,
+    )
+    conn.commit()
+
+    worker_query = {
+        "parent_task_id": backlog_id,
+        "fence_token": worker_fence,
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(runtime_context),
+        "target_project_root": str(worker_root),
+    }
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            query=worker_query,
+        )
+    )
+    resolution = guide["finish_hint_source_backed_resolution"]
+    assert resolution["fail_closed"] is True
+    assert resolution["timeline_projection_authoritative"] is False
+    blocked_submission = guide["actionable_payloads"][
+        "finish_time_worker_attestation_submission"
+    ]
+    assert blocked_submission["actionable"] is False
+    assert "test_results" not in blocked_submission["copy_safe_body"]
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_contract_worker_commit_projection",
+        lambda *_args, **_kwargs: {
+            "schema_version": "runtime_context.contract_worker_commit_projection.v1",
+            "status": "validated",
+            "canonical_worker_commit_required": True,
+            "contract_execution_id": successor["contract_execution_id"],
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "worker_commit_sha": head_commit,
+            "head_commit": head_commit,
+            "changed_files": ["agent/governance/server.py"],
+            "owned_files": ["agent/governance/server.py"],
+            "diff_base_commit": runtime_context.base_commit,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_finish_changed_files",
+        lambda *_args, **_kwargs: ["agent/governance/server.py"],
+    )
+    from agent.governance import worker_transcript_verify
+
+    monkeypatch.setattr(
+        worker_transcript_verify,
+        "verify_worker_transcript",
+        lambda payload: {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "attestation_phase": "finish",
+            "status": "passed",
+            "ok": True,
+            "worker_self_attesting": True,
+            "self_attesting": True,
+            "finish_time_self_attesting": True,
+            "finish_time_blockers": [],
+            "worker_session_id": payload["worker_session_id"],
+            "filer_principal": payload["filer_principal"],
+            "worker_transcript_ref": "codex:finish-alias-facade-conflict",
+            "harness_type": "codex",
+            "blockers": [],
+        },
+    )
+    worker_session_id = f"session-{worker_task_id}"
+    timeline_count_before = conn.execute(
+        "SELECT COUNT(*) AS count FROM task_timeline_events"
+    ).fetchone()["count"]
+    contract_before = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    revision_before = contract_before["execution_state_revision"]
+    completed_before = len(contract_before["completed_lines"])
+
+    with pytest.raises((GovernanceError, ValidationError)) as rejected:
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    **worker_query,
+                    "worker_session_id": worker_session_id,
+                    "filer_principal": worker_session_id,
+                    "worker_transcript_ref": (
+                        "codex:finish-alias-facade-conflict"
+                    ),
+                    "harness_type": "codex",
+                    "graph_trace_ids": [graph_trace_id],
+                    "read_receipt_event_id": evidence_events["read_receipt"],
+                    "read_receipt_hash": (
+                        "sha256:mf-parallel-runtime-projection-read"
+                    ),
+                    "head_commit": head_commit,
+                    "changed_files": ["agent/governance/server.py"],
+                    "actual_cwd": str(worker_root),
+                    "actual_git_root": str(worker_root),
+                    "test_results": test_results,
+                },
+            )
+        )
+
+    assert rejected.value is not None
+    assert conn.execute(
+        "SELECT COUNT(*) AS count FROM task_timeline_events"
+    ).fetchone()["count"] == timeline_count_before
+    contract_after = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    assert contract_after["execution_state_revision"] == revision_before
+    assert len(contract_after["completed_lines"]) == completed_before
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        event_kind="worker_progress",
+    ) == []
+    assert conflict["id"] > evidence_events["implementation"]
