@@ -103241,6 +103241,86 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     assert "contract_merge_authority" not in batch_scope
 
 
+def test_batch_read_model_does_not_guess_ambiguous_planned_item_binding():
+    batch_id = "mf-batch-parallel-ambiguous-binding"
+    merge_queue_id = "mq-batch-ambiguous-binding"
+    planned_task_id = f"{batch_id}:row:1"
+    backlog_id = "AC-BATCH-AMBIGUOUS-ROW-1"
+    planned_item = MergeQueueItem(
+        project_id=PID,
+        merge_queue_id=merge_queue_id,
+        queue_item_id="mqitem-batch-ambiguous-1",
+        backlog_id=backlog_id,
+        task_id=planned_task_id,
+        branch_ref="",
+        queue_index=1,
+        status="planned",
+        target_ref="refs/heads/main",
+    )
+    batch_runtime = BatchMergeRuntime(
+        project_id=PID,
+        batch_id=batch_id,
+        target_ref="refs/heads/main",
+        batch_base_commit="a" * 40,
+        current_target_head="a" * 40,
+        items=(
+            BatchMergeItem(
+                task_id=planned_task_id,
+                branch_ref="",
+                worktree_path="",
+                queue_index=1,
+                status="planned",
+                branch_head="",
+                merge_queue_id=merge_queue_id,
+            ),
+        ),
+    )
+    ambiguous_contexts = [
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id=batch_id,
+            backlog_id=backlog_id,
+            task_id=f"cex-batch-ambiguous-{index}",
+            branch_ref=f"refs/heads/codex/cex-batch-ambiguous-{index}",
+            status="merge_ready",
+            merge_queue_id=merge_queue_id,
+        )
+        for index in (1, 2)
+    ]
+
+    recovered = parallel_branch_runtime._recover_read_model_merge_queue_items(
+        [planned_item],
+        project_id=PID,
+        merge_queue_id=merge_queue_id,
+        target_ref="refs/heads/main",
+        contexts=ambiguous_contexts,
+        batch_runtime=batch_runtime,
+    )
+
+    assert len(recovered) == 3
+    durable_projection = next(
+        item for item in recovered if item.queue_item_id == planned_item.queue_item_id
+    )
+    assert durable_projection.task_id == planned_task_id
+    assert durable_projection.queue_index == 1
+    assert {
+        item.task_id for item in recovered if item.queue_item_id != planned_item.queue_item_id
+    } == {context.task_id for context in ambiguous_contexts}
+
+    standalone = parallel_branch_runtime._recover_read_model_merge_queue_items(
+        [planned_item],
+        project_id=PID,
+        merge_queue_id=merge_queue_id,
+        target_ref="refs/heads/main",
+        contexts=ambiguous_contexts[:1],
+        batch_runtime=None,
+    )
+    assert len(standalone) == 2
+    assert next(
+        item for item in standalone if item.queue_item_id == planned_item.queue_item_id
+    ).task_id == planned_task_id
+
+
 def test_batch_merge_queue_binds_finish_lanes_to_planned_order_and_epoch(conn):
     batch_id = "mf-batch-parallel-order-binding"
     merge_queue_id = "mq-batch-order-binding"
@@ -103285,11 +103365,40 @@ def test_batch_merge_queue_binds_finish_lanes_to_planned_order_and_epoch(conn):
                 queue_index=2,
                 status="planned",
                 depends_on=(planned_task_ids[0],),
+                hard_depends_on=(planned_task_ids[0],),
+                serializes_after=(planned_task_ids[0],),
+                conflicts_with=(planned_task_ids[0],),
+                same_node_or_file_conflicts=(planned_task_ids[0],),
+                requires_graph_epoch=(planned_task_ids[0], "full-existing"),
                 target_ref="refs/heads/main",
                 base_commit=target_head,
                 current_target_head=target_head,
             ),
         ],
+    )
+    upsert_batch_merge_runtime(
+        conn,
+        BatchMergeRuntime(
+            project_id=PID,
+            batch_id=batch_id,
+            target_ref="refs/heads/main",
+            batch_base_commit=target_head,
+            current_target_head=target_head,
+            items=tuple(
+                BatchMergeItem(
+                    task_id=task_id,
+                    branch_ref="",
+                    worktree_path="",
+                    queue_index=index,
+                    status="planned",
+                    branch_head="",
+                    base_commit=target_head,
+                    merge_queue_id=merge_queue_id,
+                    depends_on=(planned_task_ids[0],) if index == 2 else (),
+                )
+                for index, task_id in enumerate(planned_task_ids, start=1)
+            ),
+        ),
     )
     runtime_contexts = []
     for index, (backlog_id, task_id) in enumerate(
@@ -103334,6 +103443,49 @@ def test_batch_merge_queue_binds_finish_lanes_to_planned_order_and_epoch(conn):
     )
     conn.commit()
 
+    # PB-010 must project the two durable planned rows through their unique
+    # live workers without synthesizing index-0 duplicates. Queue identity,
+    # order, and dependency edges remain owned by the original Batch plan.
+    read_model = parallel_branch_runtime.build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PID,
+        batch_id=batch_id,
+        merge_queue_id=merge_queue_id,
+        target_ref="refs/heads/main",
+        current_target_head=target_head,
+    )
+    projected_rows = read_model.merge_queue["rows"]
+    assert len(projected_rows) == 2
+    assert [row["queue_item_id"] for row in projected_rows] == list(queue_item_ids)
+    assert [row["queue_index"] for row in projected_rows] == [1, 2]
+    assert [row["task_id"] for row in projected_rows] == list(runtime_task_ids)
+    assert [row["branch_ref"] for row in projected_rows] == [
+        context.branch_ref for context in runtime_contexts
+    ]
+    assert projected_rows[1]["depends_on"] == [runtime_task_ids[0]]
+    assert projected_rows[1]["hard_depends_on"] == [runtime_task_ids[0]]
+    assert projected_rows[1]["serializes_after"] == [runtime_task_ids[0]]
+    assert projected_rows[1]["conflicts_with"] == [runtime_task_ids[0]]
+    assert projected_rows[1]["same_node_or_file_conflicts"] == [
+        runtime_task_ids[0]
+    ]
+    assert projected_rows[1]["requires_graph_epoch"] == [
+        runtime_task_ids[0],
+        "full-existing",
+    ]
+    durable_before_materialization = list_merge_queue_items(
+        conn,
+        PID,
+        merge_queue_id,
+    )
+    assert [item.task_id for item in durable_before_materialization] == list(
+        planned_task_ids
+    )
+    assert [item.status for item in durable_before_materialization] == [
+        "planned",
+        "planned",
+    ]
+
     first_result = queue_merge_item_for_branch_context(
         conn,
         project_id=PID,
@@ -103349,6 +103501,14 @@ def test_batch_merge_queue_binds_finish_lanes_to_planned_order_and_epoch(conn):
     assert after_first[0].task_id == runtime_task_ids[0]
     assert after_first[0].branch_ref == runtime_contexts[0].branch_ref
     assert after_first[1].depends_on == (runtime_task_ids[0],)
+    assert after_first[1].hard_depends_on == (runtime_task_ids[0],)
+    assert after_first[1].serializes_after == (runtime_task_ids[0],)
+    assert after_first[1].conflicts_with == (runtime_task_ids[0],)
+    assert after_first[1].same_node_or_file_conflicts == (runtime_task_ids[0],)
+    assert after_first[1].requires_graph_epoch == (
+        runtime_task_ids[0],
+        "full-existing",
+    )
 
     epoch = open_or_validate_integration_epoch(
         conn,

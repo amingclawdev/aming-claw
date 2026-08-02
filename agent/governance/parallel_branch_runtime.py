@@ -12734,6 +12734,98 @@ def _merge_queue_item_from_batch_lineage(
     )
 
 
+def _read_model_batch_planned_item_context_bindings(
+    items: Sequence[MergeQueueItem],
+    *,
+    project_id: str,
+    merge_queue_id: str,
+    active_target_ref: str,
+    contexts: Sequence[BranchTaskRuntimeContext],
+    batch_runtime: BatchMergeRuntime | None,
+) -> dict[str, BranchTaskRuntimeContext]:
+    """Bind unmaterialized Batch rows to live workers for read projection only.
+
+    Batch planning owns queue identity and ordering, while worker allocation may
+    assign a different task id.  Before durable materialization, project the
+    original queue row through the one live RuntimeContext with the same child
+    backlog.  Ambiguous or incomplete lineage deliberately remains unbound so
+    the operator sees recovery state instead of a guessed identity.
+    """
+
+    if batch_runtime is None or batch_runtime.batch_id == "":
+        return {}
+
+    batch_items_by_task = _batch_items_by_task_id(batch_runtime)
+    durable_task_ids = {item.task_id for item in items}
+    planned_by_backlog: dict[str, list[MergeQueueItem]] = {}
+    for item in items:
+        batch_item = batch_items_by_task.get(item.task_id)
+        if (
+            _normalize_merge_queue_status(item.status) != "planned"
+            or batch_item is None
+            or not item.backlog_id
+            or (
+                batch_item.merge_queue_id
+                and batch_item.merge_queue_id != merge_queue_id
+            )
+        ):
+            continue
+        planned_by_backlog.setdefault(item.backlog_id, []).append(item)
+
+    contexts_by_backlog: dict[str, list[BranchTaskRuntimeContext]] = {}
+    for context in contexts:
+        if (
+            context.project_id != project_id
+            or context.batch_id != batch_runtime.batch_id
+            or context.merge_queue_id != merge_queue_id
+            or not context.backlog_id
+            or not context.branch_ref
+            or context.task_id in durable_task_ids
+            or not _context_matches_read_model_target_ref(
+                context,
+                active_target_ref=active_target_ref,
+            )
+            or not _context_matches_read_model_preview_queue(
+                context,
+                active_merge_queue_id=merge_queue_id,
+            )
+        ):
+            continue
+        contexts_by_backlog.setdefault(context.backlog_id, []).append(context)
+
+    bindings: dict[str, BranchTaskRuntimeContext] = {}
+    for backlog_id, planned_items in planned_by_backlog.items():
+        candidates = contexts_by_backlog.get(backlog_id, [])
+        if len(planned_items) != 1 or len(candidates) != 1:
+            continue
+        bindings[planned_items[0].task_id] = candidates[0]
+    return bindings
+
+
+def _rebind_read_model_merge_queue_dependencies(
+    item: MergeQueueItem,
+    *,
+    task_id_bindings: Mapping[str, str],
+) -> MergeQueueItem:
+    if not task_id_bindings:
+        return item
+
+    def rebound(values: Sequence[str]) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(task_id_bindings.get(value, value) for value in values)
+        )
+
+    return replace(
+        item,
+        depends_on=rebound(item.depends_on),
+        hard_depends_on=rebound(item.hard_depends_on),
+        serializes_after=rebound(item.serializes_after),
+        conflicts_with=rebound(item.conflicts_with),
+        same_node_or_file_conflicts=rebound(item.same_node_or_file_conflicts),
+        requires_graph_epoch=rebound(item.requires_graph_epoch),
+    )
+
+
 def _recover_read_model_merge_queue_items(
     items: list[MergeQueueItem],
     *,
@@ -12750,6 +12842,18 @@ def _recover_read_model_merge_queue_items(
     active_target_ref = target_ref or (
         batch_runtime.target_ref if batch_runtime is not None else ""
     )
+    planned_item_bindings = _read_model_batch_planned_item_context_bindings(
+        items,
+        project_id=project_id,
+        merge_queue_id=merge_queue_id,
+        active_target_ref=active_target_ref,
+        contexts=contexts,
+        batch_runtime=batch_runtime,
+    )
+    task_id_bindings = {
+        planned_task_id: context.task_id
+        for planned_task_id, context in planned_item_bindings.items()
+    }
     recovered: list[MergeQueueItem] = []
     seen_tasks: set[str] = set()
 
@@ -12760,6 +12864,29 @@ def _recover_read_model_merge_queue_items(
             batch_item=batch_items_by_task.get(item.task_id),
             batch_runtime=batch_runtime,
         )
+        bound_context = planned_item_bindings.get(item.task_id)
+        if bound_context is not None:
+            enriched = replace(
+                enriched,
+                task_id=bound_context.task_id,
+                branch_ref=bound_context.branch_ref,
+                status=bound_context.status or enriched.status,
+                base_commit=bound_context.base_commit or enriched.base_commit,
+                branch_head=bound_context.head_commit or enriched.branch_head,
+                current_target_head=(
+                    bound_context.target_head_commit
+                    or enriched.current_target_head
+                ),
+                merge_preview_id=(
+                    bound_context.merge_preview_id
+                    or enriched.merge_preview_id
+                ),
+                snapshot_id=bound_context.snapshot_id or enriched.snapshot_id,
+                projection_id=(
+                    bound_context.projection_id or enriched.projection_id
+                ),
+            )
+            seen_tasks.add(bound_context.task_id)
         recovered.append(
             _with_read_model_queue_lineage(
                 enriched,
@@ -12833,7 +12960,14 @@ def _recover_read_model_merge_queue_items(
         )
         seen_tasks.add(context.task_id)
 
-    return sorted(recovered, key=lambda item: (item.queue_index, item.queue_item_id))
+    rebound = [
+        _rebind_read_model_merge_queue_dependencies(
+            item,
+            task_id_bindings=task_id_bindings,
+        )
+        for item in recovered
+    ]
+    return sorted(rebound, key=lambda item: (item.queue_index, item.queue_item_id))
 
 
 def decide_persisted_merge_queue(
