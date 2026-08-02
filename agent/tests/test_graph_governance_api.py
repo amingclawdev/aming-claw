@@ -37226,8 +37226,611 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
             )
         )
     assert rejoin_without_lineage.value.code == (
-        "runtime_context_rejoin_requires_existing_worker_lineage"
+        "runtime_context_pre_lineage_rejoin_identity_mismatch"
     )
+
+
+def _setup_pre_lineage_rejoin_recovery_case(
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    suffix: str,
+):
+    """Create one accepted initial join with no read/startup lineage."""
+
+    now_iso = "2099-08-02T01:00:00Z"
+    monkeypatch.setattr(server, "_utc_now", lambda: now_iso)
+    backlog_id = f"AC-PRE-LINEAGE-REJOIN-{suffix.upper()}"
+    task_id = f"pre-lineage-rejoin-{suffix}-worker"
+    parent_task_id = f"cex-pre-lineage-rejoin-{suffix}"
+    worker_id = f"desktop-pre-lineage-rejoin-{suffix}"
+    worker_session_id = f"desktop-session-pre-lineage-rejoin-{suffix}"
+    host_startup_id = f"desktop-startup-pre-lineage-rejoin-{suffix}"
+    target_root = tmp_path / f"pre-lineage-rejoin-{suffix}"
+    target_root.mkdir()
+    route_identity = {
+        "route_id": f"route-pre-lineage-rejoin-{suffix}",
+        "route_context_hash": f"sha256:route-pre-lineage-rejoin-{suffix}",
+        "prompt_contract_id": f"rprompt-pre-lineage-rejoin-{suffix}",
+        "prompt_contract_hash": f"sha256:prompt-pre-lineage-rejoin-{suffix}",
+        "route_token_ref": f"rtok-pre-lineage-rejoin-{suffix}",
+        "visible_injection_manifest_hash": (
+            f"sha256:visible-pre-lineage-rejoin-{suffix}"
+        ),
+    }
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            worktree_path=str(target_root),
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            root_task_id=parent_task_id,
+            backlog_id=backlog_id,
+            stage_task_id=task_id,
+            worker_id=worker_id,
+            worker_slot_id=worker_id,
+            agent_id=worker_id,
+            allocation_owner=worker_id,
+            branch_ref=f"refs/heads/codex/{task_id}",
+            status=STATE_WORKTREE_READY,
+            fence_token=f"fence-pre-lineage-rejoin-{suffix}",
+            attempt=1,
+            retry_round=0,
+        ),
+        now_iso=now_iso,
+    )
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        **route_identity,
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id=f"crev-pre-lineage-rejoin-{suffix}",
+        route_identity=route_identity,
+        payload={
+            "contract_execution_id": parent_task_id,
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_id,
+            "target_project_root": str(target_root),
+            "route_identity": route_identity,
+        },
+        now_iso=now_iso,
+    )
+    conn.commit()
+
+    initial_join_body = {
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "contract_execution_id": parent_task_id,
+        "target_project_root": str(target_root),
+        "worker_id": worker_id,
+        "worker_slot_id": worker_id,
+        "agent_id": worker_id,
+        "actual_host_worker_id": worker_id,
+        "worker_session_id": worker_session_id,
+        "host_startup_id": host_startup_id,
+        "host_session_id": worker_session_id,
+        **route_identity,
+        "reason": "issue the only initial host envelope for this Desktop worker",
+        "ttl_seconds": 3600,
+        "now_iso": now_iso,
+    }
+    initial_join = (
+        server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body=initial_join_body,
+            )
+        )
+    )
+    assert initial_join["ok"] is True
+    assert initial_join["status"] == "session_token_initial_join_issued"
+    initial_join_events = [
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            event_kind="observer_command",
+        )
+        if (event.get("payload") or {}).get("action")
+        == "runtime_context_session_token_initial_join"
+    ]
+    assert len(initial_join_events) == 1
+    assert not task_timeline.list_events(
+        conn,
+        PID,
+        task_id=task_id,
+        event_kind="mf_subagent_read_receipt",
+    )
+    assert not task_timeline.list_events(
+        conn,
+        PID,
+        task_id=task_id,
+        event_kind="mf_subagent_startup",
+    )
+    saved = get_branch_context(conn, PID, task_id)
+    assert saved is not None
+    assert saved.last_recovery_action == "mf_subagent_initial_join_issued"
+    assert saved.lease_id
+    assert saved.lease_expires_at
+    return {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_session_id": worker_session_id,
+        "host_startup_id": host_startup_id,
+        "target_root": target_root,
+        "route_identity": route_identity,
+        "context": saved,
+        "initial_join": initial_join,
+        "initial_join_event": initial_join_events[0],
+    }
+
+
+def _pre_lineage_rejoin_body(case: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": case["task_id"],
+        "parent_task_id": case["parent_task_id"],
+        "contract_execution_id": case["parent_task_id"],
+        "target_project_root": str(case["target_root"]),
+        "worker_id": case["worker_id"],
+        "worker_slot_id": case["worker_id"],
+        "agent_id": case["worker_id"],
+        "actual_host_worker_id": case["worker_id"],
+        "worker_session_id": case["worker_session_id"],
+        "host_startup_id": case["host_startup_id"],
+        "host_session_id": case["worker_session_id"],
+        **case["route_identity"],
+        "reason": "same Desktop worker lost the accepted envelope before lineage",
+        "ttl_seconds": 3600,
+    }
+
+
+def _pre_lineage_rejoin(
+    case: Mapping[str, Any],
+    *,
+    body_updates: Mapping[str, Any] | None = None,
+):
+    body = _pre_lineage_rejoin_body(case)
+    body.update(dict(body_updates or {}))
+    return server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case["context"].runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body=body,
+        )
+    )
+
+
+def _pre_lineage_case_events(conn, case: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return task_timeline.list_events(
+        conn,
+        PID,
+        task_id=case["task_id"],
+        backlog_id=case["backlog_id"],
+    )
+
+
+def _assert_pre_lineage_rejoin_zero_write(
+    conn,
+    case: Mapping[str, Any],
+    error: GovernanceError,
+    *,
+    before_context,
+    before_events: list[dict[str, Any]],
+    before_revision=None,
+) -> None:
+    assert error.details["mutation_performed"] is False
+    assert error.details["credential_rotated"] is False
+    assert error.details["fail_closed"] is True
+    assert get_branch_context(conn, PID, case["task_id"]) == before_context
+    if before_revision is not None:
+        assert get_latest_branch_contract_revision(
+            conn,
+            PID,
+            before_context.runtime_context_id,
+        ) == before_revision
+    assert _pre_lineage_case_events(conn, case) == before_events
+
+
+def test_runtime_context_pre_lineage_rejoin_rotates_auth_once_without_state_or_evidence_transition(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="once",
+    )
+    before = case["context"]
+    before_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        before.runtime_context_id,
+    )
+    before_events = _pre_lineage_case_events(conn, case)
+
+    rejoin = _pre_lineage_rejoin(case)
+
+    assert rejoin["ok"] is True
+    assert rejoin["status"] == "session_token_rejoin_issued"
+    assert rejoin["pre_lineage_auth_only_rejoin"] is True
+    assert rejoin["reopen_for_revision"] is False
+    assert rejoin["revision_rejoin_applied"] is False
+    authority = rejoin["pre_lineage_rejoin_authority"]
+    assert authority["schema_version"] == (
+        "runtime_context.pre_lineage_rejoin_authority.v1"
+    )
+    assert authority["server_derived"] is True
+    assert authority["authorization_mode"] == (
+        "exactly_one_accepted_initial_join_audit"
+    )
+    assert authority["initial_join_event_ref"] == (
+        f"timeline:{case['initial_join_event']['id']}"
+    )
+    assert authority["auth_only"] is True
+    assert authority["evidence_synthesized"] is False
+    assert authority["attempt_transition_applied"] is False
+    assert authority["retry_round_transition_applied"] is False
+    assert authority["status_transition_applied"] is False
+
+    after = get_branch_context(conn, PID, case["task_id"])
+    assert after is not None
+    for field in (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "backlog_id",
+        "target_project_root",
+        "worktree_path",
+        "worker_id",
+        "worker_slot_id",
+        "agent_id",
+        "actual_host_worker_id",
+        "host_startup_id",
+        "host_session_id",
+        "status",
+        "attempt",
+        "retry_round",
+    ):
+        assert getattr(after, field) == getattr(before, field), field
+    assert after.last_recovery_action == (
+        "mf_subagent_pre_lineage_session_token_rejoin_issued"
+    )
+    assert after.session_token_hash != before.session_token_hash
+    assert after.lease_id != before.lease_id
+    assert get_latest_branch_contract_revision(
+        conn,
+        PID,
+        after.runtime_context_id,
+    ) == before_revision
+    assert not task_timeline.list_events(
+        conn,
+        PID,
+        task_id=case["task_id"],
+        event_kind="mf_subagent_read_receipt",
+    )
+    assert not task_timeline.list_events(
+        conn,
+        PID,
+        task_id=case["task_id"],
+        event_kind="mf_subagent_startup",
+    )
+    after_events = _pre_lineage_case_events(conn, case)
+    assert len(after_events) == len(before_events) + 1
+    rejoin_audit = after_events[-1]
+    assert rejoin_audit["event_type"] == (
+        "observer.runtime_context_session_token_rejoin"
+    )
+    assert rejoin_audit["payload"]["pre_lineage_auth_only_rejoin"] is True
+    assert rejoin_audit["payload"]["pre_lineage_rejoin_authority"] == authority
+    serialized = json.dumps(after_events, sort_keys=True)
+    assert rejoin["session_token"] not in serialized
+    assert rejoin["fence_token"] not in serialized
+    assert rejoin["raw_tokens_persisted_to_timeline"] is False
+
+    state_before_second_loss = after
+    events_before_second_loss = list(after_events)
+    with pytest.raises(GovernanceError) as second_loss:
+        _pre_lineage_rejoin(case)
+    assert second_loss.value.code == (
+        "runtime_context_pre_lineage_rejoin_already_consumed"
+    )
+    assert second_loss.value.details["next_legal_action"] == (
+        "stop_and_report_bounded_pre_lineage_recovery_exhausted"
+    )
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        second_loss.value,
+        before_context=state_before_second_loss,
+        before_events=events_before_second_loss,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("task_id", "wrong-pre-lineage-task"),
+        ("parent_task_id", "wrong-pre-lineage-parent"),
+        ("contract_execution_id", "cex-wrong-pre-lineage-contract"),
+        ("target_project_root", "/tmp/wrong-pre-lineage-root"),
+        ("worker_id", "wrong-pre-lineage-worker"),
+        ("worker_slot_id", "wrong-pre-lineage-slot"),
+        ("agent_id", "wrong-pre-lineage-agent"),
+        ("actual_host_worker_id", "wrong-pre-lineage-host"),
+        ("worker_session_id", "wrong-pre-lineage-session"),
+        ("host_startup_id", "wrong-pre-lineage-startup"),
+        ("host_session_id", "wrong-pre-lineage-host-session"),
+        ("route_id", "route-wrong-pre-lineage"),
+        ("route_context_hash", "sha256:wrong-pre-lineage-route"),
+        ("prompt_contract_id", "rprompt-wrong-pre-lineage"),
+        ("prompt_contract_hash", "sha256:wrong-pre-lineage-prompt"),
+        ("route_token_ref", "rtok-wrong-pre-lineage"),
+        (
+            "visible_injection_manifest_hash",
+            "sha256:wrong-pre-lineage-visible",
+        ),
+    ],
+)
+def test_runtime_context_pre_lineage_rejoin_identity_route_and_contract_drift_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    field,
+    bad_value,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"drift-{field.replace('_', '-')}",
+    )
+    before_context = case["context"]
+    before_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        before_context.runtime_context_id,
+    )
+    before_events = _pre_lineage_case_events(conn, case)
+
+    with pytest.raises(GovernanceError) as drift:
+        _pre_lineage_rejoin(case, body_updates={field: bad_value})
+
+    assert drift.value.code in {
+        "runtime_context_pre_lineage_rejoin_identity_mismatch",
+        "runtime_context_pre_lineage_rejoin_route_identity_mismatch",
+        "runtime_context_pre_lineage_rejoin_contract_identity_mismatch",
+        "runtime_context_rejoin_route_token_ref_invalid",
+    }
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        drift.value,
+        before_context=before_context,
+        before_events=before_events,
+        before_revision=before_revision,
+    )
+
+
+@pytest.mark.parametrize(
+    ("context_updates", "expected_reason"),
+    [
+        (
+            {
+                "lease_id": "mfrlease-expired-pre-lineage",
+                "lease_expires_at": "2099-08-02T00:59:59Z",
+            },
+            "initial_join_lease_not_active",
+        ),
+        (
+            {"lease_id": "", "lease_expires_at": ""},
+            "initial_join_lease_not_active",
+        ),
+        (
+            {"status": "cancelled"},
+            "runtime_context_not_active",
+        ),
+        (
+            {"session_token_hash": ""},
+            "initial_join_auth_binding_missing",
+        ),
+    ],
+)
+def test_runtime_context_pre_lineage_rejoin_invalid_lease_or_state_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    context_updates,
+    expected_reason,
+):
+    suffix = expected_reason.replace("_", "-") + "-" + str(
+        len(str(context_updates))
+    )
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=suffix,
+    )
+    mutated = upsert_branch_context(
+        conn,
+        replace(case["context"], **context_updates),
+        now_iso="2099-08-02T01:00:00Z",
+    )
+    case["context"] = mutated
+    before_events = _pre_lineage_case_events(conn, case)
+
+    with pytest.raises(GovernanceError) as invalid:
+        _pre_lineage_rejoin(case)
+
+    assert invalid.value.code == (
+        "runtime_context_pre_lineage_rejoin_authority_invalid"
+    )
+    assert invalid.value.details["reason"] == expected_reason
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        invalid.value,
+        before_context=mutated,
+        before_events=before_events,
+    )
+
+
+@pytest.mark.parametrize("audit_shape", ["absent", "forged", "multiple"])
+def test_runtime_context_pre_lineage_rejoin_requires_exactly_one_canonical_initial_join_audit(
+    conn,
+    monkeypatch,
+    tmp_path,
+    audit_shape,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"audit-{audit_shape}",
+    )
+    initial_event = case["initial_join_event"]
+    if audit_shape in {"absent", "forged"}:
+        conn.execute(
+            "DELETE FROM task_timeline_events WHERE id = ?",
+            (initial_event["id"],),
+        )
+    if audit_shape in {"forged", "multiple"}:
+        forged_payload = copy.deepcopy(initial_event["payload"])
+        if audit_shape == "forged":
+            forged_payload["runtime_context_id"] = "mfrctx-forged-pre-lineage"
+            forged_payload["worker_session_id"] = "forged-desktop-session"
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            task_id=case["task_id"],
+            backlog_id=case["backlog_id"],
+            event_type="observer.runtime_context_session_token_initial_join",
+            event_kind="observer_command",
+            phase="runtime_context_initial_join",
+            status="accepted",
+            actor="observer-forged-pre-lineage-audit",
+            payload=forged_payload,
+        )
+    conn.commit()
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_events = _pre_lineage_case_events(conn, case)
+
+    with pytest.raises(GovernanceError) as audit_error:
+        _pre_lineage_rejoin(case)
+
+    assert audit_error.value.code == (
+        "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid"
+    )
+    assert audit_error.value.details["audit_cardinality"] == (
+        0 if audit_shape == "absent" else (2 if audit_shape == "multiple" else 1)
+    )
+    assert audit_error.value.details["audit_valid"] is False
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        audit_error.value,
+        before_context=before_context,
+        before_events=before_events,
+    )
+
+
+def test_runtime_context_pre_lineage_rejoin_guide_projects_same_call_parse_and_bounded_stop_contract(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="guide",
+    )
+
+    with pytest.raises(GovernanceError) as missing_auth:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": case["context"].runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": case["parent_task_id"],
+                    "session_token_ref": runtime_context_session_token_ref(
+                        case["context"]
+                    ),
+                    "target_project_root": str(case["target_root"]),
+                },
+            )
+        )
+
+    assert missing_auth.value.code == "fence_invalidated_or_unknown"
+    details = missing_auth.value.details
+    assert details["next_legal_action"] == (
+        "request_runtime_context_pre_lineage_rejoin_host_envelope"
+    )
+    submission = details["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]
+    assert submission["action"] == (
+        "request_runtime_context_pre_lineage_rejoin_host_envelope"
+    )
+    assert submission["recovery_mode"] == "pre_lineage_auth_only_once"
+    expected_body = _pre_lineage_rejoin_body(case)
+    projected_body = submission["copy_safe_body"]
+    expected_body.pop("reason")
+    for field, value in expected_body.items():
+        assert projected_body[field] == value, field
+    contract = submission["pre_lineage_recovery_contract"]
+    assert contract == {
+        "schema_version": "runtime_context.pre_lineage_recovery_contract.v1",
+        "authorization": "exactly_one_accepted_initial_join_audit",
+        "max_rejoin_rotations": 1,
+        "auth_only": True,
+        "evidence_synthesis_allowed": False,
+        "same_worker_and_desktop_session_required": True,
+        "mcp_calltoolresult_content_text_parse_in_same_call_required": True,
+        "raw_env_process_local_injection_only": True,
+        "raw_env_persistence_allowed": False,
+        "automatic_retry": False,
+        "replacement_loss_action": (
+            "stop_and_report_bounded_pre_lineage_recovery_exhausted"
+        ),
+    }
+    instructions = " ".join(submission["worker_instructions"])
+    assert "content[0].text" in instructions
+    assert "same functions.exec invocation" in instructions
+    assert "process-local" in instructions
+    assert "do not persist" in instructions
+    assert "do not retry" in instructions
+    assert "stop_and_report_bounded_pre_lineage_recovery_exhausted" in instructions
 
 
 def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_ref(
