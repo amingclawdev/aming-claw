@@ -35322,6 +35322,7 @@ def _runtime_context_actual_worker_commit_line(
                 }}
                 enriched_payload = {**dict(payload), **dict(continuation)}
                 return enriched_line, enriched_payload
+            continue
         if line_runtime_context_id != runtime_context_id or line_task_id != task_id:
             continue
         return dict(raw_line), dict(payload)
@@ -78275,14 +78276,6 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
         for value in active_chain.get("execution_ids") or []
         if str(value or "").strip()
     }
-    current_selectors = {
-        str(current_projection.get(field) or "").strip()
-        for field in (
-            "current_contract_execution_id",
-            "active_child_contract_execution_id",
-        )
-        if str(current_projection.get(field) or "").strip()
-    }
     projected_next_line = (
         current_projection.get("next_legal_action")
         if isinstance(current_projection.get("next_legal_action"), Mapping)
@@ -78299,8 +78292,17 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
         == project_id
         and str(current_projection.get("backlog_id") or "").strip()
         == backlog_id
-        and current_projection.get("terminal") is not True
-        and current_selectors == {execution_id}
+        and str(current_projection.get("readiness_state") or "").strip()
+        == "contract_active"
+        and str(
+            current_projection.get("current_contract_execution_id") or ""
+        ).strip()
+        == execution_id
+        and str(
+            current_projection.get("active_child_contract_execution_id")
+            or ""
+        ).strip()
+        == execution_id
         and execution_id in active_execution_ids
         and (
             (
