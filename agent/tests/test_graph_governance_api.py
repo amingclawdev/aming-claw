@@ -4514,6 +4514,126 @@ def test_worker_commit_bypass_v3_accepts_nonancestor_postdeploy_blob_equivalence
     )
 
 
+@pytest.mark.parametrize("bypass_actor_role", ["observer", "qa"])
+def test_worker_commit_bypass_v3_current_response_preserves_projected_writer_hash(
+    conn,
+    tmp_path,
+    bypass_actor_role,
+):
+    case = _ac8_worker_commit_graph_epoch_recovery_case(
+        conn,
+        tmp_path,
+        suffix=f"response-writer-hash-{bypass_actor_role}",
+    )
+    execution_id = case["execution_id"]
+    runtime = server._contract_runtime(conn)
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": execution_id,
+            },
+            bypass_actor_role,
+        )
+    )
+
+    assert current["ok"] is True
+    assert current["actor_role"] == bypass_actor_role
+    reader_guide = current["runtime_guide"]
+    reader_hash = str(reader_guide["runtime_guide_hash"])
+    assert reader_hash == current["runtime_guide_hash"]
+    assert reader_guide["same_lane_worker_commit_recovery_projection"] is True
+    copy_safe_body = copy.deepcopy(
+        reader_guide["line_bypass_guidance"]["create_new_copy_safe_body"]
+    )
+    writer_hash = str(copy_safe_body["runtime_guide_hash"])
+
+    stored = runtime.store.get(execution_id)
+    _recovery_record, projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=stored,
+            actor_role=bypass_actor_role,
+        )
+    )
+    projected_gate_record = runtime.projected_record(
+        execution_id,
+        actor_role=bypass_actor_role,
+        completed_lines=(
+            server._contract_runtime_projection_completed_lines(projection)
+        ),
+        projection=projection,
+    )
+    projected_gate_hash = str(
+        projected_gate_record["runtime_guide"]["runtime_guide_hash"]
+    )
+    assert reader_hash != writer_hash
+    assert writer_hash == projected_gate_hash
+
+    bypass_body = {
+        **copy_safe_body,
+        "classification": "system_logic",
+        "reason": (
+            "AC8 current graph-epoch recovery cannot satisfy the historical "
+            "worker_commit line normally"
+        ),
+        "decision": "continue_with_audited_exception",
+        "evidence_refs": [f"commit:{case['candidate_commit']}"],
+        "graph_trace_ids": [case["fresh_trace_id"]],
+    }
+    before_record_hash = server.stable_sha256(runtime.store.get(execution_id))
+    before_timeline_count = len(task_timeline.list_events(conn, PID, limit=1000))
+    stale_response = server.handle_project_contract_runtime_line_bypass(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": execution_id,
+            },
+            bypass_actor_role,
+            method="POST",
+            body={**bypass_body, "runtime_guide_hash": reader_hash},
+        )
+    )
+    assert stale_response["ok"] is False
+    assert any(
+        "runtime_guide_hash" in str(error).lower()
+        for error in stale_response["decision"]["errors"]
+    )
+    assert server.stable_sha256(runtime.store.get(execution_id)) == (
+        before_record_hash
+    )
+    assert len(task_timeline.list_events(conn, PID, limit=1000)) == (
+        before_timeline_count
+    )
+    assert conn.execute(
+        "SELECT 1 FROM backlog_bugs WHERE bug_id = ?",
+        (stale_response["diagnostic_backlog_id"],),
+    ).fetchone() is None
+
+    response = server.handle_project_contract_runtime_line_bypass(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": execution_id,
+            },
+            bypass_actor_role,
+            method="POST",
+            body=bypass_body,
+        )
+    )
+    assert response["ok"] is True, json.dumps(response, indent=2, sort_keys=True)
+    assert response["actor_role"] == bypass_actor_role
+    assert response["diagnostic_status"] == "OPEN"
+    written = response["written_line"]
+    assert written["status"] == "waived"
+    assert written["no_pass_claim"] is True
+    _assert_worker_commit_bypass_continuation_v3(
+        written["payload"]["continuation_authority"],
+        case,
+    )
+
+
 def _persist_ac8_worker_commit_graph_epoch_bypass_case(
     conn,
     tmp_path,
