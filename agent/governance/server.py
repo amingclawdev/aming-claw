@@ -79642,6 +79642,104 @@ def _contract_runtime_normal_worker_commit_epoch_bypass_authority(
         == commit_sha
     ):
         return {}
+
+    expected_changed_files = sorted(
+        set(recovery.get("changed_files") or [])
+    )
+    expected_owned_files = sorted(
+        set(recovery.get("owned_files") or [])
+    )
+    claimed_changed_files = sorted(
+        set(
+            _runtime_context_service_query_values(
+                request,
+                "changed_files",
+                "commit_diff_files",
+                "worker_changed_files",
+            )
+        )
+    )
+    claimed_owned_files = sorted(
+        set(
+            _runtime_context_service_query_values(
+                request,
+                "owned_files",
+            )
+        )
+    )
+    if (
+        claimed_changed_files
+        and claimed_changed_files != expected_changed_files
+    ) or (
+        claimed_owned_files
+        and claimed_owned_files != expected_owned_files
+    ):
+        return {}
+    expected_diff_base = str(
+        recovery.get("diff_base_commit") or ""
+    ).strip().lower()
+    claimed_bases = {
+        str(candidate.get(field) or "").strip().lower()
+        for candidate in _contract_runtime_mapping_candidates(request)
+        for field in ("base_commit", "diff_base_commit")
+        if str(candidate.get(field) or "").strip()
+    }
+    if claimed_bases and claimed_bases != {expected_diff_base}:
+        return {}
+    expected_parent = str(
+        recovery.get("commit_parent_sha") or ""
+    ).strip().lower()
+    claimed_parents = {
+        str(candidate.get("commit_parent_sha") or "").strip().lower()
+        for candidate in _contract_runtime_mapping_candidates(request)
+        if str(candidate.get("commit_parent_sha") or "").strip()
+    }
+    if claimed_parents and claimed_parents != {expected_parent}:
+        return {}
+
+    direct_commit_sources = [request, embedded]
+    if embedded_continuation:
+        direct_commit_sources.append(embedded_continuation)
+    claimed_commits = {
+        str(source.get(field) or "").strip().lower()
+        for source in direct_commit_sources
+        for field in ("commit_sha", "worker_commit_sha", "head_commit")
+        if str(source.get(field) or "").strip()
+    }
+    if claimed_commits and claimed_commits != {commit_sha}:
+        return {}
+    line_claims = {
+        field: {
+            str(candidate.get(field) or "").strip()
+            for candidate in _contract_runtime_mapping_candidates(request)
+            if str(candidate.get(field) or "").strip()
+        }
+        for field in ("stage_id", "line_id")
+    }
+    if any(
+        claims and claims != {"worker_commit"}
+        for claims in line_claims.values()
+    ):
+        return {}
+    execution_claims = {
+        str(candidate.get(field) or "").strip()
+        for candidate in _contract_runtime_mapping_candidates(request)
+        for field in (
+            "contract_execution_id",
+            "successor_contract_execution_id",
+        )
+        if str(candidate.get(field) or "").strip()
+    }
+    backlog_claims = {
+        str(candidate.get("backlog_id") or "").strip()
+        for candidate in _contract_runtime_mapping_candidates(request)
+        if str(candidate.get("backlog_id") or "").strip()
+    }
+    if (
+        execution_claims
+        and execution_claims != {execution_id}
+    ) or (backlog_claims and backlog_claims != {backlog_id}):
+        return {}
     if any(
         str(line.get("stage_id") or "").strip()
         == "worker_implementation"
