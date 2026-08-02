@@ -17659,6 +17659,48 @@ def test_runtime_context_implementation_evidence_rejects_invalid_test_results_be
     ]["partial_sibling_blocked_is_finish_compatible"] is False
 
 
+def test_runtime_context_implementation_evidence_rejects_non_mapping_top_level_test_results_before_db_even_when_nested_is_valid(
+    monkeypatch,
+):
+    def reject_db_access(_project_id):
+        raise AssertionError("non-mapping test_results must be rejected before DB access")
+
+    monkeypatch.setattr(server, "get_connection", reject_db_access)
+
+    with pytest.raises(GovernanceError) as invalid_results:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": "mfrctx-non-mapping-implementation-results",
+                },
+                method="POST",
+                body={
+                    "task_id": "worker-non-mapping-implementation-results",
+                    "test_results": ["not-a-mapping"],
+                    "payload": {
+                        "test_results": {
+                            "status": "passed",
+                            "passed": True,
+                            "commands": [
+                                {"command": "pytest -q", "status": "passed"}
+                            ],
+                        }
+                    },
+                },
+            )
+        )
+
+    assert invalid_results.value.code == (
+        "worker_implementation_test_results_not_finish_compatible"
+    )
+    assert invalid_results.value.details["received_type"] == "list"
+    assert invalid_results.value.details["zero_db_access"] is True
+    assert invalid_results.value.details["zero_contract_runtime_write"] is True
+    assert invalid_results.value.details["zero_timeline_write"] is True
+    assert invalid_results.value.details["same_input_retry_required"] is True
+
+
 def test_runtime_context_implementation_evidence_rejects_empty_or_fake_graph_trace_ids(
     conn,
     tmp_path,

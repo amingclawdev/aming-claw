@@ -43096,24 +43096,34 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     supplied_payload = (
         body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
     )
+    top_level_test_results_present = "test_results" in body
+    nested_test_results_present = "test_results" in supplied_payload
     supplied_test_results_present = bool(
-        "test_results" in body or "test_results" in supplied_payload
+        top_level_test_results_present or nested_test_results_present
     )
-    supplied_test_results = (
+    supplied_test_results_value = (
         body.get("test_results")
-        if isinstance(body.get("test_results"), Mapping)
+        if top_level_test_results_present
         else (
             supplied_payload.get("test_results")
-            if isinstance(supplied_payload.get("test_results"), Mapping)
+            if nested_test_results_present
             else {}
         )
+    )
+    supplied_test_results = (
+        dict(supplied_test_results_value)
+        if isinstance(supplied_test_results_value, Mapping)
+        else {}
     )
     projected_test_results = (
         _runtime_context_finish_attestation_project_test_results(
             supplied_test_results
         )
     )
-    if supplied_test_results_present and not projected_test_results:
+    if supplied_test_results_present and (
+        not isinstance(supplied_test_results_value, Mapping)
+        or not projected_test_results
+    ):
         raise GovernanceError(
             "worker_implementation_test_results_not_finish_compatible",
             (
@@ -43134,6 +43144,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
                 "received_status": str(
                     supplied_test_results.get("status") or ""
                 ).strip(),
+                "received_type": type(supplied_test_results_value).__name__,
                 "zero_db_access": True,
                 "zero_contract_runtime_write": True,
                 "zero_timeline_write": True,
@@ -43411,9 +43422,13 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     ):
         if event_route_identity.get(key):
             payload[key] = event_route_identity.get(key)
-    for key in ("changed_files", "tests", "test_results", "risk", "summary"):
+    for key in ("changed_files", "tests", "risk", "summary"):
         if key in body:
             payload[key] = body.get(key)
+    if supplied_test_results_present:
+        payload["test_results"] = public_contract_revision_payload(
+            supplied_test_results
+        )
     if "precommit_implementation_correction_intent" in body:
         payload["precommit_implementation_correction_intent"] = body.get(
             "precommit_implementation_correction_intent"
