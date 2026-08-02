@@ -35295,16 +35295,26 @@ def _runtime_context_actual_worker_commit_line(
         line_task_id = _timeline_first_deep_text(raw_line, "task_id")
         if str(raw_line.get("evidence_kind") or "").strip() == "contract_line_bypass":
             continuation = (
-                payload.get("continuation_authority")
-                if isinstance(payload.get("continuation_authority"), Mapping)
-                else _contract_runtime_worker_commit_bypass_continuation_authority(
+                _contract_runtime_worker_commit_bypass_continuation_authority(
                     conn,
                     project_id=str(record.get("project_id") or ""),
                     record=record,
                     request=raw_line,
                 )
             )
-            if continuation.get("server_derived") is True:
+            if (
+                continuation.get("server_derived") is True
+                and continuation.get("db_verified") is True
+                and continuation.get("no_pass_claim") is True
+                and continuation.get("authoritative_pass_synthesized")
+                is not True
+                and str(
+                    continuation.get("runtime_context_id") or ""
+                ).strip()
+                == runtime_context_id
+                and str(continuation.get("task_id") or "").strip()
+                == task_id
+            ):
                 enriched_line = {**dict(raw_line), **{
                     key: continuation[key]
                     for key in ("commit_sha", "runtime_context_id", "task_id", "parent_task_id")
@@ -78142,6 +78152,7 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
     project_id: str,
     record: Mapping[str, Any],
     completed: Sequence[Mapping[str, Any]],
+    persisted_worker_commit_line: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Join one audited implementation bypass to its current worker lane.
 
@@ -78153,9 +78164,31 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
 
     if conn is None:
         return {}
+    from .parallel_branch_runtime import (
+        ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
+        MERGE_READY_INPUT_STATES,
+    )
+
     execution_id = str(record.get("contract_execution_id") or "").strip()
     backlog_id = str(record.get("backlog_id") or "").strip()
     next_line = _contract_runtime_next_line(record)
+    persisted_line = (
+        persisted_worker_commit_line
+        if isinstance(persisted_worker_commit_line, Mapping)
+        else {}
+    )
+    persisted_payload = (
+        persisted_line.get("payload")
+        if isinstance(persisted_line.get("payload"), Mapping)
+        else {}
+    )
+    persisted_continuation = (
+        persisted_payload.get("continuation_authority")
+        if isinstance(
+            persisted_payload.get("continuation_authority"), Mapping
+        )
+        else {}
+    )
 
     def exact_claim(value: Mapping[str, Any], field: str) -> str:
         claims = {
@@ -78165,10 +78198,52 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
         }
         return next(iter(claims)) if len(claims) == 1 else ""
 
-    runtime_context_id = exact_claim(next_line, "runtime_context_id")
-    task_id = exact_claim(next_line, "task_id")
-    lane_id = exact_claim(next_line, "lane_id")
-    line_instance_id = exact_claim(next_line, "line_instance_id")
+    identity_source = persisted_line or next_line
+    runtime_context_id = exact_claim(identity_source, "runtime_context_id")
+    task_id = exact_claim(identity_source, "task_id")
+    lane_id = exact_claim(
+        persisted_continuation if persisted_line else next_line,
+        "lane_id",
+    )
+    line_instance_id = exact_claim(identity_source, "line_instance_id")
+    pre_write_line_valid = bool(
+        not persisted_line
+        and str(next_line.get("stage_id") or "").strip() == "worker_commit"
+        and str(next_line.get("line_id") or "").strip() == "worker_commit"
+        and str(next_line.get("evidence_kind") or "").strip()
+        == "worker_commit"
+        and str(next_line.get("owner_role") or "").strip() == "mf_sub"
+    )
+    persisted_line_valid = bool(
+        persisted_line
+        and str(persisted_line.get("stage_id") or "").strip()
+        == "worker_commit"
+        and str(persisted_line.get("line_id") or "").strip()
+        == "worker_commit"
+        and str(persisted_line.get("evidence_kind") or "").strip()
+        == "contract_line_bypass"
+        and str(persisted_line.get("actor_role") or "").strip()
+        in {"observer", "qa"}
+        and str(persisted_line.get("status") or "").strip().lower()
+        == "waived"
+        and persisted_line.get("no_pass_claim") is True
+        and str(persisted_payload.get("schema_version") or "").strip()
+        == "contract_line_bypass.v1"
+        and persisted_payload.get("no_pass_claim") is True
+        and str(
+            persisted_payload.get("blocked_evidence_kind") or ""
+        ).strip()
+        == "worker_commit"
+        and str(persisted_payload.get("blocked_owner_role") or "").strip()
+        == "mf_sub"
+        and str(persisted_continuation.get("schema_version") or "").strip()
+        == "contract_runtime.worker_commit_bypass_continuation.v2"
+        and persisted_continuation.get("no_pass_claim") is True
+        and persisted_continuation.get("authoritative_pass_synthesized")
+        is False
+        and persisted_continuation.get("implementation_pass_claimed")
+        is False
+    )
     if not (
         execution_id
         and backlog_id
@@ -78176,11 +78251,7 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
         and str(record.get("contract_id") or "").strip()
         == MF_PARALLEL_CONTRACT_ID
         and not _runtime_record_is_complete(record)
-        and str(next_line.get("stage_id") or "").strip() == "worker_commit"
-        and str(next_line.get("line_id") or "").strip() == "worker_commit"
-        and str(next_line.get("evidence_kind") or "").strip()
-        == "worker_commit"
-        and str(next_line.get("owner_role") or "").strip() == "mf_sub"
+        and (pre_write_line_valid or persisted_line_valid)
         and runtime_context_id
         and task_id
         and lane_id
@@ -78231,10 +78302,19 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
         and current_projection.get("terminal") is not True
         and current_selectors == {execution_id}
         and execution_id in active_execution_ids
-        and str(projected_next_line.get("line_id") or "").strip()
-        == "worker_commit"
-        and str(projected_next_line.get("stage_id") or "").strip()
-        == "worker_commit"
+        and (
+            (
+                str(projected_next_line.get("line_id") or "").strip()
+                == "worker_commit"
+                and str(
+                    projected_next_line.get("stage_id") or ""
+                ).strip()
+                == "worker_commit"
+            )
+            if not persisted_line
+            else str(projected_next_line.get("line_id") or "").strip()
+            != "worker_commit"
+        )
     ):
         return {}
 
@@ -78282,41 +78362,194 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
         matching_bypasses.append((index, line, payload))
     if len(matching_bypasses) != 1:
         return {}
-    bypass_index, bypass_line, bypass = matching_bypasses[0]
-    bypass_actor_role = str(
-        bypass_line.get("actor_role") or ""
-    ).strip()
-
-    diagnostic_id = str(
-        bypass.get("diagnostic_backlog_id") or ""
-    ).strip()
-    bypass_identity = str(bypass.get("bypass_identity") or "").strip()
-    classification = str(bypass.get("classification") or "").strip()
-    source_backlog_id = str(
-        bypass.get("source_backlog_id") or ""
-    ).strip()
-    try:
-        bypass_revision = int(
-            bypass.get("execution_state_revision") or 0
+    bypass_index, bypass_line, _ = matching_bypasses[0]
+    implementation_bypass_audit = (
+        _contract_runtime_strict_no_pass_bypass_audit(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=bypass_line,
+            expected_line_id="worker_implementation",
+            expected_blocked_evidence_kind="implementation",
+            expected_event_task_ids={execution_id},
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            line_instance_id=line_instance_id,
         )
+    )
+    if not implementation_bypass_audit:
+        return {}
+
+    matching_contexts: list[Any] = []
+    matching_dispatch_indexes: list[int] = []
+    for dispatch_index, dispatch in enumerate(completed[:bypass_index]):
+        if str(dispatch.get("line_id") or "").strip() != (
+            "observer_dispatch_bounded_workers"
+        ):
+            continue
+        dispatch_matched = False
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=dispatch,
+        ):
+            context_identity = _contract_runtime_context_identity(context)
+            if context_identity[:2] != (runtime_context_id, task_id):
+                continue
+            matching_contexts.append(context)
+            dispatch_matched = True
+        if dispatch_matched:
+            matching_dispatch_indexes.append(dispatch_index)
+    if len(matching_contexts) != 1 or len(matching_dispatch_indexes) != 1:
+        return {}
+    context = matching_contexts[0]
+    context_parent_task_id = _contract_runtime_context_identity(context)[2]
+    context_lane_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    allowed_context_states = set(ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES)
+    if persisted_line:
+        allowed_context_states.update(MERGE_READY_INPUT_STATES)
+    if not (
+        context_lane_id == lane_id
+        and str(getattr(context, "status", "") or "").strip()
+        in allowed_context_states
+        and str(getattr(context, "backlog_id", "") or backlog_id).strip()
+        == backlog_id
+        and str(getattr(context, "fence_token", "") or "").strip()
+    ):
+        return {}
+    expected_optional_claims = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": context_parent_task_id,
+        "lane_id": lane_id,
+    }
+    for field, expected in expected_optional_claims.items():
+        claims = {
+            str(candidate.get(field) or "").strip()
+            for candidate in _contract_runtime_mapping_candidates(bypass_line)
+            if str(candidate.get(field) or "").strip()
+        }
+        if claims and claims != {expected}:
+            return {}
+    return {
+        "schema_version": (
+            "contract_runtime.worker_implementation_bypass_continuation_anchor.v1"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+        "contract_execution_id": execution_id,
+        "backlog_id": backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": context_parent_task_id,
+        "lane_id": lane_id,
+        "line_instance_id": line_instance_id,
+        "implementation_bypass_diagnostic_id": (
+            implementation_bypass_audit["diagnostic_backlog_id"]
+        ),
+        "implementation_bypass_source_event_ref": (
+            implementation_bypass_audit["source_event_ref"]
+        ),
+        "implementation_bypass_diagnostic_event_ref": (
+            implementation_bypass_audit["diagnostic_event_ref"]
+        ),
+        "context": context,
+    }
+
+
+def _contract_runtime_strict_no_pass_bypass_audit(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    line: Mapping[str, Any],
+    expected_line_id: str,
+    expected_blocked_evidence_kind: str,
+    expected_event_task_ids: set[str],
+    runtime_context_id: str,
+    task_id: str,
+    line_instance_id: str,
+) -> dict[str, Any]:
+    """Revalidate one exact no-PASS line, OPEN diagnostic, and audit pair."""
+
+    if conn is None:
+        return {}
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    payload = (
+        line.get("payload")
+        if isinstance(line.get("payload"), Mapping)
+        else {}
+    )
+    diagnostic_id = str(payload.get("diagnostic_backlog_id") or "").strip()
+    bypass_identity = str(payload.get("bypass_identity") or "").strip()
+    classification = str(payload.get("classification") or "").strip()
+    actor_role = str(line.get("actor_role") or "").strip()
+    line_instance_claims = {
+        str(candidate.get("line_instance_id") or "").strip()
+        for candidate in _contract_runtime_mapping_candidates(line)
+        if str(candidate.get("line_instance_id") or "").strip()
+    }
+    execution_claims = {
+        str(candidate.get(key) or "").strip()
+        for candidate in _contract_runtime_mapping_candidates(line)
+        for key in ("contract_execution_id", "successor_contract_execution_id")
+        if str(candidate.get(key) or "").strip()
+    }
+    try:
+        bypass_revision = int(payload.get("execution_state_revision") or 0)
     except (TypeError, ValueError):
         return {}
     if not (
-        diagnostic_id
+        execution_id
+        and backlog_id
+        and diagnostic_id
         and bypass_identity
         and classification
         and bypass_revision > 0
-        and source_backlog_id == backlog_id
-        and str(bypass.get("disposition") or "").strip()
+        and line_instance_claims == {line_instance_id}
+        and (not execution_claims or execution_claims == {execution_id})
+        and actor_role in {"observer", "qa"}
+        and str(line.get("stage_id") or "").strip() == expected_line_id
+        and str(line.get("line_id") or "").strip() == expected_line_id
+        and str(line.get("evidence_kind") or "").strip()
+        == "contract_line_bypass"
+        and str(line.get("status") or "").strip().lower() == "waived"
+        and line.get("no_pass_claim") is True
+        and str(payload.get("schema_version") or "").strip()
+        == "contract_line_bypass.v1"
+        and str(payload.get("source_backlog_id") or "").strip()
+        == backlog_id
+        and str(payload.get("blocked_owner_role") or "").strip()
+        == "mf_sub"
+        and str(payload.get("blocked_evidence_kind") or "").strip()
+        == expected_blocked_evidence_kind
+        and str(payload.get("disposition") or "").strip()
         == "proceeded_with_exception"
+        and payload.get("no_pass_claim") is True
     ):
         return {}
+    diagnostic_binding = {
+        "source_backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "line_id": expected_line_id,
+        "execution_state_revision": bypass_revision,
+        "bypass_identity": bypass_identity,
+        "classification": classification,
+        "disposition": "proceeded_with_exception",
+        "no_pass_claim": True,
+    }
     try:
         diagnostic = conn.execute(
-            """
-            SELECT status, mf_type, chain_trigger_json, bypass_policy_json
-            FROM backlog_bugs WHERE bug_id = ?
-            """,
+            "SELECT status, mf_type, chain_trigger_json, bypass_policy_json "
+            "FROM backlog_bugs WHERE bug_id = ?",
             (diagnostic_id,),
         ).fetchone()
     except sqlite3.Error:
@@ -78329,21 +78562,17 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
     policy = backlog_runtime.parse_json_object(
         diagnostic["bypass_policy_json"]
     )
-    diagnostic_binding = {
-        "source_backlog_id": backlog_id,
-        "contract_execution_id": execution_id,
-        "line_id": "worker_implementation",
-        "execution_state_revision": bypass_revision,
-        "bypass_identity": bypass_identity,
-        "classification": classification,
-        "disposition": "proceeded_with_exception",
-        "no_pass_claim": True,
-    }
     if not (
         str(diagnostic["status"] or "").strip().upper() == "OPEN"
         and str(diagnostic["mf_type"] or "").strip() == "chain_rescue"
-        and all(chain.get(key) == value for key, value in diagnostic_binding.items())
-        and all(policy.get(key) == value for key, value in diagnostic_binding.items())
+        and all(
+            chain.get(key) == value
+            for key, value in diagnostic_binding.items()
+        )
+        and all(
+            policy.get(key) == value
+            for key, value in diagnostic_binding.items()
+        )
         and policy.get("keep_open") is True
     ):
         return {}
@@ -78378,8 +78607,8 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
     if len(source_events) != 1 or len(diagnostic_events) != 1:
         return {}
 
-    def audited_event_binding(event: Mapping[str, Any]) -> tuple[Any, ...]:
-        payload = (
+    def event_binding(event: Mapping[str, Any]) -> tuple[Any, ...]:
+        event_payload = (
             event.get("payload")
             if isinstance(event.get("payload"), Mapping)
             else {}
@@ -78387,34 +78616,39 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
         return (
             str(event.get("event_kind") or "").strip(),
             str(event.get("actor") or "").strip(),
-            str(event.get("task_id") or "").strip(),
             str(event.get("status") or "").strip(),
             str(event.get("decision") or "").strip(),
-            str(payload.get("source_backlog_id") or "").strip(),
-            str(payload.get("contract_execution_id") or "").strip(),
-            str(payload.get("line_id") or "").strip(),
-            str(payload.get("diagnostic_backlog_id") or "").strip(),
-            str(payload.get("bypass_identity") or "").strip(),
-            str(payload.get("classification") or "").strip(),
-            str(payload.get("disposition") or "").strip(),
-            payload.get("no_pass_claim"),
+            str(event_payload.get("source_backlog_id") or "").strip(),
+            str(
+                event_payload.get("contract_execution_id") or ""
+            ).strip(),
+            str(event_payload.get("line_id") or "").strip(),
+            str(
+                event_payload.get("diagnostic_backlog_id") or ""
+            ).strip(),
+            str(event_payload.get("bypass_identity") or "").strip(),
+            str(event_payload.get("classification") or "").strip(),
+            str(event_payload.get("disposition") or "").strip(),
+            event_payload.get("no_pass_claim"),
         )
 
-    expected_event_binding = (
+    expected_source = (
         "record_blocker",
-        bypass_actor_role,
-        execution_id,
+        actor_role,
         "proceeded_with_exception",
         "linked_open_diagnostic_no_pass",
         backlog_id,
         execution_id,
-        "worker_implementation",
+        expected_line_id,
         diagnostic_id,
         bypass_identity,
         classification,
         "proceeded_with_exception",
         True,
     )
+    expected_diagnostic = list(expected_source)
+    expected_diagnostic[2] = "open"
+    expected_diagnostic[3] = "keep_open_until_block_repaired"
     source_event = source_events[0]
     diagnostic_event = diagnostic_events[0]
     source_event_id = _contract_runtime_projection_timeline_event_id(
@@ -78423,110 +78657,52 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
     diagnostic_event_id = _contract_runtime_projection_timeline_event_id(
         diagnostic_event
     )
-    diagnostic_event_binding = list(expected_event_binding)
-    diagnostic_event_binding[3] = "open"
-    diagnostic_event_binding[4] = "keep_open_until_block_repaired"
+    event_task_ids = {
+        str(source_event.get("task_id") or "").strip(),
+        str(diagnostic_event.get("task_id") or "").strip(),
+    }
     if not (
-        audited_event_binding(source_event) == expected_event_binding
-        and audited_event_binding(diagnostic_event)
-        == tuple(diagnostic_event_binding)
+        event_binding(source_event) == expected_source
+        and event_binding(diagnostic_event) == tuple(expected_diagnostic)
+        and len(event_task_ids) == 1
+        and event_task_ids.issubset(expected_event_task_ids)
         and 0 < source_event_id < diagnostic_event_id
     ):
         return {}
-
-    matching_contexts: list[Any] = []
-    matching_dispatch_indexes: list[int] = []
-    for dispatch_index, dispatch in enumerate(completed[:bypass_index]):
-        if str(dispatch.get("line_id") or "").strip() != (
-            "observer_dispatch_bounded_workers"
-        ):
-            continue
-        dispatch_matched = False
-        for context in _contract_runtime_contexts_for_dispatch_line(
-            conn,
-            project_id=project_id,
-            record=record,
-            line=dispatch,
-        ):
-            context_identity = _contract_runtime_context_identity(context)
-            if context_identity[:2] != (runtime_context_id, task_id):
-                continue
-            matching_contexts.append(context)
-            dispatch_matched = True
-        if dispatch_matched:
-            matching_dispatch_indexes.append(dispatch_index)
-    if len(matching_contexts) != 1 or len(matching_dispatch_indexes) != 1:
-        return {}
-    context = matching_contexts[0]
-    context_parent_task_id = _contract_runtime_context_identity(context)[2]
-    context_lane_id = str(
-        getattr(context, "worker_slot_id", "")
-        or getattr(context, "worker_id", "")
-        or ""
-    ).strip()
-    if not (
-        context_lane_id == lane_id
-        and str(getattr(context, "status", "") or "").strip()
-        in {"allocated", "worktree_ready", "running"}
-        and str(getattr(context, "backlog_id", "") or backlog_id).strip()
-        == backlog_id
-        and str(getattr(context, "fence_token", "") or "").strip()
-    ):
-        return {}
-    expected_optional_claims = {
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": context_parent_task_id,
-        "lane_id": lane_id,
-    }
-    for field, expected in expected_optional_claims.items():
-        claims = {
-            str(candidate.get(field) or "").strip()
-            for candidate in _contract_runtime_mapping_candidates(bypass_line)
-            if str(candidate.get(field) or "").strip()
-        }
-        if claims and claims != {expected}:
-            return {}
     for event in (source_event, diagnostic_event):
+        event_payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
         for field, expected in {
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "line_instance_id": line_instance_id,
         }.items():
-            payload_claims = {
+            claims = {
                 str(candidate.get(field) or "").strip()
                 for candidate in _contract_runtime_mapping_candidates(
-                    event.get("payload")
-                    if isinstance(event.get("payload"), Mapping)
-                    else {}
+                    event_payload
                 )
                 if str(candidate.get(field) or "").strip()
             }
-            if payload_claims and payload_claims != {expected}:
+            if claims and claims != {expected}:
                 return {}
     return {
         "schema_version": (
-            "contract_runtime.worker_implementation_bypass_continuation_anchor.v1"
+            "contract_runtime.strict_no_pass_bypass_audit.v1"
         ),
         "server_derived": True,
         "db_verified": True,
         "no_pass_claim": True,
         "authoritative_pass_synthesized": False,
-        "contract_execution_id": execution_id,
-        "backlog_id": backlog_id,
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": context_parent_task_id,
-        "lane_id": lane_id,
-        "line_instance_id": line_instance_id,
-        "implementation_bypass_diagnostic_id": diagnostic_id,
-        "implementation_bypass_source_event_ref": _runtime_context_event_ref(
-            source_event
+        "line_id": expected_line_id,
+        "diagnostic_backlog_id": diagnostic_id,
+        "source_event_ref": _runtime_context_event_ref(source_event),
+        "diagnostic_event_ref": _runtime_context_event_ref(
+            diagnostic_event
         ),
-        "implementation_bypass_diagnostic_event_ref": (
-            _runtime_context_event_ref(diagnostic_event)
-        ),
-        "context": context,
     }
 
 
@@ -78574,9 +78750,11 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
         line for line in record.get("completed_lines") or [] if isinstance(line, Mapping)
     ]
     stop = len(completed)
+    persisted_request = False
     for index, line in enumerate(completed):
-        if line is request or line == request:
+        if line is request:
             stop = index
+            persisted_request = True
             break
     requested_runtime_context_id = _timeline_first_deep_text(
         request, "runtime_context_id"
@@ -78608,6 +78786,9 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
                 project_id=project_id,
                 record=record,
                 completed=completed[:stop],
+                persisted_worker_commit_line=(
+                    request if persisted_request else None
+                ),
             )
         )
         if not bypass_anchor:
@@ -78638,6 +78819,27 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
                 if str(candidate.get(field) or "").strip()
             }
             if claimed and claimed != {expected}:
+                return {}
+        persisted_bypass_audit: dict[str, Any] = {}
+        if persisted_request:
+            persisted_bypass_audit = (
+                _contract_runtime_strict_no_pass_bypass_audit(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    line=request,
+                    expected_line_id="worker_commit",
+                    expected_blocked_evidence_kind="worker_commit",
+                    expected_event_task_ids={
+                        str(record.get("contract_execution_id") or "").strip(),
+                        task_id,
+                    },
+                    runtime_context_id=runtime_context_id,
+                    task_id=task_id,
+                    line_instance_id=canonical_claims["line_instance_id"],
+                )
+            )
+            if not persisted_bypass_audit:
                 return {}
 
         worktree_path = str(
@@ -78720,7 +78922,7 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
             for key, value in bypass_anchor.items()
             if key != "context"
         }
-        return {
+        continuation = {
             "schema_version": (
                 "contract_runtime.worker_commit_bypass_continuation.v2"
             ),
@@ -78754,6 +78956,22 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
             "canonical_historical_commit_sha": "",
             "implementation_bypass_anchor": public_anchor,
         }
+        if persisted_request:
+            embedded_continuation = (
+                payload.get("continuation_authority")
+                if isinstance(
+                    payload.get("continuation_authority"), Mapping
+                )
+                else {}
+            )
+            if not embedded_continuation or stable_sha256(
+                embedded_continuation
+            ) != stable_sha256(continuation):
+                return {}
+            continuation["persisted_worker_commit_bypass_audit"] = (
+                persisted_bypass_audit
+            )
+        return continuation
     runtime_context_id = _timeline_first_deep_text(
         implementation, "runtime_context_id"
     )
@@ -78897,7 +79115,13 @@ def _contract_runtime_server_candidate_commit(
                 record=record,
                 request=line,
             )
-            if continuation.get("server_derived") is True:
+            if (
+                continuation.get("server_derived") is True
+                and continuation.get("db_verified") is True
+                and continuation.get("no_pass_claim") is True
+                and continuation.get("authoritative_pass_synthesized")
+                is not True
+            ):
                 return str(continuation.get("commit_sha") or "").strip().lower()
             continue
         value = str(line.get(candidate_path) or "").strip().lower()
@@ -78950,7 +79174,13 @@ def _contract_runtime_server_candidate_base_commit(
                 record=record,
                 request=line,
             )
-            if payload.get("server_derived") is not True:
+            if not (
+                payload.get("server_derived") is True
+                and payload.get("db_verified") is True
+                and payload.get("no_pass_claim") is True
+                and payload.get("authoritative_pass_synthesized")
+                is not True
+            ):
                 continue
         if (
             _timeline_first_deep_text(line, "runtime_context_id")
