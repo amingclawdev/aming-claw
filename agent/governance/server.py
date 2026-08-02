@@ -78971,6 +78971,7 @@ def _contract_runtime_canonical_owned_file_provenance(
     canonical_commit_sha: str,
     active_snapshot_id: str,
     owned_files: Sequence[str],
+    repository_root: str,
     persisted: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Prove that a deployed canonical commit carried the exact owned blobs.
@@ -78999,14 +79000,10 @@ def _contract_runtime_canonical_owned_file_provenance(
         and normalized_owned_files
     ):
         return {}
-    canonical_root = project_service.resolve_project_root(
-        project_id,
-        None,
-        fallback_self=True,
-    )
-    if canonical_root is None:
+    repository_root = str(repository_root or "").strip()
+    if not repository_root:
         return {}
-    root = Path(canonical_root).resolve()
+    root = Path(repository_root).resolve()
     if (
         _qa_post_merge_resolve_commit(root, candidate_commit)
         != candidate_commit
@@ -79161,6 +79158,7 @@ def _contract_runtime_worker_commit_graph_epoch_transition_authority(
     context: Any,
     old_graph_trace_ids: Sequence[str],
     fresh_graph_trace_ids: Sequence[str],
+    old_epoch_commit_candidates: Sequence[str] = (),
     persisted: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Verify an old implementation trace and one fresh active-epoch trace."""
@@ -79301,6 +79299,11 @@ def _contract_runtime_worker_commit_graph_epoch_transition_authority(
         for field in ("target_head_commit", "base_commit")
         if str(getattr(context, field, "") or "").strip()
     }
+    expected_old_commits.update(
+        str(item or "").strip().lower()
+        for item in old_epoch_commit_candidates
+        if str(item or "").strip()
+    )
     for trace_id in old_ids:
         row = rows_by_id[trace_id]
         snapshot_id = str(row["snapshot_id"] or "").strip()
@@ -79393,6 +79396,8 @@ def _contract_runtime_normal_worker_commit_epoch_bypass_authority(
         request if persisted_request else next_line,
         "lane_id",
     )
+    if runtime_context_id and not line_instance_id:
+        line_instance_id = f"runtime_context:{runtime_context_id}"
     if persisted_request:
         for field, fallback in (
             ("parent_task_id", parent_task_id),
@@ -79447,9 +79452,7 @@ def _contract_runtime_normal_worker_commit_epoch_bypass_authority(
             (
                 runtime_context_id,
                 task_id,
-                parent_task_id,
                 line_instance_id,
-                lane_id,
             )
         )
         and line_instance_id == f"runtime_context:{runtime_context_id}"
@@ -79586,12 +79589,33 @@ def _contract_runtime_normal_worker_commit_epoch_bypass_authority(
         or getattr(context, "worker_id", "")
         or ""
     ).strip()
+    if parent_task_id and context_parent_id != parent_task_id:
+        return {}
+    if lane_id and context_lane_id != lane_id:
+        return {}
+    parent_task_id = context_parent_id
+    lane_id = context_lane_id
     if (
         (context_runtime_id, context_task_id, context_parent_id)
         != (runtime_context_id, task_id, parent_task_id)
         or context_lane_id != lane_id
     ):
         return {}
+    canonical_claims = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "lane_id": lane_id,
+        "line_instance_id": line_instance_id,
+    }
+    for field, expected in canonical_claims.items():
+        claims = {
+            str(candidate.get(field) or "").strip()
+            for candidate in _contract_runtime_mapping_candidates(request)
+            if str(candidate.get(field) or "").strip()
+        }
+        if claims and claims != {expected}:
+            return {}
     historical_record = {
         **dict(stored_record),
         "completed_lines": list(authority_completed[:authority_stop]),
@@ -79689,6 +79713,7 @@ def _contract_runtime_normal_worker_commit_epoch_bypass_authority(
             context=context,
             old_graph_trace_ids=implementation_trace_ids,
             fresh_graph_trace_ids=fresh_trace_ids,
+            old_epoch_commit_candidates=[earlier_commit_sha],
             persisted=persisted_epoch,
         )
     )
@@ -79714,6 +79739,9 @@ def _contract_runtime_normal_worker_commit_epoch_bypass_authority(
             graph_epoch.get("active_snapshot_id") or ""
         ).strip(),
         owned_files=list(recovery.get("owned_files") or []),
+        repository_root=str(
+            getattr(context, "worktree_path", "") or ""
+        ).strip(),
         persisted=persisted_canonical,
     )
     if not canonical_provenance:
