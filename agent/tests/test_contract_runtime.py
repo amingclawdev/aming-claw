@@ -745,6 +745,7 @@ def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation()
                     "task_id": rework_task_id,
                     "parent_task_id": contract_execution_id,
                     "merge_queue_id": "mq-rev9-single-worker-fix",
+                    "queue_item_id": "mqi-rev9-single-worker-fix",
                     "contract_runtime_dispatch_source_ref": (
                         f"contract_runtime:{contract_execution_id}:"
                         "completed_lines:2"
@@ -764,6 +765,16 @@ def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation()
     assert merge["all_lane_merges_verified"] is True
     assert merge["required_worker_count"] == 1
     assert merge["runtime_context_id"] == rework_runtime_context_id
+
+    qa_authority = server._contract_runtime_rev8_postmerge_qa_authority(
+        None,
+        project_id="aming-claw",
+        record=record,
+    )
+    assert qa_authority["verified"] is False
+    assert qa_authority["blocker_codes"] == [
+        "observer_reconcile_line_not_unique"
+    ]
 
 
 def _accepted_no_pass_line(*, reported_baseline_failed: int) -> dict:

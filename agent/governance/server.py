@@ -81807,10 +81807,12 @@ def _contract_runtime_rev8_postmerge_qa_authority(
             "blocker_codes": [code for code in codes if code],
         }
 
-    required_worker_count = _contract_runtime_mf_parallel_required_worker_count(
-        record,
-        conn=conn,
-        project_id=project_id,
+    required_worker_count = (
+        _contract_runtime_mf_parallel_current_generation_worker_count(
+            record,
+            conn=conn,
+            project_id=project_id,
+        )
     )
     merge = _contract_runtime_rev8_two_worker_merge_projection(
         record,
