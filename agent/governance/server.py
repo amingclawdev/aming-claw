@@ -79350,6 +79350,124 @@ def _contract_runtime_worker_commit_graph_epoch_transition_authority(
     return proof
 
 
+def _contract_runtime_raw_current_chain_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    """Read and hash-check the durable current-chain row without projection.
+
+    Persisted worker-commit bypass evidence is itself consulted while the
+    runtime-freshness overlay derives a candidate commit.  Re-entering that
+    overlay from the bypass validator would recurse.  This reader deliberately
+    performs one raw SELECT and reconstructs the exact persisted hash payload;
+    it never rebuilds or refreshes the projection.
+    """
+
+    columns = (
+        "project_id",
+        "backlog_id",
+        "contract_chain_id",
+        "root_contract_execution_id",
+        "current_contract_execution_id",
+        "current_contract_id",
+        "parent_to_resume_contract_execution_id",
+        "active_child_contract_execution_id",
+        "readiness_state",
+        "generation",
+        "projection_watermark",
+        "projection_hash",
+        "active_chain_json",
+        "next_legal_action_json",
+        "degraded_flags_json",
+        "source_refs_json",
+        "updated_at",
+    )
+    try:
+        row = conn.execute(
+            "SELECT " + ", ".join(columns) + " "
+            "FROM backlog_contract_chain_current "
+            "WHERE project_id = ? AND backlog_id = ?",
+            (project_id, backlog_id),
+        ).fetchone()
+    except sqlite3.Error:
+        return {}
+    if row is None:
+        return {}
+    if isinstance(row, sqlite3.Row):
+        data = dict(row)
+    else:
+        try:
+            data = dict(zip(columns, row, strict=True))
+        except (TypeError, ValueError):
+            return {}
+
+    def json_field(name: str, expected_type: type) -> Any:
+        try:
+            value = json.loads(str(data.get(name) or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, expected_type) else None
+
+    active_chain = json_field("active_chain_json", dict)
+    next_legal_action = json_field("next_legal_action_json", dict)
+    degraded_flags = json_field("degraded_flags_json", dict)
+    source_refs = json_field("source_refs_json", list)
+    if any(
+        value is None
+        for value in (
+            active_chain,
+            next_legal_action,
+            degraded_flags,
+            source_refs,
+        )
+    ):
+        return {}
+    projection = {
+        "schema_version": "backlog_contract_chain_current.v1",
+        "project_id": str(data.get("project_id") or ""),
+        "backlog_id": str(data.get("backlog_id") or ""),
+        "contract_chain_id": str(data.get("contract_chain_id") or ""),
+        "root_contract_execution_id": str(
+            data.get("root_contract_execution_id") or ""
+        ),
+        "current_contract_execution_id": str(
+            data.get("current_contract_execution_id") or ""
+        ),
+        "current_contract_id": str(data.get("current_contract_id") or ""),
+        "parent_to_resume_contract_execution_id": str(
+            data.get("parent_to_resume_contract_execution_id") or ""
+        ),
+        "active_child_contract_execution_id": str(
+            data.get("active_child_contract_execution_id") or ""
+        ),
+        "readiness_state": str(data.get("readiness_state") or ""),
+        "generation": int(data.get("generation") or 0),
+        "projection_watermark": int(
+            data.get("projection_watermark") or 0
+        ),
+        "projection_hash": str(data.get("projection_hash") or ""),
+        "active_chain": active_chain,
+        "next_legal_action": next_legal_action,
+        "degraded_flags": degraded_flags,
+        "source_refs": source_refs,
+        "source_of_proof": "contract_runtime_executions.completed_lines",
+        "updated_at": str(data.get("updated_at") or ""),
+    }
+    if not (
+        projection["project_id"] == project_id
+        and projection["backlog_id"] == backlog_id
+        and projection["projection_hash"]
+        and projection["projection_hash"]
+        == contract_chain_projection_hash(projection)
+    ):
+        return {}
+    projection["degraded"] = bool(degraded_flags)
+    projection["projection_source"] = "backlog_contract_chain_current"
+    return projection
+
+
 def _contract_runtime_normal_worker_commit_epoch_bypass_authority(
     conn,
     *,
@@ -79753,11 +79871,19 @@ def _contract_runtime_normal_worker_commit_epoch_bypass_authority(
     ):
         return {}
 
-    current_projection = _contract_chain_current_projection(
-        conn,
-        project_id=project_id,
-        backlog_id=backlog_id,
-        rebuild_if_missing=False,
+    current_projection = (
+        _contract_runtime_raw_current_chain_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+        if persisted_request
+        else _contract_chain_current_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            rebuild_if_missing=False,
+        )
     )
     active_chain = (
         current_projection.get("active_chain")
