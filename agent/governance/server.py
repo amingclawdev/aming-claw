@@ -78305,11 +78305,19 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
     ):
         return {}
 
-    current_projection = _contract_chain_current_projection(
-        conn,
-        project_id=project_id,
-        backlog_id=backlog_id,
-        rebuild_if_missing=False,
+    current_projection = (
+        _contract_runtime_raw_current_chain_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+        if persisted_line
+        else _contract_chain_current_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            rebuild_if_missing=False,
+        )
     )
     active_chain = (
         current_projection.get("active_chain")

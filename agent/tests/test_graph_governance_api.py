@@ -3643,6 +3643,108 @@ def test_persisted_worker_commit_bypass_remains_revalidated_no_pass_candidate_au
     )
 
 
+def test_persisted_worker_commit_bypass_qa_candidate_current_read_avoids_full_projection(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    case = _persisted_worker_commit_bypass_case(
+        conn,
+        tmp_path,
+        suffix="qa-candidate-current-read",
+    )
+    durable_current = server.rebuild_backlog_contract_chain_projection(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+    )
+    assert durable_current["next_legal_action"]["line_id"] != "worker_commit"
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        task_id=case["task_id"],
+        event_type="qa.independent_verification",
+        event_kind="independent_verification",
+        phase="verification",
+        actor="qa:qa-candidate-current-read",
+        status="passed",
+        commit_sha=case["candidate_commit"],
+        payload={
+            "contract_execution_id": case["execution_id"],
+            "runtime_context_id": case["runtime_context_id"],
+            "task_id": case["task_id"],
+            "parent_task_id": case["execution_id"],
+            "candidate_commit_sha": case["candidate_commit"],
+            "graph_trace_ids": ["gqt-qa-candidate-current-read"],
+            "verdict": "PASS",
+        },
+    )
+    conn.commit()
+
+    runtime = server._contract_runtime(conn)
+    before = runtime.store.get(case["execution_id"])
+    before_hash = server.stable_sha256(before)
+    raw_authority = server._contract_runtime_raw_current_chain_authority
+    raw_authority_calls = 0
+
+    def tracked_raw_authority(*args, **kwargs):
+        nonlocal raw_authority_calls
+        raw_authority_calls += 1
+        return raw_authority(*args, **kwargs)
+
+    def forbidden_full_projection(*_args, **_kwargs):
+        raise AssertionError(
+            "persisted bypass revalidation must not re-enter runtime freshness"
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_raw_current_chain_authority",
+        tracked_raw_authority,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_chain_current_projection",
+        forbidden_full_projection,
+    )
+
+    candidate_commit = server._contract_runtime_server_candidate_commit(
+        conn,
+        project_id=PID,
+        record=before,
+    )
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": case["execution_id"],
+            },
+            "observer",
+        )
+    )
+
+    assert candidate_commit == case["candidate_commit"]
+    assert current["ok"] is True
+    assert current["contract_execution_id"] == case["execution_id"]
+    assert raw_authority_calls >= 2
+    after = runtime.store.get(case["execution_id"])
+    assert server.stable_sha256(after) == before_hash
+    persisted_worker_commit = next(
+        line
+        for line in reversed(after["completed_lines"])
+        if line.get("line_id") == "worker_commit"
+    )
+    assert persisted_worker_commit["evidence_kind"] == "contract_line_bypass"
+    assert persisted_worker_commit["status"] == "waived"
+    assert persisted_worker_commit["no_pass_claim"] is True
+    assert not any(
+        line.get("line_id") == "worker_commit"
+        and line.get("evidence_kind") == "worker_commit"
+        for line in after["completed_lines"]
+    )
+
+
 def test_persisted_worker_commit_bypass_survives_canonical_finish_validation_only(
     conn,
     tmp_path,
