@@ -70372,10 +70372,22 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         }
 
     if required_worker_count == 1:
-        dispatch_payload = dispatch_payloads[0]
+        dispatch_payload = dict(dispatch_payloads[0])
+        bounded_workers = [dict(dispatch_payload)]
+        single_worker_payload = {
+            **dispatch_payload,
+            "bounded_workers": bounded_workers,
+            "worker_count": required_worker_count,
+            "required_worker_count": required_worker_count,
+            "atomic_dispatch": False,
+        }
         copy_payload.update(dispatch_payload)
-        copy_payload["payload"] = dict(dispatch_payload)
-        next_action.update(dispatch_payload)
+        copy_payload["bounded_workers"] = bounded_workers
+        copy_payload["worker_count"] = required_worker_count
+        copy_payload["required_worker_count"] = required_worker_count
+        copy_payload["atomic_dispatch"] = False
+        copy_payload["payload"] = single_worker_payload
+        next_action.update(single_worker_payload)
     else:
         atomic_payload = {
             "schema_version": "mf_parallel.atomic_two_worker_dispatch.v1",

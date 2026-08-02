@@ -102948,6 +102948,23 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     assert len(
         child_record["metadata"]["observer_worker_cardinality_revisions"]
     ) == 2
+    child_prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": child_execution_id,
+            },
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+            },
+        )
+    )
+    assert child_prefill["ok"] is True
+    child_record = server._contract_runtime(conn).store.get(child_execution_id)
 
     child_worker_context = _insert_mf_parallel_source_backed_runtime_context(
         conn,
@@ -102967,23 +102984,134 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
         route_task_id=child_execution_id,
         parent_task_id=child_execution_id,
     )
-    bound_dispatch, dispatch_errors = (
-        server._contract_runtime_bind_mf_parallel_dispatch_authority(
-            conn,
-            project_id=PID,
-            record=child_record,
-            write={
-                "stage_id": "dispatch",
-                "line_id": "observer_dispatch_bounded_workers",
-                "evidence_kind": "dispatch_bounded_worker",
-                "payload": {"bounded_workers": [child_worker]},
-            },
+    append_branch_contract_revision(
+        conn,
+        child_worker_context,
+        revision_id="crev-mf-batch-cardinality-copy-safe",
+        contract_version=server.MF_PARALLEL_CONTRACT_ID,
+        payload={
+            **child_worker,
+            "contract_execution_id": child_execution_id,
+            "observer_command_id": child_execution_id,
+            "acceptance_criteria": [
+                {
+                    "id": "AC-BATCH-A",
+                    "required_scope": {
+                        "kind": "files",
+                        "files": ["agent/governance/server.py"],
+                    },
+                }
+            ],
+        },
+        route_identity=child_worker["route_identity"],
+        route_gate={
+            "decision": "prepared",
+            **child_worker["route_identity"],
+        },
+        actor="parallel_branch_allocate",
+        now_iso="2026-08-02T12:55:00Z",
+    )
+    conn.commit()
+    projected_dispatch_record = server._contract_runtime_read(
+        conn,
+        contract_execution_id=child_execution_id,
+        actor_role="observer",
+    )
+    assert projected_dispatch_record["runtime_guide"]["next_legal_action"][
+        "line_id"
+    ] == "observer_dispatch_bounded_workers"
+    assert projected_dispatch_record["runtime_guide"]["next_legal_action"][
+        "stage_id"
+    ] == "dispatch"
+    assert projected_dispatch_record["runtime_guide"]["next_legal_action"][
+        "evidence_kind"
+    ] == "dispatch_bounded_worker"
+    assert projected_dispatch_record["runtime_guide"][
+        "dispatch_copy_safe_projection"
+    ]["status"] == "ready"
+    copy_safe_dispatch_body = projected_dispatch_record["runtime_guide"][
+        "next_legal_action"
+    ]["writer_role_safe_copy_payload"]["copy_payload"]
+    assert copy_safe_dispatch_body["payload"]["bounded_workers"] == [
+        copy_safe_dispatch_body["bounded_workers"][0]
+    ]
+    assert copy_safe_dispatch_body["payload"]["bounded_workers"][0][
+        "runtime_context_id"
+    ] == child_worker_context.runtime_context_id
+    forged_copy_safe_body = copy.deepcopy(copy_safe_dispatch_body)
+    forged_copy_safe_body["payload"]["bounded_workers"][0][
+        "branch_ref"
+    ] = "refs/heads/codex/forged-copy-safe-worker"
+    forged_precheck = (
+        server.handle_project_contract_runtime_line_write_precheck(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": child_execution_id,
+                },
+                "observer",
+                method="POST",
+                body=forged_copy_safe_body,
+            )
         )
     )
-    assert dispatch_errors == []
+    assert forged_precheck["ok"] is False
+    assert any(
+        "branch_ref" in error
+        for error in forged_precheck["decision"]["errors"]
+    )
+    accepted_dispatch = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": child_execution_id,
+            },
+            "observer",
+            method="POST",
+            body=copy_safe_dispatch_body,
+        )
+    )
+    assert accepted_dispatch["ok"] is True
+    accepted_child_record = server._contract_runtime(conn).store.get(
+        child_execution_id
+    )
+    bound_dispatch = accepted_child_record["completed_lines"][-1]
     assert bound_dispatch["payload"]["required_worker_count"] == 1
     assert bound_dispatch["payload"]["atomic_dispatch"] is not True
     assert len(bound_dispatch["payload"]["bounded_workers"]) == 1
+    canonical_worker = bound_dispatch["payload"]["bounded_workers"][0]
+    merge_projection_record = _rev8_postmerge_qa_binding_record()
+    merge_projection_record["completed_lines"][0]["payload"] = dict(
+        bound_dispatch["payload"]
+    )
+    merge_line = merge_projection_record["completed_lines"][1]
+    merge_line["line_instance_id"] = (
+        f"runtime_context:{canonical_worker['runtime_context_id']}"
+    )
+    merge_authority = merge_line["payload"]["durable_merge_authority"]
+    merge_authority.update(
+        {
+            "runtime_context_id": canonical_worker["runtime_context_id"],
+            "task_id": canonical_worker["task_id"],
+            "parent_task_id": canonical_worker["parent_task_id"],
+            "merge_queue_id": canonical_worker["merge_queue_id"],
+        }
+    )
+    merge_projection_record["completed_lines"] = [
+        merge_projection_record["completed_lines"][0],
+        merge_line,
+    ]
+    merge_projection = (
+        server._contract_runtime_rev8_two_worker_merge_projection(
+            merge_projection_record,
+            required_worker_count=1,
+        )
+    )
+    assert merge_projection["all_lane_merges_verified"] is True
+    assert merge_projection["lane_runtime_context_ids"] == [
+        child_worker_context.runtime_context_id
+    ]
+    assert merge_projection["required_worker_count"] == 1
 
     with pytest.raises(
         GovernanceError,
