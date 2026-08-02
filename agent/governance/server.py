@@ -78709,6 +78709,1083 @@ def _contract_runtime_strict_no_pass_bypass_audit(
     }
 
 
+def _contract_runtime_pinned_current_full_provenance(
+    conn,
+    *,
+    project_id: str,
+    snapshot_id: str,
+    commit_sha: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    persisted: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Pin one protected current-full activation for later readback."""
+
+    snapshot_id = str(snapshot_id or "").strip()
+    commit_sha = str(commit_sha or "").strip().lower()
+    backlog_id = str(backlog_id or "").strip()
+    contract_execution_id = str(contract_execution_id or "").strip()
+    if not (
+        conn is not None
+        and snapshot_id
+        and backlog_id
+        and contract_execution_id
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha)
+    ):
+        return {}
+    from . import graph_snapshot_store
+
+    persisted_value = persisted if isinstance(persisted, Mapping) else {}
+    persisted_source = str(persisted_value.get("source") or "").strip()
+    if persisted_value and persisted_source == "protected_current_full_reconcile":
+        provenance_id = str(
+            persisted_value.get("provenance_id") or ""
+        ).strip()
+        provenance_hash = str(
+            persisted_value.get("provenance_hash") or ""
+        ).strip()
+        try:
+            rows = conn.execute(
+                "SELECT provenance_id, snapshot_id, target_commit_sha, "
+                "provenance_hash, reconcile_event_id, marker_json "
+                "FROM graph_current_full_reconcile_provenance "
+                "WHERE provenance_id = ? AND project_id = ? "
+                "AND snapshot_id = ? AND target_commit_sha = ?",
+                (
+                    provenance_id,
+                    project_id,
+                    snapshot_id,
+                    commit_sha,
+                ),
+            ).fetchall()
+        except sqlite3.Error:
+            return {}
+        if len(rows) != 1:
+            return {}
+        row = rows[0]
+        try:
+            marker = json.loads(str(row["marker_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        marker_core = dict(marker) if isinstance(marker, Mapping) else {}
+        marker_hash = str(
+            marker_core.pop("provenance_hash", "") or ""
+        ).strip()
+        if not (
+            provenance_id
+            and provenance_hash
+            and provenance_hash
+            == str(row["provenance_hash"] or "").strip()
+            == marker_hash
+            == stable_sha256(marker_core)
+            and str(marker.get("schema_version") or "").strip()
+            == "current_full_reconcile.provenance.v2"
+            and marker.get("normal_update_path") is True
+            and marker.get("activate") is True
+            and str(marker.get("protected_action") or "").strip()
+            == "graph_current_full_reconcile"
+            and str(marker.get("snapshot_id") or "").strip()
+            == snapshot_id
+            and str(marker.get("target_commit_sha") or "").strip().lower()
+            == commit_sha
+            and int(marker.get("reconcile_event_id") or 0)
+            == int(row["reconcile_event_id"] or 0)
+        ):
+            return {}
+        proof = {
+            "schema_version": (
+                "contract_runtime.pinned_current_full_provenance.v1"
+            ),
+            "verified": True,
+            "server_derived": True,
+            "source": "protected_current_full_reconcile",
+            "snapshot_id": snapshot_id,
+            "commit_sha": commit_sha,
+            "provenance_id": provenance_id,
+            "provenance_hash": provenance_hash,
+            "reconcile_event_id": int(row["reconcile_event_id"] or 0),
+        }
+        return (
+            proof
+            if stable_sha256(persisted_value) == stable_sha256(proof)
+            else {}
+        )
+
+    snapshot = (
+        graph_snapshot_store.get_graph_snapshot(
+            conn,
+            project_id,
+            snapshot_id,
+        )
+        or {}
+    )
+    if not (
+        str(snapshot.get("snapshot_id") or "").strip() == snapshot_id
+        and str(snapshot.get("commit_sha") or "").strip().lower()
+        == commit_sha
+        and str(snapshot.get("snapshot_kind") or "").strip() == "full"
+        and (
+            bool(persisted_value)
+            or str(snapshot.get("status") or "").strip() == "active"
+        )
+    ):
+        return {}
+    binding = graph_snapshot_store._current_full_snapshot_provenance_binding(
+        conn,
+        project_id,
+        snapshot,
+    )
+    if not (
+        binding.get("verified") is True
+        and str(binding.get("snapshot_id") or "").strip() == snapshot_id
+        and str(binding.get("snapshot_commit") or "").strip().lower()
+        == commit_sha
+        and str(binding.get("provenance_target_commit") or "")
+        .strip()
+        .lower()
+        == commit_sha
+    ):
+        try:
+            notes = json.loads(str(snapshot.get("notes") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            notes = {}
+        anchor = (
+            notes.get("full_reconcile_anchor")
+            if isinstance(notes.get("full_reconcile_anchor"), Mapping)
+            else {}
+        )
+        try:
+            qa_event_id = int(notes.get("candidate_qa_event_id") or 0)
+        except (TypeError, ValueError):
+            qa_event_id = 0
+        try:
+            qa_rows = conn.execute(
+                "SELECT id, backlog_id, task_id, event_type, event_kind, "
+                "phase, actor, status, commit_sha FROM task_timeline_events "
+                "WHERE id = ? AND project_id = ?",
+                (qa_event_id, project_id),
+            ).fetchall()
+        except sqlite3.Error:
+            qa_rows = []
+        qa_row = qa_rows[0] if len(qa_rows) == 1 else None
+        operator_marker = {
+            "backlog_id": str(notes.get("backlog_id") or "").strip(),
+            "contract_execution_id": str(
+                notes.get("contract_execution_id") or ""
+            ).strip(),
+            "candidate_qa_event_id": qa_event_id,
+            "protected_route_failure_request_id": str(
+                notes.get("protected_route_failure_request_id") or ""
+            ).strip(),
+            "recovery_scope": str(notes.get("recovery_scope") or "").strip(),
+            "full_reconcile_anchor": dict(anchor),
+            "no_pass_claim": notes.get("no_pass_claim"),
+            "contract_reconcile_pass_synthesized": notes.get(
+                "contract_reconcile_pass_synthesized"
+            ),
+        }
+        operator_proof = {
+            "schema_version": (
+                "contract_runtime.pinned_current_full_provenance.v1"
+            ),
+            "verified": True,
+            "server_derived": True,
+            "source": "audited_operator_current_full_recovery",
+            "snapshot_id": snapshot_id,
+            "commit_sha": commit_sha,
+            "provenance_id": f"operator-current-full:{snapshot_id}",
+            "provenance_hash": stable_sha256(operator_marker),
+            "reconcile_event_id": 0,
+            "candidate_qa_event_id": qa_event_id,
+            "protected_route_failure_request_id": operator_marker[
+                "protected_route_failure_request_id"
+            ],
+        }
+        if not (
+            operator_marker["backlog_id"] == backlog_id
+            and operator_marker["contract_execution_id"]
+            == contract_execution_id
+            and operator_marker["no_pass_claim"] is True
+            and operator_marker["contract_reconcile_pass_synthesized"]
+            is False
+            and operator_marker["recovery_scope"]
+            == "operator_exact_main_after_audited_two_lane_bypass_merge"
+            and operator_marker["protected_route_failure_request_id"].startswith(
+                "req-"
+            )
+            and str(anchor.get("project_id") or "").strip() == project_id
+            and str(anchor.get("snapshot_id") or "").strip() == snapshot_id
+            and str(anchor.get("anchor_commit") or "").strip().lower()
+            == commit_sha
+            and str(anchor.get("reconcile_mode") or "").strip() == "full"
+            and qa_row is not None
+            and str(qa_row["backlog_id"] or "").strip() == backlog_id
+            and str(qa_row["task_id"] or "").strip()
+            == contract_execution_id
+            and str(qa_row["event_type"] or "").strip()
+            == "qa.independent_verification"
+            and str(qa_row["event_kind"] or "").strip()
+            == "independent_verification"
+            and str(qa_row["phase"] or "").strip() == "verification"
+            and str(qa_row["actor"] or "").strip().startswith("qa:")
+            and str(qa_row["status"] or "").strip().lower() == "passed"
+            and str(qa_row["commit_sha"] or "").strip().lower()
+            == commit_sha
+        ):
+            return {}
+        if persisted_value and stable_sha256(persisted_value) != stable_sha256(
+            operator_proof
+        ):
+            return {}
+        return operator_proof
+    proof = {
+        "schema_version": (
+            "contract_runtime.pinned_current_full_provenance.v1"
+        ),
+        "verified": True,
+        "server_derived": True,
+        "source": "protected_current_full_reconcile",
+        "snapshot_id": snapshot_id,
+        "commit_sha": commit_sha,
+        "provenance_id": str(binding.get("provenance_id") or "").strip(),
+        "provenance_hash": str(
+            binding.get("provenance_hash") or ""
+        ).strip(),
+        "reconcile_event_id": int(
+            binding.get("reconcile_event_id") or 0
+        ),
+    }
+    if persisted_value and stable_sha256(persisted_value) != stable_sha256(
+        proof
+    ):
+        return {}
+    return proof
+
+
+def _contract_runtime_canonical_owned_file_provenance(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    candidate_commit_sha: str,
+    canonical_commit_sha: str,
+    active_snapshot_id: str,
+    owned_files: Sequence[str],
+    persisted: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Prove that a deployed canonical commit carried the exact owned blobs.
+
+    A later governance repair may legitimately change the same runtime file.
+    In that case an accepted post-deploy QA event may pin the earlier combined
+    candidate that carried the worker's exact blob, but only while that pinned
+    commit remains an ancestor of the supplied canonical commit.
+    """
+
+    candidate_commit = str(candidate_commit_sha or "").strip().lower()
+    canonical_commit = str(canonical_commit_sha or "").strip().lower()
+    active_snapshot_id = str(active_snapshot_id or "").strip()
+    normalized_owned_files = sorted(
+        {
+            str(item or "").strip().replace("\\", "/")
+            for item in owned_files
+            if str(item or "").strip()
+        }
+    )
+    if not (
+        conn is not None
+        and active_snapshot_id
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_commit)
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", canonical_commit)
+        and normalized_owned_files
+    ):
+        return {}
+    canonical_root = project_service.resolve_project_root(
+        project_id,
+        None,
+        fallback_self=True,
+    )
+    if canonical_root is None:
+        return {}
+    root = Path(canonical_root).resolve()
+    if (
+        _qa_post_merge_resolve_commit(root, candidate_commit)
+        != candidate_commit
+        or _qa_post_merge_resolve_commit(root, canonical_commit)
+        != canonical_commit
+    ):
+        return {}
+
+    def blob_oids(commit_sha: str) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for path in normalized_owned_files:
+            oid = _git_output(
+                root,
+                ["rev-parse", "--verify", f"{commit_sha}:{path}"],
+                timeout=10,
+            ).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+                return {}
+            values[path] = oid
+        return values
+
+    candidate_blobs = blob_oids(candidate_commit)
+    if not candidate_blobs:
+        return {}
+    persisted_value = persisted if isinstance(persisted, Mapping) else {}
+    persisted_current_full = (
+        persisted_value.get("current_full_provenance")
+        if isinstance(
+            persisted_value.get("current_full_provenance"),
+            Mapping,
+        )
+        else None
+    )
+    current_full_provenance = (
+        _contract_runtime_pinned_current_full_provenance(
+            conn,
+            project_id=project_id,
+            snapshot_id=active_snapshot_id,
+            commit_sha=canonical_commit,
+            backlog_id=str(record.get("backlog_id") or "").strip(),
+            contract_execution_id=str(
+                record.get("contract_execution_id") or ""
+            ).strip(),
+            persisted=persisted_current_full,
+        )
+    )
+    if not current_full_provenance:
+        return {}
+    canonical_blobs = blob_oids(canonical_commit)
+    provenance_commit = canonical_commit
+    provenance_event_ref = ""
+    source = "canonical_commit_owned_blob_match"
+    if canonical_blobs != candidate_blobs:
+        pinned_provenance_commit = str(
+            persisted_value.get("provenance_commit_sha") or ""
+        ).strip().lower()
+        pinned_event_ref = str(
+            persisted_value.get("provenance_event_ref") or ""
+        ).strip()
+        backlog_id = str(record.get("backlog_id") or "").strip()
+        execution_id = str(
+            record.get("contract_execution_id") or ""
+        ).strip()
+        candidates: list[tuple[int, str, str]] = []
+        for event in _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id="",
+            backlog_id=backlog_id,
+        ):
+            if not isinstance(event, Mapping):
+                continue
+            event_id = _contract_runtime_projection_timeline_event_id(event)
+            event_ref = f"timeline:{event_id}" if event_id > 0 else ""
+            event_type = str(event.get("event_type") or "").strip().lower()
+            event_status = str(
+                event.get("status") or event.get("decision") or ""
+            ).strip().lower()
+            event_task_id = str(event.get("task_id") or "").strip()
+            event_commit = str(event.get("commit_sha") or "").strip().lower()
+            if not (
+                event_ref
+                and event_type == "qa.postdeploy_independent_verification"
+                and event_status
+                in {
+                    "accepted",
+                    "ok",
+                    "pass",
+                    "passed",
+                    "succeeded",
+                    "success",
+                }
+                and _contract_runtime_projection_timeline_actor_role(event)
+                == "qa"
+                and event_task_id == execution_id
+                and re.fullmatch(
+                    r"[0-9a-f]{40}|[0-9a-f]{64}",
+                    event_commit,
+                )
+                and _runtime_context_service_graph_trace_values_from_event(
+                    event
+                )
+                and _git_commit_is_ancestor(
+                    root,
+                    event_commit,
+                    canonical_commit,
+                )
+                and blob_oids(event_commit) == candidate_blobs
+            ):
+                continue
+            if pinned_provenance_commit and (
+                event_commit != pinned_provenance_commit
+                or event_ref != pinned_event_ref
+            ):
+                continue
+            candidates.append((event_id, event_commit, event_ref))
+        if len(candidates) != 1:
+            return {}
+        _event_id, provenance_commit, provenance_event_ref = candidates[0]
+        source = "postdeploy_qa_owned_blob_carrier+git_ancestry"
+
+    proof = {
+        "schema_version": (
+            "contract_runtime.canonical_owned_file_provenance.v1"
+        ),
+        "verified": True,
+        "server_derived": True,
+        "source": source,
+        "candidate_commit_sha": candidate_commit,
+        "canonical_commit_sha": canonical_commit,
+        "owned_files": normalized_owned_files,
+        "blob_oids": candidate_blobs,
+        "provenance_commit_sha": provenance_commit,
+        "provenance_event_ref": provenance_event_ref,
+        "current_canonical_commit_contains_candidate_blobs": (
+            canonical_blobs == candidate_blobs
+        ),
+        "canonical_history_contains_trusted_candidate_blobs": True,
+        "current_full_provenance": current_full_provenance,
+    }
+    if isinstance(persisted, Mapping) and stable_sha256(persisted) != stable_sha256(
+        proof
+    ):
+        return {}
+    return proof
+
+
+def _contract_runtime_worker_commit_graph_epoch_transition_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    old_graph_trace_ids: Sequence[str],
+    fresh_graph_trace_ids: Sequence[str],
+    persisted: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Verify an old implementation trace and one fresh active-epoch trace."""
+
+    if conn is None:
+        return {}
+    old_ids = sorted(
+        {
+            str(item or "").strip()
+            for item in old_graph_trace_ids
+            if str(item or "").strip()
+        }
+    )
+    fresh_ids = sorted(
+        {
+            str(item or "").strip()
+            for item in fresh_graph_trace_ids
+            if str(item or "").strip()
+        }
+    )
+    if not old_ids or len(fresh_ids) != 1 or set(old_ids) & set(fresh_ids):
+        return {}
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    fence_token = str(getattr(context, "fence_token", "") or "").strip()
+    if not all((runtime_context_id, task_id, parent_task_id, fence_token)):
+        return {}
+
+    persisted_value = persisted if isinstance(persisted, Mapping) else {}
+    pinned_snapshot_id = str(
+        persisted_value.get("active_snapshot_id") or ""
+    ).strip()
+    pinned_commit = str(
+        persisted_value.get("active_graph_commit") or ""
+    ).strip().lower()
+    try:
+        if pinned_snapshot_id and pinned_commit:
+            snapshot = conn.execute(
+                "SELECT snapshot_id, commit_sha FROM graph_snapshots "
+                "WHERE project_id = ? AND snapshot_id = ?",
+                (project_id, pinned_snapshot_id),
+            ).fetchone()
+            if not snapshot:
+                return {}
+            active_snapshot_id = str(snapshot["snapshot_id"] or "").strip()
+            active_commit = str(snapshot["commit_sha"] or "").strip().lower()
+        else:
+            active = conn.execute(
+                "SELECT r.snapshot_id, s.commit_sha "
+                "FROM graph_snapshot_refs r "
+                "JOIN graph_snapshots s ON s.project_id = r.project_id "
+                " AND s.snapshot_id = r.snapshot_id "
+                "WHERE r.project_id = ? AND r.ref_name = 'active'",
+                (project_id,),
+            ).fetchone()
+            if not active:
+                return {}
+            active_snapshot_id = str(active["snapshot_id"] or "").strip()
+            active_commit = str(active["commit_sha"] or "").strip().lower()
+        trace_ids = [*old_ids, *fresh_ids]
+        placeholders = ",".join("?" for _ in trace_ids)
+        rows = conn.execute(
+            f"""
+            SELECT t.trace_id, t.snapshot_id, t.query_source,
+                   t.query_purpose, t.parent_task_id, t.task_id,
+                   t.runtime_context_id, t.worker_role, t.fence_token,
+                   t.status, t.route_id, t.route_context_hash,
+                   t.prompt_contract_id, t.prompt_contract_hash,
+                   t.visible_injection_manifest_hash, t.route_token_ref,
+                   s.commit_sha AS snapshot_commit_sha
+            FROM graph_query_traces t
+            LEFT JOIN graph_snapshots s
+              ON s.project_id = t.project_id
+             AND s.snapshot_id = t.snapshot_id
+            WHERE t.project_id = ? AND t.trace_id IN ({placeholders})
+            """,
+            (project_id, *trace_ids),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    if (
+        not active_snapshot_id
+        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", active_commit)
+        or len(rows) != len(trace_ids)
+    ):
+        return {}
+    rows_by_id = {
+        str(row["trace_id"] or "").strip(): row for row in rows
+    }
+    if set(rows_by_id) != set(trace_ids):
+        return {}
+
+    identity_fields = (
+        "query_source",
+        "query_purpose",
+        "parent_task_id",
+        "task_id",
+        "runtime_context_id",
+        "worker_role",
+        "fence_token",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "route_token_ref",
+    )
+    canonical_identity = {
+        "query_source": "mf_subagent",
+        "parent_task_id": parent_task_id,
+        "task_id": task_id,
+        "runtime_context_id": runtime_context_id,
+        "worker_role": "mf_sub",
+        "fence_token": fence_token,
+    }
+    identity_anchor = rows_by_id[old_ids[0]]
+    for trace_id in trace_ids:
+        row = rows_by_id[trace_id]
+        if str(row["status"] or "").strip().lower() != "complete":
+            return {}
+        if str(row["query_purpose"] or "").strip() not in {
+            "subagent_context_build",
+            "subagent_gate_validation",
+        }:
+            return {}
+        for field, expected in canonical_identity.items():
+            if str(row[field] or "").strip() != expected:
+                return {}
+        for field in identity_fields:
+            if str(row[field] or "").strip() != str(
+                identity_anchor[field] or ""
+            ).strip():
+                return {}
+
+    expected_old_commits = {
+        str(getattr(context, field, "") or "").strip().lower()
+        for field in ("target_head_commit", "base_commit")
+        if str(getattr(context, field, "") or "").strip()
+    }
+    for trace_id in old_ids:
+        row = rows_by_id[trace_id]
+        snapshot_id = str(row["snapshot_id"] or "").strip()
+        snapshot_commit = str(
+            row["snapshot_commit_sha"] or ""
+        ).strip().lower()
+        if (
+            not snapshot_id
+            or snapshot_commit not in expected_old_commits
+            or (
+                snapshot_id == active_snapshot_id
+                and snapshot_commit == active_commit
+            )
+        ):
+            return {}
+    fresh_row = rows_by_id[fresh_ids[0]]
+    if not (
+        str(fresh_row["snapshot_id"] or "").strip()
+        == active_snapshot_id
+        and str(fresh_row["snapshot_commit_sha"] or "").strip().lower()
+        == active_commit
+    ):
+        return {}
+    proof = {
+        "schema_version": (
+            "contract_runtime.worker_commit_graph_epoch_transition.v1"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "old_graph_trace_ids": old_ids,
+        "fresh_graph_trace_ids": fresh_ids,
+        "old_graph_trace_current": False,
+        "fresh_graph_trace_current_at_authorization": True,
+        "active_snapshot_id": active_snapshot_id,
+        "active_graph_commit": active_commit,
+    }
+    if isinstance(persisted, Mapping) and stable_sha256(persisted) != stable_sha256(
+        proof
+    ):
+        return {}
+    return proof
+
+
+def _contract_runtime_normal_worker_commit_epoch_bypass_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    request: Mapping[str, Any],
+    completed: Sequence[Mapping[str, Any]],
+    stop: int,
+    commit_sha: str,
+    persisted_request: bool,
+) -> dict[str, Any]:
+    """Authorize only the AC8 normal-lineage graph-epoch deadlock bypass."""
+
+    if conn is None:
+        return {}
+    next_line = _contract_runtime_next_line(record)
+    embedded = (
+        request.get("payload")
+        if isinstance(request.get("payload"), Mapping)
+        else {}
+    )
+    embedded_continuation = (
+        embedded.get("continuation_authority")
+        if isinstance(embedded.get("continuation_authority"), Mapping)
+        else {}
+    )
+    runtime_context_id = _timeline_first_deep_text(
+        request if persisted_request else next_line,
+        "runtime_context_id",
+    )
+    task_id = _timeline_first_deep_text(
+        request if persisted_request else next_line,
+        "task_id",
+    )
+    parent_task_id = _timeline_first_deep_text(
+        request if persisted_request else next_line,
+        "parent_task_id",
+    )
+    line_instance_id = _timeline_first_deep_text(
+        request if persisted_request else next_line,
+        "line_instance_id",
+    )
+    lane_id = _timeline_first_deep_text(
+        request if persisted_request else next_line,
+        "lane_id",
+    )
+    if persisted_request:
+        for field, fallback in (
+            ("parent_task_id", parent_task_id),
+            ("lane_id", lane_id),
+        ):
+            if not fallback:
+                value = str(embedded_continuation.get(field) or "").strip()
+                if field == "parent_task_id":
+                    parent_task_id = value
+                else:
+                    lane_id = value
+    pre_write_line_valid = bool(
+        not persisted_request
+        and str(next_line.get("source") or "").strip()
+        == "contract_runtime_same_lane_worker_commit_recovery"
+        and str(next_line.get("action") or "").strip()
+        == "record_worker_commit"
+        and str(next_line.get("recovery_status") or "").strip()
+        == "eligible"
+        and next_line.get("same_lane_worker_commit_recovery_projection")
+        is True
+        and str(next_line.get("stage_id") or "").strip()
+        == "worker_commit"
+        and str(next_line.get("line_id") or "").strip()
+        == "worker_commit"
+        and str(next_line.get("evidence_kind") or "").strip()
+        == "worker_commit"
+        and str(next_line.get("owner_role") or "").strip() == "mf_sub"
+    )
+    persisted_line_valid = bool(
+        persisted_request
+        and str(request.get("stage_id") or "").strip() == "worker_commit"
+        and str(request.get("line_id") or "").strip() == "worker_commit"
+        and str(request.get("evidence_kind") or "").strip()
+        == "contract_line_bypass"
+        and str(request.get("status") or "").strip().lower() == "waived"
+        and request.get("no_pass_claim") is True
+        and str(embedded_continuation.get("schema_version") or "").strip()
+        == "contract_runtime.worker_commit_bypass_continuation.v3"
+    )
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    if not (
+        execution_id
+        and backlog_id
+        and str(record.get("project_id") or "").strip() == project_id
+        and str(record.get("contract_id") or "").strip()
+        == MF_PARALLEL_CONTRACT_ID
+        and not _runtime_record_is_complete(record)
+        and (pre_write_line_valid or persisted_line_valid)
+        and all(
+            (
+                runtime_context_id,
+                task_id,
+                parent_task_id,
+                line_instance_id,
+                lane_id,
+            )
+        )
+        and line_instance_id == f"runtime_context:{runtime_context_id}"
+    ):
+        return {}
+
+    try:
+        stored_record = _contract_runtime_store(conn).get(execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return {}
+    authority_completed = [
+        line
+        for line in stored_record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+    authority_stop = len(authority_completed)
+    if persisted_request:
+        persisted_matches = [
+            index
+            for index, line in enumerate(authority_completed)
+            if str(line.get("stage_id") or "").strip() == "worker_commit"
+            and str(line.get("line_id") or "").strip() == "worker_commit"
+            and str(line.get("evidence_kind") or "").strip()
+            == "contract_line_bypass"
+            and _timeline_first_deep_text(line, "runtime_context_id")
+            == runtime_context_id
+            and _timeline_first_deep_text(line, "task_id") == task_id
+            and stable_sha256(line) == stable_sha256(request)
+        ]
+        if len(persisted_matches) != 1:
+            return {}
+        authority_stop = persisted_matches[0]
+
+    implementation_matches: list[tuple[int, Mapping[str, Any]]] = []
+    worker_commit_matches: list[tuple[int, Mapping[str, Any]]] = []
+    for index, line in enumerate(authority_completed[:authority_stop]):
+        if not isinstance(line, Mapping) or not (
+            _runtime_context_contract_line_matches_worker(
+                line,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+            )
+        ):
+            continue
+        line_id = str(line.get("line_id") or "").strip()
+        evidence_kind = str(line.get("evidence_kind") or "").strip()
+        if line_id == "worker_implementation" and evidence_kind == "implementation":
+            implementation_matches.append((index, line))
+        elif line_id == "worker_commit" and evidence_kind == "worker_commit":
+            worker_commit_matches.append((index, line))
+    if len(implementation_matches) != 1 or len(worker_commit_matches) != 1:
+        return {}
+    implementation_index, implementation = implementation_matches[0]
+    worker_commit_index, earlier_worker_commit = worker_commit_matches[0]
+    if not implementation_index < worker_commit_index < authority_stop:
+        return {}
+    implementation_lineage = _worker_implementation_lineage(
+        record,
+        implementation,
+    )
+    implementation_trace_ids = sorted(
+        set(implementation_lineage.get("graph_trace_ids") or [])
+    )
+    earlier_payload = (
+        earlier_worker_commit.get("payload")
+        if isinstance(earlier_worker_commit.get("payload"), Mapping)
+        else {}
+    )
+    earlier_trace_ids = sorted(
+        set(
+            _runtime_context_service_query_values(
+                earlier_payload,
+                "graph_trace_ids",
+                "verified_trace_ids",
+            )
+        )
+    )
+    earlier_commit_sha = str(
+        earlier_worker_commit.get("commit_sha")
+        or earlier_payload.get("worker_commit_sha")
+        or earlier_payload.get("commit_sha")
+        or ""
+    ).strip().lower()
+    if not (
+        implementation_trace_ids
+        and earlier_trace_ids == implementation_trace_ids
+        and str(earlier_payload.get("implementation_lineage_ref") or "").strip()
+        == str(implementation_lineage.get("implementation_lineage_ref") or "").strip()
+        and re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            earlier_commit_sha,
+        )
+        and earlier_commit_sha != commit_sha
+        and _active_failed_qa_line_index(
+            authority_completed[:authority_stop]
+        )
+        < 0
+    ):
+        return {}
+
+    matching_contexts: list[Any] = []
+    matching_dispatch_indexes: list[int] = []
+    for dispatch_index, dispatch in enumerate(
+        authority_completed[:implementation_index]
+    ):
+        if str(dispatch.get("line_id") or "").strip() != (
+            "observer_dispatch_bounded_workers"
+        ):
+            continue
+        dispatch_matched = False
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=dispatch,
+        ):
+            if _contract_runtime_context_identity(context)[:2] != (
+                runtime_context_id,
+                task_id,
+            ):
+                continue
+            matching_contexts.append(context)
+            dispatch_matched = True
+        if dispatch_matched:
+            matching_dispatch_indexes.append(dispatch_index)
+    if len(matching_contexts) != 1 or len(matching_dispatch_indexes) != 1:
+        return {}
+    context = matching_contexts[0]
+    context_runtime_id, context_task_id, context_parent_id = (
+        _contract_runtime_context_identity(context)
+    )
+    context_lane_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    if (
+        (context_runtime_id, context_task_id, context_parent_id)
+        != (runtime_context_id, task_id, parent_task_id)
+        or context_lane_id != lane_id
+    ):
+        return {}
+    historical_record = {
+        **dict(stored_record),
+        "completed_lines": list(authority_completed[:authority_stop]),
+    }
+    recovery = _runtime_context_same_lane_worker_commit_recovery(
+        historical_record,
+        context,
+        conn=conn,
+        project_id=project_id,
+    )
+    if not (
+        recovery.get("status") == "eligible"
+        and recovery.get("blocked") is False
+        and recovery.get("server_derived") is True
+        and str(recovery.get("recovery_reason") or "").strip()
+        == "pre_attestation_same_lane_descendant"
+        and str(recovery.get("next_legal_action") or "").strip()
+        == "record_worker_commit"
+        and int(recovery.get("superseded_completed_line_index") or -1)
+        == worker_commit_index
+        and str(recovery.get("recorded_commit_sha") or "").strip().lower()
+        == earlier_commit_sha
+        and str(recovery.get("actual_worktree_head_commit") or "").strip().lower()
+        == commit_sha
+    ):
+        return {}
+    if any(
+        str(line.get("stage_id") or "").strip()
+        == "worker_implementation"
+        and str(line.get("line_id") or "").strip()
+        == "worker_implementation"
+        and str(line.get("evidence_kind") or "").strip()
+        == "contract_line_bypass"
+        and _timeline_first_deep_text(line, "line_instance_id")
+        == line_instance_id
+        for line in authority_completed[:authority_stop]
+    ):
+        return {}
+
+    current_projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    active_chain = (
+        current_projection.get("active_chain")
+        if isinstance(current_projection.get("active_chain"), Mapping)
+        else {}
+    )
+    if not (
+        current_projection
+        and not bool(current_projection.get("degraded"))
+        and str(current_projection.get("projection_source") or "").strip()
+        == "backlog_contract_chain_current"
+        and str(current_projection.get("source_of_proof") or "").strip()
+        == "contract_runtime_executions.completed_lines"
+        and str(current_projection.get("readiness_state") or "").strip()
+        == "contract_active"
+        and str(current_projection.get("current_contract_execution_id") or "").strip()
+        == execution_id
+        and str(current_projection.get("active_child_contract_execution_id") or "").strip()
+        == execution_id
+        and execution_id
+        in {
+            str(item or "").strip()
+            for item in active_chain.get("execution_ids") or []
+        }
+    ):
+        return {}
+
+    fresh_trace_ids = (
+        list(embedded_continuation.get("fresh_graph_trace_ids") or [])
+        if persisted_request
+        else _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(
+                request,
+                "graph_trace_ids",
+            )
+        )
+    )
+    persisted_epoch = (
+        embedded_continuation.get("graph_epoch_transition_authority")
+        if persisted_request
+        and isinstance(
+            embedded_continuation.get("graph_epoch_transition_authority"),
+            Mapping,
+        )
+        else None
+    )
+    graph_epoch = (
+        _contract_runtime_worker_commit_graph_epoch_transition_authority(
+            conn,
+            project_id=project_id,
+            context=context,
+            old_graph_trace_ids=implementation_trace_ids,
+            fresh_graph_trace_ids=fresh_trace_ids,
+            persisted=persisted_epoch,
+        )
+    )
+    if not graph_epoch:
+        return {}
+    active_commit = str(graph_epoch.get("active_graph_commit") or "").strip()
+    persisted_canonical = (
+        embedded_continuation.get("canonical_owned_file_provenance")
+        if persisted_request
+        and isinstance(
+            embedded_continuation.get("canonical_owned_file_provenance"),
+            Mapping,
+        )
+        else None
+    )
+    canonical_provenance = _contract_runtime_canonical_owned_file_provenance(
+        conn,
+        project_id=project_id,
+        record=record,
+        candidate_commit_sha=commit_sha,
+        canonical_commit_sha=active_commit,
+        active_snapshot_id=str(
+            graph_epoch.get("active_snapshot_id") or ""
+        ).strip(),
+        owned_files=list(recovery.get("owned_files") or []),
+        persisted=persisted_canonical,
+    )
+    if not canonical_provenance:
+        return {}
+
+    continuation = {
+        "schema_version": (
+            "contract_runtime.worker_commit_bypass_continuation.v3"
+        ),
+        "recovery_kind": "normal_implementation_graph_epoch_transition",
+        "server_derived": True,
+        "db_verified": True,
+        "source": (
+            "normal_worker_implementation+prior_worker_commit+"
+            "current_graph_epoch_recovery"
+        ),
+        "authorization_scope": "worker_commit_bypass_only",
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+        "implementation_pass_claimed": False,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "lane_id": lane_id,
+        "line_instance_id": line_instance_id,
+        "commit_sha": commit_sha,
+        "worker_commit_sha": commit_sha,
+        "earlier_worker_commit_sha": earlier_commit_sha,
+        "changed_files": list(recovery.get("changed_files") or []),
+        "commit_diff_files": list(recovery.get("changed_files") or []),
+        "commit_parent_sha": str(recovery.get("commit_parent_sha") or "").strip(),
+        "diff_base_commit": str(recovery.get("diff_base_commit") or "").strip(),
+        "owned_files": list(recovery.get("owned_files") or []),
+        "out_of_scope_files": [],
+        "clean_worktree": True,
+        "old_graph_trace_ids": implementation_trace_ids,
+        "fresh_graph_trace_ids": fresh_trace_ids,
+        "active_snapshot_id": str(
+            graph_epoch.get("active_snapshot_id") or ""
+        ).strip(),
+        "active_graph_commit": active_commit,
+        "implementation_lineage_ref": str(
+            implementation_lineage.get("implementation_lineage_ref") or ""
+        ).strip(),
+        "graph_epoch_transition_authority": graph_epoch,
+        "canonical_owned_file_provenance": canonical_provenance,
+    }
+    if persisted_request:
+        if not embedded_continuation or stable_sha256(
+            embedded_continuation
+        ) != stable_sha256(continuation):
+            return {}
+        persisted_audit = _contract_runtime_strict_no_pass_bypass_audit(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=request,
+            expected_line_id="worker_commit",
+            expected_blocked_evidence_kind="worker_commit",
+            expected_event_task_ids={execution_id, task_id},
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            line_instance_id=line_instance_id,
+        )
+        if not persisted_audit:
+            return {}
+        continuation["persisted_worker_commit_bypass_audit"] = (
+            persisted_audit
+        )
+    return continuation
+
+
 def _contract_runtime_worker_commit_bypass_continuation_authority(
     conn,
     *,
@@ -78975,6 +80052,20 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
                 persisted_bypass_audit
             )
         return continuation
+    epoch_transition = (
+        _contract_runtime_normal_worker_commit_epoch_bypass_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+            request=request,
+            completed=completed,
+            stop=stop,
+            commit_sha=commit_sha,
+            persisted_request=persisted_request,
+        )
+    )
+    if epoch_transition:
+        return epoch_transition
     runtime_context_id = _timeline_first_deep_text(
         implementation, "runtime_context_id"
     )
