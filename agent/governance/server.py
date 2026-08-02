@@ -72214,22 +72214,66 @@ def _contract_runtime_guide_for_response(
         if isinstance(guide.get("line_bypass_guidance"), Mapping)
         else {}
     )
+    next_action = (
+        guide.get("next_legal_action")
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    bypass_current_line = (
+        bypass_guidance.get("current_line_binding")
+        if isinstance(bypass_guidance.get("current_line_binding"), Mapping)
+        else {}
+    )
+    same_lane_worker_commit_bypass_projection = (
+        guide.get("same_lane_worker_commit_recovery_projection") is True
+        and str(next_action.get("line_id") or "").strip() == "worker_commit"
+        and str(bypass_current_line.get("line_id") or "").strip()
+        == "worker_commit"
+    )
     if bypass_actor_hash and bypass_guidance:
         aligned_bypass = dict(bypass_guidance)
         if normalized_actor_role in {"observer", "qa"}:
-            for key in (
+            bypass_hash_fields = (
                 "current_line_binding",
                 "create_new_copy_safe_body",
                 "reuse_existing_open_copy_safe_body",
-            ):
+            )
+            projected_bypass_hash_values = [
+                str(value.get("runtime_guide_hash") or "").strip()
+                for key in bypass_hash_fields
+                for value in (aligned_bypass.get(key),)
+                if isinstance(value, Mapping)
+                and str(value.get("runtime_guide_hash") or "").strip()
+            ]
+            preserve_projected_bypass_writer_hash = (
+                same_lane_worker_commit_bypass_projection
+                and len(projected_bypass_hash_values)
+                == len(bypass_hash_fields)
+                and len(set(projected_bypass_hash_values)) == 1
+            )
+            for key in bypass_hash_fields:
                 value = aligned_bypass.get(key)
                 if isinstance(value, Mapping):
                     aligned_value = dict(value)
-                    aligned_value["runtime_guide_hash"] = bypass_actor_hash
+                    if not preserve_projected_bypass_writer_hash:
+                        aligned_value["runtime_guide_hash"] = bypass_actor_hash
                     aligned_bypass[key] = aligned_value
-            aligned_bypass["runtime_guide_hash_source"] = (
-                "runtime_guide.runtime_guide_hash"
-            )
+            if preserve_projected_bypass_writer_hash:
+                aligned_bypass["runtime_guide_hash_source"] = (
+                    "projected_record.runtime_guide.line_bypass_guidance."
+                    "runtime_guide_hash_before_same_lane_recovery_reader_overlay"
+                )
+                aligned_bypass["runtime_guide_hash_copy_safe"] = True
+                aligned_bypass["runtime_guide_hash_purpose"] = (
+                    "contract_runtime_line_bypass_writer"
+                )
+                aligned_bypass[
+                    "top_level_runtime_guide_hash_is_reader_only_recovery_hash"
+                ] = True
+            else:
+                aligned_bypass["runtime_guide_hash_source"] = (
+                    "runtime_guide.runtime_guide_hash"
+                )
             aligned_bypass["bypass_actor_role"] = normalized_actor_role
             aligned_bypass["bypass_actor_role_hash_aligned"] = True
             aligned_bypass["status"] = "executable_for_authenticated_bypass_actor"
