@@ -710,7 +710,14 @@ def _contract_runtime_bypass_line_schema_properties() -> dict[str, Any]:
         "line_id": {"type": "string"},
         "execution_state_revision": {"type": "integer"},
         "runtime_guide_hash": {"type": "string"},
-        "diagnostic_backlog_id": {"type": "string"},
+        "diagnostic_backlog_id": {
+            "type": "string",
+            "description": (
+                "Omit on the first bypass to create the root diagnostic. "
+                "Afterward use only the server-advertised generation root; "
+                "downstream gates never create another diagnostic row."
+            ),
+        },
         "diagnostic_priority": {"type": "string"},
         "classification": {"type": "string"},
         "reason": {"type": "string"},
@@ -2761,8 +2768,9 @@ TOOLS: list[dict] = [
     {
         "name": "contract_runtime_bypass_line",
         "description": (
-            "Waive only the current ContractRuntime line, link an OPEN diagnostic, "
-            "and never claim PASS."
+            "Waive the current ContractRuntime line without claiming PASS. The "
+            "first bypass roots one no-PASS diagnostic generation; downstream "
+            "gates reuse that root and must record their own reason."
         ),
         "inputSchema": {
             "type": "object",

@@ -2312,6 +2312,110 @@ def _canonical_audited_bypass_payload(
     return payload
 
 
+def _contract_runtime_no_pass_generation(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive the immutable no-PASS generation rooted at the first bypass.
+
+    A bypass taints the source execution generation without turning any gate
+    into PASS.  Later inherited gate exceptions reuse this root diagnostic;
+    they never create a new diagnostic merely because upstream PASS evidence
+    is unavailable.  The completed-line ledger is the authority so legacy v1
+    roots acquire the same deterministic generation identity without rewrite.
+    """
+
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    source_backlog_id = str(record.get("backlog_id") or "").strip()
+    if not execution_id or not source_backlog_id:
+        return {}
+    completed = record.get("completed_lines")
+    if not isinstance(completed, Sequence):
+        return {}
+    for line_index, line in enumerate(completed):
+        if not isinstance(line, Mapping):
+            continue
+        payload = _canonical_audited_bypass_payload(line)
+        if not payload:
+            continue
+        bypass_identity = str(payload.get("bypass_identity") or "").strip()
+        diagnostic_id = str(
+            payload.get("diagnostic_backlog_id") or ""
+        ).strip()
+        if not bypass_identity or not diagnostic_id:
+            continue
+        persisted_generation = (
+            payload.get("no_pass_generation")
+            if isinstance(payload.get("no_pass_generation"), Mapping)
+            else {}
+        )
+        generation_id = str(
+            persisted_generation.get("generation_id") or ""
+        ).strip()
+        if not generation_id:
+            digest = hashlib.sha256(
+                canonical_json(
+                    {
+                        "project_id": str(record.get("project_id") or ""),
+                        "source_backlog_id": source_backlog_id,
+                        "contract_execution_id": execution_id,
+                        "root_bypass_identity": bypass_identity,
+                        "root_line_instance_id": str(
+                            line.get("line_instance_id") or ""
+                        ),
+                    }
+                ).encode("utf-8")
+            ).hexdigest()[:20]
+            generation_id = f"bypassgen-{digest}"
+        inherited_count = 0
+        for candidate in completed[line_index + 1 :]:
+            if not isinstance(candidate, Mapping):
+                continue
+            candidate_payload = _canonical_audited_bypass_payload(candidate)
+            candidate_generation = (
+                candidate_payload.get("no_pass_generation")
+                if isinstance(
+                    candidate_payload.get("no_pass_generation"), Mapping
+                )
+                else {}
+            )
+            if (
+                str(candidate_generation.get("generation_id") or "").strip()
+                == generation_id
+                and str(candidate_generation.get("role") or "").strip()
+                == "inherited_gate"
+            ):
+                inherited_count += 1
+        return {
+            "schema_version": "contract_runtime.no_pass_generation.v1",
+            "generation_id": generation_id,
+            "status": "active_no_pass",
+            "source_backlog_id": source_backlog_id,
+            "contract_execution_id": execution_id,
+            "root_completed_line_index": line_index,
+            "root_generation_persisted": bool(persisted_generation),
+            "root_bypass_identity": bypass_identity,
+            "root_diagnostic_backlog_id": diagnostic_id,
+            "root_stage_id": str(line.get("stage_id") or ""),
+            "root_line_id": str(line.get("line_id") or ""),
+            "root_line_instance_id": str(line.get("line_instance_id") or ""),
+            "root_classification": str(
+                payload.get("classification") or ""
+            ),
+            "root_execution_state_revision": int(
+                payload.get("execution_state_revision") or 0
+            ),
+            "root_reason": str(payload.get("reason") or ""),
+            "inherited_gate_count": inherited_count,
+            "no_pass_claim": True,
+            "authoritative_pass_synthesized": False,
+            "unlock_policy": (
+                "authoritative_root_repair_then_fresh_execution_generation"
+            ),
+            "historical_lines_append_only": True,
+        }
+    return {}
+
+
 def _historical_audited_bypass_supersession_disposition(
     record: Mapping[str, Any],
     canonical_bypasses: Sequence[tuple[int, Mapping[str, Any], Mapping[str, Any]]],
@@ -8080,9 +8184,10 @@ class ContractRuntime:
         projected_completed_lines: Sequence[Mapping[str, Any]] | None = None,
         projection: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Explicitly waive only the current line without claiming it passed."""
+        """Waive the current line without PASS or downstream diagnostic fanout."""
 
         record = self.store.get(contract_execution_id)
+        active_no_pass_generation = _contract_runtime_no_pass_generation(record)
         request = dict(bypass)
         effective_actor_role = _effective_actor_role(request, actor_role=actor_role)
         evidence_refs = _sanitize_line_evidence_value(request.get("evidence_refs") or [])
@@ -8104,6 +8209,17 @@ class ContractRuntime:
             "evidence_refs": evidence_refs,
             "continuation_authority": continuation_authority,
         }
+        legacy_worker_commit_compatibility = bool(
+            active_no_pass_generation
+            and active_no_pass_generation.get("root_generation_persisted")
+            is not True
+            and request_fields["line_id"] == "worker_commit"
+        )
+        if legacy_worker_commit_compatibility:
+            # Historical v1 executions already minted a distinct, strictly
+            # validated worker-commit diagnostic.  Keep that immutable v2/v3
+            # continuation path readable; later gates enter single-root mode.
+            active_no_pass_generation = {}
         request_hash = stable_sha256(request_fields)
 
         def rejected(*errors: str, current: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -8158,6 +8274,14 @@ class ContractRuntime:
         ]
         if missing:
             return rejected(*(f"missing {key}" for key in missing))
+        if active_no_pass_generation and request_fields[
+            "diagnostic_backlog_id"
+        ] != str(
+            active_no_pass_generation.get("root_diagnostic_backlog_id") or ""
+        ):
+            return rejected(
+                "active no-PASS generation requires its root diagnostic"
+            )
         if effective_actor_role not in {"observer", "qa"}:
             return rejected("bypass actor_role must be observer or qa")
         try:
@@ -8213,6 +8337,88 @@ class ContractRuntime:
             "no_pass_claim": True,
             "evidence_refs": evidence_refs,
         }
+        if active_no_pass_generation:
+            payload["no_pass_generation"] = {
+                "schema_version": "contract_line_bypass_generation_link.v1",
+                "generation_id": str(
+                    active_no_pass_generation.get("generation_id") or ""
+                ),
+                "role": "inherited_gate",
+                "root_bypass_identity": str(
+                    active_no_pass_generation.get("root_bypass_identity") or ""
+                ),
+                "root_diagnostic_backlog_id": str(
+                    active_no_pass_generation.get(
+                        "root_diagnostic_backlog_id"
+                    )
+                    or ""
+                ),
+                "root_stage_id": str(
+                    active_no_pass_generation.get("root_stage_id") or ""
+                ),
+                "root_line_id": str(
+                    active_no_pass_generation.get("root_line_id") or ""
+                ),
+                "root_line_instance_id": str(
+                    active_no_pass_generation.get("root_line_instance_id")
+                    or ""
+                ),
+                "root_classification": str(
+                    active_no_pass_generation.get("root_classification") or ""
+                ),
+                "root_execution_state_revision": int(
+                    active_no_pass_generation.get(
+                        "root_execution_state_revision"
+                    )
+                    or 0
+                ),
+                "gate_reason_code": request_fields["classification"],
+                "gate_reason": request_fields["reason"],
+                "original_gate_evidence_status": (
+                    "not_authoritatively_satisfied_due_to_active_no_pass_generation"
+                ),
+                "diagnostic_created": False,
+                "no_pass_claim": True,
+                "authoritative_pass_synthesized": False,
+            }
+        else:
+            digest = hashlib.sha256(
+                canonical_json(
+                    {
+                        "project_id": str(record.get("project_id") or ""),
+                        "source_backlog_id": str(record.get("backlog_id") or ""),
+                        "contract_execution_id": contract_execution_id,
+                        "root_bypass_identity": request_fields[
+                            "bypass_identity"
+                        ],
+                        "root_line_instance_id": str(
+                            next_action.get("line_instance_id") or ""
+                        ),
+                    }
+                ).encode("utf-8")
+            ).hexdigest()[:20]
+            payload["no_pass_generation"] = {
+                "schema_version": "contract_line_bypass_generation_link.v1",
+                "generation_id": f"bypassgen-{digest}",
+                "role": "root",
+                "root_bypass_identity": request_fields["bypass_identity"],
+                "root_diagnostic_backlog_id": request_fields[
+                    "diagnostic_backlog_id"
+                ],
+                "root_stage_id": str(next_action.get("stage_id") or ""),
+                "root_line_id": request_fields["line_id"],
+                "root_line_instance_id": str(
+                    next_action.get("line_instance_id") or ""
+                ),
+                "root_classification": request_fields["classification"],
+                "root_execution_state_revision": expected_revision,
+                "gate_reason_code": request_fields["classification"],
+                "gate_reason": request_fields["reason"],
+                "original_gate_evidence_status": "blocked_at_root",
+                "diagnostic_created": True,
+                "no_pass_claim": True,
+                "authoritative_pass_synthesized": False,
+            }
         if continuation_authority:
             payload["continuation_authority"] = continuation_authority
         written_line = {
@@ -8886,6 +9092,13 @@ def _attach_line_bypass_guidance(
     if line_instance_id:
         identity_parts.append(line_instance_id)
     bypass_identity = ":".join(identity_parts)
+    active_no_pass_generation = _contract_runtime_no_pass_generation(record)
+    if (
+        active_no_pass_generation
+        and active_no_pass_generation.get("root_generation_persisted") is not True
+        and line_id == "worker_commit"
+    ):
+        active_no_pass_generation = {}
     diagnostic_suffix = hashlib.sha256(
         bypass_identity.encode("utf-8")
     ).hexdigest()[:16].upper()
@@ -8914,6 +9127,25 @@ def _attach_line_bypass_guidance(
         ),
         "evidence_refs": evidence_refs,
     }
+    if active_no_pass_generation:
+        common_body.update(
+            {
+                "diagnostic_backlog_id": str(
+                    active_no_pass_generation.get(
+                        "root_diagnostic_backlog_id"
+                    )
+                    or ""
+                ),
+                "classification": "<gate-specific inherited reason code>",
+                "reason": (
+                    "<why this exact gate cannot produce authoritative evidence "
+                    "under the active no-PASS generation>"
+                ),
+                "decision": (
+                    "inherit the root no-PASS disposition; do not claim this gate passed"
+                ),
+            }
+        )
     exact_binding = {
         "source_backlog_id": source_backlog_id,
         "contract_execution_id": contract_execution_id,
@@ -8921,7 +9153,11 @@ def _attach_line_bypass_guidance(
     }
     guide["line_bypass_guidance"] = {
         "schema_version": "contract_runtime.line_bypass_guidance.v1",
-        "status": "available_for_current_line",
+        "status": (
+            "active_generation_inherited_bypass_required"
+            if active_no_pass_generation
+            else "available_for_current_line"
+        ),
         "copy_safe": True,
         "endpoint": (
             f"/api/projects/{record.get('project_id')}/contract-runtime/"
@@ -9020,6 +9256,54 @@ def _attach_line_bypass_guidance(
             "bypass_acceptance_logic_unchanged": True,
         },
     }
+    if active_no_pass_generation:
+        guide["line_bypass_guidance"]["no_pass_generation"] = dict(
+            active_no_pass_generation
+        )
+        guide["line_bypass_guidance"]["diagnostic_row_binding"] = {
+            "policy": "reuse_generation_root_only",
+            "create_new": {
+                "recommended": False,
+                "allowed": False,
+                "reason": (
+                    "the first bypass already owns the sole diagnostic row "
+                    "for this execution generation"
+                ),
+            },
+            "reuse_generation_root": {
+                "required": True,
+                "diagnostic_backlog_id": str(
+                    active_no_pass_generation.get(
+                        "root_diagnostic_backlog_id"
+                    )
+                    or ""
+                ),
+                "root_bypass_identity": str(
+                    active_no_pass_generation.get("root_bypass_identity") or ""
+                ),
+                "root_line_id": str(
+                    active_no_pass_generation.get("root_line_id") or ""
+                ),
+                "downstream_gate_reason_required": True,
+                "new_backlog_row_forbidden": True,
+            },
+        }
+        guide["line_bypass_guidance"]["inherited_bypass_copy_safe_body"] = dict(
+            common_body
+        )
+        guide["line_bypass_guidance"].pop("create_new_copy_safe_body", None)
+        guide["line_bypass_guidance"].pop(
+            "reuse_existing_open_copy_safe_body", None
+        )
+        guide["line_bypass_guidance"]["invariants"].update(
+            {
+                "one_root_diagnostic_per_generation": True,
+                "every_inherited_gate_reason_required": True,
+                "downstream_missing_upstream_evidence_creates_no_backlog_row": True,
+                "old_generation_remains_no_pass_after_repair": True,
+                "unlock_starts_fresh_execution_generation": True,
+            }
+        )
 
 
 def _runtime_guide_role_hashes(

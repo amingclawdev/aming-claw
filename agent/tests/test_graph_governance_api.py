@@ -3344,7 +3344,23 @@ def _live_worker_commit_after_implementation_bypass_case(
         )
     )
     assert bypass["ok"] is True, json.dumps(bypass, indent=2, sort_keys=True)
-    implementation_bypass = bypass["written_line"]
+    # This helper intentionally models the immutable pre-generation v1 rows
+    # that exercise persisted worker-commit continuation compatibility.
+    legacy_record = runtime.store.get(execution_id)
+    implementation_bypass = next(
+        line
+        for line in legacy_record["completed_lines"]
+        if isinstance(line, dict)
+        and isinstance(line.get("payload"), dict)
+        and line["payload"].get("bypass_identity") == bypass_identity
+    )
+    implementation_bypass["payload"].pop("no_pass_generation", None)
+    runtime.store.update(
+        execution_id,
+        legacy_record,
+        expected_revision=int(legacy_record["execution_state_revision"]),
+    )
+    conn.commit()
     assert implementation_bypass["actor_role"] == "observer"
     assert implementation_bypass["evidence_kind"] == "contract_line_bypass"
     assert implementation_bypass["line_instance_id"] == (
@@ -76915,6 +76931,153 @@ def test_contract_runtime_line_bypass_atomically_links_open_diagnostic(conn):
     assert conn.execute(
         "SELECT COUNT(*) FROM backlog_bugs WHERE bug_id LIKE 'AC-CONTRACT-LINE-BYPASS-%'"
     ).fetchone()[0] == 1
+
+
+def test_contract_runtime_downstream_bypass_reuses_generation_root_diagnostic(
+    conn,
+):
+    backlog_id = "AC-CONTRACT-RUNTIME-INHERITED-BYPASS-GENERATION"
+    execution_id = "cex-contract-runtime-inherited-bypass-generation"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    runtime = server._contract_runtime(conn)
+    record = runtime.start_execution(
+        "observer_hotfix",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=execution_id,
+    )
+    conn.commit()
+
+    def bypass(payload):
+        return server.handle_project_contract_runtime_line_bypass(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": execution_id,
+                },
+                "observer",
+                method="POST",
+                body=payload,
+            )
+        )
+
+    root = bypass(
+        {
+            "bypass_identity": f"bypass:{execution_id}:root",
+            "stage_id": "pre_mutation",
+            "line_id": "hotfix_pre_reason",
+            "execution_state_revision": record["execution_state_revision"],
+            "runtime_guide_hash": record["runtime_guide"][
+                "runtime_guide_hash"
+            ],
+            "classification": "environment_root_blocker",
+            "reason": "the root environment cannot produce the precondition",
+            "decision": "continue this generation as audited no-PASS",
+            "evidence_refs": ["request:req-generation-root"],
+        }
+    )
+
+    assert root["ok"] is True
+    root_diagnostic_id = root["diagnostic_backlog_id"]
+    root_generation = root["no_pass_generation"]
+    assert root_generation["role"] == "root"
+    assert root_generation["diagnostic_created"] is True
+    guidance = root["runtime_guide"]["line_bypass_guidance"]
+    assert guidance["no_pass_generation_status"] == (
+        "active_generation_inherited_bypass_required"
+    )
+    assert guidance["diagnostic_row_binding"]["policy"] == (
+        "reuse_generation_root_only"
+    )
+    assert guidance["diagnostic_row_binding"]["create_new"]["allowed"] is False
+    assert "create_new_copy_safe_body" not in guidance
+    inherited_body = dict(guidance["inherited_bypass_copy_safe_body"])
+    inherited_body.update(
+        {
+            "classification": "upstream_root_evidence_missing",
+            "reason": (
+                "hotfix_post_action_summary cannot claim its upstream root "
+                "precondition passed"
+            ),
+            "decision": (
+                "record this exact gate as inherited no-PASS without a new row"
+            ),
+            "evidence_refs": ["request:req-generation-inherited-gate"],
+        }
+    )
+
+    revision_before_negative = int(root["execution_state_revision"])
+    root_event_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE backlog_id = ?",
+        (root_diagnostic_id,),
+    ).fetchone()[0]
+    with pytest.raises(
+        server.ValidationError,
+        match="active no-PASS generation requires its root diagnostic",
+    ):
+        bypass(
+            {
+                **inherited_body,
+                "diagnostic_backlog_id": "AC-WRONG-DOWNSTREAM-DIAGNOSTIC",
+            }
+        )
+    missing_reason = bypass({**inherited_body, "reason": ""})
+    assert missing_reason["ok"] is False
+    assert missing_reason["decision"]["errors"] == ["missing reason"]
+    assert runtime.store.get(execution_id)["execution_state_revision"] == (
+        revision_before_negative
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE backlog_id = ?",
+        (root_diagnostic_id,),
+    ).fetchone()[0] == root_event_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backlog_bugs "
+        "WHERE bug_id = 'AC-WRONG-DOWNSTREAM-DIAGNOSTIC'"
+    ).fetchone()[0] == 0
+
+    inherited = bypass(inherited_body)
+
+    assert inherited["ok"] is True
+    assert inherited["diagnostic_backlog_id"] == root_diagnostic_id
+    inherited_generation = inherited["no_pass_generation"]
+    assert inherited_generation["generation_id"] == (
+        root_generation["generation_id"]
+    )
+    assert inherited_generation["role"] == "inherited_gate"
+    assert inherited_generation["diagnostic_created"] is False
+    assert inherited_generation["gate_reason_code"] == (
+        "upstream_root_evidence_missing"
+    )
+    assert inherited_generation["gate_reason"] == (
+        "hotfix_post_action_summary cannot claim its upstream root "
+        "precondition passed"
+    )
+    assert inherited_generation["authoritative_pass_synthesized"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backlog_bugs "
+        "WHERE bug_id LIKE 'AC-CONTRACT-LINE-BYPASS-%'"
+    ).fetchone()[0] == 1
+    events = conn.execute(
+        "SELECT backlog_id, event_type, decision, payload_json "
+        "FROM task_timeline_events "
+        "WHERE correlation_id = ? ORDER BY id",
+        (f"contract-line-bypass:{inherited_body['bypass_identity']}",),
+    ).fetchall()
+    assert [(row["backlog_id"], row["event_type"]) for row in events] == [
+        (backlog_id, "contract_line_bypass"),
+        (root_diagnostic_id, "contract_line_bypass_diagnostic_linked"),
+    ]
+    assert all(
+        json.loads(row["payload_json"])["reason"]
+        == inherited_generation["gate_reason"]
+        for row in events
+    )
+    assert events[0]["decision"] == "inherited_root_diagnostic_no_pass"
+    assert events[1]["decision"] == (
+        "record_inherited_gate_reason_keep_root_open"
+    )
 
 
 def test_mf_parallel_qa_pass_with_linked_open_graph_diagnostic_advances_merge(

@@ -65,6 +65,7 @@ from .contracts.runtime import (
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
     _active_failed_qa_line,
     _active_failed_qa_line_index,
+    _contract_runtime_no_pass_generation,
     _line_evidence_from_write,
     _worker_commit_completed_implementation,
     _worker_commit_text,
@@ -16497,6 +16498,19 @@ def _contract_runtime_active_linked_bypass_diagnostics(
             payload.get("diagnostic_backlog_id") or ""
         ).strip()
         classification = str(payload.get("classification") or "").strip()
+        generation_link = (
+            payload.get("no_pass_generation")
+            if isinstance(payload.get("no_pass_generation"), Mapping)
+            else {}
+        )
+        inherited_generation = bool(
+            str(generation_link.get("role") or "").strip()
+            == "inherited_gate"
+        )
+        if inherited_generation:
+            # QA reports the root diagnostic once; inherited gates keep their
+            # own timeline reasons without duplicating the active-link list.
+            continue
         if (
             str(raw_line.get("evidence_kind") or "").strip()
             != "contract_line_bypass"
@@ -72238,6 +72252,10 @@ def _contract_runtime_guide_for_response(
                 "create_new_copy_safe_body",
                 "reuse_existing_open_copy_safe_body",
             )
+            bypass_hash_alignment_fields = (
+                *bypass_hash_fields,
+                "inherited_bypass_copy_safe_body",
+            )
             projected_bypass_hash_values = [
                 str(value.get("runtime_guide_hash") or "").strip()
                 for key in bypass_hash_fields
@@ -72251,7 +72269,7 @@ def _contract_runtime_guide_for_response(
                 == len(bypass_hash_fields)
                 and len(set(projected_bypass_hash_values)) == 1
             )
-            for key in bypass_hash_fields:
+            for key in bypass_hash_alignment_fields:
                 value = aligned_bypass.get(key)
                 if isinstance(value, Mapping):
                     aligned_value = dict(value)
@@ -72276,12 +72294,19 @@ def _contract_runtime_guide_for_response(
                 )
             aligned_bypass["bypass_actor_role"] = normalized_actor_role
             aligned_bypass["bypass_actor_role_hash_aligned"] = True
+            if isinstance(
+                aligned_bypass.get("no_pass_generation"), Mapping
+            ):
+                aligned_bypass["no_pass_generation_status"] = (
+                    "active_generation_inherited_bypass_required"
+                )
             aligned_bypass["status"] = "executable_for_authenticated_bypass_actor"
         else:
             for key in (
                 "current_line_binding",
                 "create_new_copy_safe_body",
                 "reuse_existing_open_copy_safe_body",
+                "inherited_bypass_copy_safe_body",
             ):
                 value = aligned_bypass.get(key)
                 if isinstance(value, Mapping):
@@ -104771,6 +104796,15 @@ def _contract_runtime_formal_no_pass_bypass_authorities(
         ).strip()
         bypass_identity = str(payload.get("bypass_identity") or "").strip()
         classification = str(payload.get("classification") or "").strip()
+        generation_link = (
+            payload.get("no_pass_generation")
+            if isinstance(payload.get("no_pass_generation"), Mapping)
+            else {}
+        )
+        inherited_generation = bool(
+            str(generation_link.get("role") or "").strip()
+            == "inherited_gate"
+        )
         disposition = str(payload.get("disposition") or "").strip()
         try:
             bypass_revision = int(payload.get("execution_state_revision") or 0)
@@ -104825,9 +104859,28 @@ def _contract_runtime_formal_no_pass_bypass_authorities(
             ).strip()
             provided_expectations = (
                 ("source_backlog_id", backlog_id),
-                ("line_id", line_id),
-                ("bypass_identity", bypass_identity),
-                ("classification", classification),
+                (
+                    "line_id",
+                    str(generation_link.get("root_line_id") or "").strip()
+                    if inherited_generation
+                    else line_id,
+                ),
+                (
+                    "bypass_identity",
+                    str(
+                        generation_link.get("root_bypass_identity") or ""
+                    ).strip()
+                    if inherited_generation
+                    else bypass_identity,
+                ),
+                (
+                    "classification",
+                    str(
+                        generation_link.get("root_classification") or ""
+                    ).strip()
+                    if inherited_generation
+                    else classification,
+                ),
             )
             if metadata_execution_id and metadata_execution_id != execution_id:
                 metadata_matches = False
@@ -104846,7 +104899,20 @@ def _contract_runtime_formal_no_pass_bypass_authorities(
                     )
                 except (TypeError, ValueError):
                     metadata_revision = 0
-                if metadata_revision != bypass_revision:
+                try:
+                    expected_metadata_revision = (
+                        int(
+                            generation_link.get(
+                                "root_execution_state_revision"
+                            )
+                            or 0
+                        )
+                        if inherited_generation
+                        else bypass_revision
+                    )
+                except (TypeError, ValueError):
+                    expected_metadata_revision = 0
+                if metadata_revision != expected_metadata_revision:
                     metadata_matches = False
                     break
             if (
@@ -104938,6 +105004,8 @@ def _contract_runtime_formal_no_pass_bypass_authorities(
             "execution_state_revision": bypass_revision,
             "bypass_identity": bypass_identity,
             "classification": classification,
+            "no_pass_generation": dict(generation_link),
+            "inherited_generation_gate": inherited_generation,
             "disposition": disposition,
             "no_pass_claim": True,
             "bypassed_business_line_passed": False,
@@ -126843,7 +126911,7 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
 
 @route("POST", "/api/projects/{project_id}/contract-runtime/{contract_execution_id}/line-bypasses")
 def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
-    """Atomically waive the current line and link its OPEN diagnostic row."""
+    """Waive one line, rooting or inheriting one no-PASS diagnostic generation."""
 
     from . import task_timeline
 
@@ -126853,11 +126921,9 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
         raise ValidationError("contract_execution_id is required")
     body = dict(ctx.body or {})
     bypass_identity = str(body.get("bypass_identity") or "").strip()
-    diagnostic_id = str(body.get("diagnostic_backlog_id") or "").strip()
-    if not diagnostic_id and bypass_identity:
-        suffix = hashlib.sha256(bypass_identity.encode("utf-8")).hexdigest()[:16]
-        diagnostic_id = f"AC-CONTRACT-LINE-BYPASS-{suffix.upper()}"
-    body["diagnostic_backlog_id"] = diagnostic_id
+    requested_diagnostic_id = str(
+        body.get("diagnostic_backlog_id") or ""
+    ).strip()
 
     with DBContext(project_id) as conn:
         runtime = _contract_runtime(conn)
@@ -126882,8 +126948,58 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
                 record=record,
                 actor_role=actor_role,
             )
+            no_pass_generation = _contract_runtime_no_pass_generation(record)
+            inherit_no_pass_generation = bool(
+                no_pass_generation
+                and not (
+                    no_pass_generation.get("root_generation_persisted")
+                    is not True
+                    and str(body.get("line_id") or "").strip()
+                    == "worker_commit"
+                )
+            )
+            root_diagnostic_id = str(
+                no_pass_generation.get("root_diagnostic_backlog_id") or ""
+            ).strip()
+            if inherit_no_pass_generation:
+                if (
+                    requested_diagnostic_id
+                    and requested_diagnostic_id != root_diagnostic_id
+                ):
+                    raise ValidationError(
+                        "active no-PASS generation requires its root diagnostic"
+                    )
+                diagnostic_id = root_diagnostic_id
+            else:
+                diagnostic_id = requested_diagnostic_id
+                if not diagnostic_id and bypass_identity:
+                    suffix = hashlib.sha256(
+                        bypass_identity.encode("utf-8")
+                    ).hexdigest()[:16]
+                    diagnostic_id = (
+                        f"AC-CONTRACT-LINE-BYPASS-{suffix.upper()}"
+                    )
+            body["diagnostic_backlog_id"] = diagnostic_id
             continuation_authority = {}
-            if str(body.get("line_id") or "").strip() == "worker_commit":
+            if (
+                str(body.get("line_id") or "").strip() == "worker_commit"
+                and inherit_no_pass_generation
+            ):
+                continuation_authority = {
+                    "schema_version": (
+                        "contract_runtime.inherited_no_pass_continuation.v1"
+                    ),
+                    "generation_id": str(
+                        no_pass_generation.get("generation_id") or ""
+                    ),
+                    "root_bypass_identity": str(
+                        no_pass_generation.get("root_bypass_identity") or ""
+                    ),
+                    "root_diagnostic_backlog_id": root_diagnostic_id,
+                    "no_pass_claim": True,
+                    "authoritative_pass_synthesized": False,
+                }
+            elif str(body.get("line_id") or "").strip() == "worker_commit":
                 continuation_authority = (
                     _contract_runtime_worker_commit_bypass_continuation_authority(
                         conn,
@@ -126945,12 +127061,17 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
                 "project_id": project_id,
                 "contract_execution_id": execution_id,
                 "actor_role": actor_role,
-                "diagnostic_backlog_id": diagnostic_id,
+                "diagnostic_backlog_id": str(
+                    body.get("diagnostic_backlog_id") or ""
+                ),
                 "decision": result.get("decision") or {},
             }
 
         timeline_events: list[dict[str, Any]] = []
         if not result.get("idempotent"):
+            diagnostic_id = str(
+                body.get("diagnostic_backlog_id") or ""
+            ).strip()
             source_id = str(record.get("backlog_id") or "").strip()
             source = conn.execute(
                 "SELECT * FROM backlog_bugs WHERE bug_id = ?", (source_id,)
@@ -126960,6 +127081,27 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
             existing = conn.execute(
                 "SELECT * FROM backlog_bugs WHERE bug_id = ?", (diagnostic_id,)
             ).fetchone()
+            written_line = (
+                result.get("written_line")
+                if isinstance(result.get("written_line"), Mapping)
+                else {}
+            )
+            written_payload = (
+                written_line.get("payload")
+                if isinstance(written_line.get("payload"), Mapping)
+                else {}
+            )
+            generation_link = (
+                written_payload.get("no_pass_generation")
+                if isinstance(
+                    written_payload.get("no_pass_generation"), Mapping
+                )
+                else {}
+            )
+            inherited_generation = bool(
+                str(generation_link.get("role") or "").strip()
+                == "inherited_gate"
+            )
             link = {
                 "source_backlog_id": source_id,
                 "contract_execution_id": execution_id,
@@ -126967,19 +127109,60 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
                 "execution_state_revision": int(body.get("execution_state_revision") or 0),
                 "bypass_identity": bypass_identity,
                 "classification": str(body.get("classification") or ""),
+                "reason_code": str(body.get("classification") or ""),
+                "reason": str(body.get("reason") or ""),
                 "disposition": "proceeded_with_exception",
                 "no_pass_claim": True,
             }
+            if generation_link:
+                link.update(
+                    {
+                        "no_pass_generation_id": str(
+                            generation_link.get("generation_id") or ""
+                        ),
+                        "no_pass_generation_role": str(
+                            generation_link.get("role") or ""
+                        ),
+                        "root_bypass_identity": str(
+                            generation_link.get("root_bypass_identity") or ""
+                        ),
+                        "root_diagnostic_backlog_id": str(
+                            generation_link.get(
+                                "root_diagnostic_backlog_id"
+                            )
+                            or ""
+                        ),
+                        "root_line_id": str(
+                            generation_link.get("root_line_id") or ""
+                        ),
+                        "diagnostic_created": not inherited_generation,
+                        "authoritative_pass_synthesized": False,
+                    }
+                )
             if existing:
                 prior = backlog_runtime.parse_json_object(existing["chain_trigger_json"])
-                if existing["status"] != "OPEN" or any(
-                    str(prior.get(key) or "") != str(link.get(key) or "")
-                    for key in ("source_backlog_id", "contract_execution_id", "line_id")
+                expected_line_id = (
+                    str(generation_link.get("root_line_id") or "").strip()
+                    if inherited_generation
+                    else str(link.get("line_id") or "").strip()
+                )
+                if (
+                    existing["status"] != "OPEN"
+                    or str(prior.get("source_backlog_id") or "")
+                    != source_id
+                    or str(prior.get("contract_execution_id") or "")
+                    != execution_id
+                    or str(prior.get("line_id") or "")
+                    != expected_line_id
                 ):
                     raise ValidationError(
                         "diagnostic_backlog_id is not the matching OPEN bypass row"
                     )
             else:
+                if inherited_generation:
+                    raise ValidationError(
+                        "active no-PASS generation root diagnostic is missing"
+                    )
                 now = _utc_now()
                 target_files = str(source["target_files"] or "[]")
                 test_files = str(source["test_files"] or "[]")
@@ -127026,7 +127209,11 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
                 backlog_id=source_id,
                 event_type="contract_line_bypass",
                 status="proceeded_with_exception",
-                decision="linked_open_diagnostic_no_pass",
+                decision=(
+                    "inherited_root_diagnostic_no_pass"
+                    if inherited_generation
+                    else "linked_open_diagnostic_no_pass"
+                ),
                 **common,
             ))
             timeline_events.append(task_timeline.record_event(
@@ -127034,7 +127221,11 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
                 backlog_id=diagnostic_id,
                 event_type="contract_line_bypass_diagnostic_linked",
                 status="open",
-                decision="keep_open_until_block_repaired",
+                decision=(
+                    "record_inherited_gate_reason_keep_root_open"
+                    if inherited_generation
+                    else "keep_open_until_block_repaired"
+                ),
                 **common,
             ))
 
@@ -127049,12 +127240,24 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
         "contract_execution_id": execution_id,
         "actor_role": actor_role,
         "idempotent": bool(result.get("idempotent")),
-        "diagnostic_backlog_id": diagnostic_id,
+        "diagnostic_backlog_id": str(
+            body.get("diagnostic_backlog_id") or ""
+        ),
         "diagnostic_status": "OPEN",
         "decision": result.get("decision") or {},
         "written_line": result.get("written_line") or {},
         "timeline_events": timeline_events,
     }
+    written_payload = (
+        response["written_line"].get("payload")
+        if isinstance(response.get("written_line"), Mapping)
+        and isinstance(response["written_line"].get("payload"), Mapping)
+        else {}
+    )
+    if isinstance(written_payload.get("no_pass_generation"), Mapping):
+        response["no_pass_generation"] = dict(
+            written_payload["no_pass_generation"]
+        )
     if isinstance(result.get("record"), Mapping):
         response.update(
             _contract_runtime_response(
