@@ -46092,6 +46092,34 @@ def _rev8_postmerge_qa_binding_authority() -> dict[str, Any]:
     return authority
 
 
+def test_rev8_merge_projection_accepts_one_observer_selected_batch_child_lane():
+    record = _rev8_postmerge_qa_binding_record()
+    dispatch = record["completed_lines"][0]
+    first_worker = dispatch["payload"]["bounded_workers"][0]
+    dispatch["payload"] = {
+        **dispatch["payload"],
+        "worker_count": 1,
+        "required_worker_count": 1,
+        "atomic_dispatch": False,
+        "bounded_workers": [first_worker],
+    }
+    record["completed_lines"] = [
+        dispatch,
+        record["completed_lines"][1],
+    ]
+
+    projection = server._contract_runtime_rev8_two_worker_merge_projection(
+        record,
+        required_worker_count=1,
+    )
+
+    assert projection["all_lane_merges_verified"] is True
+    assert projection["required_worker_count"] == 1
+    assert projection["lane_merge_count"] == 1
+    assert projection["runtime_context_id"] == first_worker["runtime_context_id"]
+    assert projection["merged_commit_sha"] == "1" * 40
+
+
 def _rev8_postmerge_current_full_state() -> dict[str, Any]:
     final_commit = "2" * 40
     target_root = "/tmp/rev8-final-integration-target"
@@ -102500,6 +102528,94 @@ def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution
     assert entered["next_legal_action"]["id"] == "observer_prefill_child_contracts"
 
 
+def test_mf_parallel_revise_rejects_standalone_change_to_one_worker(conn):
+    backlog_id = "AC-MF-PARALLEL-REVISE-STANDALONE"
+    task_id = "mf-parallel-revise-standalone"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-mf-parallel-revise-standalone",
+    )
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    contract_execution_id = server._mf_parallel_execution_id(
+        PID,
+        backlog_id,
+        parent_execution_id,
+        task_id,
+    )
+    route_token_ref = "rtok-mf-parallel-revise-standalone"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["mf_parallel_enter", "mf_parallel_revise"],
+    )
+
+    entered = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "reason": "Observer selects two workers for a standalone run.",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+                "onboard_service_waiver": True,
+                "owned_files": ["agent/governance/server.py"],
+                "metadata": {"required_worker_count": 2},
+            },
+        )
+    )
+    assert entered["contract_execution_id"] == contract_execution_id
+    assert entered["worker_cardinality_policy"]["required_worker_count"] == 2
+    assert entered["worker_cardinality_policy"]["source"] == (
+        "observer_selected_standalone_cardinality"
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="mf_parallel revise requires observer_session_id",
+    ):
+        server.handle_project_mf_parallel_revise(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": contract_execution_id,
+                },
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "required_worker_count": 1,
+                    "reason": "An observer session is mandatory.",
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    with pytest.raises(
+        GovernanceError,
+        match="one worker may be selected only for a server-verified",
+    ):
+        server.handle_project_mf_parallel_revise(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": contract_execution_id,
+                },
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "required_worker_count": 1,
+                    "reason": "Standalone one-worker downgrade must fail closed.",
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+
 def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     conn,
     monkeypatch,
@@ -102643,8 +102759,26 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     assert all(
         item["requires_distinct_route_token_ref"]
         and item["route_token_task_id_policy"] == "mf_parallel_successor_execution_id"
+        and item["route_token_allowed_actions"]
+        == ["mf_parallel_enter", "mf_parallel_revise"]
         and item["merge_queue"]["merge_queue_id"] == result["merge_queue_plan"]["merge_queue_id"]
         and item["merge_queue"]["queue_item_id"]
+        and item["observer_worker_cardinality_input"][
+            "input_path"
+        ]
+        == "body.metadata.required_worker_count"
+        and item["observer_worker_cardinality_input"][
+            "observer_must_select"
+        ]
+        is True
+        and item["observer_worker_cardinality_input"][
+            "recommended_worker_count"
+        ]
+        == 1
+        and item["observer_worker_cardinality_input"][
+            "revision_entrypoint"
+        ]["interface"]
+        == "mf_parallel_revise"
         for item in result["per_row_successors"]
     )
     payload = result["event"]["payload"]
@@ -102656,6 +102790,254 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     assert payload["fanout_policy"]["fanout_ready"] is True
     assert payload["fanout_policy"]["shared_backlog_close_token_allowed"] is False
     assert payload["fanout_policy"]["successor_contract_template_id"] == "mf_parallel.v2"
+
+    # The batch observer explicitly selects one worker for this row child.
+    # The server accepts and freezes that selection only after re-verifying
+    # the server-authored batch event and durable queue identity.
+    child_successor = next(
+        item
+        for item in result["per_row_successors"]
+        if item["backlog_id"] == child_a
+    )
+    child_task_id = child_successor["body"]["task_id"]
+    child_parent_id = server._onboard_service_execution_id(PID, child_a)
+    child_execution_id = server._mf_parallel_execution_id(
+        PID,
+        child_a,
+        child_parent_id,
+        child_task_id,
+    )
+    child_route_ref = "rtok-mf-batch-parallel-child-a"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=child_a,
+        contract_execution_id=child_execution_id,
+        route_token_ref=child_route_ref,
+        allowed_actions=[
+            "mf_parallel_enter",
+            "mf_parallel_revise",
+            "task_timeline_append",
+        ],
+    )
+    child_enter_body = {
+        **child_successor["body"],
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": child_route_ref,
+        "owned_files": child_successor["owned_files"],
+        "metadata": {"required_worker_count": 1},
+    }
+    child_enter = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=child_enter_body,
+        )
+    )
+
+    assert child_enter["contract_execution_id"] == child_execution_id
+    assert child_enter["worker_cardinality_policy"]["source"] == (
+        "verified_batch_child_lineage"
+    )
+    assert child_enter["worker_cardinality_policy"]["required_worker_count"] == 1
+    assert child_enter["worker_cardinality_policy"][
+        "atomic_dispatch_required"
+    ] is False
+    assert child_enter["worker_cardinality_policy"]["revision_contract"][
+        "interface"
+    ] == "mf_parallel_revise"
+    child_record = server._contract_runtime(conn).store.get(child_execution_id)
+    selection = child_record["metadata"][
+        "observer_worker_cardinality_selection"
+    ]
+    assert selection["observer_selected"] is True
+    assert selection["selection_frozen_at_enter"] is True
+    assert selection["required_worker_count"] == 1
+    assert selection["batch_child_authority"]["db_verified"] is True
+    assert server._contract_runtime_mf_parallel_required_worker_count(
+        child_record,
+        conn=conn,
+        project_id=PID,
+    ) == 1
+    projected_child = server._contract_runtime_read(
+        conn,
+        contract_execution_id=child_execution_id,
+        actor_role="observer",
+    )
+    assert projected_child["runtime_guide"][
+        "effective_worker_cardinality_policy"
+    ]["required_worker_count"] == 1
+    assert projected_child["runtime_guide"]["next_legal_action"][
+        "effective_worker_cardinality_policy"
+    ]["source"] == "verified_batch_child_lineage"
+
+    revise_to_two = server.handle_project_mf_parallel_revise(
+        _ctx(
+            {
+                "project_id": PID,
+                "contract_execution_id": child_execution_id,
+            },
+            method="POST",
+            body={
+                "backlog_id": child_a,
+                "required_worker_count": 2,
+                "reason": "Observer expands this row to two bounded workers before allocation.",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": child_route_ref,
+            },
+        )
+    )
+    assert revise_to_two["ok"] is True
+    assert revise_to_two["revision"]["prior_required_worker_count"] == 1
+    assert revise_to_two["revision"]["required_worker_count"] == 2
+    assert revise_to_two["worker_cardinality_policy"][
+        "required_worker_count"
+    ] == 2
+    assert revise_to_two["event"]["event_kind"] == "contract_binding"
+    assert revise_to_two["event"]["payload"]["contract_change_kind"] == (
+        "append_only_contract_revision"
+    )
+    assert revise_to_two["event"]["status"] == "accepted"
+
+    revise_back_to_one = server.handle_project_mf_parallel_revise(
+        _ctx(
+            {
+                "project_id": PID,
+                "contract_execution_id": child_execution_id,
+            },
+            method="POST",
+            body={
+                "backlog_id": child_a,
+                "required_worker_count": 1,
+                "reason": "Observer restores one row-scoped worker before allocation.",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": child_route_ref,
+            },
+        )
+    )
+    assert revise_back_to_one["ok"] is True
+    assert revise_back_to_one["revision"]["prior_required_worker_count"] == 2
+    assert revise_back_to_one["revision"]["required_worker_count"] == 1
+    assert revise_back_to_one["worker_cardinality_policy"][
+        "required_worker_count"
+    ] == 1
+    child_record = server._contract_runtime(conn).store.get(child_execution_id)
+    revisions = child_record["metadata"][
+        "observer_worker_cardinality_revisions"
+    ]
+    assert [item["revision_number"] for item in revisions] == [1, 2]
+    assert revisions[1]["prior_selection_hash"] == revisions[0]["selection_hash"]
+    assert child_record["metadata"][
+        "observer_worker_cardinality_initial_selection"
+    ]["selection_frozen_at_enter"] is True
+    assert child_record["metadata"][
+        "observer_worker_cardinality_selection"
+    ]["selection_origin"] == "mf_parallel_revise"
+
+    idempotent_reenter = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=child_enter_body,
+        )
+    )
+    assert idempotent_reenter["contract_execution_id"] == child_execution_id
+    assert idempotent_reenter["worker_cardinality_policy"][
+        "required_worker_count"
+    ] == 1
+    child_record = server._contract_runtime(conn).store.get(child_execution_id)
+    assert len(
+        child_record["metadata"]["observer_worker_cardinality_revisions"]
+    ) == 2
+
+    child_worker_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=child_a,
+        task_id=f"{child_task_id}-worker",
+        parent_task_id=child_execution_id,
+        base_commit="a" * 40,
+        target_head_commit="a" * 40,
+        merge_queue_id=result["merge_queue_plan"]["merge_queue_id"],
+        owned_files=tuple(child_successor["owned_files"]),
+    )
+    child_worker = _mf_parallel_rev3_worker_dispatch_payload(
+        conn,
+        backlog_id=child_a,
+        runtime_context=child_worker_context,
+        route_label="mf-batch-parallel-child-a-worker",
+        route_task_id=child_execution_id,
+        parent_task_id=child_execution_id,
+    )
+    bound_dispatch, dispatch_errors = (
+        server._contract_runtime_bind_mf_parallel_dispatch_authority(
+            conn,
+            project_id=PID,
+            record=child_record,
+            write={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "payload": {"bounded_workers": [child_worker]},
+            },
+        )
+    )
+    assert dispatch_errors == []
+    assert bound_dispatch["payload"]["required_worker_count"] == 1
+    assert bound_dispatch["payload"]["atomic_dispatch"] is not True
+    assert len(bound_dispatch["payload"]["bounded_workers"]) == 1
+
+    with pytest.raises(
+        GovernanceError,
+        match="cannot change after the first RuntimeContext allocation",
+    ):
+        server.handle_project_mf_parallel_revise(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": child_execution_id,
+                },
+                method="POST",
+                body={
+                    "backlog_id": child_a,
+                    "required_worker_count": 2,
+                    "reason": "This revision is intentionally too late.",
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": child_route_ref,
+                },
+            )
+        )
+
+    forged_record = copy.deepcopy(child_record)
+    forged_selection = forged_record["metadata"][
+        "observer_worker_cardinality_selection"
+    ]
+    forged_selection["batch_child_authority"]["batch_id"] = "forged-batch"
+    forged_selection["selection_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in forged_selection.items()
+            if key != "selection_hash"
+        }
+    )
+    assert server._contract_runtime_mf_parallel_required_worker_count(
+        forged_record,
+        conn=conn,
+        project_id=PID,
+    ) == 2
+
+    with pytest.raises(
+        GovernanceError,
+        match="worker cardinality is frozen after enter",
+    ):
+        server.handle_project_mf_parallel_enter(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    **child_enter_body,
+                    "metadata": {"required_worker_count": 2},
+                },
+            )
+        )
 
     # A materialized batch runtime context remains on the existing batch
     # authority path.  The stricter mf_parallel durable-merge projection must

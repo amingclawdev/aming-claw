@@ -3124,6 +3124,7 @@ def _observer_session_renewal_gate_guidance(
 _OBSERVER_ROUTE_PROTECTED_WRITE_ACTIONS = (
     "direct_fix_enter",
     "mf_parallel_enter",
+    "mf_parallel_revise",
     "mf_batch_parallel_enter",
     "backlog_close",
     "contract_runtime_submit_line",
@@ -70026,6 +70027,16 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         if isinstance(guide.get("next_legal_action"), Mapping)
         else {}
     )
+    cardinality_policy = _contract_runtime_mf_parallel_worker_cardinality_policy(
+        conn,
+        project_id=project_id,
+        record=record,
+    )
+    guide["effective_worker_cardinality_policy"] = cardinality_policy
+    if next_action:
+        next_action["effective_worker_cardinality_policy"] = cardinality_policy
+        guide["next_legal_action"] = next_action
+    projected["runtime_guide"] = guide
     if (
         str(next_action.get("stage_id") or "").strip() != "dispatch"
         or str(next_action.get("line_id") or "").strip()
@@ -70033,7 +70044,7 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         or str(next_action.get("evidence_kind") or "").strip()
         != "dispatch_bounded_worker"
     ):
-        return projected, {}
+        return projected, cardinality_policy
 
     safe_copy = (
         dict(guide.get("writer_role_safe_copy_payload") or {})
@@ -70046,7 +70057,7 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         else {}
     )
     if not copy_payload:
-        return projected, {}
+        return projected, cardinality_policy
 
     from .parallel_branch_runtime import (
         branch_contract_revision_to_dict,
@@ -70084,7 +70095,9 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         candidates.append((context, revision_payload))
     policy = _contract_runtime_mf_parallel_dispatch_authority_policy(record)
     required_worker_count = _contract_runtime_mf_parallel_required_worker_count(
-        record
+        record,
+        conn=conn,
+        project_id=project_id,
     )
     candidates.sort(
         key=lambda item: (
@@ -70531,6 +70544,7 @@ def _runtime_next_action_from_guide(
         "submit_line_guidance",
         "copy_safe_dispatch_ready",
         "dispatch_copy_safe_body_source",
+        "effective_worker_cardinality_policy",
     ):
         if key in next_line:
             result[key] = next_line[key]
@@ -81245,7 +81259,15 @@ def _contract_runtime_rev8_postmerge_qa_authority(
             "blocker_codes": [code for code in codes if code],
         }
 
-    merge = _contract_runtime_rev8_two_worker_merge_projection(record)
+    required_worker_count = _contract_runtime_mf_parallel_required_worker_count(
+        record,
+        conn=conn,
+        project_id=project_id,
+    )
+    merge = _contract_runtime_rev8_two_worker_merge_projection(
+        record,
+        required_worker_count=required_worker_count,
+    )
     merged_commit = str(
         merge.get("merged_commit_sha") or ""
     ).strip().lower()
@@ -81263,7 +81285,8 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         and merge.get("authority_verified") is True
         and merge.get("dispatch_lineage_verified") is True
         and merge.get("all_lane_merges_verified") is True
-        and int(merge.get("lane_merge_count") or 0) == 2
+        and int(merge.get("lane_merge_count") or 0)
+        == required_worker_count
         and runtime_context_id
         and task_id
         and parent_task_id
@@ -81271,7 +81294,7 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         and queue_item_id
         and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit)
     ):
-        return blocked("two_lane_merge_projection_unverified")
+        return blocked("required_lane_merge_projection_unverified")
 
     reconcile_lines = [
         (index, line)
@@ -81465,7 +81488,7 @@ def _contract_runtime_rev8_postmerge_qa_authority(
     authority = {
         "schema_version": "contract_runtime.rev8_postmerge_qa_authority.v1",
         "source": (
-            "ContractRuntime.two_lane_merge+"
+            "ContractRuntime.required_lane_merge+"
             "parallel_branch_merge_queue_items+git_target_ref_owner+"
             "graph_current_full_reconcile_provenance"
         ),
@@ -86549,10 +86572,19 @@ def _contract_runtime_completed_line_acceptance(
 
 def _contract_runtime_rev8_two_worker_merge_projection(
     record: Mapping[str, Any],
+    *,
+    required_worker_count: int = 2,
 ) -> dict[str, Any]:
-    """Join the two pre-QA lane merges to the one atomic rev8 dispatch."""
+    """Join every required pre-QA lane merge to the pinned rev8 dispatch.
 
-    if str(record.get("revision") or "").strip() != "rev8":
+    The legacy name is retained for call-site stability. Standalone rev8 keeps
+    two workers; an observer-selected, server-verified batch child uses one.
+    """
+
+    if (
+        str(record.get("revision") or "").strip() != "rev8"
+        or required_worker_count not in {1, 2}
+    ):
         return {}
     dispatch_selection = _contract_runtime_current_dispatch_authority_line(
         record
@@ -86575,7 +86607,10 @@ def _contract_runtime_rev8_two_worker_merge_projection(
         for worker in expected_workers
         if str(worker.get("runtime_context_id") or "").strip()
     }
-    if len(expected_workers) != 2 or len(expected_by_runtime) != 2:
+    if (
+        len(expected_workers) != required_worker_count
+        or len(expected_by_runtime) != required_worker_count
+    ):
         return {}
 
     completed_merge_authorities: list[dict[str, Any]] = []
@@ -86661,11 +86696,11 @@ def _contract_runtime_rev8_two_worker_merge_projection(
         for authority in completed_merge_authorities
     ]
     if not (
-        len(completed_merge_authorities) == 2
+        len(completed_merge_authorities) == required_worker_count
         and authority_lane_ids == set(expected_by_runtime)
-        and len(distinct_task_ids) == 2
-        and len(distinct_queue_ids) == 2
-        and len(set(event_ids)) == 2
+        and len(distinct_task_ids) == required_worker_count
+        and len(distinct_queue_ids) == required_worker_count
+        and len(set(event_ids)) == required_worker_count
     ):
         return {}
     final_merge = max(
@@ -86685,7 +86720,8 @@ def _contract_runtime_rev8_two_worker_merge_projection(
         ).strip(),
         "contract_runtime_dispatch_source_ref": dispatch_source_ref,
         "all_lane_merges_verified": True,
-        "lane_merge_count": 2,
+        "lane_merge_count": required_worker_count,
+        "required_worker_count": required_worker_count,
         "lane_runtime_context_ids": sorted(authority_lane_ids),
         "lane_merge_queue_ids": sorted(distinct_queue_ids),
     }
@@ -86698,7 +86734,16 @@ def _contract_runtime_current_full_reconcile_authority(
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
     if str(record.get("revision") or "").strip() == "rev8":
-        merge = _contract_runtime_rev8_two_worker_merge_projection(record)
+        merge = _contract_runtime_rev8_two_worker_merge_projection(
+            record,
+            required_worker_count=(
+                _contract_runtime_mf_parallel_required_worker_count(
+                    record,
+                    conn=conn,
+                    project_id=project_id,
+                )
+            ),
+        )
         final_runtime_context_id = str(
             merge.get("runtime_context_id") or ""
         ).strip()
@@ -87165,7 +87210,16 @@ def _contract_runtime_reconcile_record_authority(
     """
 
     if str(record.get("revision") or "").strip() == "rev8":
-        merge = _contract_runtime_rev8_two_worker_merge_projection(record)
+        merge = _contract_runtime_rev8_two_worker_merge_projection(
+            record,
+            required_worker_count=(
+                _contract_runtime_mf_parallel_required_worker_count(
+                    record,
+                    conn=conn,
+                    project_id=project_id,
+                )
+            ),
+        )
     else:
         merge = _contract_runtime_trusted_merge_projection(
             conn,
@@ -87405,17 +87459,384 @@ def _contract_runtime_mf_parallel_dispatch_authority_policy(
     return dict(policy)
 
 
+def _contract_runtime_mf_batch_child_worker_cardinality_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    batch_id: str,
+    merge_queue_id: str,
+    queue_item_id: str = "",
+) -> dict[str, Any]:
+    """Verify that one mf_parallel successor is a canonical batch row child.
+
+    A caller-provided ``parent_batch_id`` is never sufficient to reduce the
+    rev8 fan-out. The claim must resolve to exactly one server-authored batch
+    enter event and its immutable durable merge-queue child identity.
+    """
+
+    values = {
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "batch_id": str(batch_id or "").strip(),
+        "merge_queue_id": str(merge_queue_id or "").strip(),
+        "queue_item_id": str(queue_item_id or "").strip(),
+    }
+    if conn is None or not all(
+        values[field]
+        for field in (
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "batch_id",
+            "merge_queue_id",
+        )
+    ):
+        return {}
+
+    try:
+        queue_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM parallel_branch_merge_queue_items
+                WHERE project_id = ? AND merge_queue_id = ?
+                ORDER BY queue_index ASC, queue_item_id ASC
+                """,
+                (values["project_id"], values["merge_queue_id"]),
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        return {}
+    child_rows = [
+        row
+        for row in queue_rows
+        if str(row.get("backlog_id") or "").strip()
+        == values["backlog_id"]
+        and str(row.get("task_id") or "").strip() == values["task_id"]
+    ]
+    if len(queue_rows) < 2 or len(child_rows) != 1:
+        return {}
+    child_row = child_rows[0]
+    canonical_queue_item_id = str(
+        child_row.get("queue_item_id") or ""
+    ).strip()
+    if not canonical_queue_item_id or (
+        values["queue_item_id"]
+        and values["queue_item_id"] != canonical_queue_item_id
+    ):
+        return {}
+
+    try:
+        entered_rows = conn.execute(
+            """
+            SELECT *
+            FROM task_timeline_events
+            WHERE project_id = ? AND event_type = 'mf_batch_parallel.entered'
+            ORDER BY id ASC
+            """,
+            (values["project_id"],),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+
+    matches: list[tuple[dict[str, Any], Mapping[str, Any]]] = []
+    for raw_row in entered_rows:
+        row = dict(raw_row)
+        payload = _json_loads(row.get("payload_json"), {})
+        if not isinstance(payload, Mapping):
+            continue
+        coordination_backlog_id = str(
+            row.get("backlog_id") or payload.get("backlog_id") or ""
+        ).strip()
+        if not (
+            str(row.get("event_kind") or "").strip()
+            in {"contract_binding", "mf_batch_parallel_entered"}
+            and str(row.get("status") or "").strip()
+            in {"accepted", "passed"}
+            and _contract_runtime_close_authority_timeline_actor_role(
+                {**row, "payload": payload}
+            )
+            == "observer"
+            and _contract_runtime_shared_batch_enter_binding_verified(
+                payload,
+                project_id=values["project_id"],
+                batch_id=values["batch_id"],
+                coordination_backlog_id=coordination_backlog_id,
+                merge_queue_id=values["merge_queue_id"],
+                queue_rows=queue_rows,
+            )
+        ):
+            continue
+        fanout = (
+            payload.get("fanout_policy")
+            if isinstance(payload.get("fanout_policy"), Mapping)
+            else {}
+        )
+        successors = [
+            item
+            for item in fanout.get("per_row_successors") or []
+            if isinstance(item, Mapping)
+        ]
+        child_matches = []
+        for successor in successors:
+            body = (
+                successor.get("body")
+                if isinstance(successor.get("body"), Mapping)
+                else {}
+            )
+            merge_queue = (
+                successor.get("merge_queue")
+                if isinstance(successor.get("merge_queue"), Mapping)
+                else {}
+            )
+            if (
+                str(successor.get("backlog_id") or "").strip()
+                == values["backlog_id"]
+                and str(body.get("task_id") or "").strip()
+                == values["task_id"]
+                and str(body.get("parent_batch_id") or "").strip()
+                == values["batch_id"]
+                and str(body.get("merge_queue_id") or "").strip()
+                == values["merge_queue_id"]
+                and str(merge_queue.get("merge_queue_id") or "").strip()
+                == values["merge_queue_id"]
+                and str(merge_queue.get("queue_item_id") or "").strip()
+                == canonical_queue_item_id
+            ):
+                child_matches.append(successor)
+        if len(child_matches) == 1:
+            matches.append((row, payload))
+    if len(matches) != 1:
+        return {}
+
+    entered_row, entered_payload = matches[0]
+    authority = {
+        "schema_version": (
+            "contract_runtime.mf_batch_child_worker_cardinality_authority.v1"
+        ),
+        "source": (
+            "server_authored_mf_batch_enter+durable_merge_queue_identity"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "project_id": values["project_id"],
+        "coordination_backlog_id": str(
+            entered_row.get("backlog_id")
+            or entered_payload.get("backlog_id")
+            or ""
+        ).strip(),
+        "child_backlog_id": values["backlog_id"],
+        "child_task_id": values["task_id"],
+        "batch_id": values["batch_id"],
+        "merge_queue_id": values["merge_queue_id"],
+        "queue_item_id": canonical_queue_item_id,
+        "batch_enter_event_id": int(entered_row.get("id") or 0),
+        "required_worker_count": 1,
+        "worker_count_policy": "exactly",
+        "atomic_dispatch_required": False,
+        "standalone_mf_parallel_policy_unchanged": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 def _contract_runtime_mf_parallel_required_worker_count(
     record: Mapping[str, Any],
+    *,
+    conn=None,
+    project_id: str = "",
 ) -> int:
-    """Return the pinned atomic fanout cardinality (legacy revisions default to one)."""
+    """Return the server-verified effective mf_parallel worker cardinality."""
 
     policy = _contract_runtime_mf_parallel_dispatch_authority_policy(record)
     try:
         count = int(policy.get("required_worker_count") or 1)
     except (TypeError, ValueError):
         count = 1
-    return max(1, count)
+    pinned_count = max(1, count)
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    selection = (
+        metadata.get("observer_worker_cardinality_selection")
+        if isinstance(
+            metadata.get("observer_worker_cardinality_selection"), Mapping
+        )
+        else {}
+    )
+    if not selection:
+        if str(record.get("revision") or "").strip() == "rev8" and not policy:
+            return 2
+        return pinned_count
+    if selection.get("observer_selected") is not True:
+        # Compatibility for executions entered before observer cardinality was
+        # a first-class input. Fresh Desktop observers must select explicitly;
+        # only that explicit, hash-frozen selection can reduce a canonical
+        # batch child to one worker. Legacy omission retains the pre-cutover
+        # standalone exactly-two policy; it never infers one from batch shape.
+        return pinned_count
+    try:
+        selected_count = int(selection.get("required_worker_count"))
+    except (TypeError, ValueError):
+        return pinned_count
+    selection_valid = bool(
+        selection.get("observer_selected") is True
+        and selection.get("selection_frozen") is True
+        and str(selection.get("selection_origin") or "")
+        in {"mf_parallel_enter", "mf_parallel_revise"}
+        and str(selection.get("selection_hash") or "")
+        == stable_sha256(
+            {
+                key: value
+                for key, value in selection.items()
+                if key != "selection_hash"
+            }
+        )
+    )
+    if not selection_valid:
+        return pinned_count
+    if selected_count == 2:
+        return 2
+    if selected_count != 1:
+        return pinned_count
+    claimed = (
+        selection.get("batch_child_authority")
+        if isinstance(selection.get("batch_child_authority"), Mapping)
+        else {}
+    )
+    if not claimed:
+        return pinned_count
+    backlog_lineage = (
+        record.get("backlog_lineage")
+        if isinstance(record.get("backlog_lineage"), Mapping)
+        else {}
+    )
+    record_project_id = str(
+        project_id or record.get("project_id") or ""
+    ).strip()
+    record_backlog_id = str(record.get("backlog_id") or "").strip()
+    record_task_id = str(
+        backlog_lineage.get("task_id")
+        or claimed.get("child_task_id")
+        or ""
+    ).strip()
+    verified = _contract_runtime_mf_batch_child_worker_cardinality_authority(
+        conn,
+        project_id=record_project_id,
+        backlog_id=record_backlog_id,
+        task_id=record_task_id,
+        batch_id=str(claimed.get("batch_id") or ""),
+        merge_queue_id=str(claimed.get("merge_queue_id") or ""),
+        queue_item_id=str(claimed.get("queue_item_id") or ""),
+    )
+    if not (
+        verified.get("db_verified") is True
+        and verified.get("server_derived") is True
+        and str(verified.get("authority_hash") or "")
+        == stable_sha256(
+            {
+                key: value
+                for key, value in verified.items()
+                if key != "authority_hash"
+            }
+        )
+        and stable_sha256(verified) == stable_sha256(dict(claimed))
+        and selection_valid
+    ):
+        return pinned_count
+    return 1
+
+
+def _contract_runtime_mf_parallel_worker_cardinality_policy(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    required_worker_count = _contract_runtime_mf_parallel_required_worker_count(
+        record,
+        conn=conn,
+        project_id=project_id,
+    )
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    selection = (
+        metadata.get("observer_worker_cardinality_selection")
+        if isinstance(
+            metadata.get("observer_worker_cardinality_selection"), Mapping
+        )
+        else {}
+    )
+    batch_child = bool(
+        required_worker_count == 1
+        and str(record.get("revision") or "").strip() == "rev8"
+        and selection.get("observer_selected") is True
+        and isinstance(selection.get("batch_child_authority"), Mapping)
+        and selection.get("batch_child_authority")
+    )
+    revisions = (
+        metadata.get("observer_worker_cardinality_revisions")
+        if isinstance(
+            metadata.get("observer_worker_cardinality_revisions"), list
+        )
+        else []
+    )
+    latest_revision = next(
+        (
+            item
+            for item in reversed(revisions)
+            if isinstance(item, Mapping)
+        ),
+        {},
+    )
+    return {
+        "schema_version": "mf_parallel.effective_worker_cardinality_policy.v1",
+        "source": (
+            "verified_batch_child_lineage"
+            if batch_child
+            else (
+                "observer_selected_standalone_cardinality"
+                if selection.get("observer_selected") is True
+                else "legacy_implicit_cardinality_compatibility"
+            )
+        ),
+        "required_worker_count": required_worker_count,
+        "worker_count_policy": "exactly",
+        "atomic_dispatch_required": required_worker_count > 1,
+        "batch_row_scoped_successor": batch_child,
+        "standalone_mf_parallel_policy_unchanged": True,
+        "caller_override_allowed": False,
+        "fresh_mcp_contract_requires_explicit_selection": True,
+        "legacy_implicit_compatibility": (
+            selection.get("observer_selected") is not True
+        ),
+        "observer_selection_origin": str(
+            selection.get("selection_origin") or "pinned_contract_definition"
+        ),
+        "selection_hash": str(selection.get("selection_hash") or ""),
+        "latest_revision_id": str(latest_revision.get("revision_id") or ""),
+        "revision_contract": {
+            "interface": "mf_parallel_revise",
+            "method": "POST",
+            "path": (
+                "/api/projects/{project_id}/mf-parallel/"
+                "{contract_execution_id}/revise"
+            ),
+            "observer_only": True,
+            "allowed_before": "first_runtime_context_allocation_or_dispatch",
+            "ordinary_reenter_change_allowed": False,
+            "accepted_revisions_append_only": True,
+        },
+    }
 
 
 def _contract_runtime_mf_parallel_bounded_workers(
@@ -87495,7 +87916,11 @@ def _contract_runtime_bind_mf_parallel_dispatch_authority(
     required_worker_count = (
         int(_required_worker_count_override)
         if _required_worker_count_override is not None
-        else _contract_runtime_mf_parallel_required_worker_count(record)
+        else _contract_runtime_mf_parallel_required_worker_count(
+            record,
+            conn=conn,
+            project_id=project_id,
+        )
     )
     raw_bounded_workers = payload.get("bounded_workers")
     if (
@@ -88076,6 +88501,9 @@ def _contract_runtime_bind_mf_parallel_dispatch_authority(
         "runtime_context_bound": True,
         "observer_impersonation_explicit": True,
     }
+    payload["worker_count"] = required_worker_count
+    payload["required_worker_count"] = required_worker_count
+    payload["atomic_dispatch"] = False
     effective["observer_impersonation"] = False
     payload["observer_impersonation"] = False
     effective["payload"] = payload
@@ -88771,6 +89199,7 @@ _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "contract_runtime_recover",
     "runtime_context_read_receipt",
     "mf_parallel_enter",
+    "mf_parallel_revise",
     "mf_batch_parallel_enter",
     "task_timeline_append",
 )
@@ -88797,6 +89226,7 @@ _CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "contract_runtime_submit_line",
     "contract_runtime_bypass_line",
     "parallel_branch_allocate",
+    "mf_parallel_revise",
     "runtime_context_read_receipt",
     "task_timeline_append",
 )
@@ -100038,6 +100468,74 @@ def _mf_parallel_successor_runtime_enter(
                     "contract_id": str(successor.get("contract_id") or ""),
                 },
             )
+        persisted_metadata = (
+            successor.get("metadata")
+            if isinstance(successor.get("metadata"), Mapping)
+            else {}
+        )
+        persisted_cardinality = (
+            persisted_metadata.get("observer_worker_cardinality_selection")
+            if isinstance(
+                persisted_metadata.get(
+                    "observer_worker_cardinality_selection"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        requested_cardinality = (
+            metadata.get("observer_worker_cardinality_selection")
+            if isinstance(metadata, Mapping)
+            and isinstance(
+                metadata.get("observer_worker_cardinality_selection"),
+                Mapping,
+            )
+            else {}
+        )
+        persisted_effective_worker_count = (
+            _contract_runtime_mf_parallel_required_worker_count(
+                successor,
+                conn=conn,
+                project_id=project_id,
+            )
+            if persisted_cardinality
+            else 0
+        )
+        try:
+            requested_worker_count = int(
+                requested_cardinality.get("required_worker_count") or 0
+            )
+        except (TypeError, ValueError):
+            requested_worker_count = 0
+        if (
+            persisted_cardinality
+            and requested_cardinality
+            and requested_worker_count != persisted_effective_worker_count
+        ):
+            raise ValidationError(
+                "mf_parallel observer worker cardinality is frozen after enter",
+                {
+                    "contract_execution_id": successor_execution_id,
+                    "persisted_required_worker_count": (
+                        persisted_effective_worker_count
+                    ),
+                    "requested_required_worker_count": (
+                        requested_worker_count
+                    ),
+                    "caller_override_after_enter_allowed": False,
+                    "next_valid_action": {
+                        "interface": "mf_parallel_revise",
+                        "method": "POST",
+                        "path": (
+                            "/api/projects/{project_id}/mf-parallel/"
+                            "{contract_execution_id}/revise"
+                        ),
+                        "allowed_before": (
+                            "first_runtime_context_allocation_or_dispatch"
+                        ),
+                    },
+                },
+            )
         if route_token_ref and not str(successor.get("route_token_ref") or ""):
             successor["route_token_ref"] = route_token_ref
             store.update(successor_execution_id, successor)
@@ -100286,6 +100784,13 @@ def _mf_parallel_successor_runtime_enter(
         edge_kind="mf_parallel_child",
         binding_kind="mf_parallel_child_current",
     )
+    worker_cardinality_policy = (
+        _contract_runtime_mf_parallel_worker_cardinality_policy(
+            conn,
+            project_id=project_id,
+            record=successor,
+        )
+    )
     return {
         "schema_version": "mf_parallel_successor_runtime_enter.v1",
         "successor_contract": successor_contract,
@@ -100316,6 +100821,7 @@ def _mf_parallel_successor_runtime_enter(
             "actor_role": "qa",
             "observer_must_not_author": True,
         },
+        "worker_cardinality_policy": worker_cardinality_policy,
     }
 
 
@@ -117277,6 +117783,8 @@ def _contract_runtime_dispatch_ticket_authority(
 def _contract_runtime_qa_ticket_authority(
     record: Mapping[str, Any],
     current_state: Mapping[str, Any],
+    *,
+    postmerge_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Project one QA service ticket from the active QA-owned contract line."""
     next_action = current_state.get("next_legal_action")
@@ -117294,6 +117802,13 @@ def _contract_runtime_qa_ticket_authority(
         {"payload": dispatch}
     )
     atomic_fanout = len(bounded_workers) > 1
+    postmerge_authority = (
+        postmerge_authority
+        if isinstance(postmerge_authority, Mapping)
+        and postmerge_authority.get("verified") is True
+        else {}
+    )
+    canonical_postmerge_qa = bool(postmerge_authority)
     if atomic_fanout:
         bounded_workers = sorted(
             bounded_workers,
@@ -117317,7 +117832,7 @@ def _contract_runtime_qa_ticket_authority(
         }
     )
     worker_task_id = str(dispatch.get("task_id") or "").strip()
-    if atomic_fanout:
+    if atomic_fanout or canonical_postmerge_qa:
         execution_id = str(record.get("contract_execution_id") or "").strip()
         qa_task_id = "qa-integration-{}".format(execution_id)
         qa_identity = "qa:integration:{}".format(execution_id)
@@ -117356,7 +117871,7 @@ def _contract_runtime_qa_ticket_authority(
             },
         }
     )
-    if atomic_fanout:
+    if atomic_fanout or canonical_postmerge_qa:
         reconcile_lines = [
             line
             for _index, line in _contract_runtime_completed_lines(record)
@@ -117378,14 +117893,16 @@ def _contract_runtime_qa_ticket_authority(
             else {}
         )
         canonical_commit = str(
-            reconcile_authority.get("canonical_head_commit")
+            postmerge_authority.get("candidate_commit_sha")
+            or reconcile_authority.get("canonical_head_commit")
             or reconcile_authority.get("reconciled_commit_sha")
             or reconcile_payload.get("commit_sha")
             or reconcile_line.get("commit_sha")
             or ""
         ).strip()
         target_project_root = str(
-            dispatch.get("target_project_root")
+            postmerge_authority.get("target_project_root")
+            or dispatch.get("target_project_root")
             or dispatch.get("project_root")
             or dispatch.get("repo_root")
             or ""
@@ -117415,6 +117932,7 @@ def _contract_runtime_qa_ticket_authority(
                     for worker in bounded_workers
                 ],
                 "postmerge_canonical_qa": True,
+                "observer_selected_worker_cardinality": len(bounded_workers),
                 "graph_basis": "reconciled_canonical_head",
                 "independent_qa_required": True,
                 "canonical_candidate_commit": canonical_commit,
@@ -117476,9 +117994,27 @@ def _observer_runtime_text_contract_runtime_authority(
         record,
         current_state,
     )
+    rev8_postmerge_authority = (
+        _contract_runtime_rev8_postmerge_qa_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
+        if str(record.get("revision") or "").strip() == "rev8"
+        and str(
+            (current_state.get("next_legal_action") or {}).get("line_id")
+            if isinstance(
+                current_state.get("next_legal_action"), Mapping
+            )
+            else ""
+        ).strip()
+        in {"qa_graph_context", "qa_independent_verification"}
+        else {}
+    )
     qa_ticket_authority = _contract_runtime_qa_ticket_authority(
         record,
         current_state,
+        postmerge_authority=rev8_postmerge_authority,
     )
     if qa_ticket_authority.get("status") == "projected":
         current_state["next_legal_action"] = dict(
@@ -124175,6 +124711,102 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                     "next_legal_action": current_state.get("next_legal_action") or {},
                 },
             )
+        worker_cardinality_input = (
+            metadata.get("worker_cardinality")
+            if isinstance(metadata.get("worker_cardinality"), Mapping)
+            else metadata
+        )
+        observer_selected_cardinality = (
+            "required_worker_count" in worker_cardinality_input
+        )
+        raw_required_worker_count = worker_cardinality_input.get(
+            "required_worker_count",
+            2,
+        )
+        try:
+            required_worker_count = int(raw_required_worker_count)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "mf_parallel observer worker cardinality must be 1 or 2",
+                {"required_worker_count": raw_required_worker_count},
+            ) from exc
+        if required_worker_count not in {1, 2}:
+            raise ValidationError(
+                "mf_parallel observer worker cardinality must be 1 or 2",
+                {"required_worker_count": required_worker_count},
+            )
+        claimed_parent_batch_id = str(
+            body.get("parent_batch_id")
+            or body.get("batch_id")
+            or metadata.get("parent_batch_id")
+            or metadata.get("batch_id")
+            or ""
+        ).strip()
+        batch_child_authority: dict[str, Any] = {}
+        if claimed_parent_batch_id:
+            batch_child_authority = (
+                _contract_runtime_mf_batch_child_worker_cardinality_authority(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                    batch_id=claimed_parent_batch_id,
+                    merge_queue_id=str(
+                        body.get("merge_queue_id")
+                        or merge_queue_item.get("merge_queue_id")
+                        or metadata.get("merge_queue_id")
+                        or ""
+                    ).strip(),
+                    queue_item_id=str(
+                        merge_queue_item.get("queue_item_id") or ""
+                    ).strip(),
+                )
+            )
+        if required_worker_count == 1 and observer_selected_cardinality:
+            if not batch_child_authority:
+                raise ValidationError(
+                    "mf_parallel observer may select one worker only for a "
+                    "server-verified mf_batch_parallel row child",
+                    {
+                        "required_worker_count": required_worker_count,
+                        "parent_batch_id": str(
+                            body.get("parent_batch_id")
+                            or body.get("batch_id")
+                            or ""
+                        ).strip(),
+                        "merge_queue_id": str(
+                            body.get("merge_queue_id")
+                            or merge_queue_item.get("merge_queue_id")
+                            or ""
+                        ).strip(),
+                        "caller_override_allowed": False,
+                    },
+                )
+        worker_cardinality_selection = {
+            "schema_version": (
+                "mf_parallel.observer_worker_cardinality_selection.v1"
+            ),
+            "source": (
+                "authenticated_observer_mf_parallel_enter"
+                if observer_selected_cardinality
+                else "legacy_implicit_standalone_two_worker_compatibility"
+            ),
+            "observer_selected": observer_selected_cardinality,
+            "selection_origin": "mf_parallel_enter",
+            "selection_frozen": True,
+            "selection_frozen_at_enter": True,
+            "required_worker_count": required_worker_count,
+            "worker_count_policy": "exactly",
+            "atomic_dispatch_required": required_worker_count > 1,
+            "batch_row_scoped_successor": bool(batch_child_authority),
+            "batch_child_authority": batch_child_authority,
+            "caller_may_change_after_enter": False,
+            "fresh_mcp_contract_requires_explicit_selection": True,
+            "legacy_implicit_compatibility": not observer_selected_cardinality,
+        }
+        worker_cardinality_selection["selection_hash"] = stable_sha256(
+            worker_cardinality_selection
+        )
         row = conn.execute(
             "SELECT target_files, test_files FROM backlog_bugs WHERE bug_id = ?",
             (backlog_id,),
@@ -124206,6 +124838,13 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             "active_integration_epoch_canonical_successor": (
                 canonical_epoch_successor
             ),
+            "observer_worker_cardinality_selection": (
+                worker_cardinality_selection
+            ),
+            "observer_worker_cardinality_initial_selection": (
+                worker_cardinality_selection
+            ),
+            "observer_worker_cardinality_revisions": [],
         }
         if onboard_service_waiver:
             metadata = {
@@ -124241,6 +124880,7 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             "worker_fence": dict(worker_fence),
             "owned_files": list(owned_files),
             "target_files": list(target_files),
+            "worker_cardinality_selection": worker_cardinality_selection,
             "agent_facing_decision_source": (
                 "contract_runtime_first_missing_line"
             ),
@@ -124328,7 +124968,441 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             "qa_independent_verification"
         )
         or {},
+        "worker_cardinality_policy": successor_runtime.get(
+            "worker_cardinality_policy"
+        )
+        or {},
         "agent_facing_decision_source": "contract_runtime_first_missing_line",
+    }
+
+
+def _contract_runtime_mf_parallel_allocation_or_dispatch_evidence(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the immutable cutoff evidence for worker-cardinality revisions."""
+
+    from .parallel_branch_runtime import (
+        list_branch_contexts,
+        runtime_context_id_for_branch_context,
+    )
+
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    allocated_contexts: list[dict[str, str]] = []
+    for context in list_branch_contexts(conn, project_id):
+        if str(getattr(context, "backlog_id", "") or "").strip() != backlog_id:
+            continue
+        if _runtime_context_mf_sub_parent_task_id(context) != contract_execution_id:
+            continue
+        allocated_contexts.append(
+            {
+                "runtime_context_id": runtime_context_id_for_branch_context(context),
+                "task_id": str(getattr(context, "task_id", "") or "").strip(),
+                "status": str(getattr(context, "status", "") or "").strip(),
+            }
+        )
+
+    completed_lines = (
+        record.get("completed_lines")
+        if isinstance(record.get("completed_lines"), list)
+        else []
+    )
+    dispatch_lines = [
+        {
+            "stage_id": str(line.get("stage_id") or ""),
+            "line_id": str(line.get("line_id") or ""),
+            "evidence_kind": str(line.get("evidence_kind") or ""),
+        }
+        for line in completed_lines
+        if isinstance(line, Mapping)
+        and (
+            str(line.get("evidence_kind") or "").strip()
+            == "dispatch_bounded_worker"
+            or str(line.get("line_id") or "").strip()
+            == "observer_dispatch_bounded_workers"
+        )
+    ]
+    return {
+        "schema_version": "mf_parallel.worker_cardinality_revision_cutoff.v1",
+        "contract_execution_id": contract_execution_id,
+        "allocation_started": bool(allocated_contexts),
+        "dispatch_started": bool(dispatch_lines),
+        "revision_allowed": not allocated_contexts and not dispatch_lines,
+        "allocated_contexts": allocated_contexts,
+        "dispatch_lines": dispatch_lines,
+        "cutoff": "first_runtime_context_allocation_or_dispatch",
+    }
+
+
+@route(
+    "POST",
+    "/api/projects/{project_id}/mf-parallel/{contract_execution_id}/revise",
+)
+def handle_project_mf_parallel_revise(ctx: RequestContext):
+    """Revise observer-selected worker cardinality before allocation/dispatch."""
+
+    project_id = ctx.get_project_id()
+    contract_execution_id = str(
+        ctx.path_params.get("contract_execution_id") or ""
+    ).strip()
+    if not contract_execution_id:
+        raise ValidationError("mf_parallel revise requires contract_execution_id")
+    body = dict(ctx.body) if isinstance(ctx.body, Mapping) else {}
+    reason = str(body.get("reason") or body.get("human_reason") or "").strip()
+    if not reason:
+        raise ValidationError("mf_parallel revise requires a human reason")
+    raw_required_worker_count = body.get("required_worker_count")
+    try:
+        required_worker_count = int(raw_required_worker_count)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(
+            "mf_parallel revise required_worker_count must be 1 or 2",
+            {"required_worker_count": raw_required_worker_count},
+        ) from exc
+    if required_worker_count not in {1, 2}:
+        raise ValidationError(
+            "mf_parallel revise required_worker_count must be 1 or 2",
+            {"required_worker_count": required_worker_count},
+        )
+    route_token_ref = _contract_runtime_ref_value(
+        ctx, "route_token_ref", "observer_route_token_ref"
+    )
+    observer_session_id = _contract_runtime_ref_value(
+        ctx, "observer_session_id", "observer_session_ref"
+    )
+    if not route_token_ref:
+        raise ValidationError("mf_parallel revise requires route_token_ref")
+    if not observer_session_id:
+        raise ValidationError("mf_parallel revise requires observer_session_id")
+    body["route_token_ref"] = route_token_ref
+    body["observer_route_token_ref"] = route_token_ref
+    body["contract_execution_id"] = contract_execution_id
+    ctx.body = body
+
+    from . import task_timeline
+
+    with DBContext(project_id) as conn:
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        store = _contract_runtime_store(conn)
+        try:
+            record = store.get(contract_execution_id)
+        except ContractRuntimeError as exc:
+            raise GovernanceError(
+                "mf_parallel_contract_execution_not_found",
+                str(exc),
+                404,
+                {"contract_execution_id": contract_execution_id},
+            ) from exc
+        if str(record.get("project_id") or "") != project_id:
+            raise ValidationError(
+                "mf_parallel revise project scope mismatch",
+                {"contract_execution_id": contract_execution_id},
+            )
+        if not _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        ):
+            raise ValidationError(
+                "mf_parallel revise accepts only mf_parallel executions",
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "contract_id": str(record.get("contract_id") or ""),
+                },
+            )
+        backlog_id = str(record.get("backlog_id") or "").strip()
+        requested_backlog_id = str(
+            body.get("backlog_id") or body.get("bug_id") or ""
+        ).strip()
+        if requested_backlog_id and requested_backlog_id != backlog_id:
+            raise ValidationError(
+                "mf_parallel revise backlog scope mismatch",
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "expected_backlog_id": backlog_id,
+                    "requested_backlog_id": requested_backlog_id,
+                },
+            )
+        body["backlog_id"] = backlog_id
+        ctx.body = body
+        derived_actor_role = _contract_runtime_effective_actor_role(
+            ctx,
+            conn,
+            action="mf_parallel_revise",
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            record=record,
+        )
+        if derived_actor_role != "observer":
+            raise PermissionDeniedError(
+                derived_actor_role,
+                "mf_parallel_revise",
+                {"required_role": "observer"},
+            )
+        route_gate = _require_route_token_mutation_gate(
+            ctx,
+            action="mf_parallel_revise",
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+        )
+
+        cutoff = _contract_runtime_mf_parallel_allocation_or_dispatch_evidence(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
+        if not cutoff.get("revision_allowed"):
+            raise GovernanceError(
+                "mf_parallel_worker_cardinality_revision_after_allocation",
+                (
+                    "mf_parallel worker cardinality cannot change after the first "
+                    "RuntimeContext allocation or dispatch"
+                ),
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "revision_cutoff": cutoff,
+                    "ordinary_reenter_change_allowed": False,
+                    "fresh_successor_required": True,
+                },
+            )
+
+        current_required_worker_count = (
+            _contract_runtime_mf_parallel_required_worker_count(
+                record,
+                conn=conn,
+                project_id=project_id,
+            )
+        )
+        if required_worker_count == current_required_worker_count:
+            raise GovernanceError(
+                "mf_parallel_worker_cardinality_revision_noop",
+                "mf_parallel revise must change the effective worker count",
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "required_worker_count": required_worker_count,
+                },
+            )
+
+        metadata = (
+            dict(record.get("metadata"))
+            if isinstance(record.get("metadata"), Mapping)
+            else {}
+        )
+        current_selection = (
+            dict(metadata.get("observer_worker_cardinality_selection"))
+            if isinstance(
+                metadata.get("observer_worker_cardinality_selection"), Mapping
+            )
+            else {}
+        )
+        initial_selection = (
+            dict(metadata.get("observer_worker_cardinality_initial_selection"))
+            if isinstance(
+                metadata.get("observer_worker_cardinality_initial_selection"),
+                Mapping,
+            )
+            else dict(current_selection)
+        )
+        batch_child_authority = (
+            dict(initial_selection.get("batch_child_authority"))
+            if isinstance(initial_selection.get("batch_child_authority"), Mapping)
+            else (
+                dict(current_selection.get("batch_child_authority"))
+                if isinstance(
+                    current_selection.get("batch_child_authority"), Mapping
+                )
+                else {}
+            )
+        )
+        if required_worker_count == 1:
+            verified_authority = (
+                _contract_runtime_mf_batch_child_worker_cardinality_authority(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    task_id=str(
+                        batch_child_authority.get("child_task_id") or ""
+                    ),
+                    batch_id=str(batch_child_authority.get("batch_id") or ""),
+                    merge_queue_id=str(
+                        batch_child_authority.get("merge_queue_id") or ""
+                    ),
+                    queue_item_id=str(
+                        batch_child_authority.get("queue_item_id") or ""
+                    ),
+                )
+            )
+            if not (
+                verified_authority.get("db_verified") is True
+                and verified_authority.get("server_derived") is True
+                and stable_sha256(verified_authority)
+                == stable_sha256(batch_child_authority)
+            ):
+                raise GovernanceError(
+                    "mf_parallel_single_worker_revision_requires_batch_child",
+                    (
+                        "one worker may be selected only for a server-verified "
+                        "mf_batch_parallel row child"
+                    ),
+                    422,
+                    {
+                        "contract_execution_id": contract_execution_id,
+                        "required_worker_count": required_worker_count,
+                        "caller_override_allowed": False,
+                    },
+                )
+            batch_child_authority = dict(verified_authority)
+
+        prior_revisions = (
+            list(metadata.get("observer_worker_cardinality_revisions"))
+            if isinstance(
+                metadata.get("observer_worker_cardinality_revisions"), list
+            )
+            else []
+        )
+        revision_number = len(prior_revisions) + 1
+        revised_at = _utc_now()
+        revision_id = _contract_runtime_stable_id(
+            "mfpcardrev",
+            contract_execution_id,
+            str(revision_number),
+            str(current_required_worker_count),
+            str(required_worker_count),
+            reason,
+        )
+        selection = {
+            "schema_version": "mf_parallel.observer_worker_cardinality_selection.v1",
+            "source": "authenticated_observer_mf_parallel_revise",
+            "observer_selected": True,
+            "selection_origin": "mf_parallel_revise",
+            "selection_frozen": True,
+            "selection_frozen_at_enter": False,
+            "required_worker_count": required_worker_count,
+            "worker_count_policy": "exactly",
+            "atomic_dispatch_required": required_worker_count > 1,
+            "batch_row_scoped_successor": bool(batch_child_authority),
+            "batch_child_authority": batch_child_authority,
+            "caller_may_change_after_enter": False,
+            "fresh_mcp_contract_requires_explicit_selection": True,
+            "legacy_implicit_compatibility": False,
+            "revision_id": revision_id,
+            "revision_number": revision_number,
+            "prior_selection_hash": str(
+                current_selection.get("selection_hash") or ""
+            ),
+        }
+        selection["selection_hash"] = stable_sha256(selection)
+        revision = {
+            "schema_version": "mf_parallel.worker_cardinality_revision.v1",
+            "revision_id": revision_id,
+            "revision_number": revision_number,
+            "contract_execution_id": contract_execution_id,
+            "backlog_id": backlog_id,
+            "prior_required_worker_count": current_required_worker_count,
+            "required_worker_count": required_worker_count,
+            "prior_selection_hash": str(
+                current_selection.get("selection_hash") or ""
+            ),
+            "selection_hash": selection["selection_hash"],
+            "authority_hash": str(
+                batch_child_authority.get("authority_hash") or ""
+            ),
+            "reason": reason,
+            "actor": "observer",
+            "route_token_ref": route_token_ref,
+            "observer_session_id": observer_session_id,
+            "accepted_before_allocation_or_dispatch": True,
+            "revised_at": revised_at,
+        }
+        revision["revision_hash"] = stable_sha256(revision)
+        metadata.setdefault(
+            "observer_worker_cardinality_initial_selection",
+            initial_selection,
+        )
+        metadata["observer_worker_cardinality_selection"] = selection
+        metadata["observer_worker_cardinality_revisions"] = [
+            *prior_revisions,
+            revision,
+        ]
+        updated = dict(record)
+        updated["metadata"] = metadata
+        updated = store.update(
+            contract_execution_id,
+            updated,
+            expected_revision=int(record.get("execution_state_revision") or 0),
+        )
+        runtime = _contract_runtime(conn)
+        runtime.current_guide(contract_execution_id, actor_role="observer")
+        updated = store.get(contract_execution_id)
+        policy = _contract_runtime_mf_parallel_worker_cardinality_policy(
+            conn,
+            project_id=project_id,
+            record=updated,
+        )
+        _record_route_token_gate_event(
+            conn,
+            project_id,
+            route_gate,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+        )
+        event = task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+            event_type="mf_parallel.worker_cardinality_revised",
+            phase="orchestration",
+            event_kind="contract_binding",
+            actor="observer",
+            status="accepted",
+            decision="accepted_before_allocation_or_dispatch",
+            payload={
+                "schema_version": "mf_parallel.worker_cardinality_revised.v1",
+                "contract_change_kind": "append_only_contract_revision",
+                "revision": revision,
+                "worker_cardinality_policy": policy,
+                "revision_cutoff": cutoff,
+                "route_token_gate": _route_gate_public_summary(route_gate),
+                "ordinary_reenter_change_allowed": False,
+                "pass_claimed": False,
+            },
+            artifact_refs={
+                "contract_execution_id": contract_execution_id,
+                "backlog_id": backlog_id,
+                "revision_id": revision_id,
+                "revision_hash": revision["revision_hash"],
+                "selection_hash": selection["selection_hash"],
+                "route_token_ref": route_token_ref,
+            },
+        )
+        conn.commit()
+
+    current_state = _runtime_current_state_from_record(updated)
+    return {
+        "ok": True,
+        "schema_version": "mf_parallel_revise.runtime_contract_response.v1",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "revision": revision,
+        "event": event,
+        "worker_cardinality_policy": policy,
+        "runtime_guide": updated.get("runtime_guide") or {},
+        "contract_runtime_current_state": current_state,
+        "next_legal_action": current_state.get("next_legal_action") or {},
+        "execution_state_revision": updated.get("execution_state_revision", 0),
+        "execution_state_hash": updated.get("execution_state_hash", ""),
+        "route_token_ref": route_token_ref,
+        "ordinary_reenter_change_allowed": False,
+        "raw_route_token_exposed": False,
     }
 
 
@@ -124635,12 +125709,39 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                 "path": "/api/projects/{project_id}/mf-parallel/enter",
                 "requires_distinct_route_token_ref": True,
                 "route_token_task_id_policy": "mf_parallel_successor_execution_id",
+                "route_token_allowed_actions": [
+                    "mf_parallel_enter",
+                    "mf_parallel_revise",
+                ],
                 "acceptance_scope_closure": dict(
                     acceptance_scope_closures.get(row_id) or {}
                 ),
                 "owned_files": list(
                     queue_items_by_backlog.get(row_id, {}).get("owned_files") or []
                 ),
+                "observer_worker_cardinality_input": {
+                    "schema_version": (
+                        "mf_batch_parallel.observer_worker_cardinality_input.v1"
+                    ),
+                    "input_path": "body.metadata.required_worker_count",
+                    "observer_must_select": True,
+                    "recommended_worker_count": 1,
+                    "allowed_worker_counts": [1, 2],
+                    "selection_frozen_by": "mf_parallel_enter",
+                    "caller_override_after_enter_allowed": False,
+                    "revision_entrypoint": {
+                        "interface": "mf_parallel_revise",
+                        "method": "POST",
+                        "path": (
+                            "/api/projects/{project_id}/mf-parallel/"
+                            "{contract_execution_id}/revise"
+                        ),
+                        "allowed_before": (
+                            "first_runtime_context_allocation_or_dispatch"
+                        ),
+                        "accepted_revisions_append_only": True,
+                    },
+                },
                 "merge_queue": {
                     key: queue_items_by_backlog.get(row_id, {}).get(key)
                     for key in (

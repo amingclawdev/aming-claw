@@ -1882,7 +1882,8 @@ TOOLS: list[dict] = [
         "name": "mf_parallel_enter",
         "description": (
             "Enter source-backed mf_parallel successor runtime only after "
-            "onboard_route_guide selects it as the next interface."
+            "onboard_route_guide selects it as the next interface. The "
+            "observer must explicitly select metadata.required_worker_count."
         ),
         "inputSchema": {
             "type": "object",
@@ -1921,12 +1922,77 @@ TOOLS: list[dict] = [
                     "type": "array",
                     "items": {"type": "string"},
                 },
-                "metadata": {"type": "object"},
+                "metadata": {
+                    "type": "object",
+                    "properties": {
+                        "required_worker_count": {
+                            "type": "integer",
+                            "enum": [1, 2],
+                        },
+                    },
+                    "required": ["required_worker_count"],
+                },
             },
-            "required": ["project_id", "reason"],
+            "required": [
+                "project_id",
+                "reason",
+                "metadata",
+                "observer_session_id",
+            ],
             "anyOf": [
                 {"required": ["backlog_id"]},
                 {"required": ["bug_id"]},
+            ],
+            "allOf": [
+                {
+                    "anyOf": [
+                        {"required": ["route_token_ref"]},
+                        {"required": ["observer_route_token_ref"]},
+                    ]
+                }
+            ],
+        },
+    },
+    {
+        "name": "mf_parallel_revise",
+        "description": (
+            "Revise an observer-selected mf_parallel worker count before the "
+            "first RuntimeContext allocation or dispatch. Ordinary re-enter "
+            "cannot change the frozen selection."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "contract_execution_id": {"type": "string"},
+                "required_worker_count": {
+                    "type": "integer",
+                    "enum": [1, 2],
+                },
+                "reason": {"type": "string"},
+                "human_reason": {"type": "string"},
+                "observer_session_id": {"type": "string"},
+                "route_token_ref": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": (
+                        "Opaque child-scoped observer route-token ref; raw "
+                        "route tokens are not accepted."
+                    ),
+                },
+            },
+            "required": [
+                "project_id",
+                "backlog_id",
+                "contract_execution_id",
+                "required_worker_count",
+                "reason",
+                "observer_session_id",
+            ],
+            "anyOf": [
+                {"required": ["route_token_ref"]},
+                {"required": ["observer_route_token_ref"]},
             ],
         },
     },
@@ -3069,6 +3135,23 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             if key != "project_id" and value is not None
         }
         return _http("POST", f"/api/projects/{pid}/mf-parallel/enter", body)
+
+    if name == "mf_parallel_revise":
+        pid = args["project_id"]
+        execution_id = urllib.parse.quote(
+            str(args["contract_execution_id"]), safe=""
+        )
+        body = {
+            key: value
+            for key, value in args.items()
+            if key not in {"project_id", "contract_execution_id"}
+            and value is not None
+        }
+        return _http(
+            "POST",
+            f"/api/projects/{pid}/mf-parallel/{execution_id}/revise",
+            body,
+        )
 
     if name == "mf_batch_parallel_enter":
         pid = args["project_id"]

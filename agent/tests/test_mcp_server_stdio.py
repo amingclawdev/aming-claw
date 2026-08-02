@@ -426,7 +426,7 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert stderr == ""
     tools = responses[0]["result"]["tools"]
     schema_meta = responses[0]["result"]["_meta"]["aming_claw_tool_schema"]
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-02.2"
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-02.3"
     assert schema_meta["loaded_client_tool_schema_version"] == (
         MCP_TOOL_SCHEMA_VERSION
     )
@@ -440,6 +440,7 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert {
         "observer_hotfix_enter",
         "mf_parallel_enter",
+        "mf_parallel_revise",
         "mf_batch_parallel_enter",
         "runtime_context_implementation_evidence",
         "runtime_context_worker_commit",
@@ -546,7 +547,14 @@ def test_mf_parallel_enter_schemas_require_backlog_scope_and_worker_fence():
             tool for tool in tools if tool["name"] == "mf_parallel_enter"
         )
         schema = mf_parallel_enter["inputSchema"]
-        assert {"project_id", "reason"}.issubset(schema["required"])
+        assert {
+            "project_id",
+            "reason",
+            "metadata",
+            "observer_session_id",
+        }.issubset(
+            schema["required"]
+        )
         assert {
             "backlog_id",
             "bug_id",
@@ -557,8 +565,35 @@ def test_mf_parallel_enter_schemas_require_backlog_scope_and_worker_fence():
             "contract_execution_id",
             "onboard_service_waiver",
         }.issubset(schema["properties"])
+        metadata_schema = schema["properties"]["metadata"]
+        assert metadata_schema["required"] == ["required_worker_count"]
+        assert metadata_schema["properties"]["required_worker_count"][
+            "enum"
+        ] == [1, 2]
         assert {"required": ["backlog_id"]} in schema["anyOf"]
         assert {"required": ["bug_id"]} in schema["anyOf"]
+        route_ref_any_of = schema["allOf"][0]["anyOf"]
+        assert {"required": ["route_token_ref"]} in route_ref_any_of
+        assert {"required": ["observer_route_token_ref"]} in route_ref_any_of
+
+
+def test_mf_parallel_revise_schemas_require_observer_scope_and_bounded_count():
+    for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
+        revise = next(
+            tool for tool in tools if tool["name"] == "mf_parallel_revise"
+        )
+        schema = revise["inputSchema"]
+        assert {
+            "project_id",
+            "backlog_id",
+            "contract_execution_id",
+            "required_worker_count",
+            "reason",
+            "observer_session_id",
+        }.issubset(schema["required"])
+        assert schema["properties"]["required_worker_count"]["enum"] == [1, 2]
+        assert {"required": ["route_token_ref"]} in schema["anyOf"]
+        assert {"required": ["observer_route_token_ref"]} in schema["anyOf"]
 
 
 def test_mf_batch_parallel_enter_schemas_require_batch_scope():
@@ -765,9 +800,11 @@ def test_governance_mcp_mf_parallel_enter_dispatches_to_runtime_facade(monkeypat
             "reason": "Human approved parallel repair.",
             "actor_role": "observer",
             "route_token_ref": "rtok-parallel",
+            "observer_session_id": "obs-parallel",
             "onboard_service_waiver": True,
             "worker_fence": {"fence_token": "fence-parallel"},
             "owned_files": ["agent/governance/server.py"],
+            "metadata": {"required_worker_count": 2},
         },
     )
 
@@ -782,9 +819,49 @@ def test_governance_mcp_mf_parallel_enter_dispatches_to_runtime_facade(monkeypat
                 "reason": "Human approved parallel repair.",
                 "actor_role": "observer",
                 "route_token_ref": "rtok-parallel",
+                "observer_session_id": "obs-parallel",
                 "onboard_service_waiver": True,
                 "worker_fence": {"fence_token": "fence-parallel"},
                 "owned_files": ["agent/governance/server.py"],
+                "metadata": {"required_worker_count": 2},
+            },
+        )
+    ]
+
+
+def test_governance_mcp_mf_parallel_revise_dispatches_to_runtime_facade(monkeypatch):
+    calls = []
+
+    def fake_http(method, path, body=None):
+        calls.append((method, path, body))
+        return {"ok": True, "revision": {"revision_id": "card-rev-1"}}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+
+    result = governance_mcp_server._dispatch_tool(
+        "mf_parallel_revise",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-PARALLEL",
+            "contract_execution_id": "cex-mf/parallel",
+            "required_worker_count": 1,
+            "reason": "Observer reduces the batch row before allocation.",
+            "observer_session_id": "obs-parallel",
+            "observer_route_token_ref": "rtok-parallel-child",
+        },
+    )
+
+    assert result["revision"]["revision_id"] == "card-rev-1"
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/mf-parallel/cex-mf%2Fparallel/revise",
+            {
+                "backlog_id": "AC-PARALLEL",
+                "required_worker_count": 1,
+                "reason": "Observer reduces the batch row before allocation.",
+                "observer_session_id": "obs-parallel",
+                "observer_route_token_ref": "rtok-parallel-child",
             },
         )
     ]
@@ -946,9 +1023,11 @@ def test_tool_dispatcher_mf_parallel_enter_posts_runtime_facade():
             "reason": "Human approved parallel repair.",
             "actor_role": "observer",
             "route_token_ref": "rtok-parallel",
+            "observer_session_id": "obs-parallel",
             "onboard_service_waiver": True,
             "worker_fence": {"fence_token": "fence-parallel"},
             "owned_files": ["agent/governance/server.py"],
+            "metadata": {"required_worker_count": 2},
         },
     )
 
@@ -963,9 +1042,54 @@ def test_tool_dispatcher_mf_parallel_enter_posts_runtime_facade():
                 "reason": "Human approved parallel repair.",
                 "actor_role": "observer",
                 "route_token_ref": "rtok-parallel",
+                "observer_session_id": "obs-parallel",
                 "onboard_service_waiver": True,
                 "worker_fence": {"fence_token": "fence-parallel"},
                 "owned_files": ["agent/governance/server.py"],
+                "metadata": {"required_worker_count": 2},
+            },
+        )
+    ]
+
+
+def test_tool_dispatcher_mf_parallel_revise_posts_runtime_facade():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "revision": {"revision_id": "card-rev-1"}}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+
+    result = dispatcher.dispatch(
+        "mf_parallel_revise",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-PARALLEL",
+            "contract_execution_id": "cex-mf/parallel",
+            "required_worker_count": 1,
+            "reason": "Observer reduces the batch row before allocation.",
+            "observer_session_id": "obs-parallel",
+            "observer_route_token_ref": "rtok-parallel-child",
+        },
+    )
+
+    assert result["revision"]["revision_id"] == "card-rev-1"
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/mf-parallel/cex-mf%2Fparallel/revise",
+            {
+                "backlog_id": "AC-PARALLEL",
+                "required_worker_count": 1,
+                "reason": "Observer reduces the batch row before allocation.",
+                "observer_session_id": "obs-parallel",
+                "observer_route_token_ref": "rtok-parallel-child",
             },
         )
     ]
