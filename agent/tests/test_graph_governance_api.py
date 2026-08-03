@@ -22849,6 +22849,11 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
                     **common_body,
                     "changed_files": [changed_path],
                     "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "test_results": {
+                        "status": "passed",
+                        "passed": True,
+                        "command": "pytest -q",
+                    },
                     "finish_gate_event_ref": finish["timeline_event"]["event_ref"],
                     "payload": {"worker_role": "mf_sub"},
                     "route_token_gate": {"caller_role": "observer"},
@@ -22904,6 +22909,11 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
                             "status": "passed",
                         }
                     ],
+                    "test_results": {
+                        "status": "passed",
+                        "passed": True,
+                        "command": "pytest -q agent/tests/test_graph_governance_api.py",
+                    },
                     "finish_gate_event_ref": finish["timeline_event"]["event_ref"],
                     "payload": {
                         "caller_role": "observer",
@@ -83182,6 +83192,11 @@ def test_timeline_precheck_enriches_ref_only_registry_child_lineage(conn, tmp_pa
                 "route_token": child_issue["route_token"],
                 "changed_files": ["agent/governance/server.py"],
                 "tests": [{"command": "pytest -q", "status": "passed"}],
+                "test_results": {
+                    "status": "passed",
+                    "passed": True,
+                    "command": "pytest -q",
+                },
                 "payload": {
                     "worker_role": "mf_sub",
                     "summary": "worker appended implementation evidence",
@@ -112433,6 +112448,29 @@ def test_direct_main_failed_qa_guide_forces_fresh_same_contract_successor(
     assert action["same_row_resume_allowed"] is False
     assert action["separate_bounded_successor_row_required"] is True
     assert action["mf_parallel_enter_allowed"] is False
+    archive_input = action["archive_action_input"]
+    assert archive_input["source_backlog_id"] == backlog_id
+    assert archive_input["commit"] == lineage["commit_sha"]
+    assert archive_input["qa_acceptance"] == {
+        "terminal_disposition": "direct_main_failed_qa_terminal",
+        "passed": False,
+        "status": "failed",
+        "reviewer": "<copy the authenticated independent QA reviewer>",
+        "reviewer_role": "qa",
+        "tests": ["<copy the failed QA test command or result ref>"],
+        "artifacts": [lineage["failed_qa_source_ref"]],
+        "source_backlog_id": backlog_id,
+        "source_task_id": lineage["task_id"],
+        "source_direct_main_event_ref": lineage["direct_event_ref"],
+        "implementation_event_ref": lineage["implementation_event_ref"],
+        "implementation_commit": lineage["commit_sha"],
+        "failed_qa_source_ref": lineage["failed_qa_source_ref"],
+        "failed_qa_status": "failed",
+    }
+    assert action["archive_action_input_path"] == (
+        "next_legal_action.archive_action_input"
+    )
+    assert action["ordinary_passed_qa_archive_unchanged"] is True
     transition = action["explicit_cross_contract_transition"]
     assert transition["default_allowed"] is False
     assert transition["schema_version"] == (
@@ -112445,6 +112483,211 @@ def test_direct_main_failed_qa_guide_forces_fresh_same_contract_successor(
     assert "direct_main_failed_qa_rework" in compact["guide_capsule"][
         "available_sections"
     ]
+
+
+def _direct_main_failed_qa_audit_archive_body(
+    *,
+    backlog_id: str,
+    lineage: Mapping[str, str],
+) -> dict[str, Any]:
+    failed_qa_source_ref = lineage["failed_qa_source_ref"]
+    return {
+        "commit": lineage["commit_sha"],
+        "reason": (
+            "Independent QA rejected the direct-main candidate; the failed source "
+            "generation is terminal and its close-ready PASS cannot be reconstructed."
+        ),
+        "source_backlog_id": backlog_id,
+        "timeline_precheck": {
+            "can_close": False,
+            "failed_gates": ["independent_verification_failed"],
+        },
+        "failure_audit": {
+            "what_happened": "Independent QA rejected the direct-main implementation.",
+            "non_reconstructable_evidence_reason": (
+                "A QA PASS and close_ready event cannot be backfilled for a rejected "
+                "candidate without fabricating append-only evidence."
+            ),
+        },
+        "qa_acceptance": {
+            "terminal_disposition": "direct_main_failed_qa_terminal",
+            "passed": False,
+            "status": "failed",
+            "reviewer": "qa:direct-main-route",
+            "reviewer_role": "qa",
+            "tests": ["pytest -q agent/tests/test_graph_governance_api.py"],
+            "artifacts": [failed_qa_source_ref],
+            "source_backlog_id": backlog_id,
+            "source_task_id": lineage["task_id"],
+            "source_direct_main_event_ref": lineage["direct_event_ref"],
+            "implementation_event_ref": lineage["implementation_event_ref"],
+            "implementation_commit": lineage["commit_sha"],
+            "failed_qa_source_ref": failed_qa_source_ref,
+            "failed_qa_status": "failed",
+        },
+        "verification": {
+            "tests": ["pytest -q agent/tests/test_graph_governance_api.py"],
+            "failed_qa_source_ref": failed_qa_source_ref,
+        },
+        "graph_snapshot": {
+            "snapshot_id": "candidate-direct-main-failed-qa",
+            "commit_sha": lineage["commit_sha"],
+        },
+        "route_waiver": _route_waiver(
+            "backlog_audit_archive",
+            task_id=lineage["task_id"],
+            backlog_id=backlog_id,
+        ),
+        "actor": "observer",
+    }
+
+
+def test_audit_archive_accepts_db_verified_direct_main_failed_qa_terminal(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-DIRECT-MAIN-FAILED-QA-TRUTHFUL-AUDIT-ARCHIVE"
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_observer_direct_independent_verification_event",
+        lambda *_args, **_kwargs: True,
+    )
+
+    result = server.handle_backlog_audit_archive(
+        _ctx_with_role(
+            {"project_id": PID, "bug_id": backlog_id},
+            "observer",
+            method="POST",
+            body=_direct_main_failed_qa_audit_archive_body(
+                backlog_id=backlog_id,
+                lineage=lineage,
+            ),
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "WAIVED"
+    archive = result["audit_archive"]
+    terminal = archive["qa_acceptance"]
+    assert terminal["passed"] is False
+    assert terminal["rejected_candidate"] is True
+    assert terminal["authenticated_failed_qa_terminal"] is True
+    assert terminal["close_satisfying"] is False
+    assert terminal["audit_only"] is True
+    assert terminal["failed_qa_source_ref"] == lineage["failed_qa_source_ref"]
+    gate = archive["audit_close_gate"]
+    assert gate["can_archive"] is True
+    assert gate["qa_acceptance_passed"] is False
+    assert gate["qa_terminal_disposition_verified"] is True
+    assert gate["normal_close_gate_can_close"] is False
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone()
+    assert row["status"] == "WAIVED"
+
+
+@pytest.mark.parametrize(
+    ("claim_path", "forged_value", "expected_field"),
+    [
+        ("source_backlog_id", "AC-WRONG-SOURCE-ROW", "source_backlog_id"),
+        (
+            "qa_acceptance.source_task_id",
+            "onboard-service-stale-task",
+            "qa_acceptance.source_task_id",
+        ),
+        (
+            "commit",
+            "b" * 40,
+            "implementation_commit",
+        ),
+        (
+            "qa_acceptance.failed_qa_source_ref",
+            "timeline:999999",
+            "qa_acceptance.failed_qa_source_ref",
+        ),
+    ],
+)
+def test_audit_archive_rejects_forged_direct_main_failed_qa_claims_zero_write(
+    conn,
+    monkeypatch,
+    claim_path,
+    forged_value,
+    expected_field,
+):
+    suffix = expected_field.replace(".", "-").upper()
+    backlog_id = f"AC-DIRECT-MAIN-FAILED-QA-ARCHIVE-REJECT-{suffix}"
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_observer_direct_independent_verification_event",
+        lambda *_args, **_kwargs: True,
+    )
+    body = _direct_main_failed_qa_audit_archive_body(
+        backlog_id=backlog_id,
+        lineage=lineage,
+    )
+    if claim_path.startswith("qa_acceptance."):
+        body["qa_acceptance"][claim_path.split(".", 1)[1]] = forged_value
+    else:
+        body[claim_path] = forged_value
+
+    with pytest.raises(ValidationError) as exc_info:
+        server.handle_backlog_audit_archive(
+            _ctx_with_role(
+                {"project_id": PID, "bug_id": backlog_id},
+                "observer",
+                method="POST",
+                body=body,
+            )
+        )
+
+    assert exc_info.value.details["field"] == expected_field
+    assert exc_info.value.details["zero_write_rejection"] is True
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone()
+    assert row["status"] != "WAIVED"
+
+
+def test_audit_archive_rejects_unauthenticated_direct_main_failed_qa_zero_write(
+    conn,
+):
+    backlog_id = "AC-DIRECT-MAIN-FAILED-QA-ARCHIVE-REJECT-UNAUTHENTICATED"
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+    )
+    body = _direct_main_failed_qa_audit_archive_body(
+        backlog_id=backlog_id,
+        lineage=lineage,
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        server.handle_backlog_audit_archive(
+            _ctx_with_role(
+                {"project_id": PID, "bug_id": backlog_id},
+                "observer",
+                method="POST",
+                body=body,
+            )
+        )
+
+    assert exc_info.value.details["field"] == "direct_main_failed_qa_state"
+    assert exc_info.value.details["zero_write_rejection"] is True
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone()
+    assert row["status"] != "WAIVED"
 
 
 def test_mf_parallel_enter_rejects_direct_main_failed_qa_before_any_write(

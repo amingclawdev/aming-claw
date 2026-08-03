@@ -94953,6 +94953,16 @@ def _onboard_parentless_direct_main_failed_qa_next_action(
     failed_qa_source_ref = str(
         failed_qa_state.get("failed_qa_source_ref") or ""
     ).strip()
+    source_backlog_id = str(
+        failed_qa_state.get("source_backlog_id") or ""
+    ).strip()
+    source_task_id = str(failed_qa_state.get("source_task_id") or "").strip()
+    implementation_commit = str(
+        failed_qa_state.get("implementation_commit") or ""
+    ).strip()
+    failed_qa_status = str(
+        failed_qa_state.get("failed_qa_status") or ""
+    ).strip()
     return {
         "schema_version": "onboard_route_guide.direct_main_failed_qa_successor.v1",
         "id": "operator_supervised_direct_main_failed_qa_rework",
@@ -94971,6 +94981,61 @@ def _onboard_parentless_direct_main_failed_qa_next_action(
         "failed_qa_source_ref": failed_qa_source_ref,
         "failed_qa_status": str(failed_qa_state.get("failed_qa_status") or ""),
         "mf_parallel_enter_allowed": False,
+        "archive_action_input": {
+            "source_backlog_id": source_backlog_id,
+            "commit": implementation_commit,
+            "reason": (
+                "Independent QA rejected this direct-main generation; preserve "
+                "the failed candidate as audit-only and terminate the source row."
+            ),
+            "timeline_precheck": {
+                "can_close": False,
+                "failed_gates": ["independent_verification_failed"],
+            },
+            "failure_audit": {
+                "what_happened": (
+                    "Independent QA rejected the direct-main implementation."
+                ),
+                "non_reconstructable_evidence_reason": (
+                    "A QA PASS and close_ready event cannot be backfilled for a "
+                    "rejected candidate without fabricating append-only evidence."
+                ),
+            },
+            "qa_acceptance": {
+                "terminal_disposition": "direct_main_failed_qa_terminal",
+                "passed": False,
+                "status": failed_qa_status,
+                "reviewer": "<copy the authenticated independent QA reviewer>",
+                "reviewer_role": "qa",
+                "tests": ["<copy the failed QA test command or result ref>"],
+                "artifacts": [failed_qa_source_ref],
+                "source_backlog_id": source_backlog_id,
+                "source_task_id": source_task_id,
+                "source_direct_main_event_ref": str(
+                    failed_qa_state.get("source_direct_main_event_ref") or ""
+                ),
+                "implementation_event_ref": str(
+                    failed_qa_state.get("implementation_event_ref") or ""
+                ),
+                "implementation_commit": implementation_commit,
+                "failed_qa_source_ref": failed_qa_source_ref,
+                "failed_qa_status": failed_qa_status,
+            },
+            "verification": {
+                "failed_qa_source_ref": failed_qa_source_ref,
+                "tests": ["<copy the failed QA test command or result ref>"],
+            },
+            "graph_snapshot": {
+                "snapshot_id": "<copy the rejected candidate snapshot id>",
+                "commit_sha": implementation_commit,
+            },
+        },
+        "archive_action_input_path": "next_legal_action.archive_action_input",
+        "archive_copy_rule": (
+            "Copy the server-projected source identity fields exactly; replace "
+            "only reviewer/test/snapshot placeholders with authenticated evidence."
+        ),
+        "ordinary_passed_qa_archive_unchanged": True,
         "required_sequence": [
             "preserve the failed source generation as raw audit",
             "audit-WAIVE the source row without synthesizing PASS",
@@ -98559,6 +98624,7 @@ def _onboard_guide_capsule_find_action_input(
 ) -> tuple[dict[str, Any], str]:
     candidate_keys = (
         "action_input",
+        "archive_action_input",
         "copy_safe_body",
         "body",
         "request_body",
@@ -99539,6 +99605,23 @@ def _onboard_route_guide_compact_service_response(
             "mf_parallel_enter_allowed": (
                 False
                 if next_action.get("mf_parallel_enter_allowed") is False
+                else None
+            ),
+            "archive_action_input": (
+                dict(next_action.get("archive_action_input"))
+                if isinstance(next_action.get("archive_action_input"), Mapping)
+                else {}
+            ),
+            "archive_action_input_path": str(
+                next_action.get("archive_action_input_path") or ""
+            ),
+            "archive_copy_rule": str(
+                next_action.get("archive_copy_rule") or ""
+            ),
+            "ordinary_passed_qa_archive_unchanged": (
+                True
+                if next_action.get("ordinary_passed_qa_archive_unchanged")
+                is True
                 else None
             ),
             "required_sequence": list(
@@ -128285,14 +128368,252 @@ def _qa_acceptance_passed(qa_acceptance: Mapping[str, Any]) -> bool:
     return status in {"pass", "passed", "accepted", "approved", "pass_with_followups"}
 
 
+_AUDIT_ARCHIVE_DIRECT_MAIN_FAILED_QA_TERMINAL_DISPOSITION = (
+    "direct_main_failed_qa_terminal"
+)
+
+
+def _raise_audit_archive_field_mismatch(
+    *,
+    field: str,
+    expected: Any,
+    actual: Any,
+    message: str,
+) -> None:
+    mismatch = {"field": field, "expected": expected, "actual": actual}
+    raise ValidationError(
+        message,
+        {
+            **mismatch,
+            "mismatches": [mismatch],
+            "zero_write_rejection": True,
+        },
+    )
+
+
+def _validate_backlog_audit_direct_main_failed_qa_terminal(
+    *,
+    qa_acceptance: Mapping[str, Any],
+    body: Mapping[str, Any],
+    failure_audit: Mapping[str, Any],
+    direct_main_failed_qa_state: Mapping[str, Any],
+    bug_id: str,
+    commit_sha: str,
+) -> dict[str, Any]:
+    """Validate one truthful DB-backed direct-main failed-QA disposition."""
+
+    disposition = str(qa_acceptance.get("terminal_disposition") or "").strip()
+    if disposition != _AUDIT_ARCHIVE_DIRECT_MAIN_FAILED_QA_TERMINAL_DISPOSITION:
+        _raise_audit_archive_field_mismatch(
+            field="qa_acceptance.terminal_disposition",
+            expected=_AUDIT_ARCHIVE_DIRECT_MAIN_FAILED_QA_TERMINAL_DISPOSITION,
+            actual=disposition,
+            message="audit archive failed-QA terminal disposition is not recognized",
+        )
+    if not direct_main_failed_qa_state:
+        _raise_audit_archive_field_mismatch(
+            field="direct_main_failed_qa_state",
+            expected="server_verified_parentless_direct_main_failed_qa_state",
+            actual="missing",
+            message=(
+                "audit archive direct-main failed-QA terminal disposition requires "
+                "DB-verified source timeline authority"
+            ),
+        )
+
+    expected_backlog_id = str(
+        direct_main_failed_qa_state.get("source_backlog_id") or ""
+    ).strip()
+    expected_commit = str(
+        direct_main_failed_qa_state.get("implementation_commit") or ""
+    ).strip()
+    server_checks = (
+        ("direct_main_failed_qa_state.source_backlog_id", bug_id, expected_backlog_id),
+        ("implementation_commit", expected_commit, commit_sha),
+        (
+            "direct_main_failed_qa_state.source_generation_terminal",
+            True,
+            direct_main_failed_qa_state.get("source_generation_terminal"),
+        ),
+        (
+            "direct_main_failed_qa_state.same_row_resume_allowed",
+            False,
+            direct_main_failed_qa_state.get("same_row_resume_allowed"),
+        ),
+    )
+    for field, expected, actual in server_checks:
+        if actual != expected:
+            _raise_audit_archive_field_mismatch(
+                field=field,
+                expected=expected,
+                actual=actual,
+                message="audit archive direct-main failed-QA server authority mismatch",
+            )
+
+    claimed_source_backlog_id = str(body.get("source_backlog_id") or "").strip()
+    if claimed_source_backlog_id and claimed_source_backlog_id != expected_backlog_id:
+        _raise_audit_archive_field_mismatch(
+            field="source_backlog_id",
+            expected=expected_backlog_id,
+            actual=claimed_source_backlog_id,
+            message="audit archive direct-main failed-QA source row mismatch",
+        )
+
+    exact_claims = (
+        "source_backlog_id",
+        "source_task_id",
+        "source_direct_main_event_ref",
+        "implementation_event_ref",
+        "implementation_commit",
+        "failed_qa_source_ref",
+        "failed_qa_status",
+    )
+    for field in exact_claims:
+        expected = str(direct_main_failed_qa_state.get(field) or "").strip()
+        actual = str(qa_acceptance.get(field) or "").strip()
+        if actual != expected:
+            _raise_audit_archive_field_mismatch(
+                field=f"qa_acceptance.{field}",
+                expected=expected,
+                actual=actual,
+                message="audit archive direct-main failed-QA evidence does not match DB authority",
+            )
+    if qa_acceptance.get("passed") is not False:
+        _raise_audit_archive_field_mismatch(
+            field="qa_acceptance.passed",
+            expected=False,
+            actual=qa_acceptance.get("passed"),
+            message="audit archive direct-main failed-QA evidence must truthfully preserve QA rejection",
+        )
+    claimed_status = str(
+        qa_acceptance.get("status") or qa_acceptance.get("decision") or ""
+    ).strip().lower()
+    expected_status = str(
+        direct_main_failed_qa_state.get("failed_qa_status") or ""
+    ).strip().lower()
+    if claimed_status != expected_status:
+        _raise_audit_archive_field_mismatch(
+            field="qa_acceptance.status",
+            expected=expected_status,
+            actual=claimed_status,
+            message="audit archive direct-main failed-QA status mismatch",
+        )
+
+    reviewer = str(
+        qa_acceptance.get("reviewer")
+        or qa_acceptance.get("reviewer_id")
+        or qa_acceptance.get("actor")
+        or ""
+    ).strip()
+    if not reviewer:
+        raise ValidationError(
+            "audit archive direct-main failed-QA evidence requires reviewer identity"
+        )
+    reviewer_role = str(
+        qa_acceptance.get("reviewer_role")
+        or qa_acceptance.get("role")
+        or qa_acceptance.get("lane")
+        or ""
+    ).strip().lower()
+    if reviewer_role in {
+        "observer",
+        "worker",
+        "mf_sub",
+        "subagent",
+        "implementation_worker",
+    }:
+        raise ValidationError(
+            "audit archive direct-main failed-QA reviewer must be independent of observer/worker"
+        )
+    known_non_qa_identities = {
+        str(body.get("actor") or "observer").strip().lower(),
+        str(body.get("observer") or "").strip().lower(),
+        str(body.get("observer_id") or "").strip().lower(),
+        str(failure_audit.get("observer") or "").strip().lower(),
+        str(failure_audit.get("observer_id") or "").strip().lower(),
+    }
+    known_non_qa_identities.discard("")
+    if reviewer.lower() in known_non_qa_identities:
+        raise ValidationError(
+            "audit archive direct-main failed-QA reviewer must differ from observer"
+        )
+    tests = _audit_archive_list_field(
+        qa_acceptance.get("tests"),
+        qa_acceptance.get("test_commands"),
+        qa_acceptance.get("test_results"),
+    )
+    artifacts = _audit_archive_list_field(
+        qa_acceptance.get("artifacts"),
+        qa_acceptance.get("artifact_refs"),
+        qa_acceptance.get("evidence_refs"),
+    )
+    if not tests:
+        raise ValidationError(
+            "audit archive direct-main failed-QA evidence requires tests or test_commands"
+        )
+    if not artifacts:
+        raise ValidationError(
+            "audit archive direct-main failed-QA evidence requires artifacts or evidence_refs"
+        )
+    if str(direct_main_failed_qa_state.get("failed_qa_source_ref") or "") not in artifacts:
+        _raise_audit_archive_field_mismatch(
+            field="qa_acceptance.artifacts",
+            expected=[direct_main_failed_qa_state.get("failed_qa_source_ref")],
+            actual=artifacts,
+            message="audit archive direct-main failed-QA artifacts must bind the failed QA event",
+        )
+    forbidden = _audit_archive_forbidden_reconstruction_claim(qa_acceptance)
+    if forbidden:
+        raise ValidationError(
+            "audit archive direct-main failed-QA evidence must not claim startup/close_ready "
+            f"was reconstructed or backfilled: {forbidden}"
+        )
+
+    return {
+        **dict(qa_acceptance),
+        "schema_version": "audit_close_direct_main_failed_qa_terminal.v1",
+        "terminal_disposition": disposition,
+        "passed": False,
+        "status": expected_status,
+        "reviewer": reviewer,
+        "reviewer_role": reviewer_role or "qa",
+        "tests": tests,
+        "artifacts": artifacts,
+        "independent_reviewer": True,
+        "rejected_candidate": True,
+        "authenticated_failed_qa_terminal": True,
+        "close_satisfying": False,
+        "audit_only": True,
+        "source_generation_terminal": True,
+        "same_row_resume_allowed": False,
+        "startup_or_close_ready_reconstructed": False,
+        "source_of_authority": "server_verified_parentless_direct_main_timeline",
+    }
+
+
 def _validate_backlog_audit_qa_acceptance(
     *,
     qa_acceptance: Mapping[str, Any],
     body: Mapping[str, Any],
     failure_audit: Mapping[str, Any],
+    direct_main_failed_qa_state: Mapping[str, Any] | None = None,
+    bug_id: str = "",
+    commit_sha: str = "",
 ) -> dict[str, Any]:
     if not qa_acceptance:
         raise ValidationError("audit archive requires passed qa_acceptance evidence")
+    terminal_disposition = str(
+        qa_acceptance.get("terminal_disposition") or ""
+    ).strip()
+    if terminal_disposition:
+        return _validate_backlog_audit_direct_main_failed_qa_terminal(
+            qa_acceptance=qa_acceptance,
+            body=body,
+            failure_audit=failure_audit,
+            direct_main_failed_qa_state=direct_main_failed_qa_state or {},
+            bug_id=bug_id,
+            commit_sha=commit_sha,
+        )
     if not _qa_acceptance_passed(qa_acceptance):
         raise ValidationError("audit archive qa_acceptance must be passed")
 
@@ -128400,9 +128721,16 @@ def _build_backlog_audit_close_gate(
         timeline_precheck.get("failed_gates"),
         timeline_precheck.get("missing_event_kinds"),
     )
+    failed_qa_terminal = bool(
+        qa_acceptance.get("authenticated_failed_qa_terminal")
+    )
     return {
         "schema_version": "audit_close_gate.v1",
-        "gate": "audit_close_with_qa_acceptance",
+        "gate": (
+            "audit_archive_verified_direct_main_failed_qa_terminal"
+            if failed_qa_terminal
+            else "audit_close_with_qa_acceptance"
+        ),
         "status": "passed",
         "allowed": True,
         "passed": True,
@@ -128414,6 +128742,11 @@ def _build_backlog_audit_close_gate(
         "failed_or_missing_normal_gate_evidence": failed_gates,
         "failure_audit_present": bool(failure_audit),
         "qa_acceptance_passed": bool(qa_acceptance.get("passed")),
+        "qa_terminal_disposition_verified": failed_qa_terminal,
+        "qa_terminal_disposition": str(
+            qa_acceptance.get("terminal_disposition") or ""
+        ),
+        "failed_qa_close_satisfying": False,
         "qa_reviewer": str(qa_acceptance.get("reviewer") or ""),
         "historical_evidence_reconstructed": False,
     }
@@ -128473,6 +128806,7 @@ def _build_backlog_audit_archive_payload(
     body: Mapping[str, Any],
     row: Mapping[str, Any],
     archived_at: str,
+    direct_main_failed_qa_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     reason = str(body.get("reason") or body.get("human_reason") or "").strip()
     if not reason:
@@ -128504,6 +128838,9 @@ def _build_backlog_audit_archive_payload(
         qa_acceptance=_json_object_field(body.get("qa_acceptance")),
         body=body,
         failure_audit=failure_audit,
+        direct_main_failed_qa_state=direct_main_failed_qa_state or {},
+        bug_id=bug_id,
+        commit_sha=commit_sha,
     )
     _validate_requested_audit_close_gate(_json_object_field(body.get("audit_close_gate")))
     audit_close_gate = _build_backlog_audit_close_gate(
@@ -128577,12 +128914,20 @@ def handle_backlog_audit_archive(ctx: RequestContext):
                 422,
             )
 
+        direct_main_failed_qa_state = (
+            _onboard_parentless_direct_main_failed_qa_state(
+                conn,
+                project_id=pid,
+                backlog_id=bug_id,
+            )
+        )
         payload = _build_backlog_audit_archive_payload(
             project_id=pid,
             bug_id=bug_id,
             body=body,
             row=row,
             archived_at=now,
+            direct_main_failed_qa_state=direct_main_failed_qa_state,
         )
         route_gate = _require_route_token_mutation_gate(
             ctx,
