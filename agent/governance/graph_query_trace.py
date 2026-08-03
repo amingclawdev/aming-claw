@@ -619,6 +619,31 @@ def _is_sha256(value: Any) -> bool:
     )
 
 
+class CandidateReviewIdentityMismatchError(ValueError):
+    """Structured fail-closed rejection for candidate comparison identity."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        identity_mismatches: list[Mapping[str, Any]],
+    ) -> None:
+        super().__init__(message)
+        self.identity_mismatches = [
+            dict(item) for item in identity_mismatches
+        ]
+
+
+def _raise_candidate_review_identity_mismatches(
+    message: str,
+    identity_mismatches: list[dict[str, Any]],
+) -> None:
+    raise CandidateReviewIdentityMismatchError(
+        message,
+        identity_mismatches=identity_mismatches,
+    )
+
+
 def _normalize_candidate_review_context(
     *,
     snapshot_id: str,
@@ -740,41 +765,119 @@ def _normalize_candidate_review_context(
         comparison_base_source = str(
             normalized_root_identity.get("comparison_base_commit_source") or ""
         ).strip()
-        if comparison_base_commit:
-            if (
-                not _is_full_commit(comparison_base_commit)
-                or comparison_base_commit == context["candidate_commit_sha"]
-            ):
-                raise ValueError(
-                    "exact candidate comparison base must be a distinct full commit"
-                )
-            if comparison_base_source != (
+        comparison_authority_required = (
+            normalized_root_identity.get("comparison_authority_required")
+            is True
+        )
+        comparison_diff_source = (
+            "server_runtime_context_base_to_exact_candidate_diff"
+        )
+        comparison_base_authorities = {
+            (
                 "ContractRuntime.completed_lines.worker_commit+"
                 "parallel_branch_runtime_context.base_commit"
-            ):
-                raise ValueError(
-                    "exact candidate comparison base requires trusted runtime authority"
+            ),
+            (
+                "ContractRuntime.completed_lines.observer_merge+"
+                "parallel_branch_merge_queue_items.target_head_before_merge"
+            ),
+        }
+        comparison_authority_present = bool(
+            comparison_authority_required
+            or comparison_base_commit
+            or comparison_base_source
+            or context["changed_files_source"] == comparison_diff_source
+        )
+        comparison_mismatches: list[dict[str, Any]] = []
+        if comparison_authority_present:
+            if not comparison_base_commit and comparison_authority_required:
+                comparison_mismatches.append(
+                    {
+                        "field": "comparison_base_commit_sha",
+                        "expected": "server-derived full ancestor commit",
+                        "actual": comparison_base_commit,
+                    }
+                )
+            elif not _is_full_commit(comparison_base_commit):
+                comparison_mismatches.append(
+                    {
+                        "field": "comparison_base_commit_sha",
+                        "expected": "full git object id",
+                        "actual": comparison_base_commit,
+                    }
+                )
+            elif comparison_base_commit == context["candidate_commit_sha"]:
+                comparison_mismatches.append(
+                    {
+                        "field": "comparison_base_commit_sha",
+                        "expected": (
+                            "full git object id distinct from "
+                            "candidate_commit_sha"
+                        ),
+                        "actual": comparison_base_commit,
+                    }
+                )
+            if comparison_base_source not in comparison_base_authorities:
+                comparison_mismatches.append(
+                    {
+                        "field": "comparison_base_commit_source",
+                        "expected": sorted(comparison_base_authorities),
+                        "actual": comparison_base_source,
+                    }
                 )
             if context["changed_files_source"] != (
-                "server_runtime_context_base_to_exact_candidate_diff"
+                comparison_diff_source
             ):
-                raise ValueError(
-                    "exact candidate runtime diff requires its canonical server source"
+                comparison_mismatches.append(
+                    {
+                        "field": "changed_files_source",
+                        "expected": comparison_diff_source,
+                        "actual": context["changed_files_source"],
+                    }
+                )
+            if comparison_mismatches:
+                _raise_candidate_review_identity_mismatches(
+                    "exact candidate comparison authority is invalid",
+                    comparison_mismatches,
                 )
         else:
+            no_authority_mismatches: list[dict[str, Any]] = []
+            if context["changed_files_source"] != "server_exact_candidate_snapshot":
+                no_authority_mismatches.append(
+                    {
+                        "field": "changed_files_source",
+                        "expected": "server_exact_candidate_snapshot",
+                        "actual": context["changed_files_source"],
+                    }
+                )
             if context["changed_files"]:
-                raise ValueError(
-                    "exact candidate graph basis without runtime comparison "
-                    "authority requires an empty changed_files list"
+                no_authority_mismatches.append(
+                    {
+                        "field": "changed_files",
+                        "expected": [],
+                        "actual": context["changed_files"],
+                    }
                 )
             if context["candidate_diff_hash"] != empty_diff_hash:
-                raise ValueError(
-                    "exact candidate graph basis without runtime comparison "
-                    "authority requires the empty diff hash"
+                no_authority_mismatches.append(
+                    {
+                        "field": "candidate_diff_hash",
+                        "expected": empty_diff_hash,
+                        "actual": context["candidate_diff_hash"],
+                    }
                 )
             if comparison_base_source:
-                raise ValueError(
-                    "exact candidate comparison source requires a comparison base"
+                no_authority_mismatches.append(
+                    {
+                        "field": "comparison_base_commit_source",
+                        "expected": "",
+                        "actual": comparison_base_source,
+                    }
+                )
+            if no_authority_mismatches:
+                _raise_candidate_review_identity_mismatches(
+                    "exact candidate snapshot identity is invalid",
+                    no_authority_mismatches,
                 )
         if context["candidate_overlay"] or context["candidate_overlay_hash"]:
             raise ValueError("exact candidate graph basis does not use an overlay")

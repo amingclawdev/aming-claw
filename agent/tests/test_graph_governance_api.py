@@ -36338,6 +36338,297 @@ def test_exact_candidate_runtime_comparison_base_falls_through_missing_parent(
         )
 
 
+def test_managed_exact_candidate_requires_comparison_authority(monkeypatch):
+    candidate_commit = "c" * 40
+    monkeypatch.setattr(
+        server,
+        "_qa_checkout_root_identity",
+        lambda **_kwargs: {
+            "query_root_identity_hash": "sha256:query",
+            "repository_identity_hash": "sha256:repo",
+            "canonical_project_identity_hash": "sha256:canonical",
+        },
+    )
+
+    with pytest.raises(server._QACandidateOverlayError) as blocked:
+        server._qa_exact_candidate_context(
+            Path("/tmp/managed-exact-candidate"),
+            project_id=PID,
+            canonical_project_root=Path("/tmp/managed-exact-candidate"),
+            candidate_commit_sha=candidate_commit,
+            comparison_authority_required=True,
+        )
+
+    assert blocked.value.reason == "exact_candidate_comparison_base_required"
+    assert server._qa_overlay_identity_mismatches(blocked.value) == [
+        {
+            "field": "comparison_base_commit_sha",
+            "expected": "full distinct trusted ContractRuntime comparison base",
+            "actual": "",
+        }
+    ]
+
+
+def test_exact_candidate_runtime_comparison_base_resolves_child_cex(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-EXACT-CANDIDATE-CHILD-CEX"
+    task_id = "exact-candidate-child-worker"
+    runtime_context_id = "mfrctx-exact-candidate-child"
+    child_execution_id = "cex-exact-candidate-child"
+    base_commit = "b" * 40
+    candidate_commit = "c" * 40
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=backlog_id,
+            parent_task_id="cex-parent-without-worker-line",
+            root_task_id="cex-root-without-worker-line",
+            branch_ref="refs/heads/codex/exact-candidate-child",
+            status=STATE_VALIDATED,
+            base_commit=base_commit,
+            target_head_commit=base_commit,
+            head_commit=candidate_commit,
+        ),
+        now_iso="2026-08-02T09:00:00Z",
+    )
+    child_record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": child_execution_id,
+    }
+
+    class StubRuntimeStore:
+        @staticmethod
+        def get(execution_id):
+            raise ContractRuntimeError(
+                f"unknown contract execution: {execution_id}"
+            )
+
+        @staticmethod
+        def list_by_backlog(**_kwargs):
+            return [child_record]
+
+    monkeypatch.setattr(server, "_contract_runtime_store", lambda _conn: StubRuntimeStore())
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_line_identity",
+        lambda record: (
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+            }
+            if record is child_record
+            else {}
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_candidate_base_commit",
+        lambda _conn, **kwargs: (
+            base_commit if kwargs["record"] is child_record else ""
+        ),
+    )
+
+    assert server._qa_exact_candidate_runtime_comparison_base(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "commit_sha": candidate_commit,
+        },
+    ) == base_commit
+
+
+def test_qa_graph_bind_rejects_persisted_comparison_base_drift(monkeypatch):
+    candidate_commit = "c" * 40
+    persisted_base = "a" * 40
+    current_base = "b" * 40
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-COMPARISON-BASE-DRIFT",
+        "contract_execution_id": "cex-comparison-base-drift",
+        "contract_id": "observer_hotfix",
+    }
+    evidence = {
+        "db_verified": True,
+        "identity_mismatches": [],
+        "graph_basis": "exact_candidate_snapshot",
+        "comparison_authority_required": True,
+        "base_commit_sha": candidate_commit,
+        "candidate_commit_sha": candidate_commit,
+        "comparison_base_commit_sha": persisted_base,
+        "comparison_base_commit_source": (
+            "ContractRuntime.completed_lines.worker_commit+"
+            "parallel_branch_runtime_context.base_commit"
+        ),
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_line_identity",
+        lambda _record: {
+            "runtime_context_id": "mfrctx-comparison-base-drift",
+            "task_id": "comparison-base-drift-worker",
+            "parent_task_id": record["contract_execution_id"],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_assigned_target_project_root",
+        lambda *_args, **_kwargs: {
+            "status": "resolved",
+            "target_project_root": "/tmp/comparison-base-drift",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_candidate_commit",
+        lambda *_args, **_kwargs: candidate_commit,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_qa_graph_trace_refs",
+        lambda *_args, **_kwargs: copy.deepcopy(evidence),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_candidate_base_commit",
+        lambda *_args, **_kwargs: current_base,
+    )
+    monkeypatch.setattr(
+        server,
+        "_qa_validate_candidate_review_claims",
+        lambda *_args, **_kwargs: None,
+    )
+
+    class QAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:comparison-base-drift",
+                "session_id": "ses-comparison-base-drift",
+            }
+
+    with pytest.raises(GovernanceError) as blocked:
+        server._contract_runtime_bind_qa_graph_authority(
+            QAContext(),
+            object(),
+            project_id=PID,
+            record=record,
+            write={"line_id": "qa_graph_context"},
+            body={"graph_trace_ids": ["gqt-comparison-base-drift"]},
+            policy={
+                "lookup_key_fields": ["graph_trace_ids"],
+                "authority_object_path": "payload.graph_trace_evidence",
+            },
+        )
+
+    assert blocked.value.code == "contract_runtime_qa_graph_trace_identity_mismatch"
+    assert blocked.value.details["identity_mismatches"][0] == {
+        "field": "comparison_base_commit_sha",
+        "expected": current_base,
+        "actual": persisted_base,
+    }
+    assert evidence["comparison_base_commit_sha"] == persisted_base
+
+
+def test_qa_graph_bind_preserves_unmanaged_empty_exact_snapshot(monkeypatch):
+    candidate_commit = "c" * 40
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-UNMANAGED-EXACT-SNAPSHOT",
+        "contract_execution_id": "cex-unmanaged-exact-snapshot",
+        "contract_id": "observer_hotfix",
+    }
+    evidence = {
+        "db_verified": True,
+        "identity_mismatches": [],
+        "graph_basis": "exact_candidate_snapshot",
+        "comparison_authority_required": False,
+        "base_commit_sha": candidate_commit,
+        "candidate_commit_sha": candidate_commit,
+        "changed_files": [],
+        "candidate_diff_hash": "sha256:" + hashlib.sha256(b"").hexdigest(),
+        "changed_files_source": "server_exact_candidate_snapshot",
+        "comparison_base_commit_sha": "",
+        "comparison_base_commit_source": "",
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_line_identity",
+        lambda _record: {
+            "runtime_context_id": "mfrctx-unmanaged-exact-snapshot",
+            "task_id": "unmanaged-exact-snapshot-worker",
+            "parent_task_id": record["contract_execution_id"],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_assigned_target_project_root",
+        lambda *_args, **_kwargs: {
+            "status": "resolved",
+            "target_project_root": "/tmp/unmanaged-exact-snapshot",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_candidate_commit",
+        lambda *_args, **_kwargs: candidate_commit,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_qa_graph_trace_refs",
+        lambda *_args, **_kwargs: copy.deepcopy(evidence),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_comparison_base_commit",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unmanaged exact snapshots must not derive comparison authority"
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_qa_validate_candidate_review_claims",
+        lambda *_args, **_kwargs: None,
+    )
+
+    class QAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:unmanaged-exact-snapshot",
+                "session_id": "ses-unmanaged-exact-snapshot",
+            }
+
+    bound = server._contract_runtime_bind_qa_graph_authority(
+        QAContext(),
+        object(),
+        project_id=PID,
+        record=record,
+        write={"line_id": "qa_graph_context", "status": "accepted"},
+        body={"graph_trace_ids": ["gqt-unmanaged-exact-snapshot"]},
+        policy={
+            "lookup_key_fields": ["graph_trace_ids"],
+            "authority_object_path": "payload.graph_trace_evidence",
+        },
+    )
+
+    persisted = bound["payload"]["graph_trace_evidence"]
+    assert persisted["comparison_authority_required"] is False
+    assert persisted["comparison_base_commit_sha"] == ""
+    assert persisted["changed_files_source"] == (
+        "server_exact_candidate_snapshot"
+    )
+
+
 def test_exact_candidate_snapshot_uses_runtime_comparison_diff_tuple(
     conn,
     tmp_path,
@@ -36460,14 +36751,14 @@ def test_exact_candidate_snapshot_uses_runtime_comparison_diff_tuple(
                 "stage_id": "implementation",
                 "line_id": "worker_commit",
                 "evidence_kind": "worker_commit",
-                "commit_sha": candidate_commit,
+                "commit_sha": candidate_commit[:12],
                 "payload": {
                     "runtime_context_id": runtime_context_id,
                     "task_id": task_id,
                     "commit_sha": candidate_commit,
-                    "worker_commit_sha": candidate_commit,
+                    "worker_commit_sha": candidate_commit[:12],
                     "validated_head_commit": candidate_commit,
-                    "diff_base_commit": base_commit,
+                    "diff_base_commit": base_commit[:12],
                 },
             },
         ],
@@ -36713,6 +37004,44 @@ def test_exact_candidate_snapshot_uses_runtime_comparison_diff_tuple(
         (PID,),
     ).fetchone()[0]
     assert trace_count_after_forged == trace_count_before_forged
+
+    missing_comparison_record = copy.deepcopy(runtime_record)
+    missing_comparison_record["completed_lines"] = (
+        missing_comparison_record["completed_lines"][:1]
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: {execution_id: missing_comparison_record},
+    )
+    escalation_count_before = conn.execute(
+        "SELECT COUNT(*) FROM qa_graph_basis_escalations WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+    trace_count_before = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError) as missing_comparison:
+        server.handle_graph_governance_query(qa_ctx)
+    assert missing_comparison.value.code == (
+        "qa_exact_candidate_comparison_authority_rejected"
+    )
+    assert missing_comparison.value.details["write_performed"] is False
+    assert missing_comparison.value.details[
+        "exact_candidate_snapshot_required"
+    ] is False
+    assert missing_comparison.value.details["identity_mismatches"][0][
+        "field"
+    ] == "comparison_base_commit_sha"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM qa_graph_basis_escalations WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == escalation_count_before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == trace_count_before
 
 
 def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
@@ -47099,6 +47428,98 @@ def _rev8_postmerge_qa_binding_authority() -> dict[str, Any]:
     return authority
 
 
+def test_rev8_postmerge_comparison_base_uses_full_merge_chain(
+    conn,
+    monkeypatch,
+):
+    record = _rev8_postmerge_qa_binding_record()
+    first_merge = record["completed_lines"][1]["payload"][
+        "durable_merge_authority"
+    ]
+    second_merge = record["completed_lines"][2]["payload"][
+        "durable_merge_authority"
+    ]
+    first_merge["target_head_after_merge"] = "1" * 40
+    second_merge["target_head_after_merge"] = "2" * 40
+    for index, (authority, before, after) in enumerate(
+        (
+            (first_merge, "a" * 40, "1" * 40),
+            (second_merge, "1" * 40, "2" * 40),
+        )
+    ):
+        upsert_merge_queue_item(
+            conn,
+            MergeQueueItem(
+                project_id=PID,
+                backlog_id=record["backlog_id"],
+                merge_queue_id=authority["merge_queue_id"],
+                queue_item_id=authority["queue_item_id"],
+                task_id=authority["task_id"],
+                branch_ref=f"refs/heads/rev8-comparison-{index}",
+                queue_index=index,
+                status="merged",
+                merge_commit=after,
+                target_head_before_merge=before,
+                target_head_after_merge=after,
+            ),
+            now_iso=f"2026-08-02T10:00:0{index}Z",
+        )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_current_generation_worker_count",
+        lambda *_args, **_kwargs: 2,
+    )
+
+    assert server._contract_runtime_server_postmerge_comparison_base_commit(
+        conn,
+        project_id=PID,
+        record=record,
+        expected_candidate_commit="2" * 40,
+    ) == "a" * 40
+    assert server._contract_runtime_server_comparison_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        expected_candidate_commit="2" * 40,
+    ) == {
+        "commit_sha": "a" * 40,
+        "source": (
+            "ContractRuntime.completed_lines.observer_merge+"
+            "parallel_branch_merge_queue_items.target_head_before_merge"
+        ),
+    }
+
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PID,
+            backlog_id=record["backlog_id"],
+            merge_queue_id=second_merge["merge_queue_id"],
+            queue_item_id=second_merge["queue_item_id"],
+            task_id=second_merge["task_id"],
+            branch_ref="refs/heads/rev8-comparison-1",
+            queue_index=1,
+            status="merged",
+            merge_commit="2" * 40,
+            target_head_before_merge="f" * 40,
+            target_head_after_merge="2" * 40,
+        ),
+        now_iso="2026-08-02T10:01:00Z",
+    )
+    assert server._contract_runtime_server_postmerge_comparison_base_commit(
+        conn,
+        project_id=PID,
+        record=record,
+        expected_candidate_commit="2" * 40,
+    ) == ""
+    assert server._contract_runtime_server_comparison_base_commit(
+        conn,
+        project_id=PID,
+        record=record,
+        expected_candidate_commit="2" * 40,
+    ) == ""
+
+
 def test_rev8_merge_projection_accepts_one_observer_selected_batch_child_lane():
     record = _rev8_postmerge_qa_binding_record()
     dispatch = record["completed_lines"][0]
@@ -47381,6 +47802,390 @@ def test_rev8_postmerge_qa_authority_fails_closed_at_each_live_boundary(
     assert receipt_blocked["blocker_codes"] == [
         "observer_reconcile_receipt_unverified"
     ]
+
+
+def test_rev8_blocked_postmerge_authority_is_not_projected_qa_ready():
+    record = _rev8_postmerge_qa_binding_record()
+    current_state = {
+        "next_legal_action": {
+            "stage_id": "qa_graph_context",
+            "line_id": "qa_graph_context",
+            "owner_role": "qa",
+            "evidence_kind": "graph_trace",
+        }
+    }
+    blocked = server._contract_runtime_qa_ticket_authority(
+        record,
+        current_state,
+        postmerge_authority={
+            "schema_version": (
+                "contract_runtime.rev8_postmerge_qa_authority.v1"
+            ),
+            "status": "blocked",
+            "verified": False,
+            "blocker_codes": ["current_full_active_snapshot_unverified"],
+        },
+    )
+
+    assert blocked["status"] == "blocked"
+    assert blocked["blocker_codes"] == [
+        "current_full_active_snapshot_unverified"
+    ]
+    assert "next_legal_action" not in blocked
+
+
+def test_runtime_authority_projects_rev8_postmerge_blocker(monkeypatch):
+    record = _rev8_postmerge_qa_binding_record()
+    record["runtime_guide"] = {
+        "next_legal_action": {
+            "stage_id": "qa_graph_context",
+            "line_id": "qa_graph_context",
+            "owner_role": "qa",
+            "evidence_kind": "graph_trace",
+        }
+    }
+    record["execution_state_revision"] = 7
+    record["execution_state"] = {
+        "execution_state_revision": 7,
+        "execution_state_hash": "sha256:state",
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_read",
+        lambda *_args, **_kwargs: copy.deepcopy(record),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_persisted_postmerge_qa_authority",
+        lambda _record: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: {
+            "schema_version": (
+                "contract_runtime.rev8_postmerge_qa_authority.v1"
+            ),
+            "status": "blocked",
+            "verified": False,
+            "blocker_codes": ["current_full_active_snapshot_unverified"],
+        },
+    )
+
+    current = server._observer_runtime_text_contract_runtime_authority(
+        object(),
+        project_id=PID,
+        backlog_id=record["backlog_id"],
+        contract_execution_id=record["contract_execution_id"],
+    )
+
+    assert current["ticket_authority_status"] == "blocked"
+    assert current["readiness_state"] == "postmerge_qa_authority_blocked"
+    assert current["blocker_codes"] == [
+        "current_full_active_snapshot_unverified"
+    ]
+    assert current["next_legal_action"]["qa_execution_ready"] is False
+
+
+def test_contract_runtime_current_state_compacts_comparison_base_verdict():
+    candidate_commit = "c" * 40
+    comparison_base = "b" * 40
+    record = {
+        "contract_execution_id": "cex-comparison-base-verdict",
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [
+            {
+                "line_id": "qa_graph_context",
+                "payload": {
+                    "graph_trace_evidence": {
+                        "db_verified": True,
+                        "graph_basis": "exact_candidate_snapshot",
+                        "comparison_authority_required": True,
+                        "candidate_commit_sha": candidate_commit,
+                        "comparison_base_commit_sha": comparison_base,
+                        "comparison_base_commit_source": "ContractRuntime",
+                        "changed_files_source": "server_runtime_diff",
+                        "identity_mismatches": [],
+                        "post_merge_provenance": {
+                            "schema_version": (
+                                "qa_exact_candidate.post_merge_provenance.v1"
+                            ),
+                            "verified": True,
+                            "candidate_commit_sha": candidate_commit,
+                            "qa_event_ref": "timeline:71",
+                            "merge_event_ref": "timeline:72",
+                            "ordered_after_qa": True,
+                            "candidate_is_ancestor": True,
+                            "scoped_merge_is_ancestor_of_canonical_head": True,
+                        },
+                    }
+                },
+            }
+        ],
+    }
+    graph_evidence = record["completed_lines"][0]["payload"][
+        "graph_trace_evidence"
+    ]
+    graph_evidence["authority_hash"] = server.stable_sha256(graph_evidence)
+    record["completed_lines"][0] = (
+        server._contract_runtime_bind_authenticated_qa_provenance(
+            {
+                "principal_id": "qa:comparison-base-verdict",
+                "session_id": "ses-comparison-base-verdict",
+            },
+            write={
+                **record["completed_lines"][0],
+                "status": "accepted",
+            },
+            source="test_comparison_base_verdict",
+            binding_claims={"graph_trace_session_matched": True},
+        )
+    )
+
+    current_state = server._runtime_current_state_from_record(record)
+    verdict = current_state["comparison_base_verdict"]
+    assert verdict["verification_status"] == "post_merge_verified"
+    assert verdict["comparison_base_commit_sha"] == comparison_base
+    assert verdict["candidate_commit_sha"] == candidate_commit
+    assert verdict["post_merge_provenance_verified"] is True
+    assert verdict["mismatch_count"] == 0
+    assert verdict["source_ref"].endswith(":completed_lines:0")
+
+    compact = server._contract_runtime_response(
+        record,
+        actor_role="observer",
+        response_view="cli_current",
+    )
+    assert compact["comparison_base_verdict"] == verdict
+    assert "contract_runtime_current_state" not in compact
+
+    corrupted_record = copy.deepcopy(record)
+    corrupted_record["completed_lines"][0]["payload"][
+        "graph_trace_evidence"
+    ]["authority_hash"] = "sha256:" + "0" * 64
+    corrupted_verdict = server._contract_runtime_comparison_base_verdict(
+        corrupted_record
+    )
+    assert corrupted_verdict["verification_status"] == "blocked"
+    assert corrupted_verdict["post_merge_provenance_verified"] is False
+
+    legacy_mismatch_record = copy.deepcopy(record)
+    legacy_mismatch_record["completed_lines"][0]["payload"][
+        "graph_trace_evidence"
+    ]["identity_mismatches"] = ["comparison_base_not_distinct"]
+    legacy_evidence = legacy_mismatch_record["completed_lines"][0]["payload"][
+        "graph_trace_evidence"
+    ]
+    legacy_evidence["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in legacy_evidence.items()
+            if key != "authority_hash"
+        }
+    )
+    legacy_verdict = server._contract_runtime_comparison_base_verdict(
+        legacy_mismatch_record
+    )
+    assert legacy_verdict["verification_status"] == "blocked"
+    assert legacy_verdict["mismatch_count"] == 1
+    assert legacy_verdict["scoped_identity_mismatches"][0] == {
+        "field": "identity_mismatches",
+        "expected": "empty structured mismatch list",
+        "actual": "comparison_base_not_distinct",
+        "legacy_unstructured": True,
+    }
+
+
+def test_persisted_post_merge_graph_proof_is_reused_fail_closed(monkeypatch):
+    backlog_id = "AC-PERSISTED-POST-MERGE-PROOF"
+    task_id = "persisted-post-merge-task"
+    trace_id = "gqt-persisted-post-merge"
+    candidate_commit = "c" * 40
+    comparison_base = "b" * 40
+    execution_id = "cex-persisted-post-merge"
+    postmerge_ticket = {
+        "schema_version": "contract_runtime.rev8_postmerge_qa_authority.v1",
+        "status": "verified",
+        "verified": True,
+        "server_derived": True,
+        "db_verified": True,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "candidate_commit_sha": candidate_commit,
+        "blocker_codes": [],
+    }
+    postmerge_ticket["authority_hash"] = server.stable_sha256(
+        postmerge_ticket
+    )
+    evidence = {
+        "db_verified": True,
+        "identity_mismatches": [],
+        "verified_trace_ids": [trace_id],
+        "trace_ids": [trace_id],
+        "task_id": task_id,
+        "graph_basis": "exact_candidate_snapshot",
+        "comparison_authority_required": True,
+        "base_commit_sha": candidate_commit,
+        "candidate_commit_sha": candidate_commit,
+        "comparison_base_commit_sha": comparison_base,
+        "comparison_base_commit_source": "ContractRuntime",
+        "changed_files": ["agent/governance/server.py"],
+        "changed_files_source": "server_runtime_context_base_to_exact_candidate_diff",
+        "candidate_diff_hash": "sha256:" + "d" * 64,
+        "post_merge_provenance": {
+            "schema_version": "qa_exact_candidate.post_merge_provenance.v1",
+            "verified": True,
+            "candidate_commit_sha": candidate_commit,
+            "qa_event_ref": "timeline:81",
+            "merge_event_ref": "timeline:82",
+            "ordered_after_qa": True,
+            "candidate_is_ancestor": True,
+            "scoped_merge_is_ancestor_of_canonical_head": True,
+        },
+        "postmerge_qa_authority": postmerge_ticket,
+    }
+    evidence["authority_hash"] = server.stable_sha256(evidence)
+    line = server._contract_runtime_bind_authenticated_qa_provenance(
+        {
+            "principal_id": "qa:persisted-post-merge",
+            "session_id": "ses-persisted-post-merge",
+        },
+        write={
+            "line_id": "qa_graph_context",
+            "status": "accepted",
+            "payload": {"graph_trace_evidence": evidence},
+        },
+        source="test_persisted_post_merge_graph_proof",
+        binding_claims={"graph_trace_session_matched": True},
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev8",
+        "completed_lines": [line],
+    }
+
+    class Store:
+        @staticmethod
+        def list_by_backlog(**_kwargs):
+            return [record]
+
+    monkeypatch.setattr(server, "_contract_runtime_store", lambda _conn: Store())
+    context, mismatches, found = (
+        server._contract_runtime_persisted_post_merge_review_context(
+            object(),
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            trace_id=trace_id,
+            candidate_commit_sha=candidate_commit,
+        )
+    )
+    assert found is True
+    assert mismatches == []
+    assert context["comparison_base_commit_sha"] == comparison_base
+    assert context["post_merge_provenance"]["merge_event_ref"] == "timeline:82"
+    assert server._contract_runtime_persisted_postmerge_qa_authority(
+        record
+    ) == postmerge_ticket
+
+    corrupted_outer = copy.deepcopy(record)
+    corrupted_outer["completed_lines"][0]["payload"][
+        "graph_trace_evidence"
+    ]["authority_hash"] = "sha256:" + "0" * 64
+    assert server._contract_runtime_persisted_postmerge_qa_authority(
+        corrupted_outer
+    )["blocker_codes"] == [
+        "persisted_postmerge_qa_authority_invalid"
+    ]
+
+    newer_evidence = {
+        "db_verified": True,
+        "identity_mismatches": [],
+        "verified_trace_ids": ["gqt-newer-round"],
+        "trace_ids": ["gqt-newer-round"],
+        "task_id": task_id,
+        "candidate_commit_sha": "d" * 40,
+    }
+    newer_evidence["authority_hash"] = server.stable_sha256(newer_evidence)
+    newer_line = server._contract_runtime_bind_authenticated_qa_provenance(
+        {
+            "principal_id": "qa:newer-round",
+            "session_id": "ses-newer-round",
+        },
+        write={
+            "line_id": "qa_graph_context",
+            "status": "accepted",
+            "payload": {"graph_trace_evidence": newer_evidence},
+        },
+        source="test_newer_round_boundary",
+        binding_claims={"graph_trace_session_matched": True},
+    )
+    multi_round_record = copy.deepcopy(record)
+    multi_round_record["completed_lines"].append(newer_line)
+    assert server._contract_runtime_persisted_postmerge_qa_authority(
+        multi_round_record
+    ) == {}
+
+    ticket_only_record = copy.deepcopy(record)
+    ticket_only_evidence = ticket_only_record["completed_lines"][0][
+        "payload"
+    ]["graph_trace_evidence"]
+    ticket_only_evidence.pop("post_merge_provenance")
+    ticket_only_evidence["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in ticket_only_evidence.items()
+            if key != "authority_hash"
+        }
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: type(
+            "TicketOnlyStore",
+            (),
+            {"list_by_backlog": staticmethod(lambda **_kwargs: [ticket_only_record])},
+        )(),
+    )
+    ticket_context, ticket_mismatches, ticket_found = (
+        server._contract_runtime_persisted_post_merge_review_context(
+            object(),
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            trace_id=trace_id,
+            candidate_commit_sha=candidate_commit,
+        )
+    )
+    assert ticket_found is True
+    assert ticket_mismatches == []
+    assert ticket_context["postmerge_qa_authority"]["verified"] is True
+
+    monkeypatch.setattr(server, "_contract_runtime_store", lambda _conn: Store())
+    line["payload"]["graph_trace_evidence"]["post_merge_provenance"][
+        "ordered_after_qa"
+    ] = False
+    _context, invalid_mismatches, invalid_found = (
+        server._contract_runtime_persisted_post_merge_review_context(
+            object(),
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            trace_id=trace_id,
+            candidate_commit_sha=candidate_commit,
+        )
+    )
+    assert invalid_found is True
+    assert {
+        item["field"] for item in invalid_mismatches
+    } >= {
+        "authority_hash",
+        "post_merge_provenance.ordered_after_qa",
+    }
 
 
 def test_rev8_postmerge_qa_graph_binding_uses_final_combined_root_and_commit(

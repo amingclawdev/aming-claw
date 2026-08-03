@@ -2099,6 +2099,52 @@ def test_mf_parallel_v2_graph_context_gates_worker_and_qa(tmp_path):
     runtime.current_guide(record["contract_execution_id"], actor_role="qa")
     qa_record = runtime.store.get(record["contract_execution_id"])
 
+    required_empty_comparison_payload = _direct_fix_graph_payload(
+        actor_role="qa",
+        trace_id="gqt-mf-parallel-v2-qa-required-empty-comparison",
+        backlog_id="AC-MF-PARALLEL-V2-GRAPH-GATE",
+        task_id="mf-parallel-v2-worker",
+    )
+    required_empty_comparison_payload["graph_trace_evidence"][
+        "comparison_authority_required"
+    ] = True
+    required_empty_comparison = runtime.submit_line_write(
+        record["contract_execution_id"],
+        {
+            **_write_from(
+                qa_record,
+                actor_role="qa",
+                stage_id="qa_graph_context",
+                line_id="qa_graph_context",
+                evidence_kind="graph_trace",
+            ),
+            "payload": required_empty_comparison_payload,
+        },
+        actor_role="qa",
+    )
+    assert required_empty_comparison["ok"] is False
+    assert any(
+        "comparison_authority_required=true" in error
+        for error in required_empty_comparison["decision"]["errors"]
+    )
+    required_empty_adapter = required_empty_comparison["decision"][
+        "imported_legacy_checks"
+    ][0]
+    assert {
+        mismatch["field"]
+        for mismatch in required_empty_adapter["identity_mismatches"]
+    } == {
+        "comparison_base_commit_sha",
+        "comparison_base_commit_source",
+        "changed_files_source",
+    }
+    assert all(
+        set(mismatch) >= {"field", "expected", "actual"}
+        for mismatch in required_empty_adapter["identity_mismatches"]
+    )
+    runtime.current_guide(record["contract_execution_id"], actor_role="qa")
+    qa_record = runtime.store.get(record["contract_execution_id"])
+
     comparison_qa_payload = _direct_fix_graph_payload(
         actor_role="qa",
         trace_id="gqt-mf-parallel-v2-qa-comparison",
@@ -2148,6 +2194,24 @@ def test_mf_parallel_v2_graph_context_gates_worker_and_qa(tmp_path):
         "requires comparison_base_commit_source=" in error
         for error in incomplete_comparison["decision"]["errors"]
     )
+    assert incomplete_comparison["decision"]["imported_legacy_checks"][0][
+        "identity_mismatches"
+    ] == [
+        {
+            "field": "comparison_base_commit_source",
+            "expected": [
+                (
+                    "ContractRuntime.completed_lines.observer_merge+"
+                    "parallel_branch_merge_queue_items.target_head_before_merge"
+                ),
+                (
+                    "ContractRuntime.completed_lines.worker_commit+"
+                    "parallel_branch_runtime_context.base_commit"
+                ),
+            ],
+            "actual": "",
+        }
+    ]
     runtime.current_guide(record["contract_execution_id"], actor_role="qa")
     qa_record = runtime.store.get(record["contract_execution_id"])
 
@@ -2179,6 +2243,18 @@ def test_mf_parallel_v2_graph_context_gates_worker_and_qa(tmp_path):
         "requires distinct comparison base and candidate commits" in error
         for error in same_commit_comparison["decision"]["errors"]
     )
+    same_commit_mismatch = same_commit_comparison["decision"][
+        "imported_legacy_checks"
+    ][0]["identity_mismatches"]
+    assert same_commit_mismatch == [
+        {
+            "field": "comparison_base_commit_sha",
+            "expected": (
+                "full git object id distinct from candidate_commit_sha"
+            ),
+            "actual": same_commit_authority["candidate_commit_sha"],
+        }
+    ]
     runtime.current_guide(record["contract_execution_id"], actor_role="qa")
     qa_record = runtime.store.get(record["contract_execution_id"])
 
@@ -2208,6 +2284,17 @@ def test_mf_parallel_v2_graph_context_gates_worker_and_qa(tmp_path):
         "server_runtime_context_base_to_exact_candidate_diff" in error
         for error in forged_source_comparison["decision"]["errors"]
     )
+    assert forged_source_comparison["decision"]["imported_legacy_checks"][0][
+        "identity_mismatches"
+    ] == [
+        {
+            "field": "changed_files_source",
+            "expected": (
+                "server_runtime_context_base_to_exact_candidate_diff"
+            ),
+            "actual": "server_forged_comparison_diff",
+        }
+    ]
     runtime.current_guide(record["contract_execution_id"], actor_role="qa")
     qa_record = runtime.store.get(record["contract_execution_id"])
 

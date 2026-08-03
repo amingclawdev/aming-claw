@@ -94,12 +94,16 @@ _QA_GRAPH_BASIS_DECISION_SCHEMA_VERSION = "qa_review_graph.basis_decision.v1"
 class WriteGateDecision:
     ok: bool
     errors: tuple[str, ...] = ()
+    identity_mismatches: tuple[Mapping[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": "contract_write_gate_decision.v1",
             "ok": self.ok,
             "errors": list(self.errors),
+            "identity_mismatches": [
+                dict(item) for item in self.identity_mismatches
+            ],
         }
 
 
@@ -207,6 +211,7 @@ def validate_contract_write(
     """Validate a proposed evidence/line write against pinned contract state."""
 
     errors: list[str] = []
+    identity_mismatches: list[dict[str, Any]] = []
     _expect_equal(errors, write, execution_state, "project_id")
     _expect_equal(errors, write, execution_state, "backlog_id")
     _expect_equal(errors, write, execution_state, "contract_execution_id")
@@ -284,6 +289,7 @@ def validate_contract_write(
     )
     _validate_graph_context(
         errors,
+        identity_mismatches,
         write,
         execution_state=execution_state,
         line_id=line_id,
@@ -304,7 +310,11 @@ def validate_contract_write(
             policy=reconcile_policy,
         )
 
-    return WriteGateDecision(ok=not errors, errors=tuple(errors))
+    return WriteGateDecision(
+        ok=not errors,
+        errors=tuple(errors),
+        identity_mismatches=tuple(identity_mismatches),
+    )
 
 
 def _validate_worker_receipt_hash_evidence(
@@ -428,6 +438,7 @@ def _validate_candidate_commit_evidence(
 
 def _validate_graph_context(
     errors: list[str],
+    identity_mismatches: list[dict[str, Any]],
     write: Mapping[str, Any],
     *,
     execution_state: Mapping[str, Any],
@@ -484,6 +495,7 @@ def _validate_graph_context(
     if bounded_qa_policy:
         _validate_bounded_qa_graph_context(
             errors,
+            identity_mismatches,
             write,
             execution_state=execution_state,
             line_id=line_id,
@@ -493,6 +505,7 @@ def _validate_graph_context(
 
 def _validate_bounded_qa_graph_context(
     errors: list[str],
+    identity_mismatches: list[dict[str, Any]],
     write: Mapping[str, Any],
     *,
     execution_state: Mapping[str, Any],
@@ -527,8 +540,8 @@ def _validate_bounded_qa_graph_context(
     )
     if missing_trace_ids:
         errors.append(f"{line_id} cannot contain missing_trace_ids")
-    identity_mismatches = evidence.get("identity_mismatches")
-    if identity_mismatches:
+    persisted_identity_mismatches = evidence.get("identity_mismatches")
+    if persisted_identity_mismatches:
         errors.append(f"{line_id} cannot contain graph trace identity_mismatches")
 
     query_source = str(evidence.get("query_source") or "").strip()
@@ -573,6 +586,16 @@ def _validate_bounded_qa_graph_context(
     comparison_base_commit_source = str(
         evidence.get("comparison_base_commit_source") or ""
     ).strip()
+    comparison_authority_required = bool(
+        evidence.get("comparison_authority_required") is True
+        or (
+            isinstance(evidence.get("root_identity"), Mapping)
+            and evidence["root_identity"].get(
+                "comparison_authority_required"
+            )
+            is True
+        )
+    )
 
     errors.extend(
         bounded_qa_graph_decision_errors(
@@ -610,35 +633,84 @@ def _validate_bounded_qa_graph_context(
         comparison_diff_source = (
             "server_runtime_context_base_to_exact_candidate_diff"
         )
-        comparison_base_source = (
-            "ContractRuntime.completed_lines.worker_commit+"
-            "parallel_branch_runtime_context.base_commit"
-        )
+        comparison_base_sources = {
+            (
+                "ContractRuntime.completed_lines.worker_commit+"
+                "parallel_branch_runtime_context.base_commit"
+            ),
+            (
+                "ContractRuntime.completed_lines.observer_merge+"
+                "parallel_branch_merge_queue_items.target_head_before_merge"
+            ),
+        }
         comparison_authority_present = bool(
-            comparison_base_commit_sha
+            comparison_authority_required
+            or comparison_base_commit_sha
             or comparison_base_commit_source
             or changed_files_source == comparison_diff_source
         )
         if comparison_authority_present:
-            if not _is_full_commit(comparison_base_commit_sha):
-                errors.append(
-                    f"{line_id} exact candidate comparison basis requires full "
-                    "comparison_base_commit_sha"
+            if not comparison_base_commit_sha and comparison_authority_required:
+                _append_identity_mismatch(
+                    errors,
+                    identity_mismatches,
+                    message=(
+                        f"{line_id} exact candidate comparison basis requires "
+                        "comparison_base_commit_sha when "
+                        "comparison_authority_required=true"
+                    ),
+                    field="comparison_base_commit_sha",
+                    expected="server-derived full ancestor commit",
+                    actual=comparison_base_commit_sha,
+                )
+            elif not _is_full_commit(comparison_base_commit_sha):
+                _append_identity_mismatch(
+                    errors,
+                    identity_mismatches,
+                    message=(
+                        f"{line_id} exact candidate comparison basis requires full "
+                        "comparison_base_commit_sha"
+                    ),
+                    field="comparison_base_commit_sha",
+                    expected="full git object id",
+                    actual=comparison_base_commit_sha,
                 )
             elif comparison_base_commit_sha == candidate_commit_sha:
-                errors.append(
-                    f"{line_id} exact candidate comparison basis requires "
-                    "distinct comparison base and candidate commits"
+                _append_identity_mismatch(
+                    errors,
+                    identity_mismatches,
+                    message=(
+                        f"{line_id} exact candidate comparison basis requires "
+                        "distinct comparison base and candidate commits"
+                    ),
+                    field="comparison_base_commit_sha",
+                    expected="full git object id distinct from candidate_commit_sha",
+                    actual=comparison_base_commit_sha,
                 )
-            if comparison_base_commit_source != comparison_base_source:
-                errors.append(
-                    f"{line_id} exact candidate comparison basis requires "
-                    f"comparison_base_commit_source={comparison_base_source}"
+            if comparison_base_commit_source not in comparison_base_sources:
+                _append_identity_mismatch(
+                    errors,
+                    identity_mismatches,
+                    message=(
+                        f"{line_id} exact candidate comparison basis requires "
+                        "comparison_base_commit_source="
+                        + "|".join(sorted(comparison_base_sources))
+                    ),
+                    field="comparison_base_commit_source",
+                    expected=sorted(comparison_base_sources),
+                    actual=comparison_base_commit_source,
                 )
             if changed_files_source != comparison_diff_source:
-                errors.append(
-                    f"{line_id} exact candidate comparison basis requires "
-                    f"changed_files_source={comparison_diff_source}"
+                _append_identity_mismatch(
+                    errors,
+                    identity_mismatches,
+                    message=(
+                        f"{line_id} exact candidate comparison basis requires "
+                        f"changed_files_source={comparison_diff_source}"
+                    ),
+                    field="changed_files_source",
+                    expected=comparison_diff_source,
+                    actual=changed_files_source,
                 )
         else:
             if changed_files_source != "server_exact_candidate_snapshot":
@@ -669,6 +741,27 @@ def _validate_bounded_qa_graph_context(
             value = str(evidence.get(field) or "").strip().lower()
             if not _is_sha256(value):
                 errors.append(f"{line_id} requires {field}")
+
+
+def _append_identity_mismatch(
+    errors: list[str],
+    identity_mismatches: list[dict[str, Any]],
+    *,
+    message: str,
+    field: str,
+    expected: Any,
+    actual: Any,
+) -> None:
+    """Retain legacy text while exposing copy-safe comparison diagnostics."""
+
+    errors.append(message)
+    identity_mismatches.append(
+        {
+            "field": str(field or ""),
+            "expected": expected,
+            "actual": actual,
+        }
+    )
 
 
 def _validate_current_full_reconcile_evidence(

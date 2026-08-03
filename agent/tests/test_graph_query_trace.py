@@ -1169,6 +1169,128 @@ def test_exact_candidate_trace_requires_and_persists_root_identity(conn, tmp_pat
     assert trace["candidate_overlay_hash"] == ""
 
 
+@pytest.mark.parametrize(
+    ("case", "expected_fields"),
+    [
+        (
+            "required_empty",
+            {
+                "comparison_base_commit_sha",
+                "comparison_base_commit_source",
+                "changed_files_source",
+            },
+        ),
+        ("same_commit", {"comparison_base_commit_sha"}),
+        ("bad_base_source", {"comparison_base_commit_source"}),
+        ("bad_diff_source", {"changed_files_source"}),
+    ],
+)
+def test_exact_candidate_comparison_identity_rejects_before_trace_insert(
+    conn,
+    tmp_path,
+    case,
+    expected_fields,
+):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    candidate_commit = "a" * 40
+    comparison_base_commit = "b" * 40
+    comparison_base_source = (
+        "ContractRuntime.completed_lines.worker_commit+"
+        "parallel_branch_runtime_context.base_commit"
+    )
+    comparison_diff_source = (
+        "server_runtime_context_base_to_exact_candidate_diff"
+    )
+    root_identity = {
+        "schema_version": "qa_review_graph.root_identity.v1",
+        "query_root": str(project_root),
+        "query_root_head_commit": candidate_commit,
+        "query_root_identity_hash": "sha256:" + "1" * 64,
+        "query_root_clean": True,
+        "query_root_status_hash": "sha256:" + hashlib.sha256(b"").hexdigest(),
+        "query_root_tree_sha": "4" * 40,
+        "query_root_untracked_files_checked": True,
+        "canonical_project_root": str(project_root),
+        "canonical_head_commit": candidate_commit,
+        "canonical_project_identity_hash": "sha256:" + "2" * 64,
+        "repository_identity_hash": "sha256:" + "3" * 64,
+        "repository_identity_match": True,
+        "comparison_authority_required": True,
+    }
+    changed_files_source = comparison_diff_source
+    if case == "required_empty":
+        changed_files_source = "server_exact_candidate_snapshot"
+    else:
+        root_identity.update(
+            {
+                "comparison_base_commit_sha": comparison_base_commit,
+                "comparison_base_commit_source": comparison_base_source,
+            }
+        )
+    if case == "same_commit":
+        root_identity["comparison_base_commit_sha"] = candidate_commit
+    elif case == "bad_base_source":
+        root_identity["comparison_base_commit_source"] = "caller_supplied"
+    elif case == "bad_diff_source":
+        changed_files_source = "server_exact_candidate_snapshot"
+
+    trace_id = f"gqt-exact-comparison-{case}"
+    count_before = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE trace_id = ?",
+        (trace_id,),
+    ).fetchone()[0]
+    with pytest.raises(
+        graph_query_trace.CandidateReviewIdentityMismatchError
+    ) as rejected:
+        graph_query_trace.start_trace(
+            conn,
+            PID,
+            snapshot_id,
+            trace_id=trace_id,
+            actor="qa:comparison-identity",
+            query_source="qa",
+            query_purpose="independent_verification",
+            task_id="qa-comparison-identity",
+            backlog_id="AC-QA-COMPARISON-IDENTITY",
+            commit_sha=candidate_commit,
+            graph_basis="exact_candidate_snapshot",
+            canonical_base_snapshot_id=snapshot_id,
+            base_commit_sha=candidate_commit,
+            candidate_commit_sha=candidate_commit,
+            changed_files=[],
+            candidate_diff_hash=(
+                "sha256:" + hashlib.sha256(b"").hexdigest()
+            ),
+            changed_files_source=changed_files_source,
+            root_identity=root_identity,
+            root_identity_hash=stable_sha256(root_identity),
+            query_root_identity_hash=root_identity[
+                "query_root_identity_hash"
+            ],
+            canonical_project_identity_hash=root_identity[
+                "canonical_project_identity_hash"
+            ],
+            repository_identity_hash=root_identity[
+                "repository_identity_hash"
+            ],
+            qa_session_id="ses-qa-comparison-identity",
+            qa_scope_binding_ref="qa_scope:sha256:comparison-identity",
+        )
+
+    assert {
+        mismatch["field"]
+        for mismatch in rejected.value.identity_mismatches
+    } == expected_fields
+    assert all(
+        set(mismatch) == {"field", "expected", "actual"}
+        for mismatch in rejected.value.identity_mismatches
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE trace_id = ?",
+        (trace_id,),
+    ).fetchone()[0] == count_before
+
+
 def test_snapshot_orphan_file_filter_excludes_attached_rows(conn, tmp_path):
     graph = {"deps_graph": {"nodes": [], "edges": []}}
     snapshot = store.create_graph_snapshot(

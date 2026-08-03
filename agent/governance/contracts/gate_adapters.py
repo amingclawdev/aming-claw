@@ -29,6 +29,9 @@ def submit_line_write_gate_adapter(
         "decision": "allow" if decision.ok else "block",
         "ok": decision.ok,
         "errors": list(decision.errors),
+        "identity_mismatches": [
+            dict(item) for item in decision.identity_mismatches
+        ],
         "warnings": [],
         "legacy_authoritative": True,
     }
