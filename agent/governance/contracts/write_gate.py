@@ -278,9 +278,49 @@ def validate_contract_write(
                 "write does not match next legal action "
                 f"{expected_stage!r}/{expected_line!r}"
             )
-        _validate_next_action_instance(errors, write, next_action)
+            if stage_id != expected_stage:
+                identity_mismatches.append(
+                    {
+                        "field": "stage_id",
+                        "expected": expected_stage,
+                        "actual": stage_id or "<missing>",
+                    }
+                )
+            if line_id != expected_line:
+                identity_mismatches.append(
+                    {
+                        "field": "line_id",
+                        "expected": expected_line,
+                        "actual": line_id or "<missing>",
+                    }
+                )
+        _validate_next_action_instance(
+            errors,
+            identity_mismatches,
+            write,
+            next_action,
+        )
     elif require_next_action and next_action is None:
         errors.append("contract execution has no remaining next legal action")
+        atomic_lane_binding = execution_state.get("atomic_lane_gate_binding")
+        if (
+            isinstance(atomic_lane_binding, Mapping)
+            and atomic_lane_binding.get("bound") is True
+        ):
+            identity_mismatches.extend(
+                [
+                    {
+                        "field": "stage_id",
+                        "expected": "<no remaining lane stage>",
+                        "actual": stage_id or "<missing>",
+                    },
+                    {
+                        "field": "line_id",
+                        "expected": "<no remaining lane line>",
+                        "actual": line_id or "<missing>",
+                    },
+                ]
+            )
 
     bounded_qa_policy = contract_line_evidence_policy(
         definition,
@@ -1232,44 +1272,178 @@ def _is_plausible_graph_trace_id(value: str) -> bool:
 
 def _validate_next_action_instance(
     errors: list[str],
+    identity_mismatches: list[dict[str, Any]],
     write: Mapping[str, Any],
     next_action: Mapping[str, Any],
 ) -> None:
+    require_full_identity = next_action.get("atomic_lane_gate_bound") is True
     expected_instance = str(next_action.get("line_instance_id") or "")
     expected_runtime_context_id = str(next_action.get("runtime_context_id") or "")
     expected_task_id = str(next_action.get("task_id") or "")
+    expected_parent_task_id = str(next_action.get("parent_task_id") or "")
     expected_lane_id = str(next_action.get("lane_id") or "")
+    expected_worker_slot_id = str(next_action.get("worker_slot_id") or "")
+    expected_worker_id = str(next_action.get("worker_id") or "")
     if not any(
-        (expected_instance, expected_runtime_context_id, expected_task_id, expected_lane_id)
+        (
+            expected_instance,
+            expected_runtime_context_id,
+            expected_task_id,
+            expected_parent_task_id,
+            expected_lane_id,
+            expected_worker_slot_id,
+            expected_worker_id,
+        )
     ):
         return
 
-    actual_runtime_context_id = _write_field(write, "runtime_context_id")
-    if expected_runtime_context_id:
-        if not actual_runtime_context_id:
-            errors.append("missing runtime_context_id for next legal action")
-        elif actual_runtime_context_id != expected_runtime_context_id:
-            errors.append("runtime_context_id does not match next legal action")
+    def expect_identity_values(
+        *,
+        field: str,
+        expected: str,
+        keys: tuple[str, ...],
+        missing_error: str,
+        mismatch_error: str,
+        require_presence: bool = True,
+    ) -> str:
+        if not expected:
+            return ""
+        values = _write_field_values(write, *keys)
+        if not values and require_presence:
+            errors.append(missing_error)
+            identity_mismatches.append(
+                {"field": field, "expected": expected, "actual": "<missing>"}
+            )
+            return ""
+        mismatches = [item for item in values if item[1] != expected]
+        if mismatches:
+            errors.append(mismatch_error)
+            identity_mismatches.extend(
+                {
+                    "field": path,
+                    "expected": expected,
+                    "actual": actual,
+                }
+                for path, actual in mismatches
+            )
+        return values[0][1] if values else ""
 
-    actual_task_id = _write_field(write, "task_id")
-    if expected_task_id and actual_task_id and actual_task_id != expected_task_id:
-        errors.append("task_id does not match next legal action")
+    actual_runtime_context_id = expect_identity_values(
+        field="runtime_context_id",
+        expected=expected_runtime_context_id,
+        keys=("runtime_context_id",),
+        missing_error="missing runtime_context_id for next legal action",
+        mismatch_error="runtime_context_id does not match next legal action",
+    )
 
-    actual_lane_id = _write_field(write, "lane_id", "worker_slot_id", "worker_id")
-    if expected_lane_id and actual_lane_id and actual_lane_id != expected_lane_id:
-        errors.append("lane_id does not match next legal action")
+    actual_task_id = expect_identity_values(
+        field="task_id",
+        expected=expected_task_id,
+        keys=("task_id",),
+        missing_error="missing task_id for next legal action",
+        mismatch_error="task_id does not match next legal action",
+        require_presence=require_full_identity,
+    )
 
-    actual_instance = _write_field(write, "line_instance_id", "instance_id")
+    expect_identity_values(
+        field="parent_task_id",
+        expected=expected_parent_task_id,
+        keys=("parent_task_id",),
+        missing_error="missing parent_task_id for next legal action",
+        mismatch_error="parent_task_id does not match next legal action",
+        require_presence=require_full_identity,
+    )
+
+    if require_full_identity:
+        actual_lane_id = expect_identity_values(
+            field="lane_id",
+            expected=expected_lane_id,
+            keys=("lane_id",),
+            missing_error="missing lane_id for next legal action",
+            mismatch_error="lane_id does not match next legal action",
+        )
+        expect_identity_values(
+            field="worker_slot_id",
+            expected=expected_worker_slot_id,
+            keys=("worker_slot_id",),
+            missing_error="missing worker_slot_id for next legal action",
+            mismatch_error="worker_slot_id does not match next legal action",
+        )
+        expect_identity_values(
+            field="worker_id",
+            expected=expected_worker_id,
+            keys=("worker_id",),
+            missing_error="missing worker_id for next legal action",
+            mismatch_error="worker_id does not match next legal action",
+        )
+    else:
+        actual_lane_id = _write_field(
+            write,
+            "lane_id",
+            "worker_slot_id",
+            "worker_id",
+        )
+        if expected_lane_id and actual_lane_id and actual_lane_id != expected_lane_id:
+            errors.append("lane_id does not match next legal action")
+            identity_mismatches.append(
+                {
+                    "field": "lane_id",
+                    "expected": expected_lane_id,
+                    "actual": actual_lane_id,
+                }
+            )
+        actual_worker_slot_id = _write_field(write, "worker_slot_id", "worker_id")
+        if (
+            expected_worker_slot_id
+            and actual_worker_slot_id
+            and actual_worker_slot_id != expected_worker_slot_id
+        ):
+            errors.append("worker_slot_id does not match next legal action")
+            identity_mismatches.append(
+                {
+                    "field": "worker_slot_id",
+                    "expected": expected_worker_slot_id,
+                    "actual": actual_worker_slot_id,
+                }
+            )
+
+    actual_instance = expect_identity_values(
+        field="line_instance_id",
+        expected=expected_instance,
+        keys=("line_instance_id", "instance_id"),
+        missing_error="missing line_instance_id for next legal action",
+        mismatch_error="line_instance_id does not match next legal action",
+        require_presence=False,
+    )
     if not actual_instance:
         actual_instance = _line_instance_id_from_values(
             runtime_context_id=actual_runtime_context_id,
             task_id=actual_task_id,
             lane_id=actual_lane_id,
         )
-    if expected_instance and actual_instance and actual_instance != expected_instance:
-        errors.append("line_instance_id does not match next legal action")
-    elif expected_instance and not actual_instance:
-        errors.append("missing line_instance_id for next legal action")
+        if expected_instance and actual_instance != expected_instance:
+            errors.append("line_instance_id does not match next legal action")
+            identity_mismatches.append(
+                {
+                    "field": "line_instance_id",
+                    "expected": expected_instance,
+                    "actual": actual_instance or "<missing>",
+                }
+            )
+
+
+def _write_field_values(
+    write: Mapping[str, Any],
+    *keys: str,
+) -> list[tuple[str, str]]:
+    payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    values: list[tuple[str, str]] = []
+    for prefix, source in (("", write), ("payload.", payload)):
+        for key in keys:
+            text = str(source.get(key) or "").strip()
+            if text:
+                values.append((f"{prefix}{key}", text))
+    return values
 
 
 def _write_field(write: Mapping[str, Any], *keys: str) -> str:

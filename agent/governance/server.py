@@ -41501,15 +41501,64 @@ def _runtime_context_submit_canonical_contract_line(
         if isinstance(record.get("runtime_guide"), Mapping)
         else {}
     )
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    lane_probe_payload = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "worker_role": "mf_sub",
+        "worker_id": str(getattr(context, "worker_id", "") or "").strip(),
+        "worker_slot_id": worker_slot_id,
+        "lane_id": worker_slot_id,
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+    }
+    lane_probe = {
+        **lane_probe_payload,
+        "actor_role": "mf_sub",
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "evidence_kind": evidence_kind,
+        "payload": lane_probe_payload,
+    }
+    lane_gate_state, lane_gate_guide = (
+        runtime.mf_parallel_atomic_lane_gate_view(
+            record,
+            guide,
+            lane_probe,
+            source_record=stored_record,
+            projection=context_projection,
+        )
+    )
+    gate_record = dict(record)
+    gate_record["execution_state"] = lane_gate_state
+    gate_record["runtime_guide"] = lane_gate_guide
+    guide = lane_gate_guide
     next_line = (
         guide.get("next_legal_action")
         if isinstance(guide.get("next_legal_action"), Mapping)
         else {}
     )
     next_line_id = str(next_line.get("line_id") or "").strip()
+    atomic_lane_binding = (
+        guide.get("atomic_lane_gate_binding")
+        if isinstance(guide.get("atomic_lane_gate_binding"), Mapping)
+        else {}
+    )
+    atomic_lane_gate_bound = bool(
+        next_line.get("atomic_lane_gate_bound") is True
+        or atomic_lane_binding.get("bound") is True
+    )
 
     canonical_payload = dict(payload)
     canonical_payload.pop("failed_qa_revision_rejoin_marker", None)
+    if atomic_lane_gate_bound:
+        for field, value in lane_probe_payload.items():
+            if value not in (None, ""):
+                canonical_payload.setdefault(field, value)
     finish_attestation_recovery = (
         _runtime_context_revise_incomplete_finish_attestation_lineage(
             conn,
@@ -41875,6 +41924,43 @@ def _runtime_context_submit_canonical_contract_line(
                 }
             if next_line_id == line_id:
                 continue
+            completed_instance = str(
+                completed.get("line_instance_id")
+                or f"runtime_context:{runtime_context_id}"
+            ).strip()
+            if atomic_lane_gate_bound:
+                raise GovernanceError(
+                    "contract_runtime_canonical_line_duplicate",
+                    "runtime-context facade rejects a duplicate completed lane line",
+                    409,
+                    {
+                        "contract_execution_id": execution_id,
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": task_id,
+                        "requested_line_id": line_id,
+                        "next_legal_action": dict(next_line),
+                        "identity_mismatches": [
+                            {
+                                "field": "line_id",
+                                "expected": (
+                                    next_line_id
+                                    or "<no remaining lane line>"
+                                ),
+                                "actual": line_id,
+                            },
+                            {
+                                "field": "line_instance_id",
+                                "expected": (
+                                    "not previously completed for this lane"
+                                ),
+                                "actual": completed_instance,
+                            },
+                        ],
+                        "contract_runtime_mutated": False,
+                        "completed_lines_mutated": False,
+                        "timeline_evidence_backfill_allowed": False,
+                    },
+                )
             return {
                 "schema_version": "runtime_context.canonical_contract_line.v1",
                 "accepted": True,
@@ -41886,12 +41972,27 @@ def _runtime_context_submit_canonical_contract_line(
                 "stage_id": stage_id,
                 "line_id": line_id,
                 "evidence_kind": evidence_kind,
-                "line_instance_id": str(
-                    completed.get("line_instance_id") or ""
-                ),
+                "line_instance_id": completed_instance,
             }
 
     if next_line_id != line_id:
+        identity_mismatches = []
+        expected_stage_id = str(next_line.get("stage_id") or "").strip()
+        if stage_id != expected_stage_id:
+            identity_mismatches.append(
+                {
+                    "field": "stage_id",
+                    "expected": expected_stage_id or "<no remaining lane stage>",
+                    "actual": stage_id or "<missing>",
+                }
+            )
+        identity_mismatches.append(
+            {
+                "field": "line_id",
+                "expected": next_line_id or "<no remaining lane line>",
+                "actual": line_id or "<missing>",
+            }
+        )
         raise GovernanceError(
             "contract_runtime_canonical_line_out_of_order",
             "runtime-context facade cannot advance a non-current Contract line",
@@ -41902,12 +42003,13 @@ def _runtime_context_submit_canonical_contract_line(
                 "task_id": task_id,
                 "requested_line_id": line_id,
                 "next_legal_action": dict(next_line),
+                "identity_mismatches": identity_mismatches,
                 "timeline_evidence_backfill_allowed": False,
             },
         )
 
     write = _contract_runtime_write_from_record(
-        record,
+        gate_record,
         actor_role="mf_sub",
         stage_id=stage_id,
         line_id=line_id,
@@ -79551,9 +79653,88 @@ def _resolve_contract_runtime_mf_sub_proof(
             },
         )
 
+    context = proof.get("context")
+    lane_gate_bound = False
+    if context is not None and isinstance(record, Mapping):
+        worker_id = str(getattr(context, "worker_id", "") or "").strip()
+        worker_slot_id = str(
+            getattr(context, "worker_slot_id", "") or worker_id
+        ).strip()
+        lane_probe_payload = {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": str(
+                getattr(context, "parent_task_id", "") or parent_task_id
+            ).strip(),
+            "worker_role": "mf_sub",
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "lane_id": worker_slot_id,
+            "line_instance_id": f"runtime_context:{runtime_context_id}",
+        }
+        lane_probe = {
+            **lane_probe_payload,
+            "actor_role": "mf_sub",
+            "stage_id": _contract_runtime_ref_value(ctx, "stage_id"),
+            "line_id": _contract_runtime_ref_value(ctx, "line_id"),
+            "evidence_kind": _contract_runtime_ref_value(ctx, "evidence_kind"),
+            "payload": lane_probe_payload,
+        }
+        try:
+            _lane_state, lane_guide = (
+                _contract_runtime(conn).mf_parallel_atomic_lane_gate_view(
+                    record,
+                    (
+                        record.get("runtime_guide")
+                        if isinstance(record.get("runtime_guide"), Mapping)
+                        else {}
+                    ),
+                    lane_probe,
+                    source_record=record,
+                )
+            )
+        except StalePinnedContractExecutionError:
+            # A stale pinned definition is recovery authority, not an
+            # optional lane-view miss.  Let the enclosing mutable facade
+            # return its normal start-new-execution repair guide.
+            raise
+        except ContractRuntimeError:
+            lane_guide = {}
+        lane_next = (
+            lane_guide.get("next_legal_action")
+            if isinstance(lane_guide.get("next_legal_action"), Mapping)
+            else {}
+        )
+        lane_binding = (
+            lane_guide.get("atomic_lane_gate_binding")
+            if isinstance(
+                lane_guide.get("atomic_lane_gate_binding"),
+                Mapping,
+            )
+            else {}
+        )
+        lane_gate_bound = bool(
+            (
+                lane_next.get("atomic_lane_gate_bound") is True
+                and str(lane_next.get("runtime_context_id") or "").strip()
+                == runtime_context_id
+            )
+            or (
+                lane_binding.get("bound") is True
+                and str(
+                    lane_binding.get("runtime_context_id") or ""
+                ).strip()
+                == runtime_context_id
+            )
+        )
+
     next_line = _contract_runtime_next_line(record or {})
     expected_runtime_context_id = str(next_line.get("runtime_context_id") or "").strip()
-    if expected_runtime_context_id and runtime_context_id != expected_runtime_context_id:
+    if (
+        expected_runtime_context_id
+        and runtime_context_id != expected_runtime_context_id
+        and not lane_gate_bound
+    ):
         raise PermissionDeniedError(
             "mf_sub",
             action,
@@ -79565,7 +79746,6 @@ def _resolve_contract_runtime_mf_sub_proof(
             },
         )
 
-    context = proof.get("context")
     if not _contract_runtime_record_references_runtime_context(
         record,
         context,
@@ -79721,6 +79901,38 @@ def _contract_runtime_line_write_body(
         from .runtime_context import attach_contract_runtime_worker_provenance
 
         write = attach_contract_runtime_worker_provenance(write, worker_proof)
+        write.setdefault(
+            "lane_id",
+            str(
+                write.get("worker_slot_id")
+                or write.get("worker_id")
+                or ""
+            ).strip(),
+        )
+        proof_identity_mismatches = []
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "lane_id",
+            "worker_slot_id",
+            "worker_id",
+        ):
+            provided = str(body.get(field) or "").strip()
+            expected = str(write.get(field) or "").strip()
+            if provided and expected and provided != expected:
+                proof_identity_mismatches.append(
+                    {
+                        "field": field,
+                        "expected": expected,
+                        "actual": provided,
+                    }
+                )
+        if proof_identity_mismatches:
+            raise ValidationError(
+                "worker identity conflicts with authenticated RuntimeContext proof",
+                {"identity_mismatches": proof_identity_mismatches},
+            )
         if write.get("line_id") == "worker_commit":
             payload = (
                 dict(write.get("payload"))
@@ -79794,6 +80006,43 @@ def _contract_runtime_line_write_body(
         write["changed_files"] = changed_files
         write["graph_trace_ids"] = graph_trace_ids
     return write
+
+
+def _contract_runtime_mf_parallel_atomic_lane_write_record(
+    runtime,
+    *,
+    record: Mapping[str, Any],
+    source_record: Mapping[str, Any],
+    projection: Mapping[str, Any] | None,
+    body: Mapping[str, Any],
+    actor_role: str,
+    worker_proof: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Bind a generic worker write to the shared atomic per-lane gate view."""
+
+    if actor_role != "mf_sub" or not worker_proof:
+        return dict(record)
+    provisional_write = _contract_runtime_line_write_body(
+        record,
+        actor_role=actor_role,
+        body=body,
+        worker_proof=worker_proof,
+    )
+    lane_state, lane_guide = runtime.mf_parallel_atomic_lane_gate_view(
+        record,
+        (
+            record.get("runtime_guide")
+            if isinstance(record.get("runtime_guide"), Mapping)
+            else {}
+        ),
+        provisional_write,
+        source_record=source_record,
+        projection=projection,
+    )
+    lane_record = dict(record)
+    lane_record["execution_state"] = lane_state
+    lane_record["runtime_guide"] = lane_guide
+    return lane_record
 
 
 _CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS = set(_QA_REVIEW_AUTHORITY_NAMES) | {
@@ -130921,15 +131170,16 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
     with DBContext(project_id) as conn:
         runtime = _contract_runtime(conn)
         record = runtime.store.get(contract_execution_id)
-        actor_role = _contract_runtime_effective_actor_role(
-            ctx,
-            conn,
-            action="contract_runtime_submit_line",
-            backlog_id=str(record.get("backlog_id") or ""),
-            contract_execution_id=contract_execution_id,
-            record=record,
-        )
+        actor_role = ""
         try:
+            actor_role = _contract_runtime_effective_actor_role(
+                ctx,
+                conn,
+                action="contract_runtime_submit_line",
+                backlog_id=str(record.get("backlog_id") or ""),
+                contract_execution_id=contract_execution_id,
+                record=record,
+            )
             if _onboard_service_record(record):
                 record = _contract_runtime_read(
                     conn,
@@ -130951,6 +131201,7 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
             else:
                 runtime.current_guide(contract_execution_id, actor_role=actor_role)
                 record = runtime.store.get(contract_execution_id)
+                stored_record = record
                 record, _dispatch_copy_projection = (
                     _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
                         conn,
@@ -130965,6 +131216,19 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                         record=record,
                         actor_role=actor_role,
                     )
+                )
+                record = _contract_runtime_mf_parallel_atomic_lane_write_record(
+                    runtime,
+                    record=record,
+                    source_record=stored_record,
+                    projection=projection,
+                    body=body,
+                    actor_role=actor_role,
+                    worker_proof=getattr(
+                        ctx,
+                        "_contract_runtime_mf_sub_proof",
+                        None,
+                    ),
                 )
                 write = _contract_runtime_line_write_body(
                     record,
@@ -131083,13 +131347,18 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                         )
                     )
         except StalePinnedContractExecutionError as exc:
+            stale_actor_role = actor_role or (
+                "mf_sub"
+                if _contract_runtime_mf_sub_proof_requested(ctx)
+                else ""
+            )
             response = _contract_runtime_stale_recovery_projection(
                 exc,
                 action="contract_runtime_submit_line",
                 route_token_ref=_contract_runtime_ref_value(
                     ctx, "route_token_ref", "observer_route_token_ref"
                 ),
-                actor_role=actor_role,
+                actor_role=stale_actor_role,
             )
             response["decision"] = {
                 "ok": False,
@@ -131500,15 +131769,16 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
     with DBContext(project_id) as conn:
         runtime = _contract_runtime(conn)
         record = runtime.store.get(contract_execution_id)
-        actor_role = _contract_runtime_effective_actor_role(
-            ctx,
-            conn,
-            action="contract_runtime_submit_line",
-            backlog_id=str(record.get("backlog_id") or ""),
-            contract_execution_id=contract_execution_id,
-            record=record,
-        )
+        actor_role = ""
         try:
+            actor_role = _contract_runtime_effective_actor_role(
+                ctx,
+                conn,
+                action="contract_runtime_submit_line",
+                backlog_id=str(record.get("backlog_id") or ""),
+                contract_execution_id=contract_execution_id,
+                record=record,
+            )
             if _onboard_service_record(record):
                 record = _contract_runtime_read(
                     conn,
@@ -131546,6 +131816,19 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                         record=record,
                         actor_role=actor_role,
                     )
+                )
+                record = _contract_runtime_mf_parallel_atomic_lane_write_record(
+                    runtime,
+                    record=record,
+                    source_record=stored_record,
+                    projection=projection,
+                    body=body,
+                    actor_role=actor_role,
+                    worker_proof=getattr(
+                        ctx,
+                        "_contract_runtime_mf_sub_proof",
+                        None,
+                    ),
                 )
                 write = _contract_runtime_line_write_body(
                     record,
@@ -131647,13 +131930,18 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                                 projection=projection,
                             )
         except StalePinnedContractExecutionError as exc:
+            stale_actor_role = actor_role or (
+                "mf_sub"
+                if _contract_runtime_mf_sub_proof_requested(ctx)
+                else ""
+            )
             response = _contract_runtime_stale_recovery_projection(
                 exc,
                 action="contract_runtime_submit_line",
                 route_token_ref=_contract_runtime_ref_value(
                     ctx, "route_token_ref", "observer_route_token_ref"
                 ),
-                actor_role=actor_role,
+                actor_role=stale_actor_role,
             )
             response["decision"] = {
                 "ok": False,

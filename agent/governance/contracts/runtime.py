@@ -28,7 +28,10 @@ from uuid import uuid4
 
 from .execution_state import (
     _first_mapping_text,
+    _is_mf_parallel_lane_line,
+    _iter_worker_payloads,
     _line_instance_id_from_mapping,
+    _mf_parallel_worker_instances,
     build_execution_state,
 )
 from .gate_decision import make_gate_decision
@@ -48,6 +51,14 @@ _JUDGMENT_HINT_DEFAULT_PORT = "40123"
 _JUDGMENT_HINT_TIMEOUT_SECONDS = 0.2
 _JUDGMENT_HINT_CACHE_TTL_SECONDS = 30.0
 _JUDGMENT_HINT_CACHE: dict[tuple[str, str], tuple[float, list[Any] | None]] = {}
+
+_MF_PARALLEL_CONTRACT_IDS = frozenset(
+    {"mf_parallel", "mf_parallel.v1", "mf_parallel.v2"}
+)
+_MF_PARALLEL_ATOMIC_DISPATCH_LINE = (
+    "dispatch",
+    "observer_dispatch_bounded_workers",
+)
 
 
 class ContractRuntimeError(ValueError):
@@ -3962,6 +3973,31 @@ def _failed_qa_rejoin_markers_from_projection(
     return markers
 
 
+def _contract_completion_satisfying_lines_for_view(
+    definition: Mapping[str, Any],
+    source_record: Mapping[str, Any],
+    line_items: Sequence[Mapping[str, Any]],
+    projection: Mapping[str, Any] | None = None,
+) -> list[Mapping[str, Any]]:
+    """Return the exact line set used by the authoritative execution state."""
+
+    completion_input_lines = _compat_completion_lines_for_record(
+        source_record,
+        definition,
+        line_items,
+    )
+    return _contract_completion_satisfying_lines(
+        completion_input_lines,
+        source_record=source_record,
+        failed_qa_rejoin_contexts=(
+            _failed_qa_rejoin_context_keys_from_projection(projection)
+        ),
+        failed_qa_rejoin_markers=(
+            _failed_qa_rejoin_markers_from_projection(projection)
+        ),
+    )
+
+
 def _line_matches_failed_qa_rejoin_marker(
     line: Mapping[str, Any],
     markers: Sequence[Mapping[str, Any]],
@@ -4954,6 +4990,366 @@ def _gate_decision_with_additional_errors(
         ),
         runtime_guide_hash=str(getattr(decision, "runtime_guide_hash", "") or ""),
     )
+
+
+def _mf_parallel_atomic_lane_gate_view(
+    definition: Mapping[str, Any],
+    record: Mapping[str, Any],
+    runtime_guide: Mapping[str, Any],
+    write: Mapping[str, Any],
+    *,
+    completion_satisfying_lines: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Bind one mf_sub write to its own first missing atomic-dispatch line.
+
+    The persisted execution state remains the deterministic global scheduler
+    view.  This private gate view only replaces the next action for an exact,
+    allocated RuntimeContext while validating its write.  Observer-owned lines
+    (especially ``observer_merge``) therefore retain the global all-lanes
+    barrier.
+    """
+
+    state = (
+        dict(record.get("execution_state"))
+        if isinstance(record.get("execution_state"), Mapping)
+        else {}
+    )
+    guide = dict(runtime_guide)
+    if (
+        str(definition.get("contract_id") or "")
+        not in _MF_PARALLEL_CONTRACT_IDS
+        or str(write.get("actor_role") or "").strip() != "mf_sub"
+    ):
+        return state, guide
+
+    completed_lines = [
+        item
+        for item in completion_satisfying_lines
+        if isinstance(item, Mapping)
+    ]
+    atomic_dispatches: list[Mapping[str, Any]] = []
+    for item in completed_lines:
+        if (
+            str(item.get("stage_id") or "").strip(),
+            str(item.get("line_id") or "").strip(),
+        ) != _MF_PARALLEL_ATOMIC_DISPATCH_LINE:
+            continue
+        payload = (
+            item.get("payload")
+            if isinstance(item.get("payload"), Mapping)
+            else {}
+        )
+        if (
+            payload.get("atomic_dispatch") is True
+            and payload.get("all_or_nothing") is True
+        ):
+            atomic_dispatches.append(item)
+    if len(atomic_dispatches) != 1:
+        return state, guide
+
+    dispatch = atomic_dispatches[0]
+    dispatch_payload = (
+        dispatch.get("payload")
+        if isinstance(dispatch.get("payload"), Mapping)
+        else {}
+    )
+    try:
+        required_worker_count = int(
+            dispatch_payload.get("required_worker_count") or 0
+        )
+        worker_count = int(dispatch_payload.get("worker_count") or 0)
+    except (TypeError, ValueError):
+        return state, guide
+    workers = _mf_parallel_worker_instances([dispatch])
+    raw_workers = list(_iter_worker_payloads(dispatch_payload))
+    runtime_context_ids = [
+        str(worker.get("runtime_context_id") or "").strip()
+        for worker in workers
+    ]
+    raw_worker_ids = [
+        _first_mapping_text(
+            worker,
+            "worker_id",
+            nested_keys=("runtime_context", "context", "branch_context"),
+        )
+        for worker in raw_workers
+    ]
+    required_identity_fields = (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "lane_id",
+        "worker_slot_id",
+        "line_instance_id",
+    )
+    if (
+        required_worker_count != 2
+        or worker_count != required_worker_count
+        or len(workers) != required_worker_count
+        or len(raw_workers) != required_worker_count
+        or len(set(runtime_context_ids)) != required_worker_count
+        or not all(runtime_context_ids)
+        or not all(raw_worker_ids)
+        or len(set(raw_worker_ids)) != required_worker_count
+        or any(
+            not all(str(worker.get(field) or "").strip() for field in required_identity_fields)
+            for worker in workers
+        )
+        or any(
+            len(
+                {
+                    str(worker.get(field) or "").strip()
+                    for worker in workers
+                }
+            )
+            != required_worker_count
+            for field in (
+                "runtime_context_id",
+                "task_id",
+                "lane_id",
+                "worker_slot_id",
+                "line_instance_id",
+            )
+        )
+    ):
+        return state, guide
+
+    requested_runtime_context_id = _first_mapping_text(
+        write,
+        "runtime_context_id",
+        nested_keys=("payload",),
+    )
+    matching_workers = [
+        worker
+        for worker in workers
+        if str(worker.get("runtime_context_id") or "").strip()
+        == requested_runtime_context_id
+    ]
+    if len(matching_workers) != 1:
+        return state, guide
+    worker = dict(matching_workers[0])
+    raw_matching_workers = [
+        item
+        for item in raw_workers
+        if _first_mapping_text(
+            item,
+            "runtime_context_id",
+            "runtimeContextId",
+            nested_keys=("runtime_context", "context", "branch_context"),
+        )
+        == requested_runtime_context_id
+    ]
+    if len(raw_matching_workers) != 1:
+        return state, guide
+    worker_id = _first_mapping_text(
+        raw_matching_workers[0],
+        "worker_id",
+        nested_keys=("runtime_context", "context", "branch_context"),
+    )
+    if worker_id:
+        worker["worker_id"] = worker_id
+    line_instance_id = str(worker.get("line_instance_id") or "").strip()
+    if not line_instance_id:
+        return state, guide
+
+    completed = {
+        (
+            str(item.get("stage_id") or "").strip(),
+            str(item.get("line_id") or "").strip(),
+            _line_instance_id_from_mapping(item),
+        )
+        for item in completed_lines
+    }
+    lane_next_action: dict[str, Any] | None = None
+    for stage, line in iter_stage_lines(definition):
+        owner_role = str(line.get("owner_role") or "").strip()
+        allowed_roles = {
+            str(role or "").strip()
+            for role in (line.get("allowed_writer_roles") or [])
+        }
+        if (
+            not _is_mf_parallel_lane_line(definition, line)
+            or owner_role != "mf_sub"
+            or "mf_sub" not in allowed_roles
+        ):
+            continue
+        stage_id = str(stage.get("stage_id") or "").strip()
+        line_id = str(line.get("line_id") or "").strip()
+        if (stage_id, line_id, line_instance_id) in completed:
+            continue
+        lane_next_action = {
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "atomic_lane_gate_bound": True,
+            "owner_role": owner_role,
+            "allowed_writer_roles": list(line.get("allowed_writer_roles") or []),
+            "evidence_kind": str(line.get("evidence_kind") or ""),
+            "required": bool(line.get("required", True)),
+            **dict(worker),
+        }
+        break
+
+    source_global_runtime_guide_hash = str(
+        guide.get("runtime_guide_hash") or ""
+    ).strip()
+    lane_binding = {
+        "schema_version": "mf_parallel.atomic_lane_gate_binding.v1",
+        "bound": True,
+        **dict(worker),
+    }
+    state["atomic_lane_gate_binding"] = lane_binding
+    state["next_action"] = lane_next_action
+    state["execution_state_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in state.items()
+            if key != "execution_state_hash"
+        }
+    )
+    guide["next_legal_action"] = (
+        dict(lane_next_action) if lane_next_action is not None else None
+    )
+    guide["atomic_lane_gate_binding"] = {
+        **lane_binding,
+        "source_global_runtime_guide_hash": (
+            source_global_runtime_guide_hash
+        ),
+    }
+    safe_copy = (
+        dict(guide.get("writer_role_safe_copy_payload") or {})
+        if isinstance(guide.get("writer_role_safe_copy_payload"), Mapping)
+        else {}
+    )
+    guide.pop("writer_role_safe_copy_payload", None)
+    lane_hash_authority = {
+        "schema_version": "contract_runtime.atomic_lane_guide_authority.v1",
+        "contract": {
+            "contract_id": str(definition.get("contract_id") or ""),
+            "version": str(definition.get("version") or ""),
+            "revision": str(definition.get("revision") or ""),
+            "definition_hash": str(
+                definition.get("definition_hash") or ""
+            ),
+        },
+        "execution": {
+            "project_id": str(record.get("project_id") or ""),
+            "backlog_id": str(record.get("backlog_id") or ""),
+            "contract_execution_id": str(
+                record.get("contract_execution_id") or ""
+            ),
+            "execution_state_revision": int(
+                record.get("execution_state_revision") or 0
+            ),
+        },
+        "atomic_dispatch_hash": stable_sha256(dispatch),
+        "lane_binding": lane_binding,
+        "next_legal_action": (
+            dict(lane_next_action)
+            if lane_next_action is not None
+            else None
+        ),
+    }
+    guide["runtime_guide_hash_scope"] = {
+        "schema_version": "contract_runtime.atomic_lane_guide_hash_scope.v1",
+        "source": "mf_parallel_atomic_lane_gate_view",
+        "private_writer_lane": True,
+        "hash_input": "authority",
+        "authority": lane_hash_authority,
+        "source_global_runtime_guide_hash": (
+            source_global_runtime_guide_hash
+        ),
+    }
+    lane_runtime_guide_hash = stable_sha256(lane_hash_authority)
+    guide["runtime_guide_hash"] = lane_runtime_guide_hash
+    if lane_next_action is None:
+        return state, guide
+
+    copy_payload = (
+        dict(safe_copy.get("copy_payload") or {})
+        if isinstance(safe_copy.get("copy_payload"), Mapping)
+        else {}
+    )
+    if copy_payload:
+        copy_payload.update(
+            {
+                "stage_id": lane_next_action["stage_id"],
+                "line_id": lane_next_action["line_id"],
+                "actor_role": "mf_sub",
+                "evidence_kind": lane_next_action["evidence_kind"],
+                "execution_state_revision": int(
+                    state.get("execution_state_revision") or 0
+                ),
+                "runtime_guide_hash": lane_runtime_guide_hash,
+            }
+        )
+        for field in (
+            "line_instance_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_role",
+            "lane_id",
+            "worker_slot_id",
+            "worker_id",
+        ):
+            value = lane_next_action.get(field)
+            if value not in (None, ""):
+                copy_payload[field] = value
+            else:
+                copy_payload.pop(field, None)
+        safe_copy["copy_payload"] = copy_payload
+        alignment = (
+            dict(safe_copy.get("hash_alignment") or {})
+            if isinstance(safe_copy.get("hash_alignment"), Mapping)
+            else {}
+        )
+        alignment["required_owner_role"] = "mf_sub"
+        alignment["required_writer_role"] = "mf_sub"
+        alignment["reader_runtime_guide_hash"] = (
+            source_global_runtime_guide_hash
+        )
+        alignment["required_writer_runtime_guide_hash"] = (
+            lane_runtime_guide_hash
+        )
+        alignment["reader_hash_is_writer_hash"] = (
+            source_global_runtime_guide_hash
+            == lane_runtime_guide_hash
+        )
+        safe_copy["hash_alignment"] = alignment
+        guide["writer_role_safe_copy_payload"] = safe_copy
+    return state, guide
+
+
+def _bind_mf_parallel_atomic_lane_runtime_guide_hash(
+    write: dict[str, Any],
+    runtime_guide: Mapping[str, Any],
+) -> None:
+    """Exchange one current global scheduler hash for its exact lane hash.
+
+    Direct ``ContractRuntime`` callers read the persisted global guide.  Once
+    the server deterministically binds their exact atomic worker identity to a
+    private lane view, the same current global hash is an admissible revision
+    token and is exchanged for the content-bound private guide hash.  Missing,
+    arbitrary, or stale hashes are never repaired here and remain fail-closed.
+    """
+
+    binding = (
+        runtime_guide.get("atomic_lane_gate_binding")
+        if isinstance(
+            runtime_guide.get("atomic_lane_gate_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    if binding.get("bound") is not True:
+        return
+    source_hash = str(
+        binding.get("source_global_runtime_guide_hash") or ""
+    ).strip()
+    lane_hash = str(runtime_guide.get("runtime_guide_hash") or "").strip()
+    requested_hash = str(write.get("runtime_guide_hash") or "").strip()
+    if source_hash and lane_hash and requested_hash == source_hash:
+        write["runtime_guide_hash"] = lane_hash
 
 
 def _line_shape_allows_contract_completion(line: Mapping[str, Any]) -> bool:
@@ -6983,6 +7379,44 @@ class ContractRuntime:
             for _stage, line in iter_stage_lines(definition)
         )
 
+    def mf_parallel_atomic_lane_gate_view(
+        self,
+        record: Mapping[str, Any],
+        runtime_guide: Mapping[str, Any],
+        write: Mapping[str, Any],
+        *,
+        source_record: Mapping[str, Any] | None = None,
+        projection: Mapping[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return the server-derived gate view for one atomic worker lane.
+
+        This does not mutate the persisted/global scheduler view.  Facades use
+        it only to construct the exact writer-bound body that
+        :meth:`submit_line_write` will independently re-derive and validate.
+        """
+
+        authoritative_source = source_record or record
+        definition = self._load_pinned_definition(authoritative_source)
+        completion_satisfying_lines = (
+            _contract_completion_satisfying_lines_for_view(
+                definition,
+                authoritative_source,
+                [
+                    item
+                    for item in (record.get("completed_lines") or [])
+                    if isinstance(item, Mapping)
+                ],
+                projection,
+            )
+        )
+        return _mf_parallel_atomic_lane_gate_view(
+            definition,
+            record,
+            runtime_guide,
+            write,
+            completion_satisfying_lines=completion_satisfying_lines,
+        )
+
     def _record_view(
         self,
         record: Mapping[str, Any],
@@ -7008,20 +7442,13 @@ class ContractRuntime:
         effective_actor_role = actor_role or str(
             record["execution_state"].get("actor_role") or ""
         )
-        completion_input_lines = _compat_completion_lines_for_record(
-            record,
-            definition,
-            line_items,
-        )
-        completion_satisfying_lines = _contract_completion_satisfying_lines(
-            completion_input_lines,
-            source_record=record,
-            failed_qa_rejoin_contexts=(
-                _failed_qa_rejoin_context_keys_from_projection(projection)
-            ),
-            failed_qa_rejoin_markers=(
-                _failed_qa_rejoin_markers_from_projection(projection)
-            ),
+        completion_satisfying_lines = (
+            _contract_completion_satisfying_lines_for_view(
+                definition,
+                record,
+                line_items,
+                projection,
+            )
         )
         state = build_execution_state(
             definition,
@@ -7162,12 +7589,23 @@ class ContractRuntime:
                 projection=projection,
             )
             guide = gate_record["runtime_guide"]
+        gate_state, gate_guide = self.mf_parallel_atomic_lane_gate_view(
+            gate_record,
+            guide,
+            effective_write,
+            source_record=refreshed,
+            projection=projection,
+        )
+        _bind_mf_parallel_atomic_lane_runtime_guide_hash(
+            effective_write,
+            gate_guide,
+        )
         gate_decision = self.gate_kernel.precheck(
             definition,
             action="submit_line",
             actor_role=effective_actor_role,
-            execution_state=gate_record["execution_state"],
-            runtime_guide=guide,
+            execution_state=gate_state,
+            runtime_guide=gate_guide,
             write=effective_write,
         )
         gate_decision = (
@@ -8857,12 +9295,23 @@ class ContractRuntime:
                 projection=projection,
             )
             guide = gate_record["runtime_guide"]
+        gate_state, gate_guide = self.mf_parallel_atomic_lane_gate_view(
+            gate_record,
+            guide,
+            effective_write,
+            source_record=refreshed,
+            projection=projection,
+        )
+        _bind_mf_parallel_atomic_lane_runtime_guide_hash(
+            effective_write,
+            gate_guide,
+        )
         gate_decision = self.gate_kernel.precheck(
             definition,
             action="submit_line",
             actor_role=effective_actor_role,
-            execution_state=gate_record["execution_state"],
-            runtime_guide=guide,
+            execution_state=gate_state,
+            runtime_guide=gate_guide,
             write=effective_write,
         )
         gate_decision = (

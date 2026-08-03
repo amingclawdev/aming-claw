@@ -71745,6 +71745,15 @@ def test_runtime_context_canonical_write_immediately_invalidates_prior_capsule(
             return current["record"]["runtime_guide"]
 
         @staticmethod
+        def mf_parallel_atomic_lane_gate_view(
+            record,
+            runtime_guide,
+            _write,
+            **_kwargs,
+        ):
+            return record["execution_state"], runtime_guide
+
+        @staticmethod
         def submit_line_write(*_args, **_kwargs):
             current["record"] = after
             return {"ok": True, "record": after}
@@ -104070,10 +104079,12 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_bounded_worker_list(co
         runtime_context.runtime_context_id: (
             runtime_context,
             "fence-parallel-list",
+            "parallel-list-dispatch-worker-token",
         ),
         second_runtime_context.runtime_context_id: (
             second_runtime_context,
             "fence-parallel-list-b",
+            "parallel-list-dispatch-worker-token-b",
         ),
     }
     dispatch = server.handle_project_contract_runtime_line_write(
@@ -104085,7 +104096,13 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_bounded_worker_list(co
                 "stage_id": "dispatch",
                 "line_id": "observer_dispatch_bounded_workers",
                 "evidence_kind": "dispatch_bounded_worker",
-                "payload": {"bounded_workers": dispatch_payloads},
+                "payload": {
+                    "bounded_workers": dispatch_payloads,
+                    "worker_count": 2,
+                    "required_worker_count": 2,
+                    "atomic_dispatch": True,
+                    "all_or_nothing": True,
+                },
             },
         )
     )
@@ -104101,9 +104118,294 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_bounded_worker_list(co
         for item in dispatch_payloads
         if item["runtime_context_id"] == active_runtime_context_id
     )
-    active_context, active_fence_token = contexts_by_id[
+    active_context, active_fence_token, _active_token = contexts_by_id[
         active_payload["runtime_context_id"]
     ]
+    inactive_payload = next(
+        item
+        for item in dispatch_payloads
+        if item["runtime_context_id"] != active_runtime_context_id
+    )
+    inactive_context, inactive_fence_token, inactive_token = contexts_by_id[
+        inactive_payload["runtime_context_id"]
+    ]
+
+    for index, payload in enumerate(dispatch_payloads, start=1):
+        worker_context, _fence_token, _token = contexts_by_id[
+            payload["runtime_context_id"]
+        ]
+        append_branch_contract_revision(
+            conn,
+            worker_context,
+            revision_id=f"crev-parallel-list-{index}",
+            payload={
+                "contract_execution_id": result["contract_execution_id"],
+                "successor_contract_execution_id": result[
+                    "contract_execution_id"
+                ],
+                "parent_contract_execution_id": result[
+                    "parent_contract_execution_id"
+                ],
+                "root_contract_execution_id": result[
+                    "root_contract_execution_id"
+                ],
+                "contract_chain_id": result["contract_chain_id"],
+                "runtime_context_id": worker_context.runtime_context_id,
+                "target_files": list(worker_context.owned_files),
+            },
+            route_identity=payload["route_identity"],
+        )
+    conn.commit()
+
+    runtime = server._contract_runtime(conn)
+    before_out_of_order = runtime.store.get(result["contract_execution_id"])
+    with pytest.raises(GovernanceError) as out_of_order:
+        server._runtime_context_submit_canonical_contract_line(
+            conn,
+            project_id=PID,
+            context=inactive_context,
+            contract_execution_id=result["contract_execution_id"],
+            stage_id="worker_startup",
+            line_id="worker_startup",
+            evidence_kind="mf_subagent_startup",
+            payload={
+                "runtime_context_id": inactive_context.runtime_context_id,
+                "task_id": inactive_context.task_id,
+                "parent_task_id": inactive_context.parent_task_id,
+                "worker_role": "mf_sub",
+                "worker_id": inactive_context.worker_id,
+                "worker_slot_id": inactive_context.worker_slot_id,
+                "target_project_root": inactive_context.target_project_root,
+            },
+        )
+    assert out_of_order.value.code == "contract_runtime_canonical_line_out_of_order"
+    assert {
+        "field": "stage_id",
+        "expected": "worker_read",
+        "actual": "worker_startup",
+    } in out_of_order.value.details["identity_mismatches"]
+    assert {
+        "field": "line_id",
+        "expected": "worker_read_runtime_guide",
+        "actual": "worker_startup",
+    } in out_of_order.value.details["identity_mismatches"]
+    after_out_of_order = runtime.store.get(result["contract_execution_id"])
+    assert after_out_of_order["execution_state_revision"] == before_out_of_order[
+        "execution_state_revision"
+    ]
+    assert after_out_of_order["completed_lines"] == before_out_of_order[
+        "completed_lines"
+    ]
+
+    inactive_read = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx(
+            {
+                "project_id": PID,
+                "runtime_context_id": inactive_context.runtime_context_id,
+            },
+            method="POST",
+            body={
+                "contract_execution_id": result["contract_execution_id"],
+                "parent_task_id": inactive_context.parent_task_id,
+                "fence_token": inactive_fence_token,
+                "session_token": inactive_token,
+                "session_token_ref": runtime_context_session_token_ref(
+                    inactive_context
+                ),
+                "target_project_root": inactive_context.target_project_root,
+                "actor": inactive_context.worker_slot_id,
+                "read_receipt_hash": _fake_sha("parallel-list-inactive-read"),
+                "launch_text_hash": _fake_sha("parallel-list-inactive-launch"),
+            },
+        )
+    )
+    assert inactive_read["ok"] is True
+    assert inactive_read["contract_runtime_canonical_line"]["accepted"] is True
+    after_inactive_read = runtime.store.get(result["contract_execution_id"])
+    assert after_inactive_read["runtime_guide"]["next_legal_action"][
+        "runtime_context_id"
+    ] == active_runtime_context_id
+
+    inactive_startup_body = {
+        "runtime_context_id": inactive_context.runtime_context_id,
+        "task_id": inactive_context.task_id,
+        "parent_task_id": inactive_context.parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": inactive_context.worker_id,
+        "worker_slot_id": inactive_context.worker_slot_id,
+        "fence_token": inactive_fence_token,
+        "session_token_ref": runtime_context_session_token_ref(
+            inactive_context
+        ),
+        "target_project_root": inactive_context.target_project_root,
+        "runtime_guide_hash": after_inactive_read["runtime_guide"][
+            "runtime_guide_hash"
+        ],
+        "stage_id": "worker_startup",
+        "line_id": "worker_startup",
+        "evidence_kind": "mf_subagent_startup",
+        "payload": {
+            "runtime_context_id": inactive_context.runtime_context_id,
+            "task_id": inactive_context.task_id,
+            "parent_task_id": inactive_context.parent_task_id,
+            "worker_role": "mf_sub",
+            "worker_id": inactive_context.worker_id,
+            "worker_slot_id": inactive_context.worker_slot_id,
+            "target_project_root": inactive_context.target_project_root,
+        },
+    }
+    before_inactive_precheck = runtime.store.get(
+        result["contract_execution_id"]
+    )
+    inactive_precheck = (
+        server.handle_project_contract_runtime_line_write_precheck(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": result[
+                        "contract_execution_id"
+                    ],
+                },
+                method="POST",
+                body=inactive_startup_body,
+            )
+        )
+    )
+    assert inactive_precheck["ok"] is True
+    assert inactive_precheck["would_mutate_completed_lines"] is False
+    assert runtime.store.get(result["contract_execution_id"]) == (
+        before_inactive_precheck
+    )
+
+    inactive_startup = server.handle_project_contract_runtime_line_write(
+        _ctx(
+            {
+                "project_id": PID,
+                "contract_execution_id": result["contract_execution_id"],
+            },
+            method="POST",
+            body=inactive_startup_body,
+        )
+    )
+    assert inactive_startup["ok"] is True
+    assert inactive_startup["actor_role"] == "mf_sub"
+    assert runtime.store.get(result["contract_execution_id"])["runtime_guide"][
+        "next_legal_action"
+    ]["runtime_context_id"] == active_runtime_context_id
+
+    before_duplicate = runtime.store.get(result["contract_execution_id"])
+    with pytest.raises(GovernanceError) as duplicate:
+        server._runtime_context_submit_canonical_contract_line(
+            conn,
+            project_id=PID,
+            context=inactive_context,
+            contract_execution_id=result["contract_execution_id"],
+            stage_id="worker_startup",
+            line_id="worker_startup",
+            evidence_kind="mf_subagent_startup",
+            payload={
+                "runtime_context_id": inactive_context.runtime_context_id,
+                "task_id": inactive_context.task_id,
+                "parent_task_id": inactive_context.parent_task_id,
+                "worker_role": "mf_sub",
+                "worker_id": inactive_context.worker_id,
+                "worker_slot_id": inactive_context.worker_slot_id,
+                "target_project_root": inactive_context.target_project_root,
+            },
+        )
+    assert duplicate.value.code == "contract_runtime_canonical_line_duplicate"
+    assert {
+        "field": "line_id",
+        "expected": "worker_graph_context",
+        "actual": "worker_startup",
+    } in duplicate.value.details["identity_mismatches"]
+    after_duplicate = runtime.store.get(result["contract_execution_id"])
+    assert after_duplicate["execution_state_revision"] == before_duplicate[
+        "execution_state_revision"
+    ]
+    assert after_duplicate["completed_lines"] == before_duplicate[
+        "completed_lines"
+    ]
+
+    terminal_record = runtime.store.get(result["contract_execution_id"])
+    terminal_revision = terminal_record["execution_state_revision"]
+    terminal_lines = list(terminal_record["completed_lines"])
+    terminal_identity = {
+        "runtime_context_id": inactive_context.runtime_context_id,
+        "task_id": inactive_context.task_id,
+        "parent_task_id": inactive_context.parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": inactive_context.worker_id,
+        "worker_slot_id": inactive_context.worker_slot_id,
+        "lane_id": inactive_context.worker_slot_id,
+        "line_instance_id": (
+            f"runtime_context:{inactive_context.runtime_context_id}"
+        ),
+    }
+    for stage_id, line_id, evidence_kind in (
+        ("worker_context", "worker_graph_context", "graph_trace"),
+        ("worker_implementation", "worker_implementation", "implementation"),
+        ("worker_commit", "worker_commit", "worker_commit"),
+        (
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "record_finish_time_worker_attestation",
+        ),
+        ("worker_finish", "worker_finish_gate", "mf_subagent_finish_gate"),
+    ):
+        terminal_lines.append(
+            {
+                **terminal_identity,
+                "stage_id": stage_id,
+                "line_id": line_id,
+                "actor_role": "mf_sub",
+                "evidence_kind": evidence_kind,
+                "status": "accepted",
+                "payload": dict(terminal_identity),
+            }
+        )
+    terminal_record["completed_lines"] = terminal_lines
+    terminal_record["execution_state_revision"] = terminal_revision + 1
+    runtime.store.update(
+        result["contract_execution_id"],
+        terminal_record,
+        expected_revision=terminal_revision,
+    )
+    runtime.current_guide(
+        result["contract_execution_id"],
+        actor_role="mf_sub",
+    )
+    before_terminal_duplicate = runtime.store.get(
+        result["contract_execution_id"]
+    )
+    with pytest.raises(GovernanceError) as terminal_duplicate:
+        server._runtime_context_submit_canonical_contract_line(
+            conn,
+            project_id=PID,
+            context=inactive_context,
+            contract_execution_id=result["contract_execution_id"],
+            stage_id="worker_finish",
+            line_id="worker_finish_gate",
+            evidence_kind="mf_subagent_finish_gate",
+            payload=dict(terminal_identity),
+        )
+    assert terminal_duplicate.value.code == (
+        "contract_runtime_canonical_line_duplicate"
+    )
+    assert {
+        "field": "line_id",
+        "expected": "<no remaining lane line>",
+        "actual": "worker_finish_gate",
+    } in terminal_duplicate.value.details["identity_mismatches"]
+    after_terminal_duplicate = runtime.store.get(
+        result["contract_execution_id"]
+    )
+    assert after_terminal_duplicate["execution_state_revision"] == (
+        before_terminal_duplicate["execution_state_revision"]
+    )
+    assert after_terminal_duplicate["completed_lines"] == (
+        before_terminal_duplicate["completed_lines"]
+    )
 
     worker_read = server.handle_project_contract_runtime_line_write(
         _ctx(
@@ -104139,6 +104441,41 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_bounded_worker_list(co
 
     assert worker_read["ok"] is True
     assert worker_read["actor_role"] == "mf_sub"
+
+    stale_record = runtime.store.get(result["contract_execution_id"])
+    stale_revision = stale_record["execution_state_revision"]
+    stale_lines = list(stale_record["completed_lines"])
+    stale_record["definition_hash"] = "sha256:stale-atomic-sibling-definition"
+    runtime.store.update(
+        result["contract_execution_id"],
+        stale_record,
+        expected_revision=stale_revision,
+    )
+    for handler in (
+        server.handle_project_contract_runtime_line_write_precheck,
+        server.handle_project_contract_runtime_line_write,
+    ):
+        stale_result = handler(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": result[
+                        "contract_execution_id"
+                    ],
+                },
+                method="POST",
+                body=inactive_startup_body,
+            )
+        )
+        assert stale_result["ok"] is False
+        assert stale_result["status"] == "blocked_stale_pinned_execution"
+        assert stale_result["safe_to_continue_existing_execution"] is False
+        assert stale_result["next_legal_action"]["id"] == (
+            "start_recovery_contract_execution"
+        )
+        after_stale_probe = runtime.store.get(result["contract_execution_id"])
+        assert after_stale_probe["execution_state_revision"] == stale_revision
+        assert after_stale_probe["completed_lines"] == stale_lines
 
 
 def test_mf_parallel_worker_read_accepts_dispatch_payload_default_worker_role(conn):
