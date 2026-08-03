@@ -713,12 +713,13 @@ def test_mf_parallel_enter_schemas_expose_server_issued_batch_child_fields():
 def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypatch):
     calls = []
 
-    implementation_schema = next(
-        tool
-        for tool in governance_mcp_server.TOOLS
-        if tool["name"] == "runtime_context_implementation_evidence"
-    )["inputSchema"]
-    assert "lane_id" in implementation_schema["properties"]
+    for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
+        implementation_schema = next(
+            tool
+            for tool in tools
+            if tool["name"] == "runtime_context_implementation_evidence"
+        )["inputSchema"]
+        assert "lane_id" in implementation_schema["properties"]
 
     def fake_http(method, path, body=None):
         calls.append((method, path, body))
@@ -2117,6 +2118,52 @@ def test_worker_auth_env_is_added_only_at_runtime_mcp_http_boundary(monkeypatch)
     assert calls[0][2]["fence_token"] == fence_token
     assert session_token not in json.dumps(result)
     assert fence_token not in json.dumps(result)
+
+
+def test_plugin_runtime_context_implementation_evidence_forwards_lane_id(monkeypatch):
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "implementation-session")
+    monkeypatch.setenv("AMING_WORKER_FENCE_TOKEN", "implementation-fence")
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    arguments = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-lane-id",
+        "lane_id": "focus-ui",
+        "changed_files": ["src/focus.js"],
+    }
+
+    assert dispatcher.dispatch(
+        "runtime_context_implementation_evidence",
+        arguments,
+    ) == {"ok": True}
+    assert calls == [
+        (
+            "POST",
+            (
+                "/api/graph-governance/aming-claw/runtime-contexts/"
+                "mfrctx-lane-id/implementation-evidence"
+            ),
+            {
+                "runtime_context_id": "mfrctx-lane-id",
+                "lane_id": "focus-ui",
+                "changed_files": ["src/focus.js"],
+                "session_token": "implementation-session",
+                "fence_token": "implementation-fence",
+            },
+        )
+    ]
+    assert "session_token" not in arguments
+    assert "fence_token" not in arguments
 
 
 def test_scope_insufficiency_mcp_routes_to_append_only_facade(monkeypatch):

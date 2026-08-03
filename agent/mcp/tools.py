@@ -539,6 +539,7 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
             "host_session_id": {"type": "string"},
             "worker_session_id": {"type": "string"},
             "worker_id": {"type": "string"},
+            "lane_id": {"type": "string"},
             "worker_slot_id": {"type": "string"},
             "filer_principal": {"type": "string"},
             "worker_transcript_ref": {"type": "string"},
