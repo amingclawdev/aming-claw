@@ -960,6 +960,7 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
             "changed_files": frozen_asset_files,
             "graph_trace_ids": [graph_trace_id],
             "tests": [{"command": "pytest -q", "status": "passed"}],
+            "test_results": {"status": "passed", "passed": True},
         }
         if intent is not None:
             request_body[
@@ -5549,6 +5550,7 @@ def test_contract_runtime_worker_implementation_preserves_top_level_lineage_proo
     body = {
         "changed_files": ["agent/governance/server.py"],
         "graph_trace_ids": ["gqt-worker-implementation-lineage"],
+        "test_results": {"status": "passed", "passed": True},
         "payload": {
             "runtime_context_id": "mfrctx-worker-implementation-lineage",
             "task_id": "worker-implementation-lineage-task",
@@ -18842,6 +18844,7 @@ def test_observer_runtime_text_prepare_mints_append_scoped_worker_route_ref(
                 "actor": "codex-mf-sub-observer-intervention-amendment",
                 "changed_files": ["agent/governance/server.py"],
                 "tests": [{"command": "pytest -q", "status": "passed"}],
+                "test_results": {"status": "passed", "passed": True},
                 "payload": {
                     "worker_role": "mf_sub",
                     "summary": "ref-only child route from runtime-text prepare",
@@ -18960,6 +18963,7 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_route_ref(
         **parent_route_identity,
         "changed_files": ["agent/governance/server.py"],
         "tests": [{"command": "pytest -q", "status": "passed"}],
+        "test_results": {"status": "passed", "passed": True},
         "payload": {
             "worker_role": "mf_sub",
             "summary": "parent-bound route ref accepted for worker evidence",
@@ -19158,6 +19162,7 @@ def test_runtime_context_implementation_route_ref_resolves_active_contract_execu
                 "route_token_ref": issued["route_token_ref"],
                 "changed_files": ["agent/governance/server.py"],
                 "tests": [{"command": "pytest -q", "status": "passed"}],
+                "test_results": {"status": "passed", "passed": True},
             },
         )
     )
@@ -19248,6 +19253,111 @@ def test_runtime_context_implementation_evidence_rejects_invalid_test_results_be
     assert invalid_results.value.details["copy_safe_test_results_guide"][
         "parallel_sibling_dependency"
     ]["partial_sibling_blocked_is_finish_compatible"] is False
+
+
+def test_runtime_context_implementation_evidence_rejects_tests_only_before_db(
+    monkeypatch,
+):
+    def reject_db_access(_project_id):
+        raise AssertionError("tests-only evidence must be rejected before DB access")
+
+    monkeypatch.setattr(server, "get_connection", reject_db_access)
+
+    with pytest.raises(GovernanceError) as missing_results:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": "mfrctx-tests-only-implementation",
+                },
+                method="POST",
+                body={
+                    "task_id": "worker-tests-only-implementation",
+                    "tests": [
+                        {"command": "pytest -q", "status": "passed"}
+                    ],
+                },
+            )
+        )
+
+    assert missing_results.value.code == (
+        "worker_implementation_test_results_not_finish_compatible"
+    )
+    assert missing_results.value.details["field"] == (
+        "ContractRuntime.worker_implementation.test_results"
+    )
+    assert missing_results.value.details["expected"] == (
+        "explicit finish-compatible test_results Mapping"
+    )
+    assert missing_results.value.details["actual"] == {
+        "present": False,
+        "received_type": "missing",
+        "received_status": "",
+    }
+    assert missing_results.value.details["zero_db_access"] is True
+    assert missing_results.value.details["zero_contract_runtime_write"] is True
+    assert missing_results.value.details["zero_timeline_write"] is True
+
+
+def test_generic_contract_runtime_worker_implementation_line_body_requires_and_projects_canonical_test_results():
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-GENERIC-IMPLEMENTATION-RESULTS-PARITY",
+        "contract_execution_id": "cex-generic-implementation-results-parity",
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "evidence_kind": "implementation",
+            }
+        },
+        "execution_state": {"execution_state_revision": 7},
+    }
+    tests_only = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        "runtime_context_id": "mfrctx-generic-results-parity",
+        "task_id": "worker-generic-results-parity",
+        "changed_files": ["agent/governance/server.py"],
+        "graph_trace_ids": ["gqt-generic-results-parity"],
+        "tests": [{"command": "pytest -q", "status": "passed"}],
+        "payload": {
+            "runtime_context_id": "mfrctx-generic-results-parity",
+            "task_id": "worker-generic-results-parity",
+        },
+    }
+
+    with pytest.raises(GovernanceError) as missing_results:
+        server._contract_runtime_line_write_body(
+            record,
+            actor_role="mf_sub",
+            body=tests_only,
+        )
+
+    assert missing_results.value.code == (
+        "worker_implementation_test_results_not_finish_compatible"
+    )
+    assert missing_results.value.details["field"] == (
+        "ContractRuntime.worker_implementation.test_results"
+    )
+    assert missing_results.value.details["actual"]["present"] is False
+    assert missing_results.value.details["zero_contract_runtime_write"] is True
+    assert missing_results.value.details["zero_timeline_write"] is True
+
+    canonical_results = {
+        "status": "passed",
+        "passed": True,
+        "commands": [{"command": "pytest -q", "status": "passed"}],
+    }
+    write = server._contract_runtime_line_write_body(
+        record,
+        actor_role="mf_sub",
+        body={**tests_only, "test_results": canonical_results},
+    )
+
+    assert write["test_results"] == canonical_results
+    assert write["payload"]["test_results"] == canonical_results
 
 
 def test_runtime_context_implementation_evidence_rejects_non_mapping_top_level_test_results_before_db_even_when_nested_is_valid(
@@ -19394,6 +19504,7 @@ def test_runtime_context_implementation_evidence_rejects_empty_or_fake_graph_tra
                     **parent_route_identity,
                     "changed_files": ["agent/governance/server.py"],
                     "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "test_results": {"status": "passed", "passed": True},
                     "graph_trace_ids": graph_trace_ids,
                     "payload": {
                         "worker_role": "mf_sub",
@@ -22644,6 +22755,7 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
                     **common_body,
                     "changed_files": [changed_path],
                     "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "test_results": {"status": "passed", "passed": True},
                     "finish_gate_event_ref": finish["timeline_event"]["event_ref"],
                     "payload": {"worker_role": "mf_sub"},
                     "route_token_gate": {
@@ -22673,6 +22785,7 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
                     **common_body,
                     "changed_files": [changed_path],
                     "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "test_results": {"status": "passed", "passed": True},
                     "finish_gate_event_ref": finish["timeline_event"]["event_ref"],
                     "payload": {"worker_role": "mf_sub"},
                     "route_token_gate": {
@@ -23297,6 +23410,7 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_child_rout
                         "agent/tests/test_graph_governance_api.py",
                     ],
                     "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "test_results": {"status": "passed", "passed": True},
                     "payload": {"worker_role": "mf_sub", "summary": "parent token path"},
                     "route_token": parent_issue["route_token"],
                 },
@@ -23325,6 +23439,7 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_child_rout
                 "target_project_root": str(target_root),
                 "changed_files": ["agent/governance/server.py"],
                 "tests": [{"command": "pytest -q", "status": "passed"}],
+                "test_results": {"status": "passed", "passed": True},
                 "payload": {"worker_role": "mf_sub", "summary": "child token path"},
                 "route_token": child_issue["route_token"],
                 "route_token_ref": child_issue["route_token_ref"],
@@ -23378,6 +23493,7 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_child_rout
                     "target_project_root": str(target_root),
                     "changed_files": ["agent/governance/server.py"],
                     "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "test_results": {"status": "passed", "passed": True},
                     "payload": {
                         "worker_role": "mf_sub",
                         "summary": "copy-safe child route ref path",
@@ -23806,6 +23922,7 @@ def test_runtime_context_implementation_evidence_accepts_parent_backlog_route_re
                 "target_project_root": str(target_root),
                 "changed_files": ["agent/governance/server.py"],
                 "tests": [{"command": "pytest -q", "status": "passed"}],
+                "test_results": {"status": "passed", "passed": True},
                 "payload": {
                     "worker_role": "mf_sub",
                     "summary": "copy-safe parent backlog route ref path",
@@ -23924,6 +24041,7 @@ def test_runtime_context_implementation_evidence_recovery_body_uses_canonical_ro
         "target_project_root": str(worktree),
         "changed_files": ["agent/governance/server.py"],
         "tests": [{"command": "pytest -q", "status": "passed"}],
+        "test_results": {"status": "passed", "passed": True},
         "payload": {"worker_role": "mf_sub", "summary": "wrong root first"},
         "route_token_ref": parent_issue["route_token_ref"],
         "route_id": parent_issue["route_id"],
@@ -23965,6 +24083,7 @@ def test_runtime_context_implementation_evidence_recovery_body_uses_canonical_ro
             "fence_token": "fence-impl-canonical-root",
             "changed_files": ["agent/governance/server.py"],
             "tests": [{"command": "pytest -q", "status": "passed"}],
+            "test_results": {"status": "passed", "passed": True},
             "graph_trace_ids": [graph_trace_id],
             "payload": {
                 "worker_role": "mf_sub",
@@ -24078,6 +24197,7 @@ def test_runtime_context_parent_route_lineage_error_retry_body_succeeds(
         "target_project_root": str(target_root),
         "changed_files": ["agent/governance/server.py"],
         "tests": [{"command": "pytest -q", "status": "passed"}],
+        "test_results": {"status": "passed", "passed": True},
         "payload": {"worker_role": "mf_sub"},
     }
 
@@ -24110,6 +24230,7 @@ def test_runtime_context_parent_route_lineage_error_retry_body_succeeds(
             "fence_token": "fence-parent-lineage-retry",
             "changed_files": ["agent/governance/server.py"],
             "tests": [{"command": "pytest -q", "status": "passed"}],
+            "test_results": {"status": "passed", "passed": True},
             "payload": {
                 "worker_role": "mf_sub",
                 "summary": "parent route ref retry succeeds",
@@ -24658,6 +24779,7 @@ def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_l
         "target_project_root": str(target_root),
         "changed_files": ["agent/governance/server.py"],
         "tests": [{"command": "pytest -q", "status": "passed"}],
+        "test_results": {"status": "passed", "passed": True},
         "payload": {"worker_role": "mf_sub"},
     }
 
@@ -44052,6 +44174,7 @@ def test_runtime_context_session_token_rejoin_rebinds_superseded_route_ref(
                 "route_token_ref": fresh_issue["route_token_ref"],
                 "changed_files": ["agent/governance/server.py"],
                 "tests": [{"command": "pytest -q", "status": "passed"}],
+                "test_results": {"status": "passed", "passed": True},
                 "payload": {
                     "worker_role": "mf_sub",
                     "summary": "fresh route ref after rejoin",
@@ -44804,6 +44927,7 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
         graph_trace_id="gqt-failed-qa-cumulative-worker",
         head_commit=initial_head,
         implementation_event_ref=f"timeline:{worker_events['implementation']}",
+        test_results={"status": "passed", "passed": True},
     )
     runtime_context = upsert_branch_context(
         conn,
@@ -57652,7 +57776,10 @@ def _complete_source_backed_mf_parallel_successor(
             "worker_implementation",
             "worker_implementation",
             "implementation",
-            worker_payload,
+            {
+                **worker_payload,
+                "test_results": {"status": "passed", "passed": True},
+            },
             worker_commit,
         ),
         (

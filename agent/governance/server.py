@@ -22499,7 +22499,11 @@ def _runtime_context_request_route_identity_shapes(
 ) -> dict[str, Any]:
     body = ctx.body if isinstance(ctx.body, Mapping) else {}
     query = ctx.query if isinstance(ctx.query, Mapping) else {}
-    payload = body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
+    payload = (
+        body.get("payload")
+        if isinstance(body.get("payload"), Mapping)
+        else {}
+    )
     nested_route_identity = (
         body.get("route_identity")
         if isinstance(body.get("route_identity"), Mapping)
@@ -44654,6 +44658,109 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
     return response
 
 
+def _runtime_context_require_worker_implementation_test_results(
+    body: Mapping[str, Any],
+    *,
+    contract_execution_id: str = "",
+    runtime_context_id: str = "",
+    task_id: str = "",
+    zero_db_access: bool = False,
+) -> dict[str, Any]:
+    """Require canonical finish-compatible results before an implementation write.
+
+    The runtime-context implementation facade and the generic ContractRuntime
+    line facade both call this gate.  Keeping the gate ahead of persistence
+    prevents a tests-only implementation line from being accepted and then
+    poisoning the later worker_commit projection.
+    """
+
+    payload = body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
+    top_level_present = "test_results" in body
+    nested_present = "test_results" in payload
+    supplied_present = bool(top_level_present or nested_present)
+    supplied_value = (
+        body.get("test_results")
+        if top_level_present
+        else payload.get("test_results")
+        if nested_present
+        else None
+    )
+    supplied = dict(supplied_value) if isinstance(supplied_value, Mapping) else {}
+    projected = _runtime_context_finish_attestation_project_test_results(supplied)
+    if supplied_present and isinstance(supplied_value, Mapping) and projected:
+        return dict(projected)
+
+    actual = {
+        "present": supplied_present,
+        "received_type": (
+            type(supplied_value).__name__ if supplied_present else "missing"
+        ),
+        "received_status": str(supplied.get("status") or "").strip(),
+    }
+    raise GovernanceError(
+        "worker_implementation_test_results_not_finish_compatible",
+        (
+            "worker_implementation requires explicit finish-compatible "
+            "test_results before implementation evidence is appended"
+        ),
+        422,
+        {
+            "contract_execution_id": str(contract_execution_id or "").strip(),
+            "runtime_context_id": str(runtime_context_id or "").strip(),
+            "task_id": str(task_id or "").strip(),
+            "field": "ContractRuntime.worker_implementation.test_results",
+            "expected": "explicit finish-compatible test_results Mapping",
+            "actual": actual,
+            "received_status": actual["received_status"],
+            "received_type": actual["received_type"],
+            "zero_db_access": bool(zero_db_access),
+            "zero_contract_runtime_write": True,
+            "zero_timeline_write": True,
+            "same_input_retry_required": True,
+            "next_legal_action": (
+                "correct_test_results_and_retry_same_implementation_input"
+            ),
+            "copy_safe_test_results_guide": {
+                "schema_version": (
+                    "runtime_context.worker_implementation_test_results_guide.v1"
+                ),
+                "owned_lane_pass": {
+                    "status": "passed",
+                    "passed": True,
+                    "commands": [
+                        {
+                            "command": "<exact owned-lane test command>",
+                            "status": "passed",
+                        }
+                    ],
+                },
+                "known_baseline_failure": {
+                    "status": "accepted_with_known_baseline_failure",
+                    "no_pass": True,
+                    "candidate_new_failures": 0,
+                    "full_failed": "<positive inherited count>",
+                    "inherited_failed": "<same count>",
+                    "baseline_failed": "<same count>",
+                    "focused_passed": "<positive count>",
+                    "full_passed": "<nonnegative count>",
+                    "baseline_passed": "<nonnegative count not above full_passed>",
+                    "overall_release_pass_claimed": False,
+                },
+                "parallel_sibling_dependency": {
+                    "test_results_policy": (
+                        "report only owned-lane test outcomes in test_results"
+                    ),
+                    "record_dependency_in": ["risk", "summary"],
+                    "partial_sibling_blocked_is_finish_compatible": False,
+                    "synthesize_pass": False,
+                },
+                "submit_unchanged_after_replacing_placeholders": True,
+            },
+            "historical_backfill_allowed": False,
+        },
+    )
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/implementation-evidence")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/implementation-evidence")
 def handle_graph_governance_runtime_context_implementation_evidence(ctx: RequestContext):
@@ -44666,101 +44773,21 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     supplied_payload = (
         body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
     )
-    top_level_test_results_present = "test_results" in body
-    nested_test_results_present = "test_results" in supplied_payload
-    supplied_test_results_present = bool(
-        top_level_test_results_present or nested_test_results_present
-    )
-    supplied_test_results_value = (
-        body.get("test_results")
-        if top_level_test_results_present
-        else (
-            supplied_payload.get("test_results")
-            if nested_test_results_present
-            else {}
-        )
-    )
     supplied_test_results = (
-        dict(supplied_test_results_value)
-        if isinstance(supplied_test_results_value, Mapping)
-        else {}
-    )
-    projected_test_results = (
-        _runtime_context_finish_attestation_project_test_results(
-            supplied_test_results
+        _runtime_context_require_worker_implementation_test_results(
+            body,
+            contract_execution_id=str(
+                body.get("contract_execution_id")
+                or supplied_payload.get("contract_execution_id")
+                or ""
+            ).strip(),
+            runtime_context_id=runtime_context_id_input,
+            task_id=str(
+                body.get("task_id") or supplied_payload.get("task_id") or ""
+            ).strip(),
+            zero_db_access=True,
         )
     )
-    if supplied_test_results_present and (
-        not isinstance(supplied_test_results_value, Mapping)
-        or not projected_test_results
-    ):
-        raise GovernanceError(
-            "worker_implementation_test_results_not_finish_compatible",
-            (
-                "worker_implementation test_results must be finish-compatible "
-                "before implementation evidence is appended"
-            ),
-            422,
-            {
-                "contract_execution_id": str(
-                    body.get("contract_execution_id")
-                    or supplied_payload.get("contract_execution_id")
-                    or ""
-                ).strip(),
-                "runtime_context_id": runtime_context_id_input,
-                "task_id": str(
-                    body.get("task_id") or supplied_payload.get("task_id") or ""
-                ).strip(),
-                "received_status": str(
-                    supplied_test_results.get("status") or ""
-                ).strip(),
-                "received_type": type(supplied_test_results_value).__name__,
-                "zero_db_access": True,
-                "zero_contract_runtime_write": True,
-                "zero_timeline_write": True,
-                "same_input_retry_required": True,
-                "next_legal_action": (
-                    "correct_test_results_and_retry_same_implementation_input"
-                ),
-                "copy_safe_test_results_guide": {
-                    "schema_version": (
-                        "runtime_context.worker_implementation_test_results_guide.v1"
-                    ),
-                    "owned_lane_pass": {
-                        "status": "passed",
-                        "passed": True,
-                        "commands": [
-                            {
-                                "command": "<exact owned-lane test command>",
-                                "status": "passed",
-                            }
-                        ],
-                    },
-                    "known_baseline_failure": {
-                        "status": "accepted_with_known_baseline_failure",
-                        "no_pass": True,
-                        "candidate_new_failures": 0,
-                        "full_failed": "<positive inherited count>",
-                        "inherited_failed": "<same count>",
-                        "baseline_failed": "<same count>",
-                        "focused_passed": "<positive count>",
-                        "full_passed": "<nonnegative count>",
-                        "baseline_passed": "<nonnegative count not above full_passed>",
-                        "overall_release_pass_claimed": False,
-                    },
-                    "parallel_sibling_dependency": {
-                        "test_results_policy": (
-                            "report only owned-lane test outcomes in test_results"
-                        ),
-                        "record_dependency_in": ["risk", "summary"],
-                        "partial_sibling_blocked_is_finish_compatible": False,
-                        "synthesize_pass": False,
-                    },
-                    "submit_unchanged_after_replacing_placeholders": True,
-                },
-                "historical_backfill_allowed": False,
-            },
-        )
     conn = get_connection(project_id)
     try:
         context, runtime_context_id, _session = _runtime_context_mf_sub_write_context(
@@ -45035,10 +45062,9 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     for key in ("changed_files", "tests", "risk", "summary"):
         if key in body:
             payload[key] = body.get(key)
-    if supplied_test_results_present:
-        payload["test_results"] = public_contract_revision_payload(
-            supplied_test_results
-        )
+    payload["test_results"] = public_contract_revision_payload(
+        supplied_test_results
+    )
     if "precommit_implementation_correction_intent" in body:
         payload["precommit_implementation_correction_intent"] = body.get(
             "precommit_implementation_correction_intent"
@@ -80342,11 +80368,34 @@ def _contract_runtime_line_write_body(
                     "timeline_evidence_backfill_allowed": False,
                 },
             )
+        supplied_test_results = (
+            _runtime_context_require_worker_implementation_test_results(
+                body,
+                contract_execution_id=str(
+                    record.get("contract_execution_id") or ""
+                ).strip(),
+                runtime_context_id=str(
+                    write.get("runtime_context_id")
+                    or payload.get("runtime_context_id")
+                    or ""
+                ).strip(),
+                task_id=str(
+                    write.get("task_id") or payload.get("task_id") or ""
+                ).strip(),
+            )
+        )
+        from .parallel_branch_runtime import public_contract_revision_payload
+
+        canonical_test_results = public_contract_revision_payload(
+            supplied_test_results
+        )
         payload["changed_files"] = changed_files
         payload["graph_trace_ids"] = graph_trace_ids
+        payload["test_results"] = canonical_test_results
         write["payload"] = payload
         write["changed_files"] = changed_files
         write["graph_trace_ids"] = graph_trace_ids
+        write["test_results"] = canonical_test_results
     return write
 
 
