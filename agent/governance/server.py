@@ -94516,6 +94516,128 @@ def _onboard_parentless_direct_main_event_is_accepted(
     return bool(exception.get("accepted")) and route_token_backed
 
 
+def _onboard_parentless_direct_main_timeline_events(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    event_kind: str,
+    task_id: str = "",
+    after_event_id: int = 0,
+) -> list[dict[str, Any]]:
+    """Read the complete narrow lineage newest-first without ASC-prefix loss."""
+
+    from . import task_timeline
+
+    task_timeline.ensure_schema(conn)
+    clauses = ["project_id = ?", "backlog_id = ?"]
+    params: list[Any] = [project_id, backlog_id]
+    if task_id:
+        clauses.append("task_id = ?")
+        params.append(task_id)
+    if after_event_id:
+        clauses.append("id > ?")
+        params.append(int(after_event_id))
+    event_kind_query = task_timeline._timeline_event_kind_query_parts(event_kind)
+    if event_kind_query is not None:
+        event_kind_clause, event_kind_params = event_kind_query
+        clauses.append(event_kind_clause)
+        params.extend(event_kind_params)
+    rows = conn.execute(
+        f"""SELECT * FROM task_timeline_events
+            WHERE {' AND '.join(clauses)}
+            ORDER BY id DESC""",
+        tuple(params),
+    ).fetchall()
+    return [task_timeline._row_to_dict(row) for row in rows]
+
+
+def _onboard_direct_main_transition_enter_event_is_authoritative(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    failed_qa_event_id: int,
+    record: Mapping[str, Any],
+    transition: Mapping[str, Any],
+) -> bool:
+    """Require an entered event created after the exact failed-QA boundary."""
+
+    lineage = (
+        record.get("backlog_lineage")
+        if isinstance(record.get("backlog_lineage"), Mapping)
+        else {}
+    )
+    successor_task_id = str(lineage.get("task_id") or "").strip()
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    transition_hash = str(transition.get("transition_hash") or "").strip()
+    if not successor_task_id or not contract_execution_id or not transition_hash:
+        return False
+    rows = conn.execute(
+        """SELECT * FROM task_timeline_events
+            WHERE project_id = ?
+              AND backlog_id = ?
+              AND task_id = ?
+              AND id > ?
+              AND event_type = 'mf_parallel.entered'
+            ORDER BY id DESC""",
+        (
+            project_id,
+            backlog_id,
+            successor_task_id,
+            int(failed_qa_event_id),
+        ),
+    ).fetchall()
+    from . import task_timeline
+
+    for row in rows:
+        event = task_timeline._row_to_dict(row)
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        event_transition = (
+            payload.get("direct_main_contract_transition")
+            if isinstance(
+                payload.get("direct_main_contract_transition"), Mapping
+            )
+            else {}
+        )
+        artifact_refs = (
+            event.get("artifact_refs")
+            if isinstance(event.get("artifact_refs"), Mapping)
+            else {}
+        )
+        meta_gate = (
+            payload.get("meta_contract_gate")
+            if isinstance(payload.get("meta_contract_gate"), Mapping)
+            else {}
+        )
+        if (
+            str(event.get("event_kind") or "").strip()
+            == "contract_binding"
+            and str(event.get("actor") or "").strip() == "observer"
+            and str(event.get("status") or "").strip().lower() == "accepted"
+            and meta_gate.get("allowed") is True
+            and str(
+                artifact_refs.get("successor_contract_execution_id") or ""
+            ).strip()
+            == contract_execution_id
+            and str(
+                artifact_refs.get("direct_main_contract_transition_hash") or ""
+            ).strip()
+            == transition_hash
+            and str(event_transition.get("transition_hash") or "").strip()
+            == transition_hash
+            and dict(event_transition) == dict(transition)
+        ):
+            return True
+    return False
+
+
 def _onboard_parentless_direct_main_failed_qa_state(
     conn,
     *,
@@ -94526,12 +94648,11 @@ def _onboard_parentless_direct_main_failed_qa_state(
 
     from . import task_timeline
 
-    direct_candidates = task_timeline.list_events(
+    direct_candidates = _onboard_parentless_direct_main_timeline_events(
         conn,
-        project_id,
+        project_id=project_id,
         backlog_id=backlog_id,
         event_kind="observer_direct_implementation_exception",
-        limit=100,
     )
     direct_events = [
         event
@@ -94540,16 +94661,19 @@ def _onboard_parentless_direct_main_failed_qa_state(
     ]
     if not direct_events:
         return {}
-    events = task_timeline.list_events(
+    implementation_candidates = _onboard_parentless_direct_main_timeline_events(
         conn,
-        project_id,
+        project_id=project_id,
         backlog_id=backlog_id,
-        limit=1000,
+        task_id=str(direct_events[0].get("task_id") or "").strip(),
+        event_kind="implementation",
+        after_event_id=int(
+            direct_events[0].get("id")
+            or direct_events[0].get("event_id")
+            or 0
+        ),
     )
-    direct_event = max(
-        direct_events,
-        key=lambda event: int(event.get("id") or event.get("event_id") or 0),
-    )
+    direct_event = direct_events[0]
     direct_event_id = int(
         direct_event.get("id") or direct_event.get("event_id") or 0
     )
@@ -94576,15 +94700,27 @@ def _onboard_parentless_direct_main_failed_qa_state(
             and _event_status(event) in passing_statuses
         )
 
-    implementations = [event for event in events if _is_direct_implementation(event)]
+    implementations = [
+        event
+        for event in implementation_candidates
+        if _is_direct_implementation(event)
+    ]
     if not implementations:
         return {}
-    implementation = max(implementations, key=_event_id)
+    implementation = implementations[0]
     implementation_event_id = _event_id(implementation)
     implementation_commit = str(implementation.get("commit_sha") or "").strip()
 
+    qa_candidates = _onboard_parentless_direct_main_timeline_events(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_kind="independent_verification",
+        after_event_id=implementation_event_id,
+    )
     qa_events: list[dict[str, Any]] = []
-    for event in events:
+    for event in qa_candidates:
         if (
             str(event.get("task_id") or "").strip() != task_id
             or _event_id(event) <= implementation_event_id
@@ -94601,7 +94737,7 @@ def _onboard_parentless_direct_main_failed_qa_state(
         qa_events.append(dict(event))
     if not qa_events:
         return {}
-    failed_qa = max(qa_events, key=_event_id)
+    failed_qa = qa_events[0]
     failed_qa_status = _event_status(failed_qa)
     if failed_qa_status in passing_statuses or failed_qa_status not in failing_statuses:
         return {}
@@ -94652,7 +94788,17 @@ def _onboard_parentless_direct_main_failed_qa_state(
             == "authenticated_observer_typed_contract_transition"
             and str(transition.get("failed_qa_source_ref") or "").strip()
             == failed_qa_source_ref
+            and int(transition.get("failed_qa_event_id") or 0)
+            == failed_qa_event_id
             and transition_hash == expected_transition_hash
+            and _onboard_direct_main_transition_enter_event_is_authoritative(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                failed_qa_event_id=failed_qa_event_id,
+                record=record,
+                transition=transition,
+            )
         ):
             return {}
 
@@ -94826,6 +94972,9 @@ def _validate_direct_main_cross_contract_transition(
         "source_of_authority": "authenticated_observer_typed_contract_transition",
         "operator_approval": dict(approval),
         "reason": reason,
+        "failed_qa_event_id": int(
+            str(failed_qa_source_ref).removeprefix("timeline:") or 0
+        ),
     }
     normalized["transition_hash"] = stable_sha256(normalized)
     return normalized, []
@@ -129276,7 +129425,15 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
         raise ValidationError(
             "mf_parallel entry requires worker_fence, owned_files, or target_files"
         )
-    metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
+    metadata = (
+        dict(body.get("metadata"))
+        if isinstance(body.get("metadata"), Mapping)
+        else {}
+    )
+    caller_direct_main_contract_transition = (
+        _direct_main_cross_contract_transition_input(body, metadata)
+    )
+    metadata.pop("direct_main_contract_transition", None)
     onboard_service_waiver = _onboard_service_waiver_requested(body, metadata)
     direct_main_contract_transition: dict[str, Any] = {}
 
@@ -129395,10 +129552,7 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             )
         )
         if direct_main_failed_qa_state:
-            transition_input = _direct_main_cross_contract_transition_input(
-                body,
-                metadata,
-            )
+            transition_input = caller_direct_main_contract_transition
             if transition_input:
                 (
                     direct_main_contract_transition,
