@@ -112716,3 +112716,257 @@ def test_direct_main_failed_qa_cross_contract_transition_requires_exact_typed_au
         "expected": "timeline:991",
         "actual": "timeline:990",
     } in mismatches
+
+
+def test_worker_commit_close_facade_binds_exact_atomic_lane_identity_and_hash(
+    conn,
+    monkeypatch,
+):
+    execution_id = "cex-worker-commit-atomic-facade-regression"
+    runtime_context_id = "mfrctx-worker-commit-atomic-facade-regression"
+    task_id = "worker-commit-atomic-facade-regression"
+    lane_id = "slot-worker-commit-atomic-facade-regression"
+    global_hash = _fake_sha("worker-commit-global-guide")
+    lane_hash = _fake_sha("worker-commit-private-lane-guide")
+    identity = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": lane_id,
+        "worker_slot_id": lane_id,
+        "lane_id": lane_id,
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-WORKER-COMMIT-ATOMIC-FACADE-REGRESSION",
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "definition_hash": _fake_sha("worker-commit-definition"),
+        "instruction_bundle_hash": _fake_sha("worker-commit-instructions"),
+        "execution_state_revision": 7,
+        "execution_state": {
+            "execution_state_revision": 7,
+            "execution_state_hash": _fake_sha("worker-commit-state-before"),
+            "next_action": {
+                "stage_id": "worker_commit",
+                "line_id": "worker_commit",
+                "evidence_kind": "worker_commit",
+            },
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": global_hash,
+            "next_legal_action": {
+                "stage_id": "worker_commit",
+                "line_id": "worker_commit",
+                "evidence_kind": "worker_commit",
+            },
+        },
+        "completed_lines": [],
+    }
+    updated_record = {
+        **copy.deepcopy(record),
+        "execution_state_revision": 8,
+        "execution_state": {
+            "execution_state_revision": 8,
+            "execution_state_hash": _fake_sha("worker-commit-state-after"),
+            "next_action": {
+                "stage_id": "worker_attestation",
+                "line_id": "worker_finish_time_attestation",
+                "evidence_kind": "record_finish_time_worker_attestation",
+            },
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": _fake_sha("worker-commit-guide-after"),
+            "next_legal_action": {
+                "stage_id": "worker_attestation",
+                "line_id": "worker_finish_time_attestation",
+                "evidence_kind": "record_finish_time_worker_attestation",
+            },
+        },
+    }
+
+    class FakeStore:
+        def get(self, requested_execution_id):
+            assert requested_execution_id == execution_id
+            return copy.deepcopy(record)
+
+    class FakeRuntime:
+        def __init__(self):
+            self.store = FakeStore()
+            self.submitted_writes = []
+
+        def current_guide(self, requested_execution_id, *, actor_role):
+            assert requested_execution_id == execution_id
+            assert actor_role == "mf_sub"
+            return copy.deepcopy(record["runtime_guide"])
+
+        def mf_parallel_atomic_lane_gate_view(
+            self,
+            gate_record,
+            guide,
+            write,
+            *,
+            source_record,
+            projection,
+        ):
+            assert write["payload"]["runtime_context_id"] == runtime_context_id
+            assert source_record["contract_execution_id"] == execution_id
+            return (
+                copy.deepcopy(gate_record["execution_state"]),
+                {
+                    **copy.deepcopy(guide),
+                    "runtime_guide_hash": lane_hash,
+                    "atomic_lane_gate_binding": {
+                        "schema_version": (
+                            "mf_parallel.atomic_lane_gate_binding.v1"
+                        ),
+                        "bound": True,
+                        **identity,
+                        "source_global_runtime_guide_hash": global_hash,
+                    },
+                },
+            )
+
+        def submit_line_write(
+            self,
+            requested_execution_id,
+            write,
+            *,
+            actor_role,
+            projected_completed_lines,
+            projection,
+        ):
+            assert requested_execution_id == execution_id
+            assert actor_role == "mf_sub"
+            self.submitted_writes.append(copy.deepcopy(write))
+            return {
+                "ok": True,
+                "decision": {"ok": True, "errors": []},
+                "record": copy.deepcopy(updated_record),
+            }
+
+    fake_runtime = FakeRuntime()
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: fake_runtime)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda _conn, **kwargs: (copy.deepcopy(kwargs["record"]), {}),
+    )
+    monkeypatch.setattr(
+        server,
+        "_onboard_guide_capsule_invalidate_contract_runtime_transition",
+        lambda **_kwargs: None,
+    )
+
+    body = {
+        "contract_execution_id": execution_id,
+        "actor": "mf_sub",
+        "contract_runtime_line": {
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+            "evidence_kind": "worker_commit",
+        },
+    }
+    accepted = server._contract_runtime_close_gate(
+        conn,
+        project_id=PID,
+        body=body,
+        event_kind="worker_commit",
+        norm_payload={
+            **identity,
+            "worker_session_id": "session-worker-commit-regression",
+            "commit_sha": "a" * 40,
+        },
+        trusted_actor_role="mf_sub",
+        trusted_worker_commit_facade=True,
+    )
+    assert accepted["accepted"] is True
+    assert accepted["line_id"] == "worker_commit"
+    assert len(fake_runtime.submitted_writes) == 1
+    submitted = fake_runtime.submitted_writes[0]
+    assert submitted["runtime_guide_hash"] == global_hash
+    for field, value in identity.items():
+        assert submitted[field] == value
+        assert submitted["payload"][field] == value
+
+    for rejected_body, rejected_payload, expected_field, expected_actual in (
+        (
+            {**body, "runtime_guide_hash": {"secret": "must-not-reflect"}},
+            identity,
+            "runtime_guide_hash",
+            "<invalid-runtime-guide-hash>",
+        ),
+        (
+            body,
+            {**identity, "lane_id": "slot-wrong-lane"},
+            "lane_id",
+            "slot-wrong-lane",
+        ),
+    ):
+        with pytest.raises(GovernanceError) as rejected:
+            server._contract_runtime_close_gate(
+                conn,
+                project_id=PID,
+                body=rejected_body,
+                event_kind="worker_commit",
+                norm_payload=rejected_payload,
+                trusted_actor_role="mf_sub",
+                trusted_worker_commit_facade=True,
+            )
+        assert rejected.value.details["field"] == expected_field
+        assert rejected.value.details["actual"] == expected_actual
+        assert rejected.value.details["zero_contract_runtime_write"] is True
+        assert rejected.value.details["zero_timeline_write"] is True
+        assert "must-not-reflect" not in json.dumps(
+            rejected.value.details,
+            sort_keys=True,
+        )
+        assert len(fake_runtime.submitted_writes) == 1
+
+
+def test_runtime_context_close_gate_success_projects_canonical_line_once():
+    requested = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+    }
+    close_gate = {
+        "accepted": True,
+        "status": "passed",
+        "contract_execution_id": "cex-single-write-regression",
+        **requested,
+        "execution_state_revision": 11,
+        "execution_state_hash": _fake_sha("single-write-state"),
+        "next_legal_action": {
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+        },
+    }
+    projected = server._runtime_context_canonical_line_from_close_gate(
+        close_gate,
+        requested_contract_line=requested,
+        norm_payload={
+            "runtime_context_id": "mfrctx-single-write-regression",
+            "task_id": "worker-single-write-regression",
+        },
+        runtime_context_id="mfrctx-single-write-regression",
+        contract_execution_id="cex-single-write-regression",
+    )
+    assert projected["accepted"] is True
+    assert projected["status"] == "completed"
+    assert projected["canonical"] is True
+    assert projected["canonical_submit_skipped"] is True
+    assert projected["single_write_authority"] == (
+        "contract_runtime_close_evidence_gate"
+    )
+    assert projected["execution_state_revision"] == 11
+
+    assert server._runtime_context_canonical_line_from_close_gate(
+        {**close_gate, "canonical_submit_required": True},
+        requested_contract_line=requested,
+        norm_payload={},
+        runtime_context_id="mfrctx-single-write-regression",
+        contract_execution_id="cex-single-write-regression",
+    ) == {}
