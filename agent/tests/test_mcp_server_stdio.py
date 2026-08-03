@@ -1498,8 +1498,10 @@ def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields
     tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
     precheck = tools["parallel_branch_allocate_precheck"]["inputSchema"]
     assert precheck["required"] == ["project_id", "lanes"]
-    assert precheck["properties"]["lanes"]["minItems"] == 2
+    assert precheck["properties"]["lanes"]["minItems"] == 1
     assert precheck["properties"]["lanes"]["maxItems"] == 2
+    assert precheck["properties"]["expected_lane_count"]["enum"] == [1, 2]
+    assert precheck["properties"]["expected_worker_count"]["enum"] == [1, 2]
     properties = tools["parallel_branch_allocate"]["inputSchema"]["properties"]
     assert {
         "contract_execution_id",

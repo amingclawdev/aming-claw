@@ -20,12 +20,12 @@
   "instruction_layer": {
     "inline": [
       "The compiled runtime guide is authoritative for the next legal action.",
-      "Observer owns orchestration, atomic two-lane dispatch, per-lane merge, canonical reconcile, and close-ready evidence only.",
-      "Dispatch exactly two host-created Codex Desktop mf_sub workers in one atomic bounded_workers payload. Each worker has a distinct RuntimeContext, task, worker slot, worktree, branch, merge queue, and disjoint owned_files fence.",
-      "Before either initial mf_sub lane allocation, call parallel_branch_allocate_precheck once with exactly two lanes. Copy its two copy_safe_allocation_bodies unchanged into parallel_branch_allocate; do not manually compose route, task, worktree, branch, merge-queue, or acceptance-union identity.",
+      "Observer owns orchestration, cardinality-aware dispatch (two atomic standalone lanes or one verified batch-child lane), per-lane merge, canonical reconcile, and close-ready evidence only.",
+      "Dispatch exactly the effective worker count: two host-created Codex Desktop mf_sub workers in one atomic bounded_workers payload for standalone mf_parallel, or one non-atomic worker for a verified batch-child contract. Each worker has a distinct RuntimeContext, task, worker slot, worktree, branch, merge queue, and owned_files fence.",
+      "Before initial mf_sub allocation, call parallel_branch_allocate_precheck using the effective allocation-precheck policy: exactly two atomic lanes for standalone mf_parallel, or exactly one non-atomic lane per verified batch-child contract. Copy every returned copy_safe_allocation_body unchanged into parallel_branch_allocate; do not manually compose route, task, worktree, branch, merge-queue, or acceptance identity.",
       "Allocation precheck and every Drift Gym checkpoint are read-only. The precheck must perform zero RuntimeContext, worktree, merge-queue, timeline, and ContractRuntime writes; caller-supplied external paths are diagnostics only and are projected to the registered repository .worktrees directory.",
-      "Both workers own their own read receipt, startup, graph trace, implementation, worker commit, finish-time attestation, and finish gate evidence. Every worker line uses its runtime_context line_instance_id.",
-      "Do not advance to merge until both worker line instances have passed finish gate. Merge each lane through its own durable merge queue, then reconcile the final canonical HEAD exactly once.",
+      "Every selected worker owns its own read receipt, startup, graph trace, implementation, worker commit, finish-time attestation, and finish gate evidence. Every worker line uses its runtime_context line_instance_id.",
+      "Do not advance to merge until every required worker line instance has passed finish gate. Merge each lane through its own durable merge queue, then reconcile the final canonical HEAD exactly once.",
       "Independent integration QA runs only after both lane merges and the activated canonical reconcile. QA must test and query the final canonical HEAD/reconciled graph, never a worker worktree or historical fixture.",
       "Authenticated independent QA alone authors PASS or NO-PASS. QA NO-PASS keeps the parent open and allocates exactly one bounded failed_qa_rework worker tied to the failed QA source on the same append-only mf_parallel execution; it does not repeat the two-lane fan-out. After repair it returns through merge, reconcile, and a fresh QA session. direct_fix is forbidden.",
       "Before implementation, compare each persisted owned_files fence with worker-authored files. Inherited target-head files are not worker-authored files and must not be added to changed_files.",
@@ -71,7 +71,7 @@
             "allowed_writer_roles": [
               "observer"
             ],
-            "description": "Call parallel_branch_allocate_precheck once for the exact two lanes, submit both returned allocation bodies unchanged, then re-read ContractRuntime and submit writer_role_safe_copy_payload.copy_payload unchanged. Manual route/task/worktree/acceptance composition is forbidden.",
+            "description": "Call parallel_branch_allocate_precheck with the effective worker cardinality (two atomic standalone lanes or one lane for this verified batch-child contract), submit every returned allocation body unchanged, then re-read ContractRuntime and submit writer_role_safe_copy_payload.copy_payload unchanged. Manual route/task/worktree/acceptance composition is forbidden.",
             "evidence_kind": "dispatch_bounded_worker",
             "line_id": "observer_dispatch_bounded_workers",
             "owner_role": "observer",
@@ -714,8 +714,28 @@
       "endpoint": "/api/graph-governance/{project_id}/parallel-branches/allocation-precheck",
       "required_before": "initial_parallel_branch_allocate",
       "expected_lane_count": 2,
+      "default_scope": "standalone_contract",
+      "allowed_lane_counts": [
+        1,
+        2
+      ],
       "lane_count_policy": "exactly",
       "atomic": true,
+      "cardinality_source": "runtime_guide.effective_worker_cardinality_policy.required_worker_count",
+      "effective_policy_projection": "runtime_guide.effective_allocation_precheck_policy",
+      "standalone_policy": {
+        "expected_lane_count": 2,
+        "atomic": true,
+        "scope": "standalone_contract"
+      },
+      "verified_batch_child_policy": {
+        "cardinality_source": "verified_batch_child_lineage",
+        "expected_lane_count": 1,
+        "atomic": false,
+        "scope": "per_child_contract",
+        "cross_child_union_allowed": false,
+        "precheck_each_child_independently": true
+      },
       "read_only": true,
       "applies_to_stage_types": [
         "mf_sub"

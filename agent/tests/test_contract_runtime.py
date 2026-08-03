@@ -150,7 +150,27 @@ def test_mf_parallel_rev9_preserves_rev8_stage_machine_and_requires_allocation_p
     assert policy["tool"] == "parallel_branch_allocate_precheck"
     assert policy["required_before"] == "initial_parallel_branch_allocate"
     assert policy["expected_lane_count"] == 2
+    assert policy["allowed_lane_counts"] == [1, 2]
     assert policy["atomic"] is True
+    assert policy["cardinality_source"] == (
+        "runtime_guide.effective_worker_cardinality_policy.required_worker_count"
+    )
+    assert policy["effective_policy_projection"] == (
+        "runtime_guide.effective_allocation_precheck_policy"
+    )
+    assert policy["standalone_policy"] == {
+        "expected_lane_count": 2,
+        "atomic": True,
+        "scope": "standalone_contract",
+    }
+    assert policy["verified_batch_child_policy"] == {
+        "cardinality_source": "verified_batch_child_lineage",
+        "expected_lane_count": 1,
+        "atomic": False,
+        "scope": "per_child_contract",
+        "cross_child_union_allowed": False,
+        "precheck_each_child_independently": True,
+    }
     assert policy["read_only"] is True
     assert policy["submit_returned_bodies_unchanged"] is True
     assert policy["applies_to_stage_types"] == ["mf_sub"]

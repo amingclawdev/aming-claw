@@ -3320,8 +3320,14 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         assert key in runtime_text_props
 
     assert precheck["inputSchema"]["required"] == ["project_id", "lanes"]
-    assert precheck_props["lanes"]["minItems"] == 2
+    assert precheck_props["lanes"]["minItems"] == 1
     assert precheck_props["lanes"]["maxItems"] == 2
+    assert precheck_props["expected_lane_count"]["enum"] == [1, 2]
+    assert precheck_props["expected_worker_count"]["enum"] == [1, 2]
+    assert (
+        governance_mcp_server._parallel_branch_allocate_precheck_schema_properties()
+        == mcp_tools._parallel_branch_allocate_precheck_schema_properties()
+    )
     assert {
         "task_id",
         "backlog_id",

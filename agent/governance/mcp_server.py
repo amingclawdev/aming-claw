@@ -913,12 +913,13 @@ def _parallel_branch_allocate_precheck_schema_properties() -> dict[str, Any]:
         "project_id": {"type": "string"},
         "lanes": {
             "type": "array",
-            "minItems": 2,
+            "minItems": 1,
             "maxItems": 2,
             "description": (
-                "Exactly two atomic mf_parallel lane requests. The read-only "
-                "precheck resolves child route refs and returns canonical "
-                "parallel_branch_allocate bodies."
+                "One verified batch-child lane or two standalone atomic "
+                "mf_parallel lanes. The read-only precheck resolves child "
+                "route refs and returns canonical parallel_branch_allocate "
+                "bodies."
             ),
             "items": {
                 "type": "object",
@@ -933,8 +934,8 @@ def _parallel_branch_allocate_precheck_schema_properties() -> dict[str, Any]:
                 ],
             },
         },
-        "expected_lane_count": {"type": "integer", "enum": [2]},
-        "expected_worker_count": {"type": "integer", "enum": [2]},
+        "expected_lane_count": {"type": "integer", "enum": [1, 2]},
+        "expected_worker_count": {"type": "integer", "enum": [1, 2]},
         "base_commit": {"type": "string"},
         "target_head_commit": {"type": "string"},
         "ref_name": {"type": "string"},
@@ -2633,9 +2634,10 @@ TOOLS: list[dict] = [
     {
         "name": "parallel_branch_allocate_precheck",
         "description": (
-            "Read-only atomic two-lane precheck that resolves child route "
-            "identity, disjoint file fences, acceptance union, commits, and "
-            "repository-local .worktrees paths before any allocation write."
+            "Read-only cardinality-aware precheck for one verified batch-child "
+            "lane or two standalone atomic lanes. Resolves child route identity, "
+            "file fences, acceptance scope, commits, and repository-local "
+            ".worktrees paths before any allocation write."
         ),
         "inputSchema": {
             "type": "object",

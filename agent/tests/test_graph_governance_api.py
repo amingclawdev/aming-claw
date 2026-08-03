@@ -14259,7 +14259,10 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
     }
 
     assert response["status"] == "ready"
+    assert response["expected_lane_count"] == 2
     assert response["lane_count"] == 2
+    assert response["atomic"] is True
+    assert response["allocation_scope"] == "standalone_contract"
     assert response["zero_write_proof"]["writes_performed"] is False
     assert before == after
     assert conn.total_changes == before_total_changes
@@ -14323,6 +14326,244 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
             ]
         )
         assert Path(allocated["context"]["worktree_path"]).exists()
+
+
+def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-ALLOCATE-PRECHECK-BATCH-CHILD"
+    contract_execution_id = "cex-allocate-precheck-batch-child"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_file = "src/batch-child.py"
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps([row_file]),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-PRECHECK-BATCH-CHILD",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": [row_file],
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    route_token_ref = "rtok-allocate-precheck-batch-child"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["parallel_branch_allocate"],
+    )
+    conn.commit()
+    before_total_changes = conn.total_changes
+
+    response = server.handle_graph_governance_parallel_branch_allocate_precheck(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "base_commit": candidate_commit,
+                "expected_lane_count": 1,
+                "lanes": [
+                    {
+                        "task_id": "batch-child-worker",
+                        "backlog_id": backlog_id,
+                        "contract_execution_id": contract_execution_id,
+                        "worker_id": "slot-batch-child",
+                        "route_token_ref": route_token_ref,
+                        "owned_files": [row_file],
+                    }
+                ],
+            },
+        )
+    )
+
+    assert response["status"] == "ready"
+    assert response["expected_lane_count"] == 1
+    assert response["lane_count"] == 1
+    assert response["atomic"] is False
+    assert response["allocation_scope"] == "per_child_contract"
+    assert response["acceptance_scope_closure"]["accepted"] is True
+    assert response["acceptance_scope_closure"][
+        "atomic_union_authoritative"
+    ] is False
+    assert response["acceptance_scope_closure"][
+        "per_child_contract_authoritative"
+    ] is True
+    assert response["copy_safe_allocation_bodies"][0][
+        "allocation_precheck"
+    ] == {
+        "schema_version": "parallel_branch_allocate_precheck.receipt.v1",
+        "status": "ready",
+        "submit_unchanged": True,
+        "zero_write": True,
+        "expected_lane_count": 1,
+        "atomic": False,
+        "scope": "per_child_contract",
+    }
+    assert conn.total_changes == before_total_changes
+    assert not (repository_root / ".worktrees").exists()
+
+
+@pytest.mark.parametrize(
+    ("expected_lane_count", "lanes"),
+    [
+        (0, []),
+        (3, []),
+        (1, []),
+        (2, [{}]),
+    ],
+)
+def test_parallel_branch_allocate_precheck_rejects_invalid_lane_count_before_writes(
+    conn,
+    expected_lane_count,
+    lanes,
+):
+    before_total_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "expected_lane_count": expected_lane_count,
+                    "lanes": lanes,
+                },
+            )
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_precheck_lane_count_mismatch"
+    )
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_total_changes
+
+
+def test_parallel_branch_allocate_precheck_rejects_cross_child_union_with_remediation(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    child_specs = [
+        (
+            "AC-PRECHECK-BATCH-CHILD-A",
+            "cex-precheck-batch-child-a",
+            "rtok-precheck-batch-child-a",
+            "src/child-a.py",
+        ),
+        (
+            "AC-PRECHECK-BATCH-CHILD-B",
+            "cex-precheck-batch-child-b",
+            "rtok-precheck-batch-child-b",
+            "src/child-b.py",
+        ),
+    ]
+    lanes = []
+    for index, (backlog_id, execution_id, route_ref, row_file) in enumerate(
+        child_specs,
+        start=1,
+    ):
+        _insert_simple_mf_close_backlog(conn, backlog_id)
+        conn.execute(
+            """
+            UPDATE backlog_bugs
+               SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+             WHERE bug_id = ?
+            """,
+            (
+                json.dumps([row_file]),
+                json.dumps(
+                    [
+                        {
+                            "id": f"AC-PRECHECK-CROSS-CHILD-{index}",
+                            "required_scope": {
+                                "kind": "files",
+                                "files": [row_file],
+                            },
+                        }
+                    ]
+                ),
+                backlog_id,
+            ),
+        )
+        _persist_contract_runtime_observer_route_ref(
+            conn,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            route_token_ref=route_ref,
+            allowed_actions=["parallel_branch_allocate"],
+        )
+        lanes.append(
+            {
+                "task_id": f"cross-child-worker-{index}",
+                "backlog_id": backlog_id,
+                "contract_execution_id": execution_id,
+                "worker_id": f"slot-cross-child-{index}",
+                "route_token_ref": route_ref,
+                "owned_files": [row_file],
+            }
+        )
+    conn.commit()
+    before_total_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "expected_lane_count": 2,
+                    "lanes": lanes,
+                },
+            )
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_precheck_atomic_scope_mismatch"
+    )
+    remediation = rejected.value.details["remediation"]
+    assert remediation == {
+        "action": "precheck_each_verified_batch_child_independently",
+        "expected_lane_count": 1,
+        "atomic": False,
+        "scope": "per_child_contract",
+        "instruction": (
+            "For verified mf_batch_parallel children, call "
+            "parallel_branch_allocate_precheck once per child with that "
+            "child's one lane and expected_lane_count=1."
+        ),
+    }
+    assert conn.total_changes == before_total_changes
+    assert not (repository_root / ".worktrees").exists()
 
 
 def test_parallel_branch_allocate_precheck_fails_atomic_input_before_writes(
@@ -103098,6 +103339,20 @@ def test_mf_parallel_revise_rejects_standalone_change_to_one_worker(conn):
     assert entered["worker_cardinality_policy"]["source"] == (
         "observer_selected_standalone_cardinality"
     )
+    projected_standalone = server._contract_runtime_read(
+        conn,
+        contract_execution_id=contract_execution_id,
+        actor_role="observer",
+    )
+    standalone_precheck_policy = projected_standalone["runtime_guide"][
+        "effective_allocation_precheck_policy"
+    ]
+    assert standalone_precheck_policy["expected_lane_count"] == 2
+    assert standalone_precheck_policy["atomic"] is True
+    assert standalone_precheck_policy["scope"] == "standalone_contract"
+    assert projected_standalone["runtime_guide"]["next_legal_action"][
+        "effective_allocation_precheck_policy"
+    ] == standalone_precheck_policy
 
     with pytest.raises(
         ValidationError,
@@ -103394,6 +103649,19 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     assert projected_child["runtime_guide"]["next_legal_action"][
         "effective_worker_cardinality_policy"
     ]["source"] == "verified_batch_child_lineage"
+    batch_child_precheck_policy = projected_child["runtime_guide"][
+        "effective_allocation_precheck_policy"
+    ]
+    assert batch_child_precheck_policy["cardinality_source"] == (
+        "verified_batch_child_lineage"
+    )
+    assert batch_child_precheck_policy["expected_lane_count"] == 1
+    assert batch_child_precheck_policy["atomic"] is False
+    assert batch_child_precheck_policy["scope"] == "per_child_contract"
+    assert batch_child_precheck_policy["verified_batch_child"] is True
+    assert projected_child["runtime_guide"]["next_legal_action"][
+        "effective_allocation_precheck_policy"
+    ] == batch_child_precheck_policy
 
     revise_to_two = server.handle_project_mf_parallel_revise(
         _ctx(

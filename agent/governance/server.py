@@ -11369,7 +11369,7 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
 def handle_graph_governance_parallel_branch_allocate_precheck(
     ctx: RequestContext,
 ):
-    """Return an atomic copy-safe allocation plan with an explicit zero-write contract."""
+    """Return a cardinality-aware copy-safe plan with a zero-write contract."""
 
     from . import batch_jobs
 
@@ -11377,25 +11377,44 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
     lanes = ctx.body.get("lanes")
     if not isinstance(lanes, list):
         raise ValidationError("lanes must be an array")
+    raw_expected_lane_count = ctx.body.get("expected_lane_count")
+    if raw_expected_lane_count in (None, ""):
+        raw_expected_lane_count = ctx.body.get("expected_worker_count")
+    if raw_expected_lane_count in (None, ""):
+        raw_expected_lane_count = 2
     try:
-        expected_lane_count = int(
-            ctx.body.get("expected_lane_count")
-            or ctx.body.get("expected_worker_count")
-            or 2
-        )
+        expected_lane_count = int(raw_expected_lane_count)
     except (TypeError, ValueError) as exc:
         raise ValidationError("expected_lane_count must be an integer") from exc
-    if expected_lane_count != 2 or len(lanes) != expected_lane_count:
+    if expected_lane_count not in {1, 2}:
         raise GovernanceError(
             "parallel_branch_allocate_precheck_lane_count_mismatch",
-            "mf_parallel allocation precheck requires exactly two atomic lanes",
+            "mf_parallel allocation precheck expected_lane_count must be 1 or 2",
             422,
             {
-                "required_lane_count": 2,
+                "allowed_lane_counts": [1, 2],
+                "expected_lane_count": expected_lane_count,
                 "requested_lane_count": len(lanes),
                 "writes_performed": False,
             },
         )
+    if len(lanes) != expected_lane_count:
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_lane_count_mismatch",
+            "mf_parallel allocation lanes must match expected_lane_count",
+            422,
+            {
+                "allowed_lane_counts": [1, 2],
+                "required_lane_count": expected_lane_count,
+                "expected_lane_count": expected_lane_count,
+                "requested_lane_count": len(lanes),
+                "writes_performed": False,
+            },
+        )
+    atomic = expected_lane_count == 2
+    allocation_scope = (
+        "standalone_contract" if atomic else "per_child_contract"
+    )
 
     repository_root = _parallel_branch_allocate_precheck_registered_repository(
         project_id
@@ -11460,6 +11479,19 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                 {
                     "backlog_ids": sorted(backlog_ids),
                     "contract_execution_ids": sorted(execution_ids),
+                    "remediation": {
+                        "action": (
+                            "precheck_each_verified_batch_child_independently"
+                        ),
+                        "expected_lane_count": 1,
+                        "atomic": False,
+                        "scope": "per_child_contract",
+                        "instruction": (
+                            "For verified mf_batch_parallel children, call "
+                            "parallel_branch_allocate_precheck once per child "
+                            "with that child's one lane and expected_lane_count=1."
+                        ),
+                    },
                     "writes_performed": False,
                 },
             )
@@ -11513,13 +11545,33 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             lane_owned_files=lane_owned_files,
             acceptance_claim_source=copy_safe_bodies,
         )
+        if not atomic:
+            acceptance_scope_closure = {
+                **acceptance_scope_closure,
+                "schema_version": (
+                    "mf_parallel.per_child_acceptance_scope.v1"
+                ),
+                "scope_mode": "mf_parallel_batch_child_persisted_lane",
+                "atomic_union_authoritative": False,
+                "per_child_contract_authoritative": True,
+            }
         all_errors = list(
             dict.fromkeys([*lane_errors, *acceptance_errors])
         )
         if all_errors:
             raise GovernanceError(
-                "parallel_branch_allocate_precheck_atomic_gate_failed",
-                "atomic allocation lanes failed identity, fence, or acceptance validation",
+                (
+                    "parallel_branch_allocate_precheck_atomic_gate_failed"
+                    if atomic
+                    else "parallel_branch_allocate_precheck_lane_gate_failed"
+                ),
+                (
+                    "atomic allocation lanes failed identity, fence, or "
+                    "acceptance validation"
+                    if atomic
+                    else "per-child allocation lane failed identity, fence, "
+                    "or acceptance validation"
+                ),
                 422,
                 {
                     "errors": all_errors,
@@ -11535,6 +11587,9 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                 "status": "ready",
                 "submit_unchanged": True,
                 "zero_write": True,
+                "expected_lane_count": expected_lane_count,
+                "atomic": atomic,
+                "scope": allocation_scope,
             }
         copy_safe_bodies.sort(key=lambda body: str(body.get("task_id") or ""))
         lane_projections.sort(
@@ -11547,9 +11602,10 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             "project_id": project_id,
             "backlog_id": backlog_id,
             "contract_execution_id": contract_execution_id,
-            "expected_lane_count": 2,
+            "expected_lane_count": expected_lane_count,
             "lane_count": len(copy_safe_bodies),
-            "atomic": True,
+            "atomic": atomic,
+            "allocation_scope": allocation_scope,
             "submit_unchanged": True,
             "mcp_tool": "parallel_branch_allocate",
             "copy_safe_allocation_bodies": copy_safe_bodies,
@@ -70640,6 +70696,41 @@ def _contract_runtime_mf_parallel_atomic_lane_errors(
     return list(dict.fromkeys(errors))
 
 
+def _contract_runtime_mf_parallel_allocation_precheck_policy(
+    cardinality_policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project allocation-precheck semantics from effective worker cardinality."""
+
+    expected_lane_count = int(
+        cardinality_policy.get("required_worker_count") or 2
+    )
+    verified_batch_child = bool(
+        expected_lane_count == 1
+        and cardinality_policy.get("source") == "verified_batch_child_lineage"
+        and cardinality_policy.get("batch_row_scoped_successor") is True
+    )
+    atomic = expected_lane_count > 1
+    return {
+        "schema_version": "mf_parallel.effective_allocation_precheck_policy.v1",
+        "source": "effective_worker_cardinality_policy",
+        "cardinality_source": str(cardinality_policy.get("source") or ""),
+        "tool": "parallel_branch_allocate_precheck",
+        "expected_lane_count": expected_lane_count,
+        "allowed_lane_counts": [1, 2],
+        "lane_count_policy": "exactly",
+        "atomic": atomic,
+        "scope": (
+            "per_child_contract"
+            if verified_batch_child
+            else "standalone_contract"
+        ),
+        "verified_batch_child": verified_batch_child,
+        "submit_returned_bodies_unchanged": True,
+        "standalone_mf_parallel_policy_unchanged": True,
+        "caller_override_allowed": False,
+    }
+
+
 def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
     conn,
     *,
@@ -70668,9 +70759,18 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         project_id=project_id,
         record=record,
     )
+    allocation_precheck_policy = (
+        _contract_runtime_mf_parallel_allocation_precheck_policy(
+            cardinality_policy
+        )
+    )
     guide["effective_worker_cardinality_policy"] = cardinality_policy
+    guide["effective_allocation_precheck_policy"] = allocation_precheck_policy
     if next_action:
         next_action["effective_worker_cardinality_policy"] = cardinality_policy
+        next_action["effective_allocation_precheck_policy"] = (
+            allocation_precheck_policy
+        )
         guide["next_legal_action"] = next_action
     projected["runtime_guide"] = guide
     if (
@@ -71195,6 +71295,7 @@ def _runtime_next_action_from_guide(
         "copy_safe_dispatch_ready",
         "dispatch_copy_safe_body_source",
         "effective_worker_cardinality_policy",
+        "effective_allocation_precheck_policy",
     ):
         if key in next_line:
             result[key] = next_line[key]
