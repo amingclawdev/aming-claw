@@ -44769,7 +44769,10 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     payload = _strip_top_level_timeline_role_fields(supplied_payload)
     raw_fence_token = _runtime_context_request_value(ctx, "fence_token")
     raw_session_token = _runtime_context_request_value(ctx, "session_token")
-    from .parallel_branch_runtime import runtime_context_session_token_ref
+    from .parallel_branch_runtime import (
+        public_contract_revision_payload,
+        runtime_context_session_token_ref,
+    )
 
     session_token_ref = (
         _runtime_context_request_value(ctx, "session_token_ref")

@@ -21740,6 +21740,11 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     runtime_context_id = context.runtime_context_id
     graph_trace_id = "gqt-runtime-facade"
     older_graph_trace_id = "gqt-runtime-facade-older"
+    _activate_basic_graph(
+        conn,
+        "scope-facade",
+        commit_sha=fixture.main_head,
+    )
     _insert_mf_sub_graph_query_trace(
         conn,
         trace_id=older_graph_trace_id,
@@ -93803,6 +93808,11 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
     ) == []
 
     graph_trace_id = "gqt-contract-canonical-worker"
+    _activate_basic_graph(
+        conn,
+        "scope-contract-canonical-worker",
+        commit_sha=base_commit,
+    )
     _insert_mf_sub_graph_query_trace(
         conn,
         trace_id=graph_trace_id,
@@ -93878,6 +93888,12 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
             "visible_injection_manifest_hash",
         )
     }
+    implementation_events_before = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=worker_task_id,
+        event_kind="implementation",
+    )
 
     implementation_response = (
         server.handle_graph_governance_runtime_context_implementation_evidence(
@@ -93896,7 +93912,17 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
                     "actor": actual_worker_id,
                     "changed_files": ["agent/governance/server.py"],
                     "graph_trace_ids": [graph_trace_id],
-                    "test_results": {"passed": True},
+                    "test_results": {
+                        "status": "passed",
+                        "passed": True,
+                        "commands": [
+                            {"command": "pytest -q", "status": "passed"}
+                        ],
+                        "session_token": "credential-must-not-persist",
+                        "details": {
+                            "raw_fence_token": "nested-credential-must-not-persist",
+                        },
+                    },
                     "summary": "canonical worker bridge implementation",
                     "route_token_ref": child_route["route_token_ref"],
                     **child_route_identity,
@@ -93905,6 +93931,21 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
         )
     )
     assert implementation_response["ok"] is True
+    assert implementation_response["schema_version"] == (
+        "runtime_context.write_facade_response.v1"
+    )
+    assert implementation_response["action"] == "implementation_evidence"
+    assert implementation_response["timeline_event"]["id"]
+    assert implementation_response["timeline_event"]["event_kind"] == (
+        "implementation"
+    )
+    canonical_response = implementation_response[
+        "contract_runtime_canonical_line"
+    ]
+    assert canonical_response["accepted"] is True
+    assert canonical_response["status"] in {"completed", "already_completed"}
+    assert canonical_response["canonical"] is True
+    assert canonical_response["line_id"] == "worker_implementation"
     contract_record = server._contract_runtime_store(conn).get(
         contract_execution_id
     )
@@ -93936,20 +93977,55 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
         "agent/governance/server.py"
     ]
     assert implementation_line["payload"]["graph_trace_ids"] == [graph_trace_id]
+    assert implementation_line["payload"]["test_results"] == {
+        "status": "passed",
+        "passed": True,
+        "commands": [{"command": "pytest -q", "status": "passed"}],
+        "details": {},
+    }
+    assert sum(
+        1
+        for line in contract_record["completed_lines"]
+        if line.get("line_id") == "worker_implementation"
+        and line.get("payload", {}).get("runtime_context_id")
+        == runtime_context.runtime_context_id
+    ) == 1
     implementation_events = task_timeline.list_events(
         conn,
         PID,
         task_id=worker_task_id,
         event_kind="implementation",
     )
+    assert len(implementation_events) == len(implementation_events_before) + 1
     assert implementation_events[-1]["payload"][
         "contract_runtime_canonical_line"
     ]["line_id"] == "worker_implementation"
     implementation_event = implementation_events[-1]
+    assert str(implementation_event["id"]) == implementation_response[
+        "timeline_event"
+    ]["id"]
     assert implementation_event["payload"]["changed_files"] == [
         "agent/governance/server.py"
     ]
     assert implementation_event["payload"]["graph_trace_ids"] == [graph_trace_id]
+    assert implementation_event["payload"]["test_results"] == {
+        "status": "passed",
+        "passed": True,
+        "commands": [{"command": "pytest -q", "status": "passed"}],
+        "details": {},
+    }
+    persisted_implementation_json = json.dumps(
+        {
+            "response": implementation_response,
+            "contract_line": implementation_line,
+            "timeline_event": implementation_event,
+        },
+        sort_keys=True,
+    )
+    assert "credential-must-not-persist" not in persisted_implementation_json
+    assert "nested-credential-must-not-persist" not in (
+        persisted_implementation_json
+    )
     assert implementation_event["payload"]["graph_trace_db_evidence"][
         "db_verified"
     ] is True
@@ -93991,7 +94067,6 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
         replace(
             runtime_context,
             head_commit=worker_commit,
-            target_head_commit=worker_commit,
         ),
     )
     conn.commit()
@@ -94142,7 +94217,7 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
         conn,
         trace_id=current_graph_trace_id,
         parent_task_id=backlog_id,
-        snapshot_id="scope-contract-canonical-worker-finish",
+        snapshot_id="scope-contract-canonical-worker",
         runtime_context_id=runtime_context.runtime_context_id,
         task_id=worker_task_id,
         worker_role="mf_sub",
