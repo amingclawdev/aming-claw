@@ -11411,6 +11411,195 @@ def _parallel_branch_allocate_precheck_requested_path_diagnostics(
     return diagnostics
 
 
+def _contract_runtime_resolve_append_scoped_child_route(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+    supplied_route_authority: Mapping[str, Any] | None = None,
+    required_actions: Sequence[str] = ("task_timeline_append",),
+    required_caller_role: str = "",
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Resolve one registered child ref through the shared append-scope gate."""
+
+    from . import observer_route_context
+
+    route_token_ref = str(route_token_ref or "").strip()
+    diagnostic: dict[str, Any] = {
+        "schema_version": (
+            "contract_runtime.append_scoped_child_route_resolution.v1"
+        ),
+        "status": "blocked",
+        "route_token_ref": route_token_ref,
+        "field": "route_token_ref",
+        "expected": "server_registered_append_scoped_child_ref",
+        "actual": "missing" if not route_token_ref else "unresolved",
+        "writes_performed": False,
+        "public_safe": True,
+        "raw_route_token_exposed": False,
+    }
+    if not route_token_ref:
+        return {}, diagnostic
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return {}, diagnostic
+    if not resolved:
+        return {}, diagnostic
+
+    resolved_scope = (
+        dict(resolved.get("scope"))
+        if isinstance(resolved.get("scope"), Mapping)
+        else {}
+    )
+    for field, expected in (
+        ("project_id", project_id),
+        ("backlog_id", backlog_id),
+        ("task_id", contract_execution_id),
+    ):
+        actual = str(resolved_scope.get(field) or "").strip()
+        if actual != expected:
+            diagnostic.update(
+                {
+                    "status": "blocked_route_scope",
+                    "field": f"scope.{field}",
+                    "expected": expected,
+                    "actual": actual or "missing",
+                }
+            )
+            return {}, diagnostic
+
+    caller_role = str(resolved.get("caller_role") or "").strip()
+    if required_caller_role and caller_role != required_caller_role:
+        diagnostic.update(
+            {
+                "status": "blocked_route_role",
+                "field": "caller_role",
+                "expected": required_caller_role,
+                "actual": caller_role or "missing",
+            }
+        )
+        return {}, diagnostic
+
+    normalized_actions = sorted(
+        {
+            str(action or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(".", "_")
+            for action in (resolved.get("allowed_actions") or [])
+            if str(action or "").strip()
+        }
+    )
+    normalized_required_actions = [
+        str(action or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(".", "_")
+        for action in required_actions
+        if str(action or "").strip()
+    ]
+    missing_action = next(
+        (
+            action
+            for action in normalized_required_actions
+            if action not in normalized_actions
+        ),
+        "",
+    )
+    if missing_action:
+        diagnostic.update(
+            {
+                "status": "blocked_route_action_scope",
+                "field": "allowed_actions",
+                "expected": missing_action,
+                "actual": normalized_actions,
+            }
+        )
+        return {}, diagnostic
+
+    registered_child = (
+        dict(resolved.get("child_route_lineage"))
+        if isinstance(resolved.get("child_route_lineage"), Mapping)
+        else {}
+    )
+    canonical_route_identity = {
+        field: str(
+            registered_child.get(field)
+            or resolved.get(field)
+            or (route_token_ref if field == "route_token_ref" else "")
+        ).strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    missing_identity = [
+        field
+        for field, value in canonical_route_identity.items()
+        if not value
+    ]
+    if missing_identity:
+        diagnostic.update(
+            {
+                "status": "blocked_incomplete_child_route_identity",
+                "field": "child_route_identity",
+                "expected": sorted(_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS),
+                "actual": {"missing_fields": missing_identity},
+            }
+        )
+        return {}, diagnostic
+
+    supplied_sources: list[Mapping[str, Any]] = []
+    if isinstance(supplied_route_authority, Mapping):
+        supplied_sources.append(supplied_route_authority)
+        for field in ("route_identity", "child_route_lineage"):
+            nested = supplied_route_authority.get(field)
+            if isinstance(nested, Mapping):
+                supplied_sources.append(nested)
+    for field, expected in canonical_route_identity.items():
+        supplied_values = sorted(
+            {
+                str(source.get(field) or "").strip()
+                for source in supplied_sources
+                if str(source.get(field) or "").strip()
+            }
+        )
+        if supplied_values and supplied_values != [expected]:
+            diagnostic.update(
+                {
+                    "status": "blocked_mixed_child_route_identity",
+                    "field": f"child_route_identity.{field}",
+                    "expected": expected,
+                    "actual": supplied_values,
+                }
+            )
+            return {}, diagnostic
+
+    diagnostic.update(
+        {
+            "status": "resolved_append_scoped_ref",
+            "field": "allowed_actions",
+            "expected": normalized_required_actions,
+            "actual": normalized_actions,
+            "caller_role": caller_role,
+            "scope": {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": contract_execution_id,
+            },
+            "child_route_identity": dict(canonical_route_identity),
+        }
+    )
+    return canonical_route_identity, diagnostic
+
+
 def _parallel_branch_allocate_precheck_copy_safe_body(
     conn,
     *,
@@ -11482,6 +11671,35 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
             },
         )
 
+    append_route_identity, append_route_diagnostic = (
+        _contract_runtime_resolve_append_scoped_child_route(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            route_token_ref=route_token_ref,
+            supplied_route_authority=lane,
+        )
+    )
+    if not append_route_identity:
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_route_action_scope_invalid",
+            (
+                "parallel allocation precheck requires one server-resolved "
+                "append-scoped child route ref per lane"
+            ),
+            422,
+            {
+                "task_id": task_id,
+                "route_token_ref": route_token_ref,
+                "field": append_route_diagnostic["field"],
+                "expected": append_route_diagnostic["expected"],
+                "actual": append_route_diagnostic["actual"],
+                "lane_diagnostics": [append_route_diagnostic],
+                "writes_performed": False,
+            },
+        )
+
     effective = _parallel_branch_allocate_effective_route_body(
         conn,
         project_id=project_id,
@@ -11493,6 +11711,21 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
         },
     )
     route_identity = _parallel_branch_runtime_contract_route_identity(effective)
+    if route_identity != append_route_identity:
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_route_action_scope_invalid",
+            "allocation and append route normalization did not resolve one identity",
+            422,
+            {
+                "task_id": task_id,
+                "route_token_ref": route_token_ref,
+                "field": "child_route_identity",
+                "expected": append_route_identity,
+                "actual": route_identity,
+                "lane_diagnostics": [append_route_diagnostic],
+                "writes_performed": False,
+            },
+        )
 
     base_commit = str(lane.get("base_commit") or default_base_commit).strip().lower()
     target_head_commit = str(
@@ -11605,6 +11838,7 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
         "worker_id": worker_id,
         "contract_execution_id": contract_execution_id,
         "route_token_ref": route_token_ref,
+        "append_route_scope": append_route_diagnostic,
         "owned_files": owned_files,
         "canonical_worktree_path": str(canonical_worktree),
         "canonical_branch_ref": branch_ref,
@@ -13687,22 +13921,11 @@ def _parallel_branch_allocate_effective_route_body(
 ) -> dict[str, Any]:
     """Recover a copy-safe allocation route identity from a registered ref."""
 
-    from . import observer_route_context
-
     effective = dict(body or {})
     route_token_ref = str(effective.get("route_token_ref") or "").strip()
     if not route_token_ref:
         return effective
 
-    explicit_identity = _parallel_branch_runtime_contract_route_identity(effective)
-    required_identity_fields = (
-        "route_id",
-        "route_context_hash",
-        "prompt_contract_id",
-        "prompt_contract_hash",
-        "visible_injection_manifest_hash",
-        "route_token_ref",
-    )
     observer_command_id = str(effective.get("observer_command_id") or "").strip()
     contract_execution_id = _runtime_context_public_text(
         effective.get("contract_execution_id"),
@@ -13719,133 +13942,53 @@ def _parallel_branch_allocate_effective_route_body(
             {
                 "route_token_ref": route_token_ref,
                 "required_fields": ["backlog_id", "contract_execution_id"],
+                "field": "route_scope",
+                "expected": ["backlog_id", "contract_execution_id"],
+                "actual": {
+                    "backlog_id": backlog_id or "missing",
+                    "contract_execution_id": contract_execution_id or "missing",
+                },
+                "public_safe": True,
+                "writes_performed": False,
             },
         )
 
-    try:
-        resolved = observer_route_context.resolve_route_token_ref(
+    canonical_route_identity, route_diagnostic = (
+        _contract_runtime_resolve_append_scoped_child_route(
             conn,
             project_id=project_id,
-            route_token_ref=route_token_ref,
             backlog_id=backlog_id,
-            task_id=contract_execution_id,
-            route_id=str(explicit_identity.get("route_id") or "").strip(),
-            route_context_hash=str(
-                explicit_identity.get("route_context_hash") or ""
-            ).strip(),
-            prompt_contract_id=str(
-                explicit_identity.get("prompt_contract_id") or ""
-            ).strip(),
+            contract_execution_id=contract_execution_id,
+            route_token_ref=route_token_ref,
+            supplied_route_authority=effective,
+            required_actions=(
+                "parallel_branch_allocate",
+                "task_timeline_append",
+            ),
+            required_caller_role="observer",
         )
-    except observer_route_context.RouteTokenRefError as exc:
-        raise GovernanceError(
-            "parallel_branch_allocate_route_token_ref_invalid",
-            str(exc),
-            422,
-            {
-                "route_token_ref": route_token_ref,
-                "backlog_id": backlog_id,
-                "contract_execution_id": contract_execution_id,
-            },
-        ) from exc
-    if not resolved:
-        raise GovernanceError(
-            "parallel_branch_allocate_route_token_ref_unknown",
-            "parallel allocation route_token_ref is not registered",
-            422,
-            {"route_token_ref": route_token_ref},
-        )
-
-    resolved_scope = (
-        dict(resolved.get("scope"))
-        if isinstance(resolved.get("scope"), Mapping)
-        else {}
     )
-    scope_mismatches = [
-        {
-            "field": field,
-            "expected": expected,
-            "resolved": str(resolved_scope.get(field) or "").strip(),
-        }
-        for field, expected in (
-            ("project_id", project_id),
-            ("backlog_id", backlog_id),
-            ("task_id", contract_execution_id),
-        )
-        if expected and str(resolved_scope.get(field) or "").strip() != expected
-    ]
-    if scope_mismatches:
+    if not canonical_route_identity:
         raise GovernanceError(
-            "parallel_branch_allocate_route_scope_mismatch",
-            "parallel allocation route_token_ref scope does not match the request",
+            "parallel_branch_allocate_route_action_scope_invalid",
+            (
+                "parallel allocation requires one server-resolved observer "
+                "child ref scoped for allocation and timeline append"
+            ),
             422,
             {
                 "route_token_ref": route_token_ref,
-                "scope_mismatches": scope_mismatches,
+                "field": route_diagnostic["field"],
+                "expected": route_diagnostic["expected"],
+                "actual": route_diagnostic["actual"],
+                "public_safe": True,
+                "lane_diagnostics": [route_diagnostic],
+                "writes_performed": False,
             },
         )
 
-    caller_role = str(resolved.get("caller_role") or "").strip()
-    if caller_role != "observer":
-        raise GovernanceError(
-            "parallel_branch_allocate_route_role_mismatch",
-            "parallel allocation route_token_ref must be observer scoped",
-            422,
-            {"route_token_ref": route_token_ref, "caller_role": caller_role},
-        )
-    allowed_actions = {
-        str(action or "").strip()
-        for action in (resolved.get("allowed_actions") or [])
-        if str(action or "").strip()
-    }
-    if "parallel_branch_allocate" not in allowed_actions:
-        raise GovernanceError(
-            "parallel_branch_allocate_route_action_not_allowed",
-            "parallel allocation route_token_ref does not allow parallel_branch_allocate",
-            422,
-            {
-                "route_token_ref": route_token_ref,
-                "allowed_actions": sorted(allowed_actions),
-            },
-        )
-
-    resolved_identity = {
-        field: str(resolved.get(field) or "").strip()
-        for field in required_identity_fields
-    }
-    missing_resolved = [
-        field for field, value in resolved_identity.items() if not value
-    ]
-    if missing_resolved:
-        raise GovernanceError(
-            "parallel_branch_allocate_route_identity_incomplete",
-            "registered parallel allocation route identity is incomplete",
-            422,
-            {
-                "route_token_ref": route_token_ref,
-                "missing_fields": missing_resolved,
-            },
-        )
-    conflicts = [
-        {
-            "field": field,
-            "requested": str(explicit_identity.get(field) or "").strip(),
-            "resolved": value,
-        }
-        for field, value in resolved_identity.items()
-        if explicit_identity.get(field)
-        and str(explicit_identity.get(field) or "").strip() != value
-    ]
-    if conflicts:
-        raise GovernanceError(
-            "parallel_branch_allocate_route_identity_conflict",
-            "explicit parallel allocation route identity conflicts with route_token_ref",
-            409,
-            {"route_token_ref": route_token_ref, "conflicts": conflicts},
-        )
-
-    effective.update(resolved_identity)
-    effective["route_identity"] = resolved_identity
+    effective.update(canonical_route_identity)
+    effective["route_identity"] = canonical_route_identity
     effective["route_token_gate"] = {
         "schema_version": "parallel_branch_allocate.route_token_ref_gate.v1",
         "decision": "route_token_ref_resolved",
@@ -13853,10 +13996,11 @@ def _parallel_branch_allocate_effective_route_body(
         "registry_verified": True,
         "binding_source": "observer_route_token_refs",
         "route_token_ref": route_token_ref,
-        "caller_role": caller_role,
+        "caller_role": str(route_diagnostic.get("caller_role") or ""),
         "allowed_action": "parallel_branch_allocate",
-        "allowed_actions": sorted(allowed_actions),
-        "scope": resolved_scope,
+        "allowed_actions": list(route_diagnostic.get("actual") or []),
+        "append_scope_status": route_diagnostic["status"],
+        "scope": dict(route_diagnostic.get("scope") or {}),
         "raw_private_context_exposed": False,
     }
     return effective
@@ -72216,6 +72360,70 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
             "copy_safe_body_available": False,
         }
 
+    route_diagnostics: list[dict[str, Any]] = []
+    for context, revision_payload in candidates:
+        route_identity = _parallel_branch_runtime_contract_route_identity(
+            revision_payload
+        )
+        _canonical_route_identity, route_diagnostic = (
+            _contract_runtime_resolve_append_scoped_child_route(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract_execution_id=execution_id,
+                route_token_ref=str(
+                    route_identity.get("route_token_ref") or ""
+                ).strip(),
+                supplied_route_authority=revision_payload,
+            )
+        )
+        route_diagnostics.append(
+            {
+                **route_diagnostic,
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    context
+                ),
+                "task_id": str(
+                    getattr(context, "task_id", "") or ""
+                ).strip(),
+            }
+        )
+    blocked_route_diagnostics = [
+        diagnostic
+        for diagnostic in route_diagnostics
+        if diagnostic.get("status") != "resolved_append_scoped_ref"
+    ]
+    if blocked_route_diagnostics:
+        next_action["copy_safe_dispatch_ready"] = False
+        next_action["dispatch_copy_safe_body_source"] = ""
+        for field in (
+            "writer_role_safe_copy_payload",
+            "parallel_branch_allocate_submission",
+            "copy_safe_dispatch_payload",
+        ):
+            guide.pop(field, None)
+            next_action.pop(field, None)
+        guide["next_legal_action"] = next_action
+        projection = {
+            "schema_version": (
+                "contract_runtime.mf_parallel_dispatch_copy_safe_projection.v2"
+            ),
+            "status": "blocked_route_action_scope",
+            "field": blocked_route_diagnostics[0].get("field"),
+            "expected": blocked_route_diagnostics[0].get("expected"),
+            "actual": blocked_route_diagnostics[0].get("actual"),
+            "lane_diagnostics": blocked_route_diagnostics,
+            "required_worker_count": required_worker_count,
+            "persisted_worker_count": len(candidates),
+            "atomic_dispatch_required": required_worker_count > 1,
+            "copy_safe_body_available": False,
+            "writes_performed": False,
+            "raw_private_context_exposed": False,
+        }
+        guide["dispatch_copy_safe_projection"] = projection
+        projected["runtime_guide"] = guide
+        return projected, projection
+
     lane_owned_files = [
         _runtime_context_public_file_values(
             list(getattr(context, "owned_files", ()) or ())
@@ -72544,6 +72752,15 @@ def _runtime_next_action_from_guide(
     next_line = guide.get("next_legal_action")
     if not isinstance(next_line, Mapping):
         return {}
+    dispatch_copy_safe_projection = (
+        guide.get("dispatch_copy_safe_projection")
+        if isinstance(guide.get("dispatch_copy_safe_projection"), Mapping)
+        else {}
+    )
+    route_action_scope_blocked = bool(
+        str(dispatch_copy_safe_projection.get("status") or "").strip()
+        == "blocked_route_action_scope"
+    )
     execution = guide.get("execution") if isinstance(guide.get("execution"), Mapping) else {}
     evidence_kind = str(next_line.get("evidence_kind") or "")
     line_id = str(next_line.get("line_id") or "")
@@ -72661,7 +72878,10 @@ def _runtime_next_action_from_guide(
         if key in next_line:
             result[key] = next_line[key]
     writer_safe_copy = guide.get("writer_role_safe_copy_payload")
-    if isinstance(writer_safe_copy, Mapping):
+    if (
+        not route_action_scope_blocked
+        and isinstance(writer_safe_copy, Mapping)
+    ):
         result["writer_role_safe_copy_payload"] = dict(writer_safe_copy)
     contract = (
         guide.get("contract")
@@ -72669,7 +72889,8 @@ def _runtime_next_action_from_guide(
         else {}
     )
     if (
-        line_id == "observer_dispatch_bounded_workers"
+        not route_action_scope_blocked
+        and line_id == "observer_dispatch_bounded_workers"
         and str(contract.get("contract_id") or "").strip()
         == MF_PARALLEL_CONTRACT_ID
     ):
@@ -72715,7 +72936,11 @@ def _runtime_next_action_from_guide(
                 "submit_unchanged": True,
                 "source_spelunking_required": False,
             }
-    bridge_guidance = _contract_runtime_mf_sub_host_bridge_guidance(guide)
+    bridge_guidance = (
+        {}
+        if route_action_scope_blocked
+        else _contract_runtime_mf_sub_host_bridge_guidance(guide)
+    )
     if bridge_guidance:
         result["mf_sub_host_bridge_guidance"] = bridge_guidance
     return result
@@ -91333,83 +91558,64 @@ def _contract_runtime_bind_mf_parallel_dispatch_authority(
         errors.append("dispatch route identity mixes parent and child route_token_ref")
     route_token_ref = next(iter(route_token_refs)) if route_token_refs else ""
     canonical_route_identity: dict[str, str] = {}
-    resolved = None
     if not route_token_ref:
         if required_child_route_fields:
             errors.append(
                 "mf_parallel policy-bound dispatch is missing route_token_ref"
             )
     else:
-        from . import observer_route_context
-
-        try:
-            resolved = observer_route_context.resolve_route_token_ref(
+        canonical_route_identity, append_route_diagnostic = (
+            _contract_runtime_resolve_append_scoped_child_route(
                 conn,
                 project_id=project_id,
+                backlog_id=str(record.get("backlog_id") or "").strip(),
+                contract_execution_id=str(
+                    record.get("contract_execution_id") or ""
+                ).strip(),
                 route_token_ref=route_token_ref,
-                backlog_id=str(record.get("backlog_id") or ""),
-                task_id=str(record.get("contract_execution_id") or ""),
+                supplied_route_authority=effective,
             )
-        except observer_route_context.RouteTokenRefError as exc:
-            errors.append(f"dispatch child route identity could not be resolved: {exc}")
-        if not resolved:
-            errors.append("dispatch child route_token_ref is not server registered")
-
-    if resolved:
-        resolved_scope = (
-            resolved.get("scope")
-            if isinstance(resolved.get("scope"), Mapping)
-            else {}
         )
-        if (
-            str(resolved_scope.get("backlog_id") or "").strip()
-            != str(record.get("backlog_id") or "").strip()
-        ):
-            errors.append(
-                "dispatch child route identity backlog does not match contract runtime"
-            )
-        if (
-            str(resolved_scope.get("task_id") or "").strip()
-            != str(record.get("contract_execution_id") or "").strip()
-        ):
-            errors.append(
-                "dispatch child route identity task scope does not match successor contract"
-            )
-        allowed_actions = {
-            str(action or "").strip().lower().replace("-", "_").replace(".", "_")
-            for action in (resolved.get("allowed_actions") or [])
-        }
-        if "task_timeline_append" not in allowed_actions:
-            errors.append("dispatch route_token_ref is not append scoped")
-        registered_child = (
-            resolved.get("child_route_lineage")
-            if isinstance(resolved.get("child_route_lineage"), Mapping)
-            else {}
-        )
-        canonical_route_identity = {
-            field: str(
-                registered_child.get(field)
-                or resolved.get(field)
-                or (route_token_ref if field == "route_token_ref" else "")
-            ).strip()
-            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-        }
-        incomplete_route = [
-            field
-            for field in required_child_route_fields
-            if not canonical_route_identity.get(field)
-        ]
-        if incomplete_route:
-            errors.append(
-                "server-resolved child route identity is incomplete: "
-                + ", ".join(incomplete_route)
-            )
-        for field, canonical in canonical_route_identity.items():
-            supplied = route_values(field)
-            if len(supplied) > 1 or any(value != canonical for value in supplied):
+        if not canonical_route_identity:
+            if (
+                append_route_diagnostic.get("status")
+                == "blocked_route_action_scope"
+            ):
+                errors.append("dispatch route_token_ref is not append scoped")
+            else:
                 errors.append(
-                    f"dispatch route identity mixes parent and child {field}"
+                    "dispatch child route identity failed append-scope "
+                    "resolution: "
+                    f"{append_route_diagnostic.get('field')} expected "
+                    f"{append_route_diagnostic.get('expected')} actual "
+                    f"{append_route_diagnostic.get('actual')}"
                 )
+        else:
+            incomplete_route = [
+                field
+                for field in required_child_route_fields
+                if not canonical_route_identity.get(field)
+            ]
+            if incomplete_route:
+                errors.append(
+                    "server-resolved child route identity is incomplete: "
+                    + ", ".join(incomplete_route)
+                )
+            for field, canonical in canonical_route_identity.items():
+                supplied = route_values(field)
+                if len(supplied) > 1 or any(
+                    value != canonical for value in supplied
+                ):
+                    errors.append(
+                        "dispatch route identity mixes parent and child "
+                        f"{field}"
+                    )
+        if (
+            append_route_diagnostic.get("status")
+            == "blocked_route_action_scope"
+            and "dispatch route_token_ref is not append scoped" not in errors
+        ):
+            errors.append("dispatch route_token_ref is not append scoped")
 
     if errors:
         return effective, list(dict.fromkeys(errors))

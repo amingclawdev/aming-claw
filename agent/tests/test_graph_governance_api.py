@@ -6054,7 +6054,10 @@ def _enter_verified_batch_child_for_allocation_precheck(
         backlog_id=child_backlog_id,
         contract_execution_id=child_execution_id,
         route_token_ref=allocation_route_ref,
-        allowed_actions=["parallel_branch_allocate"],
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
     )
     conn.commit()
     return (
@@ -14403,7 +14406,10 @@ def test_parallel_branch_allocate_rejects_explicit_ref_identity_conflict_before_
         backlog_id="AC-ALLOCATE-REF-ONLY",
         contract_execution_id=contract_execution_id,
         route_token_ref=route_token_ref,
-        allowed_actions=["parallel_branch_allocate"],
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
     )
     body = _ref_only_parallel_allocate_body(
         tmp_path,
@@ -14411,14 +14417,33 @@ def test_parallel_branch_allocate_rejects_explicit_ref_identity_conflict_before_
         contract_execution_id=contract_execution_id,
         route_token_ref=route_token_ref,
     )
+    body["route_identity"] = {
+        "route_id": f"route-{route_token_ref}",
+        "route_context_hash": _fake_sha(f"{route_token_ref}:context"),
+        "prompt_contract_id": f"prompt-{route_token_ref}",
+        "prompt_contract_hash": _fake_sha(f"{route_token_ref}:prompt"),
+        "visible_injection_manifest_hash": _fake_sha(
+            f"{route_token_ref}:manifest"
+        ),
+        "route_token_ref": route_token_ref,
+    }
     body["prompt_contract_hash"] = _fake_sha("explicit-conflict")
+    before_total_changes = conn.total_changes
 
     with pytest.raises(GovernanceError) as rejected:
         server.handle_graph_governance_parallel_branch_allocate(
             _ctx({"project_id": PID}, method="POST", body=body)
         )
 
-    assert rejected.value.code == "parallel_branch_allocate_route_identity_conflict"
+    assert rejected.value.code == (
+        "parallel_branch_allocate_route_action_scope_invalid"
+    )
+    assert rejected.value.details["field"] == (
+        "child_route_identity.prompt_contract_hash"
+    )
+    assert rejected.value.details["public_safe"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_total_changes
     assert get_branch_context(conn, PID, body["task_id"]) is None
 
 
@@ -14432,7 +14457,10 @@ def test_parallel_branch_allocate_rejects_contract_scope_mismatch_before_write(
         backlog_id="AC-ALLOCATE-REF-ONLY",
         contract_execution_id="cex-other-contract",
         route_token_ref=route_token_ref,
-        allowed_actions=["parallel_branch_allocate"],
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
     )
     body = _ref_only_parallel_allocate_body(
         tmp_path,
@@ -14440,13 +14468,63 @@ def test_parallel_branch_allocate_rejects_contract_scope_mismatch_before_write(
         contract_execution_id="cex-request-contract",
         route_token_ref=route_token_ref,
     )
+    before_total_changes = conn.total_changes
 
     with pytest.raises(GovernanceError) as rejected:
         server.handle_graph_governance_parallel_branch_allocate(
             _ctx({"project_id": PID}, method="POST", body=body)
         )
 
-    assert rejected.value.code == "parallel_branch_allocate_route_token_ref_invalid"
+    assert rejected.value.code == (
+        "parallel_branch_allocate_route_action_scope_invalid"
+    )
+    assert rejected.value.details["field"] == "scope.task_id"
+    assert rejected.value.details["expected"] == "cex-request-contract"
+    assert rejected.value.details["actual"] == "cex-other-contract"
+    assert rejected.value.details["public_safe"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_total_changes
+    assert get_branch_context(conn, PID, body["task_id"]) is None
+
+
+def test_parallel_branch_allocate_rejects_cross_backlog_ref_before_write(
+    conn,
+    tmp_path,
+):
+    contract_execution_id = "cex-allocate-cross-backlog"
+    route_token_ref = "rtok-allocate-cross-backlog"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id="AC-ALLOCATE-OTHER-BACKLOG",
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+    )
+    body = _ref_only_parallel_allocate_body(
+        tmp_path,
+        task_id="allocate-cross-backlog-worker",
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+    )
+    before_total_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_route_action_scope_invalid"
+    )
+    assert rejected.value.details["field"] == "scope.backlog_id"
+    assert rejected.value.details["expected"] == "AC-ALLOCATE-REF-ONLY"
+    assert rejected.value.details["actual"] == "AC-ALLOCATE-OTHER-BACKLOG"
+    assert rejected.value.details["public_safe"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_total_changes
     assert get_branch_context(conn, PID, body["task_id"]) is None
 
 
@@ -14503,7 +14581,7 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
             conn,
             backlog_id=backlog_id,
             contract_execution_id=contract_execution_id,
-            route_token_ref=f"rtok-allocate-precheck-{suffix}",
+            route_token_ref=f"rtok-allocate-precheck-nonappend-{suffix}",
             allowed_actions=["parallel_branch_allocate"],
         )
     conn.commit()
@@ -14520,6 +14598,101 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
     }
     before_total_changes = conn.total_changes
     external_root = tmp_path / "legacy-external-world"
+    with pytest.raises(GovernanceError) as nonappend_rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "lanes": [
+                        {
+                            "task_id": f"allocate-precheck-worker-{suffix}",
+                            "backlog_id": backlog_id,
+                            "contract_execution_id": contract_execution_id,
+                            "worker_id": f"slot-{suffix}",
+                            "route_token_ref": (
+                                f"rtok-allocate-precheck-nonappend-{suffix}"
+                            ),
+                            "owned_files": [row_file],
+                        }
+                        for suffix, row_file in zip(("a", "b"), row_files)
+                    ],
+                },
+            )
+        )
+    assert nonappend_rejected.value.code == (
+        "parallel_branch_allocate_precheck_route_action_scope_invalid"
+    )
+    assert nonappend_rejected.value.details["field"] == "allowed_actions"
+    assert nonappend_rejected.value.details["expected"] == (
+        "task_timeline_append"
+    )
+    assert nonappend_rejected.value.details["actual"] == [
+        "parallel_branch_allocate"
+    ]
+    assert nonappend_rejected.value.details["lane_diagnostics"][0][
+        "writes_performed"
+    ] is False
+    assert nonappend_rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_total_changes
+
+    with pytest.raises(GovernanceError) as nonappend_allocate_rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": "allocate-precheck-worker-a",
+                    "backlog_id": backlog_id,
+                    "contract_execution_id": contract_execution_id,
+                    "worker_id": "slot-a",
+                    "route_token_ref": (
+                        "rtok-allocate-precheck-nonappend-a"
+                    ),
+                    "owned_files": [row_files[0]],
+                    "workspace_root": str(repository_root),
+                    "target_project_root": str(repository_root),
+                    "worktree_path": str(
+                        repository_root / ".worktrees" / "nonappend-a"
+                    ),
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "merge_queue_id": "mq-nonappend-a",
+                    "create_worktree": False,
+                },
+            )
+        )
+    assert nonappend_allocate_rejected.value.code == (
+        "parallel_branch_allocate_route_action_scope_invalid"
+    )
+    assert nonappend_allocate_rejected.value.details["field"] == (
+        "allowed_actions"
+    )
+    assert nonappend_allocate_rejected.value.details["expected"] == (
+        "task_timeline_append"
+    )
+    assert nonappend_allocate_rejected.value.details["actual"] == [
+        "parallel_branch_allocate"
+    ]
+    assert nonappend_allocate_rejected.value.details["public_safe"] is True
+    assert nonappend_allocate_rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_total_changes
+
+    for suffix in ("a", "b"):
+        _persist_contract_runtime_observer_route_ref(
+            conn,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            route_token_ref=f"rtok-allocate-precheck-{suffix}",
+            allowed_actions=[
+                "parallel_branch_allocate",
+                "task_timeline_append",
+            ],
+        )
+    conn.commit()
+    before_total_changes = conn.total_changes
     response = server.handle_graph_governance_parallel_branch_allocate_precheck(
         _ctx(
             {"project_id": PID},
@@ -14894,10 +15067,16 @@ def test_batch_child_allocation_rejects_worker_branch_as_target_before_write(
                 },
             )
         )
-    assert wrong_route_rejected.value.code in {
-        "parallel_branch_allocate_route_token_ref_invalid",
-        "parallel_branch_allocate_route_token_ref_unknown",
-    }
+    assert wrong_route_rejected.value.code == (
+        "parallel_branch_allocate_route_action_scope_invalid"
+    )
+    assert wrong_route_rejected.value.details["field"] == "route_token_ref"
+    assert wrong_route_rejected.value.details["expected"] == (
+        "server_registered_append_scoped_child_ref"
+    )
+    assert wrong_route_rejected.value.details["actual"] == "unresolved"
+    assert wrong_route_rejected.value.details["public_safe"] is True
+    assert wrong_route_rejected.value.details["writes_performed"] is False
     assert "target_ref" not in wrong_route_rejected.value.details
     assert "expected_source" not in wrong_route_rejected.value.details
     assert {
@@ -15283,7 +15462,10 @@ def test_legacy_revised_batch_child_two_worker_allocation_fails_closed(
         backlog_id=backlog_id,
         contract_execution_id=contract_execution_id,
         route_token_ref=second_route_ref,
-        allowed_actions=["parallel_branch_allocate"],
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
     )
     store = server._contract_runtime(conn).store
     record = store.get(contract_execution_id)
@@ -15446,7 +15628,10 @@ def test_parallel_branch_allocate_precheck_rejects_standalone_single_lane_spoof(
         backlog_id=backlog_id,
         contract_execution_id=contract_execution_id,
         route_token_ref=route_token_ref,
-        allowed_actions=["parallel_branch_allocate"],
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
     )
     conn.commit()
     before_total_changes = conn.total_changes
@@ -15582,7 +15767,10 @@ def test_parallel_branch_allocate_precheck_rejects_cross_child_union_with_remedi
             backlog_id=backlog_id,
             contract_execution_id=execution_id,
             route_token_ref=route_ref,
-            allowed_actions=["parallel_branch_allocate"],
+            allowed_actions=[
+                "parallel_branch_allocate",
+                "task_timeline_append",
+            ],
         )
         lanes.append(
             {
@@ -15678,7 +15866,10 @@ def test_parallel_branch_allocate_precheck_fails_atomic_input_before_writes(
         backlog_id=backlog_id,
         contract_execution_id=contract_execution_id,
         route_token_ref="rtok-allocate-precheck-duplicate",
-        allowed_actions=["parallel_branch_allocate"],
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
     )
     conn.commit()
     before = conn.execute(
@@ -15765,14 +15956,20 @@ def test_parallel_branch_allocate_precheck_rejects_child_route_from_other_contra
         backlog_id=backlog_id,
         contract_execution_id=requested_execution_id,
         route_token_ref="rtok-allocate-precheck-route-a",
-        allowed_actions=["parallel_branch_allocate"],
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
     )
     _persist_contract_runtime_observer_route_ref(
         conn,
         backlog_id=backlog_id,
         contract_execution_id="cex-allocate-precheck-other",
         route_token_ref="rtok-allocate-precheck-route-b",
-        allowed_actions=["parallel_branch_allocate"],
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
     )
     conn.commit()
     before_total_changes = conn.total_changes
@@ -15810,8 +16007,15 @@ def test_parallel_branch_allocate_precheck_rejects_child_route_from_other_contra
             )
         )
 
-    assert rejected.value.code == "parallel_branch_allocate_route_token_ref_invalid"
-    assert rejected.value.details["contract_execution_id"] == requested_execution_id
+    assert rejected.value.code == (
+        "parallel_branch_allocate_precheck_route_action_scope_invalid"
+    )
+    assert rejected.value.details["field"] == "scope.task_id"
+    assert rejected.value.details["expected"] == requested_execution_id
+    assert rejected.value.details["actual"] == (
+        "cex-allocate-precheck-other"
+    )
+    assert rejected.value.details["writes_performed"] is False
     assert conn.total_changes == before_total_changes
     assert not (repository_root / ".worktrees").exists()
 
@@ -15889,13 +16093,22 @@ def test_parallel_branch_allocate_rejects_ref_without_allocation_action_before_w
         contract_execution_id=contract_execution_id,
         route_token_ref=route_token_ref,
     )
+    before_total_changes = conn.total_changes
 
     with pytest.raises(GovernanceError) as rejected:
         server.handle_graph_governance_parallel_branch_allocate(
             _ctx({"project_id": PID}, method="POST", body=body)
         )
 
-    assert rejected.value.code == "parallel_branch_allocate_route_action_not_allowed"
+    assert rejected.value.code == (
+        "parallel_branch_allocate_route_action_scope_invalid"
+    )
+    assert rejected.value.details["field"] == "allowed_actions"
+    assert rejected.value.details["expected"] == "parallel_branch_allocate"
+    assert rejected.value.details["actual"] == ["task_timeline_append"]
+    assert rejected.value.details["public_safe"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_total_changes
     assert get_branch_context(conn, PID, body["task_id"]) is None
 
 
@@ -15921,13 +16134,24 @@ def test_parallel_branch_allocate_rejects_complete_identity_with_unknown_ref_bef
             ),
         }
     )
+    before_total_changes = conn.total_changes
 
     with pytest.raises(GovernanceError) as rejected:
         server.handle_graph_governance_parallel_branch_allocate(
             _ctx({"project_id": PID}, method="POST", body=body)
         )
 
-    assert rejected.value.code == "parallel_branch_allocate_route_token_ref_unknown"
+    assert rejected.value.code == (
+        "parallel_branch_allocate_route_action_scope_invalid"
+    )
+    assert rejected.value.details["field"] == "route_token_ref"
+    assert rejected.value.details["expected"] == (
+        "server_registered_append_scoped_child_ref"
+    )
+    assert rejected.value.details["actual"] == "unresolved"
+    assert rejected.value.details["public_safe"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_total_changes
     assert get_branch_context(conn, PID, body["task_id"]) is None
 
 
@@ -15964,7 +16188,10 @@ def test_parallel_branch_allocate_rejects_coordinator_route_ref_before_write(
         backlog_id="AC-ALLOCATE-REF-ONLY",
         contract_execution_id=contract_execution_id,
         route_token_ref=route_token_ref,
-        allowed_actions=["parallel_branch_allocate"],
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
         caller_role="coordinator",
     )
     body = _ref_only_parallel_allocate_body(
@@ -15973,13 +16200,22 @@ def test_parallel_branch_allocate_rejects_coordinator_route_ref_before_write(
         contract_execution_id=contract_execution_id,
         route_token_ref=route_token_ref,
     )
+    before_total_changes = conn.total_changes
 
     with pytest.raises(GovernanceError) as rejected:
         server.handle_graph_governance_parallel_branch_allocate(
             _ctx({"project_id": PID}, method="POST", body=body)
         )
 
-    assert rejected.value.code == "parallel_branch_allocate_route_role_mismatch"
+    assert rejected.value.code == (
+        "parallel_branch_allocate_route_action_scope_invalid"
+    )
+    assert rejected.value.details["field"] == "caller_role"
+    assert rejected.value.details["expected"] == "observer"
+    assert rejected.value.details["actual"] == "coordinator"
+    assert rejected.value.details["public_safe"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_total_changes
     assert get_branch_context(conn, PID, body["task_id"]) is None
 
 
@@ -75214,6 +75450,61 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
         ] is True
         assert lane_closure["full_row_file_union_required_per_lane"] is False
         allocations.append(allocated)
+
+    conn.execute(
+        """
+        UPDATE observer_route_token_refs
+           SET allowed_actions_json = ?
+         WHERE project_id = ? AND route_token_ref = ?
+        """,
+        (
+            json.dumps(["parallel_branch_allocate"]),
+            PID,
+            lanes[0]["route_token_ref"],
+        ),
+    )
+    conn.commit()
+    blocked_projection = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="GET",
+        )
+    )
+    blocked_guide = blocked_projection["runtime_guide"]
+    assert blocked_guide["dispatch_copy_safe_projection"]["status"] == (
+        "blocked_route_action_scope"
+    )
+    assert blocked_guide["dispatch_copy_safe_projection"][
+        "copy_safe_body_available"
+    ] is False
+    assert blocked_guide["next_legal_action"][
+        "copy_safe_dispatch_ready"
+    ] is False
+    for surface in (
+        blocked_guide,
+        blocked_guide["next_legal_action"],
+        blocked_projection["next_legal_action"],
+    ):
+        assert "writer_role_safe_copy_payload" not in surface
+        assert "parallel_branch_allocate_submission" not in surface
+        assert "copy_safe_dispatch_payload" not in surface
+
+    conn.execute(
+        """
+        UPDATE observer_route_token_refs
+           SET allowed_actions_json = ?
+         WHERE project_id = ? AND route_token_ref = ?
+        """,
+        (
+            json.dumps(
+                ["parallel_branch_allocate", "task_timeline_append"]
+            ),
+            PID,
+            lanes[0]["route_token_ref"],
+        ),
+    )
+    conn.commit()
 
     current = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
