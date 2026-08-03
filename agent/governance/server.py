@@ -76596,22 +76596,114 @@ def _contract_runtime_projection_timeline_scope_matches(
     return False
 
 
+def _contract_runtime_declared_timeline_actor_role(
+    event: Mapping[str, Any],
+) -> str:
+    """Return only an explicit or server-validated timeline role.
+
+    ``actor`` is an opaque principal/session identity.  In particular, a
+    Desktop task path can contain ``observer``, ``qa``, or ``worker`` without
+    declaring any of those roles.  Timeline insertion already persists the
+    meta-contract's validated role, so legacy rows without a top-level
+    ``actor_role`` remain readable without falling back to lexical inference.
+    """
+
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    verification = (
+        event.get("verification")
+        if isinstance(event.get("verification"), Mapping)
+        else {}
+    )
+    validated_gates: list[Mapping[str, Any]] = []
+    meta_gate = payload.get("meta_contract_gate")
+    if isinstance(meta_gate, Mapping):
+        validated_gates.append(meta_gate)
+    contract_gate = payload.get("contract_gate_decision")
+    if isinstance(contract_gate, Mapping):
+        contract_meta_gate = contract_gate.get("meta_contract_gate")
+        if isinstance(contract_meta_gate, Mapping):
+            validated_gates.append(contract_meta_gate)
+        imported_checks = contract_gate.get("imported_legacy_checks")
+        if isinstance(imported_checks, list):
+            for check in imported_checks:
+                if not isinstance(check, Mapping):
+                    continue
+                evidence = check.get("evidence")
+                if not isinstance(evidence, Mapping):
+                    continue
+                imported_meta_gate = evidence.get("meta_contract_gate")
+                if isinstance(imported_meta_gate, Mapping):
+                    validated_gates.append(imported_meta_gate)
+    def consumer_role(value: Any) -> str:
+        role = str(value or "").strip().lower()
+        aliases = {
+            "observer": "observer",
+            "codex_observer": "observer",
+            "mf_observer": "observer",
+            "route_observer": "observer",
+            "coordinator": "observer",
+            "observer_coordinator": "observer",
+            "operator": "observer",
+            "api": "observer",
+            "qa": "qa",
+            "mf_qa": "qa",
+            "qa_reviewer": "qa",
+            "qa_verifier": "qa",
+            "independent_verifier": "qa",
+            "independent_reviewer": "qa",
+            "independent_qa": "qa",
+            "codex_qa_verifier": "qa",
+            "mf_sub": "mf_sub",
+            "worker": "mf_sub",
+            "implementation_worker": "mf_sub",
+            "bounded_implementation_worker": "mf_sub",
+            "bounded_worker": "mf_sub",
+        }
+        return aliases.get(role, "")
+
+    if validated_gates:
+        if any(
+            gate.get("allowed") is not True
+            or str(gate.get("status") or "").strip().lower() != "passed"
+            for gate in validated_gates
+        ):
+            return ""
+        normalized_gate_roles = [
+            consumer_role(gate.get("role")) for gate in validated_gates
+        ]
+        if any(not role for role in normalized_gate_roles):
+            return ""
+        gate_roles = set(normalized_gate_roles)
+        # A persisted validation gate is canonical.  Rejected, missing-role,
+        # or conflicting gates fail closed instead of allowing raw role fields
+        # in the same event to override the server verdict.
+        return next(iter(gate_roles)) if len(gate_roles) == 1 else ""
+
+    # Gate-less legacy events may still carry an explicit role declaration.
+    # This compatibility path never reads the opaque ``actor`` principal.
+    for value in (
+        event.get("actor_role"),
+        payload.get("actor_role"),
+        payload.get("worker_role"),
+        payload.get("reviewer_role"),
+        payload.get("verifier_role"),
+        payload.get("qa_role"),
+        verification.get("actor_role"),
+        verification.get("worker_role"),
+        verification.get("reviewer_role"),
+        verification.get("verifier_role"),
+        verification.get("qa_role"),
+    ):
+        role = consumer_role(value)
+        if role:
+            return role
+    return ""
+
+
 def _contract_runtime_projection_timeline_actor_role(
     event: Mapping[str, Any],
 ) -> str:
-    role = str(event.get("actor_role") or "").strip().lower()
-    if role in {"observer", "qa", "mf_sub"}:
-        return role
-    actor = str(event.get("actor") or "").strip().lower()
-    if "mf_sub" in actor:
-        return "mf_sub"
-    if "qa" in actor:
-        return "qa"
-    if "observer" in actor or "operator" in actor:
-        return "observer"
-    if "worker" in actor:
-        return "mf_sub"
-    return ""
+    return _contract_runtime_declared_timeline_actor_role(event)
 
 
 def _contract_runtime_projected_post_worker_line(
@@ -106109,30 +106201,7 @@ def _contract_runtime_close_authority_overlap_component_memberships(
 def _contract_runtime_close_authority_timeline_actor_role(
     event: Mapping[str, Any],
 ) -> str:
-    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
-    verification = (
-        event.get("verification")
-        if isinstance(event.get("verification"), Mapping)
-        else {}
-    )
-    for value in (
-        event.get("actor_role"),
-        payload.get("actor_role"),
-        payload.get("worker_role"),
-        verification.get("actor_role"),
-        verification.get("worker_role"),
-    ):
-        role = str(value or "").strip().lower()
-        if role in {"observer", "qa", "mf_sub"}:
-            return role
-    actor = str(event.get("actor") or "").strip().lower()
-    if "mf_sub" in actor or "worker" in actor:
-        return "mf_sub"
-    if "qa" in actor:
-        return "qa"
-    if "observer" in actor or "operator" in actor:
-        return "observer"
-    return ""
+    return _contract_runtime_declared_timeline_actor_role(event)
 
 
 def _contract_runtime_close_authority_timeline_line(

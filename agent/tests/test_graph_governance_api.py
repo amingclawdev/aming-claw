@@ -109813,3 +109813,116 @@ def test_finish_attestation_facade_does_not_persist_explicit_alias_conflict(
         event_kind="worker_progress",
     ) == []
     assert conflict["id"] > evidence_events["implementation"]
+
+
+def test_contract_runtime_actor_role_requires_declared_role_fields():
+    opaque_actor = {
+        "actor": (
+            "/root/dp_parallel_724_fresh_observer/"
+            "dp724_qa_worker"
+        )
+    }
+    assert server._contract_runtime_projection_timeline_actor_role(
+        opaque_actor
+    ) == ""
+    assert server._contract_runtime_close_authority_timeline_actor_role(
+        opaque_actor
+    ) == ""
+
+    assert server._contract_runtime_projection_timeline_actor_role(
+        {**opaque_actor, "actor_role": "qa"}
+    ) == "qa"
+    assert server._contract_runtime_close_authority_timeline_actor_role(
+        {**opaque_actor, "payload": {"worker_role": "mf_sub"}}
+    ) == "mf_sub"
+
+    validated_qa = {
+        **opaque_actor,
+        "payload": {
+            "meta_contract_gate": {
+                "allowed": True,
+                "status": "passed",
+                "role": "qa",
+            }
+        },
+    }
+    assert server._contract_runtime_projection_timeline_actor_role(
+        validated_qa
+    ) == "qa"
+    assert server._contract_runtime_close_authority_timeline_actor_role(
+        validated_qa
+    ) == "qa"
+    assert server._contract_runtime_projection_timeline_actor_role(
+        {
+            **opaque_actor,
+            "payload": {
+                "reviewer_role": "qa",
+                "meta_contract_gate": {
+                    "allowed": False,
+                    "status": "compatibility_rejected",
+                    "role": "qa",
+                }
+            },
+        }
+    ) == ""
+    conflicting_qa_claim = {
+        **opaque_actor,
+        "payload": {
+            "reviewer_role": "qa",
+            "meta_contract_gate": {
+                "allowed": True,
+                "status": "passed",
+                "role": "observer",
+            },
+        },
+    }
+    assert server._contract_runtime_projection_timeline_actor_role(
+        conflicting_qa_claim
+    ) == "observer"
+    assert server._contract_runtime_close_authority_timeline_actor_role(
+        conflicting_qa_claim
+    ) == "observer"
+
+    validated_operator = {
+        **opaque_actor,
+        "payload": {
+            "meta_contract_gate": {
+                "allowed": True,
+                "status": "passed",
+                "role": "operator",
+            }
+        },
+    }
+    assert server._contract_runtime_projection_timeline_actor_role(
+        validated_operator
+    ) == "observer"
+    assert server._contract_runtime_close_authority_timeline_actor_role(
+        validated_operator
+    ) == "observer"
+
+    assert server._contract_runtime_projection_timeline_actor_role(
+        {**opaque_actor, "payload": {"reviewer_role": "independent_qa"}}
+    ) == "qa"
+    assert server._contract_runtime_close_authority_timeline_actor_role(
+        {**opaque_actor, "payload": {"worker_role": "worker"}}
+    ) == "mf_sub"
+
+    assert server._contract_runtime_projection_timeline_actor_role(
+        {
+            **opaque_actor,
+            "payload": {
+                "meta_contract_gate": {
+                    "allowed": True,
+                    "status": "passed",
+                    "role": "observer",
+                },
+                "contract_gate_decision": {
+                    "meta_contract_gate": {
+                        "allowed": True,
+                        "status": "passed",
+                        "role": "unknown",
+                    }
+                },
+            },
+        }
+    ) == ""

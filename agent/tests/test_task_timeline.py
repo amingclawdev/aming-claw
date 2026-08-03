@@ -7980,6 +7980,77 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(transported[0]["reviewer_identity"], reviewer_id)
         self.assertEqual(transported[0]["resolved_qa_verdict_refs"], ["evt-123"])
 
+    def test_observer_transport_cannot_relay_rejected_qa_target_gate(self):
+        from agent.governance import task_timeline
+
+        qa_target = {
+            "id": 1,
+            "event_kind": "qa_review",
+            "phase": "verification",
+            "actor": "qa-lane-reviewer",
+            "status": "passed",
+            "payload": {
+                "reviewer_role": "qa",
+                "meta_contract_gate": {
+                    "allowed": False,
+                    "status": "compatibility_rejected",
+                    "role": "qa",
+                    "action": "qa_review",
+                },
+            },
+        }
+        transport = {
+            "id": 2,
+            "event_kind": "qa_verification",
+            "phase": "verification",
+            "actor": "observer-on-behalf-of:qa-lane-reviewer",
+            "status": "passed",
+            "payload": {
+                "reviewer": "qa-lane-reviewer",
+                "reviewer_role": "qa",
+                "qa_verdict_refs": ["timeline:1"],
+                "meta_contract_gate": {
+                    "allowed": True,
+                    "status": "passed",
+                    "role": "observer",
+                    "action": "qa_verification",
+                },
+            },
+        }
+
+        result = task_timeline._independent_qa_gate(
+            [qa_target, transport],
+            {"requirements": {"independent_qa": True}},
+        )
+
+        self.assertFalse(result["passed"], result)
+        self.assertTrue(
+            any(
+                item.get("reason") == "qa_verdict_ref_target_gate_rejected"
+                for item in result["rejected_evidence_events"]
+            ),
+            result,
+        )
+
+        qa_target["payload"]["meta_contract_gate"] = {
+            "allowed": True,
+            "status": "passed",
+            "role": "observer",
+            "action": "observer_command",
+        }
+        non_qa_result = task_timeline._independent_qa_gate(
+            [qa_target, transport],
+            {"requirements": {"independent_qa": True}},
+        )
+        self.assertFalse(non_qa_result["passed"], non_qa_result)
+        self.assertTrue(
+            any(
+                item.get("reason") == "qa_verdict_ref_target_gate_rejected"
+                for item in non_qa_result["rejected_evidence_events"]
+            ),
+            non_qa_result,
+        )
+
     def test_payload_reviewer_with_same_timeline_verdict_ref_counts(self):
         """Observer transport with payload.reviewer still needs a QA verdict ref."""
         from agent.governance import task_timeline
@@ -8032,6 +8103,162 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertTrue(result["passed"], result)
         self.assertEqual(len(result["evidence_events"]), 1)
         self.assertEqual(result["evidence_events"][0]["reviewer_identity"], "qa-lane-reviewer")
+
+    def test_independent_qa_does_not_infer_event_kind_from_opaque_actor(self):
+        from agent.governance import task_timeline
+
+        event = {
+            "event_kind": "verification",
+            "phase": "verification",
+            "actor": "/root/task_not_qa_but_name_contains_qa",
+            "status": "passed",
+        }
+        result = task_timeline._independent_qa_gate(
+            [event],
+            {"requirements": {"independent_qa": True}},
+        )
+
+        self.assertFalse(result["passed"], result)
+        self.assertEqual(result["evidence_events"], [])
+
+    def test_independent_qa_accepts_declared_reviewer_role(self):
+        from agent.governance import task_timeline
+
+        event = {
+            "event_kind": "verification",
+            "phase": "verification",
+            "actor": "/root/external-review-session",
+            "status": "passed",
+            "payload": {"reviewer_role": "qa"},
+        }
+        result = task_timeline._independent_qa_gate(
+            [event],
+            {"requirements": {"independent_qa": True}},
+        )
+
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(len(result["evidence_events"]), 1)
+
+    def test_independent_qa_uses_passed_canonical_meta_gate_role(self):
+        from agent.governance import task_timeline
+
+        event = {
+            "event_kind": "qa_verification",
+            "phase": "qa_verification",
+            "actor": "/root/opaque-desktop-session",
+            "status": "passed",
+            "payload": {
+                "reviewer_role": "qa",
+                "meta_contract_gate": {
+                    "allowed": True,
+                    "status": "passed",
+                    "role": "qa",
+                    "action": "qa_verification",
+                }
+            },
+        }
+        result = task_timeline._independent_qa_gate(
+            [event],
+            {"requirements": {"independent_qa": True}},
+        )
+
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(len(result["evidence_events"]), 1)
+
+    def test_independent_qa_rejected_meta_gate_overrides_raw_qa_claim(self):
+        from agent.governance import task_timeline
+
+        event = {
+            "event_kind": "qa_verification",
+            "phase": "qa_verification",
+            "actor": "/root/opaque-desktop-session",
+            "status": "passed",
+            "payload": {
+                "reviewer_role": "qa",
+                "meta_contract_gate": {
+                    "allowed": False,
+                    "status": "compatibility_rejected",
+                    "role": "qa",
+                    "action": "qa_verification",
+                },
+            },
+        }
+        result = task_timeline._independent_qa_gate(
+            [event],
+            {"requirements": {"independent_qa": True}},
+        )
+
+        self.assertFalse(result["passed"], result)
+        self.assertEqual(result["evidence_events"], [])
+
+    def test_independent_qa_observer_gate_overrides_raw_qa_markers(self):
+        from agent.governance import task_timeline
+
+        event = {
+            "event_kind": "qa_verification",
+            "phase": "qa_verification",
+            "actor": "/root/opaque-desktop-session",
+            "status": "passed",
+            "payload": {
+                "reviewer_role": "qa",
+                "meta_contract_gate": {
+                    "allowed": True,
+                    "status": "passed",
+                    "role": "observer",
+                    "action": "observer_command",
+                },
+            },
+        }
+        result = task_timeline._independent_qa_gate(
+            [event],
+            {"requirements": {"independent_qa": True}},
+        )
+
+        self.assertFalse(result["passed"], result)
+        self.assertEqual(result["evidence_events"], [])
+
+    def test_independent_qa_ignores_nested_caller_meta_gate_claim(self):
+        from agent.governance import task_timeline
+
+        event = {
+            "event_kind": "verification",
+            "phase": "verification",
+            "actor": "/root/opaque-desktop-session",
+            "status": "passed",
+            "payload": {
+                "evidence": {
+                    "meta_contract_gate": {
+                        "allowed": True,
+                        "status": "passed",
+                        "role": "qa",
+                        "action": "qa_verification",
+                    }
+                }
+            },
+        }
+        result = task_timeline._independent_qa_gate(
+            [event],
+            {"requirements": {"independent_qa": True}},
+        )
+
+        self.assertFalse(result["passed"], result)
+        self.assertEqual(result["evidence_events"], [])
+
+    def test_event_marker_ignores_opaque_actor_text(self):
+        from agent.governance import task_timeline
+
+        marker = task_timeline._event_marker(
+            {
+                "event_type": "observation",
+                "phase": "implementation",
+                "actor": "/root/qa_read_receipt_worker",
+                "status": "passed",
+            }
+        )
+
+        self.assertNotIn("qa", marker)
+        self.assertNotIn("read_receipt", marker)
+        self.assertNotIn("worker", marker)
 
     def test_direct_independent_qa_mixed_row_list_still_counts(self):
         """Direct independent QA is not rejected just because rows are mixed."""

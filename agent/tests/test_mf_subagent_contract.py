@@ -1350,6 +1350,30 @@ def test_meta_contract_trusted_worker_proof_precedes_opaque_qa_suffix() -> None:
     assert gate["action"] == "mf_subagent_startup"
 
 
+def test_meta_contract_uses_declared_worker_role_not_opaque_observer_path() -> None:
+    gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "mf_subagent.startup",
+            "event_kind": "mf_subagent_startup",
+            "actor": (
+                "/root/dp_parallel_724_fresh_observer/"
+                "dp724_focus_worker"
+            ),
+            "status": "passed",
+            "payload": {
+                "worker_role": "mf_sub",
+                "worker_id": "dp724-focus-worker",
+                "agent_id": "dp724-focus-worker",
+                "runtime_context_id": "mfrctx-focus-worker",
+            },
+        }
+    )
+
+    assert gate["allowed"] is True
+    assert gate["role"] == MF_SUB_ROLE
+    assert gate["action"] == "mf_subagent_startup"
+
+
 def test_meta_contract_trusted_worker_proof_does_not_relabel_explicit_qa() -> None:
     with pytest.raises(
         MfSubagentContractError,

@@ -508,6 +508,7 @@ _ROUTE_TOKEN_REQUIRED_FIELDS = (
 _META_CONTRACT_TEMPLATE = "meta_contract.v1.json"
 _META_ROLE_ALIASES = {
     "observer": OBSERVER_COORDINATOR_ROLE,
+    "codex_observer": OBSERVER_COORDINATOR_ROLE,
     "mf_observer": OBSERVER_COORDINATOR_ROLE,
     "route_observer": OBSERVER_COORDINATOR_ROLE,
     "coordinator": OBSERVER_COORDINATOR_ROLE,
@@ -523,6 +524,7 @@ _META_ROLE_ALIASES = {
     "watchdog": "system",
     "observer_command_watchdog": "system",
     "mf_sub": MF_SUB_ROLE,
+    "mf_qa": "qa",
     "worker": MF_SUB_ROLE,
     "implementation_worker": MF_SUB_ROLE,
     "bounded_implementation_worker": MF_SUB_ROLE,
@@ -532,6 +534,8 @@ _META_ROLE_ALIASES = {
     "qa_verifier": "qa",
     "independent_verifier": "qa",
     "independent_reviewer": "qa",
+    "independent_qa": "qa",
+    "codex_qa_verifier": "qa",
     "operator": "operator",
     "api": "operator",
 }
@@ -5744,30 +5748,34 @@ def _meta_normalize_role(value: Any) -> str:
         return ""
     if role in _META_ROLE_ALIASES:
         return _META_ROLE_ALIASES[role]
-    if any(token in role for token in _META_SYSTEM_ROLE_TOKENS):
+
+    def declared_role(token: str) -> bool:
+        return bool(
+            role == token
+            or role.startswith(f"{token}_")
+            or role.startswith(f"{token}:")
+            or role.startswith(f"{token}/")
+        )
+
+    # Role values and explicit role-qualified principals are declarations.
+    # Arbitrary host/session identities are opaque: a task path containing
+    # ``observer``, ``qa``, or ``worker`` must not acquire that role.
+    if any(declared_role(token) for token in _META_SYSTEM_ROLE_TOKENS):
         return "system"
-    if any(token in role for token in _META_JUDGE_ROLE_TOKENS):
+    if any(declared_role(token) for token in _META_JUDGE_ROLE_TOKENS):
         return "judge"
-    if any(token in role for token in _META_OBSERVER_ROLE_TOKENS):
+    if any(declared_role(token) for token in _META_OBSERVER_ROLE_TOKENS):
         return OBSERVER_COORDINATOR_ROLE
-    explicit_qa_role = any(
-        role == token
-        or role.startswith(f"{token}_")
-        or role.startswith(f"{token}:")
-        or role.startswith(f"{token}/")
-        for token in _META_QA_ROLE_TOKENS
-    )
+    explicit_qa_role = any(declared_role(token) for token in _META_QA_ROLE_TOKENS)
     if explicit_qa_role:
         return "qa"
     # Host-created worker principals can include the name of the repair they
     # are executing (for example ``failed_qa_rejoin``).  A QA token inside
     # that task-derived suffix must not override an explicit subagent/worker
     # identity.  Explicit leading QA/reviewer/verifier roles remain QA above.
-    if any(token in role for token in _META_WORKER_ROLE_TOKENS):
+    if any(declared_role(token) for token in _META_WORKER_ROLE_TOKENS):
         return MF_SUB_ROLE
-    if any(token in role for token in _META_QA_ROLE_TOKENS):
-        return "qa"
-    if "operator" in role:
+    if declared_role("operator"):
         return "operator"
     return role
 

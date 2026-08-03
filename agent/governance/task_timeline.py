@@ -2814,7 +2814,49 @@ def _independent_qa_role_token(value: Any) -> bool:
     )
 
 
-def _independent_qa_reviewer_or_actor_is_qa(event: dict[str, Any]) -> bool:
+def _independent_qa_canonical_meta_gate(
+    event: dict[str, Any],
+) -> tuple[bool, dict[str, str]]:
+    payload = _mapping(event.get("payload"))
+    gates: list[dict[str, Any]] = []
+    meta_gate = _mapping(payload.get("meta_contract_gate"))
+    if meta_gate:
+        gates.append(meta_gate)
+    contract_gate = _mapping(payload.get("contract_gate_decision"))
+    contract_meta_gate = _mapping(contract_gate.get("meta_contract_gate"))
+    if contract_meta_gate:
+        gates.append(contract_meta_gate)
+    imported_checks = contract_gate.get("imported_legacy_checks")
+    if isinstance(imported_checks, list):
+        for check in imported_checks:
+            evidence = _mapping(_mapping(check).get("evidence"))
+            imported_meta_gate = _mapping(evidence.get("meta_contract_gate"))
+            if imported_meta_gate:
+                gates.append(imported_meta_gate)
+    if not gates:
+        return False, {}
+    if any(
+        gate.get("allowed") is not True
+        or _text(gate.get("status") or "").strip().lower() != "passed"
+        for gate in gates
+    ):
+        return True, {}
+    canonical = {
+        (
+            _route_marker(gate.get("role")),
+            _route_marker(gate.get("action")),
+        )
+        for gate in gates
+    }
+    if len(canonical) != 1:
+        return True, {}
+    role, action = next(iter(canonical))
+    if not role or not action:
+        return True, {}
+    return True, {"role": role, "action": action}
+
+
+def _independent_qa_has_explicit_role_declaration(event: dict[str, Any]) -> bool:
     if _independent_qa_role_token(event.get("actor")):
         return True
     if _independent_qa_role_token(_independent_qa_reviewer_identity(event)):
@@ -2828,7 +2870,25 @@ def _independent_qa_reviewer_or_actor_is_qa(event: dict[str, Any]) -> bool:
     return False
 
 
+def _independent_qa_reviewer_or_actor_is_qa(event: dict[str, Any]) -> bool:
+    gate_present, canonical_gate = _independent_qa_canonical_meta_gate(event)
+    if gate_present:
+        return bool(
+            canonical_gate.get("role") == "qa"
+            and _independent_qa_has_explicit_role_declaration(event)
+        )
+    return _independent_qa_has_explicit_role_declaration(event)
+
+
 def _independent_qa_meta_gate_matches(event: dict[str, Any]) -> bool:
+    gate_present, canonical_gate = _independent_qa_canonical_meta_gate(event)
+    if gate_present:
+        return bool(
+            canonical_gate.get("role") == "qa"
+            and canonical_gate.get("action")
+            in {"qa_verification", "independent_verification", "qa_review"}
+            and _independent_qa_has_explicit_role_declaration(event)
+        )
     if not _independent_qa_reviewer_or_actor_is_qa(event):
         return False
     allowed_actions = {"qa_verification", "independent_verification", "qa_review"}
@@ -2929,6 +2989,20 @@ def _independent_qa_same_timeline_scope(
     return True
 
 
+def _independent_qa_canonical_gate_allows_direct_verdict(
+    event: dict[str, Any],
+) -> bool:
+    gate_present, canonical_gate = _independent_qa_canonical_meta_gate(event)
+    if not gate_present:
+        return True
+    return bool(
+        canonical_gate.get("role") == "qa"
+        and canonical_gate.get("action")
+        in {"qa_verification", "independent_verification", "qa_review"}
+        and _independent_qa_has_explicit_role_declaration(event)
+    )
+
+
 def _independent_qa_resolved_verdict_refs(
     event: dict[str, Any],
     events_by_ref: dict[str, dict[str, Any]],
@@ -2946,6 +3020,8 @@ def _independent_qa_resolved_verdict_refs(
             continue
         status = _text(target.get("status") or target.get("decision")).lower()
         if status not in MF_CLOSE_PASS_STATUSES:
+            continue
+        if not _independent_qa_canonical_gate_allows_direct_verdict(target):
             continue
         if not _independent_qa_event_kind_matches(target):
             continue
@@ -2989,6 +3065,12 @@ def _independent_qa_verdict_ref_rejection_reasons(
         status = _text(target.get("status") or target.get("decision")).lower()
         if status not in MF_CLOSE_PASS_STATUSES:
             rejections.append({"verdict_ref": ref, "reason": "qa_verdict_ref_not_passing"})
+            continue
+        if not _independent_qa_canonical_gate_allows_direct_verdict(target):
+            rejections.append({
+                "verdict_ref": ref,
+                "reason": "qa_verdict_ref_target_gate_rejected",
+            })
             continue
         if not _independent_qa_event_kind_matches(target):
             rejections.append({"verdict_ref": ref, "reason": "qa_verdict_ref_not_qa_event"})
@@ -3138,19 +3220,35 @@ def _independent_qa_gate(
         kind_lower = _text(event.get("event_kind")).lower()
         type_lower = _text(event.get("event_type")).lower()
         phase_lower = _text(event.get("phase")).lower()
-        actor_lower = _text(event.get("actor")).lower()
 
         if status not in MF_CLOSE_PASS_STATUSES:
             continue
 
         # Only consider QA/independent-verification event kinds.
-        marker_tokens = {kind_lower, type_lower, phase_lower, actor_lower}
-        if not any(
-            tok
-            for tok in marker_tokens
-            if "qa" in tok or "independent_verification" in tok
-        ):
-            continue
+        marker_tokens = {kind_lower, type_lower, phase_lower}
+        gate_present, canonical_gate = _independent_qa_canonical_meta_gate(event)
+        if gate_present:
+            canonical_direct_qa = bool(
+                canonical_gate.get("role") == "qa"
+                and canonical_gate.get("action")
+                in {"qa_verification", "independent_verification", "qa_review"}
+                and _independent_qa_has_explicit_role_declaration(event)
+            )
+            canonical_observer_transport = bool(
+                canonical_gate.get("role") == "observer"
+                and canonical_gate.get("action")
+                in {"qa_verification", "independent_verification", "qa_review"}
+                and _is_independent_qa_observer_transport(event)
+            )
+            if not canonical_direct_qa and not canonical_observer_transport:
+                continue
+        else:
+            declared_qa_role = _independent_qa_reviewer_or_actor_is_qa(event)
+            if not declared_qa_role and not any(
+                "qa" in token or "independent_verification" in token
+                for token in marker_tokens
+            ):
+                continue
 
         # Derive the effective reviewer identity.
         reviewer_identity = _independent_qa_reviewer_identity(event)
@@ -3389,7 +3487,7 @@ def _event_marker(event: dict[str, Any]) -> str:
     return _normalize_token(
         " ".join(
             str(event.get(key) or "")
-            for key in ("event_type", "event_kind", "phase", "actor", "status")
+            for key in ("event_type", "event_kind", "phase", "status")
         )
     )
 
@@ -10948,6 +11046,12 @@ def _cross_ref_row_scoped_independent_qa(
     if not _independent_qa_event_kind_matches(event):
         return False
     if not _route_event_passed(event):
+        return False
+    # A canonical QA role admits evidence but does not by itself waive child
+    # route lineage checks.  The row-scoped exemption additionally requires a
+    # declared independent reviewer/QA principal; otherwise cross-ref remains
+    # authoritative for opaque or forged child-route events.
+    if not _independent_qa_has_explicit_role_declaration(event):
         return False
     return _cross_ref_same_row_floor(event, anchor)
 
