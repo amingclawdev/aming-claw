@@ -178,8 +178,12 @@ def test_mf_parallel_rev9_preserves_rev8_stage_machine_and_requires_allocation_p
     cardinality_sensitive_text = json.dumps(rev9, ensure_ascii=False)
     assert "both lane merges" not in cardinality_sensitive_text
     assert "two-lane fan-out" not in cardinality_sensitive_text
+    assert "both finished worker lanes" not in cardinality_sensitive_text
+    assert "both line instances" not in cardinality_sensitive_text
     assert "all required lane merges" in cardinality_sensitive_text
     assert "initial required-lane fan-out" in cardinality_sensitive_text
+    assert "every finished worker lane required" in cardinality_sensitive_text
+    assert "every required line instance" in cardinality_sensitive_text
     assert policy["zero_write_surfaces"] == [
         "runtime_context",
         "worktree",

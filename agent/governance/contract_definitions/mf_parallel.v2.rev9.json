@@ -213,13 +213,13 @@
       },
       {
         "stage_id": "observer_lane_merge",
-        "description": "Observer integrates both finished worker lanes through their durable merge queues.",
+        "description": "Observer integrates every finished worker lane required by the effective cardinality policy through that lane's durable merge queue.",
         "lines": [
           {
             "allowed_writer_roles": [
               "observer"
             ],
-            "description": "Observer records one durable merge for each finished worker lane; both line instances must complete before canonical reconcile.",
+            "description": "Observer records one durable merge for each finished worker lane; every required line instance must complete before canonical reconcile.",
             "evidence_kind": "merge",
             "line_id": "observer_merge",
             "owner_role": "observer",
