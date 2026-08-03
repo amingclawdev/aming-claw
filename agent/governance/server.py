@@ -25071,6 +25071,7 @@ def _runtime_context_worker_recovery_details(
         )
         session_token_initial_join_submission: dict[str, Any] = {}
         session_token_rejoin_submission: dict[str, Any] = {}
+        rejoin_contract_execution_id = ""
         pre_lineage_bootstrap_recovery = bool(
             missing_worker_lineage
             and session_token_rejoin_eligibility.get("eligible") is True
@@ -25338,6 +25339,7 @@ def _runtime_context_worker_recovery_details(
             fence_token_hash=fence_token_hash,
             session_token_ref=runtime_context_session_token_ref(context),
             read_receipt_event_ref=str(timeline_refs.get("read_receipt_event_ref") or ""),
+            contract_execution_id=rejoin_contract_execution_id,
             session_token_rejoin_eligibility=(
                 session_token_rejoin_eligibility
             ),
@@ -25351,6 +25353,11 @@ def _runtime_context_worker_recovery_details(
             actionable_payloads["session_token_rejoin_submission"] = (
                 session_token_rejoin_submission
             )
+            session_renewal_hints = actionable_payloads.get(
+                "session_renewal_hints"
+            )
+            if isinstance(session_renewal_hints, dict):
+                session_renewal_hints["rejoin"] = session_token_rejoin_submission
     recovery_actions = [
         {
             "id": recovery_action_id,

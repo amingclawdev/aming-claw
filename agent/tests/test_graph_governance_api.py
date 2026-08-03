@@ -42325,6 +42325,14 @@ def test_runtime_context_pre_lineage_rejoin_guide_projects_same_call_parse_and_b
     expected_body.pop("reason")
     for field, value in expected_body.items():
         assert projected_body[field] == value, field
+    assert projected_body["contract_execution_id"] == (
+        case["parent_task_id"]
+    )
+    renewal_rejoin = details["actionable_payloads"]["session_renewal_hints"][
+        "rejoin"
+    ]
+    assert renewal_rejoin == submission
+    assert renewal_rejoin["copy_safe_body"] == projected_body
     contract = submission["pre_lineage_recovery_contract"]
     assert contract == {
         "schema_version": "runtime_context.pre_lineage_recovery_contract.v1",
