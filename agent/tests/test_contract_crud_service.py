@@ -2186,6 +2186,93 @@ def test_mf_parallel_runtime_binds_worker_lines_to_runtime_context_instances():
             }
         return write
 
+    lane_read_hashes = {}
+    for lane in ("a", "b"):
+        probe = lane_write(
+            record,
+            lane,
+            stage_id="worker_read",
+            line_id="worker_read_runtime_guide",
+            evidence_kind="read_receipt",
+        )
+        _lane_state, lane_guide = runtime.mf_parallel_atomic_lane_gate_view(
+            record,
+            record["runtime_guide"],
+            probe,
+            source_record=record,
+        )
+        lane_read_hashes[lane] = lane_guide["runtime_guide_hash"]
+    assert lane_read_hashes["a"] != lane_read_hashes["b"]
+
+    for invalid_hash, public_actual in (
+        ("sha256:" + "f" * 64, "sha256:" + "f" * 64),
+        (lane_read_hashes["a"], lane_read_hashes["a"]),
+        (
+            {"session_token": "must-not-be-reflected"},
+            "<invalid-runtime-guide-hash>",
+        ),
+        (["must-not-be-reflected"], "<invalid-runtime-guide-hash>"),
+        (None, "<invalid-runtime-guide-hash>"),
+        ("", "<invalid-runtime-guide-hash>"),
+    ):
+        invalid_b_read = lane_write(
+            record,
+            "b",
+            stage_id="worker_read",
+            line_id="worker_read_runtime_guide",
+            evidence_kind="read_receipt",
+        )
+        invalid_b_read["runtime_guide_hash"] = invalid_hash
+        before_invalid_hash = runtime.store.get(
+            "cex-mf-parallel-lane-bound-test"
+        )
+        rejected_invalid_hash = runtime.submit_line_write(
+            "cex-mf-parallel-lane-bound-test",
+            invalid_b_read,
+        )
+        assert rejected_invalid_hash["ok"] is False
+        hash_gate = rejected_invalid_hash["decision"][
+            "imported_legacy_checks"
+        ][0]
+        assert {
+            "field": "runtime_guide_hash",
+            "expected": lane_read_hashes["b"],
+            "actual": public_actual,
+        } in hash_gate["identity_mismatches"]
+        assert any(
+            error.startswith("runtime_guide_hash mismatch:")
+            for error in hash_gate["errors"]
+        )
+        assert "must-not-be-reflected" not in repr(hash_gate)
+        assert runtime.store.get("cex-mf-parallel-lane-bound-test") == (
+            before_invalid_hash
+        )
+
+    missing_hash_b_read = lane_write(
+        record,
+        "b",
+        stage_id="worker_read",
+        line_id="worker_read_runtime_guide",
+        evidence_kind="read_receipt",
+    )
+    missing_hash_b_read.pop("runtime_guide_hash")
+    before_missing_hash = runtime.store.get("cex-mf-parallel-lane-bound-test")
+    rejected_missing_hash = runtime.submit_line_write(
+        "cex-mf-parallel-lane-bound-test",
+        missing_hash_b_read,
+    )
+    assert rejected_missing_hash["ok"] is False
+    assert {
+        "field": "runtime_guide_hash",
+        "expected": lane_read_hashes["b"],
+        "actual": "<missing>",
+    } in rejected_missing_hash["decision"]["imported_legacy_checks"][0][
+        "identity_mismatches"
+    ]
+    assert runtime.store.get("cex-mf-parallel-lane-bound-test") == (
+        before_missing_hash
+    )
+
     before = runtime.store.get("cex-mf-parallel-lane-bound-test")
     skipped_a_startup = runtime.submit_line_write(
         "cex-mf-parallel-lane-bound-test",
@@ -2252,6 +2339,7 @@ def test_mf_parallel_runtime_binds_worker_lines_to_runtime_context_instances():
     )
     cross_wired_b["task_id"] = lanes["a"]["task_id"]
     cross_wired_b["payload"]["task_id"] = lanes["a"]["task_id"]
+    cross_wired_b["runtime_guide_hash"] = lane_read_hashes["a"]
     rejected_cross_wire = runtime.precheck_line_write(
         "cex-mf-parallel-lane-bound-test",
         cross_wired_b,
@@ -2261,6 +2349,13 @@ def test_mf_parallel_runtime_binds_worker_lines_to_runtime_context_instances():
         "field": "task_id",
         "expected": lanes["b"]["task_id"],
         "actual": lanes["a"]["task_id"],
+    } in rejected_cross_wire["decision"]["imported_legacy_checks"][0][
+        "identity_mismatches"
+    ]
+    assert {
+        "field": "runtime_guide_hash",
+        "expected": lane_read_hashes["b"],
+        "actual": lane_read_hashes["a"],
     } in rejected_cross_wire["decision"]["imported_legacy_checks"][0][
         "identity_mismatches"
     ]
@@ -2371,6 +2466,27 @@ def test_mf_parallel_runtime_binds_worker_lines_to_runtime_context_instances():
         stale_b_startup,
     )
     assert rejected_stale["ok"] is False
+    _lane_state, current_b_startup_guide = (
+        runtime.mf_parallel_atomic_lane_gate_view(
+            record,
+            record["runtime_guide"],
+            lane_write(
+                record,
+                "b",
+                stage_id="worker_startup",
+                line_id="worker_startup",
+                evidence_kind="mf_subagent_startup",
+            ),
+            source_record=record,
+        )
+    )
+    assert {
+        "field": "runtime_guide_hash",
+        "expected": current_b_startup_guide["runtime_guide_hash"],
+        "actual": stale_b_startup["runtime_guide_hash"],
+    } in rejected_stale["decision"]["imported_legacy_checks"][0][
+        "identity_mismatches"
+    ]
     assert runtime.store.get("cex-mf-parallel-lane-bound-test") == before_duplicate
 
     accepted_b_startup = runtime.submit_line_write(

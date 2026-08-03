@@ -104257,6 +104257,42 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_bounded_worker_list(co
     before_inactive_precheck = runtime.store.get(
         result["contract_execution_id"]
     )
+    malicious_hash_body = copy.deepcopy(inactive_startup_body)
+    malicious_hash_body["runtime_guide_hash"] = {
+        "session_token": "must-not-be-reflected"
+    }
+    rejected_malicious_hash = (
+        server.handle_project_contract_runtime_line_write_precheck(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": result[
+                        "contract_execution_id"
+                    ],
+                },
+                method="POST",
+                body=malicious_hash_body,
+            )
+        )
+    )
+    assert rejected_malicious_hash["ok"] is False
+    public_hash_mismatches = rejected_malicious_hash["decision"][
+        "imported_legacy_checks"
+    ][0]["identity_mismatches"]
+    assert any(
+        item.get("field") == "runtime_guide_hash"
+        and str(item.get("expected") or "").startswith("sha256:")
+        and item.get("actual") == "<invalid-runtime-guide-hash>"
+        for item in public_hash_mismatches
+    )
+    assert "must-not-be-reflected" not in json.dumps(
+        rejected_malicious_hash,
+        sort_keys=True,
+    )
+    assert runtime.store.get(result["contract_execution_id"]) == (
+        before_inactive_precheck
+    )
+
     inactive_precheck = (
         server.handle_project_contract_runtime_line_write_precheck(
             _ctx(

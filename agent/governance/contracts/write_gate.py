@@ -220,7 +220,12 @@ def validate_contract_write(
     _expect_equal(errors, write, execution_state, "execution_state_revision")
 
     if runtime_guide is not None:
-        _expect_runtime_guide_hash(errors, write, runtime_guide)
+        _expect_runtime_guide_hash(
+            errors,
+            identity_mismatches,
+            write,
+            runtime_guide,
+        )
 
     stage_id = str(write.get("stage_id") or "")
     line_id = str(write.get("line_id") or "")
@@ -1496,6 +1501,7 @@ def _expect_value(
 
 def _expect_runtime_guide_hash(
     errors: list[str],
+    identity_mismatches: list[dict[str, Any]],
     write: Mapping[str, Any],
     runtime_guide: Mapping[str, Any],
 ) -> None:
@@ -1508,6 +1514,13 @@ def _expect_runtime_guide_hash(
     expected = writer_expected or top_level_expected
     if field not in write:
         errors.append(f"missing {field}")
+        identity_mismatches.append(
+            {
+                "field": field,
+                "expected": _public_safe_runtime_guide_hash(expected),
+                "actual": _public_safe_runtime_guide_hash(None, missing=True),
+            }
+        )
         return
     actual = write.get(field)
     if actual == expected:
@@ -1521,6 +1534,13 @@ def _expect_runtime_guide_hash(
             top_level_expected=top_level_expected,
             writer_expected=writer_expected,
         )
+    )
+    identity_mismatches.append(
+        {
+            "field": field,
+            "expected": _public_safe_runtime_guide_hash(expected),
+            "actual": _public_safe_runtime_guide_hash(actual),
+        }
     )
 
 
@@ -1598,9 +1618,13 @@ def _runtime_guide_hash_mismatch_message(
         or alignment.get("required_owner_role")
         or actor_role
     )
-    required_hash = str(expected or "")
-    actual_hash = str(actual or "")
-    reader_role = _matching_reader_role(alignment, actual_hash, required_role)
+    required_hash = _public_safe_runtime_guide_hash(expected)
+    actual_hash = _public_safe_runtime_guide_hash(actual)
+    reader_role = _matching_reader_role(
+        alignment,
+        actual if isinstance(actual, str) else "",
+        required_role,
+    )
     if not reader_role:
         reader_role = str(alignment.get("reader_role") or "")
     reader_fragment = (
@@ -1625,6 +1649,20 @@ def _runtime_guide_hash_mismatch_message(
         "before calling contract_runtime_submit_line."
         f"{authority_fragment}"
     )
+
+
+def _public_safe_runtime_guide_hash(
+    value: Any,
+    *,
+    missing: bool = False,
+) -> str:
+    """Render one hash claim without echoing attacker-controlled containers."""
+
+    if missing:
+        return "<missing>"
+    if isinstance(value, str) and _is_sha256(value):
+        return value
+    return "<invalid-runtime-guide-hash>"
 
 
 def _matching_reader_role(
