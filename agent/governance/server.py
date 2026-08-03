@@ -53941,6 +53941,16 @@ def handle_graph_governance_query(ctx: RequestContext):
                             ).get("comparison_base_commit_sha")
                             or ""
                         ),
+                        comparison_base_commit_source=str(
+                            (
+                                qa_proof.get("root_identity")
+                                if isinstance(
+                                    qa_proof.get("root_identity"), Mapping
+                                )
+                                else {}
+                            ).get("comparison_base_commit_source")
+                            or ""
+                        ),
                         comparison_authority_required=bool(
                             qa_proof.get("comparison_authority_required")
                             or (

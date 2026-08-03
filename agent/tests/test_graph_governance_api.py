@@ -36734,6 +36734,8 @@ def test_exact_candidate_snapshot_uses_runtime_comparison_diff_tuple(
         "backlog_id": backlog_id,
         "contract_execution_id": execution_id,
         "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev9",
         "completed_lines": [
             {
                 "stage_id": "dispatch",
@@ -36767,6 +36769,17 @@ def test_exact_candidate_snapshot_uses_runtime_comparison_diff_tuple(
         server,
         "_contract_runtime_store",
         lambda _conn: {execution_id: runtime_record},
+    )
+    runtime_comparison_authority = (
+        server._qa_exact_candidate_runtime_comparison_authority
+    )
+    monkeypatch.setattr(
+        server,
+        "_qa_exact_candidate_runtime_comparison_authority",
+        lambda *_args, **_kwargs: {
+            "commit_sha": base_commit,
+            "source": server._QA_POSTMERGE_COMPARISON_BASE_SOURCE,
+        },
     )
 
     assert server._contract_runtime_server_candidate_base_commit(
@@ -36839,9 +36852,49 @@ def test_exact_candidate_snapshot_uses_runtime_comparison_diff_tuple(
     )
     assert trace["root_identity"]["comparison_base_commit_sha"] == base_commit
     assert trace["root_identity"]["comparison_base_commit_source"] == (
-        "ContractRuntime.completed_lines.worker_commit+"
-        "parallel_branch_runtime_context.base_commit"
+        server._QA_POSTMERGE_COMPARISON_BASE_SOURCE
     )
+    assert trace["root_identity_hash"] == server.stable_sha256(
+        trace["root_identity"]
+    )
+
+    exact_context = server._qa_exact_candidate_context
+    recompute_calls = 0
+
+    def _change_source_during_post_query_recompute(*args, **kwargs):
+        nonlocal recompute_calls
+        result = exact_context(*args, **kwargs)
+        recompute_calls += 1
+        if recompute_calls == 2:
+            result["comparison_base_commit_source"] = (
+                server._QA_WORKER_COMPARISON_BASE_SOURCE
+            )
+            result["root_identity"] = {
+                **result["root_identity"],
+                "comparison_base_commit_source": (
+                    server._QA_WORKER_COMPARISON_BASE_SOURCE
+                ),
+            }
+            result["root_identity_hash"] = server.stable_sha256(
+                result["root_identity"]
+            )
+        return result
+
+    monkeypatch.setattr(
+        server,
+        "_qa_exact_candidate_context",
+        _change_source_during_post_query_recompute,
+    )
+    with pytest.raises(GovernanceError) as source_drift:
+        server.handle_graph_governance_query(qa_ctx)
+    assert source_drift.value.code == "qa_exact_candidate_root_changed"
+    assert "comparison_base_commit_source" in source_drift.value.details[
+        "identity_mismatches"
+    ]
+    assert "root_identity_hash" in source_drift.value.details[
+        "identity_mismatches"
+    ]
+    monkeypatch.setattr(server, "_qa_exact_candidate_context", exact_context)
 
     timeline_ctx = _ctx_with_role(
         {"project_id": PID},
@@ -37008,6 +37061,11 @@ def test_exact_candidate_snapshot_uses_runtime_comparison_diff_tuple(
     missing_comparison_record = copy.deepcopy(runtime_record)
     missing_comparison_record["completed_lines"] = (
         missing_comparison_record["completed_lines"][:1]
+    )
+    monkeypatch.setattr(
+        server,
+        "_qa_exact_candidate_runtime_comparison_authority",
+        runtime_comparison_authority,
     )
     monkeypatch.setattr(
         server,
