@@ -23642,6 +23642,7 @@ def _runtime_context_worker_recovery_payloads(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "lane_id": worker_slot_id or worker_id,
         "worker_role": "mf_sub",
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
@@ -23660,6 +23661,7 @@ def _runtime_context_worker_recovery_payloads(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "lane_id": worker_slot_id or worker_id,
         "worker_role": "mf_sub",
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
@@ -23718,6 +23720,7 @@ def _runtime_context_worker_recovery_payloads(
         "runtime_context_id": "copy_safe_body.runtime_context_id",
         "task_id": "copy_safe_body.task_id",
         "parent_task_id": "copy_safe_body.parent_task_id",
+        "lane_id": "copy_safe_body.lane_id",
         "target_project_root": "copy_safe_body.target_project_root",
         "session_token": "copy_safe_body.session_token",
         "session_token_ref": "copy_safe_body.session_token_ref",
@@ -24331,6 +24334,7 @@ def _runtime_context_worker_recovery_payloads(
                 "runtime_context_id",
                 "task_id",
                 "parent_task_id",
+                "lane_id",
                 "worker_role",
                 "session_token or session_token_ref",
                 "fence_token",
@@ -44740,6 +44744,41 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         )
     finally:
         conn.close()
+    lane_id = str(context.worker_slot_id or context.worker_id or "").strip()
+    submitted_lane_claims = [
+        ("lane_id", str(body.get("lane_id") or "").strip()),
+        (
+            "payload.lane_id",
+            str(supplied_payload.get("lane_id") or "").strip(),
+        ),
+    ]
+    lane_identity_mismatches = [
+        {"field": field, "expected": lane_id, "actual": actual}
+        for field, actual in submitted_lane_claims
+        if actual and actual != lane_id
+    ]
+    if lane_identity_mismatches:
+        raise GovernanceError(
+            "runtime_context_lane_identity_mismatch",
+            (
+                "implementation-evidence lane_id conflicts with the "
+                "authenticated RuntimeContext worker lane"
+            ),
+            422,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": str(context.task_id or "").strip(),
+                "field": "lane_id",
+                "expected": lane_id,
+                "actual": lane_identity_mismatches[0]["actual"],
+                "identity_mismatches": lane_identity_mismatches,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+                "next_legal_action": (
+                    "refresh_worker_guide_and_copy_authenticated_lane_id"
+                ),
+            },
+        )
     if historical_route_correction:
         event_route_identity = dict(
             historical_route_correction.get("canonical_route_identity") or {}
@@ -44865,6 +44904,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         "runtime_context_id": runtime_context_id,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
+        "lane_id": lane_id,
         "observer_command_id": observer_command_id,
         "fence_token_hash": fence_token_hash,
         "fence_token_redacted": bool(fence_token_hash),
@@ -44904,6 +44944,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
             "runtime_context_id": runtime_context_id,
             "task_id": context.task_id,
             "parent_task_id": parent_task_id,
+            "lane_id": lane_id,
             "worker_id": context.worker_id,
             "worker_slot_id": context.worker_slot_id or context.worker_id,
             "target_project_root": target_project_root,
@@ -44948,6 +44989,11 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
 
     event_body = {
         "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "lane_id": lane_id,
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id or context.worker_id,
         "backlog_id": context.backlog_id,
         "contract_execution_id": contract_execution_identity.get(
             "contract_execution_id",

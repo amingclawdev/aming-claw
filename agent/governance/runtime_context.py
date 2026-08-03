@@ -350,6 +350,9 @@ def worker_proof_line_provenance(proof: Mapping[str, Any] | None) -> dict[str, A
 
     if not isinstance(proof, Mapping) or not proof:
         return {}
+    worker_id = _text(proof.get("worker_id"))
+    worker_slot_id = _text(proof.get("worker_slot_id")) or worker_id
+    lane_id = _text(proof.get("lane_id")) or worker_slot_id or worker_id
     return {
         "schema_version": CONTRACT_RUNTIME_WORKER_PROVENANCE_SCHEMA_VERSION,
         "source": "runtime_context_copy_safe_worker_proof",
@@ -360,8 +363,9 @@ def worker_proof_line_provenance(proof: Mapping[str, Any] | None) -> dict[str, A
         "task_id": _text(proof.get("task_id")),
         "parent_task_id": _text(proof.get("parent_task_id")),
         "worker_role": "mf_sub",
-        "worker_id": _text(proof.get("worker_id")),
-        "worker_slot_id": _text(proof.get("worker_slot_id")),
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "lane_id": lane_id,
         "target_project_root": _text(proof.get("target_project_root")),
         "session_token_ref": _text(proof.get("session_token_ref")),
         "session_token_ref_present": bool(proof.get("session_token_ref")),
@@ -391,6 +395,7 @@ def attach_contract_runtime_worker_provenance(
             "worker_role": "mf_sub",
             "worker_id": provenance["worker_id"],
             "worker_slot_id": provenance["worker_slot_id"],
+            "lane_id": provenance["lane_id"],
             "authorization_source": "runtime_context_copy_safe_worker_proof",
             "actor_session_principal": worker_id,
             "evidence_owner_actor": worker_id,
@@ -406,6 +411,7 @@ def attach_contract_runtime_worker_provenance(
     payload.update(
         {
             "worker_evidence_provenance": provenance,
+            "lane_id": provenance["lane_id"],
             "observer_impersonation": False,
         }
     )
@@ -417,6 +423,7 @@ def attach_contract_runtime_worker_provenance(
     )
     artifact_refs.setdefault("runtime_context_id", provenance["runtime_context_id"])
     artifact_refs.setdefault("task_id", provenance["task_id"])
+    artifact_refs.setdefault("lane_id", provenance["lane_id"])
     artifact_refs.setdefault("worker_role", "mf_sub")
     artifact_refs["worker_evidence_provenance"] = provenance
     line["artifact_refs"] = artifact_refs

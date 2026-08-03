@@ -535,6 +535,14 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
     properties.update(
         {
             "task_id": {"type": "string"},
+            "lane_id": {
+                "type": "string",
+                "description": (
+                    "Atomic worker lane identity projected by the Runtime "
+                    "Context guide; the facade verifies it against the "
+                    "authenticated worker context."
+                ),
+            },
             "contract_execution_id": {"type": "string"},
             "implementation_event_ref": {"type": "string"},
             "implementation_lineage_ref": {"type": "string"},

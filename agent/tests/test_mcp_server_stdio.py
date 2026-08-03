@@ -713,6 +713,13 @@ def test_mf_parallel_enter_schemas_expose_server_issued_batch_child_fields():
 def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypatch):
     calls = []
 
+    implementation_schema = next(
+        tool
+        for tool in governance_mcp_server.TOOLS
+        if tool["name"] == "runtime_context_implementation_evidence"
+    )["inputSchema"]
+    assert "lane_id" in implementation_schema["properties"]
+
     def fake_http(method, path, body=None):
         calls.append((method, path, body))
         return {"ok": True, "path": path}
@@ -727,7 +734,11 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
     }
     assert governance_mcp_server._dispatch_tool(
         "runtime_context_implementation_evidence",
-        {**common, "changed_files": ["src/app.js"]},
+        {
+            **common,
+            "lane_id": "lane-demo",
+            "changed_files": ["src/app.js"],
+        },
     )["ok"] is True
     assert governance_mcp_server._dispatch_tool(
         "runtime_context_worker_commit",
@@ -769,6 +780,7 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
                 "runtime_context_id": "mfrctx-demo",
                 "session_token": "worker-session",
                 "fence_token": "fence-demo",
+                "lane_id": "lane-demo",
                 "changed_files": ["src/app.js"],
             },
         ),

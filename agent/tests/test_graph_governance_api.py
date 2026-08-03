@@ -18950,27 +18950,68 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_route_ref(
         now_iso="2026-06-28T00:00:00Z",
     )
     session_token_ref = runtime_context_session_token_ref(context)
+    implementation_body = {
+        "parent_task_id": parent_task_id,
+        "lane_id": context.worker_slot_id,
+        "fence_token": "fence-runtime-parent-bound",
+        "session_token": session_token,
+        "session_token_ref": session_token_ref,
+        "target_project_root": str(worktree),
+        **parent_route_identity,
+        "changed_files": ["agent/governance/server.py"],
+        "tests": [{"command": "pytest -q", "status": "passed"}],
+        "payload": {
+            "worker_role": "mf_sub",
+            "summary": "parent-bound route ref accepted for worker evidence",
+        },
+        "route_token_ref": parent_issue["route_token_ref"],
+    }
+    before_wrong_lane_events = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    wrong_lane_body = copy.deepcopy(implementation_body)
+    wrong_lane_body["lane_id"] = "slot-wrong-lane"
+    wrong_lane_body["payload"]["lane_id"] = "slot-wrong-nested-lane"
+    with pytest.raises(GovernanceError) as wrong_lane:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=wrong_lane_body,
+            )
+        )
+    assert wrong_lane.value.code == "runtime_context_lane_identity_mismatch"
+    assert wrong_lane.value.details["field"] == "lane_id"
+    assert wrong_lane.value.details["expected"] == context.worker_slot_id
+    assert wrong_lane.value.details["actual"] == "slot-wrong-lane"
+    assert wrong_lane.value.details["identity_mismatches"] == [
+        {
+            "field": "lane_id",
+            "expected": context.worker_slot_id,
+            "actual": "slot-wrong-lane",
+        },
+        {
+            "field": "payload.lane_id",
+            "expected": context.worker_slot_id,
+            "actual": "slot-wrong-nested-lane",
+        },
+    ]
+    assert wrong_lane.value.details["zero_contract_runtime_write"] is True
+    assert wrong_lane.value.details["zero_timeline_write"] is True
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == before_wrong_lane_events
 
     response = server.handle_graph_governance_runtime_context_implementation_evidence(
         _ctx_with_role(
             {"project_id": PID, "runtime_context_id": context.runtime_context_id},
             "mf_sub",
             method="POST",
-            body={
-                "parent_task_id": parent_task_id,
-                "fence_token": "fence-runtime-parent-bound",
-                "session_token": session_token,
-                "session_token_ref": session_token_ref,
-                "target_project_root": str(worktree),
-                **parent_route_identity,
-                "changed_files": ["agent/governance/server.py"],
-                "tests": [{"command": "pytest -q", "status": "passed"}],
-                "payload": {
-                    "worker_role": "mf_sub",
-                    "summary": "parent-bound route ref accepted for worker evidence",
-                },
-                "route_token_ref": parent_issue["route_token_ref"],
-            },
+            body=implementation_body,
         )
     )
 
@@ -18994,6 +19035,10 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_route_ref(
     assert payload["route_token_gate"]["scope"]["task_id"] == parent_task_id
     assert payload["worker_evidence_provenance"]["session_token_ref"] == (
         session_token_ref
+    )
+    assert payload["lane_id"] == context.worker_slot_id
+    assert payload["worker_evidence_provenance"]["lane_id"] == (
+        context.worker_slot_id
     )
     assert payload["source_backed_contract_gate_authority"][
         "source_of_authority"
@@ -100147,16 +100192,22 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
         "copy_safe_body"
     ]
     apply_body = merge_payloads["apply_merge_queue_item"]["copy_safe_body"]
-    implementation_body = payloads[
+    implementation_skeleton = payloads[
         "implementation_evidence_facade_payload_skeleton"
-    ]["copy_safe_body"]
-    implementation_diff_guidance = payloads[
-        "implementation_evidence_facade_payload_skeleton"
-    ]["implementation_diff_submission_guidance"]
+    ]
+    implementation_body = implementation_skeleton["copy_safe_body"]
+    implementation_diff_guidance = implementation_skeleton[
+        "implementation_diff_submission_guidance"
+    ]
     worker_commit_skeleton = payloads["worker_commit_facade_payload_skeleton"]
     worker_commit_body = worker_commit_skeleton["copy_safe_body"]
 
     assert contract_refs["route_token_ref"] == "rtok-contract-runtime-guide-scope"
+    assert implementation_body["lane_id"] == "worker-guide-scope"
+    assert "lane_id" in implementation_skeleton["required_fields"]
+    assert implementation_skeleton["field_pointers"]["lane_id"] == (
+        "copy_safe_body.lane_id"
+    )
     assert "parallel_branch_merge_queue_materialize" in contract_refs["not_valid_for"]
     assert merge_refs["worker_task_id"] == "worker-guide-scope-task"
     assert merge_refs["contract_execution_scope_allowed"] is False
