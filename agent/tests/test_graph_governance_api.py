@@ -112146,3 +112146,383 @@ def test_contract_runtime_actor_role_requires_declared_role_fields():
             },
         }
     ) == ""
+
+
+def _record_parentless_direct_main_failed_qa_route_lineage(
+    conn: sqlite3.Connection,
+    *,
+    backlog_id: str,
+) -> dict[str, str]:
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ? WHERE bug_id = ?",
+        (
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            backlog_id,
+        ),
+    )
+    task_id = server._onboard_service_execution_id(PID, backlog_id)
+    commit_sha = "a" * 40
+    route_gate = {
+        "schema_version": "route_token_mutation_gate.v1",
+        "allowed": True,
+        "accepted": True,
+        "status": "accepted",
+        "action": "task_timeline_append",
+        "server_projected": True,
+        "projection_source": "server_route_token_mutation_gate",
+        "resolved_from_ref": True,
+        "registry_verified": True,
+        "binding_source": "observer_route_token_refs",
+        "route_id": f"route-{backlog_id.lower()}",
+        "route_context_hash": _fake_sha(f"route-{backlog_id.lower()}"),
+        "scope": {
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        },
+    }
+    direct_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="mf.observer_direct_implementation_exception",
+        event_kind="observer_direct_implementation_exception",
+        phase="pre_mutation",
+        status="accepted",
+        decision="operator_supervised_direct_main_approved",
+        actor="observer",
+        payload={
+            "source_backed_contract_gate_authority": (
+                task_timeline.source_backed_route_gate_authority(route_gate)
+            ),
+            "observer_direct_pre_mutation_authority": {
+                "accepted": True,
+                "server_projected": True,
+                "projection_source": (
+                    "task_timeline_append_pre_persistence_gate"
+                ),
+            }
+        },
+    )
+    implementation = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="observer.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        status="passed",
+        actor="observer",
+        commit_sha=commit_sha,
+        payload={
+            "source_backed_contract_gate_authority": (
+                task_timeline.source_backed_route_gate_authority(route_gate)
+            ),
+            "changed_files": [
+                "agent/governance/server.py",
+                "agent/tests/test_graph_governance_api.py",
+            ]
+        },
+    )
+    failed_qa = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="qa.independent_verification",
+        event_kind="independent_verification",
+        phase="qa",
+        status="failed",
+        actor="qa:direct-main-route",
+        commit_sha=commit_sha,
+        payload={"observer_impersonation": False},
+        verification={"candidate_new_failures": ["route crossed contract"]},
+    )
+    conn.commit()
+    return {
+        "task_id": task_id,
+        "commit_sha": commit_sha,
+        "direct_event_ref": f"timeline:{direct_event['id']}",
+        "implementation_event_ref": f"timeline:{implementation['id']}",
+        "failed_qa_source_ref": f"timeline:{failed_qa['id']}",
+    }
+
+
+def test_direct_main_failed_qa_guide_forces_fresh_same_contract_successor(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-DIRECT-MAIN-FAILED-QA-GUIDE-SAME-CONTRACT"
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_observer_direct_independent_verification_event",
+        lambda *_args, **_kwargs: True,
+    )
+
+    compact = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "parallel_worker",
+                "route_token_ref": "rtok-direct-main-failed-guide",
+                "response_view": "compact",
+            },
+        )
+    )
+
+    action = compact["next_legal_action"]
+    assert compact["selected_work_type"] == "parallel_worker"
+    assert action["id"] == "operator_supervised_direct_main_failed_qa_rework"
+    assert action["source_work_type"] == "operator_supervised_direct_main"
+    assert action["source_contract_kind"] == (
+        "operator_supervised_direct_main.v1"
+    )
+    assert action["successor_work_type"] == "operator_supervised_direct_main"
+    assert action["successor_contract_kind"] == (
+        "operator_supervised_direct_main.v1"
+    )
+    assert action["successor_generation"] == "fresh"
+    assert action["failed_qa_source_ref"] == lineage["failed_qa_source_ref"]
+    assert action["source_generation_terminal"] is True
+    assert action["same_row_resume_allowed"] is False
+    assert action["separate_bounded_successor_row_required"] is True
+    assert action["mf_parallel_enter_allowed"] is False
+    transition = action["explicit_cross_contract_transition"]
+    assert transition["default_allowed"] is False
+    assert transition["schema_version"] == (
+        "operator_supervised_direct_main.contract_transition.v1"
+    )
+    assert transition["accepted_modes"] == ["expand_scope", "revise_scope"]
+    assert compact["direct_main_failed_qa_rework"]["source_task_id"] == (
+        lineage["task_id"]
+    )
+    assert "direct_main_failed_qa_rework" in compact["guide_capsule"][
+        "available_sections"
+    ]
+
+
+def test_mf_parallel_enter_rejects_direct_main_failed_qa_before_any_write(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-DIRECT-MAIN-FAILED-QA-MF-PARALLEL-ZERO-WRITE"
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_observer_direct_independent_verification_event",
+        lambda *_args, **_kwargs: True,
+    )
+    server._contract_runtime_store(conn)
+    before_runtime = conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0]
+    before_timeline = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_mf_parallel_enter(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": "must-not-materialize-parallel",
+                    "reason": "plain reasons must not cross contract families",
+                    "route_token_ref": "rtok-must-not-materialize-parallel",
+                    "onboard_service_waiver": True,
+                    "owned_files": ["agent/governance/server.py"],
+                    "metadata": {"required_worker_count": 2},
+                },
+            )
+        )
+
+    assert rejected.value.code == (
+        "direct_main_failed_qa_cross_contract_forbidden"
+    )
+    assert rejected.value.status == 409
+    assert rejected.value.details["field"] == "successor_work_type"
+    assert rejected.value.details["expected"] == (
+        "operator_supervised_direct_main"
+    )
+    assert rejected.value.details["actual"] == "parallel_worker"
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["failed_qa_source_ref"] == (
+        lineage["failed_qa_source_ref"]
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0] == before_runtime
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == before_timeline
+
+
+def test_mf_parallel_enter_accepts_exact_typed_direct_main_scope_transition(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-DIRECT-MAIN-FAILED-QA-MF-PARALLEL-TYPED-TRANSITION"
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_observer_direct_independent_verification_event",
+        lambda *_args, **_kwargs: True,
+    )
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-direct-main-typed-transition",
+    )
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=lineage["task_id"],
+        target_files=[
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+        allowed_actions=["mf_parallel_enter", "onboard_route_guide"],
+    )
+    route_token_ref = parent_issue["route_token_ref"]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_token_ref,
+        token=parent_issue["route_token"],
+    )
+    transition = {
+        "schema_version": (
+            "operator_supervised_direct_main.contract_transition.v1"
+        ),
+        "transition_mode": "revise_scope",
+        "source_work_type": "operator_supervised_direct_main",
+        "source_contract_kind": "operator_supervised_direct_main.v1",
+        "successor_work_type": "parallel_worker",
+        "successor_contract_kind": "mf_parallel.v2",
+        "source_backlog_id": backlog_id,
+        "source_task_id": lineage["task_id"],
+        "failed_qa_source_ref": lineage["failed_qa_source_ref"],
+        "source_generation_terminal": True,
+        "reason": "operator deliberately revised scope into parallel work",
+        "operator_approval": {
+            "approved": True,
+            "approval_ref": "operator:revise-scope:direct-main-failed-qa",
+        },
+    }
+
+    result = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "reason": "enter only through typed cross-contract authority",
+                "task_id": "direct-main-typed-transition-parallel",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+                "onboard_service_waiver": True,
+                "owned_files": ["agent/governance/server.py"],
+                "metadata": {
+                    "required_worker_count": 2,
+                    "direct_main_contract_transition": transition,
+                },
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    projected = result["event"]["payload"][
+        "direct_main_contract_transition"
+    ]
+    assert projected["accepted"] is True
+    assert projected["server_projected"] is True
+    assert projected["failed_qa_source_ref"] == lineage["failed_qa_source_ref"]
+    assert projected["transition_mode"] == "revise_scope"
+    assert projected["transition_hash"].startswith("sha256:")
+    assert result["event"]["artifact_refs"]["failed_qa_source_ref"] == (
+        lineage["failed_qa_source_ref"]
+    )
+    assert server._onboard_parentless_direct_main_failed_qa_state(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    ) == {}
+
+
+@pytest.mark.parametrize("transition_mode", ["revise_scope", "expand_scope"])
+def test_direct_main_failed_qa_cross_contract_transition_requires_exact_typed_authority(
+    transition_mode,
+):
+    backlog_id = "AC-DIRECT-MAIN-FAILED-QA-TYPED-TRANSITION"
+    failed_state = {
+        "source_task_id": "onboard-service-direct-main-source",
+        "failed_qa_source_ref": "timeline:991",
+    }
+    transition = {
+        "schema_version": (
+            "operator_supervised_direct_main.contract_transition.v1"
+        ),
+        "transition_mode": transition_mode,
+        "source_work_type": "operator_supervised_direct_main",
+        "source_contract_kind": "operator_supervised_direct_main.v1",
+        "successor_work_type": "parallel_worker",
+        "successor_contract_kind": "mf_parallel.v2",
+        "source_backlog_id": backlog_id,
+        "source_task_id": failed_state["source_task_id"],
+        "failed_qa_source_ref": failed_state["failed_qa_source_ref"],
+        "source_generation_terminal": True,
+        "reason": f"operator approved {transition_mode} contract transition",
+        "operator_approval": {
+            "approved": True,
+            "approval_ref": f"operator:{transition_mode}:991",
+        },
+    }
+
+    accepted, mismatches = (
+        server._validate_direct_main_cross_contract_transition(
+            transition,
+            failed_qa_state=failed_state,
+            backlog_id=backlog_id,
+        )
+    )
+    assert mismatches == []
+    assert accepted["accepted"] is True
+    assert accepted["server_projected"] is True
+    assert accepted["transition_mode"] == transition_mode
+    assert accepted["failed_qa_source_ref"] == "timeline:991"
+    assert accepted["transition_hash"].startswith("sha256:")
+
+    wrong_source = copy.deepcopy(transition)
+    wrong_source["failed_qa_source_ref"] = "timeline:990"
+    accepted, mismatches = (
+        server._validate_direct_main_cross_contract_transition(
+            wrong_source,
+            failed_qa_state=failed_state,
+            backlog_id=backlog_id,
+        )
+    )
+    assert accepted == {}
+    assert {
+        "field": "failed_qa_source_ref",
+        "expected": "timeline:991",
+        "actual": "timeline:990",
+    } in mismatches

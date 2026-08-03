@@ -94458,6 +94458,379 @@ def _onboard_parentless_direct_main_canonical_timeline_event() -> dict[str, Any]
     )
 
 
+_OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE = "operator_supervised_direct_main"
+_OPERATOR_SUPERVISED_DIRECT_MAIN_CONTRACT_KIND = (
+    "operator_supervised_direct_main.v1"
+)
+_MF_PARALLEL_WORK_TYPE = "parallel_worker"
+_MF_PARALLEL_CONTRACT_KIND = "mf_parallel.v2"
+_DIRECT_MAIN_CONTRACT_TRANSITION_SCHEMA = (
+    "operator_supervised_direct_main.contract_transition.v1"
+)
+_DIRECT_MAIN_CONTRACT_TRANSITION_MODES = {"revise_scope", "expand_scope"}
+
+
+def _onboard_parentless_direct_main_event_is_accepted(
+    event: Mapping[str, Any],
+) -> bool:
+    """Return only server-backed, append-time accepted direct-main boundaries."""
+
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    authority = (
+        payload.get("observer_direct_pre_mutation_authority")
+        if isinstance(
+            payload.get("observer_direct_pre_mutation_authority"), Mapping
+        )
+        else {}
+    )
+    identity = _observer_root_route_identity_from_event(event)
+    route_token_backed = bool(
+        _contract_runtime_close_authority_route_token_backed_event(
+            event,
+            identity,
+            require_source_backed_authority=True,
+        )
+    )
+    if (
+        authority.get("accepted") is True
+        and authority.get("server_projected") is True
+        and str(authority.get("projection_source") or "").strip()
+        == "task_timeline_append_pre_persistence_gate"
+    ):
+        return route_token_backed
+
+    from . import task_timeline
+
+    route_identity = {
+        "route_ids": [identity.get("route_id", "")]
+        if identity.get("route_id")
+        else [],
+        "route_context_hashes": [identity.get("route_context_hash", "")]
+        if identity.get("route_context_hash")
+        else [],
+    }
+    exception = task_timeline._observer_direct_exception_event(
+        dict(event),
+        route_identity,
+    )
+    return bool(exception.get("accepted")) and route_token_backed
+
+
+def _onboard_parentless_direct_main_failed_qa_state(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    """Project an unresolved parentless direct-main QA failure from raw evidence."""
+
+    from . import task_timeline
+
+    direct_candidates = task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        event_kind="observer_direct_implementation_exception",
+        limit=100,
+    )
+    direct_events = [
+        event
+        for event in direct_candidates
+        if _onboard_parentless_direct_main_event_is_accepted(event)
+    ]
+    if not direct_events:
+        return {}
+    events = task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    )
+    direct_event = max(
+        direct_events,
+        key=lambda event: int(event.get("id") or event.get("event_id") or 0),
+    )
+    direct_event_id = int(
+        direct_event.get("id") or direct_event.get("event_id") or 0
+    )
+    task_id = str(direct_event.get("task_id") or "").strip()
+    if not task_id:
+        return {}
+
+    passing_statuses = {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+    failing_statuses = {"blocked", "error", "fail", "failed", "no_pass", "rejected"}
+
+    def _event_id(event: Mapping[str, Any]) -> int:
+        return int(event.get("id") or event.get("event_id") or 0)
+
+    def _event_status(event: Mapping[str, Any]) -> str:
+        return str(event.get("status") or event.get("decision") or "").strip().lower()
+
+    def _is_direct_implementation(event: Mapping[str, Any]) -> bool:
+        return (
+            str(event.get("task_id") or "").strip() == task_id
+            and _event_id(event) > direct_event_id
+            and str(event.get("actor") or "").strip() == "observer"
+            and str(event.get("event_kind") or event.get("phase") or "").strip()
+            == "implementation"
+            and _event_status(event) in passing_statuses
+        )
+
+    implementations = [event for event in events if _is_direct_implementation(event)]
+    if not implementations:
+        return {}
+    implementation = max(implementations, key=_event_id)
+    implementation_event_id = _event_id(implementation)
+    implementation_commit = str(implementation.get("commit_sha") or "").strip()
+
+    qa_events: list[dict[str, Any]] = []
+    for event in events:
+        if (
+            str(event.get("task_id") or "").strip() != task_id
+            or _event_id(event) <= implementation_event_id
+        ):
+            continue
+        qa_commit = str(event.get("commit_sha") or "").strip()
+        if implementation_commit and qa_commit and qa_commit != implementation_commit:
+            continue
+        if not task_timeline._observer_direct_independent_verification_event(
+            dict(event),
+            conn=conn,
+        ):
+            continue
+        qa_events.append(dict(event))
+    if not qa_events:
+        return {}
+    failed_qa = max(qa_events, key=_event_id)
+    failed_qa_status = _event_status(failed_qa)
+    if failed_qa_status in passing_statuses or failed_qa_status not in failing_statuses:
+        return {}
+    failed_qa_event_id = _event_id(failed_qa)
+    failed_qa_source_ref = f"timeline:{failed_qa_event_id}"
+
+    try:
+        runtime_records = _contract_runtime_store(conn).list_by_backlog(
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    except ContractRuntimeError:
+        runtime_records = []
+    for record in runtime_records:
+        if (
+            str(record.get("contract_id") or "").strip()
+            != _MF_PARALLEL_CONTRACT_KIND
+            or str(record.get("parent_contract_execution_id") or "").strip()
+            != task_id
+        ):
+            continue
+        metadata = (
+            record.get("metadata")
+            if isinstance(record.get("metadata"), Mapping)
+            else {}
+        )
+        transition = (
+            metadata.get("direct_main_contract_transition")
+            if isinstance(
+                metadata.get("direct_main_contract_transition"), Mapping
+            )
+            else {}
+        )
+        transition_hash = str(transition.get("transition_hash") or "").strip()
+        expected_transition_hash = stable_sha256(
+            {
+                key: value
+                for key, value in transition.items()
+                if key != "transition_hash"
+            }
+        )
+        if (
+            transition.get("accepted") is True
+            and transition.get("server_projected") is True
+            and str(transition.get("projection_source") or "").strip()
+            == "mf_parallel_enter_pre_persistence_gate"
+            and str(transition.get("source_of_authority") or "").strip()
+            == "authenticated_observer_typed_contract_transition"
+            and str(transition.get("failed_qa_source_ref") or "").strip()
+            == failed_qa_source_ref
+            and transition_hash == expected_transition_hash
+        ):
+            return {}
+
+    return {
+        "schema_version": "onboard_route_guide.direct_main_failed_qa_state.v1",
+        "status": "failed_qa_direct_main_rework_required",
+        "source_work_type": _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE,
+        "source_contract_kind": _OPERATOR_SUPERVISED_DIRECT_MAIN_CONTRACT_KIND,
+        "successor_work_type": _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE,
+        "successor_contract_kind": _OPERATOR_SUPERVISED_DIRECT_MAIN_CONTRACT_KIND,
+        "source_backlog_id": backlog_id,
+        "source_task_id": task_id,
+        "source_direct_main_event_ref": f"timeline:{direct_event_id}",
+        "implementation_event_ref": f"timeline:{implementation_event_id}",
+        "implementation_commit": implementation_commit,
+        "failed_qa_source_ref": failed_qa_source_ref,
+        "failed_qa_status": failed_qa_status,
+        "source_generation_terminal": True,
+        "same_row_resume_allowed": False,
+        "separate_bounded_successor_row_required": True,
+        "mf_parallel_enter_allowed": False,
+        "source_refs": [
+            f"timeline:{direct_event_id}",
+            f"timeline:{implementation_event_id}",
+            failed_qa_source_ref,
+        ],
+    }
+
+
+def _onboard_parentless_direct_main_failed_qa_next_action(
+    failed_qa_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the typed same-contract recovery action for direct-main QA FAIL."""
+
+    failed_qa_source_ref = str(
+        failed_qa_state.get("failed_qa_source_ref") or ""
+    ).strip()
+    return {
+        "schema_version": "onboard_route_guide.direct_main_failed_qa_successor.v1",
+        "id": "operator_supervised_direct_main_failed_qa_rework",
+        "action": "backlog_audit_archive_then_file_direct_main_successor",
+        "interface": "backlog_audit_archive",
+        "readiness_state": "failed_qa_direct_main_rework_required",
+        "source_work_type": _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE,
+        "source_contract_kind": _OPERATOR_SUPERVISED_DIRECT_MAIN_CONTRACT_KIND,
+        "successor_work_type": _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE,
+        "successor_contract_kind": _OPERATOR_SUPERVISED_DIRECT_MAIN_CONTRACT_KIND,
+        "successor_interface": "observer_direct_mutation_exception",
+        "successor_generation": "fresh",
+        "source_generation_terminal": True,
+        "same_row_resume_allowed": False,
+        "separate_bounded_successor_row_required": True,
+        "failed_qa_source_ref": failed_qa_source_ref,
+        "failed_qa_status": str(failed_qa_state.get("failed_qa_status") or ""),
+        "mf_parallel_enter_allowed": False,
+        "required_sequence": [
+            "preserve the failed source generation as raw audit",
+            "audit-WAIVE the source row without synthesizing PASS",
+            "file one separate bounded repair row with source/successor work type operator_supervised_direct_main",
+            "onboard the fresh row with operator_supervised_direct_main",
+            "record a fresh pre-mutation exception before editing",
+            "run independent QA and current-HEAD full reconcile before close",
+        ],
+        "explicit_cross_contract_transition": {
+            "default_allowed": False,
+            "schema_version": _DIRECT_MAIN_CONTRACT_TRANSITION_SCHEMA,
+            "accepted_modes": sorted(_DIRECT_MAIN_CONTRACT_TRANSITION_MODES),
+            "required_fields": {
+                "source_work_type": _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE,
+                "source_contract_kind": _OPERATOR_SUPERVISED_DIRECT_MAIN_CONTRACT_KIND,
+                "successor_work_type": _MF_PARALLEL_WORK_TYPE,
+                "successor_contract_kind": _MF_PARALLEL_CONTRACT_KIND,
+                "failed_qa_source_ref": failed_qa_source_ref,
+                "operator_approval.approved": True,
+                "operator_approval.approval_ref": "<non-empty>",
+            },
+            "plain_reason_is_authority": False,
+        },
+        "direct_main_failed_qa_state": dict(failed_qa_state),
+        "source_of_authority": "server_verified_parentless_direct_main_timeline",
+    }
+
+
+def _direct_main_cross_contract_transition_input(
+    body: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    value = body.get("direct_main_contract_transition")
+    if not isinstance(value, Mapping):
+        value = metadata.get("direct_main_contract_transition")
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _validate_direct_main_cross_contract_transition(
+    transition: Mapping[str, Any],
+    *,
+    failed_qa_state: Mapping[str, Any],
+    backlog_id: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Validate the only explicit observer-approved direct-main -> parallel edge."""
+
+    failed_qa_source_ref = str(
+        failed_qa_state.get("failed_qa_source_ref") or ""
+    ).strip()
+    source_task_id = str(failed_qa_state.get("source_task_id") or "").strip()
+    expected = {
+        "schema_version": _DIRECT_MAIN_CONTRACT_TRANSITION_SCHEMA,
+        "transition_mode": sorted(_DIRECT_MAIN_CONTRACT_TRANSITION_MODES),
+        "source_work_type": _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE,
+        "source_contract_kind": _OPERATOR_SUPERVISED_DIRECT_MAIN_CONTRACT_KIND,
+        "successor_work_type": _MF_PARALLEL_WORK_TYPE,
+        "successor_contract_kind": _MF_PARALLEL_CONTRACT_KIND,
+        "source_backlog_id": backlog_id,
+        "source_task_id": source_task_id,
+        "failed_qa_source_ref": failed_qa_source_ref,
+        "source_generation_terminal": True,
+    }
+    mismatches: list[dict[str, Any]] = []
+    for field, expected_value in expected.items():
+        actual_value = transition.get(field)
+        matches = (
+            str(actual_value or "").strip() in _DIRECT_MAIN_CONTRACT_TRANSITION_MODES
+            if field == "transition_mode"
+            else actual_value is True
+            if expected_value is True
+            else str(actual_value or "").strip() == str(expected_value)
+        )
+        if not matches:
+            mismatches.append(
+                {"field": field, "expected": expected_value, "actual": actual_value}
+            )
+    approval = (
+        transition.get("operator_approval")
+        if isinstance(transition.get("operator_approval"), Mapping)
+        else {}
+    )
+    if approval.get("approved") is not True:
+        mismatches.append(
+            {
+                "field": "operator_approval.approved",
+                "expected": True,
+                "actual": approval.get("approved"),
+            }
+        )
+    approval_ref = str(approval.get("approval_ref") or "").strip()
+    if not approval_ref:
+        mismatches.append(
+            {
+                "field": "operator_approval.approval_ref",
+                "expected": "non-empty operator approval reference",
+                "actual": approval.get("approval_ref"),
+            }
+        )
+    reason = str(transition.get("reason") or approval.get("reason") or "").strip()
+    if not reason:
+        mismatches.append(
+            {
+                "field": "reason",
+                "expected": "non-empty revise/expand-scope reason",
+                "actual": transition.get("reason"),
+            }
+        )
+    if mismatches:
+        return {}, mismatches
+    normalized = {
+        **dict(transition),
+        "schema_version": _DIRECT_MAIN_CONTRACT_TRANSITION_SCHEMA,
+        "accepted": True,
+        "server_projected": True,
+        "projection_source": "mf_parallel_enter_pre_persistence_gate",
+        "source_of_authority": "authenticated_observer_typed_contract_transition",
+        "operator_approval": dict(approval),
+        "reason": reason,
+    }
+    normalized["transition_hash"] = stable_sha256(normalized)
+    return normalized, []
+
+
 def _onboard_parentless_direct_main_post_mutation_event_guidance(
     *,
     project_id: str,
@@ -94708,12 +95081,29 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
         "authoritative_close_failure_policy": {
             "post_hoc_backfill_after_first_authoritative_close_failure": False,
             "historical_missing_line_repair_forbidden": True,
+            "source_work_type": _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE,
+            "source_contract_kind": _OPERATOR_SUPERVISED_DIRECT_MAIN_CONTRACT_KIND,
+            "successor_work_type": _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE,
+            "successor_contract_kind": _OPERATOR_SUPERVISED_DIRECT_MAIN_CONTRACT_KIND,
+            "source_generation_terminal": True,
+            "same_row_resume_allowed": False,
+            "separate_bounded_successor_row_required": True,
+            "mf_parallel_enter_allowed": False,
             "required_recovery": (
                 "Preserve the failed attempt as raw audit, terminalize and "
                 "discard that validation generation, repair the root cause in "
                 "a separate bounded row, complete independent QA plus "
                 "current-HEAD full reconcile, then start a fresh generation."
             ),
+            "explicit_cross_contract_transition": {
+                "default_allowed": False,
+                "schema_version": _DIRECT_MAIN_CONTRACT_TRANSITION_SCHEMA,
+                "accepted_modes": sorted(_DIRECT_MAIN_CONTRACT_TRANSITION_MODES),
+                "requires_exact_failed_qa_source_ref": True,
+                "requires_authenticated_observer": True,
+                "requires_operator_approval": True,
+                "plain_reason_is_authority": False,
+            },
         },
     }
 
@@ -98846,10 +99236,66 @@ def _onboard_route_guide_compact_service_response(
                 is False
                 else None
             ),
+            "source_work_type": str(
+                next_action.get("source_work_type") or ""
+            ),
+            "source_contract_kind": str(
+                next_action.get("source_contract_kind") or ""
+            ),
+            "successor_work_type": str(
+                next_action.get("successor_work_type") or ""
+            ),
+            "successor_contract_kind": str(
+                next_action.get("successor_contract_kind") or ""
+            ),
+            "successor_generation": str(
+                next_action.get("successor_generation") or ""
+            ),
+            "failed_qa_source_ref": str(
+                next_action.get("failed_qa_source_ref") or ""
+            ),
+            "source_generation_terminal": (
+                True
+                if next_action.get("source_generation_terminal") is True
+                else None
+            ),
+            "same_row_resume_allowed": (
+                False
+                if next_action.get("same_row_resume_allowed") is False
+                else None
+            ),
+            "separate_bounded_successor_row_required": (
+                True
+                if next_action.get("separate_bounded_successor_row_required")
+                is True
+                else None
+            ),
+            "mf_parallel_enter_allowed": (
+                False
+                if next_action.get("mf_parallel_enter_allowed") is False
+                else None
+            ),
+            "required_sequence": list(
+                next_action.get("required_sequence") or []
+            )[:16],
+            "explicit_cross_contract_transition": (
+                dict(next_action.get("explicit_cross_contract_transition"))
+                if isinstance(
+                    next_action.get("explicit_cross_contract_transition"),
+                    Mapping,
+                )
+                else {}
+            ),
             "blocker_ids": blocker_ids,
         }.items()
         if value not in ("", [], {}, None)
     }
+    for explicit_false_field in (
+        "same_row_resume_allowed",
+        "mf_parallel_enter_allowed",
+    ):
+        if next_action.get(explicit_false_field) is False:
+            next_action_projection[explicit_false_field] = False
     authority = {
         "source_of_authority": source_of_authority,
         "contract_execution_id": identity["contract_execution_id"],
@@ -98894,6 +99340,17 @@ def _onboard_route_guide_compact_service_response(
         else current_projection.get("failure_domain_disposition")
         if isinstance(
             current_projection.get("failure_domain_disposition"), Mapping
+        )
+        else {}
+    )
+    direct_main_failed_qa_rework = (
+        runtime_resume.get("direct_main_failed_qa_rework")
+        if isinstance(
+            runtime_resume.get("direct_main_failed_qa_rework"), Mapping
+        )
+        else current_projection.get("direct_main_failed_qa_rework")
+        if isinstance(
+            current_projection.get("direct_main_failed_qa_rework"), Mapping
         )
         else {}
     )
@@ -99026,6 +99483,13 @@ def _onboard_route_guide_compact_service_response(
                     section_name="failure_domain_disposition",
                 )
             )
+        if direct_main_failed_qa_rework:
+            sections["direct_main_failed_qa_rework"] = (
+                _onboard_guide_capsule_bounded_section(
+                    direct_main_failed_qa_rework,
+                    section_name="direct_main_failed_qa_rework",
+                )
+            )
         return sections
 
     entry, cache_metrics = _onboard_guide_capsule_get_or_create(
@@ -99111,6 +99575,10 @@ def _onboard_route_guide_compact_service_response(
         "satisfies_gate": False,
         "synthesizes_pass": False,
     }
+    if direct_main_failed_qa_rework:
+        response["direct_main_failed_qa_rework"] = dict(
+            direct_main_failed_qa_rework
+        )
     if completed_repair_barrier:
         response["completed_repair_fresh_generation_barrier"] = (
             _onboard_guide_capsule_bounded_section(
@@ -99844,6 +100312,38 @@ def _onboard_route_guide_service_response(
                 target_files=target_files,
                 request_body=batch_action_request_body,
             )
+    direct_main_failed_qa_state = (
+        _onboard_parentless_direct_main_failed_qa_state(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    )
+    if direct_main_failed_qa_state:
+        next_action = _onboard_parentless_direct_main_failed_qa_next_action(
+            direct_main_failed_qa_state
+        )
+        current_projection = {
+            **dict(current_projection),
+            "readiness_state": "failed_qa_direct_main_rework_required",
+            "next_legal_action": dict(next_action),
+            "scheduler_eligible": False,
+            "resume_eligible": False,
+            "direct_main_failed_qa_rework": dict(
+                direct_main_failed_qa_state
+            ),
+        }
+        runtime_resume = {
+            **dict(runtime_resume),
+            "status": "failed_qa_direct_main_rework_required",
+            "readiness_state": "failed_qa_direct_main_rework_required",
+            "next_legal_action": dict(next_action),
+            "scheduler_eligible": False,
+            "resume_eligible": False,
+            "direct_main_failed_qa_rework": dict(
+                direct_main_failed_qa_state
+            ),
+        }
     qa_runtime_record: Mapping[str, Any] | None = None
     if (
         str(role or "").strip() == "qa"
@@ -99964,6 +100464,15 @@ def _onboard_route_guide_service_response(
             route_guide["failure_domain_disposition"] = dict(
                 failure_domain_disposition
             )
+    if direct_main_failed_qa_state:
+        guidance["direct_main_failed_qa_rework"] = dict(
+            direct_main_failed_qa_state
+        )
+        route_guide = guidance.get("onboard_route_guide")
+        if isinstance(route_guide, dict):
+            route_guide["direct_main_failed_qa_rework"] = dict(
+                direct_main_failed_qa_state
+            )
     _onboard_route_guide_apply_runtime_route_token_scope(
         conn,
         record=record,
@@ -100015,6 +100524,10 @@ def _onboard_route_guide_service_response(
     if completed_repair_barrier:
         response["completed_repair_fresh_generation_barrier"] = dict(
             completed_repair_barrier
+        )
+    if direct_main_failed_qa_state:
+        response["direct_main_failed_qa_rework"] = dict(
+            direct_main_failed_qa_state
         )
     if response_view == "full":
         response["response_view"] = "full"
@@ -128765,6 +129278,7 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
         )
     metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
     onboard_service_waiver = _onboard_service_waiver_requested(body, metadata)
+    direct_main_contract_transition: dict[str, Any] = {}
 
     from . import task_timeline
     from .mf_subagent_contract import validate_meta_contract_timeline_event
@@ -128873,6 +129387,75 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                     "role_source": "contract_runtime_effective_actor_role",
                 },
             )
+        direct_main_failed_qa_state = (
+            _onboard_parentless_direct_main_failed_qa_state(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+            )
+        )
+        if direct_main_failed_qa_state:
+            transition_input = _direct_main_cross_contract_transition_input(
+                body,
+                metadata,
+            )
+            if transition_input:
+                (
+                    direct_main_contract_transition,
+                    transition_mismatches,
+                ) = _validate_direct_main_cross_contract_transition(
+                    transition_input,
+                    failed_qa_state=direct_main_failed_qa_state,
+                    backlog_id=backlog_id,
+                )
+            else:
+                transition_mismatches = [
+                    {
+                        "field": "successor_work_type",
+                        "expected": _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE,
+                        "actual": _MF_PARALLEL_WORK_TYPE,
+                    }
+                ]
+            if transition_mismatches:
+                first_mismatch = transition_mismatches[0]
+                raise GovernanceError(
+                    "direct_main_failed_qa_cross_contract_forbidden",
+                    (
+                        "failed operator-supervised direct-main QA must return "
+                        "to a fresh direct-main repair row; mf_parallel entry "
+                        "requires an explicit typed observer revise/expand-scope "
+                        "transition with exact failed-QA and operator authority"
+                    ),
+                    409,
+                    {
+                        "field": first_mismatch.get("field"),
+                        "expected": first_mismatch.get("expected"),
+                        "actual": first_mismatch.get("actual"),
+                        "mismatches": transition_mismatches,
+                        "zero_write_rejection": True,
+                        "failed_qa_source_ref": direct_main_failed_qa_state.get(
+                            "failed_qa_source_ref", ""
+                        ),
+                        "source_work_type": (
+                            _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE
+                        ),
+                        "successor_work_type": (
+                            _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE
+                        ),
+                        "attempted_work_type": _MF_PARALLEL_WORK_TYPE,
+                        "next_legal_action": (
+                            _onboard_parentless_direct_main_failed_qa_next_action(
+                                direct_main_failed_qa_state
+                            )
+                        ),
+                    },
+                )
+            metadata = {
+                **dict(metadata),
+                "direct_main_contract_transition": dict(
+                    direct_main_contract_transition
+                ),
+            }
         if onboard_service_waiver:
             parent_record = _onboard_service_materialize_parent_record(
                 conn,
@@ -129056,6 +129639,10 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             ),
             "observer_worker_cardinality_revisions": [],
         }
+        if direct_main_contract_transition:
+            metadata["direct_main_contract_transition"] = dict(
+                direct_main_contract_transition
+            )
         if onboard_service_waiver:
             metadata = {
                 **metadata,
@@ -129098,6 +129685,10 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             "onboard_service_waiver": onboard_service_waiver,
             "legacy_onboard_contract_waived": onboard_service_waiver,
         }
+        if direct_main_contract_transition:
+            payload["direct_main_contract_transition"] = dict(
+                direct_main_contract_transition
+            )
         payload["meta_contract_gate"] = validate_meta_contract_timeline_event(
             {
                 "event_type": "mf_parallel.entered",
@@ -129138,6 +129729,24 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                 ),
                 "onboard_service": (
                     ONBOARD_ROUTE_GUIDE_SERVICE_ID if onboard_service_waiver else ""
+                ),
+                **(
+                    {
+                        "failed_qa_source_ref": str(
+                            direct_main_contract_transition.get(
+                                "failed_qa_source_ref"
+                            )
+                            or ""
+                        ),
+                        "direct_main_contract_transition_hash": str(
+                            direct_main_contract_transition.get(
+                                "transition_hash"
+                            )
+                            or ""
+                        ),
+                    }
+                    if direct_main_contract_transition
+                    else {}
                 ),
             },
         )
