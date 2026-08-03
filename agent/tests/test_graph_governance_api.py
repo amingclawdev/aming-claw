@@ -5771,6 +5771,120 @@ def _persist_contract_runtime_observer_route_ref(
     )
 
 
+def _guide_bound_mf_batch_action_input(
+    *,
+    backlog_id: str,
+    backlog_ids: list[str],
+    reason: str,
+    observer_session_id: str,
+    route_token_ref: str,
+    task_id: str,
+    target_head_commit: str,
+    graph_snapshot_id: str,
+    required_worker_count: int = 1,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "backlog_ids": backlog_ids,
+                "role": "observer",
+                "work_type": "multi_backlog_parallel",
+                "reason": reason,
+                "task_id": task_id,
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+                "target_head_commit": target_head_commit,
+                "graph_snapshot_id": graph_snapshot_id,
+                "metadata": {
+                    "required_worker_count": required_worker_count,
+                },
+                "response_view": "compact",
+            },
+        )
+    )
+    return dict(guide.get("action_input") or {}), guide
+
+
+def _prepare_guide_bound_mf_batch_entry(
+    conn: sqlite3.Connection,
+    *,
+    suffix: str,
+    required_worker_count: int = 1,
+    observer_session_id: str = "",
+) -> dict[str, Any]:
+    backlog_id = f"AC-MF-BATCH-GUIDE-{suffix}"
+    child_ids = [
+        f"AC-MF-BATCH-GUIDE-{suffix}-A",
+        f"AC-MF-BATCH-GUIDE-{suffix}-B",
+    ]
+    for index, row_id in enumerate([backlog_id, *child_ids]):
+        _insert_simple_mf_close_backlog(conn, row_id)
+        owned_file = f"agent/governance/batch-guide-{suffix}-{index}.py"
+        conn.execute(
+            """
+            UPDATE backlog_bugs
+               SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+             WHERE bug_id = ?
+            """,
+            (
+                json.dumps([owned_file]),
+                json.dumps(
+                    [
+                        {
+                            "id": f"AC-BATCH-GUIDE-{suffix}-{index}",
+                            "required_scope": {
+                                "kind": "files",
+                                "files": [owned_file],
+                            },
+                        }
+                    ]
+                ),
+                row_id,
+            ),
+        )
+    conn.commit()
+    observer_session_id = (
+        observer_session_id
+        or _insert_active_observer_session_ref(
+            conn,
+            session_id=f"obs-mf-batch-guide-{suffix}",
+        )
+    )
+    route_token_ref = f"rtok-mf-batch-guide-{suffix}"
+    service_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=service_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["mf_batch_parallel_enter"],
+    )
+    action_input, guide = _guide_bound_mf_batch_action_input(
+        backlog_id=backlog_id,
+        backlog_ids=child_ids,
+        reason=f"Guide-bound batch entry {suffix}.",
+        task_id=f"batch-guide-{suffix}",
+        observer_session_id=observer_session_id,
+        route_token_ref=route_token_ref,
+        target_head_commit=f"target-head-{suffix}",
+        graph_snapshot_id=f"scope-target-head-{suffix}",
+        required_worker_count=required_worker_count,
+    )
+    assert guide["next_legal_action"]["action_input_ready"] is True
+    return {
+        "backlog_id": backlog_id,
+        "child_ids": child_ids,
+        "observer_session_id": observer_session_id,
+        "route_token_ref": route_token_ref,
+        "service_execution_id": service_execution_id,
+        "action_input": action_input,
+        "guide": guide,
+    }
+
+
 def _enter_standalone_mf_parallel_for_allocation_precheck(
     conn: sqlite3.Connection,
     *,
@@ -5869,25 +5983,28 @@ def _enter_verified_batch_child_for_allocation_precheck(
     _persist_contract_runtime_observer_route_ref(
         conn,
         backlog_id=batch_backlog_id,
-        contract_execution_id="",
+        contract_execution_id=server._onboard_service_execution_id(
+            PID, batch_backlog_id
+        ),
         route_token_ref=parent_route_ref,
         allowed_actions=["mf_batch_parallel_enter"],
     )
+    action_input, guide = _guide_bound_mf_batch_action_input(
+        backlog_id=batch_backlog_id,
+        backlog_ids=[child_backlog_id, sibling_backlog_id],
+        reason="Create server-verified batch-child lineage.",
+        task_id=f"batch-allocation-precheck-{suffix}",
+        observer_session_id=observer_session_id,
+        route_token_ref=parent_route_ref,
+        target_head_commit=f"target-head-{suffix}",
+        graph_snapshot_id=f"scope-target-head-{suffix}",
+    )
+    assert guide["next_legal_action"]["action_input_ready"] is True
     batch = server.handle_project_mf_batch_parallel_enter(
         _ctx(
             {"project_id": PID},
             method="POST",
-            body={
-                "backlog_id": batch_backlog_id,
-                "backlog_ids": [child_backlog_id, sibling_backlog_id],
-                "reason": "Create server-verified batch-child lineage.",
-                "task_id": f"batch-allocation-precheck-{suffix}",
-                "observer_session_id": observer_session_id,
-                "observer_route_token_ref": parent_route_ref,
-                "onboard_service_waiver": True,
-                "target_head_commit": f"target-head-{suffix}",
-                "graph_snapshot_id": f"scope-target-head-{suffix}",
-            },
+            body=action_input,
         )
     )
     child_successor = next(
@@ -64224,26 +64341,26 @@ def test_backlog_close_accepts_mf_batch_parent_onboard_service_authority(
     _persist_contract_runtime_observer_route_ref(
         conn,
         backlog_id=backlog_id,
-        contract_execution_id="",
+        contract_execution_id=server._onboard_service_execution_id(PID, backlog_id),
         route_token_ref=parent_route_token_ref,
         allowed_actions=["mf_batch_parallel_enter"],
     )
-
+    action_input, guide = _guide_bound_mf_batch_action_input(
+        backlog_id=backlog_id,
+        backlog_ids=[child_a, child_b],
+        reason="Human approved multi-row fan-out through onboard service.",
+        task_id="mf-batch-parent-close",
+        observer_session_id=observer_session_id,
+        route_token_ref=parent_route_token_ref,
+        target_head_commit="target-head-batch-parent",
+        graph_snapshot_id="snapshot-batch-parent",
+    )
+    assert guide["next_legal_action"]["action_input_ready"] is True
     entered = server.handle_project_mf_batch_parallel_enter(
         _ctx(
             {"project_id": PID},
             method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "backlog_ids": [child_a, child_b],
-                "reason": "Human approved multi-row fan-out through onboard service.",
-                "task_id": "mf-batch-parent-close",
-                "observer_session_id": observer_session_id,
-                "observer_route_token_ref": parent_route_token_ref,
-                "onboard_service_waiver": True,
-                "target_head_commit": "target-head-batch-parent",
-                "graph_snapshot_id": "snapshot-batch-parent",
-            },
+            body=action_input,
         )
     )
     parent_execution_id = entered["parent_contract_execution_id"]
@@ -64410,26 +64527,25 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
     _persist_contract_runtime_observer_route_ref(
         conn,
         backlog_id=backlog_id,
-        contract_execution_id="",
+        contract_execution_id=server._onboard_service_execution_id(PID, backlog_id),
         route_token_ref=parent_route_token_ref,
         allowed_actions=["mf_batch_parallel_enter"],
     )
-
+    action_input, _guide = _guide_bound_mf_batch_action_input(
+        backlog_id=backlog_id,
+        backlog_ids=[child_a, child_b],
+        reason="Build a completed source-backed batch parent fixture.",
+        task_id="playback-mf-batch-unknown-current",
+        observer_session_id=observer_session_id,
+        route_token_ref=parent_route_token_ref,
+        target_head_commit=close_commit,
+        graph_snapshot_id="snapshot-playback-mf-batch-parent",
+    )
     entered = server.handle_project_mf_batch_parallel_enter(
         _ctx(
             {"project_id": PID},
             method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "backlog_ids": [child_a, child_b],
-                "reason": "Build a completed source-backed batch parent fixture.",
-                "task_id": "playback-mf-batch-unknown-current",
-                "observer_session_id": observer_session_id,
-                "observer_route_token_ref": parent_route_token_ref,
-                "onboard_service_waiver": True,
-                "target_head_commit": close_commit,
-                "graph_snapshot_id": "snapshot-playback-mf-batch-parent",
-            },
+            body=action_input,
         )
     )
     parent_execution_id = entered["parent_contract_execution_id"]
@@ -105772,26 +105888,27 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     _persist_contract_runtime_observer_route_ref(
         conn,
         backlog_id=backlog_id,
-        contract_execution_id="",
+        contract_execution_id=server._onboard_service_execution_id(PID, backlog_id),
         route_token_ref=route_token_ref,
         allowed_actions=["mf_batch_parallel_enter"],
     )
-
+    action_input, guide = _guide_bound_mf_batch_action_input(
+        backlog_id=backlog_id,
+        backlog_ids=[child_a, child_b],
+        reason="Human approved multi-row fan-out through onboard service.",
+        task_id="batch-parallel-onboard-service",
+        observer_session_id=observer_session_id,
+        route_token_ref=route_token_ref,
+        target_head_commit="target-head-1",
+        graph_snapshot_id="scope-target-head-1",
+        required_worker_count=2,
+    )
+    assert guide["next_legal_action"]["action_input_ready"] is True
     result = server.handle_project_mf_batch_parallel_enter(
         _ctx(
             {"project_id": PID},
             method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "backlog_ids": [child_a, child_b],
-                "reason": "Human approved multi-row fan-out through onboard service.",
-                "task_id": "batch-parallel-onboard-service",
-                "observer_session_id": observer_session_id,
-                "observer_route_token_ref": route_token_ref,
-                "onboard_service_waiver": True,
-                "target_head_commit": "target-head-1",
-                "graph_snapshot_id": "scope-target-head-1",
-            },
+            body=action_input,
         )
     )
 
@@ -105842,6 +105959,10 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
         child_a,
         child_b,
     ]
+    assert all(
+        item["body"]["metadata"]["required_worker_count"] == 2
+        for item in result["per_row_successors"]
+    )
     assert all(
         item["requires_distinct_route_token_ref"]
         and item["route_token_task_id_policy"] == "mf_parallel_successor_execution_id"
@@ -106324,6 +106445,510 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
         runtime_context_id_for_branch_context(batch_context)
     )
     assert "contract_merge_authority" not in batch_scope
+
+
+def test_mf_batch_guide_entry_replay_survives_timeline_window_and_active_epoch(
+    conn,
+):
+    first = _prepare_guide_bound_mf_batch_entry(
+        conn,
+        suffix="REPLAY-WINDOW",
+        required_worker_count=2,
+    )
+    fresh = _prepare_guide_bound_mf_batch_entry(
+        conn,
+        suffix="ACTIVE-EPOCH-FRESH",
+        observer_session_id=first["observer_session_id"],
+    )
+    conn.executemany(
+        """
+        INSERT INTO task_timeline_events (
+            project_id, backlog_id, task_id, event_type, phase, event_kind,
+            actor, status, payload_json, created_at
+        ) VALUES (?, ?, ?, 'test.older_event', 'test', 'diagnostic',
+                  'test', 'accepted', '{}', '2026-08-03T00:00:00Z')
+        """,
+        [
+            (PID, first["backlog_id"], f"older-event-{index}")
+            for index in range(1005)
+        ],
+    )
+    conn.commit()
+
+    entered = server.handle_project_mf_batch_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=first["action_input"],
+        )
+    )
+    assert entered["replayed"] is False
+    assert entered["writes_performed"] is True
+    assert entered["event"]["id"] > 1000
+    assert all(
+        successor["body"]["owned_files"] == successor["owned_files"]
+        and successor["body"]["target_files"] == successor["target_files"]
+        for successor in entered["per_row_successors"]
+    )
+
+    def durable_counts() -> tuple[int, int, int, int]:
+        return (
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM task_timeline_events
+                 WHERE project_id = ? AND backlog_id = ?
+                   AND event_type = 'mf_batch_parallel.entered'
+                """,
+                (PID, first["backlog_id"]),
+            ).fetchone()[0],
+            conn.execute(
+                "SELECT COUNT(*) FROM parallel_branch_merge_queue_items"
+            ).fetchone()[0],
+            conn.execute(
+                "SELECT COUNT(*) FROM contract_runtime_executions"
+            ).fetchone()[0],
+            conn.execute(
+                "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+            ).fetchone()[0],
+        )
+
+    before_replay = durable_counts()
+    parallel_branch_runtime.upsert_integration_epoch(
+        conn,
+        parallel_branch_runtime.IntegrationEpoch(
+            project_id=PID,
+            batch_id="active-epoch-after-batch-entry",
+            epoch_id="epoch-after-batch-entry",
+            coordination_backlog_id=first["backlog_id"],
+            target_ref="refs/heads/main",
+            base_head="a" * 40,
+            current_head="a" * 40,
+            merge_queue_id="mq-active-epoch-after-batch-entry",
+        ),
+    )
+    conn.commit()
+
+    replay = server.handle_project_mf_batch_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=first["action_input"],
+        )
+    )
+    assert replay["replayed"] is True
+    assert replay["writes_performed"] is False
+    assert replay["event"]["id"] == entered["event"]["id"]
+    assert replay["merge_queue_plan"] == entered["merge_queue_plan"]
+    assert durable_counts() == before_replay
+
+    status, blocked = server.handle_project_mf_batch_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=fresh["action_input"],
+        )
+    )
+    assert status == 409
+    assert blocked["error"] == "integration_epoch_dispatch_base_frozen"
+    assert durable_counts() == before_replay
+
+
+@pytest.mark.parametrize(
+    ("field", "mutate", "expected_code"),
+    [
+        (
+            "onboard_service_waiver",
+            lambda body: body.update({"onboard_service_waiver": True}),
+            "mf_batch_parallel_caller_authority_claim_rejected",
+        ),
+        (
+            "parent_contract_execution_id",
+            lambda body: body.update(
+                {"parent_contract_execution_id": "cex-caller-forged"}
+            ),
+            "mf_batch_parallel_caller_authority_claim_rejected",
+        ),
+        (
+            "merge_queue_id",
+            lambda body: body.update({"merge_queue_id": "mq-caller-forged"}),
+            "mf_batch_parallel_merge_queue_authority_claim_rejected",
+        ),
+        (
+            "schema_version",
+            lambda body: body.update({"schema_version": "forged.v1"}),
+            "mf_batch_parallel_entry_semantics_mismatch",
+        ),
+        (
+            "metadata.batch_scope",
+            lambda body: body["metadata"].update({"batch_scope": "forged"}),
+            "mf_batch_parallel_entry_semantics_mismatch",
+        ),
+        (
+            "metadata.successor_contract_template_id",
+            lambda body: body["metadata"].update(
+                {"successor_contract_template_id": "mf_parallel.forged"}
+            ),
+            "mf_batch_parallel_entry_semantics_mismatch",
+        ),
+        (
+            "metadata.nested_worker_fanout_supported",
+            lambda body: body["metadata"].update(
+                {"nested_worker_fanout_supported": True}
+            ),
+            "mf_batch_parallel_entry_semantics_mismatch",
+        ),
+        (
+            "project_id",
+            lambda body: body.update({"project_id": "wrong-project"}),
+            "mf_batch_parallel_entry_contract_mismatch",
+        ),
+        (
+            "backlog_id",
+            lambda body: body.update({"bug_id": "AC-WRONG-BACKLOG"}),
+            "mf_batch_parallel_entry_alias_conflict",
+        ),
+        (
+            "observer_session_id",
+            lambda body: body.update({"observer_session_id": "obs-wrong"}),
+            "mf_batch_parallel_entry_contract_mismatch",
+        ),
+        (
+            "observer_route_token_ref",
+            lambda body: body.update(
+                {"observer_route_token_ref": "rtok-wrong"}
+            ),
+            "mf_batch_parallel_entry_contract_mismatch",
+        ),
+    ],
+)
+def test_mf_batch_entry_rejects_forged_authority_and_identity_without_writes(
+    conn,
+    field,
+    mutate,
+    expected_code,
+):
+    prepared = _prepare_guide_bound_mf_batch_entry(
+        conn,
+        suffix=f"FORGED-{field.replace('.', '-').upper()}",
+    )
+    body = copy.deepcopy(prepared["action_input"])
+    mutate(body)
+    before = (
+        conn.execute(
+            "SELECT COUNT(*) FROM task_timeline_events"
+        ).fetchone()[0],
+        conn.execute(
+            "SELECT COUNT(*) FROM parallel_branch_merge_queue_items"
+        ).fetchone()[0],
+        conn.execute(
+            "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+        ).fetchone()[0],
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_mf_batch_parallel_enter(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+    assert rejected.value.code == expected_code
+    assert rejected.value.details["field"] == field
+    assert rejected.value.details["writes_performed"] is False
+    assert (
+        conn.execute("SELECT COUNT(*) FROM task_timeline_events").fetchone()[0],
+        conn.execute(
+            "SELECT COUNT(*) FROM parallel_branch_merge_queue_items"
+        ).fetchone()[0],
+        conn.execute(
+            "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+        ).fetchone()[0],
+    ) == before
+
+
+@pytest.mark.parametrize("corrupt_field", ["source", "action_input_hash"])
+def test_mf_batch_binding_corruption_blocks_guide_and_entry_without_writes(
+    conn,
+    corrupt_field,
+):
+    prepared = _prepare_guide_bound_mf_batch_entry(
+        conn,
+        suffix=f"CORRUPT-{corrupt_field.upper()}",
+    )
+    parent = server._contract_runtime_store(conn).get(
+        prepared["service_execution_id"]
+    )
+    corrupted = copy.deepcopy(parent)
+    binding = corrupted["metadata"]["mf_batch_parallel_entry_binding"]
+    binding[corrupt_field] = "forged-binding-value"
+    conn.execute(
+        """
+        UPDATE contract_runtime_executions
+           SET record_json = ?
+         WHERE contract_execution_id = ?
+        """,
+        (json.dumps(corrupted), prepared["service_execution_id"]),
+    )
+    conn.commit()
+    before = (
+        conn.execute("SELECT COUNT(*) FROM task_timeline_events").fetchone()[0],
+        conn.execute(
+            "SELECT COUNT(*) FROM parallel_branch_merge_queue_items"
+        ).fetchone()[0],
+    )
+    for call in (
+        lambda: server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": prepared["backlog_id"],
+                    "role": "observer",
+                    "work_type": "multi_backlog_parallel",
+                    "response_view": "compact",
+                },
+            )
+        ),
+        lambda: server.handle_project_mf_batch_parallel_enter(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=prepared["action_input"],
+            )
+        ),
+    ):
+        with pytest.raises(GovernanceError) as rejected:
+            call()
+        assert rejected.value.code == "mf_batch_parallel_guide_binding_invalid"
+        assert rejected.value.details["field"] == corrupt_field
+        assert rejected.value.details["writes_performed"] is False
+        assert (
+            conn.execute("SELECT COUNT(*) FROM task_timeline_events").fetchone()[0],
+            conn.execute(
+                "SELECT COUNT(*) FROM parallel_branch_merge_queue_items"
+            ).fetchone()[0],
+        ) == before
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_field"),
+    [
+        ("inactive_session", "observer_session_id"),
+        ("wrong_route_scope", "observer_route_token_ref"),
+    ],
+)
+def test_mf_batch_first_complete_guide_requires_proof_before_materialization(
+    conn,
+    failure_kind,
+    expected_field,
+):
+    suffix = failure_kind.upper()
+    backlog_id = f"AC-MF-BATCH-GUIDE-PROOF-{suffix}"
+    child_ids = [f"{backlog_id}-A", f"{backlog_id}-B"]
+    for index, row_id in enumerate([backlog_id, *child_ids]):
+        _insert_simple_mf_close_backlog(conn, row_id)
+        owned_file = f"agent/governance/guide-proof-{failure_kind}-{index}.py"
+        conn.execute(
+            """
+            UPDATE backlog_bugs
+               SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+             WHERE bug_id = ?
+            """,
+            (
+                json.dumps([owned_file]),
+                json.dumps(
+                    [
+                        {
+                            "id": f"AC-GUIDE-PROOF-{suffix}-{index}",
+                            "required_scope": {
+                                "kind": "files",
+                                "files": [owned_file],
+                            },
+                        }
+                    ]
+                ),
+                row_id,
+            ),
+        )
+    conn.commit()
+    active_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id=f"obs-guide-proof-{failure_kind}",
+    )
+    service_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    valid_route_ref = f"rtok-guide-proof-valid-{failure_kind}"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=service_execution_id,
+        route_token_ref=valid_route_ref,
+        allowed_actions=["mf_batch_parallel_enter"],
+    )
+    presented_session_id = active_session_id
+    presented_route_ref = valid_route_ref
+    if failure_kind == "inactive_session":
+        presented_session_id = "obs-guide-proof-inactive"
+    else:
+        presented_route_ref = "rtok-guide-proof-wrong-scope"
+        _persist_contract_runtime_observer_route_ref(
+            conn,
+            backlog_id=backlog_id,
+            contract_execution_id="cex-wrong-guide-scope",
+            route_token_ref=presented_route_ref,
+            allowed_actions=["mf_batch_parallel_enter"],
+        )
+    body = {
+        "backlog_id": backlog_id,
+        "backlog_ids": child_ids,
+        "role": "observer",
+        "work_type": "multi_backlog_parallel",
+        "reason": f"Reject first complete guide {failure_kind}.",
+        "task_id": f"batch-guide-proof-{failure_kind}",
+        "observer_session_id": presented_session_id,
+        "observer_route_token_ref": presented_route_ref,
+        "target_head_commit": f"target-head-{failure_kind}",
+        "graph_snapshot_id": f"scope-target-head-{failure_kind}",
+        "metadata": {"required_worker_count": 1},
+        "response_view": "compact",
+    }
+    server._contract_runtime_store(conn)
+
+    def mutation_counts() -> tuple[int, int, int]:
+        current_table = conn.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'backlog_contract_chain_current'
+            """
+        ).fetchone()[0]
+        current_count = (
+            conn.execute(
+                "SELECT COUNT(*) FROM backlog_contract_chain_current"
+            ).fetchone()[0]
+            if current_table
+            else 0
+        )
+        return (
+            conn.execute(
+                "SELECT COUNT(*) FROM contract_runtime_executions"
+            ).fetchone()[0],
+            current_count,
+            conn.execute(
+                "SELECT COUNT(*) FROM task_timeline_events"
+            ).fetchone()[0],
+        )
+
+    before = mutation_counts()
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_onboard_route_guide(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+    assert rejected.value.code == "mf_batch_parallel_guide_identity_rejected"
+    assert rejected.value.details["field"] == expected_field
+    assert rejected.value.details["writes_performed"] is False
+    assert mutation_counts() == before
+    with pytest.raises(ContractRuntimeError):
+        server._contract_runtime_store(conn).get(service_execution_id)
+
+    action_input, guide = _guide_bound_mf_batch_action_input(
+        backlog_id=backlog_id,
+        backlog_ids=child_ids,
+        reason=f"Accept corrected complete guide {failure_kind}.",
+        task_id=f"batch-guide-proof-{failure_kind}",
+        observer_session_id=active_session_id,
+        route_token_ref=valid_route_ref,
+        target_head_commit=f"target-head-{failure_kind}",
+        graph_snapshot_id=f"scope-target-head-{failure_kind}",
+    )
+    assert guide["next_legal_action"]["action_input_ready"] is True
+    assert action_input["observer_session_id"] == active_session_id
+    assert action_input["observer_route_token_ref"] == valid_route_ref
+
+
+def test_mf_batch_legacy_parent_authority_blocks_second_canonical_entry(conn):
+    prepared = _prepare_guide_bound_mf_batch_entry(
+        conn,
+        suffix="LEGACY-PARENT-CONFLICT",
+    )
+    action_input = prepared["action_input"]
+    batch_id = server._mf_batch_parallel_batch_id(
+        PID,
+        prepared["backlog_id"],
+        prepared["child_ids"],
+        action_input["task_id"],
+    )
+    merge_queue_id = server._contract_runtime_stable_id(
+        "mq",
+        PID,
+        prepared["backlog_id"],
+        batch_id,
+        server.MF_BATCH_PARALLEL_RECORD_CONTRACT_ID,
+    )
+    legacy_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=prepared["backlog_id"],
+        task_id=action_input["task_id"],
+        event_type="mf_batch_parallel.entered",
+        phase="orchestration",
+        event_kind="contract_binding",
+        actor="observer",
+        status="accepted",
+        payload={
+            "batch_id": batch_id,
+            "parent_contract_execution_id": "cex-legacy-onboard-parent",
+            "merge_queue_plan": {"merge_queue_id": merge_queue_id},
+        },
+    )
+    conn.commit()
+    before_event_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_mf_batch_parallel_enter(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=action_input,
+            )
+        )
+    assert rejected.value.code == (
+        "mf_batch_parallel_existing_parent_authority_conflict"
+    )
+    assert rejected.value.details["field"] == "parent_contract_execution_id"
+    assert rejected.value.details["expected"] == prepared["service_execution_id"]
+    assert rejected.value.details["event_ids"] == [legacy_event["id"]]
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == before_event_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_merge_queue_items"
+    ).fetchone()[0] == 0
+
+
+def test_mf_batch_mcp_schema_matches_copy_safe_guide_authority_contract():
+    from agent.governance import mcp_server as governance_mcp_server
+
+    batch_schema = next(
+        tool for tool in governance_mcp_server.TOOLS
+        if tool["name"] == "mf_batch_parallel_enter"
+    )["inputSchema"]
+    properties = batch_schema["properties"]
+    assert "onboard_service_waiver" not in properties
+    assert "merge_queue_id" not in properties
+    assert properties["schema_version"]["const"] == (
+        "onboard_route_guide.mf_batch_parallel_entry_input.v1"
+    )
+    metadata = properties["metadata"]["properties"]
+    assert metadata["batch_scope"]["const"] == (
+        "row_scoped_mf_parallel_successors"
+    )
+    assert metadata["successor_contract_template_id"]["const"] == "mf_parallel.v2"
+    assert metadata["nested_worker_fanout_supported"]["const"] is False
+    assert metadata["initial_two_worker_selection_supported"]["const"] is True
+    assert metadata["revision_to_two_workers_supported"]["const"] is False
+
+    parallel_schema = next(
+        tool for tool in governance_mcp_server.TOOLS
+        if tool["name"] == "mf_parallel_enter"
+    )["inputSchema"]
+    assert "onboard_service_waiver" in parallel_schema["properties"]
 
 
 def test_batch_read_model_does_not_guess_ambiguous_planned_item_binding():
@@ -106888,35 +107513,50 @@ def test_mf_batch_parallel_enter_blocks_without_preflight_target_head(conn):
     _persist_contract_runtime_observer_route_ref(
         conn,
         backlog_id=backlog_id,
-        contract_execution_id="",
+        contract_execution_id=server._onboard_service_execution_id(PID, backlog_id),
         route_token_ref=route_token_ref,
         allowed_actions=["mf_batch_parallel_enter"],
     )
-
+    action_input, guide = _guide_bound_mf_batch_action_input(
+        backlog_id=backlog_id,
+        backlog_ids=[child_a, child_b],
+        reason="Human approved multi-row fan-out through onboard service.",
+        task_id="batch-parallel-onboard-service-blocked",
+        observer_session_id=observer_session_id,
+        route_token_ref=route_token_ref,
+        target_head_commit="",
+        graph_snapshot_id="scope-batch-preflight-blocked",
+    )
+    assert guide["next_legal_action"]["action_input_ready"] is False
+    assert "target_head_commit" in guide["next_legal_action"][
+        "action_input_missing_fields"
+    ]
+    queue_count_before = conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_merge_queue_items"
+    ).fetchone()[0]
+    event_count_before = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
     with pytest.raises(
-        ValidationError,
-        match="mf_batch_parallel preflight gate blocked fanout_ready",
+        GovernanceError,
+        match="ready durable guide-issued action_input",
     ) as exc:
         server.handle_project_mf_batch_parallel_enter(
             _ctx(
                 {"project_id": PID},
                 method="POST",
-                body={
-                    "backlog_id": backlog_id,
-                    "backlog_ids": [child_a, child_b],
-                    "reason": "Human approved multi-row fan-out through onboard service.",
-                    "task_id": "batch-parallel-onboard-service-blocked",
-                    "observer_session_id": observer_session_id,
-                    "observer_route_token_ref": route_token_ref,
-                    "onboard_service_waiver": True,
-                },
+                body=action_input,
             )
         )
-
-    assert exc.value.details["preflight_gate"]["fanout_ready"] is False
-    assert {
-        blocker["code"] for blocker in exc.value.details["preflight_gate"]["blockers"]
-    } == {"missing_target_head_commit"}
+    assert exc.value.code == "mf_batch_parallel_guide_binding_required"
+    assert exc.value.details["field"] == "guide_action_input.ready"
+    assert exc.value.details["writes_performed"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_merge_queue_items"
+    ).fetchone()[0] == queue_count_before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == event_count_before
 
 
 def test_mf_parallel_enter_blocks_incomplete_onboard_root(conn):

@@ -2318,6 +2318,31 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
                 },
+                "backlog_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "For mf_batch_parallel selection, the exact child rows "
+                        "to bind into the copy-safe entry action_input."
+                    ),
+                },
+                "task_id": {"type": "string"},
+                "reason": {"type": "string"},
+                "human_reason": {"type": "string"},
+                "observer_session_id": {"type": "string"},
+                "target_head_commit": {"type": "string"},
+                "target_ref": {"type": "string"},
+                "graph_snapshot_id": {"type": "string"},
+                "preflight_mode": {"type": "string"},
+                "metadata": {
+                    "type": "object",
+                    "properties": {
+                        "required_worker_count": {
+                            "type": "integer",
+                            "enum": [1, 2],
+                        }
+                    },
+                },
                 "response_view": {
                     "type": "string",
                     "enum": ["compact", "full"],
@@ -2429,6 +2454,18 @@ TOOLS: list[dict] = [
                     "description": "Audit-only claim; HTTP facade derives effective role from token/session.",
                 },
                 "contract_execution_id": {"type": "string"},
+                "parent_batch_id": {
+                    "type": "string",
+                    "description": "Server-issued batch parent id copied from mf_batch_parallel per-row successor.",
+                },
+                "merge_queue_id": {
+                    "type": "string",
+                    "description": "Server-issued canonical merge queue id for a verified batch child.",
+                },
+                "merge_queue_item": {
+                    "type": "object",
+                    "description": "Server-issued durable queue item projection for a verified batch child.",
+                },
                 "route_token_ref": {"type": "string"},
                 "observer_route_token_ref": {
                     "type": "string",
@@ -2534,6 +2571,10 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "schema_version": {
+                    "type": "string",
+                    "const": "onboard_route_guide.mf_batch_parallel_entry_input.v1",
+                },
                 "project_id": {"type": "string"},
                 "backlog_id": {
                     "type": "string",
@@ -2565,10 +2606,6 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
                 },
-                "onboard_service_waiver": {
-                    "type": "boolean",
-                    "description": "Use the onboard_route_guide service parent instead of legacy onboard_contract.",
-                },
                 "target_head_commit": {"type": "string"},
                 "target_head": {
                     "type": "string",
@@ -2589,13 +2626,57 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Alias for preflight_mode.",
                 },
-                "merge_queue_id": {"type": "string"},
-                "metadata": {"type": "object"},
+                "metadata": {
+                    "type": "object",
+                    "properties": {
+                        "required_worker_count": {
+                            "type": "integer",
+                            "enum": [1, 2],
+                        },
+                        "batch_scope": {
+                            "type": "string",
+                            "const": "row_scoped_mf_parallel_successors",
+                        },
+                        "successor_contract_template_id": {
+                            "type": "string",
+                            "const": "mf_parallel.v2",
+                        },
+                        "nested_worker_fanout_supported": {
+                            "type": "boolean",
+                            "const": False,
+                        },
+                        "initial_two_worker_selection_supported": {
+                            "type": "boolean",
+                            "const": True,
+                        },
+                        "revision_to_two_workers_supported": {
+                            "type": "boolean",
+                            "const": False,
+                        },
+                    },
+                    "required": ["required_worker_count"],
+                },
             },
-            "required": ["project_id", "backlog_ids", "reason"],
+            "required": [
+                "project_id",
+                "backlog_ids",
+                "reason",
+                "observer_session_id",
+                "target_head_commit",
+                "graph_snapshot_id",
+                "metadata",
+            ],
             "anyOf": [
                 {"required": ["backlog_id"]},
                 {"required": ["bug_id"]},
+            ],
+            "allOf": [
+                {
+                    "anyOf": [
+                        {"required": ["route_token_ref"]},
+                        {"required": ["observer_route_token_ref"]},
+                    ]
+                }
             ],
         },
     },

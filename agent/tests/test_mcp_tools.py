@@ -3106,20 +3106,37 @@ def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
         "qa_session_heartbeat",
     }.issubset(names)
     assert "contract_execution_id" not in _tool_properties("onboard_contract_start")
-    assert _tool_properties("mf_batch_parallel_enter").keys() >= {
+    batch_properties = _tool_properties("mf_batch_parallel_enter")
+    assert batch_properties.keys() >= {
+        "schema_version",
         "backlog_id",
         "bug_id",
         "backlog_ids",
         "observer_session_id",
         "observer_route_token_ref",
-        "onboard_service_waiver",
         "target_head_commit",
         "target_ref",
         "snapshot_id",
         "graph_snapshot_id",
         "preflight_mode",
         "merge_mode",
+        "metadata",
+    }
+    assert "onboard_service_waiver" not in batch_properties
+    assert "merge_queue_id" not in batch_properties
+    assert batch_properties["schema_version"]["const"] == (
+        "onboard_route_guide.mf_batch_parallel_entry_input.v1"
+    )
+    assert batch_properties["metadata"]["properties"][
+        "nested_worker_fanout_supported"
+    ]["const"] is False
+    assert _tool_properties("mf_parallel_enter").keys() >= {
+        "parent_batch_id",
         "merge_queue_id",
+        "merge_queue_item",
+        "onboard_service_waiver",
+        "owned_files",
+        "target_files",
     }
     assert _tool_properties("observer_hotfix_enter").keys() >= {
         "observer_session_id",

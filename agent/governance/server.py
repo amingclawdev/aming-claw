@@ -92567,6 +92567,319 @@ def _onboard_service_parent_materialized(
     return _onboard_service_record(record)
 
 
+def _onboard_service_verified_mf_batch_entry_binding(
+    record: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    require_ready: bool,
+) -> dict[str, Any]:
+    """Return a server-owned batch binding or fail closed on any drift."""
+
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    raw_binding = metadata.get("mf_batch_parallel_entry_binding")
+    binding = dict(raw_binding) if isinstance(raw_binding, Mapping) else {}
+    expected_parent_execution_id = _onboard_service_execution_id(
+        project_id, backlog_id
+    )
+    action_input = (
+        dict(binding.get("action_input"))
+        if isinstance(binding.get("action_input"), Mapping)
+        else {}
+    )
+    action_metadata = (
+        action_input.get("metadata")
+        if isinstance(action_input.get("metadata"), Mapping)
+        else {}
+    )
+    recomputed_missing = _mf_batch_parallel_entry_action_input_missing(
+        action_input
+    )
+    expected_values: dict[str, Any] = {
+        "schema_version": "onboard_service.mf_batch_entry_binding.v1",
+        "source": "onboard_route_guide_service",
+        "parent_contract_execution_id": expected_parent_execution_id,
+        "merge_queue_id_server_derived": True,
+        "caller_authority_fields_accepted": False,
+        "action_input.schema_version": (
+            "onboard_route_guide.mf_batch_parallel_entry_input.v1"
+        ),
+        "action_input.project_id": project_id,
+        "action_input.backlog_id": backlog_id,
+        "action_input.metadata.batch_scope": (
+            "row_scoped_mf_parallel_successors"
+        ),
+        "action_input.metadata.successor_contract_template_id": (
+            MF_PARALLEL_CONTRACT_ID
+        ),
+        "action_input.metadata.nested_worker_fanout_supported": False,
+        "action_input.metadata.initial_two_worker_selection_supported": True,
+        "action_input.metadata.revision_to_two_workers_supported": False,
+        "action_input_hash": stable_sha256(action_input),
+        "missing_fields": recomputed_missing,
+        "ready": not recomputed_missing,
+    }
+    actual_values: dict[str, Any] = {
+        "schema_version": binding.get("schema_version"),
+        "source": binding.get("source"),
+        "parent_contract_execution_id": binding.get(
+            "parent_contract_execution_id"
+        ),
+        "merge_queue_id_server_derived": binding.get(
+            "merge_queue_id_server_derived"
+        ),
+        "caller_authority_fields_accepted": binding.get(
+            "caller_authority_fields_accepted"
+        ),
+        "action_input.schema_version": action_input.get("schema_version"),
+        "action_input.project_id": action_input.get("project_id"),
+        "action_input.backlog_id": action_input.get("backlog_id"),
+        "action_input.metadata.batch_scope": action_metadata.get("batch_scope"),
+        "action_input.metadata.successor_contract_template_id": (
+            action_metadata.get("successor_contract_template_id")
+        ),
+        "action_input.metadata.nested_worker_fanout_supported": (
+            action_metadata.get("nested_worker_fanout_supported")
+        ),
+        "action_input.metadata.initial_two_worker_selection_supported": (
+            action_metadata.get("initial_two_worker_selection_supported")
+        ),
+        "action_input.metadata.revision_to_two_workers_supported": (
+            action_metadata.get("revision_to_two_workers_supported")
+        ),
+        "action_input_hash": binding.get("action_input_hash"),
+        "missing_fields": list(binding.get("missing_fields") or []),
+        "ready": binding.get("ready"),
+    }
+    mismatches = [
+        {"field": field, "expected": expected, "actual": actual_values[field]}
+        for field, expected in expected_values.items()
+        if actual_values[field] != expected
+    ]
+    if require_ready and not recomputed_missing and binding.get("ready") is not True:
+        mismatches.append(
+            {
+                "field": "ready",
+                "expected": True,
+                "actual": binding.get("ready"),
+            }
+        )
+    if not binding:
+        mismatches.insert(
+            0,
+            {
+                "field": "mf_batch_parallel_entry_binding",
+                "expected": "server_owned_binding",
+                "actual": "missing",
+            },
+        )
+    if not action_input:
+        mismatches.insert(
+            0,
+            {
+                "field": "action_input",
+                "expected": "mapping",
+                "actual": type(binding.get("action_input")).__name__,
+            },
+        )
+    if mismatches:
+        raise GovernanceError(
+            "mf_batch_parallel_guide_binding_invalid",
+            "mf_batch_parallel durable guide binding failed server-authority verification",
+            409,
+            {
+                **mismatches[0],
+                "identity_mismatches": mismatches,
+                "parent_contract_execution_id": expected_parent_execution_id,
+                "writes_performed": False,
+            },
+        )
+    if require_ready and recomputed_missing:
+        raise GovernanceError(
+            "mf_batch_parallel_guide_binding_required",
+            "mf_batch_parallel durable guide binding is incomplete",
+            422,
+            {
+                "field": "missing_fields",
+                "expected": [],
+                "actual": recomputed_missing,
+                "writes_performed": False,
+            },
+        )
+    return binding
+
+
+def _onboard_service_require_mf_batch_guide_observer_proof(
+    ctx: RequestContext | None,
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    """Verify first-write batch guide identity before any durable mutation."""
+
+    service_execution_id = _onboard_service_execution_id(project_id, backlog_id)
+    if ctx is None:
+        raise GovernanceError(
+            "mf_batch_parallel_guide_identity_rejected",
+            "first complete mf_batch_parallel guide binding requires request-scoped observer proof",
+            403,
+            {
+                "field": "request_context",
+                "expected": "authenticated_request_context",
+                "actual": "missing",
+                "parent_contract_execution_id": service_execution_id,
+                "writes_performed": False,
+            },
+        )
+    try:
+        proof = _resolve_contract_runtime_observer_proof(
+            ctx,
+            conn,
+            project_id=project_id,
+            action="mf_batch_parallel_enter",
+            backlog_id=backlog_id,
+            contract_execution_id=service_execution_id,
+        )
+    except PermissionDeniedError as exc:
+        proof_details = dict(exc.details or {})
+        proof_error = str(proof_details.get("proof_error") or "")
+        field = (
+            "observer_session_id"
+            if "session" in proof_error
+            else "observer_route_token_ref"
+        )
+        expected: Any = (
+            "active_observer_session"
+            if field == "observer_session_id"
+            else {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": service_execution_id,
+                "allowed_action": "mf_batch_parallel_enter",
+            }
+        )
+        raise GovernanceError(
+            "mf_batch_parallel_guide_identity_rejected",
+            "first complete mf_batch_parallel guide binding requires active exact observer proof",
+            403,
+            {
+                **proof_details,
+                "field": field,
+                "expected": expected,
+                "actual": _contract_runtime_ref_value(
+                    ctx,
+                    field,
+                    "observer_session_ref"
+                    if field == "observer_session_id"
+                    else "route_token_ref",
+                ),
+                "parent_contract_execution_id": service_execution_id,
+                "writes_performed": False,
+            },
+        ) from exc
+    if not proof:
+        raise GovernanceError(
+            "mf_batch_parallel_guide_identity_rejected",
+            "first complete mf_batch_parallel guide binding requires active exact observer proof",
+            403,
+            {
+                "field": "observer_session_id",
+                "expected": "active_observer_session",
+                "actual": "missing",
+                "parent_contract_execution_id": service_execution_id,
+                "writes_performed": False,
+            },
+        )
+    return proof
+
+
+def _onboard_service_bind_mf_batch_entry_contract(
+    conn,
+    *,
+    record: Mapping[str, Any],
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str,
+    request_body: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Persist the exact guide-issued batch body without caller-owned authority."""
+
+    action_input = _mf_batch_parallel_entry_action_input_contract(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+        request_body=request_body,
+    )
+    missing_fields = _mf_batch_parallel_entry_action_input_missing(action_input)
+    binding = {
+        "schema_version": "onboard_service.mf_batch_entry_binding.v1",
+        "source": "onboard_route_guide_service",
+        "action_input": action_input,
+        "action_input_hash": stable_sha256(action_input),
+        "ready": not missing_fields,
+        "missing_fields": missing_fields,
+        "parent_contract_execution_id": _onboard_service_execution_id(
+            project_id, backlog_id
+        ),
+        "merge_queue_id_server_derived": True,
+        "caller_authority_fields_accepted": False,
+    }
+    metadata = (
+        dict(record.get("metadata"))
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    existing = (
+        metadata.get("mf_batch_parallel_entry_binding")
+        if isinstance(metadata.get("mf_batch_parallel_entry_binding"), Mapping)
+        else {}
+    )
+    if existing:
+        existing = _onboard_service_verified_mf_batch_entry_binding(
+            record,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            require_ready=False,
+        )
+    if stable_sha256(existing) == stable_sha256(binding):
+        return dict(record)
+    if existing.get("ready") is True:
+        # The first complete guide projection is the durable generation
+        # contract. Ordinary guide reads may neither revise nor erase it.
+        return dict(record)
+    if missing_fields:
+        # Incomplete discovery remains advisory and must not mint mutable
+        # runtime authority that a later compact read could accidentally drift.
+        return dict(record)
+    metadata["mf_batch_parallel_entry_binding"] = binding
+    revision = int(record.get("execution_state_revision") or 0) + 1
+    updated = _onboard_service_refresh_execution_state(
+        {**dict(record), "metadata": metadata},
+        completed_lines=[
+            dict(line)
+            for line in (record.get("completed_lines") or [])
+            if isinstance(line, Mapping)
+        ]
+        or [_onboard_service_waiver_line()],
+        route_token_ref=route_token_ref,
+        revision=revision,
+    )
+    stored = _contract_runtime_store(conn).update(
+        str(record.get("contract_execution_id") or ""),
+        updated,
+        expected_revision=int(record.get("execution_state_revision") or 0),
+    )
+    stored["contract_chain_current"] = upsert_contract_chain_root_current_binding(
+        conn, stored
+    )
+    return stored
+
+
 def _onboard_contract_route_issue_target_files_from_record(
     record: Mapping[str, Any],
 ) -> list[str]:
@@ -96434,6 +96747,175 @@ def _onboard_route_guide_completed_mf_parallel_successor_action_input(
     }
 
 
+_MF_BATCH_PARALLEL_CALLER_AUTHORITY_FIELDS = (
+    "onboard_service_waiver",
+    "legacy_onboard_contract_waived",
+    "waive_onboard_contract",
+    "onboard_service",
+    "onboard_service_parent",
+    "onboard_contract_facade",
+    "parent_contract_execution_id",
+    "root_contract_execution_id",
+    "contract_chain_id",
+)
+
+
+def _mf_batch_parallel_entry_action_input_contract(
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str,
+    request_body: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the single copy-safe batch-entry body used by guide and facade."""
+
+    request = request_body if isinstance(request_body, Mapping) else {}
+    metadata = (
+        request.get("metadata")
+        if isinstance(request.get("metadata"), Mapping)
+        else {}
+    )
+    raw_backlog_ids = request.get("backlog_ids")
+    backlog_ids = (
+        [
+            str(item or "").strip()
+            for item in raw_backlog_ids
+            if str(item or "").strip()
+        ]
+        if isinstance(raw_backlog_ids, list)
+        else []
+    )
+    worker_count = metadata.get("required_worker_count")
+    try:
+        required_worker_count: Any = int(worker_count)
+    except (TypeError, ValueError):
+        required_worker_count = worker_count
+    observer_route_token_ref = str(
+        request.get("observer_route_token_ref")
+        or request.get("route_token_ref")
+        or route_token_ref
+        or ""
+    ).strip()
+    target_head_commit = str(
+        request.get("target_head_commit")
+        or request.get("target_head")
+        or request.get("head_commit")
+        or ""
+    ).strip()
+    snapshot_id = str(
+        request.get("graph_snapshot_id")
+        or request.get("snapshot_id")
+        or ""
+    ).strip()
+    action_input = {
+        "schema_version": "onboard_route_guide.mf_batch_parallel_entry_input.v1",
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "backlog_ids": backlog_ids,
+        "task_id": str(
+            request.get("task_id")
+            or _onboard_service_execution_id(project_id, backlog_id)
+        ).strip(),
+        "reason": str(
+            request.get("reason") or request.get("human_reason") or ""
+        ).strip(),
+        "observer_session_id": str(
+            request.get("observer_session_id")
+            or request.get("observer_session_ref")
+            or ""
+        ).strip(),
+        "observer_route_token_ref": observer_route_token_ref,
+        "target_head_commit": target_head_commit,
+        "graph_snapshot_id": snapshot_id,
+        "target_ref": str(request.get("target_ref") or "refs/heads/main").strip(),
+        "preflight_mode": str(
+            request.get("preflight_mode")
+            or request.get("merge_mode")
+            or "parallel"
+        ).strip(),
+        "metadata": {
+            "required_worker_count": required_worker_count,
+            "batch_scope": "row_scoped_mf_parallel_successors",
+            "successor_contract_template_id": MF_PARALLEL_CONTRACT_ID,
+            # Two workers may be selected only at the initial child enter.
+            # The existing child revise contract still rejects a later 1 -> 2
+            # nested expansion because it has no durable nested merge queue.
+            "nested_worker_fanout_supported": False,
+            "initial_two_worker_selection_supported": True,
+            "revision_to_two_workers_supported": False,
+        },
+    }
+    return action_input
+
+
+def _mf_batch_parallel_entry_action_input_missing(
+    action_input: Mapping[str, Any],
+) -> list[str]:
+    metadata = (
+        action_input.get("metadata")
+        if isinstance(action_input.get("metadata"), Mapping)
+        else {}
+    )
+    missing = [
+        field
+        for field in (
+            "project_id",
+            "backlog_id",
+            "reason",
+            "observer_session_id",
+            "observer_route_token_ref",
+            "target_head_commit",
+            "graph_snapshot_id",
+        )
+        if not str(action_input.get(field) or "").strip()
+    ]
+    backlog_ids = action_input.get("backlog_ids")
+    if (
+        not isinstance(backlog_ids, list)
+        or len(backlog_ids) < 2
+        or len(set(str(item) for item in backlog_ids)) != len(backlog_ids)
+    ):
+        missing.append("backlog_ids")
+    if metadata.get("required_worker_count") not in {1, 2}:
+        missing.append("metadata.required_worker_count")
+    return missing
+
+
+def _onboard_route_guide_completed_mf_batch_action_input(
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str,
+    request_body: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    action_input = _mf_batch_parallel_entry_action_input_contract(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+        request_body=request_body,
+    )
+    missing = _mf_batch_parallel_entry_action_input_missing(action_input)
+    return {
+        "schema_version": "onboard_route_guide.mf_batch_parallel_action.v1",
+        "interface": "mf_batch_parallel_enter",
+        "copy_safe": True,
+        "ready": not missing,
+        "missing_fields": missing,
+        "action_input": action_input,
+        "server_derived_authority": {
+            "parent_contract_execution_id": _onboard_service_execution_id(
+                project_id, backlog_id
+            ),
+            "merge_queue_id": "derived_after_batch_id",
+            "caller_claims_accepted": False,
+        },
+        "omitted_server_authority_fields": [
+            *_MF_BATCH_PARALLEL_CALLER_AUTHORITY_FIELDS,
+            "merge_queue_id",
+        ],
+    }
+
+
 def _onboard_route_guide_completed_next_action(
     *,
     role: str = "",
@@ -96444,6 +96926,7 @@ def _onboard_route_guide_completed_next_action(
     backlog_id: str = "",
     route_token_ref: str = "",
     target_files: Sequence[str] = (),
+    request_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     selected_role = str(role or "").strip() or "observer"
     selected_work_type = str(work_type or "").strip()
@@ -96529,6 +97012,12 @@ def _onboard_route_guide_completed_next_action(
             ),
         }
     if selected_work_type in {"multi_backlog_parallel", "mf_batch_parallel"}:
+        batch_action = _onboard_route_guide_completed_mf_batch_action_input(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+            request_body=request_body,
+        )
         return {
             **base,
             "id": "mf_batch_parallel_enter",
@@ -96538,6 +97027,15 @@ def _onboard_route_guide_completed_next_action(
             "requires_role": "observer",
             "requires_route_token_ref": True,
             "requires_backlog_ids": True,
+            "requires_active_observer_session": True,
+            "action_input": batch_action["action_input"],
+            "action_input_copy_safe": True,
+            "action_input_ready": batch_action["ready"],
+            "action_input_missing_fields": batch_action["missing_fields"],
+            "server_derived_authority": batch_action["server_derived_authority"],
+            "omitted_server_authority_fields": batch_action[
+                "omitted_server_authority_fields"
+            ],
             "contract_template_id": MF_BATCH_PARALLEL_CONTRACT_ID,
             "successor_contract_template_id": MF_PARALLEL_CONTRACT_ID,
             "fanout_successor": "mf_parallel",
@@ -98067,6 +98565,24 @@ def _onboard_route_guide_compact_service_response(
                 next_action.get("successor_action_input_interface") or ""
             ),
             "successor_action_input": successor_action_input,
+            "action_input_ready": (
+                bool(next_action.get("action_input_ready"))
+                if "action_input_ready" in next_action
+                else None
+            ),
+            "action_input_missing_fields": list(
+                next_action.get("action_input_missing_fields") or []
+            ),
+            "server_derived_authority": (
+                dict(next_action.get("server_derived_authority"))
+                if isinstance(
+                    next_action.get("server_derived_authority"), Mapping
+                )
+                else {}
+            ),
+            "omitted_server_authority_fields": list(
+                next_action.get("omitted_server_authority_fields") or []
+            ),
             "mf_parallel_enter_contract_execution_id_required": (
                 False
                 if next_action.get(
@@ -98649,12 +99165,14 @@ def _qa_onboard_compact_selected_role_response(
 def _onboard_route_guide_service_response(
     conn,
     *,
+    request_context: RequestContext | None = None,
     project_id: str,
     backlog_id: str,
     route_token_ref: str = "",
     role: str = "",
     work_type: str = "",
     response_view: str = "",
+    request_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     from .parallel_branch_runtime import (
         get_active_integration_epoch,
@@ -98754,13 +99272,108 @@ def _onboard_route_guide_service_response(
     )
     no_direct_fix = True
     historical_source_resume = False
+    materialize_route_token_ref = route_token_ref
+    if str(work_type or "").strip() in {
+        "multi_backlog_parallel",
+        "mf_batch_parallel",
+    }:
+        try:
+            existing_batch_parent = _contract_runtime_store(conn).get(
+                _onboard_service_execution_id(project_id, backlog_id)
+            )
+        except ContractRuntimeError:
+            existing_batch_parent = {}
+        existing_batch_metadata = (
+            existing_batch_parent.get("metadata")
+            if isinstance(existing_batch_parent.get("metadata"), Mapping)
+            else {}
+        )
+        existing_batch_binding = (
+            existing_batch_metadata.get("mf_batch_parallel_entry_binding")
+            if isinstance(
+                existing_batch_metadata.get("mf_batch_parallel_entry_binding"),
+                Mapping,
+            )
+            else {}
+        )
+        existing_batch_action = (
+            existing_batch_binding.get("action_input")
+            if isinstance(existing_batch_binding.get("action_input"), Mapping)
+            else {}
+        )
+        if existing_batch_binding:
+            existing_batch_binding = (
+                _onboard_service_verified_mf_batch_entry_binding(
+                    existing_batch_parent,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    require_ready=False,
+                )
+            )
+            existing_batch_action = dict(
+                existing_batch_binding.get("action_input") or {}
+            )
+        if existing_batch_binding.get("ready") is True:
+            materialize_route_token_ref = str(
+                existing_batch_action.get("observer_route_token_ref") or ""
+            ).strip()
+        else:
+            proposed_action_input = _mf_batch_parallel_entry_action_input_contract(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                route_token_ref=route_token_ref,
+                request_body=request_body,
+            )
+            if not _mf_batch_parallel_entry_action_input_missing(
+                proposed_action_input
+            ):
+                _onboard_service_require_mf_batch_guide_observer_proof(
+                    request_context,
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                )
     record = _onboard_service_materialize_parent_record(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
-        route_token_ref=route_token_ref,
+        route_token_ref=materialize_route_token_ref,
     )
     route_token_ref = str(record.get("route_token_ref") or "").strip()
+    batch_action_request_body = request_body
+    if str(work_type or "").strip() in {
+        "multi_backlog_parallel",
+        "mf_batch_parallel",
+    }:
+        record = _onboard_service_bind_mf_batch_entry_contract(
+            conn,
+            record=record,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+            request_body=request_body,
+        )
+        bound_metadata = (
+            record.get("metadata")
+            if isinstance(record.get("metadata"), Mapping)
+            else {}
+        )
+        bound_entry = (
+            bound_metadata.get("mf_batch_parallel_entry_binding")
+            if isinstance(
+                bound_metadata.get("mf_batch_parallel_entry_binding"), Mapping
+            )
+            else {}
+        )
+        if bound_entry:
+            bound_entry = _onboard_service_verified_mf_batch_entry_binding(
+                record,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                require_ready=False,
+            )
+        if bound_entry.get("ready") is True:
+            batch_action_request_body = dict(bound_entry["action_input"])
     target_files = _onboard_contract_route_issue_target_files(
         conn,
         backlog_id=backlog_id,
@@ -98974,6 +99587,7 @@ def _onboard_route_guide_service_response(
                 backlog_id=backlog_id,
                 route_token_ref=route_token_ref,
                 target_files=target_files,
+                request_body=batch_action_request_body,
             )
     qa_runtime_record: Mapping[str, Any] | None = None
     if (
@@ -128780,6 +129394,63 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
     """Enter a parent route for multi-backlog parallel fan-out."""
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    claimed_project_id = str(body.get("project_id") or "").strip()
+    if claimed_project_id and claimed_project_id != project_id:
+        raise GovernanceError(
+            "mf_batch_parallel_entry_contract_mismatch",
+            "mf_batch_parallel guide-bound project identity mismatch",
+            422,
+            {
+                "field": "project_id",
+                "expected": project_id,
+                "actual": claimed_project_id,
+                "writes_performed": False,
+            },
+        )
+    alias_groups = {
+        "backlog_id": (body.get("backlog_id"), body.get("bug_id")),
+        "reason": (body.get("reason"), body.get("human_reason")),
+        "observer_session_id": (
+            body.get("observer_session_id"),
+            body.get("observer_session_ref"),
+        ),
+        "observer_route_token_ref": (
+            body.get("observer_route_token_ref"),
+            body.get("route_token_ref"),
+        ),
+        "target_head_commit": (
+            body.get("target_head_commit"),
+            body.get("target_head"),
+            body.get("head_commit"),
+        ),
+        "graph_snapshot_id": (
+            body.get("graph_snapshot_id"),
+            body.get("snapshot_id"),
+        ),
+        "preflight_mode": (
+            body.get("preflight_mode"),
+            body.get("merge_mode"),
+        ),
+    }
+    for field, raw_values in alias_groups.items():
+        values = [
+            str(value or "").strip()
+            for value in raw_values
+            if str(value or "").strip()
+        ]
+        if len(set(values)) > 1:
+            raise GovernanceError(
+                "mf_batch_parallel_entry_alias_conflict",
+                "mf_batch_parallel aliases must resolve to one exact value",
+                422,
+                {
+                    "field": field,
+                    "expected": values[0],
+                    "actual": values[1],
+                    "alias_values": values,
+                    "writes_performed": False,
+                },
+            )
     backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
     if not backlog_id:
         raise ValidationError("mf_batch_parallel entry requires coordination backlog_id")
@@ -128812,7 +129483,80 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
     actor = str(body.get("actor") or "api").strip()
     body_role_claim = str(body.get("actor_role") or body.get("role") or "").strip()
     metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
-    onboard_service_waiver = _onboard_service_waiver_requested(body, metadata)
+    fixed_semantic_claims = {
+        "schema_version": (
+            body.get("schema_version"),
+            "onboard_route_guide.mf_batch_parallel_entry_input.v1",
+        ),
+        "metadata.batch_scope": (
+            metadata.get("batch_scope"),
+            "row_scoped_mf_parallel_successors",
+        ),
+        "metadata.successor_contract_template_id": (
+            metadata.get("successor_contract_template_id"),
+            MF_PARALLEL_CONTRACT_ID,
+        ),
+        "metadata.nested_worker_fanout_supported": (
+            metadata.get("nested_worker_fanout_supported"),
+            False,
+        ),
+        "metadata.initial_two_worker_selection_supported": (
+            metadata.get("initial_two_worker_selection_supported"),
+            True,
+        ),
+        "metadata.revision_to_two_workers_supported": (
+            metadata.get("revision_to_two_workers_supported"),
+            False,
+        ),
+    }
+    for field, (actual, expected) in fixed_semantic_claims.items():
+        source = body if field == "schema_version" else metadata
+        source_field = field if field == "schema_version" else field.split(".", 1)[1]
+        if source_field in source and actual != expected:
+            raise GovernanceError(
+                "mf_batch_parallel_entry_semantics_mismatch",
+                "mf_batch_parallel server-owned semantics must match the guide action_input",
+                422,
+                {
+                    "field": field,
+                    "expected": expected,
+                    "actual": actual,
+                    "writes_performed": False,
+                },
+            )
+    explicit_authority_claims = [
+        field
+        for field in _MF_BATCH_PARALLEL_CALLER_AUTHORITY_FIELDS
+        if field in body or field in metadata
+    ]
+    if explicit_authority_claims:
+        field = explicit_authority_claims[0]
+        actual = body.get(field) if field in body else metadata.get(field)
+        raise GovernanceError(
+            "mf_batch_parallel_caller_authority_claim_rejected",
+            "mf_batch_parallel parent authority is derived only from the durable guide binding",
+            422,
+            {
+                "field": field,
+                "expected": "omitted_server_derived",
+                "actual": actual,
+                "rejected_fields": explicit_authority_claims,
+                "writes_performed": False,
+            },
+        )
+    claimed_merge_queue_id = str(body.get("merge_queue_id") or "").strip()
+    if claimed_merge_queue_id:
+        raise GovernanceError(
+            "mf_batch_parallel_merge_queue_authority_claim_rejected",
+            "mf_batch_parallel merge_queue_id is server-derived after canonical batch identity",
+            422,
+            {
+                "field": "merge_queue_id",
+                "expected": "omitted_server_derived",
+                "actual": claimed_merge_queue_id,
+                "writes_performed": False,
+            },
+        )
     target_head_commit = str(
         body.get("target_head_commit")
         or body.get("target_head")
@@ -128830,73 +129574,179 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
         get_active_integration_epoch,
         integration_epoch_resume_payload,
         integration_epoch_to_dict,
+        list_merge_queue_items,
         merge_queue_item_to_dict,
         plan_mf_batch_parallel_preflight,
         upsert_merge_queue_items,
     )
 
     with DBContext(project_id) as conn:
-        active_epoch = get_active_integration_epoch(
-            conn,
-            project_id,
-            target_ref=target_ref,
+        service_execution_id = _onboard_service_execution_id(
+            project_id, backlog_id
         )
-        if active_epoch is not None:
-            return 409, {
-                "ok": False,
-                "error": "integration_epoch_dispatch_base_frozen",
-                "message": (
-                    "a new batch cannot enter on a target ref frozen by an "
-                    "active integration epoch"
-                ),
-                "integration_epoch": integration_epoch_to_dict(active_epoch),
-                "next_legal_action": integration_epoch_resume_payload(
-                    conn, active_epoch
-                ),
-            }
-        root_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
-        derived_actor_role = _contract_runtime_effective_actor_role(
-            ctx,
-            conn,
-            action="mf_batch_parallel_enter",
-            backlog_id=backlog_id,
-        )
-        if derived_actor_role != "observer":
-            raise PermissionDeniedError(
-                derived_actor_role,
-                "mf_batch_parallel_enter",
+        try:
+            parent_record = _contract_runtime_store(conn).get(
+                service_execution_id
+            )
+        except ContractRuntimeError as exc:
+            raise GovernanceError(
+                "mf_batch_parallel_guide_binding_required",
+                "mf_batch_parallel requires a prior complete onboard_route_guide batch action_input",
+                422,
                 {
-                    "required_role": "observer",
-                    "body_role_claim": body_role_claim,
-                    "role_source": "contract_runtime_effective_actor_role",
+                    "field": "parent_contract_execution_id",
+                    "expected": service_execution_id,
+                    "actual": "missing",
+                    "writes_performed": False,
+                },
+            ) from exc
+        parent_metadata = (
+            parent_record.get("metadata")
+            if isinstance(parent_record.get("metadata"), Mapping)
+            else {}
+        )
+        entry_binding = (
+            parent_metadata.get("mf_batch_parallel_entry_binding")
+            if isinstance(
+                parent_metadata.get("mf_batch_parallel_entry_binding"), Mapping
+            )
+            else {}
+        )
+        if not (
+            _onboard_service_record(parent_record)
+            and _runtime_record_is_complete(parent_record)
+            and entry_binding
+        ):
+            raise GovernanceError(
+                "mf_batch_parallel_guide_binding_required",
+                "mf_batch_parallel requires one ready durable guide-issued action_input",
+                422,
+                {
+                    "field": "guide_action_input.ready",
+                    "expected": True,
+                    "actual": bool(entry_binding.get("ready")),
+                    "missing_fields": list(entry_binding.get("missing_fields") or []),
+                    "writes_performed": False,
                 },
             )
-        if onboard_service_waiver:
-            parent_record = _onboard_service_materialize_parent_record(
+        entry_binding = _onboard_service_verified_mf_batch_entry_binding(
+            parent_record,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            require_ready=True,
+        )
+        expected_action_input = dict(entry_binding["action_input"])
+        actual_action_input = _mf_batch_parallel_entry_action_input_contract(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+            request_body=body,
+        )
+        identity_mismatches: list[dict[str, Any]] = []
+        for field in (
+            "project_id",
+            "backlog_id",
+            "backlog_ids",
+            "task_id",
+            "reason",
+            "observer_session_id",
+            "observer_route_token_ref",
+            "target_head_commit",
+            "graph_snapshot_id",
+            "target_ref",
+            "preflight_mode",
+        ):
+            if actual_action_input.get(field) != expected_action_input.get(field):
+                identity_mismatches.append(
+                    {
+                        "field": field,
+                        "expected": expected_action_input.get(field),
+                        "actual": actual_action_input.get(field),
+                    }
+                )
+        expected_metadata = (
+            expected_action_input.get("metadata")
+            if isinstance(expected_action_input.get("metadata"), Mapping)
+            else {}
+        )
+        actual_metadata = (
+            actual_action_input.get("metadata")
+            if isinstance(actual_action_input.get("metadata"), Mapping)
+            else {}
+        )
+        for field in (
+            "required_worker_count",
+            "batch_scope",
+            "successor_contract_template_id",
+            "nested_worker_fanout_supported",
+            "initial_two_worker_selection_supported",
+            "revision_to_two_workers_supported",
+        ):
+            if actual_metadata.get(field) != expected_metadata.get(field):
+                identity_mismatches.append(
+                    {
+                        "field": f"metadata.{field}",
+                        "expected": expected_metadata.get(field),
+                        "actual": actual_metadata.get(field),
+                    }
+                )
+        if identity_mismatches:
+            raise GovernanceError(
+                "mf_batch_parallel_entry_contract_mismatch",
+                "mf_batch_parallel request does not match the durable guide action_input",
+                422,
+                {
+                    **identity_mismatches[0],
+                    "identity_mismatches": identity_mismatches,
+                    "expected_action_input_hash": str(
+                        entry_binding.get("action_input_hash") or ""
+                    ),
+                    "actual_action_input_hash": stable_sha256(actual_action_input),
+                    "writes_performed": False,
+                },
+            )
+        try:
+            observer_proof = _resolve_contract_runtime_observer_proof(
+                ctx,
                 conn,
                 project_id=project_id,
+                action="mf_batch_parallel_enter",
                 backlog_id=backlog_id,
-                route_token_ref=route_token_ref,
+                contract_execution_id=service_execution_id,
             )
-        else:
-            try:
-                parent_record = _onboard_contract_parent_for_successor(
-                    conn,
-                    project_id=project_id,
-                    backlog_id=backlog_id,
-                    actor_role=derived_actor_role,
-                )
-            except ContractRuntimeError as exc:
-                raise ValidationError(
-                    "onboard_route_guide service waiver or returned legacy onboard_contract facade is required before mf_batch_parallel successor",
-                    {
-                        "contract_execution_id": root_execution_id,
-                        "contract_id": ONBOARD_CONTRACT_ID,
-                        "agent_facing_decision_source": (
-                            "contract_runtime_first_missing_line"
-                        ),
-                    },
-                ) from exc
+        except PermissionDeniedError as exc:
+            proof_details = dict(exc.details or {})
+            proof_error = str(proof_details.get("proof_error") or "")
+            field = (
+                "observer_session_id"
+                if "session" in proof_error
+                else "observer_route_token_ref"
+            )
+            raise GovernanceError(
+                "mf_batch_parallel_entry_identity_rejected",
+                "mf_batch_parallel observer session and route identity must match the guide binding",
+                403,
+                {
+                    **proof_details,
+                    "field": field,
+                    "expected": expected_action_input.get(field),
+                    "actual": actual_action_input.get(field),
+                    "writes_performed": False,
+                },
+            ) from exc
+        if not observer_proof:
+            raise GovernanceError(
+                "mf_batch_parallel_entry_identity_rejected",
+                "mf_batch_parallel requires active observer session and route proof",
+                403,
+                {
+                    "field": "observer_session_id",
+                    "expected": expected_action_input.get("observer_session_id"),
+                    "actual": actual_action_input.get("observer_session_id"),
+                    "writes_performed": False,
+                },
+            )
+        derived_actor_role = "observer"
         if not _runtime_record_is_complete(parent_record):
             current_state = _runtime_current_state_from_record(parent_record)
             raise ValidationError(
@@ -128917,15 +129767,341 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
             backlog_ids,
             task_id,
         )
-        merge_queue_id = str(body.get("merge_queue_id") or "").strip()
-        if not merge_queue_id:
-            merge_queue_id = _contract_runtime_stable_id(
-                "mq",
-                project_id,
-                backlog_id,
-                batch_id,
-                MF_BATCH_PARALLEL_RECORD_CONTRACT_ID,
+        merge_queue_id = _contract_runtime_stable_id(
+            "mq",
+            project_id,
+            backlog_id,
+            batch_id,
+            MF_BATCH_PARALLEL_RECORD_CONTRACT_ID,
+        )
+        # Replay authority must not depend on the public timeline window. That
+        # API clamps reads to 1,000 oldest events, which can hide the durable
+        # batch entry in a long-lived coordination row.
+        task_timeline.ensure_schema(conn)
+        entered_rows = conn.execute(
+            """
+            SELECT *
+              FROM task_timeline_events
+             WHERE project_id = ?
+               AND backlog_id = ?
+               AND event_type = 'mf_batch_parallel.entered'
+               AND event_kind = 'contract_binding'
+               AND LOWER(COALESCE(status, '')) IN (
+                   'accepted', 'ok', 'passed', 'succeeded'
+               )
+             ORDER BY id ASC
+            """,
+            (project_id, backlog_id),
+        ).fetchall()
+        existing_enter_events: list[dict[str, Any]] = []
+        conflicting_parent_events: list[dict[str, Any]] = []
+        for entered_row in entered_rows:
+            event = dict(entered_row)
+            event["payload"] = _json_loads(event.get("payload_json"), {})
+            event["verification"] = _json_loads(
+                event.get("verification_json"), {}
             )
+            event["artifact_refs"] = _json_loads(
+                event.get("artifact_refs_json"), {}
+            )
+            event_payload = (
+                event["payload"]
+                if isinstance(event.get("payload"), Mapping)
+                else {}
+            )
+            event_merge_queue_plan = (
+                event_payload.get("merge_queue_plan")
+                if isinstance(event_payload.get("merge_queue_plan"), Mapping)
+                else {}
+            )
+            same_generation = (
+                str(event_payload.get("batch_id") or "").strip() == batch_id
+                or str(event_merge_queue_plan.get("merge_queue_id") or "").strip()
+                == merge_queue_id
+            )
+            if not same_generation:
+                continue
+            event_parent_execution_id = str(
+                event_payload.get("parent_contract_execution_id") or ""
+            ).strip()
+            if event_parent_execution_id == service_execution_id:
+                existing_enter_events.append(event)
+            else:
+                conflicting_parent_events.append(event)
+        if conflicting_parent_events:
+            raise GovernanceError(
+                "mf_batch_parallel_existing_parent_authority_conflict",
+                "canonical batch generation already has authority from a different parent",
+                409,
+                {
+                    "field": "parent_contract_execution_id",
+                    "expected": service_execution_id,
+                    "actual": sorted(
+                        {
+                            str(
+                                (
+                                    event.get("payload")
+                                    if isinstance(event.get("payload"), Mapping)
+                                    else {}
+                                ).get("parent_contract_execution_id")
+                                or ""
+                            ).strip()
+                            for event in conflicting_parent_events
+                        }
+                    ),
+                    "batch_id": batch_id,
+                    "merge_queue_id": merge_queue_id,
+                    "event_ids": [
+                        int(event.get("id") or 0)
+                        for event in conflicting_parent_events
+                    ],
+                    "writes_performed": False,
+                },
+            )
+        if existing_enter_events:
+            if len(existing_enter_events) != 1:
+                raise GovernanceError(
+                    "mf_batch_parallel_duplicate_durable_authority",
+                    "mf_batch_parallel coordination generation has multiple durable entry authorities",
+                    409,
+                    {
+                        "field": "durable_batch_authority_count",
+                        "expected": 1,
+                        "actual": len(existing_enter_events),
+                        "event_ids": [
+                            int(event.get("id") or 0)
+                            for event in existing_enter_events
+                        ],
+                        "writes_performed": False,
+                    },
+                )
+            existing_event = existing_enter_events[0]
+            existing_payload = (
+                existing_event.get("payload")
+                if isinstance(existing_event.get("payload"), Mapping)
+                else {}
+            )
+            replay_checks = (
+                (
+                    "batch_id",
+                    batch_id,
+                    str(existing_payload.get("batch_id") or ""),
+                ),
+                (
+                    "merge_queue_id",
+                    merge_queue_id,
+                    str(
+                        (
+                            existing_payload.get("merge_queue_plan")
+                            if isinstance(
+                                existing_payload.get("merge_queue_plan"), Mapping
+                            )
+                            else {}
+                        ).get("merge_queue_id")
+                        or ""
+                    ),
+                ),
+                (
+                    "guide_action_input_hash",
+                    str(entry_binding.get("action_input_hash") or ""),
+                    str(existing_payload.get("guide_action_input_hash") or ""),
+                ),
+                (
+                    "backlog_ids",
+                    backlog_ids,
+                    list(existing_payload.get("backlog_ids") or []),
+                ),
+            )
+            replay_mismatches = [
+                {"field": field, "expected": expected, "actual": actual}
+                for field, expected, actual in replay_checks
+                if expected != actual
+            ]
+            if replay_mismatches:
+                raise GovernanceError(
+                    "mf_batch_parallel_generation_already_entered",
+                    "mf_batch_parallel coordination generation is already bound to different durable authority",
+                    409,
+                    {
+                        **replay_mismatches[0],
+                        "identity_mismatches": replay_mismatches,
+                        "existing_event_id": int(existing_event.get("id") or 0),
+                        "writes_performed": False,
+                    },
+                )
+            durable_queue_items = list_merge_queue_items(
+                conn, project_id, merge_queue_id
+            )
+            existing_merge_queue_plan = (
+                existing_payload.get("merge_queue_plan")
+                if isinstance(existing_payload.get("merge_queue_plan"), Mapping)
+                else {}
+            )
+
+            def _queue_item_identity(item: Mapping[str, Any]) -> dict[str, Any]:
+                return {
+                    "merge_queue_id": str(item.get("merge_queue_id") or ""),
+                    "queue_item_id": str(item.get("queue_item_id") or ""),
+                    "backlog_id": str(item.get("backlog_id") or ""),
+                    "task_id": str(item.get("task_id") or ""),
+                    "queue_index": int(item.get("queue_index") or 0),
+                }
+
+            def _ordered_queue_identities(
+                items: Sequence[Mapping[str, Any]],
+            ) -> list[dict[str, Any]]:
+                return sorted(
+                    (_queue_item_identity(item) for item in items),
+                    key=lambda item: (
+                        item["queue_index"],
+                        item["queue_item_id"],
+                    ),
+                )
+
+            planned_identities = _ordered_queue_identities(
+                [
+                    item
+                    for item in (
+                        existing_merge_queue_plan.get("planned_items") or []
+                    )
+                    if isinstance(item, Mapping)
+                ]
+            )
+            recorded_durable_identities = _ordered_queue_identities(
+                [
+                    item
+                    for item in (
+                        existing_merge_queue_plan.get("durable_queue_items")
+                        or []
+                    )
+                    if isinstance(item, Mapping)
+                ]
+            )
+            actual_durable_identities = _ordered_queue_identities(
+                [
+                    {
+                        "merge_queue_id": item.merge_queue_id,
+                        "queue_item_id": item.queue_item_id,
+                        "backlog_id": item.backlog_id,
+                        "task_id": item.task_id,
+                        "queue_index": item.queue_index,
+                    }
+                    for item in durable_queue_items
+                ]
+            )
+            durable_backlog_ids = {
+                item["backlog_id"] for item in actual_durable_identities
+            }
+            queue_identity_mismatches: list[dict[str, Any]] = []
+            for field, expected, actual in (
+                (
+                    "merge_queue_plan.planned_item_identities",
+                    planned_identities,
+                    actual_durable_identities,
+                ),
+                (
+                    "merge_queue_plan.durable_queue_item_identities",
+                    recorded_durable_identities,
+                    actual_durable_identities,
+                ),
+                (
+                    "durable_merge_queue_backlog_ids",
+                    sorted(backlog_ids),
+                    sorted(durable_backlog_ids),
+                ),
+            ):
+                if expected != actual:
+                    queue_identity_mismatches.append(
+                        {"field": field, "expected": expected, "actual": actual}
+                    )
+            noncanonical_merge_queue_ids = sorted(
+                {
+                    item["merge_queue_id"]
+                    for item in [
+                        *planned_identities,
+                        *recorded_durable_identities,
+                        *actual_durable_identities,
+                    ]
+                    if item["merge_queue_id"] != merge_queue_id
+                }
+            )
+            if noncanonical_merge_queue_ids:
+                queue_identity_mismatches.append(
+                    {
+                        "field": "merge_queue_plan.item.merge_queue_id",
+                        "expected": merge_queue_id,
+                        "actual": noncanonical_merge_queue_ids,
+                    }
+                )
+            if queue_identity_mismatches:
+                raise GovernanceError(
+                    "mf_batch_parallel_durable_queue_corrupt",
+                    "mf_batch_parallel replay found a non-canonical or incomplete durable merge queue",
+                    409,
+                    {
+                        **queue_identity_mismatches[0],
+                        "identity_mismatches": queue_identity_mismatches,
+                        "merge_queue_id": merge_queue_id,
+                        "writes_performed": False,
+                    },
+                )
+            fanout_policy = (
+                existing_payload.get("fanout_policy")
+                if isinstance(existing_payload.get("fanout_policy"), Mapping)
+                else {}
+            )
+            return {
+                "ok": True,
+                "schema_version": "mf_batch_parallel_enter.route_response.v1",
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "batch_id": batch_id,
+                "event": existing_event,
+                "contract_id": MF_BATCH_PARALLEL_RECORD_CONTRACT_ID,
+                "contract_template_id": MF_BATCH_PARALLEL_CONTRACT_ID,
+                "parent_contract_execution_id": service_execution_id,
+                "root_contract_execution_id": str(
+                    parent_record.get("root_contract_execution_id")
+                    or service_execution_id
+                ),
+                "contract_chain_id": str(
+                    parent_record.get("contract_chain_id") or ""
+                ),
+                "per_row_successors": list(
+                    fanout_policy.get("per_row_successors") or []
+                ),
+                "preflight_gate": dict(
+                    existing_payload.get("preflight_gate") or {}
+                ),
+                "acceptance_scope_closures": dict(
+                    existing_payload.get("acceptance_scope_closures") or {}
+                ),
+                "merge_queue_plan": dict(
+                    existing_payload.get("merge_queue_plan") or {}
+                ),
+                "route_token_ref": route_token_ref,
+                "agent_facing_decision_source": "onboard_route_guide_service",
+                "replayed": True,
+                "writes_performed": False,
+            }
+        active_epoch = get_active_integration_epoch(
+            conn,
+            project_id,
+            target_ref=target_ref,
+        )
+        if active_epoch is not None:
+            return 409, {
+                "ok": False,
+                "error": "integration_epoch_dispatch_base_frozen",
+                "message": (
+                    "a new batch cannot enter on a target ref frozen by an "
+                    "active integration epoch"
+                ),
+                "integration_epoch": integration_epoch_to_dict(active_epoch),
+                "next_legal_action": integration_epoch_resume_payload(
+                    conn, active_epoch
+                ),
+            }
         rows = conn.execute(
             f"""
             SELECT bug_id, status, priority, target_files, test_files,
@@ -129087,6 +130263,9 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                 "owned_files": list(
                     queue_items_by_backlog.get(row_id, {}).get("owned_files") or []
                 ),
+                "target_files": list(
+                    queue_items_by_backlog.get(row_id, {}).get("owned_files") or []
+                ),
                 "observer_worker_cardinality_input": {
                     "schema_version": (
                         "mf_batch_parallel.observer_worker_cardinality_input.v1"
@@ -129095,6 +130274,9 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                     "observer_must_select": True,
                     "recommended_worker_count": 1,
                     "allowed_worker_counts": [1, 2],
+                    "nested_worker_fanout_supported": False,
+                    "initial_two_worker_selection_supported": True,
+                    "revision_to_two_workers_supported": False,
                     "selection_frozen_by": "mf_parallel_enter",
                     "caller_override_after_enter_allowed": False,
                     "revision_entrypoint": {
@@ -129107,6 +130289,8 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                         "allowed_before": (
                             "first_runtime_context_allocation_or_dispatch"
                         ),
+                        "allowed_worker_counts": [1],
+                        "two_worker_expansion_supported": False,
                         "accepted_revisions_append_only": True,
                     },
                 },
@@ -129131,7 +130315,22 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                         or f"{batch_id}:row:{index + 1}"
                     ),
                     "parent_batch_id": batch_id,
-                    "onboard_service_waiver": onboard_service_waiver,
+                    # This successor body is generated by the accepted batch
+                    # authority, not copied from a caller waiver claim.
+                    "onboard_service_waiver": True,
+                    "metadata": {
+                        "required_worker_count": int(
+                            expected_metadata["required_worker_count"]
+                        )
+                    },
+                    "owned_files": list(
+                        queue_items_by_backlog.get(row_id, {}).get("owned_files")
+                        or []
+                    ),
+                    "target_files": list(
+                        queue_items_by_backlog.get(row_id, {}).get("owned_files")
+                        or []
+                    ),
                     "reason": f"{reason} (batch row {index + 1}/{len(backlog_ids)})",
                     "merge_queue_id": merge_queue_id,
                     "merge_queue_item": queue_items_by_backlog.get(row_id, {}),
@@ -129153,9 +130352,10 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
             "parent_contract_execution_id": parent_execution_id,
             "root_contract_execution_id": root_parent_execution_id,
             "contract_chain_id": contract_chain_id,
-            "legacy_onboard_contract_waived": onboard_service_waiver,
-            "onboard_service": (
-                ONBOARD_ROUTE_GUIDE_SERVICE_ID if onboard_service_waiver else ""
+            "legacy_onboard_contract_waived": True,
+            "onboard_service": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+            "guide_action_input_hash": str(
+                entry_binding.get("action_input_hash") or ""
             ),
             "preflight_gate": preflight_gate,
             "acceptance_scope_closures": acceptance_scope_closures,
@@ -129212,6 +130412,8 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
         "merge_queue_plan": preflight_gate.get("merge_queue_plan") or {},
         "route_token_ref": route_token_ref,
         "agent_facing_decision_source": "onboard_route_guide_service",
+        "replayed": False,
+        "writes_performed": True,
     }
 
 
@@ -129834,12 +131036,14 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
             )
             return _onboard_route_guide_service_response(
                 conn,
+                request_context=ctx,
                 project_id=project_id,
                 backlog_id=backlog_id or canonical_backlog_id,
                 route_token_ref=route_token_ref,
                 role=role,
                 work_type=work_type,
                 response_view=response_view,
+                request_body=body,
             )
         if not backlog_id and work_type and work_type in _ONBOARD_NO_BACKLOG_WORK_TYPES:
             response = _onboard_no_backlog_service_response(
@@ -129896,12 +131100,14 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
                 )
         response = _onboard_route_guide_service_response(
             conn,
+            request_context=ctx,
             project_id=project_id,
             backlog_id=backlog_id,
             route_token_ref=route_token_ref,
             role=role,
             work_type=work_type,
             response_view=response_view,
+            request_body=body,
         )
     if queue_view:
         selection = dict(queue_view.get("selection") or {})

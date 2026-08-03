@@ -182,9 +182,26 @@ def test_both_mcp_adapters_expose_compact_onboard_capsule_contract():
         onboard = next(
             tool for tool in tools if tool.get("name") == "onboard_route_guide"
         )
-        response_view = onboard["inputSchema"]["properties"]["response_view"]
+        onboard_properties = onboard["inputSchema"]["properties"]
+        response_view = onboard_properties["response_view"]
         assert response_view["enum"] == ["compact", "full"]
         assert response_view["default"] == "compact"
+        assert {
+            "backlog_ids",
+            "task_id",
+            "reason",
+            "human_reason",
+            "observer_session_id",
+            "observer_route_token_ref",
+            "target_head_commit",
+            "target_ref",
+            "graph_snapshot_id",
+            "preflight_mode",
+            "metadata",
+        }.issubset(onboard_properties)
+        assert onboard_properties["metadata"]["properties"][
+            "required_worker_count"
+        ]["enum"] == [1, 2]
         assert body_builder(
             {
                 "project_id": "aming-claw",
@@ -194,6 +211,25 @@ def test_both_mcp_adapters_expose_compact_onboard_capsule_contract():
             "backlog_id": "AC-MCP-CAPSULE",
             "response_view": "compact",
         }
+        batch_guide_args = {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-MCP-CAPSULE",
+            "backlog_ids": ["AC-CHILD-A", "AC-CHILD-B"],
+            "role": "observer",
+            "work_type": "multi_backlog_parallel",
+            "task_id": "batch-task",
+            "reason": "Human-approved batch.",
+            "observer_session_id": "obs-ref",
+            "observer_route_token_ref": "rtok-ref",
+            "target_head_commit": "a" * 40,
+            "graph_snapshot_id": "full-a",
+            "metadata": {"required_worker_count": 2},
+        }
+        assert body_builder(batch_guide_args) == {
+            key: value
+            for key, value in batch_guide_args.items()
+            if key != "project_id"
+        } | {"response_view": "compact"}
         section = next(
             tool
             for tool in tools
@@ -602,26 +638,76 @@ def test_mf_batch_parallel_enter_schemas_require_batch_scope():
             tool for tool in tools if tool["name"] == "mf_batch_parallel_enter"
         )
         schema = mf_batch_parallel_enter["inputSchema"]
-        assert {"project_id", "backlog_ids", "reason"}.issubset(schema["required"])
         assert {
+            "project_id",
+            "backlog_ids",
+            "reason",
+            "observer_session_id",
+            "target_head_commit",
+            "graph_snapshot_id",
+            "metadata",
+        }.issubset(schema["required"])
+        assert {
+            "schema_version",
             "backlog_id",
             "bug_id",
             "backlog_ids",
             "actor_role",
             "observer_session_id",
             "observer_route_token_ref",
-            "onboard_service_waiver",
             "target_head_commit",
             "target_ref",
             "snapshot_id",
             "graph_snapshot_id",
             "preflight_mode",
             "merge_mode",
-            "merge_queue_id",
             "metadata",
         }.issubset(schema["properties"])
+        assert "onboard_service_waiver" not in schema["properties"]
+        assert "merge_queue_id" not in schema["properties"]
+        assert schema["properties"]["schema_version"]["const"] == (
+            "onboard_route_guide.mf_batch_parallel_entry_input.v1"
+        )
+        metadata = schema["properties"]["metadata"]
+        assert metadata["required"] == ["required_worker_count"]
+        assert metadata["properties"]["batch_scope"]["const"] == (
+            "row_scoped_mf_parallel_successors"
+        )
+        assert metadata["properties"]["successor_contract_template_id"][
+            "const"
+        ] == "mf_parallel.v2"
+        assert metadata["properties"]["nested_worker_fanout_supported"][
+            "const"
+        ] is False
+        assert metadata["properties"]["initial_two_worker_selection_supported"][
+            "const"
+        ] is True
+        assert metadata["properties"]["revision_to_two_workers_supported"][
+            "const"
+        ] is False
         assert {"required": ["backlog_id"]} in schema["anyOf"]
         assert {"required": ["bug_id"]} in schema["anyOf"]
+        assert {
+            "anyOf": [
+                {"required": ["route_token_ref"]},
+                {"required": ["observer_route_token_ref"]},
+            ]
+        } in schema["allOf"]
+
+
+def test_mf_parallel_enter_schemas_expose_server_issued_batch_child_fields():
+    for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
+        schema = next(
+            tool for tool in tools if tool["name"] == "mf_parallel_enter"
+        )["inputSchema"]
+        assert {
+            "parent_batch_id",
+            "merge_queue_id",
+            "merge_queue_item",
+            "onboard_service_waiver",
+            "owned_files",
+            "target_files",
+        }.issubset(schema["properties"])
 
 
 def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypatch):
