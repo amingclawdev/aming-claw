@@ -14448,6 +14448,22 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
     assert response["effective_allocation_precheck_policy"][
         "cardinality_source"
     ] == "observer_selected_standalone_cardinality"
+    standalone_target_contract = response[
+        "effective_allocation_precheck_policy"
+    ]["target_ref_contract"]
+    assert standalone_target_contract["durable_target_source"] == ""
+    assert standalone_target_contract["target_authority"] == (
+        "standalone_caller_allocation_contract"
+    )
+    assert standalone_target_contract[
+        "copy_safe_precheck_injects_ref_name"
+    ] is False
+    assert standalone_target_contract[
+        "copy_safe_precheck_removes_target_branch"
+    ] is False
+    assert standalone_target_contract["mismatch_policy"] == (
+        "not_applicable_no_durable_batch_authority"
+    )
     assert response["zero_write_proof"]["writes_performed"] is False
     assert before == after
     assert conn.total_changes == before_total_changes
@@ -14570,6 +14586,19 @@ def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
     assert response["effective_allocation_precheck_policy"][
         "cardinality_source"
     ] == "verified_batch_child_lineage"
+    assert response["effective_allocation_precheck_policy"][
+        "target_ref_contract"
+    ] == {
+        "schema_version": "parallel_branch_allocate.target_ref_contract.v1",
+        "worker_branch_field": "branch_ref",
+        "planned_target_field": "ref_name",
+        "accepted_target_alias_fields": ["ref_name", "target_branch"],
+        "durable_target_source": "parallel_branch_merge_queue_items.target_ref",
+        "target_from_branch_ref_allowed": False,
+        "copy_safe_precheck_injects_ref_name": True,
+        "copy_safe_precheck_removes_target_branch": True,
+        "mismatch_policy": "reject_before_write_with_field_expected_actual",
+    }
     assert response["acceptance_scope_closure"]["accepted"] is True
     assert response["acceptance_scope_closure"][
         "atomic_union_authoritative"
@@ -14589,8 +14618,665 @@ def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
         "scope": "per_child_contract",
         "cardinality_source": "verified_batch_child_lineage",
     }
+    copy_safe_body = response["copy_safe_allocation_bodies"][0]
+    assert copy_safe_body["ref_name"] == "main"
+    assert copy_safe_body["branch_ref"].startswith("refs/heads/codex/")
+    assert copy_safe_body["branch_ref"] != "refs/heads/main"
+    assert "target_branch" not in copy_safe_body
+    assert "target_ref" not in copy_safe_body
+    target_authority = response["lane_projections"][0][
+        "target_ref_authority"
+    ]
+    assert target_authority["target_ref"] == "refs/heads/main"
+    assert target_authority["ref_name"] == "main"
+    assert target_authority["expected_source"] == (
+        "durable_merge_queue_item.target_ref"
+    )
     assert conn.total_changes == before_total_changes
     assert not (repository_root / ".worktrees").exists()
+
+
+def test_batch_child_allocation_rejects_worker_branch_as_target_before_write(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-ALLOCATE-PRECHECK-BATCH-TARGET-REF"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    contract_execution_id, route_token_ref, row_files = (
+        _enter_verified_batch_child_for_allocation_precheck(
+            conn,
+            batch_backlog_id="AC-ALLOCATE-BATCH-TARGET-PARENT",
+            child_backlog_id=backlog_id,
+            sibling_backlog_id="AC-ALLOCATE-BATCH-TARGET-SIBLING",
+            child_files=["src/batch-target-child.py"],
+            sibling_files=["src/batch-target-sibling.py"],
+            suffix="target-ref",
+        )
+    )
+    record = server._contract_runtime(conn).store.get(contract_execution_id)
+    target_authority = (
+        server._parallel_branch_allocate_verified_batch_target_authority(
+            conn,
+            project_id=PID,
+            record=record,
+        )
+    )
+    child_task_id = target_authority["task_id"]
+    worker_branch_ref = (
+        f"refs/heads/codex/{server._parallel_branch_allocate_slug(child_task_id)}"
+    )
+    zero_write_tables = (
+        "parallel_branch_runtime_contexts",
+        "parallel_branch_runtime_contract_revisions",
+        "task_timeline_events",
+    )
+    before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    }
+    before_total_changes = conn.total_changes
+    wrong_lane = {
+        "task_id": child_task_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "worker_id": "slot-batch-target",
+        "route_token_ref": route_token_ref,
+        "owned_files": row_files,
+        "batch_id": target_authority["batch_id"],
+        "merge_queue_id": target_authority["merge_queue_id"],
+        "target_branch": worker_branch_ref,
+    }
+
+    with pytest.raises(GovernanceError) as precheck_rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "expected_lane_count": 1,
+                    "lanes": [wrong_lane],
+                },
+            )
+        )
+
+    assert precheck_rejected.value.code == (
+        "parallel_branch_allocate_batch_target_ref_mismatch"
+    )
+    assert precheck_rejected.value.details["field"] == "target_branch"
+    assert precheck_rejected.value.details["expected"] == "refs/heads/main"
+    assert precheck_rejected.value.details["actual"] == worker_branch_ref
+    assert precheck_rejected.value.details["expected_source"] == (
+        "durable_merge_queue_item.target_ref"
+    )
+    assert precheck_rejected.value.details["worker_branch_ref"] == (
+        worker_branch_ref
+    )
+    assert precheck_rejected.value.details["writes_performed"] is False
+    assert precheck_rejected.value.details["mismatches"] == [
+        {
+            "field": "target_branch",
+            "expected": "refs/heads/main",
+            "actual": worker_branch_ref,
+            "expected_source": "durable_merge_queue_item.target_ref",
+        }
+    ]
+    assert {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    } == before
+    assert conn.total_changes == before_total_changes
+
+    direct_common = {
+        "workspace_root": str(repository_root),
+        "base_commit": candidate_commit,
+        "target_head_commit": candidate_commit,
+        "create_worktree": False,
+    }
+    with pytest.raises(GovernanceError) as missing_route_rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    **{
+                        key: value
+                        for key, value in wrong_lane.items()
+                        if key != "route_token_ref"
+                    },
+                    **direct_common,
+                },
+            )
+        )
+    assert missing_route_rejected.value.code == (
+        "parallel_branch_allocate_route_token_ref_required"
+    )
+    assert missing_route_rejected.value.details[
+        "durable_batch_authority_projected"
+    ] is False
+    assert "target_ref" not in missing_route_rejected.value.details
+    assert "expected_source" not in missing_route_rejected.value.details
+
+    with pytest.raises(GovernanceError) as wrong_route_rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    **wrong_lane,
+                    **direct_common,
+                    "route_token_ref": "rtok-unknown-batch-target",
+                },
+            )
+        )
+    assert wrong_route_rejected.value.code in {
+        "parallel_branch_allocate_route_token_ref_invalid",
+        "parallel_branch_allocate_route_token_ref_unknown",
+    }
+    assert "target_ref" not in wrong_route_rejected.value.details
+    assert "expected_source" not in wrong_route_rejected.value.details
+    assert {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    } == before
+    assert conn.total_changes == before_total_changes
+
+    direct_body = {
+        **wrong_lane,
+        **direct_common,
+    }
+    with pytest.raises(GovernanceError) as direct_rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=direct_body,
+            )
+        )
+    assert direct_rejected.value.code == (
+        "parallel_branch_allocate_batch_target_ref_mismatch"
+    )
+    assert direct_rejected.value.details["field"] == "target_branch"
+    assert direct_rejected.value.details["writes_performed"] is False
+    assert {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    } == before
+    assert conn.total_changes == before_total_changes
+
+    wrong_identity_lane = {
+        **{
+            key: value
+            for key, value in wrong_lane.items()
+            if key != "target_branch"
+        },
+        "batch_id": "attacker-batch",
+        "merge_queue_id": "attacker-queue",
+        "ref_name": "main",
+    }
+    with pytest.raises(GovernanceError) as identity_precheck_rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "expected_lane_count": 1,
+                    "lanes": [wrong_identity_lane],
+                },
+            )
+        )
+    assert identity_precheck_rejected.value.code == (
+        "parallel_branch_allocate_batch_identity_mismatch"
+    )
+    assert identity_precheck_rejected.value.details["field"] == "batch_id"
+    assert identity_precheck_rejected.value.details["expected"] == (
+        target_authority["batch_id"]
+    )
+    assert identity_precheck_rejected.value.details["actual"] == (
+        "attacker-batch"
+    )
+
+    with pytest.raises(GovernanceError) as identity_direct_rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    **wrong_identity_lane,
+                    "workspace_root": str(repository_root),
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "create_worktree": False,
+                },
+            )
+        )
+    assert identity_direct_rejected.value.code == (
+        "parallel_branch_allocate_batch_identity_mismatch"
+    )
+    assert identity_direct_rejected.value.details["writes_performed"] is False
+    assert {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    } == before
+    assert conn.total_changes == before_total_changes
+
+    corrected = server.handle_graph_governance_parallel_branch_allocate_precheck(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "base_commit": candidate_commit,
+                "target_head_commit": candidate_commit,
+                "expected_lane_count": 1,
+                "lanes": [
+                    {
+                        key: value
+                        for key, value in wrong_lane.items()
+                        if key != "target_branch"
+                    }
+                ],
+            },
+        )
+    )["copy_safe_allocation_bodies"][0]
+    assert corrected["ref_name"] == "main"
+    assert corrected["branch_ref"] != corrected["ref_name"]
+    assert "target_branch" not in corrected
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_active_integration_epoch",
+        lambda *_args, **_kwargs: None,
+    )
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=corrected,
+        )
+    )
+    assert status == 201
+    assert allocated["context"]["ref_name"] == "main"
+    assert allocated["context"]["branch_ref"] == corrected["branch_ref"]
+    read = server.handle_graph_governance_parallel_branches(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "batch_id": target_authority["batch_id"],
+                "merge_queue_id": target_authority["merge_queue_id"],
+                "target_ref": "refs/heads/main",
+            },
+        )
+    )["read_model"]
+    assert read["summary"]["lane_count"] == 1
+    assert read["branch_lanes"][0]["task_id"] == child_task_id
+    assert read["branch_lanes"][0]["branch_ref"] == corrected["branch_ref"]
+
+
+def test_batch_child_direct_allocate_fails_closed_when_durable_target_is_lost(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-ALLOCATE-BATCH-TARGET-AUTHORITY-LOSS"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    contract_execution_id, route_token_ref, row_files = (
+        _enter_verified_batch_child_for_allocation_precheck(
+            conn,
+            batch_backlog_id="AC-ALLOCATE-BATCH-AUTHORITY-LOSS-PARENT",
+            child_backlog_id=backlog_id,
+            sibling_backlog_id="AC-ALLOCATE-BATCH-AUTHORITY-LOSS-SIBLING",
+            child_files=["src/batch-authority-loss-child.py"],
+            sibling_files=["src/batch-authority-loss-sibling.py"],
+            suffix="target-authority-loss",
+        )
+    )
+    record = server._contract_runtime(conn).store.get(contract_execution_id)
+    selection = record["metadata"]["observer_worker_cardinality_selection"]
+    claimed = selection["batch_child_authority"]
+    assert server._parallel_branch_allocate_declares_batch_child(record) is True
+    conn.execute(
+        """
+        DELETE FROM parallel_branch_merge_queue_items
+        WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (PID, claimed["merge_queue_id"], claimed["queue_item_id"]),
+    )
+    conn.commit()
+    assert server._contract_runtime_mf_parallel_worker_cardinality_policy(
+        conn,
+        project_id=PID,
+        record=record,
+    )["source"] != "verified_batch_child_lineage"
+    before_contexts = conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+    ).fetchone()[0]
+
+    with pytest.raises(GovernanceError) as precheck_rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "expected_lane_count": 1,
+                    "lanes": [
+                        {
+                            "task_id": claimed["child_task_id"],
+                            "backlog_id": backlog_id,
+                            "contract_execution_id": contract_execution_id,
+                            "worker_id": "slot-authority-loss-precheck",
+                            "route_token_ref": route_token_ref,
+                            "owned_files": row_files,
+                            "batch_id": claimed["batch_id"],
+                            "merge_queue_id": claimed["merge_queue_id"],
+                        }
+                    ],
+                },
+            )
+        )
+    assert precheck_rejected.value.code == (
+        "parallel_branch_allocate_batch_target_authority_missing"
+    )
+    assert precheck_rejected.value.details["field"] == "queue_item_status"
+    assert precheck_rejected.value.details["expected"] == "planned"
+    assert precheck_rejected.value.details["writes_performed"] is False
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": claimed["child_task_id"],
+                    "backlog_id": backlog_id,
+                    "contract_execution_id": contract_execution_id,
+                    "worker_id": "slot-authority-loss",
+                    "route_token_ref": route_token_ref,
+                    "owned_files": row_files,
+                    "batch_id": claimed["batch_id"],
+                    "merge_queue_id": claimed["merge_queue_id"],
+                    "target_branch": "refs/heads/codex/wrong-target",
+                    "workspace_root": str(repository_root),
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "create_worktree": False,
+                },
+            )
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_batch_target_authority_missing"
+    )
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+    ).fetchone()[0] == before_contexts
+
+
+def test_batch_child_allocation_rejects_terminal_merge_queue_item_before_write(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-ALLOCATE-BATCH-TARGET-TERMINAL"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    contract_execution_id, route_token_ref, row_files = (
+        _enter_verified_batch_child_for_allocation_precheck(
+            conn,
+            batch_backlog_id="AC-ALLOCATE-BATCH-TERMINAL-PARENT",
+            child_backlog_id=backlog_id,
+            sibling_backlog_id="AC-ALLOCATE-BATCH-TERMINAL-SIBLING",
+            child_files=["src/batch-terminal-child.py"],
+            sibling_files=["src/batch-terminal-sibling.py"],
+            suffix="target-terminal",
+        )
+    )
+    record = server._contract_runtime(conn).store.get(contract_execution_id)
+    claimed = record["metadata"]["observer_worker_cardinality_selection"][
+        "batch_child_authority"
+    ]
+    conn.execute(
+        """
+        UPDATE parallel_branch_merge_queue_items
+           SET status = 'merged'
+         WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (PID, claimed["merge_queue_id"], claimed["queue_item_id"]),
+    )
+    conn.commit()
+    assert server._parallel_branch_allocate_verified_batch_child_lineage_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    assert not server._parallel_branch_allocate_verified_batch_target_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    before_contexts = conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+    ).fetchone()[0]
+    lane = {
+        "task_id": claimed["child_task_id"],
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "worker_id": "slot-terminal",
+        "route_token_ref": route_token_ref,
+        "owned_files": row_files,
+        "batch_id": claimed["batch_id"],
+        "merge_queue_id": claimed["merge_queue_id"],
+        "ref_name": "main",
+    }
+
+    with pytest.raises(GovernanceError) as precheck_rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "expected_lane_count": 1,
+                    "lanes": [lane],
+                },
+            )
+        )
+    assert precheck_rejected.value.code == (
+        "parallel_branch_allocate_batch_target_authority_missing"
+    )
+    assert precheck_rejected.value.details["expected"] == "planned"
+    assert precheck_rejected.value.details["actual"] == (
+        "missing_or_non_planned"
+    )
+
+    with pytest.raises(GovernanceError) as direct_rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    **lane,
+                    "workspace_root": str(repository_root),
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "create_worktree": False,
+                },
+            )
+        )
+    assert direct_rejected.value.code == (
+        "parallel_branch_allocate_batch_target_authority_missing"
+    )
+    assert direct_rejected.value.details["writes_performed"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+    ).fetchone()[0] == before_contexts
+
+
+def test_legacy_revised_batch_child_two_worker_allocation_fails_closed(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-ALLOCATE-BATCH-LEGACY-NESTED"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    row_files = ["src/batch-nested-a.py", "src/batch-nested-b.py"]
+    contract_execution_id, route_token_ref, _ = (
+        _enter_verified_batch_child_for_allocation_precheck(
+            conn,
+            batch_backlog_id="AC-ALLOCATE-BATCH-NESTED-PARENT",
+            child_backlog_id=backlog_id,
+            sibling_backlog_id="AC-ALLOCATE-BATCH-NESTED-SIBLING",
+            child_files=row_files,
+            sibling_files=["src/batch-nested-sibling.py"],
+            suffix="legacy-nested",
+        )
+    )
+    second_route_ref = "rtok-batch-allocation-precheck-allocate-legacy-nested-b"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=second_route_ref,
+        allowed_actions=["parallel_branch_allocate"],
+    )
+    store = server._contract_runtime(conn).store
+    record = store.get(contract_execution_id)
+    metadata = dict(record["metadata"])
+    selection = dict(metadata["observer_worker_cardinality_selection"])
+    selection.update(
+        {
+            "source": "authenticated_observer_mf_parallel_revise",
+            "selection_origin": "mf_parallel_revise",
+            "selection_frozen_at_enter": False,
+            "required_worker_count": 2,
+            "atomic_dispatch_required": True,
+            "revision_id": "legacy-pre-fix-revision",
+            "revision_number": 1,
+            "prior_selection_hash": selection["selection_hash"],
+        }
+    )
+    selection["selection_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in selection.items()
+            if key != "selection_hash"
+        }
+    )
+    metadata["observer_worker_cardinality_selection"] = selection
+    updated = dict(record)
+    updated["metadata"] = metadata
+    store.update(
+        contract_execution_id,
+        updated,
+        expected_revision=int(record["execution_state_revision"]),
+    )
+    conn.commit()
+    revised = store.get(contract_execution_id)
+    policy = server._contract_runtime_mf_parallel_worker_cardinality_policy(
+        conn,
+        project_id=PID,
+        record=revised,
+    )
+    assert policy["source"] == "verified_batch_child_lineage"
+    assert policy["required_worker_count"] == 2
+    assert policy["batch_row_scoped_successor"] is True
+    before_contexts = conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+    ).fetchone()[0]
+    authority = (
+        server._parallel_branch_allocate_verified_batch_target_authority(
+            conn,
+            project_id=PID,
+            record=revised,
+        )
+    )
+    lanes = [
+        {
+            "task_id": f"batch-nested-worker-{suffix}",
+            "backlog_id": backlog_id,
+            "contract_execution_id": contract_execution_id,
+            "worker_id": f"slot-nested-{suffix}",
+            "route_token_ref": route_ref,
+            "owned_files": [row_file],
+            "batch_id": authority["batch_id"],
+            "merge_queue_id": authority["merge_queue_id"],
+            "ref_name": "main",
+        }
+        for suffix, route_ref, row_file in (
+            ("a", route_token_ref, row_files[0]),
+            ("b", second_route_ref, row_files[1]),
+        )
+    ]
+
+    with pytest.raises(GovernanceError) as precheck_rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "expected_lane_count": 2,
+                    "lanes": lanes,
+                },
+            )
+        )
+    assert precheck_rejected.value.code == (
+        "parallel_branch_allocate_batch_child_nested_fanout_unsupported"
+    )
+    assert precheck_rejected.value.details["actual"] == 2
+    assert precheck_rejected.value.details["writes_performed"] is False
+
+    with pytest.raises(GovernanceError) as direct_rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    **lanes[0],
+                    "workspace_root": str(repository_root),
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "create_worktree": False,
+                },
+            )
+        )
+    assert direct_rejected.value.code == (
+        "parallel_branch_allocate_batch_child_nested_fanout_unsupported"
+    )
+    assert direct_rejected.value.details["writes_performed"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+    ).fetchone()[0] == before_contexts
 
 
 def test_parallel_branch_allocate_precheck_rejects_standalone_single_lane_spoof(
@@ -104792,68 +105478,52 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
         "effective_allocation_precheck_policy"
     ] == batch_child_precheck_policy
 
-    revise_to_two = server.handle_project_mf_parallel_revise(
-        _ctx(
-            {
-                "project_id": PID,
-                "contract_execution_id": child_execution_id,
-            },
-            method="POST",
-            body={
-                "backlog_id": child_a,
-                "required_worker_count": 2,
-                "reason": "Observer expands this row to two bounded workers before allocation.",
-                "observer_session_id": observer_session_id,
-                "observer_route_token_ref": child_route_ref,
-            },
+    before_revise_events = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError) as revise_to_two_rejected:
+        server.handle_project_mf_parallel_revise(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": child_execution_id,
+                },
+                method="POST",
+                body={
+                    "backlog_id": child_a,
+                    "required_worker_count": 2,
+                    "reason": (
+                        "Observer requests nested workers before allocation."
+                    ),
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": child_route_ref,
+                },
+            )
         )
+    assert revise_to_two_rejected.value.code == (
+        "mf_parallel_batch_child_nested_fanout_unsupported"
     )
-    assert revise_to_two["ok"] is True
-    assert revise_to_two["revision"]["prior_required_worker_count"] == 1
-    assert revise_to_two["revision"]["required_worker_count"] == 2
-    assert revise_to_two["worker_cardinality_policy"][
+    assert revise_to_two_rejected.value.details["field"] == (
         "required_worker_count"
-    ] == 2
-    assert revise_to_two["event"]["event_kind"] == "contract_binding"
-    assert revise_to_two["event"]["payload"]["contract_change_kind"] == (
-        "append_only_contract_revision"
     )
-    assert revise_to_two["event"]["status"] == "accepted"
+    assert revise_to_two_rejected.value.details["expected"] == 1
+    assert revise_to_two_rejected.value.details["actual"] == 2
+    assert revise_to_two_rejected.value.details["writes_performed"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == before_revise_events
 
-    revise_back_to_one = server.handle_project_mf_parallel_revise(
-        _ctx(
-            {
-                "project_id": PID,
-                "contract_execution_id": child_execution_id,
-            },
-            method="POST",
-            body={
-                "backlog_id": child_a,
-                "required_worker_count": 1,
-                "reason": "Observer restores one row-scoped worker before allocation.",
-                "observer_session_id": observer_session_id,
-                "observer_route_token_ref": child_route_ref,
-            },
-        )
-    )
-    assert revise_back_to_one["ok"] is True
-    assert revise_back_to_one["revision"]["prior_required_worker_count"] == 2
-    assert revise_back_to_one["revision"]["required_worker_count"] == 1
-    assert revise_back_to_one["worker_cardinality_policy"][
-        "required_worker_count"
-    ] == 1
     child_record = server._contract_runtime(conn).store.get(child_execution_id)
-    revisions = child_record["metadata"][
-        "observer_worker_cardinality_revisions"
-    ]
-    assert [item["revision_number"] for item in revisions] == [1, 2]
-    assert revisions[1]["prior_selection_hash"] == revisions[0]["selection_hash"]
+    revisions = child_record["metadata"].get(
+        "observer_worker_cardinality_revisions", []
+    )
+    assert revisions == []
     assert child_record["metadata"][
         "observer_worker_cardinality_initial_selection"
     ]["selection_frozen_at_enter"] is True
     assert child_record["metadata"][
         "observer_worker_cardinality_selection"
-    ]["selection_origin"] == "mf_parallel_revise"
+    ]["selection_origin"] == "mf_parallel_enter"
 
     idempotent_reenter = server.handle_project_mf_parallel_enter(
         _ctx(
@@ -104868,8 +105538,10 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     ] == 1
     child_record = server._contract_runtime(conn).store.get(child_execution_id)
     assert len(
-        child_record["metadata"]["observer_worker_cardinality_revisions"]
-    ) == 2
+        child_record["metadata"].get(
+            "observer_worker_cardinality_revisions", []
+        )
+    ) == 0
     child_prefill = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {

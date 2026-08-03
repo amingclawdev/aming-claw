@@ -11611,6 +11611,11 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
         "canonical_merge_queue_id": merge_queue_id,
         "commit_verification": commit_verification,
         "path_diagnostics": path_diagnostics,
+        "caller_supplied_batch_identity_fields": [
+            field
+            for field in ("batch_id", "merge_queue_id")
+            if str(lane.get(field) or "").strip()
+        ],
         "caller_path_projection_applied": bool(path_diagnostics),
         "materialized": False,
     }
@@ -11820,12 +11825,98 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
         cardinality_source = str(
             cardinality_policy.get("source") or ""
         ).strip()
+        declared_batch_child = _parallel_branch_allocate_declares_batch_child(
+            contract_record
+        )
         verified_batch_child = bool(
-            authoritative_lane_count == 1
-            and cardinality_source == "verified_batch_child_lineage"
+            cardinality_source == "verified_batch_child_lineage"
             and cardinality_policy.get("batch_row_scoped_successor") is True
             and allocation_precheck_policy.get("verified_batch_child") is True
         )
+        batch_target_authority: dict[str, Any] = {}
+        if declared_batch_child:
+            batch_target_authority = (
+                _parallel_branch_allocate_verified_batch_target_authority(
+                    conn,
+                    project_id=project_id,
+                    record=contract_record,
+                )
+            )
+            if not batch_target_authority:
+                raise GovernanceError(
+                    "parallel_branch_allocate_batch_target_authority_missing",
+                    (
+                        "verified batch-child allocation requires one durable "
+                        "planned target_ref"
+                    ),
+                    422,
+                    {
+                        "contract_execution_id": contract_execution_id,
+                        "cardinality_source": cardinality_source,
+                        "field": "queue_item_status",
+                        "expected": "planned",
+                        "actual": "missing_or_non_planned",
+                        "expected_source": (
+                            "parallel_branch_merge_queue_items.status"
+                        ),
+                        "writes_performed": False,
+                    },
+                )
+            if authoritative_lane_count > 1:
+                raise GovernanceError(
+                    (
+                        "parallel_branch_allocate_batch_child_"
+                        "nested_fanout_unsupported"
+                    ),
+                    (
+                        "a batch row child cannot allocate two bounded workers "
+                        "until nested durable merge queues and row-level fan-in "
+                        "are supported"
+                    ),
+                    422,
+                    {
+                        "field": "expected_lane_count",
+                        "expected": 1,
+                        "actual": authoritative_lane_count,
+                        "expected_source": (
+                            "mf_batch_parallel.current_nested_topology_capability"
+                        ),
+                        "contract_execution_id": contract_execution_id,
+                        "cardinality_source": cardinality_source,
+                        "writes_performed": False,
+                        "next_legal_action": (
+                            "keep one worker per batch row child; expand batch "
+                            "parallelism by adding independent rows"
+                        ),
+                    },
+                )
+            for body, lane_projection in zip(
+                copy_safe_bodies,
+                lane_projections,
+                strict=True,
+            ):
+                ref_name = _parallel_branch_allocate_require_batch_target_match(
+                    body,
+                    authority=batch_target_authority,
+                    identity_fields=(
+                        lane_projection.get(
+                            "caller_supplied_batch_identity_fields"
+                        )
+                        or ()
+                    ),
+                )
+                body.pop("target_ref", None)
+                body.pop("target_branch", None)
+                body["ref_name"] = ref_name
+                body["batch_id"] = str(
+                    batch_target_authority.get("batch_id") or ""
+                )
+                body["merge_queue_id"] = str(
+                    batch_target_authority.get("merge_queue_id") or ""
+                )
+                lane_projection["target_ref_authority"] = dict(
+                    batch_target_authority
+                )
         if expected_lane_count != authoritative_lane_count:
             raise GovernanceError(
                 "parallel_branch_allocate_precheck_cardinality_mismatch",
@@ -13069,6 +13160,265 @@ def _parallel_branch_allocate_mf_parallel_rev8_record(
     return dict(record)
 
 
+def _parallel_branch_allocate_normalized_target_ref(value: Any) -> str:
+    """Normalize a merge target alias without treating a worker ref as authority."""
+
+    target_ref = str(value or "").strip()
+    if not target_ref:
+        return ""
+    if target_ref.startswith("refs/"):
+        return target_ref
+    return f"refs/heads/{target_ref}"
+
+
+def _parallel_branch_allocate_verified_batch_target_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve one allocation-eligible batch merge target from frozen lineage."""
+
+    verified = _parallel_branch_allocate_verified_batch_child_lineage_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+    )
+    if not verified:
+        return {}
+    queue_row = conn.execute(
+        """
+        SELECT target_ref, status
+        FROM parallel_branch_merge_queue_items
+        WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+          AND backlog_id = ? AND task_id = ?
+        """,
+        (
+            project_id,
+            str(verified.get("merge_queue_id") or "").strip(),
+            str(verified.get("queue_item_id") or "").strip(),
+            str(verified.get("child_backlog_id") or "").strip(),
+            str(verified.get("child_task_id") or "").strip(),
+        ),
+    ).fetchone()
+    queue_item_status = str(_row_get(queue_row, "status", "") or "").strip()
+    if queue_item_status != "planned":
+        return {}
+    target_ref = _parallel_branch_allocate_normalized_target_ref(
+        _row_get(queue_row, "target_ref", "")
+    )
+    if not target_ref:
+        return {}
+    return {
+        "schema_version": "parallel_branch_allocate.batch_target_authority.v1",
+        "source": "parallel_branch_merge_queue_items.target_ref",
+        "expected_source": "durable_merge_queue_item.target_ref",
+        "project_id": project_id,
+        "batch_id": str(verified.get("batch_id") or "").strip(),
+        "backlog_id": str(verified.get("child_backlog_id") or "").strip(),
+        "task_id": str(verified.get("child_task_id") or "").strip(),
+        "merge_queue_id": str(verified.get("merge_queue_id") or "").strip(),
+        "queue_item_id": str(verified.get("queue_item_id") or "").strip(),
+        "queue_item_status": queue_item_status,
+        "target_ref": target_ref,
+        "ref_name": _parallel_branch_allocate_branch_name(target_ref),
+        "server_derived": True,
+        "db_verified": True,
+        "allocation_eligible": True,
+    }
+
+
+def _parallel_branch_allocate_frozen_batch_child_claim(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Read one hash-valid frozen batch-child declaration from a contract."""
+
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    selection = (
+        metadata.get("observer_worker_cardinality_selection")
+        if isinstance(
+            metadata.get("observer_worker_cardinality_selection"), Mapping
+        )
+        else {}
+    )
+    claimed = (
+        dict(selection.get("batch_child_authority"))
+        if isinstance(selection.get("batch_child_authority"), Mapping)
+        else {}
+    )
+    try:
+        selected_count = int(selection.get("required_worker_count") or 0)
+    except (TypeError, ValueError):
+        return {}
+    selection_valid = bool(
+        selection.get("observer_selected") is True
+        and selection.get("selection_frozen") is True
+        and str(selection.get("selection_origin") or "")
+        in {"mf_parallel_enter", "mf_parallel_revise"}
+        and selected_count in {1, 2}
+        and selection.get("batch_row_scoped_successor") is True
+        and claimed
+        and str(selection.get("selection_hash") or "")
+        == stable_sha256(
+            {
+                key: value
+                for key, value in selection.items()
+                if key != "selection_hash"
+            }
+        )
+    )
+    return claimed if selection_valid else {}
+
+
+def _parallel_branch_allocate_verified_batch_child_lineage_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reverify frozen batch identity independently of current worker count."""
+
+    claimed = _parallel_branch_allocate_frozen_batch_child_claim(record)
+    if not claimed:
+        return {}
+    verified = _contract_runtime_mf_batch_child_worker_cardinality_authority(
+        conn,
+        project_id=project_id,
+        backlog_id=str(record.get("backlog_id") or "").strip(),
+        task_id=str(claimed.get("child_task_id") or "").strip(),
+        batch_id=str(claimed.get("batch_id") or "").strip(),
+        merge_queue_id=str(claimed.get("merge_queue_id") or "").strip(),
+        queue_item_id=str(claimed.get("queue_item_id") or "").strip(),
+    )
+    if not (
+        verified.get("db_verified") is True
+        and verified.get("server_derived") is True
+        and stable_sha256(verified) == stable_sha256(claimed)
+    ):
+        return {}
+    return dict(verified)
+
+
+def _parallel_branch_allocate_declares_batch_child(
+    record: Mapping[str, Any],
+) -> bool:
+    """Return whether frozen contract metadata claims batch-child semantics."""
+
+    return bool(_parallel_branch_allocate_frozen_batch_child_claim(record))
+
+
+def _parallel_branch_allocate_require_batch_target_match(
+    body: Mapping[str, Any],
+    *,
+    authority: Mapping[str, Any],
+    identity_fields: Sequence[str] = ("batch_id", "merge_queue_id"),
+) -> str:
+    """Reject caller identity/target aliases that conflict with batch authority."""
+
+    expected_target_ref = str(authority.get("target_ref") or "").strip()
+    expected_ref_name = str(authority.get("ref_name") or "").strip()
+    expected_source = str(authority.get("expected_source") or "").strip()
+    identity_mismatches = [
+        {
+            "field": field,
+            "expected": expected,
+            "actual": actual,
+            "expected_source": "durable_merge_queue_item.identity",
+        }
+        for field, expected in (
+            ("batch_id", str(authority.get("batch_id") or "").strip()),
+            (
+                "merge_queue_id",
+                str(authority.get("merge_queue_id") or "").strip(),
+            ),
+        )
+        if field in set(identity_fields)
+        if (actual := str(body.get(field) or "").strip())
+        and actual != expected
+    ]
+    if identity_mismatches:
+        first = identity_mismatches[0]
+        raise GovernanceError(
+            "parallel_branch_allocate_batch_identity_mismatch",
+            (
+                "batch allocation identity must match the durable planned "
+                "merge-queue child"
+            ),
+            422,
+            {
+                "field": first["field"],
+                "expected": first["expected"],
+                "actual": first["actual"],
+                "expected_source": first["expected_source"],
+                "mismatches": identity_mismatches,
+                "batch_id": str(authority.get("batch_id") or ""),
+                "merge_queue_id": str(authority.get("merge_queue_id") or ""),
+                "queue_item_id": str(authority.get("queue_item_id") or ""),
+                "writes_performed": False,
+                "next_legal_action": (
+                    "use the batch_id and merge_queue_id returned by allocation "
+                    "precheck; caller identity overrides are forbidden"
+                ),
+            },
+        )
+    expected_by_field = {
+        "target_ref": expected_target_ref,
+        "target_branch": expected_target_ref,
+        "ref_name": expected_ref_name,
+    }
+    mismatches: list[dict[str, Any]] = []
+    for field, expected in expected_by_field.items():
+        actual = str(body.get(field) or "").strip()
+        if not actual:
+            continue
+        if (
+            _parallel_branch_allocate_normalized_target_ref(actual)
+            == expected_target_ref
+        ):
+            continue
+        mismatches.append(
+            {
+                "field": field,
+                "expected": expected,
+                "actual": actual,
+                "expected_source": expected_source,
+            }
+        )
+    if mismatches:
+        first = mismatches[0]
+        raise GovernanceError(
+            "parallel_branch_allocate_batch_target_ref_mismatch",
+            (
+                "batch allocation target aliases must match the durable planned "
+                "target; branch_ref is the worker branch and cannot supply it"
+            ),
+            422,
+            {
+                "field": first["field"],
+                "expected": first["expected"],
+                "actual": first["actual"],
+                "expected_source": first["expected_source"],
+                "mismatches": mismatches,
+                "batch_id": str(authority.get("batch_id") or ""),
+                "merge_queue_id": str(authority.get("merge_queue_id") or ""),
+                "queue_item_id": str(authority.get("queue_item_id") or ""),
+                "target_ref": expected_target_ref,
+                "ref_name": expected_ref_name,
+                "worker_branch_ref": str(body.get("branch_ref") or "").strip(),
+                "writes_performed": False,
+                "next_legal_action": (
+                    "remove target_branch, use the returned ref_name, and submit "
+                    "the same copy-safe allocation body unchanged"
+                ),
+            },
+        )
+    return expected_ref_name
+
+
 def _parallel_branch_allocate_should_persist_contract_revision(
     body: Mapping[str, Any],
     *,
@@ -13648,12 +13998,162 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         str(ctx.body.get("backlog_id") or ""),
     )
     conn = get_connection(project_id)
-    rev8_allocation_record = _parallel_branch_allocate_mf_parallel_rev8_record(
-        conn,
-        project_id=project_id,
-        backlog_id=str(ctx.body.get("backlog_id") or ""),
-        body=ctx.body or {},
+    rev8_allocation_record: dict[str, Any] = {}
+    effective_body: dict[str, Any] = dict(ctx.body or {})
+    batch_route_resolved = False
+    batch_target_authority: dict[str, Any] = {}
+    allocation_ref_name = str(
+        ctx.body.get("ref_name") or ctx.body.get("target_branch") or "main"
     )
+    try:
+        _require_graph_governance_operator(
+            ctx,
+            conn,
+            "graph-governance.parallel-branches.allocate",
+        )
+        rev8_allocation_record = (
+            _parallel_branch_allocate_mf_parallel_rev8_record(
+                conn,
+                project_id=project_id,
+                backlog_id=str(ctx.body.get("backlog_id") or ""),
+                body=ctx.body or {},
+            )
+        )
+        if rev8_allocation_record:
+            cardinality_policy = (
+                _contract_runtime_mf_parallel_worker_cardinality_policy(
+                    conn,
+                    project_id=project_id,
+                    record=rev8_allocation_record,
+                )
+            )
+            declared_batch_child = (
+                _parallel_branch_allocate_declares_batch_child(
+                    rev8_allocation_record
+                )
+            )
+            if declared_batch_child:
+                if not str(ctx.body.get("route_token_ref") or "").strip():
+                    raise GovernanceError(
+                        "parallel_branch_allocate_route_token_ref_required",
+                        (
+                            "batch-child allocation requires an observer-scoped "
+                            "route_token_ref before durable authority is projected"
+                        ),
+                        422,
+                        {
+                            "required_field": "route_token_ref",
+                            "contract_execution_id": str(
+                                rev8_allocation_record.get(
+                                    "contract_execution_id"
+                                )
+                                or ""
+                            ),
+                            "writes_performed": False,
+                            "durable_batch_authority_projected": False,
+                        },
+                    )
+                effective_body = _parallel_branch_allocate_effective_route_body(
+                    conn,
+                    project_id=project_id,
+                    body=ctx.body or {},
+                )
+                ctx.body = effective_body
+                batch_route_resolved = True
+                batch_target_authority = (
+                    _parallel_branch_allocate_verified_batch_target_authority(
+                        conn,
+                        project_id=project_id,
+                        record=rev8_allocation_record,
+                    )
+                )
+                if not batch_target_authority:
+                    raise GovernanceError(
+                        "parallel_branch_allocate_batch_target_authority_missing",
+                        (
+                            "verified batch-child allocation requires one durable "
+                            "planned target_ref"
+                        ),
+                        422,
+                        {
+                            "contract_execution_id": str(
+                                rev8_allocation_record.get(
+                                    "contract_execution_id"
+                                )
+                                or ""
+                            ),
+                            "cardinality_source": str(
+                                cardinality_policy.get("source") or ""
+                            ),
+                            "field": "queue_item_status",
+                            "expected": "planned",
+                            "actual": "missing_or_non_planned",
+                            "expected_source": (
+                                "parallel_branch_merge_queue_items.status"
+                            ),
+                            "writes_performed": False,
+                        },
+                    )
+                if int(
+                    cardinality_policy.get("required_worker_count") or 0
+                ) > 1:
+                    raise GovernanceError(
+                        (
+                            "parallel_branch_allocate_batch_child_"
+                            "nested_fanout_unsupported"
+                        ),
+                        (
+                            "a batch row child cannot allocate two bounded "
+                            "workers until nested durable merge queues and "
+                            "row-level fan-in are supported"
+                        ),
+                        422,
+                        {
+                            "field": "required_worker_count",
+                            "expected": 1,
+                            "actual": int(
+                                cardinality_policy.get("required_worker_count")
+                                or 0
+                            ),
+                            "expected_source": (
+                                "mf_batch_parallel."
+                                "current_nested_topology_capability"
+                            ),
+                            "contract_execution_id": str(
+                                rev8_allocation_record.get(
+                                    "contract_execution_id"
+                                )
+                                or ""
+                            ),
+                            "cardinality_source": str(
+                                cardinality_policy.get("source") or ""
+                            ),
+                            "writes_performed": False,
+                            "next_legal_action": (
+                                "keep one worker per batch row child; expand "
+                                "batch parallelism by adding independent rows"
+                            ),
+                        },
+                    )
+                allocation_ref_name = (
+                    _parallel_branch_allocate_require_batch_target_match(
+                        ctx.body or {},
+                        authority=batch_target_authority,
+                    )
+                )
+                ctx.body = {
+                    **dict(ctx.body or {}),
+                    "batch_id": str(
+                        batch_target_authority.get("batch_id") or ""
+                    ),
+                    "merge_queue_id": str(
+                        batch_target_authority.get("merge_queue_id") or ""
+                    ),
+                    "ref_name": allocation_ref_name,
+                }
+    except Exception:
+        conn.close()
+        raise
     if request_file_fence_explicit:
         if not request_owned_files:
             request_owned_files = list(request_target_files)
@@ -13732,7 +14232,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         attempt=_query_int(ctx.body, "attempt", 1),
         branch_prefix=str(ctx.body.get("branch_prefix") or "codex"),
         worktree_root=worktree_root,
-        ref_name=str(ctx.body.get("ref_name") or ctx.body.get("target_branch") or "main"),
+        ref_name=allocation_ref_name,
         base_commit=base_commit,
         target_head_commit=target_head_commit,
         merge_queue_id=normalized_merge_queue_id,
@@ -13772,7 +14272,6 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     acceptance_scope_criteria: list[Any] = []
     acceptance_scope_closure: dict[str, Any] = {}
     try:
-        _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.allocate")
         acceptance_existing_context = get_branch_context(
             conn,
             project_id,
@@ -13838,11 +14337,12 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 reported_acceptance_criteria=reported_acceptance,
                 implementation_started=acceptance_implementation_started,
             )
-        effective_body = _parallel_branch_allocate_effective_route_body(
-            conn,
-            project_id=project_id,
-            body=ctx.body or {},
-        )
+        if not batch_route_resolved:
+            effective_body = _parallel_branch_allocate_effective_route_body(
+                conn,
+                project_id=project_id,
+                body=ctx.body or {},
+            )
         if create_worktree:
             commit_verification = _parallel_branch_allocate_verify_commits(
                 project_id,
@@ -13852,7 +14352,8 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 target_head_commit=target_head_commit,
             )
         allocation_target_ref = str(
-            ctx.body.get("target_ref")
+            batch_target_authority.get("target_ref")
+            or ctx.body.get("target_ref")
             or (
                 context.ref_name
                 if str(context.ref_name or "").startswith("refs/")
@@ -71112,12 +71613,47 @@ def _contract_runtime_mf_parallel_allocation_precheck_policy(
     expected_lane_count = int(
         cardinality_policy.get("required_worker_count") or 2
     )
+    declared_batch_child = bool(
+        cardinality_policy.get("batch_row_scoped_successor") is True
+    )
     verified_batch_child = bool(
-        expected_lane_count == 1
+        declared_batch_child
         and cardinality_policy.get("source") == "verified_batch_child_lineage"
-        and cardinality_policy.get("batch_row_scoped_successor") is True
     )
     atomic = expected_lane_count > 1
+    nested_batch_fanout_supported = not (
+        declared_batch_child and expected_lane_count > 1
+    )
+    target_ref_contract = (
+        {
+            "schema_version": "parallel_branch_allocate.target_ref_contract.v1",
+            "worker_branch_field": "branch_ref",
+            "planned_target_field": "ref_name",
+            "accepted_target_alias_fields": ["ref_name", "target_branch"],
+            "durable_target_source": (
+                "parallel_branch_merge_queue_items.target_ref"
+            ),
+            "target_from_branch_ref_allowed": False,
+            "copy_safe_precheck_injects_ref_name": True,
+            "copy_safe_precheck_removes_target_branch": True,
+            "mismatch_policy": (
+                "reject_before_write_with_field_expected_actual"
+            ),
+        }
+        if declared_batch_child
+        else {
+            "schema_version": "parallel_branch_allocate.target_ref_contract.v1",
+            "worker_branch_field": "branch_ref",
+            "planned_target_field": "ref_name",
+            "accepted_target_alias_fields": ["ref_name", "target_branch"],
+            "durable_target_source": "",
+            "target_authority": "standalone_caller_allocation_contract",
+            "target_from_branch_ref_allowed": False,
+            "copy_safe_precheck_injects_ref_name": False,
+            "copy_safe_precheck_removes_target_branch": False,
+            "mismatch_policy": "not_applicable_no_durable_batch_authority",
+        }
+    )
     return {
         "schema_version": "mf_parallel.effective_allocation_precheck_policy.v1",
         "source": "effective_worker_cardinality_policy",
@@ -71129,13 +71665,21 @@ def _contract_runtime_mf_parallel_allocation_precheck_policy(
         "atomic": atomic,
         "scope": (
             "per_child_contract"
-            if verified_batch_child
+            if declared_batch_child
             else "standalone_contract"
         ),
         "verified_batch_child": verified_batch_child,
+        "declared_batch_child": declared_batch_child,
+        "allocation_supported": nested_batch_fanout_supported,
+        "unsupported_reason": (
+            "batch_child_nested_merge_queue_and_row_fan_in_not_implemented"
+            if not nested_batch_fanout_supported
+            else ""
+        ),
         "submit_returned_bodies_unchanged": True,
         "standalone_mf_parallel_policy_unchanged": True,
         "caller_override_allowed": False,
+        "target_ref_contract": target_ref_contract,
     }
 
 
@@ -89620,12 +90164,17 @@ def _contract_runtime_mf_parallel_worker_cardinality_policy(
         )
         else {}
     )
-    batch_child = bool(
-        required_worker_count == 1
-        and _is_mf_parallel_postmerge_revision(record)
-        and selection.get("observer_selected") is True
-        and isinstance(selection.get("batch_child_authority"), Mapping)
-        and selection.get("batch_child_authority")
+    declared_batch_child = bool(
+        _is_mf_parallel_postmerge_revision(record)
+        and _parallel_branch_allocate_declares_batch_child(record)
+    )
+    verified_batch_child = bool(
+        declared_batch_child
+        and _parallel_branch_allocate_verified_batch_child_lineage_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
     )
     revisions = (
         metadata.get("observer_worker_cardinality_revisions")
@@ -89646,17 +90195,22 @@ def _contract_runtime_mf_parallel_worker_cardinality_policy(
         "schema_version": "mf_parallel.effective_worker_cardinality_policy.v1",
         "source": (
             "verified_batch_child_lineage"
-            if batch_child
+            if verified_batch_child
             else (
-                "observer_selected_standalone_cardinality"
-                if selection.get("observer_selected") is True
-                else "legacy_implicit_cardinality_compatibility"
+                "declared_batch_child_authority_missing"
+                if declared_batch_child
+                else (
+                    "observer_selected_standalone_cardinality"
+                    if selection.get("observer_selected") is True
+                    else "legacy_implicit_cardinality_compatibility"
+                )
             )
         ),
         "required_worker_count": required_worker_count,
         "worker_count_policy": "exactly",
         "atomic_dispatch_required": required_worker_count > 1,
-        "batch_row_scoped_successor": batch_child,
+        "batch_row_scoped_successor": declared_batch_child,
+        "batch_child_lineage_verified": verified_batch_child,
         "standalone_mf_parallel_policy_unchanged": True,
         "caller_override_allowed": False,
         "fresh_mcp_contract_requires_explicit_selection": True,
@@ -89679,6 +90233,10 @@ def _contract_runtime_mf_parallel_worker_cardinality_policy(
             "allowed_before": "first_runtime_context_allocation_or_dispatch",
             "ordinary_reenter_change_allowed": False,
             "accepted_revisions_append_only": True,
+            "batch_child_two_worker_revision_supported": False,
+            "batch_parallelism_expansion": (
+                "add_independent_batch_rows_not_nested_child_workers"
+            ),
         },
     }
 
@@ -127406,6 +127964,33 @@ def handle_project_mf_parallel_revise(ctx: RequestContext):
                 project_id=project_id,
             )
         )
+        if (
+            required_worker_count > 1
+            and _parallel_branch_allocate_declares_batch_child(record)
+        ):
+            raise GovernanceError(
+                "mf_parallel_batch_child_nested_fanout_unsupported",
+                (
+                    "a batch row child cannot be revised to two workers until "
+                    "nested durable merge queues and row-level fan-in are supported"
+                ),
+                422,
+                {
+                    "field": "required_worker_count",
+                    "expected": 1,
+                    "actual": required_worker_count,
+                    "expected_source": (
+                        "mf_batch_parallel.current_nested_topology_capability"
+                    ),
+                    "contract_execution_id": contract_execution_id,
+                    "prior_required_worker_count": current_required_worker_count,
+                    "writes_performed": False,
+                    "next_legal_action": (
+                        "keep one worker per batch row child; expand batch "
+                        "parallelism by adding independent rows"
+                    ),
+                },
+            )
         if required_worker_count == current_required_worker_count:
             raise GovernanceError(
                 "mf_parallel_worker_cardinality_revision_noop",
