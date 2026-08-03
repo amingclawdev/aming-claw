@@ -5771,6 +5771,182 @@ def _persist_contract_runtime_observer_route_ref(
     )
 
 
+def _enter_standalone_mf_parallel_for_allocation_precheck(
+    conn: sqlite3.Connection,
+    *,
+    backlog_id: str,
+    task_id: str,
+    owned_files: list[str],
+    suffix: str,
+) -> str:
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id=f"obs-allocation-precheck-{suffix}",
+    )
+    parent_execution_id = server._onboard_service_execution_id(
+        PID,
+        backlog_id,
+    )
+    contract_execution_id = server._mf_parallel_execution_id(
+        PID,
+        backlog_id,
+        parent_execution_id,
+        task_id,
+    )
+    enter_route_ref = f"rtok-allocation-precheck-enter-{suffix}"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=enter_route_ref,
+        allowed_actions=["mf_parallel_enter"],
+    )
+    entered = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "reason": "Create the authoritative standalone precheck CEX.",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": enter_route_ref,
+                "onboard_service_waiver": True,
+                "owned_files": owned_files,
+                "metadata": {"required_worker_count": 2},
+            },
+        )
+    )
+    assert entered["contract_execution_id"] == contract_execution_id
+    assert entered["worker_cardinality_policy"]["required_worker_count"] == 2
+    return contract_execution_id
+
+
+def _enter_verified_batch_child_for_allocation_precheck(
+    conn: sqlite3.Connection,
+    *,
+    batch_backlog_id: str,
+    child_backlog_id: str,
+    sibling_backlog_id: str,
+    child_files: list[str],
+    sibling_files: list[str],
+    suffix: str,
+) -> tuple[str, str, list[str]]:
+    for row_id, row_files in (
+        (batch_backlog_id, child_files),
+        (child_backlog_id, child_files),
+        (sibling_backlog_id, sibling_files),
+    ):
+        _insert_simple_mf_close_backlog(conn, row_id)
+        conn.execute(
+            """
+            UPDATE backlog_bugs
+               SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+             WHERE bug_id = ?
+            """,
+            (
+                json.dumps(row_files),
+                json.dumps(
+                    [
+                        {
+                            "id": f"AC-PRECHECK-{row_id}",
+                            "required_scope": {
+                                "kind": "files",
+                                "files": row_files,
+                            },
+                        }
+                    ]
+                ),
+                row_id,
+            ),
+        )
+    conn.commit()
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id=f"obs-batch-allocation-precheck-{suffix}",
+    )
+    parent_route_ref = f"rtok-batch-allocation-precheck-parent-{suffix}"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=batch_backlog_id,
+        contract_execution_id="",
+        route_token_ref=parent_route_ref,
+        allowed_actions=["mf_batch_parallel_enter"],
+    )
+    batch = server.handle_project_mf_batch_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": batch_backlog_id,
+                "backlog_ids": [child_backlog_id, sibling_backlog_id],
+                "reason": "Create server-verified batch-child lineage.",
+                "task_id": f"batch-allocation-precheck-{suffix}",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": parent_route_ref,
+                "onboard_service_waiver": True,
+                "target_head_commit": f"target-head-{suffix}",
+                "graph_snapshot_id": f"scope-target-head-{suffix}",
+            },
+        )
+    )
+    child_successor = next(
+        item
+        for item in batch["per_row_successors"]
+        if item["backlog_id"] == child_backlog_id
+    )
+    child_task_id = child_successor["body"]["task_id"]
+    child_parent_id = server._onboard_service_execution_id(
+        PID,
+        child_backlog_id,
+    )
+    child_execution_id = server._mf_parallel_execution_id(
+        PID,
+        child_backlog_id,
+        child_parent_id,
+        child_task_id,
+    )
+    child_enter_ref = f"rtok-batch-allocation-precheck-child-enter-{suffix}"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=child_backlog_id,
+        contract_execution_id=child_execution_id,
+        route_token_ref=child_enter_ref,
+        allowed_actions=["mf_parallel_enter"],
+    )
+    entered = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                **child_successor["body"],
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": child_enter_ref,
+                "owned_files": child_successor["owned_files"],
+                "metadata": {"required_worker_count": 1},
+            },
+        )
+    )
+    assert entered["contract_execution_id"] == child_execution_id
+    assert entered["worker_cardinality_policy"]["source"] == (
+        "verified_batch_child_lineage"
+    )
+    allocation_route_ref = f"rtok-batch-allocation-precheck-allocate-{suffix}"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=child_backlog_id,
+        contract_execution_id=child_execution_id,
+        route_token_ref=allocation_route_ref,
+        allowed_actions=["parallel_branch_allocate"],
+    )
+    conn.commit()
+    return (
+        child_execution_id,
+        allocation_route_ref,
+        list(child_successor["owned_files"]),
+    )
+
+
 def _persist_parallel_allocate_route_ref(
     conn: sqlite3.Connection,
     *,
@@ -14163,7 +14339,6 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
     monkeypatch,
 ):
     backlog_id = "AC-ALLOCATE-PRECHECK-ZERO-WRITE"
-    contract_execution_id = "cex-allocate-precheck-zero-write"
     repository_root = tmp_path / "registered-repository"
     candidate_commit = _init_test_git_repo(repository_root)
     monkeypatch.setattr(
@@ -14198,6 +14373,13 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
             ),
             backlog_id,
         ),
+    )
+    contract_execution_id = _enter_standalone_mf_parallel_for_allocation_precheck(
+        conn,
+        backlog_id=backlog_id,
+        task_id="allocate-precheck-standalone",
+        owned_files=row_files,
+        suffix="zero-write",
     )
     for suffix in ("a", "b"):
         _persist_contract_runtime_observer_route_ref(
@@ -14263,6 +14445,9 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
     assert response["lane_count"] == 2
     assert response["atomic"] is True
     assert response["allocation_scope"] == "standalone_contract"
+    assert response["effective_allocation_precheck_policy"][
+        "cardinality_source"
+    ] == "observer_selected_standalone_cardinality"
     assert response["zero_write_proof"]["writes_performed"] is False
     assert before == after
     assert conn.total_changes == before_total_changes
@@ -14281,6 +14466,8 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
         and body["target_project_root"] == body["worktree_path"]
         and body["create_worktree"] is True
         and body["allocation_precheck"]["submit_unchanged"] is True
+        and body["allocation_precheck"]["cardinality_source"]
+        == "observer_selected_standalone_cardinality"
         and "fence_token" not in body
         and "session_token" not in body
         for body in bodies
@@ -14334,7 +14521,6 @@ def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
     monkeypatch,
 ):
     backlog_id = "AC-ALLOCATE-PRECHECK-BATCH-CHILD"
-    contract_execution_id = "cex-allocate-precheck-batch-child"
     repository_root = tmp_path / "registered-repository"
     candidate_commit = _init_test_git_repo(repository_root)
     monkeypatch.setattr(
@@ -14342,39 +14528,17 @@ def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
         "resolve_project_root",
         lambda *_args, **_kwargs: repository_root,
     )
-    _insert_simple_mf_close_backlog(conn, backlog_id)
-    row_file = "src/batch-child.py"
-    conn.execute(
-        """
-        UPDATE backlog_bugs
-           SET target_files = ?, test_files = '[]', acceptance_criteria = ?
-         WHERE bug_id = ?
-        """,
-        (
-            json.dumps([row_file]),
-            json.dumps(
-                [
-                    {
-                        "id": "AC-PRECHECK-BATCH-CHILD",
-                        "required_scope": {
-                            "kind": "files",
-                            "files": [row_file],
-                        },
-                    }
-                ]
-            ),
-            backlog_id,
-        ),
+    contract_execution_id, route_token_ref, row_files = (
+        _enter_verified_batch_child_for_allocation_precheck(
+            conn,
+            batch_backlog_id="AC-ALLOCATE-PRECHECK-BATCH-PARENT",
+            child_backlog_id=backlog_id,
+            sibling_backlog_id="AC-ALLOCATE-PRECHECK-BATCH-SIBLING",
+            child_files=["src/batch-child.py"],
+            sibling_files=["src/batch-sibling.py"],
+            suffix="positive",
+        )
     )
-    route_token_ref = "rtok-allocate-precheck-batch-child"
-    _persist_contract_runtime_observer_route_ref(
-        conn,
-        backlog_id=backlog_id,
-        contract_execution_id=contract_execution_id,
-        route_token_ref=route_token_ref,
-        allowed_actions=["parallel_branch_allocate"],
-    )
-    conn.commit()
     before_total_changes = conn.total_changes
 
     response = server.handle_graph_governance_parallel_branch_allocate_precheck(
@@ -14391,7 +14555,7 @@ def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
                         "contract_execution_id": contract_execution_id,
                         "worker_id": "slot-batch-child",
                         "route_token_ref": route_token_ref,
-                        "owned_files": [row_file],
+                        "owned_files": row_files,
                     }
                 ],
             },
@@ -14403,6 +14567,9 @@ def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
     assert response["lane_count"] == 1
     assert response["atomic"] is False
     assert response["allocation_scope"] == "per_child_contract"
+    assert response["effective_allocation_precheck_policy"][
+        "cardinality_source"
+    ] == "verified_batch_child_lineage"
     assert response["acceptance_scope_closure"]["accepted"] is True
     assert response["acceptance_scope_closure"][
         "atomic_union_authoritative"
@@ -14420,7 +14587,100 @@ def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
         "expected_lane_count": 1,
         "atomic": False,
         "scope": "per_child_contract",
+        "cardinality_source": "verified_batch_child_lineage",
     }
+    assert conn.total_changes == before_total_changes
+    assert not (repository_root / ".worktrees").exists()
+
+
+def test_parallel_branch_allocate_precheck_rejects_standalone_single_lane_spoof(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-ALLOCATE-PRECHECK-STANDALONE-SPOOF"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_files = ["src/standalone-a.py", "src/standalone-b.py"]
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(row_files),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-PRECHECK-STANDALONE-SPOOF",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": row_files,
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    contract_execution_id = _enter_standalone_mf_parallel_for_allocation_precheck(
+        conn,
+        backlog_id=backlog_id,
+        task_id="allocation-precheck-standalone-spoof",
+        owned_files=row_files,
+        suffix="standalone-spoof",
+    )
+    route_token_ref = "rtok-allocation-precheck-standalone-spoof"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["parallel_branch_allocate"],
+    )
+    conn.commit()
+    before_total_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "expected_lane_count": 1,
+                    "lanes": [
+                        {
+                            "task_id": "standalone-spoof-worker",
+                            "backlog_id": backlog_id,
+                            "contract_execution_id": contract_execution_id,
+                            "worker_id": "slot-standalone-spoof",
+                            "route_token_ref": route_token_ref,
+                            "owned_files": row_files,
+                        }
+                    ],
+                },
+            )
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_precheck_cardinality_mismatch"
+    )
+    assert rejected.value.details["expected_lane_count"] == 2
+    assert rejected.value.details["caller_expected_lane_count"] == 1
+    assert rejected.value.details["actual_lane_count"] == 1
+    assert rejected.value.details["cardinality_source"] == (
+        "observer_selected_standalone_cardinality"
+    )
+    assert rejected.value.details["remediation"]["atomic"] is True
+    assert rejected.value.details["writes_performed"] is False
     assert conn.total_changes == before_total_changes
     assert not (repository_root / ".worktrees").exists()
 
@@ -14572,7 +14832,6 @@ def test_parallel_branch_allocate_precheck_fails_atomic_input_before_writes(
     monkeypatch,
 ):
     backlog_id = "AC-ALLOCATE-PRECHECK-ATOMIC-FAIL"
-    contract_execution_id = "cex-allocate-precheck-atomic-fail"
     repository_root = tmp_path / "registered-repository"
     candidate_commit = _init_test_git_repo(repository_root)
     monkeypatch.setattr(
@@ -14603,6 +14862,13 @@ def test_parallel_branch_allocate_precheck_fails_atomic_input_before_writes(
             ),
             backlog_id,
         ),
+    )
+    contract_execution_id = _enter_standalone_mf_parallel_for_allocation_precheck(
+        conn,
+        backlog_id=backlog_id,
+        task_id="allocation-precheck-atomic-fail",
+        owned_files=row_files,
+        suffix="atomic-fail",
     )
     _persist_contract_runtime_observer_route_ref(
         conn,

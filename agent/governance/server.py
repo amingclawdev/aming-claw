@@ -11411,11 +11411,6 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                 "writes_performed": False,
             },
         )
-    atomic = expected_lane_count == 2
-    allocation_scope = (
-        "standalone_contract" if atomic else "per_child_contract"
-    )
-
     repository_root = _parallel_branch_allocate_precheck_registered_repository(
         project_id
     )
@@ -11497,6 +11492,139 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             )
         backlog_id = next(iter(backlog_ids))
         contract_execution_id = next(iter(execution_ids))
+        try:
+            contract_record = _contract_runtime_store(conn).get(
+                contract_execution_id
+            )
+        except ContractRuntimeError as exc:
+            raise GovernanceError(
+                "parallel_branch_allocate_precheck_contract_authority_missing",
+                (
+                    "allocation precheck requires the exact source-backed "
+                    "mf_parallel ContractRuntime execution"
+                ),
+                422,
+                {
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "contract_execution_id": contract_execution_id,
+                    "writes_performed": False,
+                },
+            ) from exc
+        contract_identity = {
+            "project_id": str(contract_record.get("project_id") or "").strip(),
+            "backlog_id": str(contract_record.get("backlog_id") or "").strip(),
+            "contract_execution_id": str(
+                contract_record.get("contract_execution_id") or ""
+            ).strip(),
+            "contract_id": str(contract_record.get("contract_id") or "").strip(),
+            "revision": str(contract_record.get("revision") or "").strip(),
+        }
+        if (
+            contract_identity["project_id"] != project_id
+            or contract_identity["backlog_id"] != backlog_id
+            or contract_identity["contract_execution_id"]
+            != contract_execution_id
+            or not _is_mf_parallel_record_contract_id(
+                contract_identity["contract_id"]
+            )
+            or not _is_mf_parallel_postmerge_revision(contract_record)
+        ):
+            raise GovernanceError(
+                "parallel_branch_allocate_precheck_contract_authority_mismatch",
+                (
+                    "allocation precheck lane scope does not match an exact "
+                    "mf_parallel ContractRuntime execution"
+                ),
+                422,
+                {
+                    "requested_identity": {
+                        "project_id": project_id,
+                        "backlog_id": backlog_id,
+                        "contract_execution_id": contract_execution_id,
+                    },
+                    "resolved_identity": contract_identity,
+                    "writes_performed": False,
+                },
+            )
+        cardinality_policy = (
+            _contract_runtime_mf_parallel_worker_cardinality_policy(
+                conn,
+                project_id=project_id,
+                record=contract_record,
+            )
+        )
+        allocation_precheck_policy = (
+            _contract_runtime_mf_parallel_allocation_precheck_policy(
+                cardinality_policy
+            )
+        )
+        authoritative_lane_count = int(
+            allocation_precheck_policy.get("expected_lane_count") or 0
+        )
+        cardinality_source = str(
+            cardinality_policy.get("source") or ""
+        ).strip()
+        verified_batch_child = bool(
+            authoritative_lane_count == 1
+            and cardinality_source == "verified_batch_child_lineage"
+            and cardinality_policy.get("batch_row_scoped_successor") is True
+            and allocation_precheck_policy.get("verified_batch_child") is True
+        )
+        if expected_lane_count != authoritative_lane_count:
+            raise GovernanceError(
+                "parallel_branch_allocate_precheck_cardinality_mismatch",
+                (
+                    "caller expected_lane_count must equal the exact "
+                    "ContractRuntime worker cardinality"
+                ),
+                422,
+                {
+                    "expected_lane_count": authoritative_lane_count,
+                    "caller_expected_lane_count": expected_lane_count,
+                    "actual_lane_count": len(copy_safe_bodies),
+                    "cardinality_source": cardinality_source,
+                    "contract_execution_id": contract_execution_id,
+                    "remediation": {
+                        "action": "resubmit_authoritative_contract_cardinality",
+                        "expected_lane_count": authoritative_lane_count,
+                        "atomic": bool(
+                            allocation_precheck_policy.get("atomic")
+                        ),
+                        "scope": str(
+                            allocation_precheck_policy.get("scope") or ""
+                        ),
+                        "instruction": (
+                            "Use runtime_guide.effective_allocation_precheck_policy "
+                            "from this exact ContractRuntime execution; caller "
+                            "cardinality overrides are forbidden."
+                        ),
+                    },
+                    "writes_performed": False,
+                },
+            )
+        if authoritative_lane_count == 1 and not verified_batch_child:
+            raise GovernanceError(
+                "parallel_branch_allocate_precheck_single_lane_authority_required",
+                (
+                    "one-lane allocation precheck requires verified "
+                    "mf_batch_parallel child lineage"
+                ),
+                422,
+                {
+                    "expected_lane_count": authoritative_lane_count,
+                    "actual_lane_count": len(copy_safe_bodies),
+                    "cardinality_source": cardinality_source,
+                    "batch_row_scoped_successor": bool(
+                        cardinality_policy.get("batch_row_scoped_successor")
+                    ),
+                    "writes_performed": False,
+                },
+            )
+        atomic = bool(allocation_precheck_policy.get("atomic"))
+        allocation_scope = str(
+            allocation_precheck_policy.get("scope") or ""
+        )
         criteria, row_files = _backlog_acceptance_scope_authority(
             conn,
             backlog_id,
@@ -11587,9 +11715,10 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                 "status": "ready",
                 "submit_unchanged": True,
                 "zero_write": True,
-                "expected_lane_count": expected_lane_count,
+                "expected_lane_count": authoritative_lane_count,
                 "atomic": atomic,
                 "scope": allocation_scope,
+                "cardinality_source": cardinality_source,
             }
         copy_safe_bodies.sort(key=lambda body: str(body.get("task_id") or ""))
         lane_projections.sort(
@@ -11602,10 +11731,13 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             "project_id": project_id,
             "backlog_id": backlog_id,
             "contract_execution_id": contract_execution_id,
-            "expected_lane_count": expected_lane_count,
+            "expected_lane_count": authoritative_lane_count,
             "lane_count": len(copy_safe_bodies),
             "atomic": atomic,
             "allocation_scope": allocation_scope,
+            "effective_allocation_precheck_policy": (
+                allocation_precheck_policy
+            ),
             "submit_unchanged": True,
             "mcp_tool": "parallel_branch_allocate",
             "copy_safe_allocation_bodies": copy_safe_bodies,

@@ -175,6 +175,11 @@ def test_mf_parallel_rev9_preserves_rev8_stage_machine_and_requires_allocation_p
     assert policy["submit_returned_bodies_unchanged"] is True
     assert policy["applies_to_stage_types"] == ["mf_sub"]
     assert policy["excluded_stage_types"] == ["failed_qa_rework"]
+    cardinality_sensitive_text = json.dumps(rev9, ensure_ascii=False)
+    assert "both lane merges" not in cardinality_sensitive_text
+    assert "two-lane fan-out" not in cardinality_sensitive_text
+    assert "all required lane merges" in cardinality_sensitive_text
+    assert "initial required-lane fan-out" in cardinality_sensitive_text
     assert policy["zero_write_surfaces"] == [
         "runtime_context",
         "worktree",

@@ -26,12 +26,12 @@
       "Allocation precheck and every Drift Gym checkpoint are read-only. The precheck must perform zero RuntimeContext, worktree, merge-queue, timeline, and ContractRuntime writes; caller-supplied external paths are diagnostics only and are projected to the registered repository .worktrees directory.",
       "Every selected worker owns its own read receipt, startup, graph trace, implementation, worker commit, finish-time attestation, and finish gate evidence. Every worker line uses its runtime_context line_instance_id.",
       "Do not advance to merge until every required worker line instance has passed finish gate. Merge each lane through its own durable merge queue, then reconcile the final canonical HEAD exactly once.",
-      "Independent integration QA runs only after both lane merges and the activated canonical reconcile. QA must test and query the final canonical HEAD/reconciled graph, never a worker worktree or historical fixture.",
-      "Authenticated independent QA alone authors PASS or NO-PASS. QA NO-PASS keeps the parent open and allocates exactly one bounded failed_qa_rework worker tied to the failed QA source on the same append-only mf_parallel execution; it does not repeat the two-lane fan-out. After repair it returns through merge, reconcile, and a fresh QA session. direct_fix is forbidden.",
+      "Independent integration QA runs only after all required lane merges and the activated canonical reconcile. QA must test and query the final canonical HEAD/reconciled graph, never a worker worktree or historical fixture.",
+      "Authenticated independent QA alone authors PASS or NO-PASS. QA NO-PASS keeps the parent open and allocates exactly one bounded failed_qa_rework worker tied to the failed QA source on the same append-only mf_parallel execution; it does not repeat the initial required-lane fan-out. After repair it returns through merge, reconcile, and a fresh QA session. direct_fix is forbidden.",
       "Before implementation, compare each persisted owned_files fence with worker-authored files. Inherited target-head files are not worker-authored files and must not be added to changed_files.",
       "A worker scope-insufficiency request is append-only sideband evidence, not authority. Never widen owned_files from the request itself.",
       "Merge materialize uses durable status merge_ready. If live apply proves a candidate is already contained, retain the canonical observer merge event with git_mutation_executed=false.",
-      "Post-merge graph_current_full_reconcile activate=true requires durable merge authority for both lanes and a distinct activation snapshot id.",
+      "Post-merge graph_current_full_reconcile activate=true requires durable merge authority for all required lanes and a distinct activation snapshot id.",
       "Copy only copy-safe route and runtime references. Never persist raw route, session, or fence tokens."
     ],
     "refs": []
@@ -231,13 +231,13 @@
       },
       {
         "stage_id": "observer_reconcile",
-        "description": "Observer activates one canonical graph snapshot after both lane merges.",
+        "description": "Observer activates one canonical graph snapshot after all required lane merges.",
         "lines": [
           {
             "allowed_writer_roles": [
               "observer"
             ],
-            "description": "After both lane merges land, reconcile and activate the final canonical HEAD exactly once before independent integration QA.",
+            "description": "After all required lane merges land, reconcile and activate the final canonical HEAD exactly once before independent integration QA.",
             "evidence_kind": "reconcile",
             "line_id": "observer_reconcile",
             "owner_role": "observer",
@@ -255,7 +255,7 @@
             "allowed_writer_roles": [
               "qa"
             ],
-            "description": "Independent QA queries the reconciled final canonical HEAD after both lane merges; worker worktrees and historical fixtures are forbidden targets.",
+            "description": "Independent QA queries the reconciled final canonical HEAD after all required lane merges; worker worktrees and historical fixtures are forbidden targets.",
             "evidence_kind": "graph_trace",
             "line_id": "qa_graph_context",
             "owner_role": "qa",
@@ -273,7 +273,7 @@
             "allowed_writer_roles": [
               "qa"
             ],
-            "description": "A fresh independent QA session verifies the integrated final canonical HEAD after reconcile. NO-PASS requires exactly one append-only bounded failed_qa_rework worker on the same mf_parallel execution; it does not repeat the two-lane fan-out and direct_fix is forbidden.",
+            "description": "A fresh independent QA session verifies the integrated final canonical HEAD after reconcile. NO-PASS requires exactly one append-only bounded failed_qa_rework worker on the same mf_parallel execution; it does not repeat the initial required-lane fan-out and direct_fix is forbidden.",
             "evidence_kind": "independent_verification",
             "line_id": "qa_independent_verification",
             "owner_role": "qa",
@@ -291,7 +291,7 @@
             "allowed_writer_roles": [
               "observer"
             ],
-            "description": "Observer close-ready evidence after both lane merges, canonical reconcile, final independent QA PASS, and close-gate prerequisites.",
+            "description": "Observer close-ready evidence after all required lane merges, canonical reconcile, final independent QA PASS, and close-gate prerequisites.",
             "evidence_kind": "close_ready",
             "line_id": "observer_close_ready",
             "owner_role": "observer",
@@ -785,7 +785,7 @@
       "contract_id": "mf_parallel.v2",
       "version": "v2",
       "mode": "same_contract_append_only_failed_qa_rework",
-      "reason": "After final canonical integration QA NO-PASS, allocate exactly one bounded failed_qa_rework worker tied to the failed QA source without repeating the two-lane fan-out, then merge, reconcile, and run a fresh independent QA session."
+      "reason": "After final canonical integration QA NO-PASS, allocate exactly one bounded failed_qa_rework worker tied to the failed QA source without repeating the initial required-lane fan-out, then merge, reconcile, and run a fresh independent QA session."
     }
   ],
   "version": "v2"
