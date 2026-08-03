@@ -45769,6 +45769,72 @@ def test_timeline_failed_qa_rejoin_starts_fresh_contract_route_revision_without_
     )
 
 
+def test_contract_runtime_read_facade_uses_zero_write_current_record(
+    conn,
+    monkeypatch,
+):
+    execution_id = "cex-zero-write-current-record"
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-ZERO-WRITE-CURRENT-RECORD",
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [],
+        "execution_state": {"execution_state_revision": 1},
+        "execution_state_revision": 1,
+        "runtime_guide": {
+            "runtime_guide_hash": _fake_sha("zero-write-current-record"),
+            "next_legal_action": {"line_id": "worker_finish_gate"},
+        },
+    }
+    current_record_calls = []
+
+    class FailOnWriteStore:
+        def get(self, requested_execution_id):
+            assert requested_execution_id == execution_id
+            return copy.deepcopy(record)
+
+        def update(self, *_args, **_kwargs):
+            raise AssertionError("read facade must not update contract runtime state")
+
+    class ReadOnlyRuntime:
+        store = FailOnWriteStore()
+
+        def current_record(self, requested_execution_id, *, actor_role):
+            assert requested_execution_id == execution_id
+            current_record_calls.append(actor_role)
+            return copy.deepcopy(record)
+
+        def current_guide(self, *_args, **_kwargs):
+            raise AssertionError("read facade must not call the mutating legacy guide")
+
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: ReadOnlyRuntime())
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_dispatch_copy_safe_projection",
+        lambda _conn, **kwargs: (copy.deepcopy(kwargs["record"]), {}),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda _conn, **kwargs: (copy.deepcopy(kwargs["record"]), {}),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_blocked_projection",
+        lambda _conn, **kwargs: copy.deepcopy(kwargs["record"]),
+    )
+
+    current = server._contract_runtime_read(
+        conn,
+        contract_execution_id=execution_id,
+        actor_role="mf_sub",
+    )
+
+    assert current_record_calls == ["mf_sub"]
+    assert current["runtime_guide"] == record["runtime_guide"]
+
+
 def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     conn,
     monkeypatch,
@@ -51923,6 +51989,12 @@ def _install_mf_sub_multitrace_contract_runtime(
             assert requested_execution_id == execution_id
             assert actor_role == "mf_sub"
             return record["runtime_guide"]
+
+        @staticmethod
+        def current_record(requested_execution_id, actor_role):
+            assert requested_execution_id == execution_id
+            assert actor_role == "mf_sub"
+            return copy.deepcopy(record)
 
         @staticmethod
         def submit_line_write(
@@ -72284,6 +72356,10 @@ def test_runtime_context_canonical_write_immediately_invalidates_prior_capsule(
             return current["record"]["runtime_guide"]
 
         @staticmethod
+        def current_record(_execution_id, actor_role):
+            return copy.deepcopy(current["record"])
+
+        @staticmethod
         def mf_parallel_atomic_lane_gate_view(
             record,
             runtime_guide,
@@ -72446,6 +72522,11 @@ def _install_close_gate_capsule_runtime(monkeypatch, *, result_mode):
         def current_guide(_execution_id, actor_role):
             assert actor_role == "observer"
             return current["record"]["runtime_guide"]
+
+        @staticmethod
+        def current_record(_execution_id, actor_role):
+            assert actor_role == "observer"
+            return copy.deepcopy(current["record"])
 
         @staticmethod
         def submit_line_write(*_args, **_kwargs):
@@ -80862,6 +80943,9 @@ def test_terminal_timeline_gate_degrades_stale_pin_but_mutable_projection_reject
         store = Store()
 
         def current_guide(self, _execution_id, *, actor_role=None):
+            raise stale
+
+        def current_record(self, _execution_id, *, actor_role=None):
             raise stale
 
     monkeypatch.setattr(server, "_contract_runtime", lambda _conn: Runtime())
@@ -90296,6 +90380,7 @@ def test_fresh_failed_qa_rework_receipt_uses_context_local_timeline_without_resu
     runtime = SimpleNamespace(
         pinned_definition_has_line=lambda _execution_id, _line_id: True,
         current_guide=lambda _execution_id, actor_role: None,
+        current_record=lambda _execution_id, actor_role: record,
         store=SimpleNamespace(get=lambda _execution_id: record),
         submit_line_write=lambda *args, **kwargs: pytest.fail(
             "context-local receipt must not resubmit the global Contract line"
@@ -113171,6 +113256,11 @@ def test_worker_commit_close_facade_binds_exact_atomic_lane_identity_and_hash(
             assert requested_execution_id == execution_id
             assert actor_role == "mf_sub"
             return copy.deepcopy(record["runtime_guide"])
+
+        def current_record(self, requested_execution_id, *, actor_role):
+            assert requested_execution_id == execution_id
+            assert actor_role == "mf_sub"
+            return copy.deepcopy(record)
 
         def mf_parallel_atomic_lane_gate_view(
             self,

@@ -7336,17 +7336,29 @@ class ContractRuntime:
         *,
         actor_role: str | None = None,
     ) -> dict[str, Any]:
+        """Refresh the legacy stored guide; live read facades use ``current_record``."""
+
+        view = self.current_record(
+            contract_execution_id,
+            actor_role=actor_role,
+        )
+        self.store.update(contract_execution_id, view)
+        return dict(view["runtime_guide"])
+
+    def current_record(
+        self,
+        contract_execution_id: str,
+        *,
+        actor_role: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the current derived execution view without taking a write lock."""
+
         record = self.store.get(contract_execution_id)
-        view = self._record_view(
+        return self._record_view(
             record,
             actor_role=actor_role,
             completed_lines=record.get("completed_lines") or [],
         )
-        record["execution_state"] = view["execution_state"]
-        record["runtime_guide"] = view["runtime_guide"]
-        record["precheck_decision"] = view["precheck_decision"]
-        self.store.update(contract_execution_id, record)
-        return dict(view["runtime_guide"])
 
     def projected_record(
         self,
@@ -7570,12 +7582,13 @@ class ContractRuntime:
             effective_write["body_actor_role"] = body_actor_role
         _enrich_line_instance_fields(effective_write)
         _enrich_qa_evidence_provenance(effective_write, effective_actor_role)
-        guide = self.current_guide(
-            contract_execution_id,
+        refreshed = record
+        gate_record = self._record_view(
+            refreshed,
             actor_role=effective_actor_role,
+            completed_lines=refreshed.get("completed_lines") or [],
         )
-        refreshed = self.store.get(contract_execution_id)
-        gate_record = refreshed
+        guide = gate_record["runtime_guide"]
         use_completed_line_projection = (
             projected_completed_lines is not None
             and str(effective_write.get("line_id") or "").strip()
@@ -7650,6 +7663,11 @@ class ContractRuntime:
         expected_revision = int(refreshed.get("execution_state_revision") or 1)
         refreshed["completed_lines"] = completed_lines
         refreshed["execution_state_revision"] = expected_revision + 1
+        refreshed = self._record_view(
+            refreshed,
+            actor_role=effective_actor_role,
+            completed_lines=completed_lines,
+        )
         try:
             self.store.update(
                 contract_execution_id,
@@ -7663,14 +7681,7 @@ class ContractRuntime:
                 "decision": WriteGateDecision(ok=False, errors=(str(exc),)).to_dict(),
                 "record": self.store.get(contract_execution_id),
             }
-        next_guide = self.current_guide(
-            contract_execution_id,
-            actor_role=effective_actor_role,
-        )
-        updated = self.store.get(contract_execution_id)
-        updated["runtime_guide"] = next_guide
-        self.store.update(contract_execution_id, updated)
-        result_record = self.store.get(contract_execution_id)
+        result_record = deepcopy(refreshed)
         if use_completed_line_projection:
             projected_after_write = list(projected_completed_lines)
             projected_after_write.append(written_line)
@@ -8912,6 +8923,11 @@ class ContractRuntime:
         updated_record = dict(record)
         updated_record["completed_lines"] = [*lines, written_line]
         updated_record["execution_state_revision"] = expected_revision + 1
+        updated_record = self._record_view(
+            updated_record,
+            actor_role=effective_actor_role,
+            completed_lines=updated_record["completed_lines"],
+        )
         try:
             self.store.update(
                 contract_execution_id,
@@ -8928,19 +8944,12 @@ class ContractRuntime:
                 ).to_dict(),
                 "record": self.store.get(contract_execution_id),
             }
-        next_guide = self.current_guide(
-            contract_execution_id,
-            actor_role=effective_actor_role,
-        )
-        persisted = self.store.get(contract_execution_id)
-        persisted["runtime_guide"] = next_guide
-        self.store.update(contract_execution_id, persisted)
         return {
             "schema_version": "contract_runtime_write_result.v1",
             "ok": True,
             "status": "revised",
             "decision": WriteGateDecision(ok=True).to_dict(),
-            "record": self.store.get(contract_execution_id),
+            "record": deepcopy(updated_record),
             "supersedes_implementation_lineage_ref": prior_lineage[
                 "implementation_lineage_ref"
             ],
@@ -9063,12 +9072,13 @@ class ContractRuntime:
         if expected_revision != actual_revision:
             return rejected("execution_state_revision mismatch")
 
-        guide = self.current_guide(
-            contract_execution_id,
+        refreshed = record
+        gate_record: Mapping[str, Any] = self._record_view(
+            refreshed,
             actor_role=effective_actor_role,
+            completed_lines=refreshed.get("completed_lines") or [],
         )
-        refreshed = self.store.get(contract_execution_id)
-        gate_record: Mapping[str, Any] = refreshed
+        guide = gate_record["runtime_guide"]
         if projected_completed_lines is not None:
             gate_record = self.projected_record(
                 contract_execution_id,
@@ -9220,6 +9230,11 @@ class ContractRuntime:
         completed_lines.append(written_line)
         refreshed["completed_lines"] = completed_lines
         refreshed["execution_state_revision"] = actual_revision + 1
+        refreshed = self._record_view(
+            refreshed,
+            actor_role=effective_actor_role,
+            completed_lines=completed_lines,
+        )
         try:
             self.store.update(
                 contract_execution_id,
@@ -9229,8 +9244,7 @@ class ContractRuntime:
         except ContractRuntimeError as exc:
             return rejected(str(exc), current=self.store.get(contract_execution_id))
 
-        self.current_guide(contract_execution_id, actor_role=effective_actor_role)
-        result_record = self.store.get(contract_execution_id)
+        result_record = deepcopy(refreshed)
         if projected_completed_lines is not None:
             projected_after = list(projected_completed_lines)
             projected_after.append(written_line)
@@ -9276,12 +9290,13 @@ class ContractRuntime:
             effective_write["body_actor_role"] = body_actor_role
         _enrich_line_instance_fields(effective_write)
         _enrich_qa_evidence_provenance(effective_write, effective_actor_role)
-        guide = self.current_guide(
-            contract_execution_id,
+        refreshed = record
+        gate_record = self._record_view(
+            refreshed,
             actor_role=effective_actor_role,
+            completed_lines=refreshed.get("completed_lines") or [],
         )
-        refreshed = self.store.get(contract_execution_id)
-        gate_record = refreshed
+        guide = gate_record["runtime_guide"]
         use_completed_line_projection = (
             projected_completed_lines is not None
             and str(effective_write.get("line_id") or "").strip()

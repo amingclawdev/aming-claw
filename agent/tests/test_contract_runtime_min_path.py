@@ -860,9 +860,13 @@ def test_projected_record_cannot_override_canonical_worker_commit_lineage(
         for error in projected_precheck["decision"]["errors"]
     )
 
+    canonical_record = runtime.current_record(
+        record["contract_execution_id"],
+        actor_role="mf_sub",
+    )
     canonical_write = {
         **_write_from(
-            runtime.store.get(record["contract_execution_id"]),
+            canonical_record,
             actor_role="mf_sub",
             stage_id="worker_implementation",
             line_id="worker_implementation",
@@ -1829,7 +1833,10 @@ def test_direct_fix_graph_context_gates_repair_and_qa(tmp_path):
     assert bad_qa_graph["ok"] is False
     assert any("query_source must be one of ['qa']" in error for error in bad_qa_graph["decision"]["errors"])
 
-    record = runtime.store.get(direct_fix["contract_execution_id"])
+    record = runtime.current_record(
+        direct_fix["contract_execution_id"],
+        actor_role="qa",
+    )
     qa_graph = runtime.submit_line_write(
         direct_fix["contract_execution_id"],
         {

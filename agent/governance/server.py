@@ -18398,8 +18398,10 @@ def _runtime_context_contract_runtime_worker_projection(
         return {}
     runtime = _contract_runtime(conn)
     try:
-        runtime.current_guide(execution_id, actor_role="mf_sub")
-        canonical_record = runtime.store.get(execution_id)
+        canonical_record = runtime.current_record(
+            execution_id,
+            actor_role="mf_sub",
+        )
         canonical_record, context_projection = (
             _contract_runtime_apply_mf_parallel_context_projection(
                 conn,
@@ -18754,8 +18756,11 @@ def _runtime_context_source_backed_contract_identity(
             diagnostic["ignored_counts"]["missing_exact_worker_lineage"] += 1
             continue
         try:
-            guide = runtime.current_guide(execution_id, actor_role="mf_sub")
-            refreshed = runtime.store.get(execution_id)
+            refreshed = runtime.current_record(
+                execution_id,
+                actor_role="mf_sub",
+            )
+            guide = refreshed["runtime_guide"]
         except ContractRuntimeError:
             diagnostic["ignored_counts"]["stale_or_unavailable"] += 1
             continue
@@ -33531,8 +33536,10 @@ def _runtime_context_validated_missing_finish_rejoin_authority(
     if execution_id:
         try:
             runtime = _contract_runtime(conn)
-            runtime.current_guide(execution_id, actor_role="mf_sub")
-            record = runtime.store.get(execution_id)
+            record = runtime.current_record(
+                execution_id,
+                actor_role="mf_sub",
+            )
         except (ContractRuntimeError, sqlite3.Error):
             record = {}
     if (
@@ -41586,8 +41593,10 @@ def _runtime_context_submit_canonical_contract_line(
                 "contract_execution_id": execution_id,
                 "line_id": line_id,
             }
-        runtime.current_guide(execution_id, actor_role="mf_sub")
-        record = runtime.store.get(execution_id)
+        record = runtime.current_record(
+            execution_id,
+            actor_role="mf_sub",
+        )
         stored_record = record
         projected_record, candidate_projection = (
             _contract_runtime_apply_mf_parallel_context_projection(
@@ -74747,7 +74756,11 @@ def _observer_onboarding_runtime_projection(
             },
         )
     try:
-        guide = runtime.current_guide(root_execution_id, actor_role=actor_role)
+        root_record = runtime.current_record(
+            root_execution_id,
+            actor_role=actor_role,
+        )
+        guide = root_record["runtime_guide"]
     except StalePinnedContractExecutionError as exc:
         return {
             "schema_version": "observer_onboarding_runtime_projection.v1",
@@ -75230,8 +75243,10 @@ def _contract_runtime_complete_direct_fix_child_for_parent(
         if not execution_id:
             continue
         try:
-            runtime.current_guide(execution_id, actor_role=actor_role or "observer")
-            record = runtime.store.get(execution_id)
+            record = runtime.current_record(
+                execution_id,
+                actor_role=actor_role or "observer",
+            )
         except (ContractRuntimeError, StalePinnedContractExecutionError):
             continue
         projection = _direct_fix_projection_for_successor(
@@ -75590,8 +75605,10 @@ def _contract_runtime_read(
             record=projected,
             actor_role=actor_role,
         )
-    runtime.current_guide(contract_execution_id, actor_role=actor_role)
-    record = runtime.store.get(contract_execution_id)
+    record = runtime.current_record(
+        contract_execution_id,
+        actor_role=actor_role,
+    )
     record, _dispatch_copy_projection = (
         _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
             conn,
@@ -98339,8 +98356,10 @@ def _onboard_blocked_contract_resume_projection(
                 }
             continue
         try:
-            runtime.current_guide(execution_id, actor_role=actor_role or "observer")
-            record = runtime.store.get(execution_id)
+            record = runtime.current_record(
+                execution_id,
+                actor_role=actor_role or "observer",
+            )
         except (ContractRuntimeError, StalePinnedContractExecutionError):
             continue
         projected = _contract_runtime_apply_blocked_projection(
@@ -100999,7 +101018,8 @@ def _onboard_contract_start(
             },
         )
     try:
-        guide = runtime.current_guide(execution_id, actor_role=actor_role)
+        record = runtime.current_record(execution_id, actor_role=actor_role)
+        guide = record["runtime_guide"]
     except StalePinnedContractExecutionError as exc:
         if not _contract_runtime_recovery_requested(recovery_policy):
             raise
@@ -101058,9 +101078,8 @@ def _onboard_contract_start(
                 },
             )
         execution_id = recovery_execution_id
-        guide = runtime.current_guide(execution_id, actor_role=actor_role)
-    record = runtime.store.get(execution_id)
-    record["runtime_guide"] = guide
+        record = runtime.current_record(execution_id, actor_role=actor_role)
+        guide = record["runtime_guide"]
     return record
 
 
@@ -101077,9 +101096,10 @@ def _onboard_contract_read(
         contract_execution_id=contract_execution_id,
         action="enter/read",
     )
-    guide = runtime.current_guide(contract_execution_id, actor_role=actor_role)
-    record = runtime.store.get(contract_execution_id)
-    record["runtime_guide"] = guide
+    record = runtime.current_record(
+        contract_execution_id,
+        actor_role=actor_role,
+    )
     return record
 
 
@@ -101254,7 +101274,8 @@ def _contract_add_start(
             },
         )
     try:
-        guide = runtime.current_guide(execution_id, actor_role=actor_role)
+        record = runtime.current_record(execution_id, actor_role=actor_role)
+        guide = record["runtime_guide"]
     except StalePinnedContractExecutionError as exc:
         if not _contract_runtime_recovery_requested(recovery_policy):
             raise
@@ -101306,9 +101327,8 @@ def _contract_add_start(
                 },
             )
         execution_id = recovery_execution_id
-        guide = runtime.current_guide(execution_id, actor_role=actor_role)
-    record = runtime.store.get(execution_id)
-    record["runtime_guide"] = guide
+        record = runtime.current_record(execution_id, actor_role=actor_role)
+        guide = record["runtime_guide"]
     return record
 
 
@@ -101325,9 +101345,10 @@ def _contract_add_read(
         contract_execution_id=contract_execution_id,
         action="enter/read",
     )
-    guide = runtime.current_guide(contract_execution_id, actor_role=actor_role)
-    record = runtime.store.get(contract_execution_id)
-    record["runtime_guide"] = guide
+    record = runtime.current_record(
+        contract_execution_id,
+        actor_role=actor_role,
+    )
     return record
 
 
@@ -103505,10 +103526,12 @@ def _contract_runtime_successor_complete(
     if str(successor.get("contract_id") or "") != successor_contract_id:
         return False
     try:
-        runtime.current_guide(successor_execution_id, actor_role=actor_role or "observer")
+        successor = runtime.current_record(
+            successor_execution_id,
+            actor_role=actor_role or "observer",
+        )
     except StalePinnedContractExecutionError:
         return False
-    successor = runtime.store.get(successor_execution_id)
     if successor_contract_id == DIRECT_FIX_CONTRACT_ID:
         projection = _direct_fix_projection_for_successor(
             conn,
@@ -104136,10 +104159,12 @@ def _contract_runtime_parent_for_successor(
     if str(parent_record.get("backlog_id") or "") != backlog_id:
         raise ValidationError("parent contract backlog mismatch")
     try:
-        runtime.current_guide(parent_contract_execution_id, actor_role=actor_role)
+        parent_record = runtime.current_record(
+            parent_contract_execution_id,
+            actor_role=actor_role,
+        )
     except StalePinnedContractExecutionError:
         raise
-    parent_record = runtime.store.get(parent_contract_execution_id)
     parent_definition = runtime.registry.get(
         str(parent_record.get("contract_id") or ""),
         version=str(parent_record.get("version") or ""),
@@ -104461,7 +104486,8 @@ def _contract_update_start(
             },
         )
     try:
-        guide = runtime.current_guide(execution_id, actor_role=actor_role)
+        record = runtime.current_record(execution_id, actor_role=actor_role)
+        guide = record["runtime_guide"]
     except StalePinnedContractExecutionError as exc:
         if not _contract_runtime_recovery_requested(recovery_policy):
             raise
@@ -104519,9 +104545,8 @@ def _contract_update_start(
                 },
             )
         execution_id = recovery_execution_id
-        guide = runtime.current_guide(execution_id, actor_role=actor_role)
-    record = runtime.store.get(execution_id)
-    record["runtime_guide"] = guide
+        record = runtime.current_record(execution_id, actor_role=actor_role)
+        guide = record["runtime_guide"]
     return record
 
 
@@ -104538,9 +104563,10 @@ def _contract_update_read(
         contract_execution_id=contract_execution_id,
         action="enter/read",
     )
-    guide = runtime.current_guide(contract_execution_id, actor_role=actor_role)
-    record = runtime.store.get(contract_execution_id)
-    record["runtime_guide"] = guide
+    record = runtime.current_record(
+        contract_execution_id,
+        actor_role=actor_role,
+    )
     record = _contract_runtime_apply_blocked_projection(
         conn,
         project_id=str(record.get("project_id") or ""),
@@ -104653,8 +104679,10 @@ def _observer_hotfix_successor_runtime_enter(
             "task_id": task_id,
         },
     }
-    runtime.current_guide(successor_execution_id, actor_role=actor_role)
-    successor = store.get(successor_execution_id)
+    successor = runtime.current_record(
+        successor_execution_id,
+        actor_role=actor_role,
+    )
     if successor_existed and _runtime_record_is_complete(successor):
         raise ValidationError(
             "observer_hotfix successor runtime is already complete",
@@ -104696,8 +104724,10 @@ def _observer_hotfix_successor_runtime_enter(
             actor_role=actor_role,
         )
         successor = write_result["record"]
-    runtime.current_guide(successor_execution_id, actor_role=actor_role)
-    successor = store.get(successor_execution_id)
+    successor = runtime.current_record(
+        successor_execution_id,
+        actor_role=actor_role,
+    )
     current_state = _runtime_current_state_from_record(successor)
     runtime_guide = successor.get("runtime_guide") or {}
     return {
@@ -104882,8 +104912,10 @@ def _direct_fix_successor_runtime_enter(
             features["direct_fix_graph_query_gate"] = False
             successor["contract_runtime_features"] = features
             store.update(successor_execution_id, successor)
-    runtime.current_guide(successor_execution_id, actor_role=actor_role)
-    successor = store.get(successor_execution_id)
+    successor = runtime.current_record(
+        successor_execution_id,
+        actor_role=actor_role,
+    )
     if successor_existed and _runtime_record_is_complete(successor):
         raise ValidationError(
             "direct_fix successor runtime is already complete",
@@ -104925,8 +104957,10 @@ def _direct_fix_successor_runtime_enter(
             actor_role=actor_role,
         )
         successor = write_result["record"]
-    runtime.current_guide(successor_execution_id, actor_role=actor_role)
-    successor = store.get(successor_execution_id)
+    successor = runtime.current_record(
+        successor_execution_id,
+        actor_role=actor_role,
+    )
     current_state = _runtime_current_state_from_record(successor)
     runtime_guide = _contract_runtime_guide_for_response(successor)
     current_projection = upsert_contract_chain_successor_binding(
@@ -105272,8 +105306,10 @@ def _mf_parallel_successor_runtime_enter(
             "task_id": task_id,
         },
     }
-    runtime.current_guide(successor_execution_id, actor_role=actor_role)
-    successor = store.get(successor_execution_id)
+    successor = runtime.current_record(
+        successor_execution_id,
+        actor_role=actor_role,
+    )
     current_state = _runtime_current_state_from_record(successor)
     runtime_guide = successor.get("runtime_guide") or {}
     route_token_ref_binding = (
@@ -107632,9 +107668,14 @@ def _contract_runtime_completed_line_projection_preflight_gate(
     )
     runtime = _contract_runtime(conn)
     try:
-        if actor_role:
-            runtime.current_guide(contract_execution_id, actor_role=actor_role)
-        record = runtime.store.get(contract_execution_id)
+        record = (
+            runtime.current_record(
+                contract_execution_id,
+                actor_role=actor_role,
+            )
+            if actor_role
+            else runtime.store.get(contract_execution_id)
+        )
     except (ContractRuntimeError, ContractDefinitionError):
         return {}
     if actor_role:
@@ -107827,8 +107868,10 @@ def _contract_runtime_close_gate(
     runtime = _contract_runtime(conn)
     projection: dict[str, Any] = {}
     try:
-        runtime.current_guide(contract_execution_id, actor_role=actor_role)
-        stored_record = runtime.store.get(contract_execution_id)
+        stored_record = runtime.current_record(
+            contract_execution_id,
+            actor_role=actor_role,
+        )
         record = stored_record
         record, projection = _contract_runtime_apply_mf_parallel_context_projection(
             conn,
@@ -116123,8 +116166,10 @@ def _contract_runtime_close_authority_projection(
         ) from exc
     if not _onboard_service_record(record):
         try:
-            runtime.current_guide(contract_execution_id, actor_role="observer")
-            record = runtime.store.get(contract_execution_id)
+            record = runtime.current_record(
+                contract_execution_id,
+                actor_role="observer",
+            )
         except ContractRuntimeError as exc:
             raise GovernanceError(
                 "contract_runtime_close_authority_rejected",
@@ -131060,8 +131105,10 @@ def handle_project_mf_parallel_revise(ctx: RequestContext):
             expected_revision=int(record.get("execution_state_revision") or 0),
         )
         runtime = _contract_runtime(conn)
-        runtime.current_guide(contract_execution_id, actor_role="observer")
-        updated = store.get(contract_execution_id)
+        updated = runtime.current_record(
+            contract_execution_id,
+            actor_role="observer",
+        )
         policy = _contract_runtime_mf_parallel_worker_cardinality_policy(
             conn,
             project_id=project_id,
@@ -133084,8 +133131,10 @@ def handle_project_onboard_contract_line_write(ctx: RequestContext):
             contract_execution_id=contract_execution_id,
         )
         try:
-            runtime.current_guide(contract_execution_id, actor_role=actor_role)
-            record = runtime.store.get(contract_execution_id)
+            record = runtime.current_record(
+                contract_execution_id,
+                actor_role=actor_role,
+            )
             write = _contract_runtime_line_write_body(
                 record,
                 actor_role=actor_role,
@@ -133255,8 +133304,10 @@ def handle_project_contract_add_line_write(ctx: RequestContext):
             contract_execution_id=contract_execution_id,
         )
         try:
-            runtime.current_guide(contract_execution_id, actor_role=actor_role)
-            record = runtime.store.get(contract_execution_id)
+            record = runtime.current_record(
+                contract_execution_id,
+                actor_role=actor_role,
+            )
             write = _contract_runtime_line_write_body(
                 record,
                 actor_role=actor_role,
@@ -133498,8 +133549,10 @@ def handle_project_contract_update_line_write(ctx: RequestContext):
             record=record,
         )
         try:
-            runtime.current_guide(contract_execution_id, actor_role=actor_role)
-            record = runtime.store.get(contract_execution_id)
+            record = runtime.current_record(
+                contract_execution_id,
+                actor_role=actor_role,
+            )
             blocked_record = _contract_runtime_apply_blocked_projection(
                 conn,
                 project_id=str(record.get("project_id") or ""),
@@ -133750,7 +133803,7 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
             )
 
         try:
-            runtime.current_guide(stale_execution_id, actor_role=actor_role)
+            runtime.current_record(stale_execution_id, actor_role=actor_role)
         except StalePinnedContractExecutionError as stale:
             recovery_execution_id = _contract_runtime_stale_recovery_id(stale)
         else:
@@ -133804,11 +133857,10 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
                         "fail_closed": True,
                     },
                 )
-            runtime.current_guide(
+            recovery_record = runtime.current_record(
                 recovery_execution_id,
                 actor_role=actor_role,
             )
-            recovery_record = runtime.store.get(recovery_execution_id)
             idempotent = True
         else:
             backlog_lineage = dict(
@@ -133872,12 +133924,10 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
                 backlog_lineage=backlog_lineage,
                 metadata=recovery_metadata,
             )
-        guide = runtime.current_guide(
+        recovery_record = runtime.current_record(
             recovery_execution_id,
             actor_role=actor_role,
         )
-        recovery_record = runtime.store.get(recovery_execution_id)
-        recovery_record["runtime_guide"] = guide
         conn.commit()
 
     response = _contract_runtime_response(
@@ -134144,8 +134194,10 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                     actor_role=actor_role,
                 )
             else:
-                runtime.current_guide(contract_execution_id, actor_role=actor_role)
-                record = runtime.store.get(contract_execution_id)
+                record = runtime.current_record(
+                    contract_execution_id,
+                    actor_role=actor_role,
+                )
                 stored_record = record
                 record, _dispatch_copy_projection = (
                     _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
@@ -134744,8 +134796,10 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                     mutate=False,
                 )
             else:
-                runtime.current_guide(contract_execution_id, actor_role=actor_role)
-                record = runtime.store.get(contract_execution_id)
+                record = runtime.current_record(
+                    contract_execution_id,
+                    actor_role=actor_role,
+                )
                 stored_record = record
                 record, _dispatch_copy_projection = (
                     _contract_runtime_mf_parallel_dispatch_copy_safe_projection(

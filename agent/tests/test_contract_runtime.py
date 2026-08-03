@@ -3,11 +3,14 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 from agent.governance import parallel_branch_runtime, server
+from agent.governance.contracts import ContractDefinitionRegistry
 from agent.governance.contracts.runtime import (
     ContractRuntime,
+    SQLiteContractExecutionStore,
     WriteGateDecision,
     _active_failed_qa_line,
     _contract_completion_satisfying_lines,
@@ -16,6 +19,129 @@ from agent.governance.contracts.runtime import (
     _worker_commit_completed_implementation,
 )
 from agent.governance.contracts.execution_state import build_execution_state
+
+
+def test_current_record_guide_projection_does_not_compete_with_finish_writer_lock(
+    tmp_path,
+):
+    """A sibling guide read must stay read-only while finish owns the writer."""
+
+    definition = {
+        "schema_version": "contract_definition.v1",
+        "contract_id": "sqlite_read_only_guide",
+        "version": "v1",
+        "revision": "rev1",
+        "role": "mf_sub",
+        "contract_type": "mf_parallel",
+        "status": "active",
+        "rule_layer": {
+            "stages": [
+                {
+                    "stage_id": "worker_finish",
+                    "lines": [
+                        {
+                            "line_id": "worker_finish_gate",
+                            "owner_role": "mf_sub",
+                            "allowed_writer_roles": ["mf_sub"],
+                            "evidence_kind": "mf_subagent_finish_gate",
+                        }
+                    ],
+                }
+            ]
+        },
+        "instruction_layer": {
+            "inline": ["Finish through the canonical runtime gate."],
+            "refs": [],
+        },
+    }
+    (tmp_path / "sqlite_read_only_guide.v1.rev1.json").write_text(
+        json.dumps(definition),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "contract-runtime.sqlite3"
+    writer_conn = sqlite3.connect(db_path, timeout=0.05)
+    reader_conn = sqlite3.connect(db_path, timeout=0.05)
+    for conn in (writer_conn, reader_conn):
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 50")
+
+    registry = ContractDefinitionRegistry(tmp_path)
+    writer_runtime = ContractRuntime(
+        registry,
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(writer_conn),
+    )
+    reader_runtime = ContractRuntime(
+        registry,
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(reader_conn),
+    )
+    execution_id = "cex-sqlite-read-only-guide"
+    created = writer_runtime.start_execution(
+        "sqlite_read_only_guide",
+        project_id="daily-planner",
+        backlog_id="DP-SQLITE-FINISH",
+        contract_execution_id=execution_id,
+        actor_role="mf_sub",
+        route_token_ref="rtok-sqlite-finish",
+    )
+    writer_conn.commit()
+
+    writer_conn.execute("BEGIN IMMEDIATE")
+    writer_conn.execute(
+        "UPDATE contract_runtime_executions SET updated_at = updated_at "
+        "WHERE contract_execution_id = ?",
+        (execution_id,),
+    )
+    changes_before_read = reader_conn.total_changes
+    guide = reader_runtime.current_record(
+        execution_id,
+        actor_role="mf_sub",
+    )["runtime_guide"]
+    assert guide["next_legal_action"]["line_id"] == "worker_finish_gate"
+    assert reader_conn.total_changes == changes_before_read
+
+    write = {
+        "project_id": created["project_id"],
+        "backlog_id": created["backlog_id"],
+        "contract_execution_id": execution_id,
+        "definition_hash": created["definition_hash"],
+        "instruction_bundle_hash": created["instruction_bundle_hash"],
+        "execution_state_revision": created["execution_state_revision"],
+        "runtime_guide_hash": guide["runtime_guide_hash"],
+        "stage_id": "worker_finish",
+        "line_id": "worker_finish_gate",
+        "actor_role": "mf_sub",
+        "evidence_kind": "mf_subagent_finish_gate",
+    }
+    precheck = reader_runtime.precheck_line_write(
+        execution_id,
+        write,
+        actor_role="mf_sub",
+    )
+    assert precheck["ok"] is True
+    assert reader_conn.total_changes == changes_before_read
+
+    finished = writer_runtime.submit_line_write(
+        execution_id,
+        write,
+        actor_role="mf_sub",
+    )
+    assert finished["ok"] is True
+    assert finished["record"]["execution_state_revision"] == 2
+    writer_conn.commit()
+
+    duplicate = writer_runtime.submit_line_write(
+        execution_id,
+        write,
+        actor_role="mf_sub",
+    )
+    assert duplicate["ok"] is False
+    persisted = writer_runtime.store.get(execution_id)
+    assert persisted["execution_state_revision"] == 2
+    assert len(persisted["completed_lines"]) == 1
+    writer_conn.close()
+    reader_conn.close()
 
 
 def test_mf_parallel_rev8_requires_both_worker_lanes_before_merge_and_final_qa():
@@ -1492,6 +1618,9 @@ def test_failed_qa_rework_close_gate_prevalidates_without_generic_mutation(
 
         def current_guide(self, *_args, **_kwargs):
             return record["runtime_guide"]
+
+        def current_record(self, *_args, **_kwargs):
+            return record
 
         def submit_line_write(self, *_args, **_kwargs):
             submit_calls.append((_args, _kwargs))
