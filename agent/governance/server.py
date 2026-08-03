@@ -25820,6 +25820,173 @@ def _runtime_context_route_identity_mismatch_fields(
     return mismatches
 
 
+def _runtime_context_rejoin_public_identity_text(value: Any) -> str:
+    """Return one bounded copy-safe rejoin diagnostic value."""
+
+    text = _runtime_context_public_text(value)
+    return text if len(text) <= 512 else f"{text[:509]}..."
+
+
+_RUNTIME_CONTEXT_REJOIN_REDACTED_REF_ACTUAL = (
+    "<redacted-invalid-opaque-ref>"
+)
+
+
+def _runtime_context_rejoin_public_identity_actual(
+    field: str,
+    value: Any,
+) -> str:
+    text = _runtime_context_rejoin_public_identity_text(value)
+    valid_ref_pattern = {
+        "route_token_ref": r"rtok-[0-9a-f]{32}",
+        "session_token_ref": r"wstok-[0-9a-f]{40}",
+    }.get(field)
+    if valid_ref_pattern and not re.fullmatch(valid_ref_pattern, text):
+        return _RUNTIME_CONTEXT_REJOIN_REDACTED_REF_ACTUAL
+    return text
+
+
+def _runtime_context_rejoin_public_identity_mismatches(
+    mismatches: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "field": _runtime_context_rejoin_public_identity_text(
+                mismatch.get("field")
+            ),
+            "expected": _runtime_context_rejoin_public_identity_text(
+                mismatch.get("expected")
+            ),
+            "actual": _runtime_context_rejoin_public_identity_actual(
+                _runtime_context_rejoin_public_identity_text(
+                    mismatch.get("field")
+                ),
+                mismatch.get("actual"),
+            ),
+        }
+        for mismatch in mismatches
+    ]
+
+
+def _runtime_context_rejoin_request_identity_mismatches(
+    body: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    context: Any,
+) -> list[dict[str, str]]:
+    """Compare caller-supplied rejoin identity with durable copy-body state.
+
+    Rejoin may omit optional identity fields after worker lineage exists, but a
+    supplied field must never select a different runtime, worker, or host
+    session.  Values returned here are copy-safe identifiers only; raw auth
+    material is deliberately outside this comparison and error contract.
+    """
+
+    from .parallel_branch_runtime import runtime_context_session_token_ref
+
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    agent_id = str(
+        getattr(context, "actual_host_worker_id", "")
+        or getattr(context, "agent_id", "")
+        or worker_id
+    ).strip()
+    expected = {
+        "runtime_context_id": str(runtime_context_id or "").strip(),
+        "task_id": str(getattr(context, "task_id", "") or "").strip(),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": agent_id,
+        "allocation_owner": str(
+            getattr(context, "allocation_owner", "")
+            or getattr(context, "agent_id", "")
+            or worker_id
+        ).strip(),
+        "actual_host_worker_id": agent_id,
+        "worker_session_id": str(
+            getattr(context, "host_session_id", "") or ""
+        ).strip(),
+        "host_startup_id": str(
+            getattr(context, "host_startup_id", "") or ""
+        ).strip(),
+        "host_session_id": str(
+            getattr(context, "host_session_id", "") or ""
+        ).strip(),
+        "session_token_ref": runtime_context_session_token_ref(context),
+    }
+    request_fields = (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_id",
+        "worker_slot_id",
+        "agent_id",
+        "allocation_owner",
+        "actual_host_worker_id",
+        "worker_session_id",
+        "host_startup_id",
+        "host_session_id",
+        "session_token_ref",
+    )
+    mismatches: list[dict[str, str]] = []
+    for field in request_fields:
+        if field not in body:
+            continue
+        actual = str(body.get(field) or "").strip()
+        if not actual:
+            continue
+        expected_value = str(expected.get(field) or "").strip()
+        if field == "parent_task_id":
+            allowed_parent_ids = {
+                str(value or "").strip()
+                for value in (
+                    getattr(context, "parent_task_id", ""),
+                    getattr(context, "root_task_id", ""),
+                    getattr(context, "chain_id", ""),
+                    getattr(context, "stage_task_id", ""),
+                    getattr(context, "task_id", ""),
+                    getattr(context, "backlog_id", ""),
+                )
+                if str(value or "").strip()
+            }
+            identity_matches = not allowed_parent_ids or actual in allowed_parent_ids
+        else:
+            identity_matches = actual == expected_value
+        if not identity_matches:
+            mismatches.append(
+                {
+                    "field": field,
+                    "expected": _runtime_context_rejoin_public_identity_text(
+                        expected_value
+                    ),
+                    "actual": _runtime_context_rejoin_public_identity_actual(
+                        field,
+                        actual,
+                    ),
+                }
+            )
+
+    expected_root = _runtime_context_effective_target_project_root(context)
+    for field in ("target_project_root", "project_root", "repo_root"):
+        if field not in body:
+            continue
+        actual = str(body.get(field) or "").strip()
+        if actual and actual != expected_root:
+            mismatches.append(
+                {
+                    "field": field,
+                    "expected": _runtime_context_rejoin_public_identity_text(
+                        expected_root
+                    ),
+                    "actual": _runtime_context_rejoin_public_identity_text(actual),
+                }
+            )
+    return mismatches
+
+
 def _runtime_context_raise_child_route_lineage_error(
     *,
     code: str,
@@ -26387,6 +26554,23 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
 
     from . import observer_route_context as _orc
 
+    pre_resolution_mismatches = (
+        _runtime_context_rejoin_public_identity_mismatches(
+            _runtime_context_route_identity_mismatch_fields(
+                expected_route_identity,
+                supplied_route_identity,
+            )
+        )
+    )
+    public_route_token_ref = _runtime_context_rejoin_public_identity_actual(
+        "route_token_ref",
+        route_token_ref,
+    )
+    route_token_ref_redacted = (
+        public_route_token_ref
+        == _RUNTIME_CONTEXT_REJOIN_REDACTED_REF_ACTUAL
+    )
+
     try:
         resolved = _runtime_context_resolve_implementation_route_token_ref(
             resolution_body,
@@ -26395,6 +26579,22 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
             contract_execution_id=contract_execution_id,
         )
     except _orc.RouteTokenRefError as exc:
+        identity_mismatches = list(pre_resolution_mismatches)
+        if not identity_mismatches:
+            expected_ref = str(
+                expected_route_identity.get("route_token_ref") or ""
+            ).strip()
+            identity_mismatches.append(
+                {
+                    "field": "route_token_ref",
+                    "expected": (
+                        expected_ref
+                        if expected_ref and expected_ref != route_token_ref
+                        else "<active same-scope route_token_ref>"
+                    ),
+                    "actual": public_route_token_ref,
+                }
+            )
         raise GovernanceError(
             "runtime_context_rejoin_route_token_ref_invalid",
             "runtime-context session rejoin route_token_ref is not active for the runtime route scope",
@@ -26402,10 +26602,16 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
             {
                 "runtime_context_id": runtime_context_id,
                 "task_id": getattr(context, "task_id", ""),
-                "route_token_ref": route_token_ref,
+                "route_token_ref": public_route_token_ref,
                 "route_token_ref_error_code": exc.code,
-                "route_token_ref_error": str(exc),
-                "route_token_ref_details": dict(exc.details or {}),
+                "route_token_ref_error": (
+                    exc.code if route_token_ref_redacted else str(exc)
+                ),
+                "route_token_ref_details": (
+                    {} if route_token_ref_redacted else dict(exc.details or {})
+                ),
+                "identity_mismatches": identity_mismatches,
+                "route_identity_mismatch_fields": identity_mismatches,
                 "next_legal_action": (
                     "issue_fresh_same_scope_route_token_ref_and_retry_runtime_context_session_token_rejoin"
                 ),
@@ -26415,6 +26621,22 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
             },
         ) from exc
     if not resolved:
+        identity_mismatches = list(pre_resolution_mismatches)
+        if not identity_mismatches:
+            expected_ref = str(
+                expected_route_identity.get("route_token_ref") or ""
+            ).strip()
+            identity_mismatches.append(
+                {
+                    "field": "route_token_ref",
+                    "expected": (
+                        expected_ref
+                        if expected_ref and expected_ref != route_token_ref
+                        else "<resolvable same-scope route_token_ref>"
+                    ),
+                    "actual": public_route_token_ref,
+                }
+            )
         raise GovernanceError(
             "runtime_context_rejoin_route_token_ref_invalid",
             "runtime-context session rejoin route_token_ref could not be resolved from the server registry",
@@ -26422,7 +26644,9 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
             {
                 "runtime_context_id": runtime_context_id,
                 "task_id": getattr(context, "task_id", ""),
-                "route_token_ref": route_token_ref,
+                "route_token_ref": public_route_token_ref,
+                "identity_mismatches": identity_mismatches,
+                "route_identity_mismatch_fields": identity_mismatches,
                 "next_legal_action": (
                     "issue_fresh_same_scope_route_token_ref_and_retry_runtime_context_session_token_rejoin"
                 ),
@@ -26456,6 +26680,9 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
                 }
             )
     if supplied_mismatches:
+        supplied_mismatches = _runtime_context_rejoin_public_identity_mismatches(
+            supplied_mismatches
+        )
         raise GovernanceError(
             (
                 "runtime_context_pre_lineage_rejoin_route_identity_mismatch"
@@ -26467,6 +26694,7 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
             {
                 "runtime_context_id": runtime_context_id,
                 "task_id": getattr(context, "task_id", ""),
+                "identity_mismatches": supplied_mismatches,
                 "route_identity_mismatch_fields": supplied_mismatches,
                 "next_legal_action": (
                     "retry_runtime_context_session_token_rejoin_with_resolved_route_identity"
@@ -34270,6 +34498,51 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             )
             if not present
         ]
+        request_identity_mismatches = (
+            _runtime_context_rejoin_request_identity_mismatches(
+                body,
+                runtime_context_id=runtime_context_id,
+                context=context,
+            )
+        )
+        pre_lineage_rejoin_already_consumed = bool(
+            missing_lineage
+            and str(getattr(context, "last_recovery_action", "") or "").strip()
+            in {
+                "mf_subagent_pre_lineage_session_token_rejoin_issued",
+                "mf_subagent_session_token_rejoin_issued",
+            }
+            and [
+                mismatch.get("field")
+                for mismatch in request_identity_mismatches
+            ]
+            == ["session_token_ref"]
+        )
+        if request_identity_mismatches and not pre_lineage_rejoin_already_consumed:
+            raise GovernanceError(
+                (
+                    "runtime_context_pre_lineage_rejoin_identity_mismatch"
+                    if missing_lineage
+                    else "runtime_context_rejoin_identity_mismatch"
+                ),
+                (
+                    "runtime-context session rejoin copy-body identity does "
+                    "not match the persisted runtime worker tuple"
+                ),
+                403,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "identity_mismatches": request_identity_mismatches,
+                    "next_legal_action": (
+                        "retry_runtime_context_session_token_rejoin_with_"
+                        "canonical_copy_body_identity"
+                    ),
+                    "credential_rotated": False,
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                },
+            )
         expected_route_identity = _runtime_context_latest_route_identity(conn, context)
         contract_execution_identity = _runtime_context_contract_execution_identity(
             _runtime_context_latest_contract_revision_payload(conn, context)
@@ -34313,6 +34586,21 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 {
                     "runtime_context_id": runtime_context_id,
                     "task_id": context.task_id,
+                    "identity_mismatches": [
+                        {
+                            "field": "contract_execution_id",
+                            "expected": (
+                                _runtime_context_rejoin_public_identity_text(
+                                    canonical_contract_execution_id
+                                )
+                            ),
+                            "actual": (
+                                _runtime_context_rejoin_public_identity_text(
+                                    requested_contract_execution_id
+                                )
+                            ),
+                        }
+                    ],
                     "expected_contract_execution_id": (
                         canonical_contract_execution_id
                     ),
@@ -34360,6 +34648,9 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 supplied_route_identity,
             )
             if mismatches:
+                mismatches = _runtime_context_rejoin_public_identity_mismatches(
+                    mismatches
+                )
                 raise GovernanceError(
                     (
                         "runtime_context_pre_lineage_rejoin_route_identity_mismatch"
@@ -34371,6 +34662,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     {
                         "runtime_context_id": runtime_context_id,
                         "task_id": context.task_id,
+                        "identity_mismatches": mismatches,
                         "route_identity_mismatch_fields": mismatches,
                         "next_legal_action": (
                             "retry_runtime_context_session_token_rejoin_with_current_route_identity"
@@ -34429,6 +34721,12 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         ),
                         "pre_lineage_rejoin_authority": (
                             pre_lineage_bootstrap_rejoin_authority
+                        ),
+                        "identity_mismatches": list(
+                            pre_lineage_bootstrap_rejoin_authority.get(
+                                "identity_mismatches"
+                            )
+                            or []
                         ),
                         "next_legal_action": (
                             pre_lineage_bootstrap_rejoin_authority.get(
@@ -34638,6 +34936,8 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         validated_missing_finish_rejoin_authority
                     ),
                     "reason": str(exc) or "fence_invalidated_or_unknown",
+                    "credential_rotated": False,
+                    "mutation_performed": False,
                     "fail_closed": True,
                 },
             ) from exc

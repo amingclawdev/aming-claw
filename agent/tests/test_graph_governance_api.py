@@ -42062,6 +42062,36 @@ def test_runtime_context_pre_lineage_rejoin_rotates_auth_once_without_state_or_e
         before_events=events_before_second_loss,
     )
 
+    with pytest.raises(GovernanceError) as wrong_identity_after_consumed:
+        _pre_lineage_rejoin(
+            case,
+            body_updates={"task_id": "wrong-task-after-consumed-rejoin"},
+        )
+    assert wrong_identity_after_consumed.value.code == (
+        "runtime_context_pre_lineage_rejoin_identity_mismatch"
+    )
+    assert wrong_identity_after_consumed.value.details["identity_mismatches"] == [
+        {
+            "field": "task_id",
+            "expected": case["task_id"],
+            "actual": "wrong-task-after-consumed-rejoin",
+        },
+        {
+            "field": "session_token_ref",
+            "expected": runtime_context_session_token_ref(
+                state_before_second_loss
+            ),
+            "actual": runtime_context_session_token_ref(case["context"]),
+        },
+    ]
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        wrong_identity_after_consumed.value,
+        before_context=state_before_second_loss,
+        before_events=events_before_second_loss,
+    )
+
 
 @pytest.mark.parametrize(
     ("field", "bad_value"),
@@ -42081,12 +42111,15 @@ def test_runtime_context_pre_lineage_rejoin_rotates_auth_once_without_state_or_e
         ("route_context_hash", "sha256:wrong-pre-lineage-route"),
         ("prompt_contract_id", "rprompt-wrong-pre-lineage"),
         ("prompt_contract_hash", "sha256:wrong-pre-lineage-prompt"),
-        ("route_token_ref", "rtok-wrong-pre-lineage"),
+        (
+            "route_token_ref",
+            "eyJhbGciOiJIUzI1NiJ9.raw-route-signature",
+        ),
         (
             "visible_injection_manifest_hash",
             "sha256:wrong-pre-lineage-visible",
         ),
-        ("session_token_ref", "wstok-wrong-pre-lineage-ref"),
+        ("session_token_ref", "sk-live-worker-session-secret-value"),
         ("__ref_only__", ""),
     ],
 )
@@ -42135,6 +42168,41 @@ def test_runtime_context_pre_lineage_rejoin_identity_route_and_contract_drift_is
         "runtime_context_pre_lineage_rejoin_contract_identity_mismatch",
         "runtime_context_rejoin_route_token_ref_invalid",
     }
+    if field != "__ref_only__":
+        mismatch = next(
+            item
+            for item in drift.value.details["identity_mismatches"]
+            if item["field"] == field
+        )
+        expected = _pre_lineage_rejoin_body(case)[field]
+        expected_actual = (
+            "<redacted-invalid-opaque-ref>"
+            if field in {"route_token_ref", "session_token_ref"}
+            else bad_value
+        )
+        assert mismatch == {
+            "field": field,
+            "expected": str(expected),
+            "actual": expected_actual,
+        }
+        if field in {"route_token_ref", "session_token_ref"}:
+            assert bad_value not in json.dumps(
+                drift.value.details,
+                sort_keys=True,
+            )
+        if field == "contract_execution_id":
+            assert drift.value.code == (
+                "runtime_context_pre_lineage_rejoin_contract_identity_mismatch"
+            )
+        elif field == "task_id":
+            assert drift.value.code == (
+                "runtime_context_pre_lineage_rejoin_identity_mismatch"
+            )
+        elif field == "route_id":
+            assert drift.value.code == (
+                "runtime_context_rejoin_route_token_ref_invalid"
+            )
+            assert drift.value.details["route_token_ref_error_code"]
     _assert_pre_lineage_rejoin_zero_write(
         conn,
         case,
@@ -43069,6 +43137,34 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
         guide_blocked.value.details["actionable_payloads"]
     )
 
+    with pytest.raises(GovernanceError) as wrong_task:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": "worker-runtime-rejoin-wrong",
+                    "parent_task_id": "parent-runtime-rejoin",
+                    "target_project_root": str(target_root),
+                    "reason": "reject a different worker task identity",
+                },
+            )
+        )
+    assert wrong_task.value.code == "runtime_context_rejoin_identity_mismatch"
+    assert wrong_task.value.details["identity_mismatches"] == [
+        {
+            "field": "task_id",
+            "expected": "worker-runtime-rejoin",
+            "actual": "worker-runtime-rejoin-wrong",
+        }
+    ]
+    assert wrong_task.value.details["credential_rotated"] is False
+    assert wrong_task.value.details["mutation_performed"] is False
+
     result = server.handle_graph_governance_runtime_context_session_token_rejoin(
         _ctx_with_role(
             {"project_id": PID, "runtime_context_id": context.runtime_context_id},
@@ -43076,7 +43172,7 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
             method="POST",
             body={
                 "task_id": "worker-runtime-rejoin",
-                "parent_task_id": "parent-runtime-rejoin",
+                "parent_task_id": "AC-RUNTIME-TOKEN-REJOIN",
                 "target_project_root": str(target_root),
                 "reason": "host worker session lost raw auth env after resume",
                 "ttl_seconds": 1200,
@@ -43087,6 +43183,7 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
 
     assert result["ok"] is True
     assert result["status"] == "session_token_rejoin_issued"
+    assert result["parent_task_id"] == "parent-runtime-rejoin"
     assert result["session_token"]
     assert result["fence_token"] == "fence-runtime-rejoin"
     assert result["route_identity"] == route_identity
@@ -43187,6 +43284,10 @@ def test_runtime_context_session_token_rejoin_accepts_contract_runtime_only_work
         )
         write.update(identity)
         write["payload"] = dict(identity)
+        if evidence_kind == "read_receipt":
+            write["payload"]["read_receipt_hash"] = _fake_sha(
+                "runtime-rejoin-contract-read-receipt"
+            )
         accepted = runtime.submit_line_write(
             successor["contract_execution_id"],
             write,
@@ -43258,6 +43359,15 @@ def test_runtime_context_session_token_rejoin_accepts_contract_runtime_only_work
     assert unrelated_contract.value.details["expected_contract_execution_id"] == (
         successor["contract_execution_id"]
     )
+    assert unrelated_contract.value.details["identity_mismatches"] == [
+        {
+            "field": "contract_execution_id",
+            "expected": successor["contract_execution_id"],
+            "actual": "cex-unrelated-runtime-rejoin",
+        }
+    ]
+    assert unrelated_contract.value.details["credential_rotated"] is False
+    assert unrelated_contract.value.details["mutation_performed"] is False
 
     result = server.handle_graph_governance_runtime_context_session_token_rejoin(
         _ctx_with_role(
