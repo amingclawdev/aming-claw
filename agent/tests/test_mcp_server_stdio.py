@@ -954,6 +954,47 @@ def test_governance_mcp_mf_parallel_enter_dispatches_to_runtime_facade(monkeypat
     ]
 
 
+@pytest.mark.parametrize("project_id", [None, "", "   "])
+def test_governance_mcp_mf_parallel_enter_rejects_missing_project_prewrite(
+    monkeypatch,
+    project_id,
+):
+    calls = []
+
+    def fake_http(method, path, body=None):
+        calls.append((method, path, body))
+        return {"ok": True}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    args = {"backlog_id": "AC-PARALLEL", "task_id": "parallel-task"}
+    if project_id is not None:
+        args["project_id"] = project_id
+
+    result = governance_mcp_server._dispatch_tool("mf_parallel_enter", args)
+
+    assert result == {
+        "ok": False,
+        "error": "mf_parallel_enter_project_id_missing_or_empty",
+        "code": "mf_parallel_enter_project_id_missing_or_empty",
+        "field": "project_id",
+        "expected": "non_empty_exact_project_id",
+        "actual": "missing_or_empty",
+        "guide": (
+            "A server-issued per_row_successors[*].body must already include "
+            "project_id; external callers must provide the exact project_id "
+            "before calling mf_parallel_enter."
+        ),
+        "source": (
+            "governance_mcp._dispatch_tool."
+            "mf_parallel_enter_prewrite_gate"
+        ),
+        "host_correctable": True,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+    }
+    assert calls == []
+
+
 def test_governance_mcp_mf_parallel_revise_dispatches_to_runtime_facade(monkeypatch):
     calls = []
 

@@ -4469,6 +4469,29 @@ def _qa_session_expiry(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _mf_parallel_enter_project_id_rejection() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "mf_parallel_enter_project_id_missing_or_empty",
+        "code": "mf_parallel_enter_project_id_missing_or_empty",
+        "field": "project_id",
+        "expected": "non_empty_exact_project_id",
+        "actual": "missing_or_empty",
+        "guide": (
+            "A server-issued per_row_successors[*].body must already include "
+            "project_id; external callers must provide the exact project_id "
+            "before calling mf_parallel_enter."
+        ),
+        "source": (
+            "runtime_mcp.ToolDispatcher.dispatch."
+            "mf_parallel_enter_prewrite_gate"
+        ),
+        "host_correctable": True,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+    }
+
+
 class ToolDispatcher:
     """Routes MCP tool calls to governance API or in-process worker pool."""
 
@@ -5070,6 +5093,8 @@ class ToolDispatcher:
             return self._api("POST", f"/api/projects/{pid}/hotfix/enter", body)
 
         if name == "mf_parallel_enter":
+            if not str(args.get("project_id") or "").strip():
+                return _mf_parallel_enter_project_id_rejection()
             pid = args["project_id"]
             body = {
                 key: value

@@ -109454,7 +109454,8 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
         child_b,
     ]
     assert all(
-        item["body"]["metadata"]["required_worker_count"] == 2
+        item["body"]["project_id"] == PID
+        and item["body"]["metadata"]["required_worker_count"] == 2
         for item in result["per_row_successors"]
     )
     assert all(
@@ -109491,6 +109492,10 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     assert payload["fanout_policy"]["fanout_ready"] is True
     assert payload["fanout_policy"]["shared_backlog_close_token_allowed"] is False
     assert payload["fanout_policy"]["successor_contract_template_id"] == "mf_parallel.v2"
+    assert all(
+        item["body"]["project_id"] == PID
+        for item in payload["fanout_policy"]["per_row_successors"]
+    )
 
     # The batch observer explicitly selects one worker for this row child.
     # The server accepts and freezes that selection only after re-verifying
@@ -109980,9 +109985,14 @@ def test_mf_batch_guide_entry_replay_survives_timeline_window_and_active_epoch(
     assert entered["writes_performed"] is True
     assert entered["event"]["id"] > 1000
     assert all(
-        successor["body"]["owned_files"] == successor["owned_files"]
+        successor["body"]["project_id"] == PID
+        and successor["body"]["owned_files"] == successor["owned_files"]
         and successor["body"]["target_files"] == successor["target_files"]
         for successor in entered["per_row_successors"]
+    )
+    assert (
+        entered["event"]["payload"]["fanout_policy"]["per_row_successors"]
+        == entered["per_row_successors"]
     )
 
     def durable_counts() -> tuple[int, int, int, int]:
@@ -110032,6 +110042,11 @@ def test_mf_batch_guide_entry_replay_survives_timeline_window_and_active_epoch(
     assert replay["replayed"] is True
     assert replay["writes_performed"] is False
     assert replay["event"]["id"] == entered["event"]["id"]
+    assert replay["per_row_successors"] == entered["per_row_successors"]
+    assert all(
+        successor["body"]["project_id"] == PID
+        for successor in replay["per_row_successors"]
+    )
     assert replay["merge_queue_plan"] == entered["merge_queue_plan"]
     assert durable_counts() == before_replay
 

@@ -3141,6 +3141,30 @@ def _http_with_optional_gov_token(
 # Tool dispatcher
 # ---------------------------------------------------------------------------
 
+
+def _mf_parallel_enter_project_id_rejection() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "mf_parallel_enter_project_id_missing_or_empty",
+        "code": "mf_parallel_enter_project_id_missing_or_empty",
+        "field": "project_id",
+        "expected": "non_empty_exact_project_id",
+        "actual": "missing_or_empty",
+        "guide": (
+            "A server-issued per_row_successors[*].body must already include "
+            "project_id; external callers must provide the exact project_id "
+            "before calling mf_parallel_enter."
+        ),
+        "source": (
+            "governance_mcp._dispatch_tool."
+            "mf_parallel_enter_prewrite_gate"
+        ),
+        "host_correctable": True,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+    }
+
+
 def _dispatch_tool(name: str, args: dict) -> Any:
     if _worker_host_envelope_present() and name in _WORKER_MCP_HOST_ONLY_TOOLS:
         raise ValueError("host-only authentication tool is unavailable in worker MCP")
@@ -3298,6 +3322,8 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         return _http("POST", f"/api/projects/{pid}/hotfix/enter", body)
 
     if name == "mf_parallel_enter":
+        if not str(args.get("project_id") or "").strip():
+            return _mf_parallel_enter_project_id_rejection()
         pid = args["project_id"]
         body = {
             key: value

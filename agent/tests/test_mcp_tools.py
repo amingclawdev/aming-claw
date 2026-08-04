@@ -3177,6 +3177,56 @@ def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
     )
 
 
+def test_tool_dispatcher_mf_parallel_enter_rejects_missing_or_blank_project_prewrite():
+    for args in (
+        {"backlog_id": "AC-PARALLEL", "task_id": "parallel-task"},
+        {
+            "project_id": "",
+            "backlog_id": "AC-PARALLEL",
+            "task_id": "parallel-task",
+        },
+        {
+            "project_id": "   ",
+            "backlog_id": "AC-PARALLEL",
+            "task_id": "parallel-task",
+        },
+    ):
+        calls = []
+
+        def fake_api(method, path, data=None):
+            calls.append((method, path, data))
+            return {"ok": True}
+
+        dispatcher = ToolDispatcher(
+            api_fn=fake_api,
+            worker_pool=None,
+            manager_api_fn=fake_api,
+        )
+        result = dispatcher.dispatch("mf_parallel_enter", args)
+
+        assert result == {
+            "ok": False,
+            "error": "mf_parallel_enter_project_id_missing_or_empty",
+            "code": "mf_parallel_enter_project_id_missing_or_empty",
+            "field": "project_id",
+            "expected": "non_empty_exact_project_id",
+            "actual": "missing_or_empty",
+            "guide": (
+                "A server-issued per_row_successors[*].body must already include "
+                "project_id; external callers must provide the exact project_id "
+                "before calling mf_parallel_enter."
+            ),
+            "source": (
+                "runtime_mcp.ToolDispatcher.dispatch."
+                "mf_parallel_enter_prewrite_gate"
+            ),
+            "host_correctable": True,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+        }
+        assert calls == []
+
+
 def test_active_mcp_onboard_contract_tools_route_to_source_backed_facade():
     recorder = _Recorder()
     dispatcher = _dispatcher(recorder)

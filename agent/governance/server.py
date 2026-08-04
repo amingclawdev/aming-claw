@@ -134056,6 +134056,7 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                     )
                 },
                 "body": {
+                    "project_id": project_id,
                     "backlog_id": row_id,
                     "task_id": str(
                         queue_items_by_backlog.get(row_id, {}).get("task_id")
