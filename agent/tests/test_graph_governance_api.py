@@ -53612,7 +53612,7 @@ def _assert_mf_sub_graph_query_rejected_without_contract_progress(
     assert graph_evidence["trace_ids"] == []
 
 
-def test_mf_sub_failed_graph_query_is_audited_without_canonical_progress(
+def test_mf_sub_malformed_function_query_is_zero_write_without_canonical_progress(
     conn,
     monkeypatch,
     tmp_path,
@@ -53631,8 +53631,20 @@ def test_mf_sub_failed_graph_query_is_audited_without_canonical_progress(
         args={},
     )
     # Preserve the real R12S13 malformed shape: query was present, but outside
-    # args.query, so the traced query must fail and remain audit-only.
+    # args.query. This is host-correctable input, so it must fail before an
+    # audit trace or canonical worker-context line is written.
     body["query"] = "_runtime_context_submit_canonical_contract_line"
+    graph_query_trace.ensure_schema(conn)
+    trace_count_before = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+    event_count_before = conn.execute(
+        """SELECT COUNT(*) FROM graph_query_events e
+             JOIN graph_query_traces t ON t.trace_id = e.trace_id
+            WHERE t.project_id = ?""",
+        (PID,),
+    ).fetchone()[0]
 
     result = server.handle_graph_governance_query(
         _ctx_with_role(
@@ -53645,8 +53657,93 @@ def test_mf_sub_failed_graph_query_is_audited_without_canonical_progress(
 
     assert result["ok"] is False
     assert result["result"]["ok"] is False
+    assert result["code"] == "graph_query_function_argument_required"
+    assert result["field"] == "args.query|args.node_id"
+    assert result["expected"] == ["query", "node_id"]
+    assert result["actual"] == []
+    assert "args.query" in result["guide"]
+    assert "args.symbol" in result["guide"]
+    assert result["source"].endswith("::_function_tool_argument_precheck")
+    assert result["zero_write_rejection"] is True
+    assert result["writes_performed"] is False
+    assert "trace_id" not in result
+    assert "result_count" not in result
+    assert result["result"]["code"] == result["code"]
+    assert result["contract_runtime_canonical_line"][
+        "status"
+    ] == "graph_query_canonical_gate_rejected"
+    assert result["contract_runtime_canonical_line"][
+        "contract_runtime_mutated"
+    ] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == trace_count_before
+    assert conn.execute(
+        """SELECT COUNT(*) FROM graph_query_events e
+             JOIN graph_query_traces t ON t.trace_id = e.trace_id
+            WHERE t.project_id = ?""",
+        (PID,),
+    ).fetchone()[0] == event_count_before
+
+    record = fixture["record"]
+    context = fixture["lanes"][0]["context"]
+    assert record["execution_state_revision"] == before[
+        "execution_state_revision"
+    ]
+    assert record["execution_state"]["execution_state_hash"] == before[
+        "execution_state_hash"
+    ]
+    assert record["runtime_guide"]["next_legal_action"] == before[
+        "next_legal_action"
+    ]
+    assert len(record["completed_lines"]) == before["completed_line_count"]
+    assert not any(
+        line.get("line_id") == "worker_graph_context"
+        and line.get("runtime_context_id") == context.runtime_context_id
+        for line in record["completed_lines"]
+    )
+
+
+def test_mf_sub_post_trace_query_failure_is_audited_without_canonical_progress(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    fixture = _install_mf_sub_multitrace_contract_runtime(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="post-trace-failed-query",
+    )
+    before = _mf_sub_multitrace_contract_state(fixture["record"])
+    body = _mf_sub_multitrace_query_body(
+        fixture,
+        0,
+        tool="function_index",
+        args={"query": "_runtime_context_submit_canonical_contract_line"},
+    )
+
+    def fail_after_trace(*_args, **_kwargs):
+        raise ValueError("synthetic post-trace query failure")
+
+    monkeypatch.setattr(graph_query_trace, "run_tool", fail_after_trace)
+
+    result = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=body,
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["result"] == {
+        "ok": False,
+        "error": "synthetic post-trace query failure",
+    }
     assert result["result_count"] == 0
-    assert result["result"].get("error")
     persisted = server.handle_graph_governance_query_trace_get(
         _ctx_with_role(
             {"project_id": PID, "trace_id": result["trace_id"]},
