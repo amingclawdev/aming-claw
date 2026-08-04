@@ -223,6 +223,57 @@ GRAPH_QUERY_TOOLS: dict[str, dict[str, Any]] = {
     "list_tools": {"required_args": [], "summary": "Alias for query_schema."},
 }
 
+
+_FUNCTION_LOOKUP_TOOLS = {
+    "function_index",
+    "function_callees",
+    "function_callers",
+}
+
+
+def _function_tool_argument_precheck(
+    tool: str,
+    args: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return a copy-safe zero-write rejection for malformed function lookups."""
+    normalized_tool = str(tool or "").strip().lower()
+    if normalized_tool not in _FUNCTION_LOOKUP_TOOLS:
+        return None
+
+    query_keys = ["query", "q"]
+    if normalized_tool in {"function_callees", "function_callers"}:
+        query_keys.append("function")
+    node_keys = ["node_id", "id"]
+    if any(str(args.get(key) or "").strip() for key in [*query_keys, *node_keys]):
+        return None
+
+    provided_keys = sorted(str(key) for key in args)
+    guide = (
+        f'Retry {normalized_tool} on the same authorized route with '
+        'args={"query":"<function symbol>"} or '
+        'args={"node_id":"<graph node id>"}; use args.query, not args.symbol. '
+        "Only the provided argument keys are returned here; no argument values "
+        "were persisted or echoed."
+    )
+    return {
+        "ok": False,
+        "error": (
+            f"{normalized_tool} requires a non-empty args.query or "
+            "args.node_id"
+        ),
+        "code": "graph_query_function_argument_required",
+        "field": "args.query|args.node_id",
+        "expected": ["query", "node_id"],
+        "actual": provided_keys,
+        "guide": guide,
+        "source": (
+            "agent.governance.graph_query_trace::"
+            "_function_tool_argument_precheck"
+        ),
+        "zero_write_rejection": True,
+        "writes_performed": False,
+    }
+
 GRAPH_CONTRACT_DIRECT_TOOLS = frozenset({
     "get_node",
     "get_neighbors",
@@ -2979,6 +3030,19 @@ def traced_query(
     budget: dict[str, Any] | None = None,
     project_root: str | Path | None = None,
 ) -> dict[str, Any]:
+    normalized_tool = str(tool or "").strip().lower()
+    normalized_args = dict(args or {})
+    argument_rejection = _function_tool_argument_precheck(
+        normalized_tool,
+        normalized_args,
+    )
+    if argument_rejection is not None:
+        return {
+            **argument_rejection,
+            "tool": normalized_tool,
+            "result": dict(argument_rejection),
+        }
+
     ensure_schema(conn)
     created_trace = False
     if not trace_id:
@@ -3143,7 +3207,7 @@ def traced_query(
         }
 
     started = time.perf_counter()
-    args = dict(args or {})
+    args = normalized_args
     result: dict[str, Any]
     error = ""
     try:

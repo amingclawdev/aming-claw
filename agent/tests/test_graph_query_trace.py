@@ -618,6 +618,63 @@ def test_function_call_query_reports_truncation_instead_of_scanning_forever(conn
     assert truncated["result"]["truncation_reason"] == "max_scan"
 
 
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        (
+            "function_index",
+            {"symbol": "secret-symbol-value", "session_token": "secret-token-value"},
+        ),
+        (
+            "function_callees",
+            {"symbol": "secret-symbol-value", "session_token": "secret-token-value"},
+        ),
+        (
+            "function_callers",
+            {"symbol": "secret-symbol-value", "session_token": "secret-token-value"},
+        ),
+    ],
+)
+def test_function_lookup_argument_rejection_precedes_schema_and_trace_writes(
+    tool,
+    args,
+):
+    bare_conn = sqlite3.connect(":memory:")
+    try:
+        result = graph_query_trace.traced_query(
+            bare_conn,
+            PID,
+            "missing-snapshot-is-never-read",
+            tool=tool,
+            args=args,
+            actor="observer",
+            query_source="observer",
+            query_purpose="prompt_context_build",
+            route_token_ref="rtok-copy-safe-only",
+        )
+
+        assert result["ok"] is False
+        assert result["code"] == "graph_query_function_argument_required"
+        assert result["field"] == "args.query|args.node_id"
+        assert result["expected"] == ["query", "node_id"]
+        assert result["actual"] == ["session_token", "symbol"]
+        assert "args.query" in result["guide"]
+        assert "args.symbol" in result["guide"]
+        assert result["source"].endswith("::_function_tool_argument_precheck")
+        assert result["zero_write_rejection"] is True
+        assert result["writes_performed"] is False
+        assert "trace_id" not in result
+        assert result["result"]["code"] == result["code"]
+        serialized = json.dumps(result, sort_keys=True)
+        assert "secret-symbol-value" not in serialized
+        assert "secret-token-value" not in serialized
+        assert bare_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+        ).fetchall() == []
+    finally:
+        bare_conn.close()
+
+
 def test_bounded_qa_overlay_one_hop_dependency_failure_is_fail_closed(
     conn, tmp_path, monkeypatch
 ):

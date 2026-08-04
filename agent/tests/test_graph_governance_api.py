@@ -37801,6 +37801,106 @@ def test_observer_graph_query_route_ref_projects_scope_and_rejects_overrides(con
     assert incomplete_exc.value.code == "observer_graph_query_route_scope_incomplete"
 
 
+def test_observer_function_query_bad_args_are_zero_write_then_same_route_corrects(
+    conn,
+):
+    backlog_id = "AC-GRAPH-QUERY-FUNCTION-ARG-DIAGNOSTIC"
+    task_id = "observer-function-query-arg-diagnostic"
+    _activate_basic_graph(
+        conn,
+        "full-observer-function-query-arg-diagnostic",
+        commit_sha="d" * 40,
+    )
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/graph_query_trace.py"],
+        allowed_actions=["graph_query"],
+        evidence_refs=["timeline:observer-function-query-arg-diagnostic"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    graph_query_trace.ensure_schema(conn)
+    conn.commit()
+
+    def persistence_counts():
+        return {
+            "traces": conn.execute(
+                "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+                (PID,),
+            ).fetchone()[0],
+            "events": conn.execute(
+                """SELECT COUNT(*) FROM graph_query_events e
+                     JOIN graph_query_traces t ON t.trace_id = e.trace_id
+                    WHERE t.project_id = ?""",
+                (PID,),
+            ).fetchone()[0],
+            "timeline": conn.execute(
+                "SELECT COUNT(*) FROM task_timeline_events WHERE project_id = ?",
+                (PID,),
+            ).fetchone()[0],
+        }
+
+    query_body = {
+        "snapshot_id": "active",
+        "tool": "function_index",
+        "query_source": "observer",
+        "query_purpose": "gate_validation",
+        "route_token_ref": issued["route_token_ref"],
+    }
+    before = persistence_counts()
+    rejected = server.handle_graph_governance_query(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                **query_body,
+                "args": {
+                    "symbol": "secret-symbol-value",
+                    "session_token": "secret-token-value",
+                },
+            },
+        )
+    )
+
+    assert rejected["ok"] is False
+    assert rejected["code"] == "graph_query_function_argument_required"
+    assert rejected["field"] == "args.query|args.node_id"
+    assert rejected["expected"] == ["query", "node_id"]
+    assert rejected["actual"] == ["session_token", "symbol"]
+    assert rejected["zero_write_rejection"] is True
+    assert rejected["writes_performed"] is False
+    assert "trace_id" not in rejected
+    serialized = json.dumps(rejected, sort_keys=True)
+    assert "secret-symbol-value" not in serialized
+    assert "secret-token-value" not in serialized
+    assert persistence_counts() == before
+
+    corrected = server.handle_graph_governance_query(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={**query_body, "args": {"query": "Feature"}},
+        )
+    )
+
+    assert corrected["ok"] is True
+    assert corrected["trace_id"].startswith("gqt-")
+    assert corrected["graph_query_identity"]["route_token_ref"] == (
+        issued["route_token_ref"]
+    )
+    assert persistence_counts() == {
+        "traces": before["traces"] + 1,
+        "events": before["events"] + 1,
+        "timeline": before["timeline"],
+    }
+
+
 def test_observer_graph_query_forbidden_route_is_zero_write_and_host_correctable(
     conn,
 ):
