@@ -73557,7 +73557,12 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
         "/api/projects/{project_id}/mf-batch-parallel/enter"
     )
     release_queue = guide["interface_index"]["release_operator_head_queue"]
-    assert release_queue == {
+    queue_remove_recipe = release_queue["remove_copy_safe_route_recipe"]
+    assert {
+        key: value
+        for key, value in release_queue.items()
+        if key != "remove_copy_safe_route_recipe"
+    } == {
         "kind": "http",
         "read_method": "GET",
         "mutation_method": "POST",
@@ -73607,6 +73612,56 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
             "reversible_by_audited_insert": True,
         },
     }
+    assert queue_remove_recipe["ordered_steps"] == [
+        "issue_exact_queue_remove_route_ref",
+        "bind_returned_route_token_ref",
+        "remove_historical_queue_member",
+    ]
+    route_issue_body = queue_remove_recipe["route_issue"][
+        "observer_route_context_issue_body"
+    ]
+    assert route_issue_body == {
+        "project_id": PID,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": server._onboard_service_execution_id(PID, backlog_id),
+        "target_files": ["agent/governance/server.py"],
+        "allowed_actions": ["release_operator_head_queue_remove"],
+        "evidence_refs": [
+            f"backlog:{backlog_id}",
+            (
+                "task:"
+                + server._onboard_service_execution_id(PID, backlog_id)
+            ),
+        ],
+    }
+    issued_queue_remove_route = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=route_issue_body,
+        )
+    )
+    assert issued_queue_remove_route["ok"] is True
+    assert issued_queue_remove_route["route_token"]["allowed_actions"] == [
+        "release_operator_head_queue_remove"
+    ]
+    assert queue_remove_recipe["scope_boundary"] == {
+        "authorization_scope": {
+            "backlog_id": backlog_id,
+            "task_id": server._onboard_service_execution_id(PID, backlog_id),
+        },
+        "queue_member_scope": {
+            "backlog_id": "request_body.backlog_id (historical member)",
+        },
+        "queue_member_scope_separate_from_authorization_scope": True,
+        "authorization_scope_must_not_be_replaced_by_queue_member": True,
+    }
+    queue_remove_body = queue_remove_recipe["queue_remove"]["request_body"]
+    assert queue_remove_body["historical_non_schedulable"] is True
+    assert queue_remove_body["historical_execution_resume_allowed"] is False
+    assert queue_remove_body["evidence_refs"]
+    assert queue_remove_recipe["raw_route_token_exposed"] is False
     graph_first = guide["graph_first_policy"]
     assert graph_first["source_symbol_discovery"]["tool_agnostic"] is True
     assert graph_first["default_sequence"][:3] == [
@@ -87531,6 +87586,277 @@ def test_observer_route_context_issue_does_not_widen_unrelated_routes(
     assert server._observer_route_context_issue_allowed_actions(
         allowed_actions
     ) == allowed_actions
+
+
+def test_observer_route_context_issue_request_shape_rejections_are_complete_and_secret_safe(
+    conn,
+):
+    backlog_id = "AC-ROUTE-ISSUE-HOST-CORRECTION"
+    task_id = "route-issue-host-correction-task"
+    target_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps([target_files[0]]),
+            json.dumps([target_files[1]]),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    base_body = {
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "target_files": target_files,
+        "allowed_actions": ["release_operator_head_queue_remove"],
+        "evidence_refs": ["timeline:route-issue-host-correction"],
+    }
+    cases = [
+        (
+            "caller_role",
+            {**base_body, "caller_role": "secret-role-value"},
+            403,
+            "secret-role-value",
+        ),
+        (
+            "target_files",
+            {**base_body, "target_files": "secret-target-value"},
+            400,
+            "secret-target-value",
+        ),
+        (
+            "target_files",
+            {**base_body, "target_files": []},
+            400,
+            "",
+        ),
+        (
+            "target_files",
+            {**base_body, "target_files": [""]},
+            400,
+            "",
+        ),
+        (
+            "backlog_id",
+            {key: value for key, value in base_body.items() if key != "backlog_id"},
+            400,
+            "",
+        ),
+        (
+            "task_id",
+            {key: value for key, value in base_body.items() if key != "task_id"},
+            400,
+            "",
+        ),
+        (
+            "allowed_actions",
+            {**base_body, "allowed_actions": "secret-action-value"},
+            400,
+            "secret-action-value",
+        ),
+        (
+            "allowed_actions",
+            {**base_body, "allowed_actions": ["*"]},
+            400,
+            "",
+        ),
+        (
+            "evidence_refs",
+            {**base_body, "evidence_refs": "secret-evidence-value"},
+            400,
+            "secret-evidence-value",
+        ),
+        (
+            "parent_route_identity",
+            {**base_body, "parent_route_identity": "secret-parent-value"},
+            400,
+            "secret-parent-value",
+        ),
+        (
+            "parent_session_token",
+            {**base_body, "parent_session_token": "secret-session-value"},
+            400,
+            "secret-session-value",
+        ),
+        (
+            "parent_route_id",
+            {**base_body, "parent_route_id": 42},
+            400,
+            "",
+        ),
+        (
+            "ttl_hours",
+            {**base_body, "ttl_hours": "secret-ttl-value"},
+            400,
+            "secret-ttl-value",
+        ),
+        (
+            "ttl_hours",
+            {**base_body, "ttl_hours": -1},
+            400,
+            "",
+        ),
+    ]
+
+    for expected_field, request_body, expected_status, secret in cases:
+        before_total_changes = conn.total_changes
+        status, rejected = server.handle_observer_route_context_issue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=request_body,
+            )
+        )
+
+        assert status == expected_status
+        assert rejected["ok"] is False
+        assert rejected["field"] == expected_field
+        assert rejected["expected"]
+        assert rejected["actual"] is not None
+        assert rejected["source"].startswith(
+            "agent/governance/server.py::handle_observer_route_context_issue."
+        )
+        assert rejected["fail_closed"] is True
+        assert rejected["zero_write_rejection"] is True
+        assert rejected["writes_performed"] is False
+        assert rejected["mutation_performed"] is False
+        assert rejected["route_issued"] is False
+        assert rejected["route_token_ref_registered"] is False
+        assert rejected["retry_same_world_allowed"] is True
+        assert rejected["public_safe"] is True
+        assert rejected["secret_safe"] is True
+        assert rejected["raw_route_token_exposed"] is False
+        assert rejected["raw_observer_session_token_exposed"] is False
+        guide = rejected["guide"]
+        assert guide["semantic_next_action"] == "observer_route_context_issue"
+        assert guide["mcp_tool"] == "observer_route_context_issue"
+        assert guide["observer_route_context_issue_body"]["caller_role"] == (
+            "observer"
+        )
+        assert guide["field_descriptions"]["target_files"].startswith(
+            "non-empty exact row-declared"
+        )
+        assert guide["route_issued"] is False
+        assert guide["public_safe"] is True
+        assert guide["secret_safe"] is True
+        assert conn.total_changes == before_total_changes
+        if secret:
+            assert secret not in json.dumps(rejected, sort_keys=True)
+
+
+def test_observer_route_context_issue_missing_target_files_is_zero_write_then_guide_corrects(
+    conn,
+):
+    backlog_id = "AC-ROUTE-ISSUE-MISSING-TARGET-FILES"
+    task_id = "route-issue-missing-target-files-task"
+    declared_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps([declared_files[0]]),
+            json.dumps([declared_files[1]]),
+            backlog_id,
+        ),
+    )
+    observer_route_context._ensure_ref_registry_schema(conn)
+    server._ensure_release_operator_head_queue_schema(conn)
+    conn.commit()
+
+    def persistence_counts():
+        return {
+            "route_refs": conn.execute(
+                "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id = ?",
+                (PID,),
+            ).fetchone()[0],
+            "timeline": conn.execute(
+                "SELECT COUNT(*) FROM task_timeline_events WHERE project_id = ?",
+                (PID,),
+            ).fetchone()[0],
+            "queue_events": conn.execute(
+                "SELECT COUNT(*) FROM release_operator_head_queue_events WHERE project_id = ?",
+                (PID,),
+            ).fetchone()[0],
+        }
+
+    before_counts = persistence_counts()
+    before_total_changes = conn.total_changes
+    status, rejected = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "caller_role": "observer",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "allowed_actions": [
+                    "release_operator_head_queue_remove"
+                ],
+                "evidence_refs": [
+                    "timeline:route-issue-missing-target-files"
+                ],
+            },
+        )
+    )
+
+    assert status == 400
+    assert rejected["field"] == "target_files"
+    assert rejected["actual"] == {
+        "present": True,
+        "type": "list",
+        "item_count": 0,
+    }
+    assert rejected["zero_write_rejection"] is True
+    assert rejected["writes_performed"] is False
+    assert rejected["mutation_performed"] is False
+    assert persistence_counts() == before_counts
+    assert conn.total_changes == before_total_changes
+    guide = rejected["guide"]
+    assert guide["correction_ready"] is True
+    assert guide["required_replacements"] == []
+    assert guide["target_files_source"] == (
+        "backlog_bugs.target_files+test_files"
+    )
+    correction_body = guide["observer_route_context_issue_body"]
+    assert correction_body["target_files"] == declared_files
+    assert correction_body["allowed_actions"] == [
+        "release_operator_head_queue_remove"
+    ]
+    assert "never invent a path" in guide["field_descriptions"]["target_files"]
+
+    corrected = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=correction_body,
+        )
+    )
+
+    assert corrected["ok"] is True
+    assert corrected["route_token_ref"].startswith("rtok-")
+    assert corrected["route_token"]["target_files"] == sorted(declared_files)
+    assert corrected["route_token"]["allowed_actions"] == [
+        "release_operator_head_queue_remove"
+    ]
+    assert persistence_counts() == {
+        **before_counts,
+        "route_refs": before_counts["route_refs"] + 1,
+    }
 
 
 @pytest.mark.parametrize("empty_dimension", ["backlog_id", "task_id"])

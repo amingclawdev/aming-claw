@@ -3686,6 +3686,218 @@ def _multi_backlog_task_binding_mismatch(
     }
 
 
+def _observer_route_context_issue_safe_actual(
+    value: Any,
+    *,
+    missing: bool = False,
+) -> Any:
+    """Describe rejected route-issue input without reflecting caller secrets."""
+
+    if missing or value is None:
+        return {"present": False, "type": "missing"}
+    if isinstance(value, str):
+        return {
+            "present": True,
+            "type": "string",
+            "non_empty": bool(value.strip()),
+        }
+    if isinstance(value, list):
+        return {
+            "present": True,
+            "type": "list",
+            "item_count": len(value),
+        }
+    if isinstance(value, Mapping):
+        return {
+            "present": True,
+            "type": "object",
+            "field_count": len(value),
+        }
+    return {
+        "present": True,
+        "type": type(value).__name__,
+    }
+
+
+def _observer_route_context_issue_declared_target_files(
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> list[str]:
+    """Read the row-declared file scope for a host-correctable rejection."""
+
+    if not project_id or not backlog_id:
+        return []
+    conn = get_connection(project_id)
+    try:
+        return _backlog_declared_direct_file_scope(conn, backlog_id)
+    finally:
+        conn.close()
+
+
+def _observer_route_context_issue_rejection(
+    *,
+    status: int,
+    project_id: str,
+    body: Mapping[str, Any],
+    error: str,
+    field: str,
+    expected: Any,
+    actual: Any,
+    source_gate: str,
+    guide_target_files: Sequence[str] | None = None,
+    correction_overrides: Mapping[str, Any] | None = None,
+    required_replacements: Sequence[str] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Return one public, deterministic, fail-closed route-issue correction.
+
+    Rejections from this helper occur before token creation or ref persistence.
+    The guide copies only route-issuance fields, never arbitrary request keys or
+    raw route/session credentials.  Unresolved required values remain guarded
+    by values that the issuance facade itself rejects, so copying a partial
+    guide cannot accidentally mint a widened route.
+    """
+
+    backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    raw_target_files = (
+        body.get("target_files")
+        if "target_files" in body
+        else body.get("owned_files")
+    )
+    target_files = [
+        str(path).strip()
+        for path in (
+            list(guide_target_files)
+            if guide_target_files is not None
+            else raw_target_files
+            if isinstance(raw_target_files, list)
+            else []
+        )
+        if str(path or "").strip()
+    ]
+    raw_allowed_actions = body.get("allowed_actions")
+    allowed_actions = (
+        [
+            str(action).strip()
+            for action in raw_allowed_actions
+            if str(action or "").strip()
+        ]
+        if isinstance(raw_allowed_actions, list)
+        else []
+    )
+    unresolved_fields: list[str] = []
+    if not backlog_id:
+        unresolved_fields.append("backlog_id")
+    if not task_id:
+        unresolved_fields.append("task_id")
+    if not target_files:
+        unresolved_fields.append("target_files")
+    if raw_allowed_actions is not None and (
+        not isinstance(raw_allowed_actions, list) or not allowed_actions
+    ):
+        unresolved_fields.append("allowed_actions")
+    for replacement in required_replacements or ():
+        replacement_field = str(replacement or "").strip()
+        if replacement_field and replacement_field not in unresolved_fields:
+            unresolved_fields.append(replacement_field)
+
+    corrected_body: dict[str, Any] = {
+        "project_id": str(project_id or "").strip(),
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "target_files": target_files,
+    }
+    if raw_allowed_actions is not None:
+        # A wildcard is intentionally used as a fail-closed replacement when
+        # the caller supplied an invalid type.  It must be replaced with the
+        # exact action grants before the guide becomes copy-ready.
+        corrected_body["allowed_actions"] = (
+            allowed_actions if allowed_actions else ["*"]
+        )
+    raw_evidence_refs = body.get("evidence_refs")
+    if raw_evidence_refs is not None:
+        # Evidence refs are optional.  Invalid or arbitrary caller values are
+        # not reflected; an empty list is a safe correction.
+        corrected_body["evidence_refs"] = []
+    if correction_overrides:
+        corrected_body.update(dict(correction_overrides))
+
+    guide = {
+        "schema_version": (
+            "observer_route_context_issue.host_correction_guide.v1"
+        ),
+        "semantic_next_action": "observer_route_context_issue",
+        "mcp_tool": "observer_route_context_issue",
+        "http_entrypoint": {
+            "method": "POST",
+            "path": "/api/projects/{project_id}/observer/route-context/issue",
+            "path_params": {"project_id": str(project_id or "").strip()},
+        },
+        "observer_route_context_issue_body": corrected_body,
+        "correction_ready": not unresolved_fields,
+        "required_replacements": unresolved_fields,
+        "field_descriptions": {
+            "caller_role": "exact literal observer",
+            "backlog_id": "authorization backlog row id",
+            "task_id": "authorization task or contract execution id",
+            "target_files": (
+                "non-empty exact row-declared or operation-owned file list; "
+                "never invent a path merely to mint a route"
+            ),
+            "allowed_actions": (
+                "optional non-empty exact action grants; replace the fail-closed "
+                "wildcard when listed in required_replacements"
+            ),
+            "evidence_refs": "optional list of durable public evidence refs",
+        },
+        "target_files_source": (
+            "backlog_bugs.target_files+test_files"
+            if guide_target_files is not None
+            else "validated request target_files/owned_files"
+        ),
+        "copy_rule": (
+            "Copy only the projected body. Replace every required_replacements "
+            "field from row/operation authority before retrying; never copy or "
+            "persist a raw route token or observer session token."
+        ),
+        "route_issued": False,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+        "raw_observer_session_token_required": False,
+        "raw_observer_session_token_exposed": False,
+        "public_safe": True,
+        "secret_safe": True,
+        "source": (
+            "agent/governance/server.py::"
+            f"handle_observer_route_context_issue.{source_gate}"
+        ),
+    }
+    return status, {
+        "ok": False,
+        "error": error,
+        "field": field,
+        "expected": expected,
+        "actual": actual,
+        "guide": guide,
+        "source": guide["source"],
+        "fail_closed": True,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "route_issued": False,
+        "route_token_ref_registered": False,
+        "retry_same_world_allowed": True,
+        "public_safe": True,
+        "secret_safe": True,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+        "raw_observer_session_token_required": False,
+        "raw_observer_session_token_exposed": False,
+    }
+
+
 @route("POST", "/api/projects/{project_id}/observer/route-context/issue")
 def handle_observer_route_context_issue(ctx: RequestContext):
     """Mint an Aming-owned, write-authorizing observer route token.
@@ -3714,22 +3926,95 @@ def handle_observer_route_context_issue(ctx: RequestContext):
         header_role = ""
     caller_role = str(body.get("caller_role") or header_role or "").strip().lower()
     if caller_role != "observer":
-        return 403, {
-            "ok": False,
-            "error": "caller_role must be 'observer' to issue a write-authorizing route token",
-        }
+        return _observer_route_context_issue_rejection(
+            status=403,
+            project_id=project_id,
+            body=body,
+            error=(
+                "caller_role must be 'observer' to issue a write-authorizing "
+                "route token"
+            ),
+            field="caller_role",
+            expected="observer",
+            actual=_observer_route_context_issue_safe_actual(
+                body.get("caller_role") or header_role,
+                missing=not bool(body.get("caller_role") or header_role),
+            ),
+            source_gate="caller_role",
+        )
 
     backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
     task_id = str(body.get("task_id") or "").strip()
-    target_files = body.get("target_files") or body.get("owned_files") or []
+    target_files = (
+        body.get("target_files")
+        if "target_files" in body
+        else body.get("owned_files") or []
+    )
+    if target_files is None:
+        target_files = []
     if not isinstance(target_files, list):
-        return 400, {"ok": False, "error": "target_files must be a list of file paths"}
+        guide_target_files = (
+            _observer_route_context_issue_declared_target_files(
+                project_id=project_id,
+                backlog_id=backlog_id,
+            )
+        )
+        return _observer_route_context_issue_rejection(
+            status=400,
+            project_id=project_id,
+            body=body,
+            error="target_files must be a list of file paths",
+            field="target_files",
+            expected={"type": "list", "min_items": 1},
+            actual=_observer_route_context_issue_safe_actual(target_files),
+            source_gate="target_files_type",
+            guide_target_files=guide_target_files,
+        )
     if not backlog_id:
-        return 400, {"ok": False, "error": "backlog_id is required"}
+        return _observer_route_context_issue_rejection(
+            status=400,
+            project_id=project_id,
+            body=body,
+            error="backlog_id is required",
+            field="backlog_id",
+            expected={"type": "string", "non_empty": True},
+            actual=_observer_route_context_issue_safe_actual(
+                body.get("backlog_id") or body.get("bug_id"),
+                missing=True,
+            ),
+            source_gate="backlog_id_required",
+        )
     if not task_id:
-        return 400, {"ok": False, "error": "task_id is required"}
+        return _observer_route_context_issue_rejection(
+            status=400,
+            project_id=project_id,
+            body=body,
+            error="task_id is required",
+            field="task_id",
+            expected={"type": "string", "non_empty": True},
+            actual=_observer_route_context_issue_safe_actual(
+                body.get("task_id"), missing=True
+            ),
+            source_gate="task_id_required",
+        )
     if not target_files:
-        return 400, {"ok": False, "error": "target_files must be a non-empty list of file paths"}
+        guide_target_files = (
+            _observer_route_context_issue_declared_target_files(
+                project_id=project_id,
+                backlog_id=backlog_id,
+            )
+        )
+        return _observer_route_context_issue_rejection(
+            status=400,
+            project_id=project_id,
+            body=body,
+            error="target_files must be a non-empty list of file paths",
+            field="target_files",
+            expected={"type": "list", "min_items": 1},
+            actual=_observer_route_context_issue_safe_actual(target_files),
+            source_gate="target_files_non_empty",
+            guide_target_files=guide_target_files,
+        )
 
     conn = get_connection(project_id)
     try:
@@ -3746,15 +4031,44 @@ def handle_observer_route_context_issue(ctx: RequestContext):
 
     allowed_actions = body.get("allowed_actions")
     if allowed_actions is not None and not isinstance(allowed_actions, list):
-        return 400, {"ok": False, "error": "allowed_actions must be a list"}
+        return _observer_route_context_issue_rejection(
+            status=400,
+            project_id=project_id,
+            body=body,
+            error="allowed_actions must be a list",
+            field="allowed_actions",
+            expected={"type": "list", "min_items": 1},
+            actual=_observer_route_context_issue_safe_actual(allowed_actions),
+            source_gate="allowed_actions_type",
+        )
     allowed_actions = _observer_route_context_issue_allowed_actions(allowed_actions)
     evidence_refs = body.get("evidence_refs")
     if evidence_refs is not None and not isinstance(evidence_refs, list):
-        return 400, {"ok": False, "error": "evidence_refs must be a list"}
+        return _observer_route_context_issue_rejection(
+            status=400,
+            project_id=project_id,
+            body=body,
+            error="evidence_refs must be a list",
+            field="evidence_refs",
+            expected={"type": "list"},
+            actual=_observer_route_context_issue_safe_actual(evidence_refs),
+            source_gate="evidence_refs_type",
+        )
 
     parent_route_identity = body.get("parent_route_identity")
     if parent_route_identity is not None and not isinstance(parent_route_identity, Mapping):
-        return 400, {"ok": False, "error": "parent_route_identity must be an object"}
+        return _observer_route_context_issue_rejection(
+            status=400,
+            project_id=project_id,
+            body=body,
+            error="parent_route_identity must be an object",
+            field="parent_route_identity",
+            expected={"type": "object"},
+            actual=_observer_route_context_issue_safe_actual(
+                parent_route_identity
+            ),
+            source_gate="parent_route_identity_type",
+        )
     raw_parent_fields = (
         "parent_route_token",
         "parent_raw_route_token",
@@ -3764,10 +4078,19 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     )
     for field in raw_parent_fields:
         if field in body:
-            return 400, {
-                "ok": False,
-                "error": "parent route identity must not include raw route/session token fields",
-            }
+            return _observer_route_context_issue_rejection(
+                status=400,
+                project_id=project_id,
+                body=body,
+                error=(
+                    "parent route identity must not include raw route/session "
+                    "token fields"
+                ),
+                field=field,
+                expected={"present": False},
+                actual={"present": True, "value_redacted": True},
+                source_gate="raw_parent_credential_refused",
+            )
     parent_identity_fields = (
         "parent_route_id",
         "parent_route_context_hash",
@@ -3782,13 +4105,34 @@ def handle_observer_route_context_issue(ctx: RequestContext):
         if value is None:
             value = ""
         if not isinstance(value, str):
-            return 400, {"ok": False, "error": f"{field} must be a string"}
+            return _observer_route_context_issue_rejection(
+                status=400,
+                project_id=project_id,
+                body=body,
+                error=f"{field} must be a string",
+                field=field,
+                expected={"type": "string"},
+                actual=_observer_route_context_issue_safe_actual(value),
+                source_gate="parent_identity_field_type",
+            )
         parent_identity_args[field] = value.strip()
 
     try:
         ttl_hours = float(body.get("ttl_hours", 24))
     except (TypeError, ValueError):
-        return 400, {"ok": False, "error": "ttl_hours must be a number"}
+        return _observer_route_context_issue_rejection(
+            status=400,
+            project_id=project_id,
+            body=body,
+            error="ttl_hours must be a number",
+            field="ttl_hours",
+            expected={"type": "number", "exclusive_minimum": 0},
+            actual=_observer_route_context_issue_safe_actual(
+                body.get("ttl_hours")
+            ),
+            source_gate="ttl_hours_type",
+            correction_overrides={"ttl_hours": 24},
+        )
 
     try:
         from . import observer_route_context
@@ -3819,7 +4163,46 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                 [str(path).strip() for path in owned_scope if str(path or "").strip()],
             )
     except ValueError as exc:
-        return 400, {"ok": False, "error": str(exc)}
+        message = str(exc)
+        value_field = (
+            "allowed_actions"
+            if message.startswith("allowed_actions")
+            else "target_files"
+            if message.startswith("target_files")
+            else "ttl_hours"
+            if message.startswith("ttl_hours")
+            else "parent_route_identity"
+            if "parent" in message
+            else "request"
+        )
+        return _observer_route_context_issue_rejection(
+            status=400,
+            project_id=project_id,
+            body=body,
+            error=message,
+            field=value_field,
+            expected="server-validated observer route issuance input",
+            actual=_observer_route_context_issue_safe_actual(
+                body.get(value_field), missing=value_field not in body
+            ),
+            source_gate="route_input_validation",
+            guide_target_files=(
+                _observer_route_context_issue_declared_target_files(
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                )
+                if value_field == "target_files"
+                else None
+            ),
+            correction_overrides=(
+                {"ttl_hours": 24} if value_field == "ttl_hours" else None
+            ),
+            required_replacements=(
+                ["allowed_actions"]
+                if value_field == "allowed_actions"
+                else []
+            ),
+        )
     except Exception as exc:  # pragma: no cover - defensive
         return 400, {"ok": False, "error": f"route token issuance failed: {exc}"}
 
@@ -97848,6 +98231,9 @@ def _onboard_contract_route_guide(
         ),
         "contract_chain_id": str(record.get("contract_chain_id") or ""),
     }
+    queue_remove_route_target_files = (
+        _onboard_contract_route_issue_target_files_from_record(record)
+    )
     role_options = [
         {
             "id": "observer",
@@ -97952,6 +98338,88 @@ def _onboard_contract_route_guide(
                 "historical_execution_resume_allowed=false",
                 "evidence_refs",
             ],
+            "remove_copy_safe_route_recipe": {
+                "schema_version": (
+                    "onboard_route_guide.release_queue_remove_route_recipe.v1"
+                ),
+                "ordered_steps": [
+                    "issue_exact_queue_remove_route_ref",
+                    "bind_returned_route_token_ref",
+                    "remove_historical_queue_member",
+                ],
+                "route_issue": {
+                    "mcp_tool": "observer_route_context_issue",
+                    "http_entrypoint": {
+                        "method": "POST",
+                        "path": (
+                            "/api/projects/{project_id}/observer/"
+                            "route-context/issue"
+                        ),
+                    },
+                    "observer_route_context_issue_body": {
+                        "project_id": project_id,
+                        "caller_role": "observer",
+                        "backlog_id": backlog_id,
+                        "task_id": contract_execution_id,
+                        "target_files": queue_remove_route_target_files,
+                        "allowed_actions": [
+                            "release_operator_head_queue_remove"
+                        ],
+                        "evidence_refs": [
+                            f"backlog:{backlog_id}",
+                            f"task:{contract_execution_id}",
+                        ],
+                    },
+                    "bind_response_field": "route_token_ref",
+                    "exact_action_grant": (
+                        "release_operator_head_queue_remove"
+                    ),
+                    "raw_route_token_required": False,
+                    "raw_route_token_exposed": False,
+                },
+                "queue_remove": {
+                    "interface": "release_operator_head_queue",
+                    "request_body": {
+                        "action": "remove",
+                        "route_token_ref": (
+                            "<copy route_issue response.route_token_ref>"
+                        ),
+                        "authorization_backlog_id": backlog_id,
+                        "authorization_task_id": contract_execution_id,
+                        "backlog_id": (
+                            "<historical queue member backlog_id>"
+                        ),
+                        "reason": (
+                            "<durable reason the historical member is no "
+                            "longer schedulable>"
+                        ),
+                        "historical_non_schedulable": True,
+                        "historical_execution_resume_allowed": False,
+                        "evidence_refs": [
+                            "<durable timeline/backlog/contract evidence ref>"
+                        ],
+                    },
+                },
+                "scope_boundary": {
+                    "authorization_scope": {
+                        "backlog_id": backlog_id,
+                        "task_id": contract_execution_id,
+                    },
+                    "queue_member_scope": {
+                        "backlog_id": (
+                            "request_body.backlog_id (historical member)"
+                        ),
+                    },
+                    "queue_member_scope_separate_from_authorization_scope": True,
+                    "authorization_scope_must_not_be_replaced_by_queue_member": True,
+                },
+                "durable_evidence_refs_required": True,
+                "copy_safe": True,
+                "raw_route_token_required": False,
+                "raw_route_token_exposed": False,
+                "raw_observer_session_token_required": False,
+                "raw_observer_session_token_exposed": False,
+            },
             "remove_guards": {
                 "operator_authorized": True,
                 "non_empty_reason": True,
