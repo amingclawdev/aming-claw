@@ -9031,11 +9031,50 @@ def _qa_validate_candidate_review_claims(
                         }
                     )
     if mismatches:
+        first_mismatch = mismatches[0]
+        field = str(first_mismatch.get("field") or "").strip()
+        expected = first_mismatch.get("expected")
+        actual = first_mismatch.get("actual")
+        expected_json = json.dumps(
+            expected,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if field in _QA_REVIEW_CLAIM_ALIASES["changed_files"]:
+            correction = (
+                f"Remove the caller-supplied `{field}` claim (recommended), "
+                f"or replace it exactly with the server-derived value "
+                f"`{expected_json}`."
+            )
+        else:
+            correction = (
+                f"Remove the caller-supplied `{field}` claim, or replace it "
+                f"exactly with the server-derived value `{expected_json}`."
+            )
         raise GovernanceError(
             "qa_graph_review_context_mismatch",
             "QA graph review context must match the server-derived candidate tuple",
             409,
-            {"identity_mismatches": mismatches},
+            {
+                "field": field,
+                "expected": expected,
+                "actual": actual,
+                "identity_mismatches": mismatches,
+                "guide": (
+                    f"{correction} Preserve the same authenticated QA session, "
+                    "graph_trace_ids, backlog_id, task_id, and commit_sha, then "
+                    "retry the same graph_query or task_timeline_append request. "
+                    "Do not mint a new QA world, bypass, waive, or change "
+                    "implementation evidence."
+                ),
+                "source": (
+                    "agent/governance/server.py::"
+                    "_qa_validate_candidate_review_claims"
+                ),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
         )
 
 

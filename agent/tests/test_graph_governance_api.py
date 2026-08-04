@@ -38099,6 +38099,75 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
         "sha256:" + hashlib.sha256(b"").hexdigest()
     )
 
+    forged_changed_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+
+    def qa_persistence_counts():
+        return {
+            "graph_traces": conn.execute(
+                "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+                (PID,),
+            ).fetchone()[0],
+            "timeline": conn.execute(
+                """SELECT COUNT(*) FROM task_timeline_events
+                   WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
+                (PID, backlog_id, task_id),
+            ).fetchone()[0],
+            "route_gates": conn.execute(
+                """SELECT COUNT(*) FROM task_timeline_events
+                   WHERE project_id = ? AND backlog_id = ? AND task_id = ?
+                     AND event_kind = 'route_token_gate'""",
+                (PID, backlog_id, task_id),
+            ).fetchone()[0],
+        }
+
+    def assert_changed_files_mismatch(rejected):
+        details = rejected.value.details
+        assert details["field"] == "changed_files"
+        assert details["expected"] == []
+        assert details["actual"] == forged_changed_files
+        assert details["identity_mismatches"] == [
+            {
+                "field": "changed_files",
+                "expected": [],
+                "actual": forged_changed_files,
+            }
+        ]
+        assert "Remove the caller-supplied `changed_files` claim" in details[
+            "guide"
+        ]
+        assert "server-derived value `[]`" in details["guide"]
+        assert "same authenticated QA session" in details["guide"]
+        assert "graph_trace_ids, backlog_id, task_id, and commit_sha" in details[
+            "guide"
+        ]
+        assert details["source"].endswith(
+            "::_qa_validate_candidate_review_claims"
+        )
+        assert details["zero_write_rejection"] is True
+        assert details["writes_performed"] is False
+
+    forged_query_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            **json.loads(json.dumps(qa_ctx.body)),
+            "candidate_review_context": {
+                "changed_files": forged_changed_files,
+            },
+        },
+    )
+    forged_query_ctx._session = dict(qa_ctx._session)
+    before_forged_query = qa_persistence_counts()
+    with pytest.raises(GovernanceError) as forged_query:
+        server.handle_graph_governance_query(forged_query_ctx)
+    assert forged_query.value.code == "qa_graph_review_context_mismatch"
+    assert_changed_files_mismatch(forged_query)
+    assert qa_persistence_counts() == before_forged_query
+
     timeline_ctx = _ctx_with_role(
         {"project_id": PID},
         "qa",
@@ -38264,6 +38333,23 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
     assert replay["idempotent_replay"] is True
     assert replay["idempotency_scope"] == "authenticated_qa_exact_authority"
     assert reverify_calls == 2
+
+    forged_timeline_body = json.loads(json.dumps(timeline_ctx.body))
+    forged_timeline_body["payload"]["changed_files"] = forged_changed_files
+    forged_timeline_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=forged_timeline_body,
+    )
+    forged_timeline_ctx._session = dict(qa_ctx._session)
+    before_forged_timeline = qa_persistence_counts()
+    with pytest.raises(GovernanceError) as forged_timeline:
+        server.handle_task_timeline_append(forged_timeline_ctx)
+    assert forged_timeline.value.code == "qa_graph_review_context_mismatch"
+    assert_changed_files_mismatch(forged_timeline)
+    assert qa_persistence_counts() == before_forged_timeline
+    assert reverify_calls == 3
 
     failed_body = json.loads(json.dumps(timeline_ctx.body))
     failed_body["status"] = "failed"
@@ -97229,6 +97315,30 @@ def test_qa_review_claims_ignore_only_payload_live_source_tuple():
         forged_audit_rejected.value.code
         == "qa_graph_review_context_mismatch"
     )
+
+    multi_mismatch = {
+        "payload": {
+            "changed_files": ["src/caller-only.py"],
+            "candidate_diff_hash": "sha256:" + "0" * 64,
+            "qa_session_token": "must-not-leak",
+        }
+    }
+    with pytest.raises(GovernanceError) as multiple_rejected:
+        server._qa_validate_candidate_review_claims(
+            multi_mismatch,
+            review_context,
+        )
+    multiple_details = multiple_rejected.value.details
+    assert multiple_details["field"] == "changed_files"
+    assert multiple_details["expected"] == []
+    assert multiple_details["actual"] == ["src/caller-only.py"]
+    assert [
+        mismatch["field"]
+        for mismatch in multiple_details["identity_mismatches"]
+    ] == ["changed_files", "candidate_diff_hash"]
+    assert "must-not-leak" not in json.dumps(multiple_details, sort_keys=True)
+    assert multiple_details["zero_write_rejection"] is True
+    assert multiple_details["writes_performed"] is False
 
 
 def test_qa_review_claims_accept_exact_no_pass_comparison_namespace():
