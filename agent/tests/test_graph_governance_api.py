@@ -40405,6 +40405,136 @@ def test_exact_candidate_context_rejects_untracked_query_root(tmp_path):
     assert exc.value.details["untracked_files_checked"] is True
 
 
+def _registered_allocator_worktree_fixture(conn, tmp_path):
+    project_root = tmp_path / "qa-exact-allocator-root"
+    candidate_commit = _init_test_git_repo(project_root)
+    worktree = project_root / ".worktrees" / "registered-worker"
+    subprocess.run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "qa-exact-registered-worker",
+            str(worktree),
+            candidate_commit,
+        ],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="qa-exact-registered-worker",
+            backlog_id="AC-QA-EXACT-REGISTERED-WORKER",
+            parent_task_id="cex-qa-exact-registered-worker",
+            root_task_id="cex-qa-exact-registered-worker",
+            target_project_root=str(project_root),
+            worktree_path=str(worktree),
+            branch_ref="refs/heads/qa-exact-registered-worker",
+            base_commit=candidate_commit,
+            head_commit=candidate_commit,
+            target_head_commit=candidate_commit,
+            status="worktree_ready",
+        ),
+    )
+    conn.commit()
+    return project_root, worktree, candidate_commit
+
+
+def test_exact_candidate_context_ignores_clean_registered_allocator_worktree(
+    conn,
+    tmp_path,
+):
+    project_root, worktree, candidate_commit = (
+        _registered_allocator_worktree_fixture(conn, tmp_path)
+    )
+    registered = server._qa_registered_allocator_worktree_paths(
+        conn,
+        project_id=PID,
+        canonical_project_root=project_root,
+    )
+
+    context = server._qa_exact_candidate_context(
+        project_root,
+        project_id=PID,
+        canonical_project_root=project_root,
+        candidate_commit_sha=candidate_commit,
+        registered_allocator_worktree_paths=registered,
+    )
+
+    assert registered == [str(worktree.resolve())]
+    assert context["root_identity"]["query_root_clean"] is True
+    assert context["root_identity"][
+        "query_root_ignored_registered_allocator_worktree_paths"
+    ] == [".worktrees/registered-worker"]
+
+
+def test_exact_candidate_context_rejects_dirty_registered_allocator_worktree(
+    conn,
+    tmp_path,
+):
+    project_root, worktree, candidate_commit = (
+        _registered_allocator_worktree_fixture(conn, tmp_path)
+    )
+    (worktree / "dirty-worker.txt").write_text("dirty\n", encoding="utf-8")
+
+    registered = server._qa_registered_allocator_worktree_paths(
+        conn,
+        project_id=PID,
+        canonical_project_root=project_root,
+    )
+    assert registered == []
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_exact_candidate_context(
+            project_root,
+            project_id=PID,
+            canonical_project_root=project_root,
+            candidate_commit_sha=candidate_commit,
+            registered_allocator_worktree_paths=registered,
+        )
+
+    assert exc.value.reason == "exact_candidate_query_root_dirty"
+    assert exc.value.details[
+        "ignored_registered_allocator_worktree_entry_count"
+    ] == 0
+
+
+def test_exact_candidate_context_rejects_unregistered_allocator_lookalike(
+    conn,
+    tmp_path,
+):
+    project_root, worktree, candidate_commit = (
+        _registered_allocator_worktree_fixture(conn, tmp_path)
+    )
+    lookalike = project_root / ".worktrees" / "unregistered-lookalike"
+    lookalike.mkdir(parents=True)
+    (lookalike / "payload.txt").write_text("not registered\n", encoding="utf-8")
+    registered = server._qa_registered_allocator_worktree_paths(
+        conn,
+        project_id=PID,
+        canonical_project_root=project_root,
+    )
+
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_exact_candidate_context(
+            project_root,
+            project_id=PID,
+            canonical_project_root=project_root,
+            candidate_commit_sha=candidate_commit,
+            registered_allocator_worktree_paths=registered,
+        )
+
+    assert registered == [str(worktree.resolve())]
+    assert exc.value.reason == "exact_candidate_query_root_dirty"
+    assert exc.value.details[
+        "ignored_registered_allocator_worktree_entry_count"
+    ] == 1
+
+
 def test_qa_candidate_overlay_rejects_wrong_repository_root(tmp_path):
     canonical = create_parallel_fixture_project(
         tmp_path,
@@ -72916,6 +73046,8 @@ def _selected_qa_runtime_guidance(
     *,
     include_dispatch: bool = True,
     conflicting_worktree: bool = False,
+    pinned_revision: str = "",
+    postmerge_complete: bool = False,
 ) -> dict[str, Any]:
     completed_lines = []
     if include_dispatch:
@@ -72935,11 +73067,31 @@ def _selected_qa_runtime_guidance(
                 ),
             },
         })
+    if postmerge_complete:
+        completed_lines.extend(
+            [
+                {
+                    "stage_id": "observer_integration",
+                    "line_id": "observer_merge",
+                    "actor_role": "observer",
+                    "evidence_kind": "merge",
+                    "status": "accepted",
+                },
+                {
+                    "stage_id": "observer_integration",
+                    "line_id": "observer_reconcile",
+                    "actor_role": "observer",
+                    "evidence_kind": "reconcile",
+                    "status": "accepted",
+                },
+            ]
+        )
     record = {
         "project_id": PID,
         "backlog_id": "AC-ONBOARD-QA-CURRENT-LINE",
         "contract_execution_id": "cex-mf-parallel-qa-current-line",
         "contract_id": "mf_parallel",
+        "revision": pinned_revision,
         "runtime_guide": {
             "completed_lines": completed_lines,
             "next_legal_action": {
@@ -73079,6 +73231,65 @@ def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe
     assert conflict["executable"] is False
     assert conflict["blocker"]["conflicting_fields"] == ["worktree_path"]
     assert "graph_query" not in json.dumps(conflict)
+
+
+def test_onboard_selected_postmerge_qa_binds_reconciled_canonical_root(
+    monkeypatch,
+):
+    canonical_root = str(Path("/tmp/canonical-project-root").resolve())
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: Path("/tmp/canonical-project-root"),
+    )
+    guidance = _selected_qa_runtime_guidance(
+        "qa_graph_context",
+        "record_graph_trace",
+        pinned_revision="rev9",
+        postmerge_complete=True,
+    )
+
+    graph_args = guidance["ordered_steps"][1]["arguments"]
+    assert graph_args["repo_root"] == canonical_root
+    assert graph_args["commit_sha"] == (
+        "<full final canonical HEAD from git rev-parse HEAD in qa_query_root>"
+    )
+    assert guidance["ordered_steps"][0]["arguments"]["commit_sha"] == (
+        "<full final canonical HEAD from git rev-parse HEAD in qa_query_root>"
+    )
+    assert guidance["canonical_dispatch_identity"] == {
+        "project_id": PID,
+        "backlog_id": "AC-ONBOARD-QA-CURRENT-LINE",
+        "original_worker_task_id": "original-worker-task",
+        "assigned_worktree": "/tmp/assigned-qa-worktree",
+        "qa_query_root": canonical_root,
+        "qa_query_root_source": "reconciled_canonical_project_root",
+    }
+    binding = guidance["legitimate_evidence_bindings"][
+        "mf_parallel_qa_graph_context"
+    ]
+    assert binding["target_project_root"] == canonical_root
+    assert binding["target_project_root_source"] == (
+        "reconciled_canonical_project_root"
+    )
+    assert binding["canonical_project_root_is_the_query_target"] is True
+    assert binding["canonical_project_root_is_not_the_query_target"] is False
+
+
+def test_onboard_selected_postmerge_revision_before_reconcile_keeps_worker_root():
+    guidance = _selected_qa_runtime_guidance(
+        "qa_graph_context",
+        "record_graph_trace",
+        pinned_revision="rev9",
+        postmerge_complete=False,
+    )
+
+    assert guidance["ordered_steps"][1]["arguments"]["repo_root"] == (
+        "/tmp/assigned-qa-worktree"
+    )
+    assert guidance["canonical_dispatch_identity"]["qa_query_root_source"] == (
+        "assigned_worker_worktree"
+    )
 
 
 def test_onboard_qa_machine_contract_binding_drives_emitted_guidance(
@@ -73263,6 +73474,8 @@ def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(
         "backlog_id": backlog_id,
         "original_worker_task_id": worker_task_id,
         "assigned_worktree": runtime_context.worktree_path,
+        "qa_query_root": runtime_context.worktree_path,
+        "qa_query_root_source": "assigned_worker_worktree",
         "runtime_context_id": runtime_context.runtime_context_id,
         "route_id": f"route-{worker_task_id}",
         "route_context_hash": f"sha256:route-{worker_task_id}",
@@ -86148,6 +86361,104 @@ def test_runtime_context_current_projects_contract_runtime_state_for_unique_fall
         current["contract_runtime_current_state"]
     )
     assert worker_view["contract_runtime_next_legal_action"] == current_next
+
+
+def test_runtime_context_current_postmerge_qa_projects_registered_canonical_root(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-RUNTIME-CURRENT-POSTMERGE-QA-ROOT"
+    worker_task_id = "runtime-current-postmerge-qa-worker"
+    worker_token = "runtime-current-postmerge-qa-token"
+    worker_fence = "fence-runtime-current-postmerge-qa"
+    canonical_root = tmp_path / "canonical-project-root"
+    worker_root = canonical_root / ".worktrees" / worker_task_id
+    canonical_root.mkdir()
+    worker_root.mkdir(parents=True)
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="runtime-current-postmerge-qa-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_root),
+        target_project_root=str(worker_root),
+    )
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        revision_id="crev-runtime-current-postmerge-qa-root",
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "contract_execution_id": successor["contract_execution_id"],
+            "target_files": ["agent/governance/server.py"],
+        },
+    )
+    conn.commit()
+    next_action = {
+        "id": "qa_graph_context",
+        "line_id": "qa_graph_context",
+        "action": "record_graph_trace",
+        "owner_role": "qa",
+    }
+    current_state = {
+        "schema_version": "contract_runtime_current_state.v1",
+        "contract_execution_id": successor["contract_execution_id"],
+        "contract_id": "mf_parallel.v2",
+        "contract_revision_id": "rev9",
+        "next_legal_action": next_action,
+    }
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_contract_runtime_worker_projection",
+        lambda *_args, **_kwargs: {
+            "contract_runtime_current_state": current_state,
+            "contract_runtime_next_legal_action": next_action,
+        },
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: canonical_root,
+    )
+
+    current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            query={
+                "parent_task_id": backlog_id,
+                "fence_token": worker_fence,
+                "session_token": worker_token,
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "target_project_root": str(worker_root),
+                "view": "all",
+            },
+        )
+    )
+
+    assert current["target_project_root"] == str(canonical_root.resolve())
+    assert current["project_root"] == str(canonical_root.resolve())
+    assert current["repo_root"] == str(canonical_root.resolve())
+    assert current["worktree_path"] == str(worker_root)
+    assert current["postmerge_qa_root_authority"] == {
+        "schema_version": "runtime_context.postmerge_qa_root_authority.v1",
+        "source": "registered_project_root",
+        "target_project_root": str(canonical_root.resolve()),
+        "assigned_worker_worktree": str(worker_root),
+        "contract_revision_id": "rev9",
+        "current_line_id": "qa_graph_context",
+        "equality_required": True,
+    }
+    assert current["source_refs"]["postmerge_qa_target_project_root"] == (
+        "registered_project_root"
+    )
 
 
 def test_runtime_context_projects_canonical_contract_qa_without_timeline_backfill(

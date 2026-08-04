@@ -7724,6 +7724,7 @@ def _qa_checkout_root_identity(
     require_canonical_base_head: bool = True,
     require_query_candidate_head: bool = False,
     require_query_review_head: bool = True,
+    registered_allocator_worktree_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
     from .checkout_provenance import describe_checkout
 
@@ -7799,6 +7800,7 @@ def _qa_checkout_root_identity(
     query_root_status_hash = ""
     query_root_tree_sha = ""
     ignored_demo_control_metadata_paths: list[str] = []
+    ignored_registered_allocator_worktree_paths: list[str] = []
     if require_query_candidate_head:
         status = _qa_git_bytes(
             query_root,
@@ -7818,6 +7820,33 @@ def _qa_checkout_root_identity(
         ):
             dirty_entries = [item for item in dirty_entries if item != demo_marker_entry]
             ignored_demo_control_metadata_paths.append(DEMO_ENVIRONMENT_MARKER)
+        registered_allocator_roots = {
+            Path(path).resolve()
+            for path in registered_allocator_worktree_paths
+            if str(path or "").strip()
+        }
+        retained_dirty_entries: list[bytes] = []
+        for item in dirty_entries:
+            if not item.startswith(b"?? "):
+                retained_dirty_entries.append(item)
+                continue
+            raw_path = item[3:].decode("utf-8", errors="surrogateescape").rstrip("/")
+            dirty_path = (query_root / raw_path).resolve()
+            registered_root = next(
+                (
+                    root
+                    for root in registered_allocator_roots
+                    if dirty_path == root or root in dirty_path.parents
+                ),
+                None,
+            )
+            if registered_root is None:
+                retained_dirty_entries.append(item)
+                continue
+            ignored_path = registered_root.relative_to(query_root).as_posix()
+            if ignored_path not in ignored_registered_allocator_worktree_paths:
+                ignored_registered_allocator_worktree_paths.append(ignored_path)
+        dirty_entries = retained_dirty_entries
         query_root_clean = not dirty_entries
         query_root_status_hash = (
             "sha256:" + hashlib.sha256(status.stdout).hexdigest()
@@ -7830,6 +7859,9 @@ def _qa_checkout_root_identity(
                 dirty_entry_count=len(dirty_entries),
                 ignored_demo_control_metadata_entry_count=len(
                     ignored_demo_control_metadata_paths
+                ),
+                ignored_registered_allocator_worktree_entry_count=len(
+                    ignored_registered_allocator_worktree_paths
                 ),
                 untracked_files_checked=True,
             )
@@ -7901,9 +7933,85 @@ def _qa_checkout_root_identity(
                 "query_root_ignored_demo_control_metadata_paths": (
                     ignored_demo_control_metadata_paths
                 ),
+                "query_root_ignored_registered_allocator_worktree_paths": sorted(
+                    ignored_registered_allocator_worktree_paths
+                ),
             }
         )
     return identity
+
+
+def _qa_registered_allocator_worktree_paths(
+    conn,
+    *,
+    project_id: str,
+    canonical_project_root: Path,
+) -> list[str]:
+    """Return clean, registered Git worktrees owned by the project allocator.
+
+    The canonical repository sees linked worktrees below ``.worktrees`` as
+    untracked directories.  Exact-candidate QA may ignore only directories
+    that are both registered in BranchRuntimeContext and independently proven
+    to be clean linked worktrees of this canonical repository.
+    """
+
+    canonical_root = Path(canonical_project_root).resolve()
+    allocator_root = (canonical_root / ".worktrees").resolve()
+    table = conn.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'parallel_branch_runtime_contexts'
+        """
+    ).fetchone()
+    if not table:
+        return []
+    canonical_common_proc = _qa_git_bytes(
+        canonical_root,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    canonical_common = Path(
+        canonical_common_proc.stdout.decode("utf-8", errors="ignore").strip()
+    ).resolve()
+    if canonical_common_proc.returncode != 0 or not str(canonical_common):
+        return []
+    rows = conn.execute(
+        """
+        SELECT target_project_root, worktree_path
+        FROM parallel_branch_runtime_contexts
+        WHERE project_id = ? AND worktree_path != ''
+        ORDER BY task_id
+        """,
+        (project_id,),
+    ).fetchall()
+    registered: list[str] = []
+    for row in rows:
+        target_root = Path(str(row["target_project_root"] or "")).resolve()
+        worktree_root = Path(str(row["worktree_path"] or "")).resolve()
+        if target_root != canonical_root or worktree_root == allocator_root:
+            continue
+        try:
+            worktree_root.relative_to(allocator_root)
+        except ValueError:
+            continue
+        if not worktree_root.is_dir():
+            continue
+        common_proc = _qa_git_bytes(
+            worktree_root,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        worktree_common = Path(
+            common_proc.stdout.decode("utf-8", errors="ignore").strip()
+        ).resolve()
+        if common_proc.returncode != 0 or worktree_common != canonical_common:
+            continue
+        clean_proc = _qa_git_bytes(
+            worktree_root,
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )
+        if clean_proc.returncode != 0 or clean_proc.stdout:
+            continue
+        registered.append(str(worktree_root))
+    return sorted(dict.fromkeys(registered))
 
 
 def _qa_exact_candidate_diff_identity(
@@ -8182,6 +8290,7 @@ def _qa_exact_candidate_context(
     comparison_base_commit_sha: str = "",
     comparison_base_commit_source: str = "",
     comparison_authority_required: bool = False,
+    registered_allocator_worktree_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
     from . import graph_query_trace
 
@@ -8200,6 +8309,9 @@ def _qa_exact_candidate_context(
         candidate_commit_sha=candidate_commit_sha,
         require_canonical_base_head=False,
         require_query_candidate_head=True,
+        registered_allocator_worktree_paths=(
+            registered_allocator_worktree_paths
+        ),
     )
     comparison_base_commit_sha = str(
         comparison_base_commit_sha or ""
@@ -10524,6 +10636,13 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                             ),
                             comparison_authority_required=(
                                 comparison_authority_required
+                            ),
+                            registered_allocator_worktree_paths=(
+                                _qa_registered_allocator_worktree_paths(
+                                    conn,
+                                    project_id=ctx.get_project_id(),
+                                    canonical_project_root=Path(canonical_root),
+                                )
                             ),
                         ),
                     }
@@ -17194,6 +17313,71 @@ def _runtime_context_projection_response(
         response["contract_runtime_current_state"] = dict(
             contract_runtime_projection.get("contract_runtime_current_state") or {}
         )
+        if _contract_runtime_current_state_is_postmerge_qa(
+            response["contract_runtime_current_state"]
+        ):
+            registered_root = project_service.resolve_project_root(
+                project_id,
+                None,
+                fallback_self=True,
+            )
+            if registered_root is not None:
+                postmerge_qa_root = str(Path(registered_root).resolve())
+                response.update(
+                    {
+                        "target_project_root": postmerge_qa_root,
+                        "project_root": postmerge_qa_root,
+                        "repo_root": postmerge_qa_root,
+                    }
+                )
+                postmerge_root_projection = _runtime_context_target_root_projection(
+                    requested_target_project_root=(
+                        _runtime_context_requested_target_project_root(ctx)
+                    ),
+                    canonical_target_project_root=postmerge_qa_root,
+                    worktree_path=worktree_path,
+                    runtime_context_id=runtime_context_id,
+                    task_id=str(getattr(context, "task_id", "") or ""),
+                    parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
+                    worker_id=worker_summary_id,
+                    worker_slot_id=worker_summary_slot_id,
+                    route_identity=_runtime_context_latest_route_identity(
+                        conn, context
+                    ),
+                )
+                response["target_project_root_projection"] = (
+                    postmerge_root_projection
+                )
+                response["corrected_request_shapes"] = (
+                    postmerge_root_projection["corrected_request_shapes"]
+                )
+                response["postmerge_qa_root_authority"] = {
+                    "schema_version": (
+                        "runtime_context.postmerge_qa_root_authority.v1"
+                    ),
+                    "source": "registered_project_root",
+                    "target_project_root": postmerge_qa_root,
+                    "assigned_worker_worktree": str(worktree_path),
+                    "contract_revision_id": str(
+                        response["contract_runtime_current_state"].get(
+                            "contract_revision_id"
+                        )
+                        or ""
+                    ),
+                    "current_line_id": str(
+                        (
+                            response["contract_runtime_current_state"].get(
+                                "next_legal_action"
+                            )
+                            or {}
+                        ).get("line_id")
+                        or ""
+                    ),
+                    "equality_required": True,
+                }
+                source_refs["postmerge_qa_target_project_root"] = (
+                    "registered_project_root"
+                )
         worker_implementation_evidence = dict(
             contract_runtime_projection.get("worker_implementation_evidence")
             or {}
@@ -19431,6 +19615,8 @@ def _governed_evidence_binding_guide(
     *,
     onboard_contract_execution_id: str = "",
     assigned_worker_worktree: str = "",
+    qa_target_project_root_source: str = "assigned_worker_worktree",
+    canonical_project_root_is_query_target: bool = False,
 ) -> dict[str, Any]:
     """Expose the four fail-closed evidence bindings in one copy-safe shape."""
 
@@ -19438,6 +19624,9 @@ def _governed_evidence_binding_guide(
 
     onboard_execution_id = str(onboard_contract_execution_id or "").strip()
     worker_worktree = str(assigned_worker_worktree or "").strip()
+    qa_root_source = str(
+        qa_target_project_root_source or "assigned_worker_worktree"
+    ).strip()
     return {
         "schema_version": "governed_evidence_bindings.v1",
         "direct_main_observer_route": {
@@ -19460,17 +19649,41 @@ def _governed_evidence_binding_guide(
             "authority": "_event_has_test_evidence",
         },
         "mf_parallel_qa_graph_context": {
-            "target_project_root_source": "assigned_worker_worktree",
+            "target_project_root_source": qa_root_source,
             "target_project_root": (
                 worker_worktree or "<assigned-worker-worktree>"
             ),
-            "canonical_project_root_is_not_the_query_target": True,
+            "canonical_project_root_is_not_the_query_target": not bool(
+                canonical_project_root_is_query_target
+            ),
+            "canonical_project_root_is_the_query_target": bool(
+                canonical_project_root_is_query_target
+            ),
             "equality_required": True,
         },
         "copy_safe": True,
         "authorizes_write": False,
         "satisfies_gate": False,
     }
+
+
+def _contract_runtime_current_state_is_postmerge_qa(
+    current_state: Mapping[str, Any] | None,
+) -> bool:
+    state = current_state if isinstance(current_state, Mapping) else {}
+    next_action = (
+        state.get("next_legal_action")
+        if isinstance(state.get("next_legal_action"), Mapping)
+        else {}
+    )
+    return bool(
+        str(state.get("contract_id") or "").strip()
+        in MF_PARALLEL_RECORD_CONTRACT_IDS
+        and str(state.get("contract_revision_id") or "").strip()
+        in MF_PARALLEL_POSTMERGE_REVISION_FAMILY
+        and str(next_action.get("line_id") or next_action.get("id") or "").strip()
+        in {"qa_graph_context", "qa_independent_verification"}
+    )
 
 
 def _runtime_context_qa_verification_guide(
@@ -94290,12 +94503,53 @@ def _onboard_selected_qa_contract_runtime_guidance(
     target_root, target_root_conflict, _target_root_present = _dispatch_identity(
         "target_project_root", "project_root", "repo_root"
     )
-    repo_root = worktree if worktree_present else target_root
+    completed_line_ids = {
+        str(candidate.get("line_id") or "").strip()
+        for _index, candidate in _contract_runtime_completed_lines(dispatch_record)
+        if _contract_runtime_line_status_passes(candidate)
+    }
+    postmerge_qa_ready = bool(
+        _is_mf_parallel_postmerge_revision(dispatch_record)
+        and {"observer_merge", "observer_reconcile"}.issubset(
+            completed_line_ids
+        )
+    )
+    registered_project_root = (
+        project_service.resolve_project_root(
+            project_id,
+            None,
+            fallback_self=True,
+        )
+        if postmerge_qa_ready
+        else None
+    )
+    canonical_qa_root = (
+        str(Path(registered_project_root).resolve())
+        if registered_project_root is not None
+        else ""
+    )
+    postmerge_qa_root = bool(postmerge_qa_ready and canonical_qa_root)
+    repo_root = (
+        canonical_qa_root
+        if postmerge_qa_root
+        else worktree
+        if worktree_present
+        else target_root
+    )
+    qa_root_source = (
+        "reconciled_canonical_project_root"
+        if postmerge_qa_root
+        else "assigned_worker_worktree"
+        if worktree_present
+        else "canonical_target_project_root_fallback"
+    )
     canonical_dispatch_identity = {
         "project_id": project_id,
         "backlog_id": backlog_id,
         "original_worker_task_id": worker_task_id,
-        "assigned_worktree": repo_root,
+        "assigned_worktree": worktree,
+        "qa_query_root": repo_root,
+        "qa_query_root_source": qa_root_source,
     }
     for field in canonical_dispatch_identity_fields:
         value, conflict, _present = _dispatch_identity(str(field))
@@ -94305,6 +94559,8 @@ def _onboard_selected_qa_contract_runtime_guidance(
         field for field, value in (("task_id", worker_task_id), ("repo_root", repo_root))
         if not value
     ]
+    if postmerge_qa_ready and not canonical_qa_root:
+        missing.append("registered_canonical_project_root")
     conflicts = [
         field for field, conflict in (
             ("task_id", task_conflict),
@@ -94333,6 +94589,10 @@ def _onboard_selected_qa_contract_runtime_guidance(
         "$assigned_worktree": repo_root,
         "$qa_session_token_ref": dict(token_transport),
     }
+    if postmerge_qa_root:
+        replacements[
+            "<full git HEAD from git rev-parse HEAD in assigned_worktree>"
+        ] = "<full final canonical HEAD from git rev-parse HEAD in qa_query_root>"
     unresolved_placeholders: set[str] = set()
 
     def _render_machine_value(value: Any) -> Any:
@@ -94374,6 +94634,8 @@ def _onboard_selected_qa_contract_runtime_guidance(
         "legitimate_evidence_bindings": _governed_evidence_binding_guide(
             onboard_contract_execution_id=onboard_execution_id,
             assigned_worker_worktree=repo_root,
+            qa_target_project_root_source=qa_root_source,
+            canonical_project_root_is_query_target=postmerge_qa_root,
         ),
         "machine_contract": {
             "token_transport": deepcopy(token_transport),
