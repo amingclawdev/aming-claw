@@ -12615,6 +12615,57 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             dict.fromkeys([*lane_errors, *acceptance_errors])
         )
         if all_errors:
+            field_mismatches: list[dict[str, Any]] = []
+            for error in all_errors:
+                field = "acceptance_criteria"
+                expected: Any = (
+                    "row acceptance closes over the exact persisted lane "
+                    "owned_files union"
+                )
+                actual: Any = error
+                distinct_prefix = "atomic bounded workers require distinct "
+                if error.startswith(distinct_prefix):
+                    field = error.removeprefix(distinct_prefix).strip()
+                    expected = (
+                        "one distinct non-empty value per allocation lane"
+                    )
+                    actual = [
+                        str(body.get(field) or "").strip()
+                        for body in copy_safe_bodies
+                    ]
+                elif error.startswith(
+                    "atomic bounded workers require disjoint owned_files: "
+                ):
+                    field = "owned_files"
+                    expected = "disjoint file fences across allocation lanes"
+                    actual = {
+                        "overlap": [
+                            path.strip()
+                            for path in error.split(":", 1)[1].split(",")
+                            if path.strip()
+                        ]
+                    }
+                elif error.startswith(
+                    "atomic bounded workers contain files outside backlog authority: "
+                ):
+                    field = "owned_files"
+                    expected = list(row_files)
+                    actual = {
+                        "outside_backlog_authority": [
+                            path.strip()
+                            for path in error.split(":", 1)[1].split(",")
+                            if path.strip()
+                        ]
+                    }
+                field_mismatches.append(
+                    {
+                        "field": field,
+                        "expected": expected,
+                        "actual": actual,
+                        "error": error,
+                    }
+                )
+            first_mismatch = field_mismatches[0]
             raise GovernanceError(
                 (
                     "parallel_branch_allocate_precheck_atomic_gate_failed"
@@ -12631,8 +12682,32 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                 422,
                 {
                     "errors": all_errors,
+                    "field": first_mismatch["field"],
+                    "expected": first_mismatch["expected"],
+                    "actual": first_mismatch["actual"],
+                    "field_mismatches": field_mismatches,
                     "acceptance_scope_closure": acceptance_scope_closure,
+                    "guide": {
+                        "action": "correct_atomic_allocation_lane_inputs",
+                        "route_token_ref_action": (
+                            "use the current mf_parallel guide's per-lane "
+                            "observer_route_context_issue request bodies; copy "
+                            "each returned route_token_ref into only that lane"
+                        ),
+                        "retry_action": "parallel_branch_allocate_precheck",
+                        "instruction": (
+                            "correct every field_mismatch and retry the same "
+                            "zero-write atomic precheck in the current world"
+                        ),
+                    },
+                    "source": (
+                        "agent/governance/server.py::"
+                        "handle_graph_governance_parallel_branch_allocate_precheck"
+                    ),
+                    "zero_write_rejection": True,
                     "writes_performed": False,
+                    "mutation_performed": False,
+                    "retry_same_world_allowed": True,
                 },
             )
 
@@ -73272,6 +73347,113 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
         "route_identity": dict(allocation_route_identity),
         **allocation_route_identity,
     }
+    bounded_worker_lanes: list[Mapping[str, Any]] = []
+    for source in (next_action, copy_payload):
+        candidates = source.get("bounded_workers")
+        if isinstance(candidates, list):
+            bounded_worker_lanes = [
+                candidate for candidate in candidates if isinstance(candidate, Mapping)
+            ]
+            if bounded_worker_lanes:
+                break
+        nested_payload = source.get("payload")
+        if isinstance(nested_payload, Mapping) and isinstance(
+            nested_payload.get("bounded_workers"),
+            list,
+        ):
+            bounded_worker_lanes = [
+                candidate
+                for candidate in nested_payload.get("bounded_workers") or []
+                if isinstance(candidate, Mapping)
+            ]
+            if bounded_worker_lanes:
+                break
+    safe_parent_route_identity = {
+        field: value
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if (value := _exact_text(allocation_route_identity.get(field)))
+    }
+    observer_route_context_issue_request_bodies: list[dict[str, Any]] = []
+    atomic_precheck_lane_templates: list[dict[str, Any]] = []
+    route_token_ref_bindings: list[dict[str, Any]] = []
+    for lane_index, lane in enumerate(bounded_worker_lanes):
+        lane_task_id = _exact_text(lane.get("task_id")) or worker_task_id
+        lane_owned_files = _runtime_context_service_query_values(
+            lane,
+            "owned_files",
+            "target_files",
+        )
+        issue_body = {
+            "project_id": project_id,
+            "caller_role": "observer",
+            "backlog_id": backlog_id,
+            "task_id": execution_id,
+            "target_files": list(lane_owned_files),
+            "owned_files": list(lane_owned_files),
+            "allowed_actions": [
+                "parallel_branch_allocate",
+                "task_timeline_append",
+            ],
+            "evidence_refs": [
+                f"contract_runtime:{execution_id}",
+                f"backlog:{backlog_id}",
+                f"lane_task:{lane_task_id}",
+            ],
+            "parent_route_identity": dict(safe_parent_route_identity),
+        }
+        observer_route_context_issue_request_bodies.append(issue_body)
+        lane_template = dict(canonical_allocation_body)
+        lane_template.update(dict(lane))
+        lane_template["task_id"] = lane_task_id
+        lane_template["owned_files"] = list(lane_owned_files)
+        lane_template["target_files"] = list(lane_owned_files)
+        lane_template.pop("route_identity", None)
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+            lane_template.pop(field, None)
+        lane_template["route_token_ref"] = (
+            f"<route_token_ref returned for lane[{lane_index}] task_id={lane_task_id}>"
+        )
+        atomic_precheck_lane_templates.append(lane_template)
+        route_token_ref_bindings.append(
+            {
+                "lane_index": lane_index,
+                "task_id": lane_task_id,
+                "source": "observer_route_context_issue.route_token_ref",
+                "destination": f"lanes[{lane_index}].route_token_ref",
+            }
+        )
+    per_lane_route_context_issue = {
+        "schema_version": (
+            "contract_runtime.mf_parallel_per_lane_route_context_issue.v1"
+        ),
+        "status": "distinct_child_route_token_refs_required",
+        "mcp_tool": "observer_route_context_issue",
+        "request_bodies": observer_route_context_issue_request_bodies,
+        "required_issue_count": len(observer_route_context_issue_request_bodies),
+        "route_token_ref_bindings": route_token_ref_bindings,
+        "atomic_precheck": {
+            "mcp_tool": "parallel_branch_allocate_precheck",
+            "request_body_template": {
+                "project_id": project_id,
+                "expected_lane_count": len(atomic_precheck_lane_templates),
+                "lanes": atomic_precheck_lane_templates,
+            },
+            "call_only_after_all_route_token_ref_bindings": True,
+        },
+        "instructions": [
+            "call observer_route_context_issue once for each request body",
+            (
+                "copy each returned route_token_ref into only the same-index "
+                "atomic precheck lane"
+            ),
+            (
+                "after every lane has a distinct returned route_token_ref, call "
+                "parallel_branch_allocate_precheck with the completed lane list"
+            ),
+        ],
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
     parallel_branch_allocate_submission = {
         "schema_version": (
             "contract_runtime.parallel_branch_allocate_submission.v1"
@@ -73372,6 +73554,7 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
         },
         "copy_safe_bridge_payload": {
             "parallel_branch_allocate": parallel_branch_allocate_submission,
+            "per_lane_observer_route_context_issue": per_lane_route_context_issue,
             "runtime_context_worker_guide": {
                 "project_id": project_id,
                 "runtime_context_id": str(
@@ -73390,6 +73573,10 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             "capacity_fallback_guidance": capacity_fallback_guidance,
         },
         "parallel_branch_allocate_submission": parallel_branch_allocate_submission,
+        "observer_route_context_issue_request_bodies": (
+            observer_route_context_issue_request_bodies
+        ),
+        "per_lane_observer_route_context_issue": per_lane_route_context_issue,
         "worker_host_envelope_handoff": worker_host_envelope_handoff,
         "capacity_fallback_guidance": capacity_fallback_guidance,
         "post_dispatch_runtime_identity": {
@@ -74510,6 +74697,26 @@ def _runtime_next_action_from_guide(
                 result["copy_safe_dispatch_payload"] = {
                     "parallel_branch_allocate": allocation_submission,
                 }
+            route_issue_request_bodies = list(
+                allocation_bridge.get(
+                    "observer_route_context_issue_request_bodies"
+                )
+                or []
+            )
+            route_issue_recipe = dict(
+                allocation_bridge.get("per_lane_observer_route_context_issue")
+                or {}
+            )
+            if route_issue_request_bodies and route_issue_recipe:
+                result["observer_route_context_issue_request_bodies"] = (
+                    route_issue_request_bodies
+                )
+                result["per_lane_observer_route_context_issue"] = (
+                    route_issue_recipe
+                )
+                result.setdefault("copy_safe_dispatch_payload", {})[
+                    "per_lane_observer_route_context_issue"
+                ] = route_issue_recipe
         copy_payload = (
             dict(writer_safe_copy.get("copy_payload") or {})
             if isinstance(writer_safe_copy, Mapping)
