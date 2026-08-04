@@ -6662,6 +6662,111 @@ def _current_full_route_action_allowed(
     return bool(allowed & accepted), sorted(allowed)
 
 
+def _current_full_route_proof_mismatch(
+    proof_error: str,
+    details: Mapping[str, Any],
+) -> tuple[str, Any, Any, list[dict[str, Any]]]:
+    """Project one deterministic, public-safe mismatch for route proof failures."""
+
+    if proof_error == "route_token_ref_action_not_allowed":
+        field = "allowed_actions"
+        expected = list(details.get("accepted_actions") or [])
+        actual = list(details.get("allowed_actions") or [])
+        mismatches = [{"field": field, "expected": expected, "actual": actual}]
+        return field, expected, actual, mismatches
+
+    if proof_error == "route_token_ref_scope_mismatch":
+        scope_mismatches = (
+            details.get("scope_mismatches")
+            if isinstance(details.get("scope_mismatches"), Mapping)
+            else {}
+        )
+        mismatches = [
+            {
+                "field": str(field),
+                "expected": values.get("expected"),
+                "actual": values.get("actual"),
+            }
+            for field, values in sorted(scope_mismatches.items())
+            if isinstance(values, Mapping)
+        ]
+        if mismatches:
+            first = mismatches[0]
+            return first["field"], first["expected"], first["actual"], mismatches
+
+    if proof_error == "missing_route_proof_fields":
+        missing = sorted(
+            {
+                str(value or "").strip()
+                for value in details.get("missing_fields") or []
+                if str(value or "").strip()
+            }
+        )
+        mismatches = [
+            {
+                "field": field,
+                "expected": "non_empty_server_registered_route_proof_value",
+                "actual": "missing_or_empty",
+            }
+            for field in missing
+        ]
+        if mismatches:
+            first = mismatches[0]
+            return first["field"], first["expected"], first["actual"], mismatches
+
+    supplied_refs = (
+        details.get("supplied_route_token_refs")
+        if isinstance(details.get("supplied_route_token_refs"), Mapping)
+        else {}
+    )
+    distinct_supplied_refs = sorted(
+        {
+            str(value or "").strip()
+            for values in supplied_refs.values()
+            for value in (values if isinstance(values, list) else [values])
+            if str(value or "").strip()
+        }
+    )
+    deterministic = {
+        "route_token_ref_alias_conflict": (
+            "route_token_ref",
+            "one_identical_route_token_ref_across_supported_aliases",
+            distinct_supplied_refs,
+        ),
+        "observer_session_not_active": (
+            "observer_session_id",
+            "active_registered_observer_session",
+            str(details.get("observer_session_status") or "inactive_or_unknown"),
+        ),
+        "route_token_ref_invalid": (
+            "route_token_ref",
+            "active_server_registered_ref_matching_current_full_scope",
+            str(details.get("route_token_ref_error_code") or "invalid"),
+        ),
+        "route_token_ref_unknown": (
+            "route_token_ref",
+            "known_server_registered_route_token_ref",
+            "unknown",
+        ),
+        "route_token_ref_not_observer": (
+            "caller_role",
+            "observer",
+            str(details.get("caller_role") or "missing_or_empty"),
+        ),
+    }
+    field, expected, actual = deterministic.get(
+        proof_error,
+        (
+            "route_proof",
+            "valid_graph_current_full_reconcile_route_proof",
+            proof_error,
+        ),
+    )
+    return field, expected, actual, [
+        {"field": field, "expected": expected, "actual": actual}
+    ]
+
+
 def _raise_current_full_route_proof(
     proof_error: str,
     message: str,
@@ -6669,6 +6774,40 @@ def _raise_current_full_route_proof(
     status: int = 403,
     **details: Any,
 ) -> None:
+    field, expected, actual, field_mismatches = (
+        _current_full_route_proof_mismatch(proof_error, details)
+    )
+    source = (
+        "server._require_current_full_reconcile_auth."
+        "route_proof_prewrite_gate.v1"
+    )
+    guide = {
+        "schema_version": (
+            "graph_current_full_reconcile.route_proof_correction.v1"
+        ),
+        "action": "correct_route_proof_then_retry_exact_current_full_call",
+        "issue": {
+            "mcp_tool": "observer_route_context_issue",
+            "required_allowed_actions": ["graph_current_full_reconcile"],
+            "preserve_scope_fields": ["project_id", "backlog_id", "task_id"],
+        },
+        "renew": {
+            "mcp_tool": "observer_route_context_renew",
+            "allowed_only_for_same_or_narrower_scope": True,
+            "required_allowed_actions": ["graph_current_full_reconcile"],
+        },
+        "retry": {
+            "mcp_tool": "graph_current_full_reconcile",
+            "same_world": True,
+            "exact_request": True,
+            "replace_only_corrected_route_proof_fields": True,
+        },
+        "instruction": (
+            "correct every field_mismatch; issue a route ref containing "
+            "graph_current_full_reconcile, or renew an already correctly "
+            "scoped ref, then retry the exact current-full call in this world"
+        ),
+    }
     route_proof_diagnostics = {
         "schema_version": "graph_current_full_reconcile.route_proof_diagnostics.v1",
         "required_role": "observer",
@@ -6686,6 +6825,10 @@ def _raise_current_full_route_proof(
         "accepted_task_scope_aliases": ["task_id", "contract_execution_id"],
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
+        "source": source,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
     }
     raise GovernanceError(
         "observer_route_token_proof_required",
@@ -6697,6 +6840,21 @@ def _raise_current_full_route_proof(
             "proof_error": proof_error,
             "route_proof_diagnostics": route_proof_diagnostics,
             **details,
+            "field": field,
+            "expected": expected,
+            "actual": actual,
+            "field_mismatches": field_mismatches,
+            "guide": guide,
+            "source": source,
+            "host_correctable": True,
+            "public_safe": True,
+            "secret_safe": True,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "retry_same_world_allowed": True,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
         },
     )
 
@@ -6755,6 +6913,9 @@ def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str)
             "observer_session_not_active",
             "current-full reconcile observer route proof requires an active observer session",
             observer_session_id=observer_session_id,
+            observer_session_status=str(
+                (session or {}).get("computed_status") or "inactive_or_unknown"
+            ),
             next_action=_observer_session_renewal_gate_guidance(
                 project_id=project_id,
                 observer_session_id=observer_session_id,

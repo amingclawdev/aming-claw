@@ -8581,6 +8581,16 @@ def test_current_full_reconcile_rejects_unrelated_action_before_build(
         route_token_ref=route_token_ref,
         allowed_actions=["backlog_close"],
     )
+    zero_write_tables = (
+        "graph_snapshots",
+        "graph_current_full_reconcile_provenance",
+        "reconcile_run_metrics",
+        "task_timeline_events",
+    )
+    counts_before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    }
 
     with pytest.raises(GovernanceError) as exc:
         server.handle_graph_governance_current_full_reconcile(
@@ -8595,14 +8605,59 @@ def test_current_full_reconcile_rejects_unrelated_action_before_build(
                     "task_id": task_id,
                     "observer_session_id": observer_session_id,
                     "observer_route_token_ref": route_token_ref,
+                    "route_token": "raw-route-secret-must-not-echo",
                 },
             )
         )
 
     assert exc.value.code == "observer_route_token_proof_required"
-    assert exc.value.details["proof_error"] == "route_token_ref_action_not_allowed"
+    details = exc.value.details
+    assert details["proof_error"] == "route_token_ref_action_not_allowed"
+    assert details["field"] == "allowed_actions"
+    assert details["expected"] == [
+        "graph_current_full_reconcile",
+        "graph-governance.reconcile.current-full",
+        "reconcile",
+    ]
+    assert details["actual"] == ["backlog_close"]
+    assert details["field_mismatches"] == [
+        {
+            "field": "allowed_actions",
+            "expected": details["expected"],
+            "actual": ["backlog_close"],
+        }
+    ]
+    assert details["guide"]["issue"]["required_allowed_actions"] == [
+        "graph_current_full_reconcile"
+    ]
+    assert details["guide"]["retry"] == {
+        "mcp_tool": "graph_current_full_reconcile",
+        "same_world": True,
+        "exact_request": True,
+        "replace_only_corrected_route_proof_fields": True,
+    }
+    assert details["source"] == (
+        "server._require_current_full_reconcile_auth."
+        "route_proof_prewrite_gate.v1"
+    )
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    assert details["mutation_performed"] is False
+    assert details["retry_same_world_allowed"] is True
+    assert details["public_safe"] is True
+    assert details["secret_safe"] is True
+    assert details["raw_route_token_required"] is False
+    assert details["raw_route_token_exposed"] is False
+    assert "raw-route-secret-must-not-echo" not in json.dumps(
+        details,
+        sort_keys=True,
+    )
     assert calls == []
     assert store.get_graph_snapshot(conn, PID, "full-current") is None
+    assert {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    } == counts_before
 
 
 def test_current_full_candidate_cannot_waive_clean_worktree(
@@ -10597,6 +10652,27 @@ def test_current_full_reconcile_route_proof_reports_missing_scope_fields(
     ]
     assert diagnostics["raw_route_token_required"] is False
     assert diagnostics["raw_route_token_exposed"] is False
+    assert exc.value.details["field"] == "backlog_id"
+    assert exc.value.details["expected"] == (
+        "non_empty_server_registered_route_proof_value"
+    )
+    assert exc.value.details["actual"] == "missing_or_empty"
+    assert exc.value.details["field_mismatches"] == [
+        {
+            "field": "backlog_id",
+            "expected": "non_empty_server_registered_route_proof_value",
+            "actual": "missing_or_empty",
+        },
+        {
+            "field": "task_id_or_contract_execution_id",
+            "expected": "non_empty_server_registered_route_proof_value",
+            "actual": "missing_or_empty",
+        },
+    ]
+    assert exc.value.details["zero_write_rejection"] is True
+    assert exc.value.details["writes_performed"] is False
+    assert exc.value.details["mutation_performed"] is False
+    assert exc.value.details["retry_same_world_allowed"] is True
 
 
 def _write_dashboard_dist(root: Path, asset_name: str) -> Path:
