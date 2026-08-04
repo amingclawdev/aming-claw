@@ -5748,7 +5748,9 @@ def _persist_contract_runtime_observer_route_ref(
     route_token_ref: str,
     allowed_actions: list[str],
     caller_role: str = "observer",
+    target_files: list[str] | None = None,
 ) -> None:
+    persisted_target_files = list(target_files or [])
     observer_route_context.persist_route_token_ref(
         conn,
         project_id=PID,
@@ -5762,6 +5764,8 @@ def _persist_contract_runtime_observer_route_ref(
             "route_token_ref": route_token_ref,
             "caller_role": caller_role,
             "allowed_actions": allowed_actions,
+            "target_files": persisted_target_files,
+            "owned_files": persisted_target_files,
             "scope": {
                 "project_id": PID,
                 "backlog_id": backlog_id,
@@ -6060,6 +6064,7 @@ def _enter_verified_batch_child_for_allocation_precheck(
             "parallel_branch_allocate",
             "task_timeline_append",
         ],
+        target_files=list(child_successor["owned_files"]),
     )
     conn.commit()
     return (
@@ -16112,6 +16117,155 @@ def test_parallel_branch_allocate_rejects_ref_without_allocation_action_before_w
     assert rejected.value.details["writes_performed"] is False
     assert conn.total_changes == before_total_changes
     assert get_branch_context(conn, PID, body["task_id"]) is None
+
+
+def test_append_scoped_route_ref_renewal_rejects_narrowed_authority_without_writes(
+    conn,
+):
+    backlog_id = "AC-ALLOCATOR-RENEWAL-NARROWED"
+    execution_id = "cex-allocator-renewal-narrowed"
+    old_ref = "rtok-allocator-renewal-narrowed"
+    owned_files = ["src/allocator-renewal.py"]
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=old_ref,
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+        target_files=owned_files,
+    )
+    observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=old_ref,
+        backlog_id=backlog_id,
+        task_id=execution_id,
+        caller_role="observer",
+        allowed_actions=["task_timeline_append"],
+        target_files=owned_files,
+        owned_files=owned_files,
+    )
+    before_total_changes = conn.total_changes
+
+    resolved, diagnostic = (
+        server._contract_runtime_resolve_append_scoped_child_route(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            route_token_ref=old_ref,
+        )
+    )
+
+    assert resolved == {}
+    assert diagnostic["status"] == "blocked_route_renewal_lineage"
+    assert diagnostic["field"] == "allowed_actions"
+    assert diagnostic["expected"] == [
+        "parallel_branch_allocate",
+        "task_timeline_append",
+    ]
+    assert diagnostic["actual"] == ["task_timeline_append"]
+    assert diagnostic["writes_performed"] is False
+    assert conn.total_changes == before_total_changes
+
+
+def test_append_scoped_route_ref_renewal_rejects_ambiguous_registry_successors(
+    conn,
+):
+    backlog_id = "AC-ALLOCATOR-RENEWAL-AMBIGUOUS"
+    execution_id = "cex-allocator-renewal-ambiguous"
+    old_ref = "rtok-allocator-renewal-ambiguous"
+    owned_files = ["src/allocator-renewal-ambiguous.py"]
+    actions = ["parallel_branch_allocate", "task_timeline_append"]
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=old_ref,
+        allowed_actions=actions,
+        target_files=owned_files,
+    )
+    first = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=old_ref,
+        backlog_id=backlog_id,
+        task_id=execution_id,
+        caller_role="observer",
+        allowed_actions=actions,
+        target_files=owned_files,
+        owned_files=owned_files,
+        evidence_refs=["test:first-successor"],
+    )
+    first_resolved = observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=first["route_token_ref"],
+    )
+    forged = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=execution_id,
+        target_files=owned_files,
+        allowed_actions=actions,
+        evidence_refs=["test:forged-second-successor"],
+    )
+    forged_ref = "rtok-forged-allocator-renewal-ambiguous"
+    forged_token = forged["route_token"]
+    forged_token["owned_files"] = list(owned_files)
+    proof = json.loads(
+        json.dumps(first_resolved["route_lineage"]["renewal_proof"])
+    )
+    proof["route_token_ref"] = forged_ref
+    proof["route_identity"] = {
+        field: (
+            forged_ref
+            if field == "route_token_ref"
+            else forged_token[field]
+        )
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+            "route_token_ref",
+        )
+    }
+    forged_token["route_lineage"] = {
+        "schema_version": observer_route_context.ROUTE_LINEAGE_SCHEMA_VERSION,
+        "renewal_proof": proof,
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=forged_ref,
+        token=forged_token,
+    )
+    before_total_changes = conn.total_changes
+
+    resolved, diagnostic = (
+        server._contract_runtime_resolve_append_scoped_child_route(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            route_token_ref=old_ref,
+        )
+    )
+
+    assert resolved == {}
+    assert diagnostic["status"] == "blocked_route_renewal_lineage"
+    assert diagnostic["field"] == "route_lineage.previous_route_token_ref"
+    assert diagnostic["expected"] == "exactly_one_registered_successor"
+    assert diagnostic["actual"] == sorted(
+        [first["route_token_ref"], forged_ref]
+    )
+    assert diagnostic["writes_performed"] is False
+    assert conn.total_changes == before_total_changes
 
 
 def test_parallel_branch_allocate_rejects_complete_identity_with_unknown_ref_before_write(
@@ -75879,6 +76033,7 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
                 "parallel_branch_allocate",
                 "task_timeline_append",
             ],
+            target_files=lane["owned_files"],
         )
         worktree_path = tmp_path / "workers" / lane["task_id"]
         status, allocated = server.handle_graph_governance_parallel_branch_allocate(
@@ -76071,6 +76226,82 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
     ]
     assert "parallel_branch_allocate_submission" not in next_action
 
+    renewed_refs: dict[str, str] = {}
+    for lane in lanes:
+        renewed = observer_route_context.renew_route_token_ref(
+            conn,
+            project_id=PID,
+            route_token_ref=lane["route_token_ref"],
+            backlog_id=backlog_id,
+            task_id=execution_id,
+            caller_role="observer",
+            allowed_actions=[
+                "parallel_branch_allocate",
+                "task_timeline_append",
+            ],
+            target_files=lane["owned_files"],
+            owned_files=lane["owned_files"],
+            evidence_refs=["test:allocator-ref-renewal"],
+        )
+        renewed_refs[lane["route_token_ref"]] = renewed["route_token_ref"]
+
+    runtime_context_count = conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+    ).fetchone()[0]
+    contract_execution_count = conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0]
+    before_projection_changes = conn.total_changes
+    renewed_current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="GET",
+        )
+    )
+    assert conn.total_changes == before_projection_changes
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+    ).fetchone()[0] == runtime_context_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0] == contract_execution_count
+    assert renewed_current["runtime_guide"]["dispatch_copy_safe_projection"][
+        "status"
+    ] == "ready"
+    renewal_diagnostics = renewed_current["runtime_guide"][
+        "dispatch_copy_safe_projection"
+    ]["lane_route_resolutions"]
+    assert {
+        item["requested_route_token_ref"]: item["resolved_route_token_ref"]
+        for item in renewal_diagnostics
+    } == renewed_refs
+    assert all(
+        item["renewal_resolution"]["registry_verified"] is True
+        and item["renewal_resolution"]["exact_scope_verified"] is True
+        and item["renewal_resolution"]["writes_performed"] is False
+        for item in renewal_diagnostics
+    )
+    copy_body = renewed_current["next_legal_action"][
+        "writer_role_safe_copy_payload"
+    ]["copy_payload"]
+    renewed_workers = copy_body["payload"]["bounded_workers"]
+    assert {worker["route_token_ref"] for worker in renewed_workers} == set(
+        renewed_refs.values()
+    )
+    assert {
+        worker["route_identity"]["route_token_ref"]
+        for worker in renewed_workers
+    } == set(renewed_refs.values())
+    assert {
+        server._parallel_branch_runtime_contract_route_identity(
+            allocation["runtime_contract_revision"]
+        )["route_token_ref"]
+        for allocation in allocations
+    } == set(renewed_refs)
+    assert '"route_token":' not in json.dumps(renewed_current, sort_keys=True)
+    assert '"session_token":' not in json.dumps(renewed_current, sort_keys=True)
+
     for field, replacement in (
         ("profile_requirements", None),
         ("branch_ref", "refs/heads/wrong-dispatch-branch"),
@@ -76109,6 +76340,147 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
     persisted = json.dumps(accepted, sort_keys=True)
     assert '"route_token":' not in persisted
     assert '"session_token":' not in persisted
+
+
+def test_batch_child_dispatch_projects_exact_renewed_allocator_route_ref(
+    conn,
+    tmp_path,
+):
+    batch_backlog_id = "AC-BATCH-RENEWED-DISPATCH-PARENT"
+    child_backlog_id = "AC-BATCH-RENEWED-DISPATCH-CHILD"
+    sibling_backlog_id = "AC-BATCH-RENEWED-DISPATCH-SIBLING"
+    child_files = ["src/batch-renewed-child.py"]
+    execution_id, old_ref, owned_files = (
+        _enter_verified_batch_child_for_allocation_precheck(
+            conn,
+            batch_backlog_id=batch_backlog_id,
+            child_backlog_id=child_backlog_id,
+            sibling_backlog_id=sibling_backlog_id,
+            child_files=child_files,
+            sibling_files=["src/batch-renewed-sibling.py"],
+            suffix="renewed-dispatch",
+        )
+    )
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+            },
+        )
+    )
+    assert prefill["ok"] is True
+    record = server._contract_runtime(conn).store.get(execution_id)
+    target_authority = (
+        server._parallel_branch_allocate_verified_batch_target_authority(
+            conn,
+            project_id=PID,
+            record=record,
+        )
+    )
+    task_id = target_authority["task_id"]
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": child_backlog_id,
+                "contract_execution_id": execution_id,
+                "successor_contract_execution_id": execution_id,
+                "current_contract_execution_id": execution_id,
+                "parent_task_id": execution_id,
+                "root_task_id": execution_id,
+                "task_id": task_id,
+                "worker_id": "worker-batch-renewed-dispatch",
+                "agent_id": "host-batch-renewed-dispatch",
+                "target_project_root": str(tmp_path),
+                "workspace_root": str(tmp_path),
+                "worktree_path": str(tmp_path / "workers" / task_id),
+                "base_commit": "b" * 40,
+                "target_head_commit": "b" * 40,
+                "batch_id": target_authority["batch_id"],
+                "merge_queue_id": target_authority["merge_queue_id"],
+                "ref_name": target_authority["ref_name"],
+                "owned_files": owned_files,
+                "profile_requirements": {
+                    "profile_id": "codex-mf-sub",
+                    "harness": "codex",
+                },
+                "retry_policy": {"attempt": 1, "max_attempts": 2},
+                "route_token_ref": old_ref,
+                "issue_same_owner_session_token": False,
+                "create_worktree": False,
+            },
+        )
+    )
+    assert status == 201
+    assert allocated["ok"] is True
+    renewed = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=old_ref,
+        backlog_id=child_backlog_id,
+        task_id=execution_id,
+        caller_role="observer",
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+        target_files=owned_files,
+        owned_files=owned_files,
+        evidence_refs=["test:batch-allocator-ref-renewal"],
+    )
+    new_ref = renewed["route_token_ref"]
+    before_projection_changes = conn.total_changes
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="GET",
+        )
+    )
+
+    assert conn.total_changes == before_projection_changes
+    projection = current["runtime_guide"]["dispatch_copy_safe_projection"]
+    assert projection["status"] == "ready"
+    assert projection["required_worker_count"] == 1
+    assert projection["atomic_dispatch"] is False
+    assert projection["lane_route_resolutions"][0][
+        "requested_route_token_ref"
+    ] == old_ref
+    assert projection["lane_route_resolutions"][0][
+        "resolved_route_token_ref"
+    ] == new_ref
+    assert server._parallel_branch_runtime_contract_route_identity(
+        allocated["runtime_contract_revision"]
+    )["route_token_ref"] == old_ref
+    copy_body = current["next_legal_action"][
+        "writer_role_safe_copy_payload"
+    ]["copy_payload"]
+    assert copy_body["route_token_ref"] == new_ref
+    assert copy_body["route_identity"]["route_token_ref"] == new_ref
+    assert copy_body["bounded_workers"][0]["route_token_ref"] == new_ref
+    assert copy_body["payload"]["route_token_ref"] == new_ref
+    dispatch_precheck = (
+        server.handle_project_contract_runtime_line_write_precheck(
+            _ctx_with_role(
+                {"project_id": PID, "contract_execution_id": execution_id},
+                "observer",
+                method="POST",
+                body=copy_body,
+            )
+        )
+    )
+    assert dispatch_precheck["ok"] is True
+    serialized = json.dumps(current, sort_keys=True)
+    assert '"route_token":' not in serialized
+    assert '"session_token":' not in serialized
 
 
 def test_contract_update_blocked_precheck_pauses_until_hotfix_successor_complete(conn):

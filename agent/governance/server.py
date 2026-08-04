@@ -11566,12 +11566,23 @@ def _contract_runtime_resolve_append_scoped_child_route(
         return {}, diagnostic
 
     try:
-        resolved = observer_route_context.resolve_route_token_ref(
+        resolved = observer_route_context.resolve_route_token_ref_renewal_descendant(
             conn,
             project_id=project_id,
             route_token_ref=route_token_ref,
         )
-    except observer_route_context.RouteTokenRefError:
+    except observer_route_context.RouteTokenRefError as exc:
+        failure = dict(getattr(exc, "details", {}) or {})
+        diagnostic.update(
+            {
+                "status": "blocked_route_renewal_lineage",
+                "field": failure.get("field") or "route_token_ref",
+                "expected": failure.get("expected")
+                or "server_registered_exact_same_scope_active_descendant",
+                "actual": failure.get("actual") or "unresolved",
+                "error_code": str(getattr(exc, "code", "") or ""),
+            }
+        )
         return {}, diagnostic
     if not resolved:
         return {}, diagnostic
@@ -11662,6 +11673,18 @@ def _contract_runtime_resolve_append_scoped_child_route(
         ).strip()
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
     }
+    renewal_resolution = (
+        dict(resolved.get("renewal_resolution"))
+        if isinstance(resolved.get("renewal_resolution"), Mapping)
+        else {}
+    )
+    requested_route_identity = (
+        dict(renewal_resolution.get("requested_route_identity"))
+        if isinstance(
+            renewal_resolution.get("requested_route_identity"), Mapping
+        )
+        else {}
+    )
     missing_identity = [
         field
         for field, value in canonical_route_identity.items()
@@ -11685,6 +11708,9 @@ def _contract_runtime_resolve_append_scoped_child_route(
             nested = supplied_route_authority.get(field)
             if isinstance(nested, Mapping):
                 supplied_sources.append(nested)
+    compatible_identity_families = {"canonical"}
+    if requested_route_identity:
+        compatible_identity_families.add("requested")
     for field, expected in canonical_route_identity.items():
         supplied_values = sorted(
             {
@@ -11693,7 +11719,7 @@ def _contract_runtime_resolve_append_scoped_child_route(
                 if str(source.get(field) or "").strip()
             }
         )
-        if supplied_values and supplied_values != [expected]:
+        if len(supplied_values) > 1:
             diagnostic.update(
                 {
                     "status": "blocked_mixed_child_route_identity",
@@ -11703,6 +11729,34 @@ def _contract_runtime_resolve_append_scoped_child_route(
                 }
             )
             return {}, diagnostic
+        if supplied_values:
+            supplied_value = supplied_values[0]
+            field_families = {
+                family
+                for family, identity in (
+                    ("canonical", canonical_route_identity),
+                    ("requested", requested_route_identity),
+                )
+                if identity
+                and supplied_value
+                == str(identity.get(field) or "").strip()
+            }
+            compatible_identity_families &= field_families
+            if not compatible_identity_families:
+                diagnostic.update(
+                    {
+                        "status": "blocked_mixed_child_route_identity",
+                        "field": f"child_route_identity.{field}",
+                        "expected": {
+                            "canonical": expected,
+                            "requested_historical": str(
+                                requested_route_identity.get(field) or ""
+                            ).strip(),
+                        },
+                        "actual": supplied_values,
+                    }
+                )
+                return {}, diagnostic
 
     diagnostic.update(
         {
@@ -11717,6 +11771,11 @@ def _contract_runtime_resolve_append_scoped_child_route(
                 "task_id": contract_execution_id,
             },
             "child_route_identity": dict(canonical_route_identity),
+            "requested_route_token_ref": route_token_ref,
+            "resolved_route_token_ref": canonical_route_identity.get(
+                "route_token_ref", ""
+            ),
+            "renewal_resolution": renewal_resolution,
         }
     )
     return canonical_route_identity, diagnostic
@@ -72726,11 +72785,12 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         }
 
     route_diagnostics: list[dict[str, Any]] = []
+    canonical_route_identities: dict[str, dict[str, str]] = {}
     for context, revision_payload in candidates:
         route_identity = _parallel_branch_runtime_contract_route_identity(
             revision_payload
         )
-        _canonical_route_identity, route_diagnostic = (
+        canonical_route_identity, route_diagnostic = (
             _contract_runtime_resolve_append_scoped_child_route(
                 conn,
                 project_id=project_id,
@@ -72742,12 +72802,15 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
                 supplied_route_authority=revision_payload,
             )
         )
+        runtime_context_id = runtime_context_id_for_branch_context(context)
+        if canonical_route_identity:
+            canonical_route_identities[runtime_context_id] = dict(
+                canonical_route_identity
+            )
         route_diagnostics.append(
             {
                 **route_diagnostic,
-                "runtime_context_id": runtime_context_id_for_branch_context(
-                    context
-                ),
+                "runtime_context_id": runtime_context_id,
                 "task_id": str(
                     getattr(context, "task_id", "") or ""
                 ).strip(),
@@ -72812,8 +72875,11 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
             candidates,
             lane_owned_files,
         ):
-            route_identity = _parallel_branch_runtime_contract_route_identity(
-                revision_payload
+            route_identity = canonical_route_identities.get(
+                runtime_context_id_for_branch_context(context),
+                _parallel_branch_runtime_contract_route_identity(
+                    revision_payload
+                ),
             )
             candidate_worker_authority.append(
                 {
@@ -72927,8 +72993,11 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
             if isinstance(revision_payload.get("payload"), Mapping)
             else {}
         )
-        route_identity = _parallel_branch_runtime_contract_route_identity(
-            revision_payload
+        route_identity = canonical_route_identities.get(
+            runtime_context_id_for_branch_context(context),
+            _parallel_branch_runtime_contract_route_identity(
+                revision_payload
+            ),
         )
         profile_requirements = (
             dict(revision_body.get("profile_requirements") or {})
@@ -73101,6 +73170,7 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         "source_of_authority": (
             "RuntimeContext+ContractRevision+observer_route_token_refs"
         ),
+        "lane_route_resolutions": route_diagnostics,
         "copy_safe_body_available": True,
         "raw_private_context_exposed": False,
     }

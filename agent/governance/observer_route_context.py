@@ -2249,6 +2249,383 @@ def resolve_route_token_ref(
     )
 
 
+def resolve_route_token_ref_renewal_descendant(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    route_token_ref: str,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Resolve an immutable historical ref through its exact registered lineage.
+
+    Allocator evidence intentionally keeps the ref that authorized allocation.
+    A later same-scope renewal supersedes that ref, so read-only dispatch
+    projection must follow the registry lineage instead of rewriting historical
+    evidence.  Every hop is checked against both registry rows and the
+    server-produced proof; scope, role, actions, and file fences must remain
+    exactly equal.  Unknown, forged, widened, unrelated, cyclic, or ambiguous
+    chains fail closed.
+    """
+
+    project_id = _string(project_id)
+    requested_ref = _string(route_token_ref)
+    if not project_id or not requested_ref:
+        return None
+
+    def fail(
+        code: str,
+        message: str,
+        *,
+        field: str,
+        expected: Any,
+        actual: Any,
+    ) -> None:
+        raise RouteTokenRefError(
+            message,
+            code=code,
+            details={
+                "field": field,
+                "expected": expected,
+                "actual": actual,
+                "requested_route_token_ref": requested_ref,
+                "writes_performed": False,
+                "registry_verified": False,
+                "fail_closed": True,
+            },
+        )
+
+    try:
+        _ensure_ref_registry_schema(conn)
+        rows = conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    rows_by_ref = {
+        _string(dict(row).get("route_token_ref")): dict(row)
+        for row in rows
+        if _string(dict(row).get("route_token_ref"))
+    }
+    requested_row = rows_by_ref.get(requested_ref)
+    if requested_row is None:
+        return None
+
+    identity_fields = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "route_token_ref",
+    )
+
+    def row_identity(row: Mapping[str, Any]) -> dict[str, str]:
+        return {
+            field: (
+                _string(row.get("route_token_ref"))
+                if field == "route_token_ref"
+                else _string(row.get(field))
+            )
+            for field in identity_fields
+        }
+
+    def exact_scope(row: Mapping[str, Any]) -> dict[str, str]:
+        scope = _row_scope(row)
+        return {
+            "project_id": _scope_value(scope, "project_id") or project_id,
+            "backlog_id": _string(row.get("backlog_id"))
+            or _scope_value(scope, "backlog_id", "bug_id"),
+            "task_id": _string(row.get("task_id"))
+            or _scope_value(scope, "task_id"),
+        }
+
+    def exact_list(value: Sequence[str]) -> list[str]:
+        return sorted(set(_string_list(value)))
+
+    current_row = requested_row
+    current_ref = requested_ref
+    visited: set[str] = set()
+    chain_refs = [requested_ref]
+    chain_edges: list[str] = []
+
+    for _hop in range(64):
+        if current_ref in visited:
+            fail(
+                "route_token_ref_renewal_lineage_cycle",
+                "route-token renewal lineage contains a cycle",
+                field="route_lineage",
+                expected="acyclic_exact_same_scope_chain",
+                actual=chain_refs,
+            )
+        visited.add(current_ref)
+        status = _string(current_row.get("status"))
+        if status == REF_STATUS_ACTIVE:
+            resolved = resolve_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=current_ref,
+                now=now,
+            )
+            if not resolved:
+                return None
+            if current_ref != requested_ref:
+                resolved = dict(resolved)
+                resolved["renewal_resolution"] = {
+                    "schema_version": (
+                        "route_token_ref_exact_renewal_descendant_resolution.v1"
+                    ),
+                    "status": "resolved_active_descendant",
+                    "requested_route_token_ref": requested_ref,
+                    "resolved_route_token_ref": current_ref,
+                    "requested_route_identity": row_identity(requested_row),
+                    "resolved_route_identity": row_identity(current_row),
+                    "route_token_ref_chain": list(chain_refs),
+                    "edge_types": list(chain_edges),
+                    "scope": exact_scope(current_row),
+                    "exact_scope_verified": True,
+                    "registry_verified": True,
+                    "writes_performed": False,
+                    "raw_route_token_exposed": False,
+                }
+            return resolved
+        if status != REF_STATUS_SUPERSEDED:
+            fail(
+                "route_token_ref_renewal_lineage_status_invalid",
+                "route-token renewal lineage contains a non-consumable row",
+                field="status",
+                expected=[REF_STATUS_ACTIVE, REF_STATUS_SUPERSEDED],
+                actual=status or "missing",
+            )
+
+        direct_claims: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+        for candidate in rows_by_ref.values():
+            candidate_ref = _string(candidate.get("route_token_ref"))
+            if not candidate_ref or candidate_ref == current_ref:
+                continue
+            lineage = _json_loads_public_mapping(
+                candidate.get(_REF_LINEAGE_COLUMNS["route_lineage"])
+            )
+            for proof_key, edge_type in (
+                ("renewal_proof", "renewal"),
+                ("same_scope_reissue_proof", "same_scope_reissue"),
+            ):
+                proof = (
+                    dict(lineage.get(proof_key) or {})
+                    if isinstance(lineage.get(proof_key), Mapping)
+                    else {}
+                )
+                if (
+                    _string(proof.get("previous_route_token_ref")) == current_ref
+                    and _string(proof.get("route_token_ref")) == candidate_ref
+                ):
+                    direct_claims.append((candidate, edge_type, proof))
+
+        claimed_refs = sorted(
+            {
+                _string(candidate.get("route_token_ref"))
+                for candidate, _, _ in direct_claims
+            }
+        )
+        if not direct_claims:
+            fail(
+                "route_token_ref_renewal_descendant_missing",
+                "superseded route-token ref has no registered direct successor",
+                field="route_lineage.previous_route_token_ref",
+                expected=current_ref,
+                actual="missing",
+            )
+        if len(claimed_refs) != 1 or len(direct_claims) != 1:
+            fail(
+                "route_token_ref_renewal_descendant_ambiguous",
+                "superseded route-token ref has ambiguous registered successors",
+                field="route_lineage.previous_route_token_ref",
+                expected="exactly_one_registered_successor",
+                actual=claimed_refs,
+            )
+
+        candidate_row, edge_type, proof = direct_claims[0]
+        candidate_ref = _string(candidate_row.get("route_token_ref"))
+        current_scope = exact_scope(current_row)
+        candidate_scope = exact_scope(candidate_row)
+        proof_scope = (
+            dict(proof.get("scope"))
+            if isinstance(proof.get("scope"), Mapping)
+            else {}
+        )
+        normalized_proof_scope = {
+            field: _string(proof_scope.get(field))
+            for field in ("project_id", "backlog_id", "task_id")
+        }
+        for field in ("project_id", "backlog_id", "task_id"):
+            expected = current_scope[field]
+            for source_name, actual in (
+                ("successor", candidate_scope[field]),
+                ("proof", normalized_proof_scope[field]),
+            ):
+                if not expected or actual != expected:
+                    fail(
+                        "route_token_ref_renewal_scope_mismatch",
+                        "route-token renewal successor changed contract scope",
+                        field=f"{source_name}.scope.{field}",
+                        expected=expected or "non_empty_exact_scope",
+                        actual=actual or "missing",
+                    )
+
+        current_role = _string(current_row.get("caller_role"))
+        candidate_role = _string(candidate_row.get("caller_role"))
+        if not current_role or candidate_role != current_role:
+            fail(
+                "route_token_ref_renewal_caller_role_mismatch",
+                "route-token renewal successor changed caller role",
+                field="caller_role",
+                expected=current_role or "non_empty_exact_role",
+                actual=candidate_role or "missing",
+            )
+
+        for field, current_values, candidate_values in (
+            (
+                "allowed_actions",
+                _row_allowed_actions(current_row),
+                _row_allowed_actions(candidate_row),
+            ),
+            (
+                "target_files",
+                _row_target_files(current_row),
+                _row_target_files(candidate_row),
+            ),
+            (
+                "owned_files",
+                _row_owned_files(current_row),
+                _row_owned_files(candidate_row),
+            ),
+        ):
+            expected = exact_list(current_values)
+            actual = exact_list(candidate_values)
+            if actual != expected:
+                fail(
+                    f"route_token_ref_renewal_{field}_mismatch",
+                    f"route-token renewal successor changed {field}",
+                    field=field,
+                    expected=expected,
+                    actual=actual,
+                )
+
+        if edge_type == "renewal":
+            required = {
+                "schema_version": REF_RENEWAL_PROOF_SCHEMA_VERSION,
+                "status": "renewed",
+                "source": "renew_route_token_ref",
+            }
+            for field, expected in required.items():
+                actual = proof.get(field)
+                if actual != expected:
+                    fail(
+                        "route_token_ref_renewal_proof_invalid",
+                        "route-token renewal proof is not server canonical",
+                        field=f"route_lineage.renewal_proof.{field}",
+                        expected=expected,
+                        actual=actual,
+                    )
+            for proof_field, expected_identity in (
+                ("previous_route_identity", row_identity(current_row)),
+                ("route_identity", row_identity(candidate_row)),
+            ):
+                actual_identity = (
+                    dict(proof.get(proof_field) or {})
+                    if isinstance(proof.get(proof_field), Mapping)
+                    else {}
+                )
+                for field in identity_fields:
+                    expected = expected_identity[field]
+                    actual = _string(actual_identity.get(field))
+                    if not expected or actual != expected:
+                        fail(
+                            "route_token_ref_renewal_identity_mismatch",
+                            "route-token renewal proof identity does not match registry",
+                            field=f"route_lineage.renewal_proof.{proof_field}.{field}",
+                            expected=expected or "non_empty_registry_identity",
+                            actual=actual or "missing",
+                        )
+        else:
+            required = {
+                "schema_version": REF_SAME_SCOPE_REISSUE_PROOF_SCHEMA_VERSION,
+                "status": "reissued_from_superseded",
+                "source": "issue_observer_write_route_context",
+                "registry_verified": True,
+                "scope_widened": False,
+            }
+            for field, expected in required.items():
+                actual = proof.get(field)
+                if actual != expected:
+                    fail(
+                        "route_token_ref_same_scope_reissue_proof_invalid",
+                        "same-scope route reissue proof is not server canonical",
+                        field=f"route_lineage.same_scope_reissue_proof.{field}",
+                        expected=expected,
+                        actual=actual,
+                    )
+            parent_lineage = _json_loads_public_mapping(
+                candidate_row.get(
+                    _REF_LINEAGE_COLUMNS["parent_route_lineage"]
+                )
+            )
+            current_identity = row_identity(current_row)
+            for field in (*_PARENT_ROUTE_REQUIRED_FIELDS, "route_token_ref"):
+                expected = current_identity[field]
+                actual = _string(parent_lineage.get(field))
+                if not expected or actual != expected:
+                    fail(
+                        "route_token_ref_same_scope_reissue_parent_mismatch",
+                        "same-scope route reissue parent does not match registry",
+                        field=f"parent_route_lineage.{field}",
+                        expected=expected or "non_empty_registry_identity",
+                        actual=actual or "missing",
+                    )
+            for field, expected in (
+                ("caller_role", current_role),
+                ("allowed_actions", exact_list(_row_allowed_actions(current_row))),
+                ("target_files", exact_list(_row_target_files(current_row))),
+                ("owned_files", exact_list(_row_owned_files(current_row))),
+            ):
+                actual = proof.get(field)
+                if isinstance(expected, list):
+                    actual = exact_list(actual or [])
+                else:
+                    actual = _string(actual)
+                if actual != expected:
+                    fail(
+                        "route_token_ref_same_scope_reissue_scope_mismatch",
+                        "same-scope route reissue proof changed authority",
+                        field=f"route_lineage.same_scope_reissue_proof.{field}",
+                        expected=expected,
+                        actual=actual,
+                    )
+
+        for field in ("raw_route_token_persisted", "raw_session_token_persisted"):
+            if proof.get(field) is not False:
+                fail(
+                    "route_token_ref_renewal_private_material_invalid",
+                    "route-token renewal proof must attest no raw credentials persisted",
+                    field=f"route_lineage.{field}",
+                    expected=False,
+                    actual=proof.get(field),
+                )
+
+        chain_refs.append(candidate_ref)
+        chain_edges.append(edge_type)
+        current_ref = candidate_ref
+        current_row = candidate_row
+
+    fail(
+        "route_token_ref_renewal_lineage_too_deep",
+        "route-token renewal lineage exceeded the bounded depth",
+        field="route_lineage",
+        expected="at_most_64_hops",
+        actual=len(chain_edges),
+    )
+
+
 def verify_route_token_binding(
     conn: sqlite3.Connection,
     *,
