@@ -11318,6 +11318,7 @@ def rejoin_mf_subagent_runtime_session_token(
     post_qa_merge_conflict_rejoin_authority: (
         PostQaMergeConflictRejoinAuthority | None
     ) = None,
+    bounded_replacement_rejoin: bool = False,
 ) -> dict[str, Any]:
     """Issue a new host envelope for an existing worker context.
 
@@ -11542,6 +11543,13 @@ def rejoin_mf_subagent_runtime_session_token(
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
         post_qa_conflict_rejoin = True
     revision_rejoin = failed_qa_revision_rejoin or post_qa_conflict_rejoin
+    if bounded_replacement_rejoin and (
+        revision_rejoin
+        or reopen_for_revision
+        or context.last_recovery_action
+        != "mf_subagent_session_token_rejoin_issued"
+    ):
+        raise BranchRuntimeFenceError("bounded_replacement_rejoin_invalid")
     if (
         context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
         and not revision_rejoin
@@ -11584,7 +11592,11 @@ def rejoin_mf_subagent_runtime_session_token(
     new_token = secrets.token_urlsafe(32)
     new_hash = mf_subagent_session_token_hash(new_token)
     lease_id = "mfrlease-" + uuid.uuid4().hex[:16]
-    if post_qa_conflict_rejoin:
+    if bounded_replacement_rejoin:
+        recovery_action = (
+            "mf_subagent_session_token_rejoin_replacement_issued"
+        )
+    elif post_qa_conflict_rejoin:
         recovery_action = "mf_subagent_post_qa_merge_conflict_rejoin_issued"
     elif failed_qa_revision_rejoin:
         recovery_action = failed_qa_recovery_action
@@ -11631,6 +11643,10 @@ def rejoin_mf_subagent_runtime_session_token(
         "reopen_for_revision": revision_rejoin,
         "reopen_for_failed_qa_revision": failed_qa_revision_rejoin,
         "revision_rejoin_applied": revision_rejoin,
+        "bounded_replacement_rejoin": bool(bounded_replacement_rejoin),
+        "bounded_replacement_generation": (
+            1 if bounded_replacement_rejoin else 0
+        ),
         "failed_qa_running_revision_rejoin_authority": (
             asdict(failed_qa_authority)
             if fresh_running_failed_qa_rejoin
@@ -11642,6 +11658,7 @@ def rejoin_mf_subagent_runtime_session_token(
         ),
         "previous_status": context.status,
         "current_status": saved.status,
+        "last_recovery_action": recovery_action,
         "attempt": saved.attempt,
         "retry_round": saved.retry_round,
         "session_token": new_token,

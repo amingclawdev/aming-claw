@@ -947,8 +947,200 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
         )
     )
     assert rejoin["session_token_ref"] != prior_session_token_ref
-    active_fence_token = rejoin["fence_token"]
-    active_session_token = rejoin["session_token"]
+    assert rejoin["bounded_rejoin_kind"] == "ordinary_initial_rejoin"
+    rejoin_context = get_branch_context(conn, PID, runtime_context.task_id)
+    assert rejoin_context is not None
+    eligibility = server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=rejoin_context,
+    )
+    assert eligibility["eligible"] is True
+    assert eligibility["mode"] == (
+        "bounded_post_lineage_replacement_auth_only"
+    )
+    stale_ref_context = rejoin_context
+    stale_ref_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    )
+    with pytest.raises(GovernanceError) as stale_ref_rejoin:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "target_project_root": str(target_root),
+                    "session_token_ref": prior_session_token_ref,
+                    "reason": "reject the stale pre-rejoin session ref",
+                },
+            )
+        )
+    assert stale_ref_rejoin.value.code == (
+        "runtime_context_rejoin_identity_mismatch"
+    )
+    assert stale_ref_rejoin.value.details["field"] == "session_token_ref"
+    assert stale_ref_rejoin.value.details["expected"] == (
+        rejoin["session_token_ref"]
+    )
+    assert stale_ref_rejoin.value.details["actual"] == prior_session_token_ref
+    assert stale_ref_rejoin.value.details["guide"]
+    assert stale_ref_rejoin.value.details["source"] == "runtime_context.current"
+    assert stale_ref_rejoin.value.details["mutation_performed"] is False
+    assert get_branch_context(
+        conn,
+        PID,
+        runtime_context.task_id,
+    ) == stale_ref_context
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    ) == stale_ref_events
+    replacement = (
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "target_project_root": str(target_root),
+                    "session_token_ref": rejoin["session_token_ref"],
+                    "reason": (
+                        "host policy rejected a cleanup command after the "
+                        "initial rejoin envelope was claimed"
+                    ),
+                },
+            )
+        )
+    )
+    assert replacement["bounded_rejoin_kind"] == (
+        "bounded_replacement_rejoin"
+    )
+    assert replacement["bounded_replacement_rejoin"] is True
+    assert replacement["bounded_replacement_generation"] == 1
+    replacement_context = get_branch_context(conn, PID, runtime_context.task_id)
+    assert replacement_context is not None
+    assert replacement_context.last_recovery_action == (
+        "mf_subagent_session_token_rejoin_replacement_issued"
+    )
+    before_third_context = replacement_context
+    before_third_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    )
+    before_third_record = server._contract_runtime(conn).store.get(
+        successor["contract_execution_id"]
+    )
+    with pytest.raises(GovernanceError) as third_rejoin:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "target_project_root": str(target_root),
+                    "session_token_ref": replacement["session_token_ref"],
+                    "reason": "a third rejoin must fail closed",
+                },
+            )
+        )
+    assert third_rejoin.value.code == (
+        "runtime_context_bounded_replacement_rejoin_exhausted"
+    )
+    assert third_rejoin.value.details["field"] == (
+        "bounded_replacement_rejoin_count"
+    )
+    assert third_rejoin.value.details["expected"] == "at most 1"
+    assert third_rejoin.value.details["actual"] == "2"
+    assert third_rejoin.value.details["mutation_performed"] is False
+    assert third_rejoin.value.details["zero_timeline_write"] is True
+    assert get_branch_context(
+        conn,
+        PID,
+        runtime_context.task_id,
+    ) == before_third_context
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    ) == before_third_events
+    assert server._contract_runtime(conn).store.get(
+        successor["contract_execution_id"]
+    ) == before_third_record
+    active_graph_trace_id = (
+        "gqt-precommit-implementation-facade-worker-replacement"
+    )
+    replacement_graph_commit, _replacement_graph_commit_source = (
+        server._runtime_context_expected_graph_commit(replacement_context)
+    )
+    conn.execute(
+        """
+        INSERT INTO graph_snapshots
+          (project_id, snapshot_id, commit_sha, snapshot_kind, status, created_at)
+        VALUES (?, ?, ?, 'scope', 'active', ?)
+        """,
+        (
+            PID,
+            "scope-mf-parallel-runtime-projection",
+            replacement_graph_commit,
+            "2026-08-04T06:00:00Z",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO graph_snapshot_refs
+          (project_id, ref_name, snapshot_id, commit_sha, updated_at)
+        VALUES (?, 'active', ?, ?, ?)
+        """,
+        (
+            PID,
+            "scope-mf-parallel-runtime-projection",
+            replacement_graph_commit,
+            "2026-08-04T06:00:00Z",
+        ),
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=active_graph_trace_id,
+        parent_task_id=backlog_id,
+        snapshot_id="scope-mf-parallel-runtime-projection",
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        worker_role="mf_sub",
+        fence_token=fence_token,
+        run_id=_mf_sub_run_id(runtime_context.task_id, fence_token),
+        created_at="2026-08-04T06:00:01Z",
+    )
+    conn.commit()
+    active_fence_token = replacement["fence_token"]
+    active_session_token = replacement["session_token"]
 
     def submit_correction(*, intent=correction_intent):
         request_body = {
@@ -958,7 +1150,7 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
             "target_project_root": str(target_root),
             "commit_sha": corrected_head,
             "changed_files": frozen_asset_files,
-            "graph_trace_ids": [graph_trace_id],
+            "graph_trace_ids": [active_graph_trace_id],
             "tests": [{"command": "pytest -q", "status": "passed"}],
             "test_results": {"status": "passed", "passed": True},
         }
@@ -1056,7 +1248,7 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
     assert implementations[-1]["commit_sha"] == corrected_head
     assert implementations[-1]["changed_files"] == sorted(frozen_asset_files)
     assert implementations[-1]["session_token_ref"] == (
-        rejoin["session_token_ref"]
+        replacement["session_token_ref"]
     )
     correction = implementations[-1]["payload"][
         "canonical_precommit_lineage_revision"
@@ -1088,7 +1280,7 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
     idempotent_correction = submit_correction()
     assert idempotent_correction[
         "contract_runtime_canonical_line"
-    ]["status"] == "already_completed"
+    ]["status"] == "accepted_completed_line_already_recorded"
 
     latest_lineage = _worker_implementation_lineage(
         revised_record,
@@ -1131,6 +1323,50 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
     assert worker_commit["next_legal_action"] == (
         "record_finish_time_worker_attestation"
     )
+    finish = (
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "contract_execution_id": successor["contract_execution_id"],
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "fence_token": active_fence_token,
+                    "session_token": active_session_token,
+                    "target_project_root": str(target_root),
+                    "head_commit": corrected_head,
+                    "worker_session_id": runtime_context.worker_slot_id,
+                    "filer_principal": runtime_context.worker_slot_id,
+                    "worker_transcript_ref": (
+                        f"multi_agent:{runtime_context.worker_slot_id}"
+                    ),
+                    "harness_type": "codex",
+                    "graph_trace_ids": latest_lineage["graph_trace_ids"],
+                    "read_receipt_hash": (
+                        "sha256:mf-parallel-runtime-projection-read"
+                    ),
+                    "read_receipt_event_id": evidence_events["read_receipt"],
+                    "changed_files": frozen_asset_files,
+                    "owned_files": owned_files,
+                    "test_results": {
+                        "status": "passed",
+                        "passed": True,
+                        "commands": ["pytest -q"],
+                    },
+                },
+            )
+        )
+    )
+    assert finish["ok"] is True
+    assert finish["finish_time_worker_self_attestation"][
+        "finish_time_self_attesting"
+    ] is True
     revision_payload = server._runtime_context_latest_contract_revision_payload(
         conn,
         runtime_context,
@@ -44286,6 +44522,23 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
     assert "session_token_initial_join_submission" not in (
         guide_blocked.value.details["actionable_payloads"]
     )
+    rejoin_submission = guide_blocked.value.details["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]
+    safe_sequence = rejoin_submission["host_safe_filesystem_sequence"]
+    assert any(
+        ".aming-claw" in instruction
+        for instruction in safe_sequence[
+            "before_requesting_any_host_envelope"
+        ]
+    )
+    assert any(
+        "recursive or destructive" in instruction
+        for instruction in safe_sequence["after_claiming_host_envelope"]
+    )
+    assert rejoin_submission["bounded_recovery_contract"][
+        "max_replacement_rejoins_after_initial_rejoin"
+    ] == 1
 
     with pytest.raises(GovernanceError) as wrong_task:
         server.handle_graph_governance_runtime_context_session_token_rejoin(
@@ -44388,6 +44641,76 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
     assert ref_only_write.value.details["diagnostics"]["reason"] == (
         "worker_auth_material_missing"
     )
+
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id="worker-runtime-rejoin",
+        backlog_id="AC-RUNTIME-TOKEN-REJOIN",
+        event_type="mf_subagent.worker_progress",
+        event_kind="worker_progress",
+        phase="implementation",
+        status="accepted",
+        actor="slot-runtime-rejoin",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": "worker-runtime-rejoin",
+            "parent_task_id": "parent-runtime-rejoin",
+        },
+    )
+    conn.commit()
+    before_blocked_replacement_context = get_branch_context(
+        conn,
+        PID,
+        "worker-runtime-rejoin",
+    )
+    before_blocked_replacement_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id="worker-runtime-rejoin",
+        backlog_id="AC-RUNTIME-TOKEN-REJOIN",
+        limit=1000,
+    )
+    with pytest.raises(GovernanceError) as post_write_replacement:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": "worker-runtime-rejoin",
+                    "parent_task_id": "parent-runtime-rejoin",
+                    "target_project_root": str(target_root),
+                    "session_token_ref": result["session_token_ref"],
+                    "reason": "reject replacement after worker progress",
+                },
+            )
+        )
+    assert post_write_replacement.value.code == (
+        "runtime_context_bounded_replacement_rejoin_rejected"
+    )
+    assert "worker evidence or protected write advanced" in " ".join(
+        post_write_replacement.value.details[
+            "bounded_replacement_rejoin_authority"
+        ]["errors"]
+    )
+    assert post_write_replacement.value.details["mutation_performed"] is False
+    assert post_write_replacement.value.details["zero_timeline_write"] is True
+    assert get_branch_context(
+        conn,
+        PID,
+        "worker-runtime-rejoin",
+    ) == before_blocked_replacement_context
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id="worker-runtime-rejoin",
+        backlog_id="AC-RUNTIME-TOKEN-REJOIN",
+        limit=1000,
+    ) == before_blocked_replacement_events
 
 
 def test_runtime_context_session_token_rejoin_accepts_contract_runtime_only_worker_sequence(
@@ -45025,6 +45348,44 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         head_commit=worker_head_commit,
         implementation_event_ref=f"timeline:{worker_events['implementation']}",
     )
+    runtime = server._contract_runtime(conn)
+    worker_finish_common = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": backlog_id,
+        "line_instance_id": (
+            f"runtime_context:{runtime_context.runtime_context_id}"
+        ),
+        "commit_sha": worker_head_commit,
+        "status": "passed",
+    }
+    for stage_id, line_id, evidence_kind in (
+        (
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "record_finish_time_worker_attestation",
+        ),
+        (
+            "worker_finish",
+            "worker_finish_gate",
+            "mf_subagent_finish_gate",
+        ),
+    ):
+        record = runtime.store.get(successor["contract_execution_id"])
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role="mf_sub",
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        write.update(worker_finish_common)
+        write["payload"] = dict(worker_finish_common)
+        assert runtime.submit_line_write(
+            successor["contract_execution_id"],
+            write,
+            actor_role="mf_sub",
+        )["ok"] is True
     runtime_context = upsert_branch_context(
         conn,
         replace(
@@ -47958,6 +48319,12 @@ def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_with
     )
     auth_rotations = []
     for index in range(2):
+        current_context = get_branch_context(
+            conn,
+            PID,
+            ready_context.task_id,
+        )
+        assert current_context is not None
         auth_rotations.append(
             server.handle_graph_governance_runtime_context_session_token_rejoin(
                 _ctx_with_role(
@@ -47971,6 +48338,11 @@ def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_with
                         "task_id": ready_context.task_id,
                         "parent_task_id": ready_context.root_task_id,
                         "target_project_root": str(target_root),
+                        "session_token_ref": (
+                            runtime_context_session_token_ref(current_context)
+                            if index
+                            else ""
+                        ),
                         "reason": (
                             "auth-only rotation without active authenticated "
                             f"failed QA #{index + 1}"
@@ -47982,8 +48354,12 @@ def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_with
         )
     first_rotation, second_rotation = auth_rotations
     assert first_rotation["reopen_for_revision"] is False
+    assert first_rotation["bounded_rejoin_kind"] == "ordinary_initial_rejoin"
     assert first_rotation["timeline_reopen_for_revision"] is False
     assert second_rotation["reopen_for_revision"] is False
+    assert second_rotation["bounded_rejoin_kind"] == (
+        "bounded_replacement_rejoin"
+    )
     assert second_rotation["timeline_reopen_for_revision"] is False
     assert second_rotation["attempt"] == first_rotation["attempt"] == 2
     assert second_rotation["retry_round"] == first_rotation["retry_round"] == 1
@@ -89564,6 +89940,11 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
                             "contract_execution_id"
                         ],
                         "target_project_root": str(worktree),
+                        "session_token_ref": (
+                            runtime_context_session_token_ref(
+                                runtime_context
+                            )
+                        ),
                         "reason": (
                             "refresh worker auth while the typed post-QA "
                             "target is unchanged"
@@ -89594,6 +89975,8 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         assert runtime_context is not None
         assert runtime_context.last_recovery_action == (
             "mf_subagent_session_token_rejoin_issued"
+            if rejoin_index == 0
+            else "mf_subagent_session_token_rejoin_replacement_issued"
         )
 
     subprocess.run(
@@ -90149,6 +90532,32 @@ def test_post_qa_merge_conflict_revision_requires_durable_preview_and_resets_fre
         check=True,
         capture_output=True,
     )
+    current_rejoin_context = get_branch_context(
+        conn,
+        PID,
+        runtime_context.task_id,
+    )
+    assert current_rejoin_context is not None
+    expected_graph_commit, _expected_graph_commit_source = (
+        server._runtime_context_expected_graph_commit(current_rejoin_context)
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO graph_snapshots
+          (project_id, snapshot_id, commit_sha, snapshot_kind, status, created_at)
+        VALUES (?, 'scope-test', ?, 'scope', 'active', ?)
+        """,
+        (PID, expected_graph_commit, "2026-08-04T06:10:00Z"),
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO graph_snapshot_refs
+          (project_id, ref_name, snapshot_id, commit_sha, updated_at)
+        VALUES (?, 'active', 'scope-test', ?, ?)
+        """,
+        (PID, expected_graph_commit, "2026-08-04T06:10:00Z"),
+    )
+    conn.commit()
 
     replacement_payload = {
         **initial_commit_payload,
