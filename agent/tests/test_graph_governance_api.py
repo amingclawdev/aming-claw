@@ -39033,6 +39033,7 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
                WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
             (PID, backlog_id, task_id),
         ).fetchone()[0]
+        before_total_changes = conn.total_changes
         rejected_ctx = _ctx_with_role(
             {"project_id": PID},
             "qa",
@@ -39059,6 +39060,8 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
             (PID, backlog_id, task_id),
         ).fetchone()[0]
         assert after_count == before_count
+        assert conn.total_changes == before_total_changes
+        return rejected.value.details
 
     unknown_body = json.loads(json.dumps(timeline_ctx.body))
     unknown_body["status"] = "unknown"
@@ -39071,12 +39074,93 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
 
     invalid_phase_body = json.loads(json.dumps(timeline_ctx.body))
     invalid_phase_body["phase"] = "deployment_qa"
-    assert_qa_input_rejected_zero_write(
+    ambiguous_phase = assert_qa_input_rejected_zero_write(
         invalid_phase_body,
         expected_code="qa_session_action_not_allowed",
         expected_field="phase",
         expected_actual="deployment_qa",
     )
+    ambiguous_prefill = ambiguous_phase["correction_prefill"]
+    assert ambiguous_phase["semantic_correction_phase"] == "verification"
+    assert ambiguous_prefill["task_timeline_append_patch"] == {
+        "phase": "verification"
+    }
+    assert ambiguous_prefill["qa_stage"] == "ambiguous_or_conflicting"
+    assert ambiguous_prefill["decision_source"] == "fail_safe_default"
+    assert ambiguous_prefill["navigation_only"] is True
+    assert ambiguous_prefill["authorizes_qa_verdict"] is False
+    assert ambiguous_prefill["authenticated_qa_graph_gate_still_required"] is True
+    assert ambiguous_prefill["zero_write_rejection"] is True
+    assert ambiguous_prefill["writes_performed"] is False
+    assert "`verification`" in ambiguous_phase["guide"]
+    assert "`postdeploy_qa`" not in ambiguous_phase["guide"]
+
+    for candidate_phase in ("candidate_qa", "predeploy_qa"):
+        candidate_body = json.loads(json.dumps(timeline_ctx.body))
+        candidate_body["phase"] = candidate_phase
+        candidate_rejection = assert_qa_input_rejected_zero_write(
+            candidate_body,
+            expected_code="qa_session_action_not_allowed",
+            expected_field="phase",
+            expected_actual=candidate_phase,
+        )
+        candidate_prefill = candidate_rejection["correction_prefill"]
+        assert candidate_rejection["semantic_correction_phase"] == (
+            "verification"
+        )
+        assert candidate_prefill["phase"] == "verification"
+        assert candidate_prefill["task_timeline_append_patch"] == {
+            "phase": "verification"
+        }
+        assert candidate_prefill["qa_stage"] == "candidate_or_predeploy"
+        assert candidate_prefill["decision_source"] == (
+            "explicit_phase_intent"
+        )
+        assert "Candidate or predeploy QA intent" in candidate_prefill[
+            "reason"
+        ]
+        assert "`verification`" in candidate_rejection["guide"]
+        assert "`postdeploy_qa`" not in candidate_rejection["guide"]
+
+    postdeploy_body = json.loads(json.dumps(timeline_ctx.body))
+    postdeploy_body["event_type"] = "qa.postdeploy.independent_verification"
+    postdeploy_body["phase"] = "deployment_qa"
+    postdeploy_rejection = assert_qa_input_rejected_zero_write(
+        postdeploy_body,
+        expected_code="qa_session_action_not_allowed",
+        expected_field="phase",
+        expected_actual="deployment_qa",
+    )
+    postdeploy_prefill = postdeploy_rejection["correction_prefill"]
+    assert postdeploy_rejection["semantic_correction_phase"] == (
+        "postdeploy_qa"
+    )
+    assert postdeploy_prefill["task_timeline_append_patch"] == {
+        "phase": "postdeploy_qa"
+    }
+    assert postdeploy_prefill["qa_stage"] == "postdeploy"
+    assert postdeploy_prefill["decision_source"] == (
+        "explicit_event_type_intent"
+    )
+    assert "Explicit postdeploy/post_deploy QA intent" in postdeploy_prefill[
+        "reason"
+    ]
+    assert postdeploy_prefill["authorizes_qa_verdict"] is False
+    assert "`postdeploy_qa`" in postdeploy_rejection["guide"]
+
+    conflict_body = json.loads(json.dumps(timeline_ctx.body))
+    conflict_body["event_type"] = "qa.postdeploy.independent_verification"
+    conflict_body["phase"] = "candidate_qa"
+    conflict_rejection = assert_qa_input_rejected_zero_write(
+        conflict_body,
+        expected_code="qa_session_action_not_allowed",
+        expected_field="phase",
+        expected_actual="candidate_qa",
+    )
+    conflict_prefill = conflict_rejection["correction_prefill"]
+    assert conflict_prefill["phase"] == "verification"
+    assert conflict_prefill["qa_stage"] == "ambiguous_or_conflicting"
+    assert conflict_prefill["decision_source"] == "fail_safe_default"
 
     implementation_body = json.loads(json.dumps(timeline_ctx.body))
     implementation_body.update(

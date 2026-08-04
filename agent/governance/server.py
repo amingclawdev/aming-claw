@@ -119493,6 +119493,147 @@ _QA_TIMELINE_VERIFICATION_EVENT_KINDS = frozenset(
 _QA_TIMELINE_VERIFICATION_PHASES = frozenset(
     {"qa", "verification", "independent_verification", "postdeploy_qa"}
 )
+_QA_TIMELINE_CANDIDATE_PHASE_INTENTS = frozenset(
+    {
+        "candidate",
+        "candidate_qa",
+        "candidate_verification",
+        "predeploy",
+        "predeploy_qa",
+        "predeploy_verification",
+        "pre_deploy",
+        "pre_deploy_qa",
+        "pre_deploy_verification",
+    }
+)
+_QA_TIMELINE_POSTDEPLOY_PHASE_INTENTS = frozenset(
+    {
+        "postdeploy",
+        "postdeploy_qa",
+        "postdeploy_verification",
+        "post_deploy",
+        "post_deploy_qa",
+        "post_deploy_verification",
+    }
+)
+
+
+def _qa_timeline_phase_correction_prefill(
+    *,
+    body: Mapping[str, Any],
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Choose a copy-safe QA phase correction from explicit phase intent.
+
+    This is navigation only, not deployment or graph authority.  Candidate and
+    predeploy intent map to the canonical ``verification`` phase.  Only an
+    explicit postdeploy/post_deploy phase or event-type family maps to
+    ``postdeploy_qa``; ambiguous or conflicting intent fails safe to
+    ``verification``.  The retried request still traverses the authenticated QA
+    graph and candidate/postdeploy authority gates.
+    """
+
+    raw_phase = str(event.get("phase") or body.get("phase") or "").strip()
+    phase_intent = raw_phase.lower().replace("-", "_").replace(".", "_")
+    raw_event_type = str(
+        event.get("event_type") or body.get("event_type") or ""
+    ).strip()
+    event_type = raw_event_type.lower().replace("-", "_")
+
+    candidate_phase = phase_intent in _QA_TIMELINE_CANDIDATE_PHASE_INTENTS
+    postdeploy_phase = (
+        phase_intent in _QA_TIMELINE_POSTDEPLOY_PHASE_INTENTS
+    )
+    candidate_event = bool(
+        event_type.startswith("qa.candidate.")
+        or event_type.startswith("qa.predeploy.")
+        or event_type.startswith("qa.pre_deploy.")
+        or event_type
+        in {
+            "qa.candidate",
+            "qa.candidate_qa",
+            "qa.predeploy",
+            "qa.predeploy_qa",
+            "qa.pre_deploy",
+            "qa.pre_deploy_qa",
+        }
+    )
+    postdeploy_event = bool(
+        event_type.startswith("qa.postdeploy.")
+        or event_type.startswith("qa.post_deploy.")
+        or event_type
+        in {
+            "qa.postdeploy",
+            "qa.postdeploy_qa",
+            "qa.post_deploy",
+            "qa.post_deploy_qa",
+        }
+    )
+    candidate_intent = candidate_phase or candidate_event
+    postdeploy_intent = postdeploy_phase or postdeploy_event
+
+    if postdeploy_intent and not candidate_intent:
+        correction = "postdeploy_qa"
+        qa_stage = "postdeploy"
+        decision_source = (
+            "explicit_phase_intent"
+            if postdeploy_phase
+            else "explicit_event_type_intent"
+        )
+        reason = (
+            "Explicit postdeploy/post_deploy QA intent uses the canonical "
+            "postdeploy_qa timeline phase."
+        )
+    elif candidate_intent and not postdeploy_intent:
+        correction = "verification"
+        qa_stage = "candidate_or_predeploy"
+        decision_source = (
+            "explicit_phase_intent"
+            if candidate_phase
+            else "explicit_event_type_intent"
+        )
+        reason = (
+            "Candidate or predeploy QA intent uses the canonical verification "
+            "timeline phase."
+        )
+    else:
+        correction = "verification"
+        qa_stage = "ambiguous_or_conflicting"
+        decision_source = "fail_safe_default"
+        reason = (
+            "No single explicit candidate/predeploy or postdeploy intent was "
+            "present; use verification and let the retried authenticated QA "
+            "graph gate determine authority."
+        )
+
+    return {
+        "schema_version": "qa_timeline.phase_correction_prefill.v1",
+        "semantic_next_action": "task_timeline_append",
+        "field": "phase",
+        "phase": correction,
+        "task_timeline_append_patch": {"phase": correction},
+        "qa_stage": qa_stage,
+        "decision_source": decision_source,
+        "reason": reason,
+        "replace_only": ["phase"],
+        "preserve_fields": [
+            "event_type",
+            "event_kind",
+            "status",
+            "actor",
+            "graph_trace_ids",
+            "backlog_id",
+            "task_id",
+            "commit_sha",
+        ],
+        "navigation_only": True,
+        "authorizes_qa_verdict": False,
+        "authenticated_qa_graph_gate_still_required": True,
+        "copy_safe": True,
+        "public_safe": True,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+    }
 
 
 def _qa_timeline_input_rejection_details(
@@ -119866,6 +120007,10 @@ def _timeline_trusted_qa_verification_authority(
             },
         )
     if phase not in _QA_TIMELINE_VERIFICATION_PHASES:
+        phase_prefill = _qa_timeline_phase_correction_prefill(
+            body=body,
+            event=event,
+        )
         raise GovernanceError(
             "qa_session_action_not_allowed",
             "QA verification evidence requires a QA or verification phase",
@@ -119875,8 +120020,10 @@ def _timeline_trusted_qa_verification_authority(
                     field="phase",
                     expected=sorted(_QA_TIMELINE_VERIFICATION_PHASES),
                     actual=phase,
-                    correction="postdeploy_qa",
+                    correction=str(phase_prefill["phase"]),
                 ),
+                "correction_prefill": phase_prefill,
+                "semantic_correction_phase": str(phase_prefill["phase"]),
                 "phase": phase,
                 "allowed_phases": sorted(_QA_TIMELINE_VERIFICATION_PHASES),
             },
