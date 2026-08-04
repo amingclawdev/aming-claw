@@ -94080,12 +94080,29 @@ def _record_source_backed_worker_authority(
         actor=worker_session_id,
         payload={**identity, "read_receipt_hash": read_receipt_hash},
     )
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
     startup_gate = {
         "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
         "status": "passed",
+        "ok": True,
+        "allowed": True,
         "bounded": True,
+        "started": True,
+        "startup_complete": True,
+        "actual_startup_recorded": True,
+        "actual_startup_required": False,
         "close_satisfying": True,
         **identity,
+        **route_identity,
+        "role": "mf_sub",
         "worker_id": context.worker_id,
         "worker_slot_id": context.worker_slot_id,
         "actual_host_worker_id": context.worker_id,
@@ -94093,14 +94110,36 @@ def _record_source_backed_worker_authority(
         "filer_principal": worker_session_id,
         "worker_transcript_ref": f"codex:{worker_session_id}",
         "harness_type": "codex",
+        "startup_source": "codex_desktop_governed_dispatch",
         "actual_cwd": str(worker_root),
         "actual_git_root": str(worker_root),
         "target_project_root": str(worker_root),
         "worktree_path": str(worker_root),
+        "branch": context.branch_ref,
+        "branch_ref": context.branch_ref,
         "head_commit": worker_commit,
         "base_commit": base_commit,
+        "fence_token_hash": runtime_context_secret_hash(worker_fence),
+        "session_token_ref": runtime_context_session_token_ref(context),
         "read_receipt_hash": read_receipt_hash,
         "read_receipt_event_id": str(read_receipt["id"]),
+        "worker_self_attesting": True,
+        "self_attesting": True,
+        "finish_time_self_attesting": True,
+        "worker_self_attestation": {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "attestation_phase": "startup",
+            "status": "passed",
+            "ok": True,
+            "worker_self_attesting": True,
+            "self_attesting": True,
+            "finish_time_self_attesting": True,
+            "worker_session_id": worker_session_id,
+            "filer_principal": worker_session_id,
+            "worker_transcript_ref": f"codex:{worker_session_id}",
+            "harness_type": "codex",
+            "blockers": [],
+        },
     }
     task_timeline.record_event(
         conn,
@@ -94218,6 +94257,136 @@ def _record_source_backed_worker_authority(
     assert stored_commit["payload"]["diff_base_commit"] == base_commit
     assert stored_commit["payload"]["commit_parent_sha"] == base_commit
     return execution_id, context, runtime, worker_session_id
+
+
+def test_worker_generated_python_cache_allows_commit_attestation_and_finish(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    candidate_server, _ = _preload_candidate_server_module()
+    monkeypatch.setattr(
+        candidate_server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(conn),
+    )
+    backlog_id = "AC-WORKER-GENERATED-PYTHON-CACHE-E2E"
+    worker_task_id = "worker-generated-python-cache-e2e"
+    worker_token = "worker-generated-python-cache-token"
+    worker_fence = "fence-worker-generated-python-cache"
+    graph_trace_id = "gqt-worker-generated-python-cache"
+    owned_file = "agent/governance/server.py"
+    worker_root = tmp_path / worker_task_id
+    base_commit, worker_commit = _source_backed_worker_git_fixture(
+        worker_root,
+        owned_file,
+    )
+    generated_cache = (
+        worker_root
+        / "agent/governance/__pycache__/server.cpython-314.pyc"
+    )
+    generated_cache.parent.mkdir(parents=True)
+    generated_cache.write_bytes(b"generated after worker tests\n")
+    raw_status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=worker_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert generated_cache.relative_to(worker_root).as_posix() in raw_status
+
+    execution_id, context, runtime, _ = _record_source_backed_worker_authority(
+        candidate_server,
+        conn,
+        backlog_id=backlog_id,
+        worker_task_id=worker_task_id,
+        worker_token=worker_token,
+        worker_fence=worker_fence,
+        graph_trace_id=graph_trace_id,
+        owned_file=owned_file,
+        worker_root=worker_root,
+        base_commit=base_commit,
+        worker_commit=worker_commit,
+        test_results={
+            "status": "passed",
+            "passed": True,
+            "command": "pytest -q generated-cache-e2e",
+        },
+    )
+    assert generated_cache.exists()
+    assert candidate_server._runtime_context_git_dirty_files(
+        str(worker_root)
+    ) == []
+    assert runtime.store.get(execution_id)["completed_lines"][-1][
+        "line_id"
+    ] == "worker_commit"
+
+    guide = candidate_server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": execution_id,
+                "fence_token": worker_fence,
+                "session_token": worker_token,
+                "session_token_ref": runtime_context_session_token_ref(context),
+                "target_project_root": str(worker_root),
+            },
+        )
+    )
+    attestation_body = copy.deepcopy(
+        guide["actionable_payloads"][
+            "finish_time_worker_attestation_submission"
+        ]["copy_safe_body"]
+    )
+    attestation_body.update(
+        {"session_token": worker_token, "fence_token": worker_fence}
+    )
+    attestation = candidate_server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=attestation_body,
+        )
+    )
+    assert attestation["ok"] is True
+    assert runtime.store.get(execution_id)["completed_lines"][-1][
+        "line_id"
+    ] == "worker_finish_time_attestation"
+
+    finish_body = copy.deepcopy(attestation["finish_gate_submission"]["body"])
+    finish_body.update(
+        {"session_token": worker_token, "fence_token": worker_fence}
+    )
+    finish_result = candidate_server.handle_graph_governance_runtime_context_finish_gate(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=finish_body,
+        )
+    )
+    if isinstance(finish_result, tuple):
+        finish_status, finished = finish_result
+        assert finish_status == 200, json.dumps(finished, sort_keys=True)
+    else:
+        finished = finish_result
+    assert finished["ok"] is True
+    assert finished["action"] == "finish_gate"
+    assert finished["timeline_event"]["event_kind"] == "mf_subagent_finish_gate"
+    assert finished["context"]["status"] == "validated"
+    assert generated_cache.exists()
 
 
 def _install_contract_runtime_lines(

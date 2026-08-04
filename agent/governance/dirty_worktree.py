@@ -21,6 +21,13 @@ DIRTY_IGNORE_PREFIXES = (
     ".aming-claw/cache/", ".aming-claw\\cache\\",
 )
 
+# Python writes bytecode beneath a directory component with this exact name.
+# Tests can create these files after a worker has claimed its evidence envelope,
+# when recursive cleanup is no longer a legal host-safe action.  Keep the match
+# component-exact so arbitrary ``.pyc`` files and lookalike directories remain
+# governed dirty paths.
+GENERATED_DIR_COMPONENTS = frozenset({"__pycache__"})
+
 
 def normalize_dirty_path(path: str) -> str:
     text = str(path or "").strip()
@@ -33,6 +40,11 @@ def is_ignored_dirty_path(path: str) -> bool:
     normalized = normalize_dirty_path(path)
     if not normalized:
         return False
+    if any(
+        component in GENERATED_DIR_COMPONENTS
+        for component in normalized.split("/")
+    ):
+        return True
     for prefix in DIRTY_IGNORE_PREFIXES:
         clean_prefix = normalize_dirty_path(prefix)
         if normalized == clean_prefix or normalized.startswith(f"{clean_prefix}/"):

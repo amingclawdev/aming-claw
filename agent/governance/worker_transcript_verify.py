@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .dirty_worktree import filter_dirty_files
+
 
 WORKER_TRANSCRIPT_ATTESTATION_SCHEMA_VERSION = "worker_transcript_self_attestation.v1"
 SUPPORTED_HARNESS_TYPES = {"claude", "codex"}
@@ -300,11 +302,13 @@ def _git_diff_truth(
         else:
             blockers.append(failure_label)
     return {
-        "changed_files": [
-            item
-            for item in _dedupe(changed)
-            if not _is_governance_worktree_artifact(item)
-        ],
+        "changed_files": filter_dirty_files(
+            [
+                item
+                for item in _dedupe(changed)
+                if not _is_governance_worktree_artifact(item)
+            ]
+        ),
         "blockers": blockers,
         "worktree_path": str(worktree),
         "base_commit": base,

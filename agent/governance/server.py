@@ -38015,6 +38015,35 @@ def _runtime_context_git_dirty_files(worktree_path: str) -> list[str]:
     return filter_dirty_files(parse_git_porcelain_paths(proc.stdout))
 
 
+def _runtime_context_worker_commit_dirty_worktree_details(
+    dirty_files: list[str],
+) -> dict[str, Any]:
+    return {
+        "field": "dirty_files",
+        "expected": [],
+        "actual": list(dirty_files),
+        "guide": (
+            "commit owned product changes or remove only the listed "
+            "non-generated dirty paths before retrying worker_commit; "
+            "do not recursively clean the claimed worktree and do not "
+            "delete generated cache paths"
+        ),
+        "source": (
+            "git status --porcelain=v1 --untracked-files=all filtered "
+            "by agent.governance.dirty_worktree.filter_dirty_files"
+        ),
+        "dirty_files": list(dirty_files),
+        "generated_artifact_policy": {
+            "ignored_directory_components": ["__pycache__"],
+            "arbitrary_pyc_outside_ignored_components_is_governed": True,
+        },
+        "host_safe": True,
+        "next_legal_action": (
+            "commit_owned_changes_or_remove_only_listed_non_generated_dirty_files"
+        ),
+    }
+
+
 def _runtime_context_worker_commit_contract_execution_id(
     revision_payload: Mapping[str, Any],
     body: Mapping[str, Any],
@@ -44444,7 +44473,9 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
                 "worker_commit_dirty_worktree",
                 "worker_commit requires a clean assigned worktree",
                 422,
-                {"dirty_files": dirty_files, "next_legal_action": "clean_worktree"},
+                _runtime_context_worker_commit_dirty_worktree_details(
+                    dirty_files
+                ),
             )
         same_lane_recovery = (
             _runtime_context_same_lane_worker_commit_recovery(
