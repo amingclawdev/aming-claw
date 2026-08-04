@@ -24180,6 +24180,10 @@ def _runtime_context_worker_recovery_payloads(
         "require_finish_gate": True,
         "worker_role": "mf_sub",
         "status": "merge_ready",
+        # Standalone mf_parallel lanes own distinct durable queues.  Ordering
+        # across those queues is expressed by the observer merge sequence, not
+        # by a dependency edge that can never resolve inside either queue.
+        "serializes_after": [],
         "fence_token": fence_token_placeholder,
         "route_token_ref": (
             "<worker_task_id close_or_merge_after_evidence route_token_ref>"
@@ -24319,6 +24323,23 @@ def _runtime_context_worker_recovery_payloads(
             },
             "body": dict(merge_materialize_body),
             "copy_safe_body": dict(merge_materialize_body),
+            "dependency_policy": {
+                "ordinary_independent_lane_serializes_after": [],
+                "dependency_scope": "same durable merge_queue_id only",
+                "cross_queue_dependency_allowed": False,
+                "server_rejects_before_write": True,
+                "correction_before_apply": {
+                    "supported": True,
+                    "fields": ["serializes_after"],
+                    "replace_semantics": "explicit field replaces the persisted set",
+                    "required_fields": [
+                        "current_target_head",
+                        "validated_target_head",
+                        "validation_attempt greater than persisted attempt",
+                    ],
+                    "already_applied_item_mutation_allowed": False,
+                },
+            },
         },
         "audited_postmerge_recovery": {
             "schema_version": (
@@ -48553,6 +48574,11 @@ def _record_parallel_branch_merge_queue_materialize_event(
             "route_token_gate": dict(route_gate or {}),
             "queue_item": dict(queue_item),
             "context": dict(context),
+            "dependency_correction": (
+                dict(queued.get("dependency_correction") or {})
+                if isinstance(queued.get("dependency_correction"), Mapping)
+                else {}
+            ),
             "source_of_authority": "parallel_branch_merge_queue_materialize",
             "audited_postmerge_recovery_authority": (
                 dict(recovery_authority) if is_postmerge_recovery else {}
@@ -49546,6 +49572,123 @@ def _active_epoch_merge_queue_materialization_allowed(
     )
 
 
+def _parallel_merge_queue_serialization_scope_failure(
+    conn,
+    *,
+    project_id: str,
+    merge_queue_id: str,
+    task_id: str,
+    requested: tuple[str, ...],
+) -> dict[str, Any]:
+    """Return exact zero-write evidence for invalid serialization edges."""
+
+    from .parallel_branch_runtime import list_merge_queue_items
+
+    same_queue_task_ids = {
+        str(item.task_id or "").strip()
+        for item in list_merge_queue_items(conn, project_id, merge_queue_id)
+        if str(item.task_id or "").strip()
+    }
+    invalid = tuple(
+        dependency
+        for dependency in requested
+        if dependency == task_id or dependency not in same_queue_task_ids
+    )
+    if not invalid:
+        return {}
+    rows = conn.execute(
+        """
+        SELECT task_id, merge_queue_id
+          FROM parallel_branch_merge_queue_items
+         WHERE project_id = ?
+         ORDER BY task_id, merge_queue_id
+        """,
+        (project_id,),
+    ).fetchall()
+    discovered_queue_ids: dict[str, list[str]] = {}
+    for row in rows:
+        dependency = str(row["task_id"] or "").strip()
+        queue_id = str(row["merge_queue_id"] or "").strip()
+        if dependency in invalid and queue_id:
+            discovered_queue_ids.setdefault(dependency, []).append(queue_id)
+    return {
+        "ok": False,
+        "error": "merge_queue_serializes_after_scope_invalid",
+        "message": (
+            "serializes_after dependencies must resolve to a distinct task in "
+            "the same durable merge queue"
+        ),
+        "field": "serializes_after",
+        "expected": {
+            "merge_queue_id": merge_queue_id,
+            "allowed_task_ids": sorted(
+                candidate
+                for candidate in same_queue_task_ids
+                if candidate != task_id
+            ),
+            "ordinary_independent_lane_value": [],
+        },
+        "actual": {
+            "task_id": task_id,
+            "serializes_after": list(requested),
+            "invalid_dependencies": list(invalid),
+            "discovered_merge_queue_ids": discovered_queue_ids,
+        },
+        "guide": {
+            "action": "remove_cross_queue_serialization_and_retry_same_world",
+            "copy_safe_patch": {"serializes_after": []},
+            "correction_required_after_prior_accept": {
+                "validated_target_head": "<exact server-resolved current target>",
+                "validation_attempt": "<persisted validation_attempt + 1>",
+            },
+        },
+        "source": (
+            "parallel_branch_merge_queue_materialize."
+            "same_durable_queue_serialization_scope.v1"
+        ),
+        "writes_performed": False,
+        "mutation_performed": False,
+        "timeline_event_recorded": False,
+        "retry_same_world_allowed": True,
+    }
+
+
+def _parallel_merge_queue_serialization_correction_failure(
+    *,
+    field: str,
+    expected: Any,
+    actual: Any,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "merge_queue_serializes_after_correction_authority_incomplete",
+        "message": (
+            "persisted serialization dependencies can be replaced only before "
+            "apply with exact target revalidation and a newer attempt"
+        ),
+        "field": field,
+        "expected": expected,
+        "actual": actual,
+        "guide": {
+            "action": "revalidate_exact_target_then_replace_serializes_after",
+            "required_fields": [
+                "serializes_after",
+                "current_target_head",
+                "validated_target_head",
+                "validation_attempt",
+            ],
+        },
+        "source": (
+            "parallel_branch_merge_queue_materialize."
+            "pre_apply_dependency_correction.v1"
+        ),
+        "writes_performed": False,
+        "mutation_performed": False,
+        "timeline_event_recorded": False,
+        "retry_same_world_allowed": True,
+    }
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-queue/materialize")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-queue")
 def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
@@ -49587,6 +49730,21 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
             target_ref=target_ref,
         )
         runtime_context = get_branch_context(conn, project_id, task_id)
+        requested_serializes_after = tuple(
+            _query_statuses(ctx.body, "serializes_after")
+        )
+        if "serializes_after" in ctx.body:
+            serialization_scope_failure = (
+                _parallel_merge_queue_serialization_scope_failure(
+                    conn,
+                    project_id=project_id,
+                    merge_queue_id=merge_queue_id,
+                    task_id=task_id,
+                    requested=requested_serializes_after,
+                )
+            )
+            if serialization_scope_failure:
+                return 409, serialization_scope_failure
         if active_epoch is not None and not (
             _active_epoch_merge_queue_materialization_allowed(
                 conn,
@@ -49658,6 +49816,90 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                         target_ref=target_ref,
                     )
                 )
+            dependency_correction: dict[str, Any] = {}
+            existing_item = existing_task_items[0] if existing_task_items else None
+            if (
+                existing_item is not None
+                and not is_never_materialized_planned_merge_queue_item(existing_item)
+                and "serializes_after" in ctx.body
+                and tuple(existing_item.serializes_after)
+                != requested_serializes_after
+            ):
+                if (
+                    str(existing_item.merge_commit or "").strip()
+                    or str(existing_item.target_head_after_merge or "").strip()
+                    or str(existing_item.completed_at or "").strip()
+                    or str(existing_item.status or "").strip().lower()
+                    in {"merged", "applied", "completed"}
+                ):
+                    return 409, _parallel_merge_queue_serialization_correction_failure(
+                        field="queue_item.status",
+                        expected="pre-apply durable queue item",
+                        actual=str(existing_item.status or ""),
+                    )
+                validated_target_head = str(
+                    ctx.body.get("validated_target_head") or ""
+                ).strip()
+                if (
+                    not validated_target_head
+                    or validated_target_head != current_target_head
+                ):
+                    return 409, _parallel_merge_queue_serialization_correction_failure(
+                        field="validated_target_head",
+                        expected=current_target_head,
+                        actual=validated_target_head,
+                    )
+                requested_validation_attempt = _query_int(
+                    ctx.body, "validation_attempt", 0
+                )
+                minimum_validation_attempt = int(
+                    existing_item.validation_attempt or 0
+                ) + 1
+                if requested_validation_attempt < minimum_validation_attempt:
+                    return 409, _parallel_merge_queue_serialization_correction_failure(
+                        field="validation_attempt",
+                        expected={"minimum": minimum_validation_attempt},
+                        actual=requested_validation_attempt,
+                    )
+                previous_serializes_after = tuple(existing_item.serializes_after)
+                conn.execute(
+                    """
+                    UPDATE parallel_branch_merge_queue_items
+                       SET serializes_after_json = ?,
+                           validated_target_head = ?,
+                           current_target_head = ?,
+                           validation_attempt = ?,
+                           updated_at = ?
+                     WHERE project_id = ? AND merge_queue_id = ?
+                       AND queue_item_id = ? AND task_id = ?
+                    """,
+                    (
+                        json.dumps(list(requested_serializes_after)),
+                        validated_target_head,
+                        current_target_head,
+                        requested_validation_attempt,
+                        _utc_now(),
+                        project_id,
+                        merge_queue_id,
+                        str(existing_item.queue_item_id or ""),
+                        task_id,
+                    ),
+                )
+                dependency_correction = {
+                    "schema_version": (
+                        "parallel_branch.merge_queue_dependency_correction.v1"
+                    ),
+                    "field": "serializes_after",
+                    "previous": list(previous_serializes_after),
+                    "replacement": list(requested_serializes_after),
+                    "validated_target_head": validated_target_head,
+                    "previous_validation_attempt": int(
+                        existing_item.validation_attempt or 0
+                    ),
+                    "validation_attempt": requested_validation_attempt,
+                    "pre_apply_only": True,
+                    "server_audited": True,
+                }
             queued = queue_merge_item_for_branch_context(
                 conn,
                 project_id=project_id,
@@ -49669,7 +49911,7 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                 fence_token=str(ctx.body.get("fence_token") or ""),
                 depends_on=tuple(_query_statuses(ctx.body, "depends_on")),
                 hard_depends_on=tuple(_query_statuses(ctx.body, "hard_depends_on")),
-                serializes_after=tuple(_query_statuses(ctx.body, "serializes_after")),
+                serializes_after=requested_serializes_after,
                 conflicts_with=tuple(_query_statuses(ctx.body, "conflicts_with")),
                 same_node_or_file_conflicts=tuple(
                     _query_statuses(ctx.body, "same_node_or_file_conflicts")
@@ -49694,6 +49936,11 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                 ),
                 now_iso=str(ctx.body.get("now_iso") or ""),
             )
+            if dependency_correction:
+                queued = {
+                    **queued,
+                    "dependency_correction": dependency_correction,
+                }
             decision = decide_persisted_merge_queue(
                 conn,
                 project_id,

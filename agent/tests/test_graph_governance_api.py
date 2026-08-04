@@ -27100,6 +27100,215 @@ def test_parallel_branch_merge_queue_materialize_records_contract_event_after_fi
     assert raw_fence_token not in json.dumps(payload, sort_keys=True)
 
 
+def test_parallel_branch_merge_queue_materialize_rejects_cross_queue_and_corrects_before_apply(
+    conn,
+):
+    root_task_id = "root-route-materialize-dependency-correction"
+    child_task_id = f"{root_task_id}-planner"
+    same_queue_dependency = f"{root_task_id}-models"
+    cross_queue_dependency = "other-queue-models"
+    queue_id = "mergeq-api-dependency-correction"
+    foreign_queue_id = "mergeq-api-foreign-dependency"
+    target_head = "target-dependency-correction"
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=root_task_id,
+        task_id=root_task_id,
+        target_files=["src/planner.py"],
+        allowed_actions=["close_or_merge_after_evidence"],
+        evidence_refs=["timeline:qa-independent-verification"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-dependency-correction",
+            backlog_id=root_task_id,
+            root_task_id=root_task_id,
+            task_id=child_task_id,
+            branch_ref="refs/heads/codex/dependency-correction-planner",
+            status=STATE_VALIDATED,
+            base_commit="base-dependency-correction",
+            head_commit="head-dependency-correction",
+            target_head_commit=target_head,
+            checkpoint_id="ckpt-dependency-correction",
+            replay_source="mf_sub_finish_gate",
+        ),
+    )
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=foreign_queue_id,
+            queue_item_id=f"{foreign_queue_id}:{cross_queue_dependency}",
+            backlog_id="AC-FOREIGN-DEPENDENCY",
+            task_id=cross_queue_dependency,
+            branch_ref="refs/heads/codex/foreign-dependency",
+            queue_index=1,
+            status="merged",
+            target_ref="refs/heads/main",
+            base_commit=target_head,
+            branch_head="foreign-dependency-head",
+            current_target_head=target_head,
+            merge_commit="foreign-dependency-merge",
+        ),
+    )
+    conn.commit()
+
+    status, rejected = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": child_task_id,
+                "merge_queue_id": queue_id,
+                "checkpoint_id": "ckpt-dependency-correction",
+                "require_finish_gate": True,
+                "route_token_ref": issued["route_token_ref"],
+                "serializes_after": [cross_queue_dependency],
+            },
+        )
+    )
+
+    assert status == 409
+    assert rejected["error"] == "merge_queue_serializes_after_scope_invalid"
+    assert rejected["field"] == "serializes_after"
+    assert rejected["writes_performed"] is False
+    assert rejected["mutation_performed"] is False
+    assert rejected["timeline_event_recorded"] is False
+    assert rejected["retry_same_world_allowed"] is True
+    assert rejected["actual"]["invalid_dependencies"] == [
+        cross_queue_dependency
+    ]
+    assert rejected["actual"]["discovered_merge_queue_ids"] == {
+        cross_queue_dependency: [foreign_queue_id]
+    }
+    assert list_merge_queue_items(conn, PID, queue_id) == []
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=root_task_id,
+        event_kind="merge_queue_item_materialize",
+        limit=5,
+    ) == []
+
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=queue_id,
+            queue_item_id=f"{queue_id}:{same_queue_dependency}",
+            backlog_id="AC-SAME-QUEUE-DEPENDENCY",
+            task_id=same_queue_dependency,
+            branch_ref="refs/heads/codex/same-queue-dependency",
+            queue_index=1,
+            status="merged",
+            target_ref="refs/heads/main",
+            base_commit=target_head,
+            branch_head="same-queue-dependency-head",
+            current_target_head=target_head,
+            merge_commit="same-queue-dependency-merge",
+        ),
+    )
+    conn.commit()
+    queued = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": child_task_id,
+                "merge_queue_id": queue_id,
+                "checkpoint_id": "ckpt-dependency-correction",
+                "require_finish_gate": True,
+                "route_token_ref": issued["route_token_ref"],
+                "serializes_after": [same_queue_dependency],
+            },
+        )
+    )
+    assert queued["ok"] is True
+    assert queued["queue_item"]["serializes_after"] == [same_queue_dependency]
+
+    correction_status, correction_rejected = (
+        server.handle_graph_governance_parallel_branch_merge_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": child_task_id,
+                    "merge_queue_id": queue_id,
+                    "checkpoint_id": "ckpt-dependency-correction",
+                    "require_finish_gate": True,
+                    "route_token_ref": issued["route_token_ref"],
+                    "serializes_after": [],
+                    "validation_attempt": 1,
+                },
+            )
+        )
+    )
+    assert correction_status == 409
+    assert correction_rejected["error"] == (
+        "merge_queue_serializes_after_correction_authority_incomplete"
+    )
+    assert correction_rejected["field"] == "validated_target_head"
+    assert correction_rejected["writes_performed"] is False
+    assert correction_rejected["retry_same_world_allowed"] is True
+    persisted_after_rejection = next(
+        item
+        for item in list_merge_queue_items(conn, PID, queue_id)
+        if item.task_id == child_task_id
+    )
+    assert persisted_after_rejection.serializes_after == (same_queue_dependency,)
+
+    corrected = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": child_task_id,
+                "merge_queue_id": queue_id,
+                "checkpoint_id": "ckpt-dependency-correction",
+                "require_finish_gate": True,
+                "route_token_ref": issued["route_token_ref"],
+                "serializes_after": [],
+                "current_target_head": target_head,
+                "validated_target_head": target_head,
+                "validation_attempt": 1,
+            },
+        )
+    )
+    assert corrected["ok"] is True
+    assert corrected["queue_item"]["serializes_after"] == []
+    assert corrected["dependency_correction"] == {
+        "schema_version": "parallel_branch.merge_queue_dependency_correction.v1",
+        "field": "serializes_after",
+        "previous": [same_queue_dependency],
+        "replacement": [],
+        "validated_target_head": target_head,
+        "previous_validation_attempt": 0,
+        "validation_attempt": 1,
+        "pre_apply_only": True,
+        "server_audited": True,
+    }
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=root_task_id,
+        event_kind="merge_queue_item_materialize",
+        limit=5,
+    )
+    assert any(
+        event["payload"]["dependency_correction"]
+        == corrected["dependency_correction"]
+        for event in events
+    )
+
+
 def test_parallel_branch_merge_queue_materialize_accepts_child_route_token_ref_after_finish_gate(conn):
     root_task_id = "root-route-materialize-child-token-task"
     child_task_id = f"{root_task_id}-focus-ui"
@@ -101326,6 +101535,19 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
         "worker-guide-scope-task"
     )
     assert materialize_body["task_id"] == "worker-guide-scope-task"
+    assert materialize_body["serializes_after"] == []
+    dependency_policy = merge_payloads["materialize_merge_queue_item"][
+        "dependency_policy"
+    ]
+    assert dependency_policy["dependency_scope"] == (
+        "same durable merge_queue_id only"
+    )
+    assert dependency_policy["cross_queue_dependency_allowed"] is False
+    assert dependency_policy["server_rejects_before_write"] is True
+    assert dependency_policy["correction_before_apply"]["supported"] is True
+    assert dependency_policy["correction_before_apply"]["fields"] == [
+        "serializes_after"
+    ]
     assert apply_body["task_id"] == "worker-guide-scope-task"
     assert materialize_body["route_token_ref"] != contract_refs["route_token_ref"]
     assert apply_body["route_token_ref"] != contract_refs["route_token_ref"]
