@@ -11781,6 +11781,95 @@ def _contract_runtime_resolve_append_scoped_child_route(
     return canonical_route_identity, diagnostic
 
 
+_MF_PARALLEL_DEFAULT_PROFILE_REQUIREMENTS = {
+    "profile_id": "codex-mf-sub",
+    "harness": "codex",
+}
+_MF_PARALLEL_DEFAULT_RETRY_POLICY = {
+    "attempt": 1,
+    "max_attempts": 2,
+}
+
+
+def _parallel_branch_allocate_require_dispatch_authority(
+    body: Mapping[str, Any],
+    *,
+    allow_missing_defaults: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Reject an allocation that cannot later produce policy-bound dispatch."""
+
+    profile_requirements_present = "profile_requirements" in body
+    retry_policy_present = "retry_policy" in body
+    profile_requirements = (
+        dict(body.get("profile_requirements") or {})
+        if isinstance(body.get("profile_requirements"), Mapping)
+        else {}
+    )
+    retry_policy = (
+        dict(body.get("retry_policy") or {})
+        if isinstance(body.get("retry_policy"), Mapping)
+        else {}
+    )
+    if allow_missing_defaults:
+        if not profile_requirements_present:
+            profile_requirements = dict(
+                _MF_PARALLEL_DEFAULT_PROFILE_REQUIREMENTS
+            )
+        if not retry_policy_present:
+            retry_policy = dict(_MF_PARALLEL_DEFAULT_RETRY_POLICY)
+    actual = {
+        "profile_requirements": profile_requirements,
+        "retry_policy": retry_policy,
+    }
+    expected = {
+        "profile_requirements": dict(
+            _MF_PARALLEL_DEFAULT_PROFILE_REQUIREMENTS
+        ),
+        "retry_policy": dict(_MF_PARALLEL_DEFAULT_RETRY_POLICY),
+    }
+    missing_fields = [
+        field for field, value in actual.items() if not value
+    ]
+    if missing_fields:
+        field = missing_fields[0]
+        raise GovernanceError(
+            "parallel_branch_allocate_dispatch_authority_incomplete",
+            (
+                "mf_parallel allocation requires non-empty profile and retry "
+                "authority before RuntimeContext persistence"
+            ),
+            422,
+            {
+                "field": field,
+                "expected": expected[field],
+                "actual": actual[field],
+                "missing_fields": missing_fields,
+                "field_mismatches": [
+                    {
+                        "field": item,
+                        "expected": expected[item],
+                        "actual": actual[item],
+                    }
+                    for item in missing_fields
+                ],
+                "guide": {
+                    "action": "parallel_branch_allocate_precheck",
+                    "body_source": "copy_safe_bodies",
+                    "submit_unchanged": True,
+                    "instruction": (
+                        "return to the current mf_parallel allocation guide, "
+                        "run allocation precheck, and submit its returned body "
+                        "unchanged"
+                    ),
+                },
+                "writes_performed": False,
+                "mutation_performed": False,
+                "retry_same_world_allowed": True,
+            },
+        )
+    return profile_requirements, retry_policy
+
+
 def _parallel_branch_allocate_precheck_copy_safe_body(
     conn,
     *,
@@ -11851,6 +11940,13 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
                 "writes_performed": False,
             },
         )
+
+    profile_requirements, retry_policy = (
+        _parallel_branch_allocate_require_dispatch_authority(
+            lane,
+            allow_missing_defaults=True,
+        )
+    )
 
     append_route_identity, append_route_diagnostic = (
         _contract_runtime_resolve_append_scoped_child_route(
@@ -12002,6 +12098,8 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
             "merge_queue_id": merge_queue_id,
             "owned_files": owned_files,
             "target_files": owned_files,
+            "profile_requirements": profile_requirements,
+            "retry_policy": retry_policy,
             "route_token_ref": route_token_ref,
             "route_identity": route_identity,
             "create_worktree": True,
@@ -14728,6 +14826,10 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     conn, active_epoch
                 ),
             }
+        if rev8_allocation_record:
+            _parallel_branch_allocate_require_dispatch_authority(
+                effective_body
+            )
         worktree_result: dict[str, Any] | None = None
         with sqlite_write_lock():
             if not create_worktree:
@@ -72111,22 +72213,23 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             "owned_files",
             "target_files",
         )
-    profile_requirements = (
-        dict(next_action.get("profile_requirements") or {})
-        if isinstance(next_action.get("profile_requirements"), Mapping)
-        else dict(dispatch_payload.get("profile_requirements") or {})
-        if isinstance(dispatch_payload.get("profile_requirements"), Mapping)
-        else {
-            "profile_id": "codex-mf-sub",
-            "harness": "codex",
-        }
+    profile_requirements = next(
+        (
+            dict(source.get("profile_requirements") or {})
+            for source in (next_action, dispatch_payload)
+            if isinstance(source.get("profile_requirements"), Mapping)
+            and source.get("profile_requirements")
+        ),
+        dict(_MF_PARALLEL_DEFAULT_PROFILE_REQUIREMENTS),
     )
-    retry_policy = (
-        dict(next_action.get("retry_policy") or {})
-        if isinstance(next_action.get("retry_policy"), Mapping)
-        else dict(dispatch_payload.get("retry_policy") or {})
-        if isinstance(dispatch_payload.get("retry_policy"), Mapping)
-        else {"attempt": 1, "max_attempts": 2}
+    retry_policy = next(
+        (
+            dict(source.get("retry_policy") or {})
+            for source in (next_action, dispatch_payload)
+            if isinstance(source.get("retry_policy"), Mapping)
+            and source.get("retry_policy")
+        ),
+        dict(_MF_PARALLEL_DEFAULT_RETRY_POLICY),
     )
     allocation_route_identity = {
         field: next_text(field, f"<{field}>")
@@ -73097,7 +73200,7 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         if dispatch_payload.get(field) in (None, "", [], {})
     ]
     if missing_fields:
-        return projected, {
+        blocked_projection = {
             "schema_version": (
                 "contract_runtime.mf_parallel_dispatch_copy_safe_projection.v2"
             ),
@@ -73110,7 +73213,52 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
                 "RuntimeContext+ContractRevision+observer_route_token_refs"
             ),
             "copy_safe_body_available": False,
+            "authorizes_write": False,
+            "same_world_authority_repair_available": False,
+            "historical_execution_resume_allowed": False,
+            "next_legal_action": (
+                "stop_current_product_world_and_repair_allocation_authority_"
+                "before_minting_a_fresh_world"
+            ),
         }
+        next_action.update(
+            {
+                "status": "blocked_incomplete_persisted_authority",
+                "copy_safe_dispatch_ready": False,
+                "block_reason": (
+                    "persisted allocation authority is incomplete; dispatch "
+                    "is non-authorizing"
+                ),
+                "blocked_next_action": blocked_projection[
+                    "next_legal_action"
+                ],
+                "current_line_blocker_policy": {
+                    "schema_version": (
+                        "mf_parallel.incomplete_persisted_allocation_"
+                        "authority.v1"
+                    ),
+                    "classification": (
+                        "blocked_incomplete_persisted_authority"
+                    ),
+                    "missing_fields": list(blocked_projection["missing_fields"]),
+                    "runtime_context_ids": list(
+                        blocked_projection["runtime_context_ids"]
+                    ),
+                    "authorizes_write": False,
+                    "same_world_authority_repair_available": False,
+                    "historical_execution_resume_allowed": False,
+                    "next_legal_action": blocked_projection[
+                        "next_legal_action"
+                    ],
+                },
+            }
+        )
+        guide.pop("writer_role_safe_copy_payload", None)
+        next_action.pop("writer_role_safe_copy_payload", None)
+        guide["next_legal_action"] = next_action
+        guide["dispatch_copy_safe_projection"] = blocked_projection
+        projected["runtime_guide"] = guide
+        return projected, blocked_projection
 
     if required_worker_count == 1:
         dispatch_payload = dict(dispatch_payloads[0])
@@ -73195,6 +73343,10 @@ def _runtime_next_action_from_guide(
     route_action_scope_blocked = bool(
         str(dispatch_copy_safe_projection.get("status") or "").strip()
         == "blocked_route_action_scope"
+    )
+    persisted_allocation_authority_blocked = bool(
+        str(dispatch_copy_safe_projection.get("status") or "").strip()
+        == "blocked_incomplete_persisted_authority"
     )
     execution = guide.get("execution") if isinstance(guide.get("execution"), Mapping) else {}
     evidence_kind = str(next_line.get("evidence_kind") or "")
@@ -73329,7 +73481,10 @@ def _runtime_next_action_from_guide(
         and str(contract.get("contract_id") or "").strip()
         == MF_PARALLEL_CONTRACT_ID
     ):
-        if next_line.get("copy_safe_dispatch_ready") is not True:
+        if (
+            next_line.get("copy_safe_dispatch_ready") is not True
+            and not persisted_allocation_authority_blocked
+        ):
             synthetic_guide = dict(guide)
             synthetic_guide["next_legal_action"] = {
                 **dict(next_line),
@@ -73374,6 +73529,7 @@ def _runtime_next_action_from_guide(
     bridge_guidance = (
         {}
         if route_action_scope_blocked
+        or persisted_allocation_authority_blocked
         else _contract_runtime_mf_sub_host_bridge_guidance(guide)
     )
     if bridge_guidance:

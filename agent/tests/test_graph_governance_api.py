@@ -14667,6 +14667,11 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
                     "base_commit": candidate_commit,
                     "target_head_commit": candidate_commit,
                     "merge_queue_id": "mq-nonappend-a",
+                    "profile_requirements": {
+                        "profile_id": "codex-mf-sub",
+                        "harness": "codex",
+                    },
+                    "retry_policy": {"attempt": 1, "max_attempts": 2},
                     "create_worktree": False,
                 },
             )
@@ -14700,6 +14705,47 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
         )
     conn.commit()
     before_total_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as empty_authority_rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "lanes": [
+                        {
+                            "task_id": "allocate-precheck-worker-a",
+                            "backlog_id": backlog_id,
+                            "contract_execution_id": contract_execution_id,
+                            "worker_id": "slot-a",
+                            "route_token_ref": "rtok-allocate-precheck-a",
+                            "owned_files": [row_files[0]],
+                            "profile_requirements": {},
+                            "retry_policy": {},
+                        },
+                        {
+                            "task_id": "allocate-precheck-worker-b",
+                            "backlog_id": backlog_id,
+                            "contract_execution_id": contract_execution_id,
+                            "worker_id": "slot-b",
+                            "route_token_ref": "rtok-allocate-precheck-b",
+                            "owned_files": [row_files[1]],
+                        },
+                    ],
+                },
+            )
+        )
+    assert empty_authority_rejected.value.code == (
+        "parallel_branch_allocate_dispatch_authority_incomplete"
+    )
+    assert empty_authority_rejected.value.details["field"] == (
+        "profile_requirements"
+    )
+    assert empty_authority_rejected.value.details["writes_performed"] is False
+    assert empty_authority_rejected.value.details["mutation_performed"] is False
+    assert conn.total_changes == before_total_changes
+
     response = server.handle_graph_governance_parallel_branch_allocate_precheck(
         _ctx(
             {"project_id": PID},
@@ -14781,6 +14827,9 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
         and body["allocation_precheck"]["submit_unchanged"] is True
         and body["allocation_precheck"]["cardinality_source"]
         == "observer_selected_standalone_cardinality"
+        and body["profile_requirements"]
+        == {"profile_id": "codex-mf-sub", "harness": "codex"}
+        and body["retry_policy"] == {"attempt": 1, "max_attempts": 2}
         and "fence_token" not in body
         and "session_token" not in body
         for body in bodies
@@ -75886,6 +75935,10 @@ def test_contract_runtime_dispatch_projects_canonical_allocation_payload():
             "target_head_commit": "target-dispatch-guide",
             "merge_queue_id": "mq-dispatch-guide",
             "owned_files": ["agent/governance/server.py"],
+            # An explicit empty projection is missing authority, not an
+            # instruction to erase the server's canonical defaults.
+            "profile_requirements": {},
+            "retry_policy": {},
         },
         "writer_role_safe_copy_payload": {
             "copy_payload": {
@@ -76036,6 +76089,62 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
             target_files=lane["owned_files"],
         )
         worktree_path = tmp_path / "workers" / lane["task_id"]
+        if lane is lanes[0]:
+            before_context_count = conn.execute(
+                "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+            ).fetchone()[0]
+            with pytest.raises(GovernanceError) as missing_authority:
+                server.handle_graph_governance_parallel_branch_allocate(
+                    _ctx_with_role(
+                        {"project_id": PID},
+                        "observer",
+                        method="POST",
+                        body={
+                            "backlog_id": backlog_id,
+                            "contract_execution_id": execution_id,
+                            "successor_contract_execution_id": execution_id,
+                            "current_contract_execution_id": execution_id,
+                            "parent_task_id": execution_id,
+                            "root_task_id": successor[
+                                "root_contract_execution_id"
+                            ],
+                            "task_id": lane["task_id"],
+                            "worker_id": lane["worker_id"],
+                            "agent_id": lane["agent_id"],
+                            "target_project_root": str(tmp_path),
+                            "workspace_root": str(tmp_path),
+                            "worktree_path": str(worktree_path),
+                            "base_commit": "a" * 40,
+                            "target_head_commit": "a" * 40,
+                            "merge_queue_id": lane["merge_queue_id"],
+                            "owned_files": lane["owned_files"],
+                            "profile_requirements": {},
+                            "retry_policy": {},
+                            "route_token_ref": lane["route_token_ref"],
+                            "issue_same_owner_session_token": False,
+                            "create_worktree": False,
+                        },
+                    )
+                )
+            assert missing_authority.value.code == (
+                "parallel_branch_allocate_dispatch_authority_incomplete"
+            )
+            assert missing_authority.value.details["field"] == (
+                "profile_requirements"
+            )
+            assert missing_authority.value.details["expected"] == {
+                "profile_id": "codex-mf-sub",
+                "harness": "codex",
+            }
+            assert missing_authority.value.details["actual"] == {}
+            assert missing_authority.value.details["writes_performed"] is False
+            assert missing_authority.value.details["mutation_performed"] is False
+            assert missing_authority.value.details["guide"][
+                "submit_unchanged"
+            ] is True
+            assert conn.execute(
+                "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+            ).fetchone()[0] == before_context_count
         status, allocated = server.handle_graph_governance_parallel_branch_allocate(
             _ctx_with_role(
                 {"project_id": PID},
@@ -76086,6 +76195,98 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
         ] is True
         assert lane_closure["full_row_file_union_required_per_lane"] is False
         allocations.append(allocated)
+
+    first_revision = allocations[0]["runtime_contract_revision"]
+    first_runtime_context_id = allocations[0]["context"][
+        "runtime_context_id"
+    ]
+    revision_row = conn.execute(
+        """
+        SELECT payload_json
+        FROM parallel_branch_runtime_contract_revisions
+        WHERE project_id = ? AND runtime_context_id = ? AND revision_id = ?
+        """,
+        (
+            PID,
+            first_runtime_context_id,
+            first_revision["revision_id"],
+        ),
+    ).fetchone()
+    original_payload_json = revision_row["payload_json"]
+    historical_payload = json.loads(original_payload_json)
+    historical_payload["profile_requirements"] = {}
+    historical_payload["retry_policy"] = {}
+    conn.execute(
+        """
+        UPDATE parallel_branch_runtime_contract_revisions
+           SET payload_json = ?
+         WHERE project_id = ? AND runtime_context_id = ? AND revision_id = ?
+        """,
+        (
+            json.dumps(historical_payload),
+            PID,
+            first_runtime_context_id,
+            first_revision["revision_id"],
+        ),
+    )
+    conn.commit()
+    historical_blocked = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="GET",
+        )
+    )
+    historical_guide = historical_blocked["runtime_guide"]
+    historical_projection = historical_guide[
+        "dispatch_copy_safe_projection"
+    ]
+    assert historical_projection["status"] == (
+        "blocked_incomplete_persisted_authority"
+    )
+    assert historical_projection["missing_fields"] == [
+        "worker[1].profile_requirements",
+        "worker[1].retry_policy",
+    ]
+    assert historical_projection["authorizes_write"] is False
+    assert (
+        historical_projection["same_world_authority_repair_available"]
+        is False
+    )
+    assert historical_projection["historical_execution_resume_allowed"] is False
+    blocker_policy = historical_guide["next_legal_action"][
+        "current_line_blocker_policy"
+    ]
+    assert blocker_policy["classification"] == (
+        "blocked_incomplete_persisted_authority"
+    )
+    assert blocker_policy["authorizes_write"] is False
+    assert (
+        blocker_policy["same_world_authority_repair_available"] is False
+    )
+    assert blocker_policy["historical_execution_resume_allowed"] is False
+    for surface in (
+        historical_guide,
+        historical_guide["next_legal_action"],
+        historical_blocked["next_legal_action"],
+    ):
+        assert "writer_role_safe_copy_payload" not in surface
+        assert "parallel_branch_allocate_submission" not in surface
+        assert "copy_safe_dispatch_payload" not in surface
+    conn.execute(
+        """
+        UPDATE parallel_branch_runtime_contract_revisions
+           SET payload_json = ?
+         WHERE project_id = ? AND runtime_context_id = ? AND revision_id = ?
+        """,
+        (
+            original_payload_json,
+            PID,
+            first_runtime_context_id,
+            first_revision["revision_id"],
+        ),
+    )
+    conn.commit()
 
     conn.execute(
         """
