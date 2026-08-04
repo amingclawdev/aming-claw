@@ -17568,6 +17568,299 @@ def test_acceptance_file_fence_argument_preserves_omitted_and_explicit_empty():
     )
 
 
+def _acceptance_fence_durable_counts(conn) -> dict[str, int]:
+    tables = (
+        "contract_runtime_executions",
+        "backlog_contract_chain_current",
+        "contract_chain_edges",
+        "parallel_branch_runtime_contexts",
+        "parallel_branch_merge_queue_items",
+        "parallel_branch_batch_runtimes",
+        "parallel_branch_batch_items",
+        "task_timeline_events",
+        "chain_events",
+    )
+    available = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    return {
+        table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in tables
+        if table in available
+    }
+
+
+def _assert_complete_acceptance_fence_zero_write(details):
+    for key in ("field", "expected", "actual", "guide", "source"):
+        assert key in details
+    assert details["public_safe"] is True
+    assert details["secret_safe"] is True
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    assert details["mutation_performed"] is False
+    for key in (
+        "contract_runtime_mutated",
+        "runtime_context_mutated",
+        "timeline_mutated",
+        "allocation_mutated",
+        "dispatch_mutated",
+        "merge_queue_mutated",
+        "merge_mutated",
+        "batch_runtime_mutated",
+        "batch_mutated",
+        "chain_mutated",
+    ):
+        assert details[key] is False
+    public = server._public_zero_write_error_response(
+        GovernanceError("acceptance_file_fence_closure_failed", "blocked", 422, details)
+    )
+    for key in (
+        "field",
+        "expected",
+        "actual",
+        "guide",
+        "source",
+        "zero_write_rejection",
+        "writes_performed",
+        "mutation_performed",
+        "retry_same_world_allowed",
+        "contract_runtime_mutated",
+        "runtime_context_mutated",
+        "timeline_mutated",
+        "allocation_mutated",
+        "dispatch_mutated",
+        "merge_queue_mutated",
+        "merge_mutated",
+        "batch_runtime_mutated",
+        "batch_mutated",
+        "chain_mutated",
+    ):
+        assert public[key] == details[key]
+    return public
+
+
+def test_mf_parallel_enter_invalid_acceptance_scope_is_public_complete_zero_write(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-PARALLEL-ENTER-ACCEPTANCE-ZERO-WRITE"
+    task_id = "parallel-enter-acceptance-zero-write"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-PARALLEL-FILES-AND-NODES",
+                        "required_scope": {
+                            "kind": "files_and_nodes",
+                            "files": ["agent/governance/server.py"],
+                            "node_ids": [],
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-parallel-acceptance-zero-write",
+    )
+    route_token_ref = "rtok-parallel-acceptance-zero-write"
+    service_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=service_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["mf_parallel_enter"],
+    )
+    body = {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "reason": "Reject malformed files_and_nodes acceptance before entry.",
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": route_token_ref,
+        "onboard_service_waiver": True,
+        "owned_files": ["agent/governance/server.py"],
+        "metadata": {"required_worker_count": 2},
+    }
+    server._contract_runtime_store(conn)
+    before_counts = _acceptance_fence_durable_counts(conn)
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_mf_parallel_enter(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    assert rejected.value.code == "acceptance_file_fence_closure_failed"
+    details = rejected.value.details
+    assert details["field"] == "acceptance_criteria[].required_scope"
+    assert details["actual"]["invalid_scope_criterion_ids"] == [
+        "AC-PARALLEL-FILES-AND-NODES"
+    ]
+    assert details["expected"]["required_scope_rules"]["files_and_nodes"] == (
+        "both non_empty files and non_empty node_ids"
+    )
+    assert details["retry_same_world_allowed"] is True
+    public = _assert_complete_acceptance_fence_zero_write(details)
+    assert _acceptance_fence_durable_counts(conn) == before_counts
+    assert conn.total_changes == before_changes
+    with pytest.raises(ContractRuntimeError):
+        server._contract_runtime_store(conn).get(service_execution_id)
+
+    from agent.governance import mcp_server as governance_mcp_server
+
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_http",
+        lambda *_args, **_kwargs: copy.deepcopy(public),
+    )
+    mcp_public = governance_mcp_server._dispatch_tool(
+        "mf_parallel_enter",
+        {"project_id": PID, **body},
+    )
+    for key in ("field", "expected", "actual", "guide", "source"):
+        assert mcp_public[key] == public[key]
+    assert mcp_public["zero_write_rejection"] is True
+    assert mcp_public["writes_performed"] is False
+
+
+def test_mf_batch_parallel_enter_outside_child_fence_is_public_complete_zero_write(
+    conn,
+):
+    prepared = _prepare_guide_bound_mf_batch_entry(
+        conn,
+        suffix="ACCEPTANCE-ZERO-WRITE",
+    )
+    invalid_child = prepared["child_ids"][0]
+    outside_file = "agent/governance/outside-child-fence.py"
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(
+                [
+                    {
+                        "id": "AC-BATCH-OUTSIDE-CHILD-FENCE",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": [outside_file],
+                        },
+                    }
+                ]
+            ),
+            invalid_child,
+        ),
+    )
+    conn.commit()
+    before_counts = _acceptance_fence_durable_counts(conn)
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_mf_batch_parallel_enter(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=prepared["action_input"],
+            )
+        )
+
+    assert rejected.value.code == "acceptance_file_fence_closure_failed"
+    details = rejected.value.details
+    assert details["field"] == "target_files+test_files file fence"
+    assert details["actual"]["missing_required_files"] == [outside_file]
+    assert details["actual"]["criterion_ids"] == [
+        "AC-BATCH-OUTSIDE-CHILD-FENCE"
+    ]
+    assert details["retry_same_world_allowed"] is True
+    _assert_complete_acceptance_fence_zero_write(details)
+    assert _acceptance_fence_durable_counts(conn) == before_counts
+    assert conn.total_changes == before_changes
+
+
+def test_acceptance_fence_reject_after_implementation_requires_fresh_rework(
+    conn,
+):
+    backlog_id = "AC-ACCEPTANCE-FENCE-POST-IMPLEMENTATION"
+    task_id = "acceptance-fence-post-implementation"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-POST-IMPLEMENTATION-OUTSIDE-FENCE",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": ["agent/governance/outside-fence.py"],
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="worker_implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="passed",
+        payload={"line_id": "worker_implementation"},
+    )
+    conn.commit()
+    before_counts = _acceptance_fence_durable_counts(conn)
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server._require_backlog_acceptance_file_fence_closure(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            allowed_files=["agent/governance/server.py"],
+        )
+
+    details = rejected.value.details
+    assert details["implementation_started"] is True
+    assert details["retry_same_world_allowed"] is False
+    assert details["guide"]["same_world_retry"] is False
+    assert details["guide"]["action"] == (
+        "create_fresh_or_rework_contract_with_revised_file_fence"
+    )
+    assert details["guide"][
+        "post_implementation_same_world_widening_forbidden"
+    ] is True
+    _assert_complete_acceptance_fence_zero_write(details)
+    assert _acceptance_fence_durable_counts(conn) == before_counts
+    assert conn.total_changes == before_changes
+
+
 def test_parallel_allocate_omitted_file_fence_derives_backlog_scope(
     conn,
     tmp_path,

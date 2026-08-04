@@ -1101,6 +1101,16 @@ def _public_zero_write_error_response(error: GovernanceError) -> dict[str, Any]:
         "writes_performed",
         "mutation_performed",
         "retry_same_world_allowed",
+        "contract_runtime_mutated",
+        "runtime_context_mutated",
+        "timeline_mutated",
+        "allocation_mutated",
+        "dispatch_mutated",
+        "merge_queue_mutated",
+        "merge_mutated",
+        "batch_runtime_mutated",
+        "batch_mutated",
+        "chain_mutated",
         "public_safe",
         "secret_safe",
         "raw_session_token_exposed",
@@ -96050,6 +96060,148 @@ def _backlog_acceptance_implementation_started(
     return False
 
 
+def _acceptance_file_fence_zero_write_diagnostics(
+    gate: Mapping[str, Any],
+    *,
+    source_gate: str,
+) -> dict[str, Any]:
+    """Add a public, copy-safe correction contract to one closed-scope reject.
+
+    The acceptance gate remains the decision authority.  This decorator only
+    makes its prewrite rejection actionable at the HTTP/MCP boundary and
+    explicitly distinguishes pre-implementation correction from a forbidden
+    in-place widening after implementation evidence exists.
+    """
+
+    diagnostic = dict(gate)
+    implementation_started = bool(diagnostic.get("implementation_started"))
+    retry_same_world_allowed = not implementation_started
+    if diagnostic.get("authority_mismatch"):
+        field = "acceptance_criteria"
+    elif diagnostic.get("missing_id_criterion_refs") or diagnostic.get(
+        "duplicate_criterion_ids"
+    ):
+        field = "acceptance_criteria[].id"
+    elif (
+        diagnostic.get("missing_scope_criterion_ids")
+        or diagnostic.get("invalid_scope_criterion_ids")
+        or diagnostic.get("unresolved_criterion_ids")
+    ):
+        field = "acceptance_criteria[].required_scope"
+    elif diagnostic.get("lane_files_outside_row_authority"):
+        field = "owned_files"
+    else:
+        field = "target_files+test_files file fence"
+
+    expected = {
+        "authority": "backlog-owned stable ids plus structured required_scope",
+        "scope_closed_by": "row-declared/minted file fence",
+        "required_scope_rules": {
+            "files": "non_empty files inside the fence",
+            "nodes": "non_empty node_ids",
+            "files_and_nodes": "both non_empty files and non_empty node_ids",
+        },
+        "worker_or_qa_scope_widening_allowed": False,
+        "post_implementation_in_place_widening_allowed": False,
+    }
+    actual_keys = (
+        "errors",
+        "criterion_ids",
+        "missing_id_criterion_refs",
+        "duplicate_criterion_ids",
+        "missing_scope_criterion_ids",
+        "invalid_scope_criterion_ids",
+        "unresolved_criterion_ids",
+        "required_file_union",
+        "required_node_union",
+        "missing_required_files",
+        "row_declared_files",
+        "minted_fence_files",
+        "lane_files_outside_row_authority",
+        "authority_mismatch",
+    )
+    actual = {
+        key: diagnostic.get(key)
+        for key in actual_keys
+        if key in diagnostic
+    }
+    actual["implementation_started"] = implementation_started
+    source = (
+        "agent.governance.server::"
+        f"{source_gate}.acceptance_file_fence_prewrite_gate"
+    )
+    remediation = dict(
+        diagnostic.get("copy_safe_observer_remediation") or {}
+    )
+    guide = {
+        **remediation,
+        "schema_version": (
+            "acceptance_file_fence_closure.host_correction_guide.v1"
+        ),
+        "implementation_started": implementation_started,
+        "same_world_retry": retry_same_world_allowed,
+        "update_authority": str(diagnostic.get("authority_source") or ""),
+        "backlog_id": str(diagnostic.get("backlog_id") or ""),
+        "required_revision": expected,
+        "next_steps": [
+            "revise observer-owned backlog acceptance/file-fence authority",
+            "call onboard_route_guide again",
+            (
+                "use a fresh/rework contract action_input"
+                if implementation_started
+                else "retry entry from the fresh same-world action_input"
+            ),
+        ],
+        "post_implementation_same_world_widening_forbidden": True,
+        "copy_rule": (
+            "Use the observer-owned backlog revision and fresh guide projection; "
+            "never widen from worker/QA claims or copy a raw token."
+        ),
+        "source": source,
+        "public_safe": True,
+        "secret_safe": True,
+    }
+    diagnostic.update(
+        {
+            "field": field,
+            "expected": expected,
+            "actual": actual,
+            "field_mismatches": [
+                {"field": field, "expected": expected, "actual": actual}
+            ],
+            "guide": guide,
+            "source": source,
+            "host_correctable": True,
+            "public_safe": True,
+            "secret_safe": True,
+            "fail_closed": True,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "retry_same_world_allowed": retry_same_world_allowed,
+            **{
+                key: False
+                for key in (
+                    "contract_runtime_mutated",
+                    "runtime_context_mutated",
+                    "timeline_mutated",
+                    "allocation_mutated",
+                    "dispatch_mutated",
+                    "merge_queue_mutated",
+                    "merge_mutated",
+                    "batch_runtime_mutated",
+                    "batch_mutated",
+                    "chain_mutated",
+                )
+            },
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        }
+    )
+    return diagnostic
+
+
 def _require_backlog_acceptance_file_fence_closure(
     conn,
     *,
@@ -96107,6 +96259,10 @@ def _require_backlog_acceptance_file_fence_closure(
         }
     )
     if not gate.get("accepted"):
+        gate = _acceptance_file_fence_zero_write_diagnostics(
+            gate,
+            source_gate="_require_backlog_acceptance_file_fence_closure",
+        )
         raise GovernanceError(
             "acceptance_file_fence_closure_failed",
             (
@@ -96196,6 +96352,12 @@ def _require_mf_parallel_rev8_lane_acceptance_authority(
         }
     )
     if not accepted:
+        gate = _acceptance_file_fence_zero_write_diagnostics(
+            gate,
+            source_gate=(
+                "_require_mf_parallel_rev8_lane_acceptance_authority"
+            ),
+        )
         raise GovernanceError(
             "acceptance_file_fence_closure_failed",
             (
@@ -108047,6 +108209,8 @@ def _mf_parallel_successor_runtime_enter(
     contract_execution_id: str = "",
     contract_revision: str = "",
     metadata: Mapping[str, Any] | None = None,
+    acceptance_scope_criteria: Sequence[Any],
+    acceptance_scope_closure: Mapping[str, Any],
 ) -> dict[str, Any]:
     runtime = _contract_runtime(conn)
     store = runtime.store
@@ -108071,58 +108235,10 @@ def _mf_parallel_successor_runtime_enter(
         body={},
         metadata=metadata if isinstance(metadata, Mapping) else {},
     )
-    acceptance_file_fence = _acceptance_file_fence_argument(
-        metadata if isinstance(metadata, Mapping) else {},
-        keys=("route_token_issue_target_files", "target_files", "owned_files"),
-    )
     try:
         existing_successor = store.get(successor_execution_id)
     except ContractRuntimeError:
         existing_successor = None
-    completed_lines = (
-        existing_successor.get("completed_lines")
-        if isinstance(existing_successor, Mapping)
-        and isinstance(existing_successor.get("completed_lines"), list)
-        else []
-    )
-    implementation_started = any(
-        str(line.get("line_id") or "") in {"worker_implementation", "worker_commit"}
-        for line in completed_lines
-        if isinstance(line, Mapping)
-    )
-    if not implementation_started:
-        implementation_started = _backlog_acceptance_implementation_started(
-            conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            task_id=task_id,
-        )
-    existing_metadata = (
-        existing_successor.get("metadata")
-        if isinstance(existing_successor, Mapping)
-        and isinstance(existing_successor.get("metadata"), Mapping)
-        else {}
-    )
-    if implementation_started:
-        reported_acceptance = existing_metadata.get("acceptance_criteria", [])
-    else:
-        reported_acceptance = (
-            metadata.get("acceptance_criteria")
-            if isinstance(metadata, Mapping) and "acceptance_criteria" in metadata
-            else _ACCEPTANCE_SCOPE_REPORT_UNSET
-        )
-    acceptance_scope_criteria, acceptance_scope_closure = (
-        _require_backlog_acceptance_file_fence_closure(
-            conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            task_id=task_id,
-            allowed_files=acceptance_file_fence,
-            actor_role=actor_role,
-            reported_acceptance_criteria=reported_acceptance,
-            implementation_started=implementation_started,
-        )
-    )
     if existing_successor is None:
         successor = runtime.start_execution(
             MF_PARALLEL_CONTRACT_ID,
@@ -133843,8 +133959,9 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                 ),
             }
         if onboard_service_waiver:
-            parent_record = _onboard_service_materialize_parent_record(
-                conn,
+            # Keep acceptance/file-fence rejection genuinely zero-write.  The
+            # service parent is materialized only after that shared gate passes.
+            parent_record = _onboard_service_parent_record(
                 project_id=project_id,
                 backlog_id=backlog_id,
                 route_token_ref=route_token_ref,
@@ -134036,6 +134153,75 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                 "legacy_onboard_contract_waived": True,
                 "onboard_service": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
             }
+        successor_execution_id = _mf_parallel_execution_id(
+            project_id,
+            backlog_id,
+            str(parent_record.get("contract_execution_id") or ""),
+            task_id,
+            contract_execution_id=contract_execution_id,
+        )
+        try:
+            existing_successor = _contract_runtime_store(conn).get(
+                successor_execution_id
+            )
+        except ContractRuntimeError:
+            existing_successor = None
+        completed_lines = (
+            existing_successor.get("completed_lines")
+            if isinstance(existing_successor, Mapping)
+            and isinstance(existing_successor.get("completed_lines"), list)
+            else []
+        )
+        implementation_started = any(
+            str(line.get("line_id") or "")
+            in {"worker_implementation", "worker_commit"}
+            for line in completed_lines
+            if isinstance(line, Mapping)
+        ) or _backlog_acceptance_implementation_started(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+        existing_metadata = (
+            existing_successor.get("metadata")
+            if isinstance(existing_successor, Mapping)
+            and isinstance(existing_successor.get("metadata"), Mapping)
+            else {}
+        )
+        reported_acceptance = (
+            existing_metadata.get("acceptance_criteria", [])
+            if implementation_started
+            else metadata.get("acceptance_criteria")
+            if "acceptance_criteria" in metadata
+            else _ACCEPTANCE_SCOPE_REPORT_UNSET
+        )
+        acceptance_scope_criteria, acceptance_scope_closure = (
+            _require_backlog_acceptance_file_fence_closure(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                allowed_files=_acceptance_file_fence_argument(
+                    metadata,
+                    keys=(
+                        "route_token_issue_target_files",
+                        "target_files",
+                        "owned_files",
+                    ),
+                ),
+                actor_role=derived_actor_role,
+                reported_acceptance_criteria=reported_acceptance,
+                implementation_started=implementation_started,
+            )
+        )
+        if onboard_service_waiver:
+            parent_record = _onboard_service_materialize_parent_record(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                route_token_ref=route_token_ref,
+            )
         successor_runtime = _mf_parallel_successor_runtime_enter(
             conn,
             project_id=project_id,
@@ -134048,6 +134234,8 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             contract_execution_id=contract_execution_id,
             contract_revision=contract_revision,
             metadata=metadata,
+            acceptance_scope_criteria=acceptance_scope_criteria,
+            acceptance_scope_closure=acceptance_scope_closure,
         )
         payload = {
             "schema_version": "mf_parallel_entered.v1",
