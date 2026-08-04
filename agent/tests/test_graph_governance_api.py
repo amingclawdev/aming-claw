@@ -76490,6 +76490,132 @@ def test_onboard_route_guide_missing_backlog_parallel_contracts_are_complete_zer
 
 
 @pytest.mark.parametrize("work_type", ["mf_parallel", "mf_batch_parallel"])
+def test_onboard_route_guide_unknown_backlog_parallel_contracts_are_complete_zero_write(
+    conn,
+    work_type,
+):
+    server._contract_runtime_store(conn)
+    parallel_branch_runtime.ensure_branch_runtime_schema(conn)
+    observer_session.ensure_schema(conn)
+    observer_route_context._ensure_ref_registry_schema(conn)
+    server._ensure_release_operator_head_queue_schema(conn)
+    task_timeline.ensure_schema(conn)
+    conn.commit()
+
+    durable_tables = (
+        "backlog_bugs",
+        "task_timeline_events",
+        "contract_runtime_executions",
+        "backlog_contract_chain_bindings",
+        "contract_chain_edges",
+        "backlog_contract_chain_current",
+        "parallel_branch_runtime_contexts",
+        "parallel_branch_runtime_contract_revisions",
+        "parallel_branch_runtime_access_audit",
+        "parallel_branch_merge_queue_items",
+        "parallel_branch_batch_runtimes",
+        "parallel_branch_batch_items",
+        "parallel_branch_integration_epochs",
+        "observer_route_token_refs",
+        "observer_sessions",
+        "observer_command_queue",
+        "release_operator_head_queue",
+        "release_operator_head_queue_events",
+    )
+
+    def durable_counts():
+        return {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in durable_tables
+        }
+
+    unknown_backlog_id = f"unknown-secret-backlog-{work_type}-must-not-echo"
+    synthetic_execution_id = server._onboard_service_execution_id(
+        PID, unknown_backlog_id
+    )
+    before_counts = durable_counts()
+    before_changes = conn.total_changes
+    secret_session_token = "unknown-backlog-secret-session-token"
+    secret_api_key = "unknown-backlog-secret-api-key"
+
+    with pytest.raises(ValidationError) as rejected:
+        server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": unknown_backlog_id,
+                    "role": "observer",
+                    "work_type": work_type,
+                    "session_token": secret_session_token,
+                    "metadata": {"api_key": secret_api_key},
+                },
+            )
+        )
+
+    assert rejected.value.code == "invalid_request"
+    details = rejected.value.details
+    assert details["error"] == "onboard_route_guide_backlog_not_found"
+    assert details["code"] == "onboard_route_guide_backlog_not_found"
+    assert details["field"] == "backlog_id"
+    assert details["expected"] == (
+        "existing_nonempty_backlog_id_or_bug_id_or_eligible_curated_queue_head"
+    )
+    assert details["actual"] == "nonexistent_nonempty_backlog_id"
+    assert details["source"] == (
+        "server.handle_project_onboard_route_guide."
+        "backlog_existence_prewrite_gate"
+    )
+    assert details["host_correctable"] is True
+    assert details["public_safe"] is True
+    assert details["secret_safe"] is True
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    assert details["work_type"] == work_type
+    guide = details["guide"]
+    assert guide["action"] == "create_or_select_backlog_then_retry"
+    assert guide["create_backlog"]["mcp_tool"] == "backlog_upsert"
+    assert guide["select_backlog"]["list_tool"] == "backlog_list"
+    assert guide["retry"]["interface"] == "onboard_route_guide"
+    serialized = json.dumps(rejected.value.to_dict(), sort_keys=True)
+    assert unknown_backlog_id not in serialized
+    assert secret_session_token not in serialized
+    assert secret_api_key not in serialized
+    assert durable_counts() == before_counts
+    assert conn.total_changes == before_changes
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE contract_execution_id = ?",
+        (synthetic_execution_id,),
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("work_type", ["mf_parallel", "mf_batch_parallel"])
+def test_onboard_route_guide_parallel_contracts_accept_existing_open_backlog(
+    conn,
+    work_type,
+):
+    backlog_id = f"AC-ONBOARD-{work_type.upper()}-EXISTING-OPEN"
+    _insert_release_queue_backlog(conn, backlog_id)
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": work_type,
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["backlog_id"] == backlog_id
+    assert result["selected_work_type"] == work_type
+
+
+@pytest.mark.parametrize("work_type", ["mf_parallel", "mf_batch_parallel"])
 def test_onboard_route_guide_parallel_contracts_still_select_eligible_queue_head(
     conn,
     monkeypatch,

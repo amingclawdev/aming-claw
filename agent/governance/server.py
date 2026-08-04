@@ -96760,16 +96760,19 @@ def _onboard_missing_backlog_error_details(
     project_id: str,
     role: str,
     work_type: str,
+    error_code: str = "onboard_route_guide_missing_backlog_id",
+    actual: str = "missing_or_empty",
+    source_gate: str = "missing_backlog_prewrite_gate",
 ) -> dict[str, Any]:
     backlog_start_guidance = _onboard_backlog_start_guidance(project_id)
     return {
-        "error": "onboard_route_guide_missing_backlog_id",
-        "code": "onboard_route_guide_missing_backlog_id",
+        "error": error_code,
+        "code": error_code,
         "field": "backlog_id",
         "expected": (
             "existing_nonempty_backlog_id_or_bug_id_or_eligible_curated_queue_head"
         ),
-        "actual": "missing_or_empty",
+        "actual": actual,
         "guide": {
             "schema_version": (
                 "onboard_route_guide.missing_backlog_correction.v1"
@@ -96800,10 +96803,7 @@ def _onboard_missing_backlog_error_details(
                 ),
             },
         },
-        "source": (
-            "server.handle_project_onboard_route_guide."
-            "missing_backlog_prewrite_gate"
-        ),
+        "source": f"server.handle_project_onboard_route_guide.{source_gate}",
         "host_correctable": True,
         "public_safe": True,
         "secret_safe": True,
@@ -96820,6 +96820,32 @@ def _onboard_missing_backlog_error_details(
             "backlog row and retry this implementation route with backlog_id."
         ),
     }
+
+
+def _require_onboard_route_guide_backlog_exists(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    role: str,
+    work_type: str,
+) -> None:
+    if conn.execute(
+        "SELECT 1 FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone() is not None:
+        return
+    raise ValidationError(
+        "onboard route guide requires an existing backlog_id or bug_id",
+        _onboard_missing_backlog_error_details(
+            project_id=project_id,
+            role=role,
+            work_type=work_type,
+            error_code="onboard_route_guide_backlog_not_found",
+            actual="nonexistent_nonempty_backlog_id",
+            source_gate="backlog_existence_prewrite_gate",
+        ),
+    )
 
 
 def _direct_fix_branch_service_takeover_guidance() -> dict[str, Any]:
@@ -136326,6 +136352,13 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
                         ),
                     },
                 )
+        _require_onboard_route_guide_backlog_exists(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            role=role,
+            work_type=work_type,
+        )
         response = _onboard_route_guide_service_response(
             conn,
             request_context=ctx,
