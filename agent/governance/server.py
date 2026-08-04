@@ -3063,6 +3063,11 @@ _OBSERVER_ROUTE_CONTEXT_ACTION_ALIASES = {
     "reconcile": ("graph_current_full_reconcile",),
 }
 
+_OBSERVER_ROUTE_CONTEXT_GRAPH_FIRST_ENTRY_ACTIONS = {
+    "mf_parallel_enter",
+    "mf_batch_parallel_enter",
+}
+
 
 def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:
     if not isinstance(allowed_actions, list):
@@ -3080,6 +3085,16 @@ def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:
         and "task_timeline_append" not in normalized
     ):
         expanded.append("task_timeline_append")
+        normalized.add("task_timeline_append")
+    if (
+        "onboard_route_guide" in normalized
+        and normalized.intersection(
+            _OBSERVER_ROUTE_CONTEXT_GRAPH_FIRST_ENTRY_ACTIONS
+        )
+        and "graph_query" not in normalized
+        and "graph_governance_query" not in normalized
+    ):
+        expanded.append("graph_query")
     return expanded
 
 
@@ -10419,6 +10434,21 @@ def _observer_graph_query_route_authority(
             {
                 "route_token_ref": route_token_ref,
                 "allowed_actions": sorted(normalized_actions),
+                "field": "allowed_actions",
+                "expected": ["graph_query"],
+                "actual": sorted(normalized_actions),
+                "guide": (
+                    "refresh onboard_route_guide and copy its "
+                    "observer_route_context_issue payload to issue a fresh "
+                    "same-scoped route ref whose allowed_actions include "
+                    "graph_query, then retry the unchanged graph_query request"
+                ),
+                "source": (
+                    "agent/governance/server.py::"
+                    "_observer_graph_query_route_authority"
+                ),
+                "zero_write_rejection": True,
+                "writes_performed": False,
             },
         )
 

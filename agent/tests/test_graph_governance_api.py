@@ -37801,6 +37801,203 @@ def test_observer_graph_query_route_ref_projects_scope_and_rejects_overrides(con
     assert incomplete_exc.value.code == "observer_graph_query_route_scope_incomplete"
 
 
+def test_observer_graph_query_forbidden_route_is_zero_write_and_host_correctable(
+    conn,
+):
+    backlog_id = "AC-OBSERVER-GRAPH-ROUTE-FORBIDDEN-DIAGNOSTIC"
+    task_id = "observer-graph-route-forbidden-task"
+    _activate_basic_graph(
+        conn,
+        "full-observer-graph-route-forbidden",
+        commit_sha="b" * 40,
+    )
+    route_token_ref = "rtok-observer-graph-route-forbidden"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["onboard_route_guide", "mf_parallel_enter"],
+    )
+    graph_query_trace.ensure_schema(conn)
+    before = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces"
+    ).fetchone()[0]
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_query(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "snapshot_id": "active",
+                    "tool": "query_schema",
+                    "query_source": "observer",
+                    "query_purpose": "gate_validation",
+                    "route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    assert rejected.value.code == "observer_graph_query_route_action_forbidden"
+    assert rejected.value.status == 403
+    assert rejected.value.details["field"] == "allowed_actions"
+    assert rejected.value.details["expected"] == ["graph_query"]
+    assert rejected.value.details["actual"] == [
+        "mf_parallel_enter",
+        "onboard_route_guide",
+    ]
+    correction_guide = rejected.value.details["guide"]
+    assert "refresh onboard_route_guide" in correction_guide
+    assert "observer_route_context_issue payload" in correction_guide
+    assert "fresh same-scoped route ref" in correction_guide
+    assert "renew" not in correction_guide
+    assert rejected.value.details["source"].endswith(
+        "::_observer_graph_query_route_authority"
+    )
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces"
+    ).fetchone()[0] == before
+
+
+def test_batch_onboard_entry_route_issue_can_execute_required_graph_first_query(
+    conn,
+):
+    suffix = "GRAPH-FIRST-ROUTE"
+    backlog_id = f"AC-MF-BATCH-GUIDE-{suffix}"
+    child_ids = [f"{backlog_id}-A", f"{backlog_id}-B"]
+    target_files = []
+    for index, row_id in enumerate([backlog_id, *child_ids]):
+        _insert_simple_mf_close_backlog(conn, row_id)
+        owned_file = f"agent/governance/batch-graph-first-{index}.py"
+        target_files.append(owned_file)
+        conn.execute(
+            """
+            UPDATE backlog_bugs
+               SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+             WHERE bug_id = ?
+            """,
+            (
+                json.dumps([owned_file]),
+                json.dumps(
+                    [
+                        {
+                            "id": f"AC-BATCH-GRAPH-FIRST-{index}",
+                            "required_scope": {
+                                "kind": "files",
+                                "files": [owned_file],
+                            },
+                        }
+                    ]
+                ),
+                row_id,
+            ),
+        )
+    conn.commit()
+    commit_sha = "e" * 40
+    snapshot_id = "full-batch-onboard-graph-first"
+    _activate_basic_graph(
+        conn,
+        snapshot_id,
+        commit_sha=commit_sha,
+    )
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-batch-onboard-graph-first",
+    )
+    service_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    issued = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "project_id": PID,
+                "caller_role": "observer",
+                "backlog_id": backlog_id,
+                "task_id": service_execution_id,
+                "target_files": target_files,
+                "allowed_actions": [
+                    "onboard_route_guide",
+                    "mf_batch_parallel_enter",
+                ],
+            },
+        )
+    )
+    assert issued["ok"] is True
+    assert "graph_query" in issued["route_token"]["allowed_actions"]
+
+    action_input, guide = _guide_bound_mf_batch_action_input(
+        backlog_id=backlog_id,
+        backlog_ids=child_ids,
+        reason="Use the guide-bound Batch route after graph-first preflight.",
+        observer_session_id=observer_session_id,
+        route_token_ref=issued["route_token_ref"],
+        task_id="batch-onboard-graph-first",
+        target_head_commit=commit_sha,
+        graph_snapshot_id=snapshot_id,
+        required_worker_count=1,
+    )
+    assert guide["next_legal_action"]["action"] == "mf_batch_parallel_enter"
+    assert guide["next_legal_action"]["action_input_ready"] is True
+    assert action_input["observer_route_token_ref"] == issued["route_token_ref"]
+
+    full_guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "backlog_ids": child_ids,
+                "role": "observer",
+                "work_type": "multi_backlog_parallel",
+                "reason": (
+                    "Project the exact Batch route issue input for graph-first."
+                ),
+                "task_id": "batch-onboard-graph-first",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": issued["route_token_ref"],
+                "target_head_commit": commit_sha,
+                "graph_snapshot_id": snapshot_id,
+                "metadata": {"required_worker_count": 1},
+                "response_view": "full",
+            },
+        )
+    )
+    projected_issue_input = full_guide["agent_onboard_guidance"][
+        "route_token_issue"
+    ]["observer_route_context_issue_payload"]
+    assert "graph_query" in projected_issue_input["allowed_actions"]
+    guide_issued = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=projected_issue_input,
+        )
+    )
+    assert guide_issued["ok"] is True
+
+    queried = server.handle_graph_governance_query(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "snapshot_id": "active",
+                "tool": "query_schema",
+                "query_source": "observer",
+                "query_purpose": "gate_validation",
+                "route_token_ref": guide_issued["route_token_ref"],
+            },
+        )
+    )
+    assert queried["ok"] is True
+    assert queried["graph_query_identity"]["backlog_id"] == backlog_id
+    assert queried["graph_query_identity"]["task_id"] == (
+        projected_issue_input["task_id"]
+    )
+
+
 def test_bounded_qa_session_can_query_graph_and_append_native_verification(
     conn,
     tmp_path,
@@ -75130,7 +75327,11 @@ def test_onboard_route_guide_compact_mf_parallel_projects_copy_safe_route_issue_
             "agent/governance/server.py",
             "agent/tests/test_graph_governance_api.py",
         ],
-        "allowed_actions": ["onboard_route_guide", "mf_parallel_enter"],
+        "allowed_actions": [
+            "onboard_route_guide",
+            "mf_parallel_enter",
+            "graph_query",
+        ],
         "evidence_refs": [
             f"onboard_service:{service_task_id}",
             f"backlog:{backlog_id}",
@@ -85752,6 +85953,37 @@ def test_observer_route_context_issue_expands_reconcile_to_current_full_only():
     )
 
     assert allowed == ["reconcile", "graph_current_full_reconcile"]
+
+
+@pytest.mark.parametrize(
+    "entry_action",
+    ["mf_parallel_enter", "mf_batch_parallel_enter"],
+)
+def test_observer_route_context_issue_adds_graph_query_for_graph_first_entry(
+    entry_action,
+):
+    allowed = server._observer_route_context_issue_allowed_actions(
+        ["onboard_route_guide", entry_action]
+    )
+
+    assert allowed == ["onboard_route_guide", entry_action, "graph_query"]
+
+
+@pytest.mark.parametrize(
+    "allowed_actions",
+    [
+        ["onboard_route_guide"],
+        ["mf_parallel_enter"],
+        ["mf_batch_parallel_enter"],
+        ["task_timeline_append"],
+    ],
+)
+def test_observer_route_context_issue_does_not_widen_unrelated_routes(
+    allowed_actions,
+):
+    assert server._observer_route_context_issue_allowed_actions(
+        allowed_actions
+    ) == allowed_actions
 
 
 @pytest.mark.parametrize("empty_dimension", ["backlog_id", "task_id"])
@@ -107962,6 +108194,11 @@ def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution
     conn,
 ):
     backlog_id = "AC-ROW-FIRST-GUIDE-MF-PARALLEL-ENTER"
+    _activate_basic_graph(
+        conn,
+        "full-row-first-guide-mf-parallel",
+        commit_sha="d" * 40,
+    )
     _insert_simple_mf_close_backlog(conn, backlog_id)
     conn.execute(
         """
@@ -108078,6 +108315,25 @@ def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution
         )
     )
     assert issued["ok"] is True
+    assert "graph_query" in issued["route_token"]["allowed_actions"]
+    queried = server.handle_graph_governance_query(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "snapshot_id": "active",
+                "tool": "query_schema",
+                "query_source": "observer",
+                "query_purpose": "gate_validation",
+                "route_token_ref": issued["route_token_ref"],
+            },
+        )
+    )
+    assert queried["ok"] is True
+    assert queried["graph_query_identity"]["backlog_id"] == backlog_id
+    assert queried["graph_query_identity"]["task_id"] == (
+        server._onboard_service_execution_id(PID, backlog_id)
+    )
 
     enter_body = {
         **projected_static_body,
