@@ -174,6 +174,22 @@ def test_mcp_stdio_serializes_qa_onboard_compact_selected_role_under_limit(
 
 
 def test_both_mcp_adapters_expose_compact_onboard_capsule_contract():
+    expected_work_types = [
+        "",
+        "capability_query",
+        "system_operation",
+        "continue_contract_chain",
+        "legacy_operator_recovery",
+        "operator_supervised_direct_main",
+        "direct_main",
+        "direct_fix",
+        "multi_backlog_parallel",
+        "mf_batch_parallel",
+        "parallel_worker",
+        "mf_parallel",
+        "qa_verification",
+        "rollback_or_recover_contract",
+    ]
     adapters = (
         (governance_mcp_server.TOOLS, governance_mcp_server._onboard_route_guide_body),
         (runtime_mcp_tools, runtime_mcp_tool_module._onboard_route_guide_body),
@@ -186,6 +202,10 @@ def test_both_mcp_adapters_expose_compact_onboard_capsule_contract():
         response_view = onboard_properties["response_view"]
         assert response_view["enum"] == ["compact", "full"]
         assert response_view["default"] == "compact"
+        assert onboard_properties["work_type"]["enum"] == expected_work_types
+        assert onboard_properties["requested_work_type"]["enum"] == (
+            expected_work_types
+        )
         assert {
             "backlog_ids",
             "task_id",
@@ -237,6 +257,12 @@ def test_both_mcp_adapters_expose_compact_onboard_capsule_contract():
         )
         section_schema = section["inputSchema"]
         assert section_schema["properties"]["sections"]["maxItems"] == 3
+        assert section_schema["properties"]["work_type"]["enum"] == (
+            expected_work_types
+        )
+        assert section_schema["properties"]["requested_work_type"]["enum"] == (
+            expected_work_types
+        )
         assert {
             "project_id",
             "guide_capsule_ref",

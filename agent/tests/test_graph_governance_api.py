@@ -75429,6 +75429,165 @@ def test_onboard_route_guide_no_backlog_capability_query_returns_start_guide(con
     assert result["next_legal_action"]["action"] == "select_or_create_backlog"
 
 
+@pytest.mark.parametrize(
+    ("response_view", "work_type_field"),
+    [
+        ("compact", "work_type"),
+        ("full", "requested_work_type"),
+    ],
+)
+def test_onboard_route_guide_unknown_work_type_is_secret_safe_zero_write_before_db_context(
+    conn,
+    monkeypatch,
+    response_view,
+    work_type_field,
+):
+    backlog_id = f"AC-ONBOARD-UNKNOWN-WORK-TYPE-{response_view.upper()}"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    server._contract_runtime_store(conn)
+    observer_session.ensure_schema(conn)
+    observer_route_context._ensure_ref_registry_schema(conn)
+    task_timeline.ensure_schema(conn)
+    conn.commit()
+
+    durable_tables = (
+        "contract_runtime_executions",
+        "backlog_contract_chain_current",
+        "backlog_contract_chain_bindings",
+        "contract_chain_edges",
+        "task_timeline_events",
+        "backlog_bugs",
+        "audit_index",
+        "observer_route_token_refs",
+        "observer_sessions",
+        "sessions",
+        "idempotency_keys",
+        "chain_events",
+        "event_outbox",
+    )
+
+    def durable_counts():
+        return {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in durable_tables
+        }
+
+    synthetic_execution_id = server._onboard_service_execution_id(
+        PID, backlog_id
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE contract_execution_id = ?",
+        (synthetic_execution_id,),
+    ).fetchone()[0] == 0
+    before_counts = durable_counts()
+    before_changes = conn.total_changes
+
+    class _ForbiddenDBContext:
+        def __init__(self, *_args, **_kwargs):
+            pytest.fail("unknown work_type reached DBContext")
+
+    monkeypatch.setattr(server, "DBContext", _ForbiddenDBContext)
+    secret_session_token = "super-secret-session-token-must-not-echo"
+    secret_api_key = "super-secret-api-key-must-not-echo"
+    with pytest.raises(ValidationError) as rejected:
+        server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    work_type_field: "multi_worker_parallel",
+                    "response_view": response_view,
+                    "session_token": secret_session_token,
+                    "metadata": {"api_key": secret_api_key},
+                },
+            )
+        )
+
+    assert rejected.value.code == "invalid_request"
+    details = rejected.value.details
+    assert details["field"] == "work_type"
+    assert details["expected"] == [
+        "capability_query",
+        "system_operation",
+        "continue_contract_chain",
+        "legacy_operator_recovery",
+        "operator_supervised_direct_main",
+        "direct_main",
+        "direct_fix",
+        "multi_backlog_parallel",
+        "mf_batch_parallel",
+        "parallel_worker",
+        "mf_parallel",
+        "qa_verification",
+        "rollback_or_recover_contract",
+    ]
+    assert details["actual"] == "multi_worker_parallel"
+    assert details["guide"]["canonical_and_alias_values"] == details["expected"]
+    assert details["guide"]["unknown_aliases_accepted"] is False
+    assert details["source"].endswith(".work_type_prewrite_gate")
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    serialized = json.dumps(rejected.value.to_dict(), sort_keys=True)
+    assert secret_session_token not in serialized
+    assert secret_api_key not in serialized
+    assert durable_counts() == before_counts
+    assert conn.total_changes == before_changes
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE contract_execution_id = ?",
+        (synthetic_execution_id,),
+    ).fetchone()[0] == 0
+
+
+def test_onboard_route_guide_unknown_unsafe_work_type_redacts_actual_before_db_context(
+    monkeypatch,
+):
+    class _ForbiddenDBContext:
+        def __init__(self, *_args, **_kwargs):
+            pytest.fail("unsafe unknown work_type reached DBContext")
+
+    monkeypatch.setattr(server, "DBContext", _ForbiddenDBContext)
+    unsafe_work_type = "multi_worker_parallel:secret-token-must-not-echo"
+    with pytest.raises(ValidationError) as rejected:
+        server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={"work_type": unsafe_work_type},
+            )
+        )
+
+    details = rejected.value.details
+    assert details["actual"] == "<redacted_invalid_work_type>"
+    assert unsafe_work_type not in json.dumps(rejected.value.to_dict())
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+
+
+def test_onboard_route_guide_empty_work_type_keeps_existing_default_semantics(conn):
+    backlog_id = "AC-ONBOARD-EMPTY-WORK-TYPE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "",
+                "response_view": "compact",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["selected_work_type"] == ""
+    assert result["next_legal_action"]["action"] == "no_runtime_action"
+
+
 def test_onboard_route_guide_no_backlog_compact_pushes_graph_first_preflight(conn):
     result = server.handle_project_onboard_route_guide(
         _ctx(

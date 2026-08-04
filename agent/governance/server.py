@@ -95263,7 +95263,71 @@ def _onboard_graph_first_preflight(
     }
 
 
+_ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUES = (
+    "capability_query",
+    "system_operation",
+    "continue_contract_chain",
+    "legacy_operator_recovery",
+    "operator_supervised_direct_main",
+    "direct_main",
+    "direct_fix",
+    "multi_backlog_parallel",
+    "mf_batch_parallel",
+    "parallel_worker",
+    "mf_parallel",
+    "qa_verification",
+    "rollback_or_recover_contract",
+)
+_ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUE_SET = frozenset(
+    _ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUES
+)
 _ONBOARD_NO_BACKLOG_WORK_TYPES = {"", "capability_query", "system_operation"}
+
+
+def _onboard_route_guide_safe_work_type_actual(work_type: str) -> str:
+    """Return only a bounded, non-secret work-type value for diagnostics."""
+
+    supplied = str(work_type or "").strip()
+    if (
+        supplied
+        and len(supplied) <= 128
+        and re.fullmatch(r"[A-Za-z0-9_.-]+", supplied)
+    ):
+        return supplied
+    return "<redacted_invalid_work_type>"
+
+
+def _require_onboard_route_guide_work_type(work_type: str) -> None:
+    """Reject a non-empty unknown work type before opening a DB context."""
+
+    supplied = str(work_type or "").strip()
+    if not supplied or supplied in _ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUE_SET:
+        return
+    expected = list(_ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUES)
+    raise ValidationError(
+        "onboard route guide work_type is not recognized",
+        {
+            "field": "work_type",
+            "expected": expected,
+            "actual": _onboard_route_guide_safe_work_type_actual(supplied),
+            "guide": {
+                "interface": "onboard_route_guide",
+                "correction": (
+                    "resubmit with one exact server-supported canonical work type "
+                    "or alias"
+                ),
+                "canonical_and_alias_values": expected,
+                "empty_work_type_behavior": "preserve_existing_discovery_or_default",
+                "unknown_aliases_accepted": False,
+            },
+            "source": (
+                "server.handle_project_onboard_route_guide."
+                "work_type_prewrite_gate"
+            ),
+            "zero_write_rejection": True,
+            "writes_performed": False,
+        },
+    )
 
 
 def _onboard_backlog_start_guidance(project_id: str) -> dict[str, Any]:
@@ -134698,6 +134762,7 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
         or _first_query_value(ctx.query, "requested_work_type")
         or ""
     ).strip()
+    _require_onboard_route_guide_work_type(work_type)
     backlog_id = str(
         body.get("backlog_id")
         or body.get("bug_id")

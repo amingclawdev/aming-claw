@@ -54,6 +54,23 @@ WORKER_MCP_HOST_ONLY_TOOLS = frozenset(
     }
 )
 
+_ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUES = [
+    "",
+    "capability_query",
+    "system_operation",
+    "continue_contract_chain",
+    "legacy_operator_recovery",
+    "operator_supervised_direct_main",
+    "direct_main",
+    "direct_fix",
+    "multi_backlog_parallel",
+    "mf_batch_parallel",
+    "parallel_worker",
+    "mf_parallel",
+    "qa_verification",
+    "rollback_or_recover_contract",
+]
+
 
 def _int_arg(args: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
     try:
@@ -2305,10 +2322,12 @@ TOOLS: list[dict] = [
                 },
                 "work_type": {
                     "type": "string",
+                    "enum": list(_ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUES),
                     "description": "Requested work type for onboard routing.",
                 },
                 "requested_work_type": {
                     "type": "string",
+                    "enum": list(_ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUES),
                     "description": "Alias for work_type.",
                 },
                 "route_token_ref": {
@@ -2388,8 +2407,14 @@ TOOLS: list[dict] = [
                 "bug_id": {"type": "string"},
                 "role": {"type": "string"},
                 "actor_role": {"type": "string"},
-                "work_type": {"type": "string"},
-                "requested_work_type": {"type": "string"},
+                "work_type": {
+                    "type": "string",
+                    "enum": list(_ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUES),
+                },
+                "requested_work_type": {
+                    "type": "string",
+                    "enum": list(_ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUES),
+                },
             },
             "required": ["project_id", "guide_capsule_ref", "sections"],
         },
