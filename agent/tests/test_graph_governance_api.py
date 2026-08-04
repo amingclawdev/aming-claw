@@ -8765,6 +8765,131 @@ def test_current_full_reconcile_accepts_route_bound_onboard_direct_main_without_
     )
 
 
+def test_current_full_reconcile_narrow_direct_main_route_reports_zero_write_correction(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-NARROW-DIRECT-MAIN-ROUTE"
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-current-full-narrow-direct-main-route",
+    )
+    route_token_ref = "rtok-current-full-narrow-direct-main-route"
+    record = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+    )
+    execution_id = record["contract_execution_id"]
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["graph_current_full_reconcile"],
+    )
+    zero_write_tables = (
+        "graph_snapshots",
+        "graph_current_full_reconcile_provenance",
+        "reconcile_run_metrics",
+        "task_timeline_events",
+    )
+    counts_before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    }
+    total_changes_before = conn.total_changes
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "activate": False,
+                    "semantic_enrich": False,
+                    "backlog_id": backlog_id,
+                    "task_id": execution_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                    "route_token": "raw-route-secret-must-not-echo",
+                },
+            )
+        )
+
+    assert exc.value.code == "current_full_reconcile_runtime_context_not_found"
+    details = exc.value.details
+    expected_actions = list(
+        server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+    )
+    assert details["field"] == "allowed_actions"
+    assert details["expected"] == expected_actions
+    assert details["actual"] == ["graph_current_full_reconcile"]
+    assert details["field_mismatches"] == [
+        {
+            "field": "allowed_actions",
+            "expected": expected_actions,
+            "actual": ["graph_current_full_reconcile"],
+        }
+    ]
+    assert details["required_companion_actions"] == [
+        "observer_direct_mutation_exception",
+        "graph_current_full_reconcile",
+    ]
+    assert details["guide"]["onboard"]["request"] == {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "role": "observer",
+        "work_type": "operator_supervised_direct_main",
+    }
+    issue_request = details["guide"]["issue"]["request"]
+    assert issue_request == {
+        "project_id": PID,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "target_files": ["agent/governance/server.py"],
+        "allowed_actions": expected_actions,
+        "evidence_refs": [
+            f"contract_runtime:{execution_id}",
+            f"backlog:{backlog_id}",
+        ],
+    }
+    assert details["guide"]["retry"] == {
+        "mcp_tool": "graph_current_full_reconcile",
+        "same_world": True,
+        "exact_request": True,
+        "replace_only_corrected_route_proof_fields": True,
+    }
+    assert details["source"] == (
+        "server._current_full_reconcile_runtime_context_scope."
+        "direct_main_full_round_prewrite_gate.v1"
+    )
+    assert details["fail_closed"] is True
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    assert details["mutation_performed"] is False
+    assert details["retry_same_world_allowed"] is True
+    assert details["public_safe"] is True
+    assert details["secret_safe"] is True
+    assert details["raw_route_token_required"] is False
+    assert details["raw_route_token_exposed"] is False
+    assert "raw-route-secret-must-not-echo" not in json.dumps(
+        details,
+        sort_keys=True,
+    )
+    assert calls == []
+    assert {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    } == counts_before
+    assert conn.total_changes == total_changes_before
+
+
 def test_current_full_reconcile_custom_run_ref_uses_graph_status_active_authority(
     conn,
     monkeypatch,

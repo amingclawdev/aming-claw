@@ -58676,7 +58676,7 @@ def _current_full_reconcile_runtime_context_scope(
                         str(trusted_merge.get("task_id") or "").strip(),
                     )
     if context is None:
-        route_bound_onboard_direct_main = bool(
+        route_bound_onboard_identity = bool(
             contract_record
             and str(contract_record.get("project_id") or "").strip()
             == project_id
@@ -58687,9 +58687,15 @@ def _current_full_reconcile_runtime_context_scope(
             and str(contract_record.get("contract_execution_id") or "").strip()
             == task_id
             and route_task_id == task_id
-            and route_bound_direct_main
+            and str(auth.get("role_source") or "").strip()
+            == "observer_session_route_token_ref"
+            and "graph_current_full_reconcile" in route_allowed_actions
             and not claimed_runtime_context_id
             and not merge_queue_id
+        )
+        route_bound_onboard_direct_main = bool(
+            route_bound_onboard_identity
+            and route_bound_direct_main
         )
         if route_bound_onboard_direct_main:
             # operator_supervised_direct_main intentionally has no branch
@@ -58698,6 +58704,115 @@ def _current_full_reconcile_runtime_context_scope(
             # runtime scope prevents direct-main provenance from masquerading
             # as parallel_branch_runtime_context evidence.
             return {}
+        if route_bound_onboard_identity:
+            expected_actions = list(
+                _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            )
+            actual_actions = sorted(route_allowed_actions)
+            source = (
+                "server._current_full_reconcile_runtime_context_scope."
+                "direct_main_full_round_prewrite_gate.v1"
+            )
+            issue_payload = {
+                "project_id": project_id,
+                "caller_role": "observer",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "target_files": (
+                    _onboard_contract_route_issue_target_files_from_record(
+                        contract_record
+                    )
+                ),
+                "allowed_actions": expected_actions,
+                "evidence_refs": [
+                    f"contract_runtime:{task_id}",
+                    f"backlog:{backlog_id}",
+                ],
+            }
+            raise GovernanceError(
+                "current_full_reconcile_runtime_context_not_found",
+                (
+                    "contextless onboard direct-main current-full reconcile "
+                    "requires the canonical full-round route actions"
+                ),
+                409,
+                {
+                    "schema_version": (
+                        "graph_current_full_reconcile."
+                        "direct_main_full_round_route_diagnostics.v1"
+                    ),
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "runtime_context_id_claimed": False,
+                    "merge_queue_id": "",
+                    "field": "allowed_actions",
+                    "expected": expected_actions,
+                    "actual": actual_actions,
+                    "field_mismatches": [
+                        {
+                            "field": "allowed_actions",
+                            "expected": expected_actions,
+                            "actual": actual_actions,
+                        }
+                    ],
+                    "required_companion_actions": [
+                        "observer_direct_mutation_exception",
+                        "graph_current_full_reconcile",
+                    ],
+                    "guide": {
+                        "schema_version": (
+                            "graph_current_full_reconcile."
+                            "direct_main_full_round_route_correction.v1"
+                        ),
+                        "action": (
+                            "issue_canonical_direct_main_full_round_route_then_"
+                            "retry_exact_current_full_call"
+                        ),
+                        "onboard": {
+                            "mcp_tool": "onboard_route_guide",
+                            "request": {
+                                "project_id": project_id,
+                                "backlog_id": backlog_id,
+                                "role": "observer",
+                                "work_type": (
+                                    "operator_supervised_direct_main"
+                                ),
+                            },
+                            "projection_path": (
+                                "agent_onboard_guidance.route_token_issue."
+                                "observer_route_context_issue_payload"
+                            ),
+                        },
+                        "issue": {
+                            "mcp_tool": "observer_route_context_issue",
+                            "request": issue_payload,
+                        },
+                        "retry": {
+                            "mcp_tool": "graph_current_full_reconcile",
+                            "same_world": True,
+                            "exact_request": True,
+                            "replace_only_corrected_route_proof_fields": True,
+                        },
+                        "instruction": (
+                            "issue the copy-safe canonical direct-main full-"
+                            "round route, then retry the exact current-full "
+                            "request with only the fresh route ref substituted"
+                        ),
+                    },
+                    "source": source,
+                    "host_correctable": True,
+                    "public_safe": True,
+                    "secret_safe": True,
+                    "fail_closed": True,
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                    "retry_same_world_allowed": True,
+                    "raw_route_token_required": False,
+                    "raw_route_token_exposed": False,
+                },
+            )
         if (
             claimed_runtime_context_id
             or (backlog_id and merge_queue_id)
