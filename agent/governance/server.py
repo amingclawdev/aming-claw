@@ -49797,6 +49797,59 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                     409,
                     {"fail_closed": True},
                 )
+            existing_item = existing_task_items[0] if existing_task_items else None
+            dependency_correction_requested = bool(
+                existing_item is not None
+                and not is_never_materialized_planned_merge_queue_item(existing_item)
+                and "serializes_after" in ctx.body
+                and tuple(existing_item.serializes_after)
+                != requested_serializes_after
+            )
+            if dependency_correction_requested:
+                canonical_target_ref = str(
+                    existing_item.target_ref or target_ref or "refs/heads/main"
+                ).strip()
+                canonical_root, canonical_root_source = (
+                    _parallel_branch_merge_repo_root_authority(
+                        conn,
+                        project_id=project_id,
+                        body={},
+                        merge_queue_id=merge_queue_id,
+                        queue_item_id=str(existing_item.queue_item_id or ""),
+                        task_id=task_id,
+                        target_ref=canonical_target_ref,
+                    )
+                )
+                server_current_target_head = _git_output(
+                    Path(canonical_root),
+                    ["rev-parse", "--verify", canonical_target_ref],
+                )
+                if not server_current_target_head:
+                    return 409, _parallel_merge_queue_serialization_correction_failure(
+                        field="current_target_head",
+                        expected={
+                            "authority": "server_owned_git_target_ref",
+                            "target_ref": canonical_target_ref,
+                            "target_root_source": canonical_root_source,
+                        },
+                        actual={
+                            "current_target_head": str(
+                                ctx.body.get("current_target_head") or ""
+                            ).strip(),
+                            "resolved_server_target_head": "",
+                        },
+                    )
+                claimed_current_target_head = str(
+                    ctx.body.get("current_target_head") or ""
+                ).strip()
+                if claimed_current_target_head != server_current_target_head:
+                    return 409, _parallel_merge_queue_serialization_correction_failure(
+                        field="current_target_head",
+                        expected=server_current_target_head,
+                        actual=claimed_current_target_head,
+                    )
+                current_target_head = server_current_target_head
+
             dependency_candidate_authority = None
             if (
                 postmerge_recovery_authority is None
@@ -49817,14 +49870,7 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                     )
                 )
             dependency_correction: dict[str, Any] = {}
-            existing_item = existing_task_items[0] if existing_task_items else None
-            if (
-                existing_item is not None
-                and not is_never_materialized_planned_merge_queue_item(existing_item)
-                and "serializes_after" in ctx.body
-                and tuple(existing_item.serializes_after)
-                != requested_serializes_after
-            ):
+            if dependency_correction_requested:
                 if (
                     str(existing_item.merge_commit or "").strip()
                     or str(existing_item.target_head_after_merge or "").strip()

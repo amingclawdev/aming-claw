@@ -27101,7 +27101,7 @@ def test_parallel_branch_merge_queue_materialize_records_contract_event_after_fi
 
 
 def test_parallel_branch_merge_queue_materialize_rejects_cross_queue_and_corrects_before_apply(
-    conn,
+    conn, tmp_path,
 ):
     root_task_id = "root-route-materialize-dependency-correction"
     child_task_id = f"{root_task_id}-planner"
@@ -27109,7 +27109,14 @@ def test_parallel_branch_merge_queue_materialize_rejects_cross_queue_and_correct
     cross_queue_dependency = "other-queue-models"
     queue_id = "mergeq-api-dependency-correction"
     foreign_queue_id = "mergeq-api-foreign-dependency"
-    target_head = "target-dependency-correction"
+    target_root = _git_repo(tmp_path)
+    target_head = subprocess.run(
+        ["git", "rev-parse", "refs/heads/main"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     issued = observer_route_context.issue_observer_write_route_context(
         project_id=PID,
         backlog_id=root_task_id,
@@ -27137,6 +27144,7 @@ def test_parallel_branch_merge_queue_materialize_rejects_cross_queue_and_correct
             base_commit="base-dependency-correction",
             head_commit="head-dependency-correction",
             target_head_commit=target_head,
+            target_project_root=str(target_root),
             checkpoint_id="ckpt-dependency-correction",
             replay_source="mf_sub_finish_gate",
         ),
@@ -27255,7 +27263,9 @@ def test_parallel_branch_merge_queue_materialize_rejects_cross_queue_and_correct
     assert correction_rejected["error"] == (
         "merge_queue_serializes_after_correction_authority_incomplete"
     )
-    assert correction_rejected["field"] == "validated_target_head"
+    assert correction_rejected["field"] == "current_target_head"
+    assert correction_rejected["expected"] == target_head
+    assert correction_rejected["actual"] == ""
     assert correction_rejected["writes_performed"] is False
     assert correction_rejected["retry_same_world_allowed"] is True
     persisted_after_rejection = next(
@@ -27264,6 +27274,69 @@ def test_parallel_branch_merge_queue_materialize_rejects_cross_queue_and_correct
         if item.task_id == child_task_id
     )
     assert persisted_after_rejection.serializes_after == (same_queue_dependency,)
+
+    timeline_count_before_forged = len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            task_id=root_task_id,
+            event_kind="merge_queue_item_materialize",
+            limit=10,
+        )
+    )
+    total_changes_before_forged = conn.total_changes
+    forged_target_head = "f" * 40
+    forged_status, forged_rejected = (
+        server.handle_graph_governance_parallel_branch_merge_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": child_task_id,
+                    "merge_queue_id": queue_id,
+                    "checkpoint_id": "ckpt-dependency-correction",
+                    "require_finish_gate": True,
+                    "route_token_ref": issued["route_token_ref"],
+                    "serializes_after": [],
+                    "current_target_head": forged_target_head,
+                    "validated_target_head": forged_target_head,
+                    "validation_attempt": 1,
+                },
+            )
+        )
+    )
+    assert forged_status == 409
+    assert forged_rejected["error"] == (
+        "merge_queue_serializes_after_correction_authority_incomplete"
+    )
+    assert forged_rejected["field"] == "current_target_head"
+    assert forged_rejected["expected"] == target_head
+    assert forged_rejected["actual"] == forged_target_head
+    assert forged_rejected["source"] == (
+        "parallel_branch_merge_queue_materialize."
+        "pre_apply_dependency_correction.v1"
+    )
+    assert forged_rejected["writes_performed"] is False
+    assert forged_rejected["mutation_performed"] is False
+    assert forged_rejected["timeline_event_recorded"] is False
+    assert conn.total_changes == total_changes_before_forged
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            task_id=root_task_id,
+            event_kind="merge_queue_item_materialize",
+            limit=10,
+        )
+    ) == timeline_count_before_forged
+    persisted_after_forged = next(
+        item
+        for item in list_merge_queue_items(conn, PID, queue_id)
+        if item.task_id == child_task_id
+    )
+    assert persisted_after_forged.serializes_after == (same_queue_dependency,)
+    assert persisted_after_forged.validation_attempt == 0
+    assert persisted_after_forged.current_target_head == target_head
 
     corrected = server.handle_graph_governance_parallel_branch_merge_queue(
         _ctx(
