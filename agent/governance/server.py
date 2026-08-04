@@ -68543,6 +68543,86 @@ def _verify_route_token_binding_server_side(
             pass
 
 
+def _route_token_mutation_gate_failure_details(
+    *,
+    action: str,
+    reason: str,
+    details: Mapping[str, Any] | None = None,
+    route_proof_supplied: bool = False,
+) -> dict[str, Any]:
+    """Complete protected-route failures with a public-safe retry contract."""
+
+    protected_action = str(action or "").strip()
+    field = "route_token_ref" if not route_proof_supplied else "route_proof"
+    expected = (
+        "active_server_registered_route_token_ref_authorizing_"
+        f"{protected_action}"
+    )
+    actual = (
+        "missing_or_empty"
+        if not route_proof_supplied
+        else "invalid_or_incomplete"
+    )
+    enriched = dict(details or {})
+    route_ref_error_code = str(
+        enriched.get("route_token_ref_error_code") or ""
+    ).strip()
+    if route_ref_error_code:
+        field = "route_token_ref"
+        actual = route_ref_error_code
+    source = "server._require_route_token_mutation_gate.prewrite_gate.v1"
+    guide = {
+        "schema_version": "protected_route_mutation_gate.correction.v1",
+        "action": "issue_or_renew_route_ref_then_retry_exact_action",
+        "issue": {
+            "mcp_tool": "observer_route_context_issue",
+            "required_allowed_actions": [protected_action],
+            "preserve_scope_fields": ["project_id", "backlog_id", "task_id"],
+        },
+        "renew": {
+            "mcp_tool": "observer_route_context_renew",
+            "allowed_only_for_same_or_narrower_scope": True,
+            "required_allowed_actions": [protected_action],
+        },
+        "retry": {
+            "mcp_tool": protected_action,
+            "protected_action": protected_action,
+            "same_world": True,
+            "exact_request": True,
+            "replace_only_corrected_route_proof_fields": True,
+        },
+        "instruction": (
+            "issue a server-registered route ref authorizing the exact protected "
+            f"action {protected_action}, or renew the same/narrower scope, then "
+            "retry the exact rejected request in this world"
+        ),
+    }
+    enriched.update(
+        {
+            "field": field,
+            "expected": expected,
+            "actual": actual,
+            "field_mismatches": [
+                {"field": field, "expected": expected, "actual": actual}
+            ],
+            "guide": guide,
+            "source": source,
+            "host_correctable": True,
+            "public_safe": True,
+            "secret_safe": True,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "retry_same_world_allowed": True,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        }
+    )
+    if reason:
+        enriched["reason"] = reason
+    return enriched
+
+
 def _require_route_token_mutation_gate(
     ctx: RequestContext,
     *,
@@ -68636,6 +68716,14 @@ def _require_route_token_mutation_gate(
                 route_token_ref=str(body.get("route_token_ref") or "").strip(),
             )
         )
+        details = _route_token_mutation_gate_failure_details(
+            action=action,
+            reason=str(exc),
+            details=details,
+            route_proof_supplied=bool(
+                body.get("route_token_ref") or body.get("route_token")
+            ),
+        )
         raise GovernanceError(
             "route_token_required",
             str(exc),
@@ -68657,6 +68745,14 @@ def _require_route_token_mutation_gate(
         details = route_token_required_failure_details(action=action, reason=str(exc))
         if "route_waiver requires timeline evidence" in str(exc):
             details.update(_route_waiver_timeline_evidence_diagnostic())
+        details = _route_token_mutation_gate_failure_details(
+            action=action,
+            reason=str(exc),
+            details=details,
+            route_proof_supplied=bool(
+                body.get("route_token_ref") or body.get("route_token")
+            ),
+        )
         raise GovernanceError(
             "route_token_required",
             str(exc),
@@ -120040,6 +120136,18 @@ def handle_task_timeline_append(ctx: RequestContext):
                         )
                     )
                     if source_block:
+                        source_block = _route_token_mutation_gate_failure_details(
+                            action="task_timeline_append",
+                            reason=str(
+                                source_block.get("reason")
+                                or "route_token required"
+                            ),
+                            details=source_block,
+                            route_proof_supplied=bool(
+                                ctx.body.get("route_token_ref")
+                                or ctx.body.get("route_token")
+                            ),
+                        )
                         raise GovernanceError(
                             "route_token_required",
                             str(source_block.get("reason") or "route_token required"),
@@ -120051,6 +120159,18 @@ def handle_task_timeline_append(ctx: RequestContext):
                             conn, project_id, ctx.body or {}, event
                         )
                         if waiver_block:
+                            waiver_block = _route_token_mutation_gate_failure_details(
+                                action="task_timeline_append",
+                                reason=str(
+                                    waiver_block.get("reason")
+                                    or "route_token required"
+                                ),
+                                details=waiver_block,
+                                route_proof_supplied=bool(
+                                    ctx.body.get("route_token_ref")
+                                    or ctx.body.get("route_token")
+                                ),
+                            )
                             raise GovernanceError(
                                 "route_token_required",
                                 str(

@@ -59292,6 +59292,149 @@ def _parentless_direct_main_pre_mutation_graph_scope(
     return parent_execution_id, route_token_ref, route_identity
 
 
+def test_task_timeline_append_missing_route_ref_is_complete_zero_write_then_corrects(
+    conn,
+):
+    backlog_id = "AC-TIMELINE-MISSING-ROUTE-DIAGNOSTIC"
+    parent_execution_id, route_token_ref, route_identity = (
+        _parentless_direct_main_pre_mutation_graph_scope(
+            conn,
+            backlog_id=backlog_id,
+        )
+    )
+    graph_trace_id = "gqt-20260804-a1b2c3d4e5"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        route_identity=route_identity,
+    )
+    missing_route_body = _canonical_parentless_direct_main_pre_mutation_body(
+        append_base={
+            "backlog_id": backlog_id,
+            "task_id": parent_execution_id,
+        },
+        route_identity=route_identity,
+        allowed_files=["agent/governance/server.py"],
+        graph_trace_ids=[graph_trace_id],
+        approval_ref="operator-timeline-route-diagnostic",
+    )
+    missing_route_body["session_token"] = (
+        "raw-session-secret-timeline-must-not-echo"
+    )
+    missing_route_body["payload"]["api_key"] = (
+        "raw-api-secret-timeline-must-not-echo"
+    )
+    zero_write_tables = (
+        "tasks",
+        "task_attempts",
+        "task_timeline_events",
+        "observer_route_token_refs",
+        "contract_runtime_executions",
+        "backlog_contract_chain_current",
+        "graph_query_traces",
+    )
+
+    def durable_counts():
+        return {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in zero_write_tables
+        }
+
+    before_counts = durable_counts()
+    before_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=missing_route_body,
+            )
+        )
+
+    assert rejected.value.code == "route_token_required"
+    details = rejected.value.details
+    expected = (
+        "active_server_registered_route_token_ref_authorizing_"
+        "task_timeline_append"
+    )
+    assert details["field"] == "route_token_ref"
+    assert details["expected"] == expected
+    assert details["actual"] == "missing_or_empty"
+    assert details["field_mismatches"] == [
+        {
+            "field": "route_token_ref",
+            "expected": expected,
+            "actual": "missing_or_empty",
+        }
+    ]
+    guide = details["guide"]
+    assert guide["issue"] == {
+        "mcp_tool": "observer_route_context_issue",
+        "required_allowed_actions": ["task_timeline_append"],
+        "preserve_scope_fields": ["project_id", "backlog_id", "task_id"],
+    }
+    assert guide["renew"] == {
+        "mcp_tool": "observer_route_context_renew",
+        "allowed_only_for_same_or_narrower_scope": True,
+        "required_allowed_actions": ["task_timeline_append"],
+    }
+    assert guide["retry"] == {
+        "mcp_tool": "task_timeline_append",
+        "protected_action": "task_timeline_append",
+        "same_world": True,
+        "exact_request": True,
+        "replace_only_corrected_route_proof_fields": True,
+    }
+    assert details["source"] == (
+        "server._require_route_token_mutation_gate.prewrite_gate.v1"
+    )
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    assert details["mutation_performed"] is False
+    assert details["retry_same_world_allowed"] is True
+    assert details["raw_route_token_required"] is False
+    assert details["raw_route_token_exposed"] is False
+    serialized = json.dumps(rejected.value.to_dict(), sort_keys=True)
+    assert "raw-session-secret-timeline-must-not-echo" not in serialized
+    assert "raw-api-secret-timeline-must-not-echo" not in serialized
+    assert durable_counts() == before_counts
+    assert conn.total_changes == before_changes
+
+    corrected_body = copy.deepcopy(missing_route_body)
+    corrected_body["route_token_ref"] = route_token_ref
+    accepted = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=corrected_body,
+        )
+    )
+
+    assert accepted["event_kind"] == "observer_direct_implementation_exception"
+    assert accepted["payload"]["observer_direct_pre_mutation_authority"][
+        "accepted"
+    ] is True
+    assert durable_counts()["task_timeline_events"] == (
+        before_counts["task_timeline_events"] + 2
+    )
+    accepted_event_kinds = {
+        row[0]
+        for row in conn.execute(
+            """SELECT event_kind FROM task_timeline_events
+               WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
+            (PID, backlog_id, parent_execution_id),
+        ).fetchall()
+    }
+    assert accepted_event_kinds == {
+        "observer_direct_implementation_exception",
+        "route_token_gate",
+    }
+
+
 def test_parentless_direct_main_pre_mutation_rejects_retained_wrong_task_traces(
     conn,
 ):
