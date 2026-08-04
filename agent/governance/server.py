@@ -118209,6 +118209,38 @@ _QA_TIMELINE_CLOSE_STATUSES = frozenset(
 _QA_TIMELINE_AUDIT_STATUSES = frozenset(
     {"failed", "fail", "rejected", "blocked"}
 )
+_QA_TIMELINE_VERIFICATION_EVENT_KINDS = frozenset(
+    {"independent_verification", "qa_verification"}
+)
+_QA_TIMELINE_VERIFICATION_PHASES = frozenset(
+    {"qa", "verification", "independent_verification", "postdeploy_qa"}
+)
+
+
+def _qa_timeline_input_rejection_details(
+    *,
+    field: str,
+    expected: list[str],
+    actual: str,
+    correction: str,
+) -> dict[str, Any]:
+    return {
+        "field": field,
+        "expected": expected,
+        "actual": actual,
+        "guide": (
+            f"Correct only `{field}` to `{correction}` in the same request and "
+            "world; preserve the authenticated bounded QA session, graph_trace_ids, "
+            "backlog_id, task_id, and commit_sha, then retry task_timeline_append. "
+            "Do not add route-token, bypass, waive, or implementation evidence."
+        ),
+        "source": (
+            "agent/governance/server.py::"
+            "_timeline_trusted_qa_verification_authority"
+        ),
+        "zero_write_rejection": True,
+        "writes_performed": False,
+    }
 
 
 def _contract_runtime_persisted_post_merge_review_context(
@@ -118537,26 +118569,55 @@ def _timeline_trusted_qa_verification_authority(
     event_kind = str(event.get("event_kind") or "").strip().lower().replace("-", "_")
     phase = str(event.get("phase") or "").strip().lower().replace("-", "_")
     status = str(body.get("status") or "").strip().lower()
-    if event_kind not in {"independent_verification", "qa_verification"}:
+    if event_kind not in _QA_TIMELINE_VERIFICATION_EVENT_KINDS:
         raise GovernanceError(
             "qa_session_action_not_allowed",
             "QA sessions may append only independent verification evidence",
             403,
-            {"event_kind": event_kind, "allowed_event_kinds": ["independent_verification", "qa_verification"]},
+            {
+                **_qa_timeline_input_rejection_details(
+                    field="event_kind",
+                    expected=sorted(_QA_TIMELINE_VERIFICATION_EVENT_KINDS),
+                    actual=event_kind,
+                    correction="independent_verification",
+                ),
+                "event_kind": event_kind,
+                "allowed_event_kinds": sorted(
+                    _QA_TIMELINE_VERIFICATION_EVENT_KINDS
+                ),
+            },
         )
-    if phase not in {"qa", "verification", "independent_verification"}:
+    if phase not in _QA_TIMELINE_VERIFICATION_PHASES:
         raise GovernanceError(
             "qa_session_action_not_allowed",
             "QA verification evidence requires a QA or verification phase",
             422,
-            {"phase": phase},
+            {
+                **_qa_timeline_input_rejection_details(
+                    field="phase",
+                    expected=sorted(_QA_TIMELINE_VERIFICATION_PHASES),
+                    actual=phase,
+                    correction="postdeploy_qa",
+                ),
+                "phase": phase,
+                "allowed_phases": sorted(_QA_TIMELINE_VERIFICATION_PHASES),
+            },
         )
     if status not in _QA_TIMELINE_CLOSE_STATUSES | _QA_TIMELINE_AUDIT_STATUSES:
+        allowed_statuses = sorted(
+            _QA_TIMELINE_CLOSE_STATUSES | _QA_TIMELINE_AUDIT_STATUSES
+        )
         raise GovernanceError(
             "qa_verification_status_invalid",
             "QA verification evidence requires an explicit passing or audit-only status",
             422,
             {
+                **_qa_timeline_input_rejection_details(
+                    field="status",
+                    expected=allowed_statuses,
+                    actual=status,
+                    correction="passed` for PASS or `failed",
+                ),
                 "status": status,
                 "passing_statuses": sorted(_QA_TIMELINE_CLOSE_STATUSES),
                 "audit_only_statuses": sorted(_QA_TIMELINE_AUDIT_STATUSES),
@@ -119319,26 +119380,25 @@ def handle_task_timeline_append(ctx: RequestContext):
                 409,
                 binding_mismatch,
             )
-        trusted_contract_runtime_actor_role = ""
+        trusted_contract_runtime_actor_role = (
+            _trusted_contract_runtime_actor_role_from_context(ctx, conn)
+        )
         contract_runtime_completed_projection_gate = {}
-        if task_timeline.is_protected_close_evidence(event):
-            trusted_contract_runtime_actor_role = (
-                _trusted_contract_runtime_actor_role_from_context(ctx, conn)
-            )
-            if (
-                trusted_contract_runtime_actor_role == "qa"
-                and not _body_has_route_token_input(ctx.body or {})
-                and not _body_has_route_waiver(ctx.body or {})
-            ):
-                trusted_qa_verification_authority = (
-                    _timeline_trusted_qa_verification_authority(
-                        ctx,
-                        conn,
-                        project_id=project_id,
-                        body=ctx.body or {},
-                        event=event,
-                    )
+        if (
+            trusted_contract_runtime_actor_role == "qa"
+            and not _body_has_route_token_input(ctx.body or {})
+            and not _body_has_route_waiver(ctx.body or {})
+        ):
+            trusted_qa_verification_authority = (
+                _timeline_trusted_qa_verification_authority(
+                    ctx,
+                    conn,
+                    project_id=project_id,
+                    body=ctx.body or {},
+                    event=event,
                 )
+            )
+        if task_timeline.is_protected_close_evidence(event):
             contract_runtime_completed_projection_gate = (
                 _contract_runtime_completed_line_projection_preflight_gate(
                     conn,

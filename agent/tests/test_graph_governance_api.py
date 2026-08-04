@@ -38108,7 +38108,7 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
             "task_id": task_id,
             "event_type": "qa.independent_verification",
             "event_kind": "independent_verification",
-            "phase": "verification",
+            "phase": "qa",
             "actor": "qa:curie",
             "status": "passed",
             "commit_sha": commit_sha,
@@ -38191,6 +38191,7 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
     assert authority["close_satisfying"] is True
     assert authority["audit_only"] is False
     assert proof["raw_qa_session_token_persisted"] is False
+    assert proof["phase"] == "qa"
     serialized_result = json.dumps(result, sort_keys=True)
     for sentinel in (
         "fake-qa-token-sentinel",
@@ -38266,6 +38267,7 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
 
     failed_body = json.loads(json.dumps(timeline_ctx.body))
     failed_body["status"] = "failed"
+    failed_body["phase"] = "postdeploy_qa"
     failed_ctx = _ctx_with_role(
         {"project_id": PID},
         "qa",
@@ -38279,6 +38281,7 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
     assert failed_authority["close_satisfying"] is False
     assert failed_authority["audit_only"] is True
     assert failed_authority["qa_session_proof"]["evidence_status"] == "failed"
+    assert failed_authority["qa_session_proof"]["phase"] == "postdeploy_qa"
     assert task_timeline._source_backed_qa_session_authority_valid(
         failed_authority,
         conn=conn,
@@ -38293,18 +38296,77 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
         "raw_qa_session_token_persisted"
     ] is False
 
+    def assert_qa_input_rejected_zero_write(
+        rejected_body,
+        *,
+        expected_code,
+        expected_field,
+        expected_actual,
+    ):
+        before_count = conn.execute(
+            """SELECT COUNT(*) FROM task_timeline_events
+               WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
+            (PID, backlog_id, task_id),
+        ).fetchone()[0]
+        rejected_ctx = _ctx_with_role(
+            {"project_id": PID},
+            "qa",
+            method="POST",
+            body=rejected_body,
+        )
+        rejected_ctx._session = dict(qa_ctx._session)
+        with pytest.raises(GovernanceError) as rejected:
+            server.handle_task_timeline_append(rejected_ctx)
+        assert rejected.value.code == expected_code
+        assert rejected.value.details["field"] == expected_field
+        assert expected_actual == rejected.value.details["actual"]
+        assert expected_actual not in rejected.value.details["expected"]
+        assert f"`{expected_field}`" in rejected.value.details["guide"]
+        assert "same request and world" in rejected.value.details["guide"]
+        assert rejected.value.details["source"].endswith(
+            "::_timeline_trusted_qa_verification_authority"
+        )
+        assert rejected.value.details["zero_write_rejection"] is True
+        assert rejected.value.details["writes_performed"] is False
+        after_count = conn.execute(
+            """SELECT COUNT(*) FROM task_timeline_events
+               WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
+            (PID, backlog_id, task_id),
+        ).fetchone()[0]
+        assert after_count == before_count
+
     unknown_body = json.loads(json.dumps(timeline_ctx.body))
     unknown_body["status"] = "unknown"
-    unknown_ctx = _ctx_with_role(
-        {"project_id": PID},
-        "qa",
-        method="POST",
-        body=unknown_body,
+    assert_qa_input_rejected_zero_write(
+        unknown_body,
+        expected_code="qa_verification_status_invalid",
+        expected_field="status",
+        expected_actual="unknown",
     )
-    unknown_ctx._session = dict(qa_ctx._session)
-    with pytest.raises(GovernanceError) as unknown:
-        server.handle_task_timeline_append(unknown_ctx)
-    assert unknown.value.code == "qa_verification_status_invalid"
+
+    invalid_phase_body = json.loads(json.dumps(timeline_ctx.body))
+    invalid_phase_body["phase"] = "deployment_qa"
+    assert_qa_input_rejected_zero_write(
+        invalid_phase_body,
+        expected_code="qa_session_action_not_allowed",
+        expected_field="phase",
+        expected_actual="deployment_qa",
+    )
+
+    implementation_body = json.loads(json.dumps(timeline_ctx.body))
+    implementation_body.update(
+        {
+            "event_type": "implementation.completed",
+            "event_kind": "implementation",
+            "phase": "implementation",
+        }
+    )
+    assert_qa_input_rejected_zero_write(
+        implementation_body,
+        expected_code="qa_session_action_not_allowed",
+        expected_field="event_kind",
+        expected_actual="implementation",
+    )
 
     event_count = conn.execute(
         """SELECT COUNT(*) FROM task_timeline_events
