@@ -7249,6 +7249,315 @@ def conn(tmp_path, monkeypatch):
     c.close()
 
 
+def _bind_batch_parent_before_child_backlog_creation(
+    conn: sqlite3.Connection,
+    *,
+    suffix: str,
+    parent_files: list[str],
+) -> tuple[str, list[str]]:
+    parent_id = f"AC-BATCH-TRIAGE-PARENT-{suffix}"
+    child_ids = [
+        f"AC-BATCH-TRIAGE-CHILD-A-{suffix}",
+        f"AC-BATCH-TRIAGE-CHILD-B-{suffix}",
+    ]
+    _insert_simple_mf_close_backlog(conn, parent_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = '[]', mf_type = 'chain_rescue',
+               status = 'OPEN'
+         WHERE bug_id = ?
+        """,
+        (json.dumps(parent_files), parent_id),
+    )
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id=f"obs-batch-triage-{suffix}",
+    )
+    route_token_ref = f"rtok-batch-triage-{suffix}"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=parent_id,
+        contract_execution_id=server._onboard_service_execution_id(
+            PID, parent_id
+        ),
+        route_token_ref=route_token_ref,
+        allowed_actions=["mf_batch_parallel_enter"],
+    )
+    conn.commit()
+    action_input, guide = _guide_bound_mf_batch_action_input(
+        backlog_id=parent_id,
+        backlog_ids=child_ids,
+        reason="Bind exact children before their backlog rows exist.",
+        observer_session_id=observer_session_id,
+        route_token_ref=route_token_ref,
+        task_id=f"batch-triage-{suffix}",
+        target_head_commit=f"head-{suffix}",
+        graph_snapshot_id=f"snapshot-{suffix}",
+    )
+    assert guide["next_legal_action"]["action_input_ready"] is True
+    assert action_input["backlog_ids"] == child_ids
+    return parent_id, child_ids
+
+
+def test_batch_child_backlog_triage_uses_exact_server_binding_and_parent_subset(
+    conn,
+):
+    parent_id, child_ids = _bind_batch_parent_before_child_backlog_creation(
+        conn,
+        suffix="ADMIT",
+        parent_files=["models.py", "planner.py"],
+    )
+    authority = server._backlog_upsert_verified_mf_batch_child_triage_authority(
+        conn,
+        project_id=PID,
+        child_backlog_id=child_ids[0],
+        child_scope_files=["models.py"],
+    )
+    assert authority["coordination_backlog_id"] == parent_id
+    assert authority["child_backlog_id"] == child_ids[0]
+    assert authority["server_owned"] is True
+    assert authority["db_verified"] is True
+    assert authority["parent_scope_overlap_admitted"] is True
+
+    result = server.handle_backlog_upsert(
+        _ctx(
+            {"project_id": PID, "bug_id": child_ids[0]},
+            method="POST",
+            body={
+                "title": "Models row-scoped implementation",
+                "status": "OPEN",
+                "target_files": ["models.py"],
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["action"] == "upserted"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backlog_bugs WHERE bug_id = ?",
+        (child_ids[0],),
+    ).fetchone()[0] == 1
+
+    # Caller-controlled identifiers or scopes outside the aggregate do not
+    # recreate the server-owned authority.
+    assert server._backlog_upsert_verified_mf_batch_child_triage_authority(
+        conn,
+        project_id=PID,
+        child_backlog_id="AC-NAME-LOOKS-LIKE-A-CHILD",
+        child_scope_files=["models.py"],
+    ) == {}
+    assert server._backlog_upsert_verified_mf_batch_child_triage_authority(
+        conn,
+        project_id=PID,
+        child_backlog_id=child_ids[1],
+        child_scope_files=["outside.py"],
+    ) == {}
+
+
+def test_batch_child_backlog_triage_keeps_sibling_conflict_zero_write(conn):
+    _, child_ids = _bind_batch_parent_before_child_backlog_creation(
+        conn,
+        suffix="SIBLING",
+        parent_files=["shared.py", "other.py"],
+    )
+    first = server.handle_backlog_upsert(
+        _ctx(
+            {"project_id": PID, "bug_id": child_ids[0]},
+            method="POST",
+            body={
+                "title": "Shared child implementation",
+                "status": "OPEN",
+                "target_files": ["shared.py"],
+            },
+        )
+    )
+    assert first["ok"] is True
+    before_changes = conn.total_changes
+    before_backlogs = conn.execute(
+        "SELECT COUNT(*) FROM backlog_bugs"
+    ).fetchone()[0]
+    before_timeline = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+
+    rejected = server.handle_backlog_upsert(
+        _ctx(
+            {"project_id": PID, "bug_id": child_ids[1]},
+            method="POST",
+            body={
+                "title": "Shared child implementation",
+                "status": "OPEN",
+                "target_files": ["shared.py"],
+            },
+        )
+    )
+
+    assert rejected[0] == 409
+    diagnostic = rejected[1]
+    assert diagnostic["error"] in {"duplicate", "triage_review_required"}
+    assert {
+        "field",
+        "expected",
+        "actual",
+        "guide",
+        "source",
+        "zero_write_rejection",
+        "writes_performed",
+    }.issubset(diagnostic)
+    assert diagnostic["zero_write_rejection"] is True
+    assert diagnostic["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert conn.execute("SELECT COUNT(*) FROM backlog_bugs").fetchone()[0] == (
+        before_backlogs
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == before_timeline
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backlog_bugs WHERE bug_id = ?",
+        (child_ids[1],),
+    ).fetchone()[0] == 0
+
+
+def test_onboard_projects_batch_contract_separately_from_chain_rescue_storage(
+    conn,
+):
+    parent_id, child_ids = _bind_batch_parent_before_child_backlog_creation(
+        conn,
+        suffix="STORAGE",
+        parent_files=["models.py", "planner.py"],
+    )
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": parent_id,
+                "backlog_ids": child_ids,
+                "role": "observer",
+                "work_type": "mf_batch_parallel",
+                "response_view": "compact",
+            },
+        )
+    )
+
+    projection = guide["work_type_storage_projection"]
+    assert projection["requested_work_type"] == "mf_batch_parallel"
+    assert projection["selected_work_type"] == "mf_batch_parallel"
+    assert projection["selected_contract"] == "mf_batch_parallel"
+    assert projection["storage_mf_type"] == "chain_rescue"
+    assert projection["storage_label_kind"] == (
+        "legacy_internal_storage_label"
+    )
+    assert projection["storage_label_is_contract_selection"] is False
+    assert projection["selected_contract_changed_by_storage_label"] is False
+
+
+def test_direct_main_guide_action_input_and_rejection_are_canonical_zero_write(
+    conn,
+):
+    backlog_id = "AC-DIRECT-MAIN-CANONICAL-ACTION-INPUT"
+    parent_execution_id, route_token_ref, route_identity = (
+        _parentless_direct_main_pre_mutation_graph_scope(
+            conn,
+            backlog_id=backlog_id,
+        )
+    )
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": route_token_ref,
+                "response_view": "compact",
+            },
+        )
+    )
+    action_input = guide["action_input"]
+    assert guide["action_input_path"] == "action_input"
+    assert action_input["event_type"] == (
+        "mf.observer_direct_implementation_exception"
+    )
+    assert action_input["event_kind"] == (
+        "observer_direct_implementation_exception"
+    )
+    assert action_input["phase"] == "pre_mutation"
+    assert action_input["status"] == "accepted"
+    assert action_input["decision"] == (
+        "operator_supervised_direct_main_approved"
+    )
+
+    graph_trace_id = "gqt-20260804-directmain-canonical"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        route_identity=route_identity,
+    )
+    invalid = _canonical_parentless_direct_main_pre_mutation_body(
+        append_base={
+            "backlog_id": backlog_id,
+            "task_id": parent_execution_id,
+            "route_token_ref": route_token_ref,
+        },
+        route_identity=route_identity,
+        allowed_files=["agent/governance/server.py"],
+        graph_trace_ids=[graph_trace_id],
+        approval_ref="operator-canonical-action-input",
+    )
+    invalid.pop("decision")
+    before_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=invalid,
+            )
+        )
+
+    assert rejected.value.code == (
+        "parentless_direct_main_pre_mutation_authority_incomplete"
+    )
+    diagnostic = rejected.value.details
+    assert {
+        "field",
+        "expected",
+        "actual",
+        "guide",
+        "source",
+        "zero_write_rejection",
+        "writes_performed",
+    }.issubset(diagnostic)
+    assert diagnostic["field"] == "decision"
+    assert diagnostic["expected"] == (
+        "operator_supervised_direct_main_approved"
+    )
+    assert diagnostic["actual"] == ""
+    assert diagnostic["guide"]["top_level_decision"] == (
+        "operator_supervised_direct_main_approved"
+    )
+    assert diagnostic["zero_write_rejection"] is True
+    assert diagnostic["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        event_kind="observer_direct_implementation_exception",
+        limit=10,
+    ) == []
+
+
 def test_health_and_version_check_distinguish_head_from_loaded_runtime(conn, tmp_path, monkeypatch):
     new_head = "bbbbbbb"
     new_head_full = "bbbbbbb000000000000000000000000000000000"

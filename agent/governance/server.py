@@ -99492,6 +99492,16 @@ def _onboard_route_guide_completed_next_action(
             "requires_graph_first": True,
             "graph_query_close_authority": graph_query_close_authority,
             "copy_safe_pre_mutation_event": pre_mutation_event,
+            "action_input": dict(
+                pre_mutation_event.get("arguments_template") or {}
+            ),
+            "action_input_source": (
+                "copy_safe_pre_mutation_event.arguments_template"
+            ),
+            "action_input_copy_safe": True,
+            "action_input_ready": bool(
+                pre_mutation_event.get("identity_ready")
+            ),
             "next_step": (
                 "run graph_query first, record observer_direct_mutation_exception "
                 "with DB-verified graph trace ids, then edit only approved files"
@@ -100937,6 +100947,46 @@ def _onboard_guide_capsule_validate_current_projection(
     }
 
 
+def _onboard_work_type_storage_projection(
+    *,
+    requested_work_type: str,
+    selected_work_type: str,
+    storage_mf_type: str,
+) -> dict[str, Any]:
+    """Separate observer-selected contract semantics from legacy row storage."""
+
+    requested = str(requested_work_type or "").strip()
+    selected = str(selected_work_type or requested).strip()
+    storage = str(storage_mf_type or "").strip()
+    canonical_contract = (
+        "mf_batch_parallel"
+        if selected in {"mf_batch_parallel", "multi_backlog_parallel"}
+        else selected
+    )
+    internal_storage_label = storage == "chain_rescue"
+    return {
+        "schema_version": "onboard_route_guide.work_type_storage_projection.v1",
+        "requested_work_type": requested,
+        "selected_work_type": selected,
+        "selected_contract": canonical_contract,
+        "storage_mf_type": storage,
+        "storage_label_kind": (
+            "legacy_internal_storage_label"
+            if internal_storage_label
+            else "contract_aligned_or_unspecified"
+        ),
+        "storage_label_is_contract_selection": False,
+        "selected_contract_changed_by_storage_label": False,
+        "chain_rescue_semantics": (
+            "MVP internal storage label; it does not replace or revise the "
+            "observer-selected mf_batch_parallel contract"
+            if internal_storage_label
+            else "not_applicable"
+        ),
+        "source": "onboard_route_guide_service+backlog_bugs.mf_type",
+    }
+
+
 def _onboard_route_guide_compact_service_response(
     *,
     project_id: str,
@@ -100953,6 +101003,18 @@ def _onboard_route_guide_compact_service_response(
 ) -> dict[str, Any]:
     selected_role = str(role or "").strip() or "observer"
     selected_work_type = str(work_type or "").strip()
+    record_metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    work_type_storage_projection = _onboard_work_type_storage_projection(
+        requested_work_type=selected_work_type,
+        selected_work_type=selected_work_type,
+        storage_mf_type=str(
+            record_metadata.get("backlog_storage_mf_type") or ""
+        ),
+    )
     selected_role_key = (
         "worker" if selected_role in {"mf_sub", "worker"} else selected_role
     )
@@ -101365,6 +101427,7 @@ def _onboard_route_guide_compact_service_response(
         "backlog_id": backlog_id,
         "selected_role": selected_role,
         "selected_work_type": selected_work_type,
+        "work_type_storage_projection": work_type_storage_projection,
         "selected_guidance_json_path": selected_guidance_path,
         "next_legal_action": next_action_projection,
         "graph_first_preflight": graph_first_preflight,
@@ -101842,7 +101905,7 @@ def _onboard_route_guide_service_response(
     backlog_row_status = _backlog_row_status_for_onboard_route(conn, backlog_id)
     backlog_policy_row = conn.execute(
         """
-        SELECT bypass_policy_json, chain_trigger_json
+        SELECT bypass_policy_json, chain_trigger_json, mf_type
           FROM backlog_bugs
          WHERE bug_id = ?
         """,
@@ -102005,6 +102068,9 @@ def _onboard_route_guide_service_response(
     record["metadata"] = {
         **dict(record.get("metadata") or {}),
         "route_token_issue_target_files": target_files,
+        "backlog_storage_mf_type": str(
+            _row_get(backlog_policy_row, "mf_type", "") or ""
+        ).strip(),
         "no_direct_fix": no_direct_fix,
         "direct_fix_policy_source": "system_direct_fix_retirement_policy",
         "historical_source_resume": historical_source_resume,
@@ -102355,6 +102421,19 @@ def _onboard_route_guide_service_response(
         },
         "selected_role": str(role or "").strip(),
         "selected_work_type": str(work_type or "").strip(),
+        "work_type_storage_projection": (
+            _onboard_work_type_storage_projection(
+                requested_work_type=str(work_type or "").strip(),
+                selected_work_type=str(work_type or "").strip(),
+                storage_mf_type=str(
+                    (record.get("metadata") or {}).get(
+                        "backlog_storage_mf_type"
+                    )
+                    if isinstance(record.get("metadata"), Mapping)
+                    else ""
+                ),
+            )
+        ),
         "legacy_onboard_contract_waived": True,
         "onboard_contract_required": False,
         "onboard_service_waiver": {
@@ -119889,6 +119968,35 @@ def handle_task_timeline_append(ctx: RequestContext):
                 )
             )
             if not direct_authority_gate.get("accepted"):
+                missing_requirement_ids = list(
+                    direct_authority_gate.get("missing_requirement_ids") or []
+                )
+                first_missing = (
+                    str(missing_requirement_ids[0])
+                    if missing_requirement_ids
+                    else "canonical_pre_mutation_event"
+                )
+                canonical_decision = (
+                    "operator_supervised_direct_main_approved"
+                )
+                actual_decision = str(
+                    ctx.body.get("decision") or ""
+                ).strip()
+                diagnostic_field = (
+                    "decision"
+                    if actual_decision != canonical_decision
+                    else first_missing
+                )
+                diagnostic_expected = (
+                    canonical_decision
+                    if diagnostic_field == "decision"
+                    else "present_in_canonical_pre_mutation_event"
+                )
+                diagnostic_actual = (
+                    actual_decision
+                    if diagnostic_field == "decision"
+                    else "missing_or_invalid"
+                )
                 raise GovernanceError(
                     "parentless_direct_main_pre_mutation_authority_incomplete",
                     (
@@ -119898,6 +120006,29 @@ def handle_task_timeline_append(ctx: RequestContext):
                     422,
                     {
                         **direct_authority_gate,
+                        "field": diagnostic_field,
+                        "expected": diagnostic_expected,
+                        "actual": diagnostic_actual,
+                        "guide": {
+                            "source": (
+                                "onboard_route_guide.next_legal_action."
+                                "action_input"
+                            ),
+                            "correction": (
+                                "refresh onboard_route_guide and submit its "
+                                "complete action_input after replacing only "
+                                "the documented placeholders"
+                            ),
+                            "top_level_decision": (
+                                "operator_supervised_direct_main_approved"
+                            ),
+                        },
+                        "source": (
+                            "server.handle_task_timeline_append."
+                            "parentless_direct_main_prewrite_gate"
+                        ),
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
                         "persisted_as_accepted": False,
                         "historical_backfill_allowed": False,
                     },
@@ -130609,6 +130740,173 @@ def handle_backlog_audit_archive(ctx: RequestContext):
         conn.close()
 
 
+def _backlog_triage_zero_write_rejection(
+    *,
+    error: str,
+    field: str,
+    expected: Any,
+    actual: Any,
+    decision: Mapping[str, Any],
+    supported_actions: Sequence[str],
+    recommended_action: str = "",
+) -> dict[str, Any]:
+    """Build one host-correctable triage rejection before any durable write."""
+
+    candidates = [
+        str(value or "").strip()
+        for value in decision.get("related_bug_ids") or []
+        if str(value or "").strip()
+    ]
+    result = {
+        "ok": False,
+        "error": str(error or "triage_review_required"),
+        "field": str(field or "triage_action"),
+        "expected": expected,
+        "actual": actual,
+        "guide": {
+            "interface": "backlog_upsert",
+            "correction": (
+                "resubmit the same bounded backlog row with one supported "
+                "triage_action and, when required, an exact candidate "
+                "triage_target_bug_id"
+            ),
+            "supported_actions": [str(value) for value in supported_actions],
+            "candidate_bug_ids": candidates,
+            "force_admit_required": False,
+            "bypass_or_waive_required": False,
+        },
+        "source": "server.handle_backlog_upsert.backlog_triage_prewrite_gate",
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "triage": dict(decision),
+        "supported_actions": [str(value) for value in supported_actions],
+    }
+    if recommended_action:
+        result["recommended_action"] = str(recommended_action)
+    return result
+
+
+def _backlog_upsert_verified_mf_batch_child_triage_authority(
+    conn,
+    *,
+    project_id: str,
+    child_backlog_id: str,
+    child_scope_files: Sequence[str],
+) -> dict[str, Any]:
+    """Resolve exact server-owned parent/child binding for backlog admission.
+
+    The child does not exist yet, so authority is found only by deterministic
+    onboard-service parent executions for existing OPEN coordination rows.  A
+    caller-supplied id, name prefix, mf_type, or lexical title never grants it.
+    """
+
+    child_id = str(child_backlog_id or "").strip()
+    child_scope = _runtime_context_public_file_values(child_scope_files)
+    if not child_id or not child_scope:
+        return {}
+    try:
+        parent_rows = conn.execute(
+            """
+            SELECT bug_id, target_files, test_files
+              FROM backlog_bugs
+             WHERE status = 'OPEN'
+             ORDER BY bug_id ASC
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+
+    matches: list[dict[str, Any]] = []
+    for parent_row in parent_rows:
+        parent_id = str(_row_get(parent_row, "bug_id", "") or "").strip()
+        if not parent_id or parent_id == child_id:
+            continue
+        try:
+            runtime_row = conn.execute(
+                """
+                SELECT record_json
+                  FROM contract_runtime_executions
+                 WHERE contract_execution_id = ?
+                   AND project_id = ?
+                   AND backlog_id = ?
+                """,
+                (
+                    _onboard_service_execution_id(project_id, parent_id),
+                    project_id,
+                    parent_id,
+                ),
+            ).fetchone()
+            if runtime_row is None:
+                continue
+            if not isinstance(runtime_row, (sqlite3.Row, dict, tuple)):
+                continue
+            record = _json_loads(
+                _row_get(runtime_row, "record_json", ""),
+                {},
+            )
+            if not isinstance(record, Mapping):
+                continue
+            binding = _onboard_service_verified_mf_batch_entry_binding(
+                record,
+                project_id=project_id,
+                backlog_id=parent_id,
+                require_ready=True,
+            )
+        except (GovernanceError, sqlite3.Error, TypeError, ValueError, KeyError):
+            continue
+        action_input = (
+            binding.get("action_input")
+            if isinstance(binding.get("action_input"), Mapping)
+            else {}
+        )
+        bound_children = [
+            str(value or "").strip()
+            for value in action_input.get("backlog_ids") or []
+            if str(value or "").strip()
+        ]
+        if (
+            str(action_input.get("project_id") or "").strip() != project_id
+            or str(action_input.get("backlog_id") or "").strip() != parent_id
+            or child_id not in bound_children
+        ):
+            continue
+        parent_scope = _runtime_context_public_file_values(
+            [
+                *_string_list_field(_row_get(parent_row, "target_files", "")),
+                *_string_list_field(_row_get(parent_row, "test_files", "")),
+            ]
+        )
+        if not set(child_scope).issubset(set(parent_scope)):
+            continue
+        authority = {
+            "schema_version": (
+                "backlog_triage.mf_batch_child_parent_scope_authority.v1"
+            ),
+            "source": (
+                "contract_runtime.onboard_service."
+                "mf_batch_parallel_entry_binding"
+            ),
+            "server_owned": True,
+            "db_verified": True,
+            "project_id": project_id,
+            "coordination_backlog_id": parent_id,
+            "child_backlog_id": child_id,
+            "bound_child_backlog_ids": bound_children,
+            "parent_contract_execution_id": str(
+                binding.get("parent_contract_execution_id") or ""
+            ),
+            "parent_scope_files": parent_scope,
+            "child_scope_files": child_scope,
+            "parent_scope_overlap_admitted": True,
+            "sibling_conflict_policy_unchanged": True,
+            "unrelated_duplicate_policy_unchanged": True,
+            "caller_authority_fields_accepted": False,
+        }
+        authority["authority_hash"] = stable_sha256(authority)
+        matches.append(authority)
+    return matches[0] if len(matches) == 1 else {}
+
+
 @route("POST", "/api/backlog/{project_id}/{bug_id}")
 def handle_backlog_upsert(ctx: RequestContext):
     """Upsert a backlog bug (ON CONFLICT DO UPDATE)."""
@@ -130640,23 +130938,36 @@ def handle_backlog_upsert(ctx: RequestContext):
                     "SELECT bug_id, title, target_files FROM backlog_bugs WHERE status='OPEN'"
                 ).fetchall()
                 open_rows = [dict(r) for r in open_rows]
-                decision = triage_backlog_insert(body | {"bug_id": bug_id}, open_rows)
+                verified_batch_child_authority = (
+                    _backlog_upsert_verified_mf_batch_child_triage_authority(
+                        conn,
+                        project_id=pid,
+                        child_backlog_id=bug_id,
+                        child_scope_files=[
+                            *_string_list_field(body.get("target_files")),
+                            *_string_list_field(body.get("test_files")),
+                        ],
+                    )
+                )
+                decision = triage_backlog_insert(
+                    body | {"bug_id": bug_id},
+                    open_rows,
+                    verified_batch_child_authority=(
+                        verified_batch_child_authority
+                    ),
+                )
                 action = decision.get("action", "admit")
-                try:
-                    audit_service.record(conn, pid, "backlog_triage", actor="ai_triage",
-                                         bug_id=bug_id, details=json.dumps(decision))
-                    conn.commit()
-                except Exception:
-                    pass
                 if explicit_triage_action:
                     allowed = {"admit", "merge_into", "supersede", "reject_dup"}
                     if explicit_triage_action not in allowed:
-                        return 400, {
-                            "ok": False,
-                            "error": "invalid_triage_action",
-                            "allowed_actions": sorted(allowed),
-                            "triage": decision,
-                        }
+                        return 400, _backlog_triage_zero_write_rejection(
+                            error="invalid_triage_action",
+                            field="triage_action",
+                            expected=sorted(allowed),
+                            actual=explicit_triage_action,
+                            decision=decision,
+                            supported_actions=sorted(allowed),
+                        )
                     if explicit_triage_action == "admit":
                         decision = {"action": "admit", "reason": "observer admitted", "related_bug_ids": [], "confidence": 1.0}
                         action = "admit"
@@ -130664,13 +130975,15 @@ def handle_backlog_upsert(ctx: RequestContext):
                         related = list(decision.get("related_bug_ids") or [])
                         target_id = explicit_target_id or (related[0] if related else "")
                         if not target_id or target_id not in related:
-                            return 409, {
-                                "ok": False,
-                                "error": "triage_target_not_candidate",
-                                "triage": decision,
-                                "triage_action": explicit_triage_action,
-                                "triage_target_bug_id": target_id,
-                            }
+                            return 409, _backlog_triage_zero_write_rejection(
+                                error="triage_target_not_candidate",
+                                field="triage_target_bug_id",
+                                expected=related,
+                                actual=target_id,
+                                decision=decision,
+                                supported_actions=sorted(allowed),
+                                recommended_action=explicit_triage_action,
+                            )
                         if explicit_triage_action == "merge_into":
                             conn.execute(
                                 "UPDATE backlog_bugs SET details_md = details_md || ? , updated_at = ? WHERE bug_id = ?",
@@ -130707,25 +131020,56 @@ def handle_backlog_upsert(ctx: RequestContext):
                         decision["related_bug_ids"] = [target_id]
                         action = "supersede"
                 if action == "reject_dup":
-                    return 409, {"ok": False, "error": "duplicate", "duplicate_of": decision["related_bug_ids"],
-                                 "reason": decision["reason"], "triage": decision}
+                    rejected = _backlog_triage_zero_write_rejection(
+                        error="duplicate",
+                        field="triage_action",
+                        expected=["reject_dup"],
+                        actual="",
+                        decision=decision,
+                        supported_actions=["reject_dup"],
+                        recommended_action="reject_dup",
+                    )
+                    rejected["duplicate_of"] = list(
+                        decision.get("related_bug_ids") or []
+                    )
+                    rejected["reason"] = str(decision.get("reason") or "")
+                    return 409, rejected
                 if action == "supersede":
                     if explicit_triage_action != "supersede":
-                        return 409, {
-                            "ok": False,
-                            "error": "triage_review_required",
-                            "recommended_action": "supersede",
-                            "supported_actions": ["admit", "supersede", "reject_dup"],
-                            "triage": decision,
-                        }
+                        return 409, _backlog_triage_zero_write_rejection(
+                            error="triage_review_required",
+                            field="triage_action",
+                            expected=["admit", "supersede", "reject_dup"],
+                            actual=explicit_triage_action,
+                            decision=decision,
+                            supported_actions=["admit", "supersede", "reject_dup"],
+                            recommended_action="supersede",
+                        )
                 if action == "merge_into" and decision["related_bug_ids"]:
-                    return 409, {
-                        "ok": False,
-                        "error": "triage_review_required",
-                        "recommended_action": "merge_into",
-                        "supported_actions": ["admit", "merge_into", "reject_dup"],
-                        "triage": decision,
-                    }
+                    return 409, _backlog_triage_zero_write_rejection(
+                        error="triage_review_required",
+                        field="triage_action",
+                        expected=["admit", "merge_into", "reject_dup"],
+                        actual=explicit_triage_action,
+                        decision=decision,
+                        supported_actions=["admit", "merge_into", "reject_dup"],
+                        recommended_action="merge_into",
+                    )
+                # Rejected triage is strictly zero-write.  Audit only an
+                # admitted/explicitly resolved decision after every review
+                # return above has been evaluated.
+                try:
+                    audit_service.record(
+                        conn,
+                        pid,
+                        "backlog_triage",
+                        actor="ai_triage",
+                        bug_id=bug_id,
+                        details=json.dumps(decision),
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
             except Exception:
                 try:
                     audit_service.record(conn, pid, "backlog_triage_failed", actor="ai_triage", bug_id=bug_id)

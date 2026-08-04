@@ -52,13 +52,26 @@ def test_admit_when_no_overlap():
         assert handle_backlog_upsert(_ctx(title="Different"))["ok"] is True
 
 def test_supersede_requires_observer_decision():
-    with patch("governance.server.get_connection", return_value=_conn([{"bug_id": "OLD-2", "title": "Diff", "target_files": '["a.py"]'}])):
+    connection = _conn([{"bug_id": "OLD-2", "title": "Diff", "target_files": '["a.py"]'}])
+    with patch("governance.server.get_connection", return_value=connection), patch(
+        "governance.server.audit_service.record"
+    ) as audit_record:
         from governance.server import handle_backlog_upsert
         r = handle_backlog_upsert(_ctx(title="New", target_files=["a.py"]))
         assert isinstance(r, tuple) and r[0] == 409
         assert r[1]["error"] == "triage_review_required"
         assert r[1]["recommended_action"] == "supersede"
         assert r[1]["triage"]["evidence"]["candidates"][0]["bug_id"] == "OLD-2"
+        assert r[1]["field"] == "triage_action"
+        assert r[1]["expected"] == ["admit", "supersede", "reject_dup"]
+        assert r[1]["actual"] == ""
+        assert r[1]["guide"]["force_admit_required"] is False
+        assert r[1]["guide"]["bypass_or_waive_required"] is False
+        assert r[1]["source"].endswith("backlog_triage_prewrite_gate")
+        assert r[1]["zero_write_rejection"] is True
+        assert r[1]["writes_performed"] is False
+        audit_record.assert_not_called()
+        connection.commit.assert_not_called()
 
 def test_confirmed_supersede_marks_old_row_superseded_not_fixed():
     conn = _conn([{"bug_id": "OLD-2", "title": "Diff", "target_files": '["a.py"]'}])
@@ -77,19 +90,102 @@ def test_confirmed_supersede_marks_old_row_superseded_not_fixed():
         assert not any("status='FIXED'" in sql for sql in update_sql)
 
 def test_reject_dup_returns_409():
-    with patch("governance.server.get_connection", return_value=_conn([{"bug_id": "OLD-1", "title": "Dup Bug", "target_files": "[]"}])):
+    connection = _conn([{"bug_id": "OLD-1", "title": "Dup Bug", "target_files": "[]"}])
+    with patch("governance.server.get_connection", return_value=connection), patch(
+        "governance.server.audit_service.record"
+    ) as audit_record:
         from governance.server import handle_backlog_upsert
         r = handle_backlog_upsert(_ctx(title="Dup Bug"))
         assert isinstance(r, tuple) and r[0] == 409 and "duplicate_of" in r[1]
+        assert r[1]["field"] == "triage_action"
+        assert r[1]["zero_write_rejection"] is True
+        assert r[1]["writes_performed"] is False
+        audit_record.assert_not_called()
+        connection.commit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("body", "error", "field"),
+    [
+        (
+            {
+                "title": "New",
+                "target_files": ["a.py"],
+                "triage_action": "force_admit",
+            },
+            "invalid_triage_action",
+            "triage_action",
+        ),
+        (
+            {
+                "title": "New",
+                "target_files": ["a.py"],
+                "triage_action": "supersede",
+                "triage_target_bug_id": "NOT-A-CANDIDATE",
+            },
+            "triage_target_not_candidate",
+            "triage_target_bug_id",
+        ),
+    ],
+)
+def test_triage_input_rejections_share_host_correctable_zero_write_diagnostic(
+    body,
+    error,
+    field,
+):
+    connection = _conn(
+        [{"bug_id": "OLD-2", "title": "Diff", "target_files": '["a.py"]'}]
+    )
+    with patch("governance.server.get_connection", return_value=connection), patch(
+        "governance.server.audit_service.record"
+    ) as audit_record:
+        from governance.server import handle_backlog_upsert
+
+        response = handle_backlog_upsert(_ctx(**body))
+
+        assert response[0] in {400, 409}
+        diagnostic = response[1]
+        assert diagnostic["error"] == error
+        assert diagnostic["field"] == field
+        assert {
+            "expected",
+            "actual",
+            "guide",
+            "source",
+            "zero_write_rejection",
+            "writes_performed",
+        }.issubset(diagnostic)
+        assert diagnostic["zero_write_rejection"] is True
+        assert diagnostic["writes_performed"] is False
+        assert diagnostic["guide"]["force_admit_required"] is False
+        assert diagnostic["guide"]["bypass_or_waive_required"] is False
+        audit_record.assert_not_called()
+        connection.commit.assert_not_called()
 
 def test_merge_into_requires_observer_decision():
-    with patch("governance.server.get_connection", return_value=_conn([{"bug_id": "OLD-3", "title": "O", "target_files": '["a.py","b.py","c.py"]'}])):
+    connection = _conn([{"bug_id": "OLD-3", "title": "O", "target_files": '["a.py","b.py","c.py"]'}])
+    with patch("governance.server.get_connection", return_value=connection), patch(
+        "governance.server.audit_service.record"
+    ) as audit_record:
         from governance.server import handle_backlog_upsert
         r = handle_backlog_upsert(_ctx(title="X", target_files=["a.py", "b.py"], details_md="e"))
         assert isinstance(r, tuple) and r[0] == 409
         assert r[1]["error"] == "triage_review_required"
         assert r[1]["recommended_action"] == "merge_into"
         assert r[1]["triage"]["evidence"]["candidates"][0]["bug_id"] == "OLD-3"
+        assert {
+            "field",
+            "expected",
+            "actual",
+            "guide",
+            "source",
+            "zero_write_rejection",
+            "writes_performed",
+        }.issubset(r[1])
+        assert r[1]["zero_write_rejection"] is True
+        assert r[1]["writes_performed"] is False
+        audit_record.assert_not_called()
+        connection.commit.assert_not_called()
 
 def test_confirmed_merge_into_appends_details():
     with patch("governance.server.get_connection", return_value=_conn([{"bug_id": "OLD-3", "title": "O", "target_files": '["a.py","b.py","c.py"]'}])):

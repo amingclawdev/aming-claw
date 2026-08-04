@@ -278,7 +278,12 @@ def select_release_operator_head_queue(
     }
 
 
-def triage_backlog_insert(payload: dict, open_rows: list[dict]) -> dict:
+def triage_backlog_insert(
+    payload: dict,
+    open_rows: list[dict],
+    *,
+    verified_batch_child_authority: dict | None = None,
+) -> dict:
     """Classify a new backlog filing against existing OPEN rows.
 
     Returns dict with keys: action, reason, related_bug_ids, confidence.
@@ -300,8 +305,35 @@ def triage_backlog_insert(payload: dict, open_rows: list[dict]) -> dict:
     n_docs = len(open_rows)
     doc_freq = _build_file_doc_freq(open_rows)
 
+    batch_authority = (
+        dict(verified_batch_child_authority)
+        if isinstance(verified_batch_child_authority, dict)
+        else {}
+    )
+    batch_coordination_backlog_id = str(
+        batch_authority.get("coordination_backlog_id") or ""
+    ).strip()
+    batch_child_backlog_id = str(
+        batch_authority.get("child_backlog_id") or ""
+    ).strip()
+    verified_parent_overlap_admission: dict = {}
+
     for row in open_rows:
         rid, rt, rtf = row.get("bug_id", ""), row.get("title", ""), _parse_tf(row.get("target_files", []))
+        if (
+            batch_authority.get("server_owned") is True
+            and batch_authority.get("db_verified") is True
+            and batch_authority.get("parent_scope_overlap_admitted") is True
+            and batch_child_backlog_id == str(payload.get("bug_id") or "").strip()
+            and batch_coordination_backlog_id == str(rid or "").strip()
+        ):
+            # A canonical mf_batch_parallel coordination row owns the aggregate
+            # scope.  Its server-bound child rows own subsets of that aggregate,
+            # so parent/child overlap is structural rather than a duplicate.
+            # Only the exact parent is skipped: sibling and unrelated rows still
+            # pass through the ordinary duplicate/conflict classifier below.
+            verified_parent_overlap_admission = dict(batch_authority)
+            continue
         if title and rt and title.strip().lower() == rt.strip().lower():
             return _decision(
                 "reject_dup",
@@ -387,4 +419,12 @@ def triage_backlog_insert(payload: dict, open_rows: list[dict]) -> dict:
                     "triage: hub-only overlap with %s (w_score=%.3f title_sim=%.3f) — admit with advisory",
                     rid, w_score, title_similarity,
                 )
+    if verified_parent_overlap_admission:
+        return _decision(
+            "admit",
+            "server-verified mf_batch_parallel child scope overlaps only its coordination parent",
+            [],
+            1.0,
+            verified_batch_child_authority=verified_parent_overlap_admission,
+        )
     return {"action": "admit", "reason": "no significant overlap", "related_bug_ids": [], "confidence": 0.8}

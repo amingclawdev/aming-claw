@@ -233,6 +233,80 @@ def test_true_duplicate_still_merges():
            decision.get("evidence", {}).get("title_similarity", 0) > 0
 
 
+def test_verified_batch_child_skips_only_exact_coordination_parent_overlap():
+    authority = {
+        "server_owned": True,
+        "db_verified": True,
+        "parent_scope_overlap_admitted": True,
+        "coordination_backlog_id": "BATCH-PARENT",
+        "child_backlog_id": "BATCH-CHILD-B",
+    }
+    child = {
+        "bug_id": "BATCH-CHILD-B",
+        "title": "Planner child implementation",
+        "target_files": ["planner.py"],
+    }
+    parent = {
+        "bug_id": "BATCH-PARENT",
+        "title": "Planner aggregate implementation",
+        "target_files": ["models.py", "planner.py"],
+    }
+
+    admitted = triage_backlog_insert(
+        child,
+        [parent],
+        verified_batch_child_authority=authority,
+    )
+
+    assert admitted["action"] == "admit"
+    assert admitted["evidence"]["verified_batch_child_authority"] == authority
+
+    sibling = {
+        "bug_id": "BATCH-CHILD-A",
+        "title": "Planner child implementation",
+        "target_files": ["planner.py"],
+    }
+    still_blocked = triage_backlog_insert(
+        child,
+        [parent, sibling],
+        verified_batch_child_authority=authority,
+    )
+
+    assert still_blocked["action"] in {
+        "reject_dup",
+        "merge_into",
+        "supersede",
+    }
+    assert still_blocked["related_bug_ids"] == ["BATCH-CHILD-A"]
+
+
+def test_batch_child_authority_never_relaxes_unrelated_duplicate():
+    decision = triage_backlog_insert(
+        {
+            "bug_id": "BATCH-CHILD",
+            "title": "Exact unrelated duplicate",
+            "target_files": ["child.py"],
+        },
+        [
+            {
+                "bug_id": "UNRELATED",
+                "title": "Exact unrelated duplicate",
+                "target_files": ["elsewhere.py"],
+            }
+        ],
+        verified_batch_child_authority={
+            "server_owned": True,
+            "db_verified": True,
+            "parent_scope_overlap_admitted": True,
+            "coordination_backlog_id": "BATCH-PARENT",
+            "child_backlog_id": "BATCH-CHILD",
+        },
+    )
+
+    assert decision["action"] == "reject_dup"
+    assert decision["related_bug_ids"] == ["UNRELATED"]
+
+
 # ---------------------------------------------------------------------------
 # Weighted overlap exposes score breakdown
 # ---------------------------------------------------------------------------
