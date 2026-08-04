@@ -95374,7 +95374,9 @@ def _onboard_backlog_start_guidance(project_id: str) -> dict[str, Any]:
             "direct_fix",
             "legacy_operator_recovery",
             "multi_backlog_parallel",
+            "mf_batch_parallel",
             "parallel_worker",
+            "mf_parallel",
             "qa_verification",
             "rollback_or_recover_contract",
         ],
@@ -95589,12 +95591,59 @@ def _onboard_missing_backlog_error_details(
     role: str,
     work_type: str,
 ) -> dict[str, Any]:
+    backlog_start_guidance = _onboard_backlog_start_guidance(project_id)
     return {
+        "error": "onboard_route_guide_missing_backlog_id",
+        "code": "onboard_route_guide_missing_backlog_id",
+        "field": "backlog_id",
+        "expected": (
+            "existing_nonempty_backlog_id_or_bug_id_or_eligible_curated_queue_head"
+        ),
+        "actual": "missing_or_empty",
+        "guide": {
+            "schema_version": (
+                "onboard_route_guide.missing_backlog_correction.v1"
+            ),
+            "action": "create_or_select_backlog_then_retry",
+            "create_backlog": dict(
+                backlog_start_guidance.get("create_backlog") or {}
+            ),
+            "select_backlog": dict(
+                backlog_start_guidance.get("select_backlog") or {}
+            ),
+            "retry": {
+                "interface": "onboard_route_guide",
+                "required_arguments": [
+                    "project_id",
+                    "backlog_id or bug_id",
+                    "work_type",
+                ],
+                "arguments": {
+                    "project_id": project_id,
+                    "backlog_id": "<exact created or selected backlog id>",
+                    "role": role,
+                    "work_type": work_type,
+                },
+                "instruction": (
+                    "retry with the exact non-empty backlog_id or bug_id from "
+                    "the created/selected OPEN row"
+                ),
+            },
+        },
+        "source": (
+            "server.handle_project_onboard_route_guide."
+            "missing_backlog_prewrite_gate"
+        ),
+        "host_correctable": True,
+        "public_safe": True,
+        "secret_safe": True,
+        "zero_write_rejection": True,
+        "writes_performed": False,
         "project_id": project_id,
         "role": role,
         "work_type": work_type,
         "allowed_without_backlog": sorted(_ONBOARD_NO_BACKLOG_WORK_TYPES - {""}),
-        "backlog_start_guidance": _onboard_backlog_start_guidance(project_id),
+        "backlog_start_guidance": backlog_start_guidance,
         "next_step": (
             "Call onboard_route_guide with work_type=capability_query or "
             "system_operation for no-backlog discovery, or create/select a "
