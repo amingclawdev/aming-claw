@@ -7669,6 +7669,91 @@ def test_mf_sub_startup_refusal_points_session_ref_workers_to_initial_join(
     )
 
 
+def test_mf_sub_startup_agent_id_mismatch_returns_prewrite_initial_join_guide(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-agent-id-prewrite"
+    worktree.mkdir(parents=True)
+    _insert_startup_context(conn, str(worktree))
+    context = get_branch_context(conn, PROJECT_ID, "mf-sub-startup")
+    assert context is not None
+    conn.commit()
+    payload = _startup_payload(
+        str(worktree),
+        agent_id="/root/daily_planner_models_worker",
+        actual_host_worker_id="/root/daily_planner_models_worker",
+        worker_session_id="/root/daily_planner_models_worker",
+        worker_transcript_path=str(worktree / "desktop-worker.jsonl"),
+        worker_transcript_ref="codex:/root/daily_planner_models_worker",
+        session_token="",
+        session_token_ref=runtime_context_session_token_ref(context),
+    )
+    before_context = get_branch_context(conn, PROJECT_ID, "mf-sub-startup")
+    before_revision = get_latest_branch_contract_revision(
+        conn,
+        PROJECT_ID,
+        context.runtime_context_id,
+    )
+    changes_before = conn.total_changes
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=payload,
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is False
+    assert result["blocker_id"] == "agent_id_mismatch"
+    assert result["field"] == "agent_id"
+    assert result["expected"] == "agent-startup"
+    assert result["actual"] == "/root/daily_planner_models_worker"
+    assert result["zero_write_rejection"] is True
+    assert result["writes_performed"] is False
+    assert result["mutation_performed"] is False
+    assert result["retry_same_world_allowed"] is True
+    assert result["timeline_event_recorded"] is False
+    assert result["refusal_timeline_recorded"] is False
+    assert "timeline_event" not in result
+    guide = result["guide"]
+    assert guide["mcp_tool"] == "runtime_context_session_token_initial_join"
+    assert guide["copy_safe_body"]["agent_id"] == "worker-startup"
+    assert guide["copy_safe_body"]["actual_host_worker_id"] == (
+        "worker-startup"
+    )
+    assert guide["copy_safe_body"]["worker_session_id"] == (
+        "/root/daily_planner_models_worker"
+    )
+    assert guide["required_sequence"][:2] == [
+        "observer_dispatch_bounded_workers accepted",
+        "runtime_context_session_token_initial_join",
+    ]
+    assert conn.total_changes == changes_before
+    assert get_branch_context(conn, PROJECT_ID, "mf-sub-startup") == before_context
+    assert get_latest_branch_contract_revision(
+        conn,
+        PROJECT_ID,
+        context.runtime_context_id,
+    ) == before_revision
+    serialized = json.dumps(result, sort_keys=True)
+    assert "secret-worker-session-token" not in serialized
+    assert "fence-startup" not in serialized
+
+    unsafe = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload={**payload, "fence_token": "wrong-fence"},
+        now_iso=NOW,
+    )
+    assert unsafe["blocker_id"] == "fence_invalidated_or_unknown"
+    assert unsafe["timeline_event"]["event_kind"] == (
+        "mf_subagent_startup_refusal"
+    )
+
+
 def test_mf_sub_graph_query_accepts_target_project_with_governance_fence(tmp_path) -> None:
     conn = _runtime_conn()
     target_root = tmp_path / "target-project"

@@ -31193,6 +31193,149 @@ def test_parallel_branch_startup_rejects_service_dispatch_missing_route_identity
     assert blocked["blocker_id"] == "agent_id_mismatch"
 
 
+def test_runtime_context_startup_facade_projects_agent_id_zero_write_correction(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-STARTUP-AGENT-ID-ZERO-WRITE"
+    task_id = "startup-agent-id-zero-write-task"
+    worktree = tmp_path / "worker-startup-agent-id-zero-write"
+    worktree.mkdir()
+    raw_session_token = "startup-agent-id-zero-write-token"
+    context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        parent_task_id="startup-agent-id-zero-write-parent",
+        fence_token="fence-startup-agent-id-zero-write",
+        token=raw_session_token,
+        worktree_path=str(worktree),
+        target_project_root=str(worktree),
+        base_commit="base-startup-agent-id-zero-write",
+        target_head_commit="target-startup-agent-id-zero-write",
+        merge_queue_id="mq-startup-agent-id-zero-write",
+        owned_files=("agent/governance/server.py",),
+    )
+    context = upsert_branch_context(
+        conn,
+        replace(
+            context,
+            agent_id="allocation-owner",
+            allocation_owner="allocation-owner",
+            head_commit="head-startup-agent-id-zero-write",
+        ),
+    )
+    route_identity = {
+        "route_id": "route-startup-agent-id-zero-write",
+        "route_context_hash": "sha256:route-startup-agent-id-zero-write",
+        "prompt_contract_id": "rprompt-startup-agent-id-zero-write",
+        "prompt_contract_hash": "sha256:prompt-startup-agent-id-zero-write",
+        "route_token_ref": "rtok-startup-agent-id-zero-write",
+        "visible_injection_manifest_hash": (
+            "sha256:visible-startup-agent-id-zero-write"
+        ),
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-startup-agent-id-zero-write",
+        route_identity=route_identity,
+    )
+    conn.commit()
+    before_context = get_branch_context(
+        conn,
+        PID,
+        task_id,
+    )
+    before_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        context.runtime_context_id,
+    )
+    before_timeline = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+    )
+    changes_before = conn.total_changes
+
+    response = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": "startup-agent-id-zero-write-parent",
+                "fence_token": "fence-startup-agent-id-zero-write",
+                "session_token_ref": runtime_context_session_token_ref(
+                    context
+                ),
+                "target_project_root": str(worktree),
+                "agent_id": "/root/daily_planner_desktop_worker",
+                "actual_host_worker_id": (
+                    "/root/daily_planner_desktop_worker"
+                ),
+                "worker_session_id": "/root/daily_planner_desktop_worker",
+                "worker_transcript_ref": (
+                    "codex:/root/daily_planner_desktop_worker"
+                ),
+                "harness_type": "codex",
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "head_commit": "head-startup-agent-id-zero-write",
+                "owned_files": ["agent/governance/server.py"],
+                "observer_command_id": "cmd-startup-agent-id-zero-write",
+                "read_receipt_hash": (
+                    "sha256:read-startup-agent-id-zero-write"
+                ),
+                "read_receipt_event_id": "timeline:read-agent-id-zero-write",
+            },
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["status"] == "host_correction_required"
+    assert response["field"] == "agent_id"
+    assert response["expected"] == "allocation-owner"
+    assert response["actual"] == "/root/daily_planner_desktop_worker"
+    assert response["zero_write_rejection"] is True
+    assert response["writes_performed"] is False
+    assert response["mutation_performed"] is False
+    assert response["retry_same_world_allowed"] is True
+    assert response["timeline_event_recorded"] is False
+    assert response["refusal_timeline_recorded"] is False
+    assert response["timeline_event"] == {}
+    guide = response["guide"]
+    assert guide["mcp_tool"] == "runtime_context_session_token_initial_join"
+    assert guide["copy_safe_body"]["agent_id"] == context.worker_id
+    assert guide["copy_safe_body"]["actual_host_worker_id"] == context.worker_id
+    assert guide["copy_safe_body"]["worker_session_id"] == (
+        "/root/daily_planner_desktop_worker"
+    )
+    serialized = json.dumps(response, sort_keys=True)
+    assert raw_session_token not in serialized
+    assert "fence-startup-agent-id-zero-write" not in serialized
+    assert conn.total_changes == changes_before
+    assert get_branch_context(
+        conn,
+        PID,
+        task_id,
+    ) == before_context
+    assert get_latest_branch_contract_revision(
+        conn,
+        PID,
+        context.runtime_context_id,
+    ) == before_revision
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+    ) == before_timeline
+
+
 def test_parallel_branch_startup_rejects_host_worker_mismatch_without_surrogate(
     conn, tmp_path
 ):
@@ -53039,6 +53182,16 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
         "agent-session-ref"
     )
     assert initial_join_submission["copy_safe_body"]["route_id"] == "route-session-ref"
+    assert initial_join_submission[
+        "required_when_desktop_identity_differs_from_allocation_owner"
+    ] is True
+    assert initial_join_submission["desktop_identity_field"] == (
+        "worker_session_id"
+    )
+    assert initial_join_submission["required_before_worker_evidence"][0] == (
+        "confirm ContractRuntime observer_dispatch_bounded_workers is accepted "
+        "before any worker line"
+    )
     identity_binding = initial_join_submission["actual_host_identity_binding"]
     assert identity_binding[
         "required_before_initial_join_when_agent_id_is_placeholder"
@@ -53049,6 +53202,37 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     assert identity_binding["desktop_worker_session_identity_is_independent"] is True
     startup_skeleton = worker_guide["startup_facade_payload_skeleton"]
     assert startup_skeleton["body_source"] == "copy_safe_body"
+    assert startup_skeleton["required_sequence"] == [
+        "observer_dispatch_bounded_workers accepted",
+        "runtime_context_session_token_initial_join when host identity differs",
+        "runtime_context_read_receipt accepted",
+        "runtime_context_startup",
+    ]
+    assert startup_skeleton["preconditions"][0]["source"] == (
+        "ContractRuntime.completed_lines.observer_dispatch_bounded_workers"
+    )
+    assert startup_skeleton["identity_submission_rule"] == {
+        "agent_id": "worker-session-ref",
+        "actual_host_worker_id": "worker-session-ref",
+        "desktop_or_codex_task_identity_field": "worker_session_id",
+        "initial_join_required_when_desktop_identity_differs": True,
+        "initial_join_submission_source": (
+            "actionable_payloads.session_token_initial_join_submission."
+            "copy_safe_body"
+        ),
+        "forbidden": (
+            "do not copy a Desktop/Codex task id into agent_id or "
+            "actual_host_worker_id"
+        ),
+    }
+    assert worker_guide["mf_parallel_happy_path_reminders"][
+        "ordered_worker_happy_path"
+    ][:4] == [
+        "observer_dispatch_bounded_workers_accepted",
+        "read_runtime_context_worker_guide",
+        "runtime_context_read_receipt",
+        "mf_subagent_startup",
+    ]
     startup_copy = startup_skeleton["copy_safe_body"]
     assert startup_copy["agent_id"] == "worker-session-ref"
     assert startup_copy["allocation_owner"] == "agent-session-ref"
@@ -93963,6 +94147,152 @@ def test_runtime_context_read_receipt_atomically_advances_canonical_contract(
     assert canonical_line["contract_execution_id"] == contract_execution_id
     assert canonical_line["line_id"] == "worker_read_runtime_guide"
     assert canonical_line["timeline_projection_authoritative"] is False
+
+
+def test_runtime_context_read_receipt_before_dispatch_is_complete_zero_write(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-CONTRACT-READ-BEFORE-DISPATCH-ZERO-WRITE"
+    worker_task_id = "contract-read-before-dispatch-worker"
+    worker_token = "contract-read-before-dispatch-token"
+    worker_fence = "fence-contract-read-before-dispatch"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    successor, runtime_context = (
+        _setup_mf_parallel_contract_runtime_worker_dispatch(
+            conn,
+            backlog_id=backlog_id,
+            task_id="contract-read-before-dispatch-parent",
+            worker_task_id=worker_task_id,
+            fence_token=worker_fence,
+            token=worker_token,
+            worktree_path=str(worker_root),
+            submit_dispatch=False,
+        )
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        revision_id="crev-contract-read-before-dispatch",
+        payload={
+            "contract_execution_id": contract_execution_id,
+            "successor_contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "target_files": ["agent/governance/server.py"],
+        },
+        route_identity=route_identity,
+    )
+    conn.commit()
+    before_record = copy.deepcopy(
+        server._contract_runtime_store(conn).get(contract_execution_id)
+    )
+    before_context = get_branch_context(conn, PID, worker_task_id)
+    before_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        runtime_context.runtime_context_id,
+    )
+    before_timeline = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+    )
+    changes_before = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_runtime_context_read_receipt(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                method="POST",
+                body={
+                    "contract_execution_id": contract_execution_id,
+                    "parent_task_id": backlog_id,
+                    "fence_token": worker_fence,
+                    "session_token": worker_token,
+                    "session_token_ref": runtime_context_session_token_ref(
+                        runtime_context
+                    ),
+                    "target_project_root": str(worker_root),
+                    "actor": runtime_context.worker_slot_id,
+                    "read_receipt_hash": _fake_sha(
+                        "contract-read-before-dispatch"
+                    ),
+                    "launch_text_hash": _fake_sha(
+                        "contract-launch-before-dispatch"
+                    ),
+                },
+            )
+        )
+
+    assert rejected.value.code == (
+        "contract_runtime_canonical_line_out_of_order"
+    )
+    details = rejected.value.details
+    assert details["field"] == "line_id"
+    assert details["expected"] == "observer_dispatch_bounded_workers"
+    assert details["actual"] == "worker_read_runtime_guide"
+    assert details["guide"]["observer_dispatch_must_be_recorded_first"] is True
+    assert details["guide"]["required_sequence"][:2] == [
+        "observer_dispatch_bounded_workers accepted",
+        "worker_read_runtime_guide via runtime_context_read_receipt",
+    ]
+    assert details["source"] == (
+        "agent.governance.server::"
+        "_runtime_context_submit_canonical_contract_line.prewrite_order_gate"
+    )
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    assert details["mutation_performed"] is False
+    assert details["retry_same_world_allowed"] is True
+    assert details["timeline_mutated"] is False
+    assert details["runtime_context_mutated"] is False
+    assert details["contract_runtime_mutated"] is False
+    assert details["public_safe"] is True
+    assert details["secret_safe"] is True
+    response = server._public_zero_write_error_response(rejected.value)
+    for key in (
+        "field",
+        "expected",
+        "actual",
+        "guide",
+        "source",
+        "zero_write_rejection",
+        "writes_performed",
+        "mutation_performed",
+        "retry_same_world_allowed",
+    ):
+        assert response[key] == details[key]
+    serialized = json.dumps(response, sort_keys=True)
+    assert worker_token not in serialized
+    assert worker_fence not in serialized
+    assert conn.total_changes == changes_before
+    assert server._contract_runtime_store(conn).get(
+        contract_execution_id
+    ) == before_record
+    assert get_branch_context(conn, PID, worker_task_id) == before_context
+    assert get_latest_branch_contract_revision(
+        conn,
+        PID,
+        runtime_context.runtime_context_id,
+    ) == before_revision
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+    ) == before_timeline
 
 
 def test_runtime_context_read_receipt_resolves_source_backed_contract_when_revision_omits_id(

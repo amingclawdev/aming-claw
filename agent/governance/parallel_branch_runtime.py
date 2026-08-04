@@ -7360,6 +7360,7 @@ def runtime_context_mf_parallel_happy_path_reminders(
             _runtime_context_batch_close_blocker_public_diagnostics(values)
         ),
         "ordered_worker_happy_path": [
+            "observer_dispatch_bounded_workers_accepted",
             "read_runtime_context_worker_guide",
             "runtime_context_read_receipt",
             "mf_subagent_startup",
@@ -8027,6 +8028,17 @@ def _runtime_context_read_receipt_hash_action(
         "ordered_worker_startup_bridge": {
             "schema_version": "runtime_context.worker_startup_bridge.v1",
             "status": "ready" if read_receipt_ref else "waiting_for_read_receipt",
+            "dispatch_precondition": {
+                "source": (
+                    "ContractRuntime.completed_lines."
+                    "observer_dispatch_bounded_workers"
+                ),
+                "status": "accepted",
+                "must_precede": "record_read_receipt",
+                "worker_action_when_missing": (
+                    "stop and ask the observer to record bounded dispatch"
+                ),
+            },
             "steps": ordered_steps,
             "mf_parallel_happy_path_reminders": happy_path_reminders,
             "privacy_boundary": {
@@ -16146,6 +16158,157 @@ def _startup_blocker(
     return payload
 
 
+def _startup_host_correctable_agent_id_mismatch(
+    *,
+    task_id: str,
+    payload: Mapping[str, Any],
+    context: BranchTaskRuntimeContext,
+    expected_runtime_context_id: str,
+    allocation_owner: str,
+    agent_id: str,
+    worker_session_id: str,
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return a copy-safe prewrite correction for a real host identity mix-up.
+
+    This path is used only after the caller has passed the ordinary fence,
+    route, worktree, and server-issued session-reference gates.  It therefore
+    fixes the host-vs-governed identity namespace without creating a refusal
+    timeline row or mutating RuntimeContext state.
+    """
+
+    runtime_context_id = str(expected_runtime_context_id or "").strip()
+    governed_worker_id = str(
+        context.worker_id or context.worker_slot_id or allocation_owner or ""
+    ).strip()
+    desktop_session_id = str(worker_session_id or agent_id or "").strip()
+    target_project_root = str(
+        context.target_project_root or context.worktree_path or ""
+    ).strip()
+    parent_task_id = str(
+        payload.get("parent_task_id")
+        or context.parent_task_id
+        or context.root_task_id
+        or context.backlog_id
+        or ""
+    ).strip()
+    safe_route_identity = {
+        key: str(route_identity.get(key) or "").strip()
+        for key in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "route_token_ref",
+            "visible_injection_manifest_hash",
+        )
+        if str(route_identity.get(key) or "").strip()
+    }
+    initial_join_body = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": str(task_id or context.task_id or "").strip(),
+        "parent_task_id": parent_task_id,
+        "target_project_root": target_project_root,
+        "worker_id": str(context.worker_id or governed_worker_id).strip(),
+        "worker_slot_id": str(
+            context.worker_slot_id or context.worker_id or governed_worker_id
+        ).strip(),
+        "agent_id": governed_worker_id,
+        "allocation_owner": str(allocation_owner or "").strip(),
+        "actual_host_worker_id": governed_worker_id,
+        "worker_session_id": desktop_session_id,
+        "host_session_id": desktop_session_id,
+        **safe_route_identity,
+        "reason": (
+            "<operator reason: bind the real Desktop/Codex session before "
+            "retrying worker startup>"
+        ),
+        "ttl_seconds": 3600,
+    }
+    source = (
+        "agent.governance.parallel_branch_runtime::"
+        "record_mf_subagent_startup.host_correctable_agent_id_prewrite_gate"
+    )
+    guide = {
+        "schema_version": "mf_subagent_startup.agent_id_correction_guide.v1",
+        "semantic_next_action": "runtime_context_session_token_initial_join",
+        "mcp_tool": "runtime_context_session_token_initial_join",
+        "http_entrypoint": {
+            "method": "POST",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                f"{runtime_context_id}/session-token/initial-join"
+            ),
+        },
+        "copy_safe_body": initial_join_body,
+        "identity_rule": {
+            "agent_id": governed_worker_id,
+            "actual_host_worker_id": governed_worker_id,
+            "desktop_or_codex_task_identity_field": "worker_session_id",
+            "desktop_session_identity_is_independent": True,
+            "allocation_owner": str(allocation_owner or "").strip(),
+        },
+        "required_sequence": [
+            "observer_dispatch_bounded_workers accepted",
+            "runtime_context_session_token_initial_join",
+            "inject returned host_envelope.env into the same live worker",
+            "runtime_context_read_receipt accepted",
+            "runtime_context_startup with corrected governed identity",
+        ],
+        "then": "retry runtime_context_startup from the same live worker",
+        "copy_rule": (
+            "Copy copy_safe_body, keep the governed worker id in agent_id and "
+            "actual_host_worker_id, put the real Desktop/Codex task id only in "
+            "worker_session_id, and never print or persist returned raw env."
+        ),
+        "source": source,
+        "public_safe": True,
+        "secret_safe": True,
+    }
+    return {
+        "ok": False,
+        "schema_version": MF_SUBAGENT_STARTUP_GATE_SCHEMA_VERSION,
+        "status": "host_correction_required",
+        "blocked": True,
+        "must_stop": True,
+        "blocker": "agent_id_mismatch",
+        "blocker_id": "agent_id_mismatch",
+        "message": (
+            "mf_subagent startup agent_id mixed the Desktop/Codex session "
+            "identity with the governed allocation identity"
+        ),
+        "field": "agent_id",
+        "expected": str(allocation_owner or governed_worker_id).strip(),
+        "actual": str(agent_id or "").strip() or "<missing>",
+        "field_mismatches": [
+            {
+                "field": "agent_id",
+                "expected": str(allocation_owner or governed_worker_id).strip(),
+                "actual": str(agent_id or "").strip() or "<missing>",
+            }
+        ],
+        "guide": guide,
+        "source": source,
+        "host_correctable": True,
+        "actual_startup_recorded": False,
+        "startup_accepted": False,
+        "startup_recorded": False,
+        "timeline_event_recorded": False,
+        "refusal_timeline_recorded": False,
+        "context_mutated": False,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "retry_same_world_allowed": True,
+        "public_safe": True,
+        "secret_safe": True,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "next_action": guide,
+    }
+
+
 def _startup_refusal_timeline_event(
     *,
     project_id: str,
@@ -17126,6 +17289,7 @@ def record_mf_subagent_startup(
     context_actual_host_worker_id = str(
         context.actual_host_worker_id if context is not None else ""
     ).strip()
+    host_correctable_agent_id_mismatch = False
     agent_id_match_mode = "actual_host_worker_bound"
     if allocation_owner and agent_id == allocation_owner:
         agent_id_match_mode = "same_as_allocation_owner"
@@ -17143,19 +17307,8 @@ def record_mf_subagent_startup(
     elif host_adapter_startup:
         agent_id_match_mode = "host_adapter_startup_token_surrogate"
     elif allocation_owner:
-        return _blocked(_startup_blocker(
-            blocker_id="agent_id_mismatch",
-            message=(
-                "mf_subagent startup agent_id must match allocation_owner unless "
-                "a host-adapter startup token surrogate joins the worker identity"
-            ),
-            context=context,
-            details={
-                "agent_id": agent_id,
-                "expected_agent_id": allocation_owner,
-                "agent_id_match_mode": "blocked_without_host_adapter_surrogate",
-            },
-        ))
+        host_correctable_agent_id_mismatch = True
+        agent_id_match_mode = "blocked_without_host_adapter_surrogate"
     try:
         _require_current_fence(context, fence_token)
     except BranchRuntimeFenceError:
@@ -17298,7 +17451,25 @@ def record_mf_subagent_startup(
         "initial_join_actual_host_worker",
         "host_adapter_server_verified_session",
     }
-    if agent_id_match_mode in server_verified_identity_modes:
+    if host_correctable_agent_id_mismatch and not context.session_token_hash:
+        return _blocked(_startup_blocker(
+            blocker_id="agent_id_mismatch",
+            message=(
+                "mf_subagent startup agent_id must match allocation_owner unless "
+                "a server-verified initial-join or host-adapter identity binds "
+                "the real worker"
+            ),
+            context=context,
+            details={
+                "agent_id": agent_id,
+                "expected_agent_id": allocation_owner,
+                "agent_id_match_mode": agent_id_match_mode,
+            },
+        ))
+    if (
+        agent_id_match_mode in server_verified_identity_modes
+        or host_correctable_agent_id_mismatch
+    ):
         if not context.session_token_hash:
             return _blocked(_startup_blocker(
                 blocker_id="session_token_not_server_issued",
@@ -17340,6 +17511,17 @@ def record_mf_subagent_startup(
                     ],
                 },
             ))
+    if host_correctable_agent_id_mismatch:
+        return _startup_host_correctable_agent_id_mismatch(
+            task_id=task,
+            payload=payload,
+            context=context,
+            expected_runtime_context_id=expected_runtime_context_id,
+            allocation_owner=allocation_owner,
+            agent_id=agent_id,
+            worker_session_id=worker_session_id,
+            route_identity=route_identity,
+        )
 
     graph_trace_db_evidence = _startup_graph_trace_db_evidence(
         conn,

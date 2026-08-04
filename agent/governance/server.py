@@ -1075,6 +1075,43 @@ def _emit_dashboard_changed(path: str, method: str) -> None:
         pass
 
 
+def _public_zero_write_error_response(error: GovernanceError) -> dict[str, Any]:
+    """Serialize a complete safe correction at the HTTP/MCP error surface.
+
+    ``GovernanceError`` keeps diagnostics under ``details`` for compatibility.
+    Host-correctable, explicitly public/secret-safe prewrite rejections also
+    need the same correction fields at the response root so HTTP and MCP
+    callers do not have to reconstruct a guide from a nested exception shape.
+    """
+
+    body = error.to_dict()
+    details = error.details if isinstance(error.details, Mapping) else {}
+    required = ("field", "expected", "actual", "guide", "source")
+    if not (
+        details.get("zero_write_rejection") is True
+        and details.get("public_safe") is True
+        and details.get("secret_safe") is True
+        and all(key in details for key in required)
+    ):
+        return body
+    for key in (
+        *required,
+        "field_mismatches",
+        "zero_write_rejection",
+        "writes_performed",
+        "mutation_performed",
+        "retry_same_world_allowed",
+        "public_safe",
+        "secret_safe",
+        "raw_session_token_exposed",
+        "raw_fence_token_exposed",
+        "raw_route_token_exposed",
+    ):
+        if key in details:
+            body[key] = details[key]
+    return body
+
+
 class GovernanceHandler(BaseHTTPRequestHandler):
     """HTTP request handler with routing and middleware."""
 
@@ -1247,7 +1284,7 @@ class GovernanceHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         except GovernanceError as e:
-            body = e.to_dict()
+            body = _public_zero_write_error_response(e)
             body["request_id"] = request_id
             self._respond(e.status, body)
         except Exception as e:
@@ -24274,6 +24311,7 @@ def _runtime_context_worker_recovery_payloads(
             "mf_subagent_startup",
         ],
         "required_before_worker_evidence": [
+            "confirm ContractRuntime observer_dispatch_bounded_workers is accepted before any worker line",
             "preserve the allocated governed worker id in agent_id/actual_host_worker_id",
             "record the independent Desktop/Codex task identity only as worker_session_id/host_session_id/transcript/filer principal",
             "parse MCP CallToolResult content[0].text and extract host_envelope.env in the same invocation",
@@ -24282,6 +24320,9 @@ def _runtime_context_worker_recovery_payloads(
             "worker submits read receipt",
             "worker records startup",
         ],
+        "required_when_desktop_identity_differs_from_allocation_owner": True,
+        "desktop_identity_field": "worker_session_id",
+        "governed_identity_fields": ["agent_id", "actual_host_worker_id"],
         "bounded_loss_policy": (
             "if the first envelope is lost, use the single advertised "
             "pre-lineage rejoin; if that replacement is lost, stop without "
@@ -25442,6 +25483,44 @@ def _runtime_context_worker_recovery_payloads(
                 *startup_identity_required_fields,
             ],
             "required_real_worker_identity_fields": startup_identity_required_fields,
+            "preconditions": [
+                {
+                    "source": (
+                        "ContractRuntime.completed_lines."
+                        "observer_dispatch_bounded_workers"
+                    ),
+                    "status": "accepted",
+                    "must_precede": "runtime_context_read_receipt",
+                },
+                {
+                    "source": (
+                        "ContractRuntime.completed_lines."
+                        "worker_read_runtime_guide"
+                    ),
+                    "status": "accepted",
+                    "must_precede": "runtime_context_startup",
+                },
+            ],
+            "identity_submission_rule": {
+                "agent_id": allocated_governed_worker_id,
+                "actual_host_worker_id": allocated_governed_worker_id,
+                "desktop_or_codex_task_identity_field": "worker_session_id",
+                "initial_join_required_when_desktop_identity_differs": True,
+                "initial_join_submission_source": (
+                    "actionable_payloads."
+                    "session_token_initial_join_submission.copy_safe_body"
+                ),
+                "forbidden": (
+                    "do not copy a Desktop/Codex task id into agent_id or "
+                    "actual_host_worker_id"
+                ),
+            },
+            "required_sequence": [
+                "observer_dispatch_bounded_workers accepted",
+                "runtime_context_session_token_initial_join when host identity differs",
+                "runtime_context_read_receipt accepted",
+                "runtime_context_startup",
+            ],
             "forbidden_startup_evidence": [
                 "current_thread",
                 "synthetic_startup",
@@ -28918,6 +28997,25 @@ def _runtime_context_write_response(
         "actionable_fields",
         "next_legal_action",
         "repair",
+        "field",
+        "expected",
+        "actual",
+        "field_mismatches",
+        "guide",
+        "source",
+        "host_correctable",
+        "zero_write_rejection",
+        "writes_performed",
+        "mutation_performed",
+        "retry_same_world_allowed",
+        "public_safe",
+        "secret_safe",
+        "timeline_event_recorded",
+        "refusal_timeline_recorded",
+        "context_mutated",
+        "raw_session_token_exposed",
+        "raw_fence_token_exposed",
+        "raw_route_token_exposed",
     ):
         if key in result:
             response[key] = result[key]
@@ -43213,6 +43311,134 @@ def _runtime_context_revise_incomplete_finish_attestation_lineage(
     }
 
 
+def _runtime_context_contract_line_order_diagnostic(
+    *,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    requested_stage_id: str,
+    requested_line_id: str,
+    next_line: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the public prewrite correction for a canonical-line sequence miss."""
+
+    expected_stage_id = str(next_line.get("stage_id") or "").strip()
+    expected_line_id = str(next_line.get("line_id") or "").strip()
+    safe_next_line = {
+        "stage_id": expected_stage_id,
+        "line_id": expected_line_id,
+        "evidence_kind": str(next_line.get("evidence_kind") or ""),
+        "actor_role": str(next_line.get("actor_role") or ""),
+    }
+    identity_mismatches: list[dict[str, Any]] = []
+    if requested_stage_id != expected_stage_id:
+        identity_mismatches.append(
+            {
+                "field": "stage_id",
+                "expected": expected_stage_id or "<no remaining lane stage>",
+                "actual": requested_stage_id or "<missing>",
+            }
+        )
+    identity_mismatches.append(
+        {
+            "field": "line_id",
+            "expected": expected_line_id or "<no remaining lane line>",
+            "actual": requested_line_id or "<missing>",
+        }
+    )
+    dispatch_first = bool(
+        expected_line_id == "observer_dispatch_bounded_workers"
+        and requested_line_id
+        in {"worker_read_runtime_guide", "worker_startup"}
+    )
+    required_sequence = (
+        [
+            "observer_dispatch_bounded_workers accepted",
+            "worker_read_runtime_guide via runtime_context_read_receipt",
+            "worker_startup via runtime_context_startup",
+        ]
+        if dispatch_first
+        else [
+            f"complete {expected_line_id or '<current canonical line>'}",
+            f"retry {requested_line_id or '<requested canonical line>'}",
+        ]
+    )
+    source = (
+        "agent.governance.server::"
+        "_runtime_context_submit_canonical_contract_line.prewrite_order_gate"
+    )
+    guide = {
+        "schema_version": (
+            "runtime_context.canonical_line_order_correction_guide.v1"
+        ),
+        "semantic_next_action": (
+            "record_observer_dispatch_bounded_workers_then_retry_worker_read"
+            if dispatch_first
+            else "complete_current_contract_line_then_retry_requested_line"
+        ),
+        "current_required_line": safe_next_line,
+        "required_sequence": required_sequence,
+        "observer_dispatch_must_be_recorded_first": dispatch_first,
+        "worker_must_stop_until_dispatch_accepted": dispatch_first,
+        "observer_action": (
+            {
+                "mcp_tool": "contract_runtime_line_write",
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "actor_role": "observer",
+            }
+            if dispatch_first
+            else {}
+        ),
+        "worker_retry": {
+            "mcp_tool": (
+                "runtime_context_read_receipt"
+                if requested_line_id == "worker_read_runtime_guide"
+                else "runtime_context_startup"
+                if requested_line_id == "worker_startup"
+                else "contract_runtime_line_write"
+            ),
+            "same_world": True,
+            "only_after_current_required_line_is_accepted": True,
+        },
+        "copy_rule": (
+            "Do not manufacture worker evidence or backfill timeline rows. "
+            "Complete the current canonical line through its owning role, "
+            "refresh ContractRuntime current state, then retry this facade."
+        ),
+        "source": source,
+        "public_safe": True,
+        "secret_safe": True,
+    }
+    return {
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "next_legal_action": safe_next_line,
+        "field": "line_id",
+        "expected": expected_line_id or "<no remaining lane line>",
+        "actual": requested_line_id or "<missing>",
+        "field_mismatches": identity_mismatches,
+        "identity_mismatches": identity_mismatches,
+        "guide": guide,
+        "source": source,
+        "host_correctable": True,
+        "public_safe": True,
+        "secret_safe": True,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "retry_same_world_allowed": True,
+        "contract_runtime_mutated": False,
+        "timeline_mutated": False,
+        "runtime_context_mutated": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+
+
 def _runtime_context_submit_canonical_contract_line(
     conn,
     *,
@@ -43864,36 +44090,18 @@ def _runtime_context_submit_canonical_contract_line(
             }
 
     if next_line_id != line_id:
-        identity_mismatches = []
-        expected_stage_id = str(next_line.get("stage_id") or "").strip()
-        if stage_id != expected_stage_id:
-            identity_mismatches.append(
-                {
-                    "field": "stage_id",
-                    "expected": expected_stage_id or "<no remaining lane stage>",
-                    "actual": stage_id or "<missing>",
-                }
-            )
-        identity_mismatches.append(
-            {
-                "field": "line_id",
-                "expected": next_line_id or "<no remaining lane line>",
-                "actual": line_id or "<missing>",
-            }
-        )
         raise GovernanceError(
             "contract_runtime_canonical_line_out_of_order",
             "runtime-context facade cannot advance a non-current Contract line",
             422,
-            {
-                "contract_execution_id": execution_id,
-                "runtime_context_id": runtime_context_id,
-                "task_id": task_id,
-                "requested_line_id": line_id,
-                "next_legal_action": dict(next_line),
-                "identity_mismatches": identity_mismatches,
-                "timeline_evidence_backfill_allowed": False,
-            },
+            _runtime_context_contract_line_order_diagnostic(
+                contract_execution_id=execution_id,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                requested_stage_id=stage_id,
+                requested_line_id=line_id,
+                next_line=next_line,
+            ),
         )
 
     write = _contract_runtime_write_from_record(
@@ -121442,15 +121650,6 @@ def handle_task_timeline_append(ctx: RequestContext):
                 qa_replay["agent_facing_decision_source"] = "contract_gate_kernel"
                 qa_replay["meta_contract_gate_decision_source"] = False
                 return qa_replay
-        if route_gate:
-            _record_route_token_gate_event(
-                conn,
-                project_id,
-                route_gate,
-                backlog_id=ctx.body.get("backlog_id", ""),
-                task_id=ctx.body.get("task_id", ""),
-                commit_sha=ctx.body.get("commit_sha", ""),
-            )
         canonical_contract_line: dict[str, Any] = {}
         requested_contract_line = (
             ctx.body.get("contract_runtime_line")
@@ -121513,6 +121712,19 @@ def handle_task_timeline_append(ctx: RequestContext):
                 norm_payload["contract_runtime_canonical_line"] = dict(
                     canonical_contract_line
                 )
+        # The canonical Contract sequence gate is the first write precondition
+        # for runtime-context worker evidence.  Persist route-gate audit only
+        # after it accepts, otherwise an out-of-order read/startup would perform
+        # a transient SQLite write before returning a same-world correction.
+        if route_gate:
+            _record_route_token_gate_event(
+                conn,
+                project_id,
+                route_gate,
+                backlog_id=ctx.body.get("backlog_id", ""),
+                task_id=ctx.body.get("task_id", ""),
+                commit_sha=ctx.body.get("commit_sha", ""),
+            )
         result = task_timeline.record_event(
             conn,
             project_id=project_id,
