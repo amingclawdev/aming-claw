@@ -42,6 +42,7 @@ from agent.governance import server
 from agent.governance import state_reconcile
 from agent.governance import task_timeline
 from agent.governance import dashboard_read_cache
+from agent.governance.checkout_provenance import describe_checkout
 from agent.governance.dashboard_read_cache import DashboardBacklogReadCache
 from agent.governance.contracts.instructions import resolve_instruction_bundle
 from agent.governance.contracts import write_gate as contract_write_gate
@@ -42529,6 +42530,193 @@ def test_exact_candidate_context_ignores_server_generated_demo_control_marker(
     ]
 
 
+def test_bounded_qa_consumes_nonactivated_exact_snapshot_execution_root(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    canonical_root = tmp_path / "qa-exact-snapshot-canonical"
+    canonical_commit = _init_test_git_repo(canonical_root)
+    candidate_root = tmp_path / "qa-exact-snapshot-separate-repository"
+    comparison_base_commit = _init_test_git_repo(
+        candidate_root,
+        filename="base.txt",
+    )
+    (candidate_root / "src").mkdir()
+    (candidate_root / "src" / "candidate.py").write_text(
+        "CANDIDATE = True\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "src/candidate.py"],
+        cwd=candidate_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "exact separate candidate"],
+        cwd=candidate_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(candidate_root)
+    snapshot_id = "full-exact-snapshot-separate-execution-root"
+    backlog_id = "AC-QA-EXACT-SNAPSHOT-SEPARATE-ROOT"
+    task_id = "qa-exact-snapshot-separate-root"
+    _activate_basic_graph(
+        conn,
+        "full-exact-snapshot-canonical-active",
+        commit_sha=canonical_commit,
+    )
+    candidate_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=snapshot_id,
+        commit_sha=candidate_commit,
+        snapshot_kind="full",
+        graph_json=_graph(),
+        notes=json.dumps(
+            {
+                "checkout_provenance": describe_checkout(
+                    candidate_root,
+                    project_id=PID,
+                )
+            },
+            sort_keys=True,
+        ),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        candidate_snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=candidate_commit,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{candidate_commit}",
+        qa_scope_binding_ref,
+    ]
+    registered = server.role_service.register(
+        conn,
+        "qa:exact-snapshot-separate-root",
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, raw=None, **_kwargs: (
+            Path(raw).resolve() if raw else canonical_root
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_qa_exact_candidate_runtime_comparison_authority",
+        lambda *_args, **_kwargs: {
+            "commit_sha": comparison_base_commit,
+            "source": server._QA_POSTMERGE_COMPARISON_BASE_SOURCE,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_qa_exact_candidate_comparison_authority_required",
+        lambda *_args, **_kwargs: True,
+    )
+    qa_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": snapshot_id,
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "commit_sha": candidate_commit,
+            # A stale/canonical caller hint must not replace the immutable
+            # execution root recorded while materializing the exact snapshot.
+            "project_root": str(canonical_root),
+        },
+    )
+    qa_ctx._session.update(
+        {
+            "session_id": registered["session_id"],
+            "principal_id": "qa:exact-snapshot-separate-root",
+            "scope": qa_scope,
+        }
+    )
+
+    queried = server.handle_graph_governance_query(qa_ctx)
+
+    assert queried["ok"] is True
+    assert store.get_active_graph_snapshot(conn, PID)["snapshot_id"] == (
+        "full-exact-snapshot-canonical-active"
+    )
+    trace = server.handle_graph_governance_query_trace_get(
+        _ctx({"project_id": PID, "trace_id": queried["trace_id"]})
+    )["trace"]
+    identity = trace["root_identity"]
+    assert identity["query_root"] == str(candidate_root.resolve())
+    assert identity["query_root_head_commit"] == candidate_commit
+    assert identity["canonical_project_root"] == str(canonical_root.resolve())
+    assert identity["canonical_head_commit"] == canonical_commit
+    assert identity["repository_identity_match"] is False
+    assert identity["repository_identity_authority"] == (
+        "exact_candidate_snapshot_materialization_provenance"
+    )
+    assert identity["snapshot_execution_root_verified"] is True
+    assert trace["graph_basis"] == "exact_candidate_snapshot"
+    assert trace["changed_files"] == ["src/candidate.py"]
+    assert trace["changed_files_source"] == (
+        "server_runtime_context_base_to_exact_candidate_diff"
+    )
+    assert identity["comparison_base_commit_sha"] == comparison_base_commit
+
+
+def test_exact_snapshot_separate_execution_root_provenance_is_fail_closed(
+    tmp_path,
+):
+    canonical_root = tmp_path / "qa-exact-snapshot-tampered-canonical"
+    _init_test_git_repo(canonical_root)
+    candidate_root = tmp_path / "qa-exact-snapshot-tampered-candidate"
+    candidate_commit = _init_test_git_repo(candidate_root)
+    provenance = describe_checkout(candidate_root, project_id=PID)
+    provenance["canonical_project_identity"]["commit_sha"] = "f" * 40
+
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_exact_candidate_context(
+            candidate_root,
+            project_id=PID,
+            canonical_project_root=canonical_root,
+            candidate_commit_sha=candidate_commit,
+            exact_snapshot_materialization_provenance=provenance,
+        )
+
+    assert exc.value.reason == (
+        "exact_candidate_snapshot_materialization_identity_mismatch"
+    )
+    assert exc.value.details["identity_mismatches"] == [
+        {
+            "field": "snapshot_candidate_commit",
+            "expected": candidate_commit,
+            "actual": "f" * 40,
+        }
+    ]
+
+
 def test_bounded_qa_graph_query_accepts_owner_registered_cross_project_demo_marker(
     conn,
     tmp_path,
@@ -42812,7 +43000,9 @@ def _registered_allocator_worktree_fixture(conn, tmp_path):
             backlog_id="AC-QA-EXACT-REGISTERED-WORKER",
             parent_task_id="cex-qa-exact-registered-worker",
             root_task_id="cex-qa-exact-registered-worker",
-            target_project_root=str(project_root),
+            # Live allocator contexts bind the assigned target to the linked
+            # worktree itself, not to the canonical repository root.
+            target_project_root=str(worktree),
             worktree_path=str(worktree),
             branch_ref="refs/heads/qa-exact-registered-worker",
             base_commit=candidate_commit,
@@ -42853,6 +43043,92 @@ def test_exact_candidate_context_ignores_clean_registered_allocator_worktree(
     ] == [".worktrees/registered-worker"]
 
 
+def test_bounded_qa_active_exact_snapshot_ignores_self_targeted_allocator_worktree(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    project_root, worktree, candidate_commit = (
+        _registered_allocator_worktree_fixture(conn, tmp_path)
+    )
+    branch_cache = worktree / ".aming-claw" / "cache" / "branches" / "worker"
+    branch_cache.mkdir(parents=True)
+    (branch_cache / "graph.branch.overlay.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    bytecode_cache = worktree / "src" / "__pycache__"
+    bytecode_cache.mkdir(parents=True)
+    (bytecode_cache / "candidate.cpython-314.pyc").write_bytes(b"generated")
+    snapshot_id = "full-exact-self-targeted-allocator"
+    backlog_id = "AC-QA-EXACT-SELF-TARGETED-ALLOCATOR"
+    task_id = "qa-exact-self-targeted-allocator"
+    _activate_basic_graph(
+        conn,
+        snapshot_id,
+        commit_sha=candidate_commit,
+    )
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=candidate_commit,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{candidate_commit}",
+        qa_scope_binding_ref,
+    ]
+    registered = server.role_service.register(
+        conn,
+        "qa:exact-self-targeted-allocator",
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, raw=None, **_kwargs: (
+            Path(raw).resolve() if raw else project_root
+        ),
+    )
+    qa_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": "active",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "commit_sha": candidate_commit,
+            "project_root": str(project_root),
+        },
+    )
+    qa_ctx._session.update(
+        {
+            "session_id": registered["session_id"],
+            "principal_id": "qa:exact-self-targeted-allocator",
+            "scope": qa_scope,
+        }
+    )
+
+    queried = server.handle_graph_governance_query(qa_ctx)
+
+    trace = server.handle_graph_governance_query_trace_get(
+        _ctx({"project_id": PID, "trace_id": queried["trace_id"]})
+    )["trace"]
+    assert trace["root_identity"]["query_root_clean"] is True
+    assert trace["root_identity"][
+        "query_root_ignored_registered_allocator_worktree_paths"
+    ] == [worktree.relative_to(project_root).as_posix()]
+
+
 def test_exact_candidate_context_rejects_dirty_registered_allocator_worktree(
     conn,
     tmp_path,
@@ -42881,6 +43157,41 @@ def test_exact_candidate_context_rejects_dirty_registered_allocator_worktree(
     assert exc.value.details[
         "ignored_registered_allocator_worktree_entry_count"
     ] == 0
+
+
+def test_allocator_worktree_does_not_ignore_tracked_generated_path_changes(
+    conn,
+    tmp_path,
+):
+    project_root, worktree, _candidate_commit = (
+        _registered_allocator_worktree_fixture(conn, tmp_path)
+    )
+    cache_file = worktree / ".aming-claw" / "cache" / "tracked.json"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_text("{}\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", ".aming-claw/cache/tracked.json"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "track generated-path fixture"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    cache_file.write_text('{"dirty": true}\n', encoding="utf-8")
+
+    registered = server._qa_registered_allocator_worktree_paths(
+        conn,
+        project_id=PID,
+        canonical_project_root=project_root,
+    )
+
+    assert registered == []
 
 
 def test_exact_candidate_context_rejects_unregistered_allocator_lookalike(

@@ -8407,6 +8407,7 @@ def _qa_checkout_root_identity(
     require_query_candidate_head: bool = False,
     require_query_review_head: bool = True,
     registered_allocator_worktree_paths: Sequence[str] = (),
+    exact_snapshot_materialization_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     from .checkout_provenance import describe_checkout
 
@@ -8425,6 +8426,111 @@ def _qa_checkout_root_identity(
     canonical_common = str(canonical_git.get("git_common_dir") or "")
     query_remote = str(query_git.get("remote_url") or "")
     canonical_remote = str(canonical_git.get("remote_url") or "")
+    query_head = str(query.get("commit_sha") or "").strip().lower()
+    snapshot_provenance = (
+        exact_snapshot_materialization_provenance
+        if isinstance(exact_snapshot_materialization_provenance, Mapping)
+        else {}
+    )
+    snapshot_execution_root_verified = False
+    if snapshot_provenance:
+        snapshot_git = (
+            snapshot_provenance.get("git")
+            if isinstance(snapshot_provenance.get("git"), Mapping)
+            else {}
+        )
+        snapshot_project_identity = (
+            snapshot_provenance.get("canonical_project_identity")
+            if isinstance(
+                snapshot_provenance.get("canonical_project_identity"), Mapping
+            )
+            else {}
+        )
+        snapshot_execution_root = str(
+            snapshot_provenance.get("execution_root") or ""
+        ).strip()
+        snapshot_worktree_root = str(
+            snapshot_git.get("worktree_root") or ""
+        ).strip()
+        snapshot_common = str(snapshot_git.get("git_common_dir") or "").strip()
+        snapshot_remote = str(snapshot_git.get("remote_url") or "")
+        identity_mismatches: list[dict[str, Any]] = []
+
+        def _record_snapshot_mismatch(
+            field: str,
+            expected: Any,
+            actual: Any,
+        ) -> None:
+            if actual != expected:
+                identity_mismatches.append(
+                    {"field": field, "expected": expected, "actual": actual}
+                )
+
+        _record_snapshot_mismatch(
+            "snapshot_execution_root",
+            str(query_root.resolve()),
+            (
+                str(Path(snapshot_execution_root).resolve())
+                if snapshot_execution_root
+                else ""
+            ),
+        )
+        _record_snapshot_mismatch(
+            "snapshot_execution_root_role",
+            "execution_root",
+            str(snapshot_provenance.get("execution_root_role") or ""),
+        )
+        _record_snapshot_mismatch(
+            "snapshot_project_identity_type",
+            "git",
+            str(snapshot_project_identity.get("type") or ""),
+        )
+        _record_snapshot_mismatch(
+            "snapshot_project_id",
+            project_id,
+            str(snapshot_project_identity.get("project_id") or ""),
+        )
+        _record_snapshot_mismatch(
+            "snapshot_candidate_commit",
+            candidate_commit_sha,
+            str(snapshot_project_identity.get("commit_sha") or "")
+            .strip()
+            .lower(),
+        )
+        _record_snapshot_mismatch(
+            "snapshot_query_root_head",
+            candidate_commit_sha,
+            query_head,
+        )
+        _record_snapshot_mismatch(
+            "snapshot_git_worktree_root",
+            str(query_root.resolve()),
+            (
+                str(Path(snapshot_worktree_root).resolve())
+                if snapshot_worktree_root
+                else ""
+            ),
+        )
+        _record_snapshot_mismatch(
+            "snapshot_git_common_dir",
+            str(Path(query_common).resolve()) if query_common else "",
+            str(Path(snapshot_common).resolve()) if snapshot_common else "",
+        )
+        _record_snapshot_mismatch(
+            "snapshot_git_remote_url",
+            query_remote,
+            snapshot_remote,
+        )
+        if identity_mismatches:
+            _qa_overlay_fail(
+                "exact_candidate_snapshot_materialization_identity_mismatch",
+                (
+                    "exact candidate snapshot execution-root provenance no "
+                    "longer matches the immutable candidate checkout"
+                ),
+                identity_mismatches=identity_mismatches,
+            )
+        snapshot_execution_root_verified = True
     query_repository_identity_hash = stable_sha256(
         {
             "type": "git",
@@ -8441,7 +8547,10 @@ def _qa_checkout_root_identity(
             "remote_url": canonical_remote,
         }
     )
-    if query_repository_identity_hash != repository_identity_hash:
+    repository_identity_match = (
+        query_repository_identity_hash == repository_identity_hash
+    )
+    if not repository_identity_match and not snapshot_execution_root_verified:
         _qa_overlay_fail(
             "query_root_repository_mismatch",
             "QA query root is not a checkout of the registered canonical repository",
@@ -8461,7 +8570,6 @@ def _qa_checkout_root_identity(
             expected_candidate_commit_sha=candidate_commit_sha,
             canonical_head_commit=canonical_head,
         )
-    query_head = str(query.get("commit_sha") or "").strip().lower()
     accepted_query_heads = (
         {candidate_commit_sha}
         if require_query_candidate_head
@@ -8603,7 +8711,14 @@ def _qa_checkout_root_identity(
         ),
         "canonical_project_identity_hash": canonical_project_identity_hash,
         "repository_identity_hash": repository_identity_hash,
-        "repository_identity_match": True,
+        "query_repository_identity_hash": query_repository_identity_hash,
+        "repository_identity_match": repository_identity_match,
+        "repository_identity_authority": (
+            "registered_canonical_repository"
+            if repository_identity_match
+            else "exact_candidate_snapshot_materialization_provenance"
+        ),
+        "snapshot_execution_root_verified": snapshot_execution_root_verified,
     }
     if require_query_candidate_head:
         identity.update(
@@ -8629,12 +8744,14 @@ def _qa_registered_allocator_worktree_paths(
     project_id: str,
     canonical_project_root: Path,
 ) -> list[str]:
-    """Return clean, registered Git worktrees owned by the project allocator.
+    """Return governance-clean registered worktrees owned by the allocator.
 
     The canonical repository sees linked worktrees below ``.worktrees`` as
     untracked directories.  Exact-candidate QA may ignore only directories
     that are both registered in BranchRuntimeContext and independently proven
-    to be clean linked worktrees of this canonical repository.
+    to be linked worktrees of this canonical repository.  The shared
+    dirty-worktree policy may ignore only known generated/cache artifacts
+    inside the linked worktree; product dirtiness still rejects the path.
     """
 
     canonical_root = Path(canonical_project_root).resolve()
@@ -8669,7 +8786,10 @@ def _qa_registered_allocator_worktree_paths(
     for row in rows:
         target_root = Path(str(row["target_project_root"] or "")).resolve()
         worktree_root = Path(str(row["worktree_path"] or "")).resolve()
-        if target_root != canonical_root or worktree_root == allocator_root:
+        if (
+            target_root not in {canonical_root, worktree_root}
+            or worktree_root == allocator_root
+        ):
             continue
         try:
             worktree_root.relative_to(allocator_root)
@@ -8688,9 +8808,20 @@ def _qa_registered_allocator_worktree_paths(
             continue
         clean_proc = _qa_git_bytes(
             worktree_root,
-            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            ["status", "--porcelain=v1", "--untracked-files=all"],
         )
-        if clean_proc.returncode != 0 or clean_proc.stdout:
+        governed_dirty_paths: list[str] = []
+        for line in clean_proc.stdout.decode(
+            "utf-8", errors="surrogateescape"
+        ).splitlines():
+            dirty_paths = parse_git_porcelain_paths(line)
+            if not dirty_paths:
+                governed_dirty_paths.append("<unparseable-git-status-entry>")
+                continue
+            if line.startswith("?? ") and not filter_dirty_files(dirty_paths):
+                continue
+            governed_dirty_paths.extend(dirty_paths)
+        if clean_proc.returncode != 0 or governed_dirty_paths:
             continue
         registered.append(str(worktree_root))
     return sorted(dict.fromkeys(registered))
@@ -8973,6 +9104,7 @@ def _qa_exact_candidate_context(
     comparison_base_commit_source: str = "",
     comparison_authority_required: bool = False,
     registered_allocator_worktree_paths: Sequence[str] = (),
+    exact_snapshot_materialization_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     from . import graph_query_trace
 
@@ -8993,6 +9125,9 @@ def _qa_exact_candidate_context(
         require_query_candidate_head=True,
         registered_allocator_worktree_paths=(
             registered_allocator_worktree_paths
+        ),
+        exact_snapshot_materialization_provenance=(
+            exact_snapshot_materialization_provenance
         ),
     )
     comparison_base_commit_sha = str(
@@ -9018,7 +9153,7 @@ def _qa_exact_candidate_context(
         )
     if comparison_base_commit_sha:
         diff_identity = _qa_exact_candidate_diff_identity(
-            canonical_project_root,
+            project_root,
             base_commit_sha=comparison_base_commit_sha,
             candidate_commit_sha=candidate_commit_sha,
             comparison_base_commit_source=(
@@ -10553,6 +10688,24 @@ def _qa_reverify_candidate_trace_context(
     except (TypeError, ValueError, json.JSONDecodeError):
         root_identity = {}
     query_root_raw = str(root_identity.get("query_root") or "").strip()
+    snapshot = graph_snapshot_store.get_graph_snapshot(
+        conn,
+        project_id,
+        str(row["snapshot_id"] or "").strip(),
+    ) or {}
+    snapshot_materialization = (
+        graph_snapshot_store.snapshot_materialization_provenance(snapshot)
+    )
+    snapshot_execution_root = str(
+        snapshot_materialization.get("execution_root") or ""
+    ).strip()
+    snapshot_execution_root_authoritative = bool(
+        root_identity.get("snapshot_execution_root_verified")
+        and snapshot_execution_root
+        and query_root_raw
+        and Path(snapshot_execution_root).resolve()
+        == Path(query_root_raw).resolve()
+    )
     canonical_root = project_service.resolve_project_root(
         project_id, None, fallback_self=True
     )
@@ -10582,7 +10735,11 @@ def _qa_reverify_candidate_trace_context(
         ),
         "",
     )
-    if supplied_root and Path(supplied_root).resolve() != Path(query_root_raw).resolve():
+    if (
+        supplied_root
+        and Path(supplied_root).resolve() != Path(query_root_raw).resolve()
+        and not snapshot_execution_root_authoritative
+    ):
         mismatches.append(
             {
                 "trace_id": trace_id,
@@ -10666,6 +10823,18 @@ def _qa_reverify_candidate_trace_context(
                 comparison_authority_required=bool(
                     review_context.get("comparison_authority_required")
                     or root_identity.get("comparison_authority_required")
+                ),
+                registered_allocator_worktree_paths=(
+                    _qa_registered_allocator_worktree_paths(
+                        conn,
+                        project_id=project_id,
+                        canonical_project_root=Path(canonical_root),
+                    )
+                ),
+                exact_snapshot_materialization_provenance=(
+                    snapshot_materialization
+                    if snapshot_execution_root_authoritative
+                    else None
                 ),
             )
         except _QACandidateOverlayError as exc:
@@ -11330,6 +11499,16 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                     )
                 )
             else:
+                snapshot_materialization = (
+                    graph_snapshot_store.snapshot_materialization_provenance(
+                        snapshot
+                    )
+                )
+                snapshot_execution_root = str(
+                    snapshot_materialization.get("execution_root") or ""
+                ).strip()
+                if snapshot_execution_root:
+                    query_root = Path(snapshot_execution_root).resolve()
                 escalation = graph_query_trace.latest_qa_graph_basis_escalation(
                     conn,
                     ctx.get_project_id(),
@@ -11379,6 +11558,11 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                                     project_id=ctx.get_project_id(),
                                     canonical_project_root=Path(canonical_root),
                                 )
+                            ),
+                            exact_snapshot_materialization_provenance=(
+                                snapshot_materialization
+                                if snapshot_execution_root
+                                else None
                             ),
                         ),
                     }
@@ -57762,7 +57946,7 @@ def handle_graph_governance_query(ctx: RequestContext):
     """Run one graph query and append it to an auditable trace."""
     project_id = ctx.get_project_id()
     body = ctx.body
-    from . import graph_query_trace
+    from . import graph_query_trace, graph_snapshot_store
     from .db import sqlite_write_lock
 
     tool = str(body.get("tool") or "")
@@ -57797,7 +57981,13 @@ def handle_graph_governance_query(ctx: RequestContext):
             or body.get("repo_root")
         ):
             root = _graph_governance_project_root(project_id, body)
-        if root is None and qa_proof:
+        if qa_proof.get("graph_basis") == "exact_candidate_snapshot":
+            root_identity = qa_proof.get("root_identity")
+            if isinstance(root_identity, Mapping) and root_identity.get(
+                "query_root"
+            ):
+                root = Path(str(root_identity["query_root"]))
+        elif root is None and qa_proof:
             root_identity = qa_proof.get("root_identity")
             if isinstance(root_identity, Mapping) and root_identity.get("query_root"):
                 root = Path(str(root_identity["query_root"]))
@@ -57947,16 +58137,27 @@ def handle_graph_governance_query(ctx: RequestContext):
                             409,
                             {},
                         )
+                    canonical_project_root = Path(
+                        project_service.resolve_project_root(
+                            project_id,
+                            None,
+                            fallback_self=True,
+                        )
+                    )
+                    exact_snapshot = graph_snapshot_store.get_graph_snapshot(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                    ) or {}
+                    exact_snapshot_materialization = (
+                        graph_snapshot_store.snapshot_materialization_provenance(
+                            exact_snapshot
+                        )
+                    )
                     recomputed_exact = _qa_exact_candidate_context(
                         Path(root),
                         project_id=project_id,
-                        canonical_project_root=Path(
-                            project_service.resolve_project_root(
-                                project_id,
-                                None,
-                                fallback_self=True,
-                            )
-                        ),
+                        canonical_project_root=canonical_project_root,
                         candidate_commit_sha=str(
                             qa_proof.get("candidate_commit_sha") or ""
                         ),
@@ -58013,6 +58214,20 @@ def handle_graph_governance_query(ctx: RequestContext):
                                 )
                                 else {}
                             ).get("comparison_authority_required")
+                        ),
+                        registered_allocator_worktree_paths=(
+                            _qa_registered_allocator_worktree_paths(
+                                conn,
+                                project_id=project_id,
+                                canonical_project_root=canonical_project_root,
+                            )
+                        ),
+                        exact_snapshot_materialization_provenance=(
+                            exact_snapshot_materialization
+                            if exact_snapshot_materialization.get(
+                                "execution_root"
+                            )
+                            else None
                         ),
                     )
                     exact_mismatches = [
