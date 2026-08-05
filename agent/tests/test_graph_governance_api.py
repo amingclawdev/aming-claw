@@ -15093,6 +15093,9 @@ def test_service_generated_dispatch_persistence_recursively_scrubs_credentials(
         "runtime_context_id": runtime_context_id,
         "worker_slot_id": f"worker-{lane}",
         "fence_token": raw_fence_token,
+        "fence_token_hash": "sha256:caller-supplied-wrong-top-level-hash",
+        "fence_token_redacted": False,
+        "raw_fence_token_persisted": True,
         "worktree_path": str(tmp_path / lane),
         "branch_ref": f"refs/heads/codex/{lane}",
         "base_commit": f"base-{lane}",
@@ -15109,11 +15112,27 @@ def test_service_generated_dispatch_persistence_recursively_scrubs_credentials(
             "nested_credentials": {
                 "fence_token": raw_fence_token,
                 "fence_token_hash": "sha256:caller-supplied-wrong-fence-hash",
+                "fence_token_redacted": False,
+                "raw_fence_token_persisted": True,
                 "session_token": raw_session_token,
+                "session_token_redacted": False,
                 "raw_session_token_persisted": True,
                 "route_token": raw_route_token,
                 "route_token_hash": "sha256:caller-supplied-wrong-route-hash",
+                "route_token_redacted": False,
+                "raw_route_token_persisted": True,
                 "echo": f"{raw_fence_token}:{raw_session_token}:{raw_route_token}",
+                "copy_safe_placeholder": {
+                    "fence_token": (
+                        "<read from env:AMING_WORKER_FENCE_TOKEN "
+                        "at submission time>"
+                    ),
+                    "fence_token_hash": (
+                        "sha256:caller-supplied-wrong-placeholder-hash"
+                    ),
+                    "fence_token_redacted": False,
+                    "raw_fence_token_persisted": True,
+                },
             }
         },
     }
@@ -15163,6 +15182,11 @@ def test_service_generated_dispatch_persistence_recursively_scrubs_credentials(
     )
     assert nested["route_token_redacted"] is True
     assert nested["raw_route_token_persisted"] is False
+    placeholder = nested["copy_safe_placeholder"]
+    assert placeholder["fence_token"].startswith("<read from env:")
+    assert placeholder["fence_token_hash"] == expected_fence_hash
+    assert placeholder["fence_token_redacted"] is True
+    assert placeholder["raw_fence_token_persisted"] is False
     assert nested["echo"] == ":".join(
         (
             expected_fence_hash,
@@ -75149,6 +75173,31 @@ def test_ordinary_mf_parallel_capsule_fetches_all_sections(conn):
         )
     )
     assert entered["ok"] is True
+
+    service_record = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=route_ref,
+    )
+    service_record = server._onboard_service_refresh_execution_state(
+        service_record,
+        completed_lines=[server._onboard_service_waiver_line()],
+        route_token_ref=route_ref,
+        revision=100,
+    )
+    server._contract_runtime_store(conn).update(
+        service_record["contract_execution_id"],
+        service_record,
+    )
+    shadowed = server.read_backlog_contract_chain_current(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    assert shadowed["current_contract_execution_id"] == service_record[
+        "contract_execution_id"
+    ]
 
     compact = server.handle_project_onboard_route_guide(
         _ctx_with_role(

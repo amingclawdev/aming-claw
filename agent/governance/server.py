@@ -805,6 +805,15 @@ def _observer_runtime_text_prepare_persistable_payload(
                 collect_raw_secrets(item)
 
     collect_raw_secrets(prepared)
+    canonical_fence_hashes = tuple(
+        sorted(
+            {
+                runtime_context_secret_hash(secret)
+                for secret in raw_fence_values
+                if secret
+            }
+        )
+    )
 
     def scrub_text(value: str) -> str:
         text = str(value or "")
@@ -885,6 +894,20 @@ def _observer_runtime_text_prepare_persistable_payload(
                     fence_text = str(nested or "").strip()
                     if _looks_like_placeholder(fence_text):
                         result["fence_token"] = fence_text
+                        supplied_fence_hash = str(
+                            value.get("fence_token_hash") or ""
+                        ).strip()
+                        canonical_fence_hash = (
+                            supplied_fence_hash
+                            if supplied_fence_hash in canonical_fence_hashes
+                            else (
+                                canonical_fence_hashes[0]
+                                if len(canonical_fence_hashes) == 1
+                                else ""
+                            )
+                        )
+                        if canonical_fence_hash:
+                            result["fence_token_hash"] = canonical_fence_hash
                         result["fence_token_redacted"] = True
                         result["raw_fence_token_persisted"] = False
                     else:
@@ -76531,6 +76554,160 @@ def _contract_chain_current_with_runtime_freshness(
     return overlay
 
 
+def _contract_chain_current_with_unique_active_mf_parallel(
+    conn,
+    current_projection: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    """Keep an entered mf_parallel child ahead of a guide-service root.
+
+    The guide service is a separately rooted compatibility execution.  Its
+    revision can advance after an ordinary source-backed mf_parallel child has
+    entered, but that bookkeeping must not make the completed service root the
+    current continuation.  Recover only one unambiguous active child and leave
+    every ambiguous or unrelated projection unchanged.
+    """
+
+    current = dict(current_projection or {})
+    current_execution_id = str(
+        current.get("current_contract_execution_id") or ""
+    ).strip()
+    if not current_execution_id:
+        return current
+    store = _contract_runtime_store(conn)
+    try:
+        selected_record = store.get(current_execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return current
+    if not _onboard_service_record(selected_record):
+        return current
+    try:
+        records = store.list_by_backlog(
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    except sqlite3.Error:
+        return current
+    candidates = [
+        record
+        for record in records
+        if _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+        and str(record.get("parent_contract_execution_id") or "").strip()
+        and not _runtime_record_is_complete(record)
+    ]
+    if len(candidates) != 1:
+        return current
+    candidate = candidates[0]
+    candidate_id = str(candidate.get("contract_execution_id") or "").strip()
+    root_id = str(candidate.get("root_contract_execution_id") or "").strip()
+    chain_id = str(candidate.get("contract_chain_id") or "").strip()
+    try:
+        root_record = store.get(root_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return current
+    if not (
+        candidate_id
+        and root_id
+        and chain_id
+        and str(candidate.get("project_id") or "") == project_id
+        and str(candidate.get("backlog_id") or "") == backlog_id
+        and str(root_record.get("project_id") or "") == project_id
+        and str(root_record.get("backlog_id") or "") == backlog_id
+        and not _onboard_service_record(root_record)
+    ):
+        return current
+    try:
+        projected_record, runtime_context_projection = (
+            _contract_runtime_apply_mf_parallel_context_projection(
+                conn,
+                project_id=project_id,
+                record=candidate,
+                actor_role=None,
+            )
+        )
+    except (ContractRuntimeError, StalePinnedContractExecutionError, sqlite3.Error):
+        return current
+    guide = (
+        projected_record.get("runtime_guide")
+        if isinstance(projected_record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_action = _runtime_next_action_from_guide(
+        guide,
+        source="backlog_contract_chain_current",
+    )
+    readiness_state = (
+        _runtime_readiness_state_from_guide(guide) or "contract_active"
+    )
+    current_state = _runtime_current_state_from_record(projected_record)
+    revision = int(current_state.get("execution_state_revision") or 0)
+    chain_records = [
+        record
+        for record in records
+        if str(record.get("contract_chain_id") or "").strip() == chain_id
+    ]
+    execution_ids = sorted(
+        str(record.get("contract_execution_id") or "").strip()
+        for record in chain_records
+        if str(record.get("contract_execution_id") or "").strip()
+    )
+    overlay = dict(current)
+    durable_projection_hash = str(current.get("projection_hash") or "")
+    if durable_projection_hash:
+        overlay["durable_projection_hash"] = durable_projection_hash
+    overlay.update(
+        {
+            "contract_chain_id": chain_id,
+            "root_contract_execution_id": root_id,
+            "current_contract_execution_id": candidate_id,
+            "current_contract_id": str(candidate.get("contract_id") or ""),
+            "parent_to_resume_contract_execution_id": "",
+            "active_child_contract_execution_id": candidate_id,
+            "readiness_state": readiness_state,
+            "generation": revision,
+            "active_chain": {
+                "schema_version": "backlog_contract_chain.active_chain.v1",
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "contract_chain_id": chain_id,
+                "root_contract_execution_id": root_id,
+                "execution_count": len(execution_ids),
+                "execution_ids": execution_ids,
+            },
+            "next_legal_action": dict(next_action),
+            "source_of_proof": "contract_runtime_executions.completed_lines",
+            "projection_selection_correction": {
+                "schema_version": (
+                    "backlog_contract_chain_current."
+                    "guide_service_active_child_correction.v1"
+                ),
+                "status": "unique_active_mf_parallel_selected",
+                "shadowed_guide_service_execution_id": current_execution_id,
+                "current_contract_execution_id": candidate_id,
+                "candidate_count": 1,
+                "source_of_authority": "contract_runtime",
+            },
+        }
+    )
+    if runtime_context_projection:
+        overlay["projection_selection_correction"][
+            "runtime_context_projection"
+        ] = runtime_context_projection
+    overlay.pop("terminal", None)
+    overlay.pop("terminal_disposition", None)
+    source_ref = f"contract_runtime:{candidate_id}:revision:{revision}"
+    source_refs = list(overlay.get("source_refs") or [])
+    if source_ref not in source_refs:
+        source_refs.append(source_ref)
+    overlay["source_refs"] = source_refs
+    overlay["projection_hash"] = contract_chain_projection_hash(overlay)
+    return overlay
+
+
 def _contract_chain_current_projection(
     conn,
     *,
@@ -76547,9 +76724,15 @@ def _contract_chain_current_projection(
             rebuild_if_missing=False,
         )
         if current_projection or not rebuild_if_missing:
-            return _contract_chain_current_with_runtime_freshness(
+            current_projection = _contract_chain_current_with_runtime_freshness(
                 conn,
                 current_projection,
+            )
+            return _contract_chain_current_with_unique_active_mf_parallel(
+                conn,
+                current_projection,
+                project_id=project_id,
+                backlog_id=backlog_id,
             )
         try:
             rebuilt_projection = rebuild_backlog_contract_chain_projection(
@@ -76560,9 +76743,15 @@ def _contract_chain_current_projection(
         except sqlite3.Error:
             rebuilt_projection = {}
         if rebuilt_projection:
-            return _contract_chain_current_with_runtime_freshness(
+            rebuilt_projection = _contract_chain_current_with_runtime_freshness(
                 conn,
                 rebuilt_projection,
+            )
+            return _contract_chain_current_with_unique_active_mf_parallel(
+                conn,
+                rebuilt_projection,
+                project_id=project_id,
+                backlog_id=backlog_id,
             )
         record = _onboard_service_materialize_parent_record(
             conn,
@@ -76572,11 +76761,17 @@ def _contract_chain_current_projection(
         )
         projected = record.get("contract_chain_current")
         if isinstance(projected, Mapping) and projected:
-            return _contract_chain_current_with_runtime_freshness(
+            projected = _contract_chain_current_with_runtime_freshness(
                 conn,
                 projected,
             )
-        return _contract_chain_current_with_runtime_freshness(
+            return _contract_chain_current_with_unique_active_mf_parallel(
+                conn,
+                projected,
+                project_id=project_id,
+                backlog_id=backlog_id,
+            )
+        current_projection = _contract_chain_current_with_runtime_freshness(
             conn,
             read_backlog_contract_chain_current(
                 conn,
@@ -76584,6 +76779,12 @@ def _contract_chain_current_projection(
                 backlog_id=backlog_id,
                 rebuild_if_missing=True,
             ),
+        )
+        return _contract_chain_current_with_unique_active_mf_parallel(
+            conn,
+            current_projection,
+            project_id=project_id,
+            backlog_id=backlog_id,
         )
     except sqlite3.Error as exc:
         return {
