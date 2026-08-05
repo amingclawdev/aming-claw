@@ -27942,6 +27942,7 @@ def _runtime_context_implementation_resolved_ref_route_identity(
 
 
 def _runtime_context_rejoin_resolved_ref_route_identity(
+    conn,
     body: Mapping[str, Any],
     supplied_route_identity: Mapping[str, Any],
     *,
@@ -27985,20 +27986,37 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
         public_route_token_ref
         == _RUNTIME_CONTEXT_REJOIN_REDACTED_REF_ACTUAL
     )
+    expected_ref = str(
+        expected_route_identity.get("route_token_ref") or ""
+    ).strip()
+    resolved_via_pre_lineage_descendant = False
 
     try:
-        resolved = _runtime_context_resolve_implementation_route_token_ref(
-            resolution_body,
-            project_id=project_id,
-            context=context,
-            contract_execution_id=contract_execution_id,
-        )
+        if (
+            pre_lineage_recovery
+            and expected_ref
+            and route_token_ref == expected_ref
+            and not pre_resolution_mismatches
+        ):
+            resolved = _orc.resolve_route_token_ref_renewal_descendant(
+                conn,
+                project_id=project_id,
+                route_token_ref=route_token_ref,
+            )
+            resolved_via_pre_lineage_descendant = bool(
+                resolved
+                and isinstance(resolved.get("renewal_resolution"), Mapping)
+            )
+        else:
+            resolved = _runtime_context_resolve_implementation_route_token_ref(
+                resolution_body,
+                project_id=project_id,
+                context=context,
+                contract_execution_id=contract_execution_id,
+            )
     except _orc.RouteTokenRefError as exc:
         identity_mismatches = list(pre_resolution_mismatches)
         if not identity_mismatches:
-            expected_ref = str(
-                expected_route_identity.get("route_token_ref") or ""
-            ).strip()
             identity_mismatches.append(
                 {
                     "field": "route_token_ref",
@@ -28038,9 +28056,6 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
     if not resolved:
         identity_mismatches = list(pre_resolution_mismatches)
         if not identity_mismatches:
-            expected_ref = str(
-                expected_route_identity.get("route_token_ref") or ""
-            ).strip()
             identity_mismatches.append(
                 {
                     "field": "route_token_ref",
@@ -28071,21 +28086,92 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
             },
         )
 
-    resolved_identity, lineage_payload = (
-        _runtime_context_implementation_resolved_ref_route_identity(
+    if resolved_via_pre_lineage_descendant:
+        renewal_resolution = dict(resolved.get("renewal_resolution") or {})
+        resolved_ref = str(
+            renewal_resolution.get("resolved_route_token_ref") or ""
+        ).strip()
+        expected_scope = {
+            "project_id": project_id,
+            "backlog_id": str(
+                getattr(context, "backlog_id", "") or ""
+            ).strip(),
+            "task_id": str(getattr(context, "task_id", "") or "").strip(),
+        }
+        resolution_scope = dict(renewal_resolution.get("scope") or {})
+        if (
+            not resolved_ref
+            or resolved_ref == expected_ref
+            or renewal_resolution.get("registry_verified") is not True
+            or renewal_resolution.get("exact_scope_verified") is not True
+            or any(
+                str(resolution_scope.get(field) or "").strip() != value
+                for field, value in expected_scope.items()
+            )
+        ):
+            raise GovernanceError(
+                "runtime_context_pre_lineage_rejoin_route_descendant_unproven",
+                "pre-lineage rejoin route ref did not resolve through a registry-proven exact-scope renewal descendant",
+                403,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": getattr(context, "task_id", ""),
+                    "next_legal_action": (
+                        "repair_exact_scope_route_ref_renewal_lineage_and_retry_"
+                        "runtime_context_session_token_rejoin"
+                    ),
+                    "credential_rotated": False,
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                },
+            )
+        resolved_identity = _runtime_context_route_identity_from_child_token(
             resolved,
-            route_token_ref=route_token_ref,
-            runtime_context_id=runtime_context_id,
-            context=context,
-            parent_route_identity=expected_route_identity,
+            route_token_ref=resolved_ref,
         )
-    )
+        lineage_payload = {
+            key: dict(resolved.get(key) or {})
+            for key in (
+                "parent_route_lineage",
+                "child_route_lineage",
+                "route_lineage",
+            )
+            if isinstance(resolved.get(key), Mapping)
+        }
+        lineage_payload.update(
+            {
+                "pre_lineage_route_token_ref_renewal": renewal_resolution,
+                "renewed_route_token_ref": {
+                    "renewed_from": expected_ref,
+                    "route_token_ref": resolved_ref,
+                    "registry_verified": True,
+                    "raw_route_token_exposed": False,
+                },
+                "resolved_route_scope": expected_scope,
+                "_runtime_context_pre_lineage_route_successor_resolved": True,
+            }
+        )
+    else:
+        resolved_identity, lineage_payload = (
+            _runtime_context_implementation_resolved_ref_route_identity(
+                resolved,
+                route_token_ref=route_token_ref,
+                runtime_context_id=runtime_context_id,
+                context=context,
+                parent_route_identity=expected_route_identity,
+            )
+        )
     supplied_mismatches = []
     for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
         supplied = str(supplied_route_identity.get(field) or "").strip()
         if not supplied:
             continue
-        authoritative = str(resolved_identity.get(field) or "").strip()
+        authoritative_identity = (
+            expected_route_identity
+            if resolved_via_pre_lineage_descendant
+            else resolved_identity
+        )
+        authoritative = str(authoritative_identity.get(field) or "").strip()
         if authoritative and supplied != authoritative:
             supplied_mismatches.append(
                 {
@@ -28503,6 +28589,9 @@ def _runtime_context_append_resolved_route_ref_contract_revision(
             or lineage_payload.get("_runtime_context_route_ref_resolved")
             or lineage_payload.get("_runtime_context_rejoin_route_ref_resolved")
             or lineage_payload.get("_runtime_context_initial_join_route_ref_resolved")
+            or lineage_payload.get(
+                "_runtime_context_pre_lineage_route_successor_resolved"
+            )
         ),
         "raw_route_token_exposed": False,
     }
@@ -36448,6 +36537,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         rejoin_route_lineage_payload: dict[str, Any] = {}
         resolved_route_identity, rejoin_route_lineage_payload = (
             _runtime_context_rejoin_resolved_ref_route_identity(
+                conn,
                 body,
                 supplied_route_identity,
                 project_id=project_id,
@@ -36507,6 +36597,14 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         selected_route_identity = (
             resolved_route_identity if resolved_route_identity else expected_route_identity
         )
+        pre_lineage_authority_route_identity = (
+            expected_route_identity
+            if rejoin_route_lineage_payload.get(
+                "_runtime_context_pre_lineage_route_successor_resolved"
+            )
+            is True
+            else selected_route_identity
+        )
         pre_lineage_bootstrap_rejoin_authority: dict[str, Any] = {}
         if missing_lineage:
             pre_lineage_bootstrap_rejoin_authority = (
@@ -36517,7 +36615,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     runtime_context_id=runtime_context_id,
                     body=body,
                     contract_execution_id=resolved_contract_execution_id,
-                    route_identity=selected_route_identity,
+                    route_identity=pre_lineage_authority_route_identity,
                     timeline_events=timeline_events,
                     effective_read_receipt_ref=effective_read_receipt_ref,
                     effective_startup_ref=effective_startup_ref,
@@ -37043,6 +37141,12 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
             if str(selected_route_identity.get(field) or "").strip()
         }
+        pre_lineage_route_successor_rebind = bool(
+            rejoin_route_lineage_payload.get(
+                "_runtime_context_pre_lineage_route_successor_resolved"
+            )
+            is True
+        )
         renewed_contract_revision = None
         if (
             resolved_route_identity
@@ -37051,7 +37155,10 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "validated_missing_finish_auth_only_rejoin"
             )
             is not True
-            and result.get("pre_lineage_auth_only_rejoin") is not True
+            and (
+                result.get("pre_lineage_auth_only_rejoin") is not True
+                or pre_lineage_route_successor_rebind
+            )
         ):
             renewed_contract_revision = (
                 _runtime_context_append_resolved_route_ref_contract_revision(
@@ -37085,7 +37192,10 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     "validated_missing_finish_auth_only_rejoin"
                 )
                 is not True
-                and result.get("pre_lineage_auth_only_rejoin") is not True
+                and (
+                    result.get("pre_lineage_auth_only_rejoin") is not True
+                    or pre_lineage_route_successor_rebind
+                )
             )
             result["route_identity_verified"] = True
             result["previous_route_identity"] = _route_identity_public_summary(
@@ -37101,6 +37211,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         "child_route_lineage",
                         "route_lineage",
                         "parent_route_lineage_repair",
+                        "pre_lineage_route_token_ref_renewal",
                     }
                     and value
                 }
@@ -37200,7 +37311,10 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         "validated_missing_finish_auth_only_rejoin"
                     )
                     is not True
-                    and result.get("pre_lineage_auth_only_rejoin") is not True
+                    and (
+                        result.get("pre_lineage_auth_only_rejoin") is not True
+                        or pre_lineage_route_successor_rebind
+                    )
                 ),
                 "route_identity_verified": bool(resolved_route_identity),
             }

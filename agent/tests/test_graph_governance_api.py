@@ -5897,7 +5897,9 @@ def _persist_append_route_token_ref(
     prompt_contract_hash: str,
     visible_injection_manifest_hash: str,
     route_token_ref: str,
+    target_files: list[str] | None = None,
 ) -> None:
+    files = list(target_files or [])
     observer_route_context.persist_route_token_ref(
         conn,
         project_id=PID,
@@ -5911,6 +5913,8 @@ def _persist_append_route_token_ref(
             "route_token_ref": route_token_ref,
             "caller_role": "observer",
             "allowed_actions": ["task_timeline_append"],
+            "target_files": files,
+            "owned_files": files,
             "scope": {
                 "project_id": PID,
                 "backlog_id": backlog_id,
@@ -44614,6 +44618,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
     tmp_path,
     *,
     suffix: str,
+    source_backed_contract_runtime: bool = False,
 ):
     """Create one accepted initial join with no read/startup lineage."""
 
@@ -44627,6 +44632,25 @@ def _setup_pre_lineage_rejoin_recovery_case(
     host_startup_id = f"desktop-startup-pre-lineage-rejoin-{suffix}"
     target_root = tmp_path / f"pre-lineage-rejoin-{suffix}"
     target_root.mkdir()
+    if source_backed_contract_runtime:
+        successor, dispatched_context = (
+            _setup_mf_parallel_contract_runtime_worker_dispatch(
+                conn,
+                backlog_id=backlog_id,
+                task_id=f"pre-lineage-rejoin-{suffix}-parent",
+                worker_task_id=task_id,
+                fence_token=f"fence-pre-lineage-rejoin-{suffix}",
+                token="",
+                worktree_path=str(target_root),
+                target_project_root=str(target_root),
+                contract_execution_id=parent_task_id,
+                base_commit="a" * 40,
+                owned_files=("agent/governance/server.py",),
+                parent_task_is_contract_execution=True,
+            )
+        )
+        assert successor["contract_execution_id"] == parent_task_id
+        worker_id = dispatched_context.worker_id
     route_identity = {
         "route_id": f"route-pre-lineage-rejoin-{suffix}",
         "route_context_hash": f"sha256:route-pre-lineage-rejoin-{suffix}",
@@ -44645,6 +44669,8 @@ def _setup_pre_lineage_rejoin_recovery_case(
             target_project_id=PID,
             target_project_root=str(target_root),
             worktree_path=str(target_root),
+            target_files=("agent/governance/server.py",),
+            owned_files=("agent/governance/server.py",),
             task_id=task_id,
             parent_task_id=parent_task_id,
             root_task_id=parent_task_id,
@@ -44655,6 +44681,10 @@ def _setup_pre_lineage_rejoin_recovery_case(
             agent_id=worker_id,
             allocation_owner=worker_id,
             branch_ref=f"refs/heads/codex/{task_id}",
+            base_commit="a" * 40,
+            head_commit="a" * 40,
+            target_head_commit="a" * 40,
+            merge_queue_id=f"mq-pre-lineage-rejoin-{suffix}",
             status=STATE_WORKTREE_READY,
             fence_token=f"fence-pre-lineage-rejoin-{suffix}",
             attempt=1,
@@ -44666,6 +44696,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
         conn,
         backlog_id=backlog_id,
         task_id=task_id,
+        target_files=["agent/governance/server.py"],
         **route_identity,
     )
     append_branch_contract_revision(
@@ -44980,6 +45011,257 @@ def test_runtime_context_pre_lineage_rejoin_rotates_auth_once_without_state_or_e
         wrong_identity_after_consumed.value,
         before_context=state_before_second_loss,
         before_events=events_before_second_loss,
+    )
+
+
+def test_runtime_context_pre_lineage_rejoin_resolves_renewal_descendant_and_rebinds_contract(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="renewal-descendant",
+        source_backed_contract_runtime=True,
+    )
+    before_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        case["context"].runtime_context_id,
+    )
+    renewed = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=case["route_identity"]["route_token_ref"],
+        backlog_id=case["backlog_id"],
+        task_id=case["task_id"],
+        allowed_actions=["task_timeline_append"],
+        ttl_hours=24.0,
+        now=datetime(2099, 8, 2, 1, 1, tzinfo=timezone.utc),
+    )
+
+    rejoin = _pre_lineage_rejoin(case)
+
+    assert rejoin["ok"] is True
+    assert rejoin["pre_lineage_auth_only_rejoin"] is True
+    assert rejoin["route_identity"] == renewed["route_identity"]
+    assert rejoin["route_identity_rebound"] is True
+    renewal = rejoin["route_lineage"][
+        "pre_lineage_route_token_ref_renewal"
+    ]
+    assert renewal["requested_route_token_ref"] == (
+        case["route_identity"]["route_token_ref"]
+    )
+    assert renewal["resolved_route_token_ref"] == renewed["route_token_ref"]
+    assert renewal["registry_verified"] is True
+    assert renewal["exact_scope_verified"] is True
+    after_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        case["context"].runtime_context_id,
+    )
+    assert after_revision is not None and after_revision != before_revision
+    assert {
+        field: after_revision.route_identity[field]
+        for field in renewed["route_identity"]
+    } == renewed["route_identity"]
+    revision_renewal = after_revision.payload["route_token_ref_renewal"]
+    assert revision_renewal["status"] == "accepted_at_rejoin"
+    assert revision_renewal["previous_route_token_ref"] == (
+        case["route_identity"]["route_token_ref"]
+    )
+    assert revision_renewal["route_token_ref"] == renewed["route_token_ref"]
+    assert revision_renewal["registry_verified"] is True
+
+    read_receipt = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case["context"].runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": case["parent_task_id"],
+                "target_project_root": str(case["target_root"]),
+                "session_token": rejoin["session_token"],
+                "session_token_ref": rejoin["session_token_ref"],
+                "fence_token": rejoin["fence_token"],
+                "read_receipt_hash": "sha256:renewal-descendant-read",
+            },
+        )
+    )
+    assert read_receipt["ok"] is True
+    assert read_receipt["action"] == "read_receipt"
+    assert read_receipt["timeline_event"]["event_kind"] == (
+        "mf_subagent_read_receipt"
+    )
+    read_canonical = read_receipt["contract_runtime_canonical_line"]
+    assert read_canonical["status"] == "completed", json.dumps(
+        read_canonical,
+        sort_keys=True,
+    )
+    assert read_canonical["canonical"] is True
+    assert read_canonical["accepted"] is True
+    assert read_canonical["contract_execution_id"] == case["parent_task_id"]
+    assert read_canonical["runtime_context_id"] == (
+        case["context"].runtime_context_id
+    )
+    assert read_canonical["task_id"] == case["task_id"]
+    assert read_canonical["line_id"] == "worker_read_runtime_guide"
+    assert read_canonical["next_legal_action"]["line_id"] == "worker_startup"
+    startup = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case["context"].runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": case["parent_task_id"],
+                "target_project_root": str(case["target_root"]),
+                "actual_cwd": str(case["target_root"]),
+                "actual_git_root": str(case["target_root"]),
+                "session_token": rejoin["session_token"],
+                "session_token_ref": rejoin["session_token_ref"],
+                "fence_token": rejoin["fence_token"],
+                "worker_session_id": case["worker_session_id"],
+                "actual_host_worker_id": case["worker_id"],
+                "agent_id": case["worker_id"],
+                "host_startup_id": case["host_startup_id"],
+                "host_session_id": case["worker_session_id"],
+                "read_receipt_event_id": read_receipt["timeline_event"]["id"],
+                "read_receipt_hash": "sha256:renewal-descendant-read",
+                "harness_type": "codex",
+                "owned_files": ["agent/governance/server.py"],
+                "head_commit": "a" * 40,
+                "observer_command_id": case["parent_task_id"],
+            },
+        )
+    )
+    assert startup["ok"] is True, json.dumps(startup, sort_keys=True)
+    assert startup["action"] == "startup"
+    assert startup["timeline_event"]["event_kind"] == "mf_subagent_startup"
+    record = server._contract_runtime(conn).store.get(case["parent_task_id"])
+    for line_id in ("worker_read_runtime_guide", "worker_startup"):
+        completed = next(
+            line
+            for line in record["completed_lines"]
+            if line.get("line_id") == line_id
+        )
+        assert completed["runtime_context_id"] == (
+            case["context"].runtime_context_id
+        )
+        assert completed["task_id"] == case["task_id"]
+
+
+@pytest.mark.parametrize(
+    ("lineage_fault", "expected_error_code"),
+    [
+        ("wrong_scope", "route_token_ref_renewal_scope_mismatch"),
+        ("ambiguous", "route_token_ref_renewal_descendant_ambiguous"),
+    ],
+)
+def test_runtime_context_pre_lineage_rejoin_rejects_unproven_renewal_descendant_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    lineage_fault,
+    expected_error_code,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"renewal-{lineage_fault}",
+    )
+    renewed = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=case["route_identity"]["route_token_ref"],
+        backlog_id=case["backlog_id"],
+        task_id=case["task_id"],
+        allowed_actions=["task_timeline_append"],
+        ttl_hours=24.0,
+        now=datetime(2099, 8, 2, 1, 1, tzinfo=timezone.utc),
+    )
+    descendant = observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=renewed["route_token_ref"],
+        now=datetime(2099, 8, 2, 1, 2, tzinfo=timezone.utc),
+    )
+    assert descendant is not None
+    if lineage_fault == "wrong_scope":
+        route_lineage = copy.deepcopy(descendant["route_lineage"])
+        route_lineage["renewal_proof"]["scope"]["task_id"] = (
+            "wrong-renewal-task"
+        )
+        conn.execute(
+            "UPDATE observer_route_token_refs SET route_lineage_json=? "
+            "WHERE project_id=? AND route_token_ref=?",
+            (
+                json.dumps(route_lineage, sort_keys=True),
+                PID,
+                renewed["route_token_ref"],
+            ),
+        )
+        conn.commit()
+    else:
+        sibling = observer_route_context.issue_observer_write_route_context(
+            project_id=PID,
+            backlog_id=case["backlog_id"],
+            task_id=case["task_id"],
+            target_files=["agent/governance/server.py"],
+            allowed_actions=["task_timeline_append"],
+            ttl_hours=24.0,
+            now=datetime(2099, 8, 2, 1, 2, tzinfo=timezone.utc),
+        )
+        sibling_token = sibling["route_token"]
+        sibling_token["owned_files"] = ["agent/governance/server.py"]
+        sibling_proof = copy.deepcopy(
+            descendant["route_lineage"]["renewal_proof"]
+        )
+        sibling_proof["route_token_ref"] = sibling["route_token_ref"]
+        sibling_token["route_lineage"] = {
+            "renewal_proof": sibling_proof,
+        }
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=PID,
+            route_token_ref=sibling["route_token_ref"],
+            token=sibling_token,
+        )
+
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        case["context"].runtime_context_id,
+    )
+    before_events = _pre_lineage_case_events(conn, case)
+    with pytest.raises(GovernanceError) as rejected:
+        _pre_lineage_rejoin(case)
+
+    assert rejected.value.code == "runtime_context_rejoin_route_token_ref_invalid"
+    assert rejected.value.details["route_token_ref_error_code"] == (
+        expected_error_code
+    )
+    assert rejected.value.details["credential_rotated"] is False
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["fail_closed"] is True
+    assert rejected.value.details["identity_mismatches"]
+    assert rejected.value.details["next_legal_action"]
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        rejected.value,
+        before_context=before_context,
+        before_events=before_events,
+        before_revision=before_revision,
     )
 
 
@@ -88635,7 +88917,9 @@ def _insert_mf_parallel_source_backed_runtime_context(
             branch_ref=f"refs/heads/codex/{task_id}",
             worktree_path=path,
             fence_token=fence_token,
-            session_token_hash=mf_subagent_session_token_hash(token),
+            session_token_hash=(
+                mf_subagent_session_token_hash(token) if token else ""
+            ),
             base_commit=base_commit,
             head_commit=base_commit,
             target_head_commit=target_head_commit,
