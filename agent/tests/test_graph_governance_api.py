@@ -44389,6 +44389,355 @@ def test_runtime_context_session_token_reissue_endpoint_audits_and_rotates(
     assert wrong_token.value.code == "fence_invalidated_or_unknown"
 
 
+def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_before_startup(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-SAFE-REF-PRESTARTUP-REISSUE"
+    worker_task_id = "safe-ref-prestartup-worker"
+    target_root = tmp_path / worker_task_id
+    head_commit = _init_test_git_repo(target_root)
+    successor, allocated = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="safe-ref-prestartup-parent",
+        worker_task_id=worker_task_id,
+        fence_token="fence-safe-ref-prestartup",
+        token="",
+        worktree_path=str(target_root),
+        target_project_root=str(target_root),
+        base_commit=head_commit,
+        parent_task_is_contract_execution=True,
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
+    desktop_session_id = "/root/safe_ref_prestartup_worker"
+    joined = server.handle_graph_governance_runtime_context_session_token_initial_join(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": allocated.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body={
+                "runtime_context_id": allocated.runtime_context_id,
+                "contract_execution_id": contract_execution_id,
+                "task_id": allocated.task_id,
+                "parent_task_id": contract_execution_id,
+                "target_project_root": str(target_root),
+                "agent_id": allocated.worker_id,
+                "actual_host_worker_id": allocated.worker_id,
+                "worker_session_id": desktop_session_id,
+                "host_session_id": desktop_session_id,
+                "reason": "issue the exact fresh worker host envelope",
+                "ttl_seconds": 3600,
+                "now_iso": "2099-08-05T04:00:00Z",
+                **route_identity,
+            },
+        )
+    )
+    receipt_hash = _fake_sha("safe-ref-prestartup-read")
+    read = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": allocated.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "runtime_context_id": allocated.runtime_context_id,
+                "contract_execution_id": contract_execution_id,
+                "task_id": allocated.task_id,
+                "parent_task_id": contract_execution_id,
+                "fence_token": joined["fence_token"],
+                "session_token": joined["session_token"],
+                "session_token_ref": joined["session_token_ref"],
+                "target_project_root": str(target_root),
+                "actor": allocated.worker_id,
+                "read_receipt_hash": receipt_hash,
+                "launch_text_hash": _fake_sha("safe-ref-prestartup-launch"),
+                **route_identity,
+            },
+        )
+    )
+    assert read["ok"] is True
+
+    guide_payloads = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        runtime_context_id=allocated.runtime_context_id,
+        task_id=allocated.task_id,
+        parent_task_id=contract_execution_id,
+        worker_id=allocated.worker_id,
+        worker_slot_id=allocated.worker_slot_id,
+        target_project_root=str(target_root),
+        backlog_id=backlog_id,
+        agent_id=allocated.agent_id,
+        allocation_owner=allocated.allocation_owner,
+        actual_host_worker_id=allocated.worker_id,
+        worker_session_id=desktop_session_id,
+        host_session_id=desktop_session_id,
+        route_identity=route_identity,
+        session_token_ref=joined["session_token_ref"],
+        contract_execution_id=contract_execution_id,
+    )
+    reissue_body = copy.deepcopy(
+        guide_payloads["session_token_reissue_submission"]["copy_safe_body"]
+    )
+    assert reissue_body["contract_execution_id"] == contract_execution_id
+    assert reissue_body["session_token_ref"] == joined["session_token_ref"]
+    assert "session_token" not in reissue_body
+    assert "fence_token" not in reissue_body
+    reissue_body.update(
+        {
+            "reason": "recover the joined worker before startup",
+            "now_iso": "2099-08-05T04:01:00Z",
+        }
+    )
+    before_record = copy.deepcopy(
+        server._contract_runtime_store(conn).get(contract_execution_id)
+    )
+    reissued = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": allocated.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=reissue_body,
+        )
+    )
+    assert reissued["ok"] is True
+    assert reissued["delivery"] == "worker_host_envelope"
+    assert reissued["contract_execution_id"] == contract_execution_id
+    assert reissued["session_token_ref"] != joined["session_token_ref"]
+    assert reissued["safe_ref_reissue_authority"]["server_derived"] is True
+    assert reissued["host_envelope"]["env"]["AMING_WORKER_SESSION_TOKEN"] == (
+        reissued["session_token"]
+    )
+    assert reissued["host_envelope"]["env"]["AMING_WORKER_FENCE_TOKEN"] == (
+        joined["fence_token"]
+    )
+    after_record = server._contract_runtime_store(conn).get(contract_execution_id)
+    assert after_record["execution_state_revision"] == before_record[
+        "execution_state_revision"
+    ]
+    assert after_record["completed_lines"] == before_record["completed_lines"]
+
+    startup = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": allocated.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "runtime_context_id": allocated.runtime_context_id,
+                "contract_execution_id": contract_execution_id,
+                "task_id": allocated.task_id,
+                "parent_task_id": contract_execution_id,
+                "session_token": reissued["session_token"],
+                "session_token_ref": reissued["session_token_ref"],
+                "fence_token": reissued["fence_token"],
+                "target_project_root": str(target_root),
+                "agent_id": allocated.worker_id,
+                "actual_host_worker_id": allocated.worker_id,
+                "worker_session_id": desktop_session_id,
+                "worker_transcript_ref": "codex:safe-ref-prestartup-worker",
+                "harness_type": "codex",
+                "filer_principal": desktop_session_id,
+                "actual_cwd": str(target_root),
+                "actual_git_root": str(target_root),
+                "branch": allocated.branch_ref,
+                "branch_ref": allocated.branch_ref,
+                "head_commit": head_commit,
+                "base_commit": head_commit,
+                "target_head_commit": head_commit,
+                "merge_queue_id": allocated.merge_queue_id,
+                "owned_files": list(allocated.owned_files),
+                "read_receipt_hash": receipt_hash,
+                "read_receipt_event_id": str(
+                    (read.get("timeline_event") or {}).get("id") or ""
+                ),
+                "startup_source": "codex_desktop_governed_dispatch",
+                **route_identity,
+            },
+        )
+    )
+    assert startup["ok"] is True, startup
+    final_record = server._contract_runtime_store(conn).get(contract_execution_id)
+    assert final_record["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "worker_graph_context"
+    )
+    audit = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="mf_subagent_session_token_reissue",
+    )
+    assert len(audit) == 1
+    serialized_audit = json.dumps(audit[0], sort_keys=True)
+    assert joined["session_token"] not in serialized_audit
+    assert reissued["session_token"] not in serialized_audit
+    assert joined["fence_token"] not in serialized_audit
+
+
+def test_runtime_context_safe_ref_reissue_wrong_scope_and_replay_are_zero_write(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-SAFE-REF-REISSUE-ZERO-WRITE"
+    worker_task_id = "safe-ref-zero-write-worker"
+    target_root = tmp_path / worker_task_id
+    head_commit = _init_test_git_repo(target_root)
+    successor, allocated = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="safe-ref-zero-write-parent",
+        worker_task_id=worker_task_id,
+        fence_token="fence-safe-ref-zero-write",
+        token="",
+        worktree_path=str(target_root),
+        target_project_root=str(target_root),
+        base_commit=head_commit,
+        parent_task_is_contract_execution=True,
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
+    desktop_session_id = "/root/safe_ref_zero_write_worker"
+    joined = server.handle_graph_governance_runtime_context_session_token_initial_join(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": allocated.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "runtime_context_id": allocated.runtime_context_id,
+                "contract_execution_id": contract_execution_id,
+                "task_id": allocated.task_id,
+                "parent_task_id": contract_execution_id,
+                "target_project_root": str(target_root),
+                "agent_id": allocated.worker_id,
+                "actual_host_worker_id": allocated.worker_id,
+                "worker_session_id": desktop_session_id,
+                "host_session_id": desktop_session_id,
+                "reason": "issue exact zero-write test envelope",
+                "now_iso": "2099-08-05T05:00:00Z",
+                **route_identity,
+            },
+        )
+    )
+    read = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": allocated.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "contract_execution_id": contract_execution_id,
+                "parent_task_id": contract_execution_id,
+                "fence_token": joined["fence_token"],
+                "session_token": joined["session_token"],
+                "session_token_ref": joined["session_token_ref"],
+                "target_project_root": str(target_root),
+                "actor": allocated.worker_id,
+                "read_receipt_hash": _fake_sha("safe-ref-zero-write-read"),
+                **route_identity,
+            },
+        )
+    )
+    assert read["ok"] is True
+    base_body = {
+        "runtime_context_id": allocated.runtime_context_id,
+        "contract_execution_id": contract_execution_id,
+        "task_id": allocated.task_id,
+        "parent_task_id": contract_execution_id,
+        "target_project_root": str(target_root),
+        "worker_id": allocated.worker_id,
+        "worker_slot_id": allocated.worker_slot_id,
+        "agent_id": allocated.worker_id,
+        "allocation_owner": allocated.worker_id,
+        "actual_host_worker_id": allocated.worker_id,
+        "worker_session_id": desktop_session_id,
+        "host_session_id": desktop_session_id,
+        "session_token_ref": joined["session_token_ref"],
+        "now_iso": "2099-08-05T05:01:00Z",
+        **route_identity,
+    }
+    for changed in (
+        {"worker_id": "cross-worker"},
+        {"worker_session_id": "cross-session"},
+        {"contract_execution_id": "cex-wrong-scope"},
+        {"route_context_hash": "sha256:wrong-route"},
+    ):
+        before_context = get_branch_context(conn, PID, allocated.task_id)
+        before_record = copy.deepcopy(
+            server._contract_runtime_store(conn).get(contract_execution_id)
+        )
+        before_events = task_timeline.list_events(conn, PID, backlog_id=backlog_id)
+        with pytest.raises(GovernanceError) as rejected:
+            server.handle_graph_governance_runtime_context_session_token_reissue(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": allocated.runtime_context_id,
+                    },
+                    "mf_sub",
+                    method="POST",
+                    body={**base_body, **changed},
+                )
+            )
+        assert rejected.value.code == "fence_invalidated_or_unknown"
+        assert get_branch_context(conn, PID, allocated.task_id) == before_context
+        assert server._contract_runtime_store(conn).get(contract_execution_id) == (
+            before_record
+        )
+        assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == (
+            before_events
+        )
+
+    accepted = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": allocated.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body=base_body,
+        )
+    )
+    before_replay_context = get_branch_context(conn, PID, allocated.task_id)
+    before_replay_events = task_timeline.list_events(conn, PID, backlog_id=backlog_id)
+    with pytest.raises(GovernanceError) as replay:
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": allocated.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body=base_body,
+            )
+        )
+    assert replay.value.code == "fence_invalidated_or_unknown"
+    assert get_branch_context(conn, PID, allocated.task_id) == before_replay_context
+    assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == (
+        before_replay_events
+    )
+    assert accepted["session_token_ref"] != base_body["session_token_ref"]
+
+
 def test_runtime_context_worker_guide_missing_auth_points_to_initial_join_before_lineage(
     conn,
     tmp_path,

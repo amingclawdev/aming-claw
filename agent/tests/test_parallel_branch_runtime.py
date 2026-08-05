@@ -70,6 +70,7 @@ from agent.governance.parallel_branch_runtime import (
     branch_context_to_dict,
     branch_runtime_allocation_evidence,
     branch_runtime_context_id,
+    build_safe_ref_prestartup_reissue_authority,
     build_runtime_context_current_view,
     build_runtime_context_gate_inputs_view,
     build_runtime_context_lane_plan_view,
@@ -5981,6 +5982,128 @@ def test_reissue_mf_sub_runtime_session_token_rotates_hash_and_fails_closed(
             session_token="closed-token",
             target_project_root=str(target_root),
         )
+
+
+def test_safe_ref_prestartup_reissue_authority_is_exact_active_and_single_use(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    target_root = tmp_path / "safe-ref-prestartup-runtime"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            governance_project_id=PROJECT_ID,
+            target_project_id=PROJECT_ID,
+            target_project_root=str(target_root),
+            task_id="mf-sub-safe-ref-prestartup",
+            parent_task_id="cex-safe-ref-prestartup",
+            root_task_id="cex-safe-ref-prestartup",
+            backlog_id="BUG-SAFE-REF-PRESTARTUP",
+            worker_id="worker-safe-ref-prestartup",
+            worker_slot_id="slot-safe-ref-prestartup",
+            allocation_owner="worker-safe-ref-prestartup",
+            actual_host_worker_id="worker-safe-ref-prestartup",
+            host_session_id="desktop-safe-ref-prestartup",
+            branch_ref="refs/heads/codex/mf-sub-safe-ref-prestartup",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-safe-ref-prestartup",
+            session_token_hash=mf_subagent_session_token_hash(
+                "joined-safe-ref-prestartup"
+            ),
+            lease_id="lease-safe-ref-prestartup",
+            lease_expires_at="2999-01-01T01:00:00Z",
+            last_recovery_action="mf_subagent_initial_join_issued",
+        ),
+        now_iso="2999-01-01T00:00:00Z",
+    )
+    authority = build_safe_ref_prestartup_reissue_authority(
+        context,
+        contract_execution_id="cex-safe-ref-prestartup",
+        read_receipt_ref=(
+            "contract_runtime:cex-safe-ref-prestartup:completed_lines:3"
+        ),
+        initial_join_event_ref="timeline:42",
+        route_identity_hash="sha256:safe-ref-prestartup-route",
+        now_iso="2999-01-01T00:01:00Z",
+    )
+    prior_ref = runtime_context_session_token_ref(context)
+    result = reissue_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=context.runtime_context_id,
+        contract_execution_id="cex-safe-ref-prestartup",
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        target_project_root=str(target_root),
+        worker_id=context.worker_id,
+        worker_slot_id=context.worker_slot_id,
+        agent_id=context.worker_id,
+        allocation_owner=context.allocation_owner,
+        actual_host_worker_id=context.actual_host_worker_id,
+        worker_session_id=context.host_session_id,
+        host_session_id=context.host_session_id,
+        session_token_ref=prior_ref,
+        safe_ref_authority=authority,
+        now_iso="2999-01-01T00:02:00Z",
+    )
+    assert result["ok"] is True
+    assert result["delivery"] == "worker_host_envelope"
+    assert result["session_token_ref"] != prior_ref
+    assert result["host_envelope"]["session_token_ref"] == (
+        result["session_token_ref"]
+    )
+    assert result["raw_session_token_persisted"] is False
+    assert result["raw_fence_token_persisted_to_timeline"] is False
+
+    saved = get_branch_context(conn, PROJECT_ID, context.task_id)
+    assert saved is not None
+    before_replay = saved
+    with pytest.raises(BranchRuntimeFenceError) as replay:
+        reissue_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PROJECT_ID,
+            runtime_context_id=context.runtime_context_id,
+            contract_execution_id="cex-safe-ref-prestartup",
+            task_id=context.task_id,
+            parent_task_id=context.parent_task_id,
+            target_project_root=str(target_root),
+            worker_id=context.worker_id,
+            worker_slot_id=context.worker_slot_id,
+            agent_id=context.worker_id,
+            allocation_owner=context.allocation_owner,
+            actual_host_worker_id=context.actual_host_worker_id,
+            worker_session_id=context.host_session_id,
+            host_session_id=context.host_session_id,
+            session_token_ref=prior_ref,
+            safe_ref_authority=authority,
+            now_iso="2999-01-01T00:03:00Z",
+        )
+    assert str(replay.value) == "fence_invalidated_or_unknown"
+    assert get_branch_context(conn, PROJECT_ID, context.task_id) == before_replay
+
+    with pytest.raises(BranchRuntimeFenceError) as forged:
+        reissue_mf_subagent_runtime_session_token(
+            conn,
+            project_id=PROJECT_ID,
+            runtime_context_id=context.runtime_context_id,
+            contract_execution_id="cex-safe-ref-prestartup",
+            task_id=context.task_id,
+            parent_task_id=context.parent_task_id,
+            target_project_root=str(target_root),
+            worker_id=context.worker_id,
+            worker_slot_id=context.worker_slot_id,
+            agent_id=context.worker_id,
+            allocation_owner=context.allocation_owner,
+            actual_host_worker_id=context.actual_host_worker_id,
+            worker_session_id="wrong-desktop-session",
+            host_session_id=context.host_session_id,
+            session_token_ref=result["session_token_ref"],
+            safe_ref_authority=replace(authority, authority_hash="sha256:forged"),
+            now_iso="2999-01-01T00:04:00Z",
+        )
+    assert str(forged.value) == "fence_invalidated_or_unknown"
 
 
 def test_runtime_session_token_lease_view_reports_remaining_ttl_without_raw_token() -> None:

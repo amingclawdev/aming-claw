@@ -1386,6 +1386,46 @@ class FailedQaRunningRevisionRejoinAuthority:
     immutable_failed_qa_verified: bool = True
 
 
+@dataclass(frozen=True)
+class SafeRefPrestartupReissueAuthority:
+    """Server-derived authority for one copy-safe pre-startup token rotation.
+
+    The opaque session ref is deliberately not a general write credential.  It
+    can authorize this one host-envelope recovery only when the governance
+    server has already bound it to an active lease, one exact source-backed
+    ContractRuntime read line, and the original initial-join audit record.
+    """
+
+    project_id: str
+    backlog_id: str
+    contract_execution_id: str
+    runtime_context_id: str
+    task_id: str
+    parent_task_id: str
+    target_project_root: str
+    worker_id: str
+    worker_slot_id: str
+    agent_id: str
+    allocation_owner: str
+    actual_host_worker_id: str
+    worker_session_id: str
+    host_startup_id: str
+    host_session_id: str
+    session_token_ref: str
+    lease_id: str
+    lease_expires_at: str
+    read_receipt_ref: str
+    initial_join_event_ref: str
+    route_identity_hash: str
+    authorized_at: str
+    authority_hash: str
+    schema_version: str = (
+        "runtime_context.safe_ref_prestartup_reissue_authority.v1"
+    )
+    server_derived: bool = True
+    caller_claims_trusted: bool = False
+
+
 def failed_qa_running_revision_session_identity(
     context: "BranchTaskRuntimeContext",
     *,
@@ -11203,24 +11243,129 @@ def get_branch_context_by_runtime_context_id(
     return _context_from_row(row) if row else None
 
 
+def build_safe_ref_prestartup_reissue_authority(
+    context: BranchTaskRuntimeContext,
+    *,
+    contract_execution_id: str,
+    read_receipt_ref: str,
+    initial_join_event_ref: str,
+    route_identity_hash: str,
+    now_iso: str = "",
+) -> SafeRefPrestartupReissueAuthority:
+    """Bind server-verified pre-startup lineage to the active opaque ref."""
+
+    lease = runtime_context_session_token_lease_view(context, now_iso=now_iso)
+    runtime_id = runtime_context_id_for_branch_context(context)
+    session_ref = runtime_context_session_token_ref(context)
+    execution_id = str(contract_execution_id or "").strip()
+    read_ref = str(read_receipt_ref or "").strip()
+    join_ref = str(initial_join_event_ref or "").strip()
+    route_hash = str(route_identity_hash or "").strip()
+    worker_id = str(context.worker_id or "").strip()
+    worker_slot_id = str(context.worker_slot_id or worker_id).strip()
+    actual_host_worker_id = str(context.actual_host_worker_id or "").strip()
+    host_session_id = str(context.host_session_id or "").strip()
+    authorized_at = str(lease.get("now") or "").strip()
+    if (
+        not all(
+            (
+                context.project_id,
+                context.backlog_id,
+                execution_id,
+                runtime_id,
+                context.task_id,
+                _parent_task_id_for_context(context),
+                runtime_context_effective_target_project_root(context),
+                worker_id,
+                worker_slot_id,
+                actual_host_worker_id,
+                host_session_id,
+                session_ref,
+                context.lease_id,
+                context.lease_expires_at,
+                read_ref,
+                join_ref,
+                route_hash,
+                authorized_at,
+            )
+        )
+        or not read_ref.startswith(
+            f"contract_runtime:{execution_id}:completed_lines:"
+        )
+        or not join_ref.startswith("timeline:")
+        or not route_hash.startswith("sha256:")
+        or str(lease.get("status") or "") != "active"
+        or lease.get("authorization_valid") is not True
+        or lease.get("expired") is not False
+        or str(lease.get("session_token_ref") or "") != session_ref
+    ):
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    authority = SafeRefPrestartupReissueAuthority(
+        project_id=context.project_id,
+        backlog_id=context.backlog_id,
+        contract_execution_id=execution_id,
+        runtime_context_id=runtime_id,
+        task_id=context.task_id,
+        parent_task_id=_parent_task_id_for_context(context),
+        target_project_root=runtime_context_effective_target_project_root(context),
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        agent_id=worker_id or worker_slot_id or context.agent_id,
+        allocation_owner=str(
+            context.allocation_owner
+            or context.worker_id
+            or context.worker_slot_id
+            or context.agent_id
+            or ""
+        ).strip(),
+        actual_host_worker_id=actual_host_worker_id,
+        worker_session_id=host_session_id,
+        host_startup_id=str(context.host_startup_id or "").strip(),
+        host_session_id=host_session_id,
+        session_token_ref=session_ref,
+        lease_id=str(context.lease_id or "").strip(),
+        lease_expires_at=str(context.lease_expires_at or "").strip(),
+        read_receipt_ref=read_ref,
+        initial_join_event_ref=join_ref,
+        route_identity_hash=route_hash,
+        authorized_at=authorized_at,
+        authority_hash="",
+    )
+    payload = asdict(authority)
+    payload.pop("authority_hash", None)
+    return replace(authority, authority_hash=_stable_authority_hash(payload))
+
+
 def reissue_mf_subagent_runtime_session_token(
     conn: sqlite3.Connection,
     *,
     project_id: str,
     runtime_context_id: str,
     task_id: str,
-    fence_token: str,
-    session_token: str,
+    fence_token: str = "",
+    session_token: str = "",
+    session_token_ref: str = "",
+    contract_execution_id: str = "",
     parent_task_id: str = "",
     target_project_root: str = "",
+    worker_id: str = "",
+    worker_slot_id: str = "",
+    agent_id: str = "",
+    allocation_owner: str = "",
+    actual_host_worker_id: str = "",
+    worker_session_id: str = "",
+    host_startup_id: str = "",
+    host_session_id: str = "",
+    safe_ref_authority: SafeRefPrestartupReissueAuthority | None = None,
     ttl_seconds: Any = None,
     now_iso: str = "",
 ) -> dict[str, Any]:
     """Rotate an mf_sub runtime session token for an active matching context.
 
-    This is a narrow recovery path for system-repair workers whose scoped token
-    lease expires. It accepts the expired-but-matching current token and never
-    persists the replacement token in clear text.
+    Raw-token callers retain the narrow expired-token renewal path.  A caller
+    that no longer has raw auth may instead present the current copy-safe ref
+    together with a server-derived, source-backed pre-startup authority.  The
+    ref is never accepted as a general write credential.
     """
 
     ensure_branch_runtime_schema(conn)
@@ -11228,23 +11373,101 @@ def reissue_mf_subagent_runtime_session_token(
     task = str(task_id or "").strip()
     fence = str(fence_token or "").strip()
     presented_token = str(session_token or "").strip()
-    if not runtime_id or not task or not fence or not presented_token:
+    presented_ref = str(session_token_ref or "").strip()
+    raw_token_mode = bool(fence and presented_token)
+    safe_ref_mode = bool(presented_ref and safe_ref_authority is not None)
+    if not runtime_id or not task or not (raw_token_mode or safe_ref_mode):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     context = get_branch_context_by_runtime_context_id(conn, project_id, runtime_id)
     if context is None or not context.fence_token:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if context.task_id != task:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
-    try:
-        _require_current_fence(context, fence)
-    except BranchRuntimeFenceError as exc:
-        raise BranchRuntimeFenceError("fence_invalidated_or_unknown") from exc
     if context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if not context.session_token_hash:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
-    if mf_subagent_session_token_hash(presented_token) != context.session_token_hash:
-        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if raw_token_mode:
+        try:
+            _require_current_fence(context, fence)
+        except BranchRuntimeFenceError as exc:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown") from exc
+        if mf_subagent_session_token_hash(presented_token) != context.session_token_hash:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    else:
+        authority = safe_ref_authority
+        if not isinstance(authority, SafeRefPrestartupReissueAuthority):
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        authority_payload = asdict(authority)
+        authority_hash = str(authority_payload.pop("authority_hash") or "")
+        lease = runtime_context_session_token_lease_view(context, now_iso=now_iso)
+        expected_scope = {
+            "project_id": context.project_id,
+            "backlog_id": context.backlog_id,
+            "contract_execution_id": str(contract_execution_id or "").strip(),
+            "runtime_context_id": runtime_id,
+            "task_id": context.task_id,
+            "parent_task_id": _parent_task_id_for_context(context),
+            "target_project_root": runtime_context_effective_target_project_root(context),
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id or context.worker_id,
+            "agent_id": context.worker_id or context.worker_slot_id or context.agent_id,
+            "allocation_owner": (
+                context.allocation_owner
+                or context.worker_id
+                or context.worker_slot_id
+                or context.agent_id
+            ),
+            "actual_host_worker_id": context.actual_host_worker_id,
+            "worker_session_id": context.host_session_id,
+            "host_startup_id": context.host_startup_id,
+            "host_session_id": context.host_session_id,
+            "session_token_ref": runtime_context_session_token_ref(context),
+            "lease_id": context.lease_id,
+            "lease_expires_at": context.lease_expires_at,
+        }
+        supplied_scope = {
+            "contract_execution_id": str(contract_execution_id or "").strip(),
+            "worker_id": str(worker_id or "").strip(),
+            "worker_slot_id": str(worker_slot_id or "").strip(),
+            "agent_id": str(agent_id or "").strip(),
+            "allocation_owner": str(allocation_owner or "").strip(),
+            "actual_host_worker_id": str(actual_host_worker_id or "").strip(),
+            "worker_session_id": str(worker_session_id or "").strip(),
+            "host_startup_id": str(host_startup_id or "").strip(),
+            "host_session_id": str(host_session_id or "").strip(),
+            "session_token_ref": presented_ref,
+        }
+        if (
+            authority.schema_version
+            != "runtime_context.safe_ref_prestartup_reissue_authority.v1"
+            or authority.server_derived is not True
+            or authority.caller_claims_trusted is not False
+            or not authority.read_receipt_ref.startswith(
+                f"contract_runtime:{authority.contract_execution_id}:completed_lines:"
+            )
+            or not authority.initial_join_event_ref.startswith("timeline:")
+            or not authority.route_identity_hash.startswith("sha256:")
+            or not authority.authorized_at
+            or authority_hash != _stable_authority_hash(authority_payload)
+            or any(
+                str(getattr(authority, field_name, "") or "").strip()
+                != str(expected_value or "").strip()
+                for field_name, expected_value in expected_scope.items()
+            )
+            or any(
+                not value
+                or value
+                != str(getattr(authority, field_name, "") or "").strip()
+                for field_name, value in supplied_scope.items()
+                if field_name != "host_startup_id" or expected_scope[field_name]
+            )
+            or str(lease.get("status") or "") != "active"
+            or lease.get("authorization_valid") is not True
+            or lease.get("expired") is not False
+            or str(lease.get("session_token_ref") or "") != presented_ref
+        ):
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     requested_target_root = _startup_path_text(target_project_root)
     context_target_root = _startup_path_text(
         runtime_context_effective_target_project_root(context)
@@ -11289,7 +11512,7 @@ def reissue_mf_subagent_runtime_session_token(
         saved,
         now_iso=_runtime_context_iso(now_dt),
     )
-    return {
+    result = {
         "ok": True,
         "schema_version": "mf_subagent_session_token_reissue_response.v1",
         "status": "session_token_reissued",
@@ -11304,12 +11527,69 @@ def reissue_mf_subagent_runtime_session_token(
         "principal_id": saved.worker_slot_id or saved.worker_id or saved.agent_id,
         "session_token": new_token,
         "session_token_hash": new_hash,
+        "session_token_ref": runtime_context_session_token_ref(saved),
         "session_token_persisted": False,
         "raw_session_token_persisted": False,
         "ttl_seconds": ttl,
         "expires_at": expires_at,
         "session_token_lease": lease,
     }
+    if safe_ref_mode:
+        fence_hash = runtime_context_secret_hash(saved.fence_token)
+        principal_id = (
+            saved.actual_host_worker_id
+            or saved.worker_slot_id
+            or saved.worker_id
+            or saved.agent_id
+        )
+        host_envelope = {
+            "schema_version": "mf_subagent_safe_ref_reissue_host_envelope.v1",
+            "project_id": saved.project_id,
+            "runtime_context_id": runtime_id,
+            "contract_execution_id": str(contract_execution_id or "").strip(),
+            "task_id": saved.task_id,
+            "parent_task_id": _parent_task_id_for_context(saved),
+            "backlog_id": saved.backlog_id,
+            "target_project_root": runtime_context_effective_target_project_root(saved),
+            "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+            "worker_id": saved.worker_id,
+            "worker_slot_id": saved.worker_slot_id or saved.worker_id,
+            "agent_id": str(agent_id or "").strip(),
+            "actual_host_worker_id": saved.actual_host_worker_id,
+            "worker_session_id": saved.host_session_id,
+            "host_startup_id": saved.host_startup_id,
+            "host_session_id": saved.host_session_id,
+            "principal_id": principal_id,
+            "session_token_ref": runtime_context_session_token_ref(saved),
+            "session_token_ref_source": "safe_ref_prestartup_reissue",
+            "branch": saved.branch_ref,
+            "branch_ref": saved.branch_ref,
+            "worktree_path": saved.worktree_path,
+            "base_commit": saved.base_commit,
+            "target_head_commit": saved.target_head_commit,
+            "merge_queue_id": saved.merge_queue_id,
+            "session_token_env": "AMING_WORKER_SESSION_TOKEN",
+            "fence_token_env": "AMING_WORKER_FENCE_TOKEN",
+            "fence_token_hash": fence_hash,
+            "fence_token_redacted": bool(fence_hash),
+            "env": {
+                "AMING_WORKER_SESSION_TOKEN": new_token,
+                "AMING_WORKER_FENCE_TOKEN": saved.fence_token,
+            },
+            "raw_tokens_persisted_to_timeline": False,
+        }
+        result.update(
+            {
+                "authorization_source": "safe_ref_prestartup_reissue_authority",
+                "fence_token": saved.fence_token,
+                "fence_token_hash": fence_hash,
+                "raw_fence_token_returned_for_host_envelope": True,
+                "raw_fence_token_persisted_to_timeline": False,
+                "delivery": "worker_host_envelope",
+                "host_envelope": host_envelope,
+            }
+        )
+    return result
 
 
 def rejoin_mf_subagent_runtime_session_token(

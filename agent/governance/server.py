@@ -22134,11 +22134,34 @@ def _runtime_context_worker_guide_response(
             "facade_status": "available",
             "required_body_fields": [
                 "runtime_context_id",
+                "contract_execution_id",
                 "task_id",
                 "parent_task_id",
-                "fence_token",
-                "session_token or session_token_ref",
                 "target_project_root",
+                "worker_id",
+                "worker_slot_id",
+                "agent_id",
+                "allocation_owner",
+                "actual_host_worker_id",
+                "worker_session_id",
+                "host_session_id",
+                "session_token_ref",
+            ],
+            "safe_ref_authority": {
+                "valid_only_when": [
+                    "source_backed ContractRuntime has the exact accepted worker read line",
+                    "the exact worker startup line is still absent",
+                    "the initial-join audit binds the current session_token_ref",
+                    "the persisted lease is active and authorization-valid",
+                    "runtime/task/parent/root/worker/session/route scope matches exactly",
+                ],
+                "returns": "fresh process-local worker_host_envelope",
+                "advances_contract_runtime_line": False,
+                "session_token_ref_alone_authorizes_other_writes": False,
+            },
+            "legacy_raw_token_alternative_fields": [
+                "fence_token",
+                "session_token",
             ],
             "ttl_policy": {
                 "default_ttl_seconds": session_token_lease.get(
@@ -22148,8 +22171,8 @@ def _runtime_context_worker_guide_response(
                 "raw_session_token_persisted": False,
             },
             "failure_policy": (
-                "stale, closed, scope-mismatched, wrong-fence, and wrong-token "
-                "requests fail closed"
+                "stale, revoked, closed, ambiguous, replayed, cross-worker, "
+                "scope-mismatched, wrong-fence, and wrong-token requests fail closed"
             ),
             "auth": _auth_guide("body.session_token"),
         },
@@ -24513,15 +24536,25 @@ def _runtime_context_worker_recovery_payloads(
     }
     session_token_reissue_body = {
         "runtime_context_id": runtime_context_id,
+        **(
+            {"contract_execution_id": contract_execution_id}
+            if contract_execution_id
+            else {}
+        ),
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "target_project_root": target_project_root,
-        "session_token": session_token_placeholder,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": allocated_governed_worker_id,
+        "allocation_owner": normalized_allocation_owner,
+        "actual_host_worker_id": allocated_governed_worker_id,
+        "worker_session_id": normalized_worker_session_id,
+        "host_startup_id": normalized_host_startup_id,
+        "host_session_id": normalized_host_session_id,
         "session_token_ref": session_token_ref_placeholder,
-        "fence_token": fence_token_placeholder,
-        "session_token_env": session_token_env,
-        "fence_token_env": fence_token_env,
-        "reason": "<worker reason: renew long-running mf_sub session>",
+        **safe_route_identity,
+        "reason": "<worker reason: recover the joined pre-startup host envelope>",
         "ttl_seconds": 3600,
     }
     session_token_reissue_submission = {
@@ -24535,13 +24568,39 @@ def _runtime_context_worker_recovery_payloads(
         "copy_safe_body": dict(session_token_reissue_body),
         "required_current_lineage": [
             "runtime_context_id",
+            "contract_execution_id",
             "task_id",
             "parent_task_id",
-            "fence_token",
-            "session_token or session_token_ref",
             "target_project_root",
+            "worker_id",
+            "worker_slot_id",
+            "agent_id",
+            "allocation_owner",
+            "actual_host_worker_id",
+            "worker_session_id",
+            "host_session_id",
+            "session_token_ref",
+            "accepted initial_join",
+            "accepted ContractRuntime worker_read_runtime_guide",
+            "absent ContractRuntime worker_startup",
         ],
+        "legacy_raw_token_alternative_body": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "target_project_root": target_project_root,
+            "session_token": session_token_placeholder,
+            "fence_token": fence_token_placeholder,
+            "ttl_seconds": 3600,
+        },
+        "successful_response": {
+            "delivery": "worker_host_envelope",
+            "inject_env_process_locally": True,
+            "contract_runtime_line_advanced": False,
+        },
         "security_boundary": {
+            "session_token_ref_is_authority_for_this_recovery_only": True,
+            "session_token_ref_alone_authorizes_other_writes": False,
             "raw_session_token_persisted": False,
             "raw_fence_token_persisted": False,
             "raw_tokens_persisted_to_timeline": False,
@@ -30874,6 +30933,270 @@ def handle_graph_governance_parallel_branch_runtime_context_worker_guide(ctx: Re
     return _runtime_context_worker_guide_response(current_state)
 
 
+def _runtime_context_safe_ref_prestartup_reissue_authority(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    body: Mapping[str, Any],
+):
+    """Resolve one exact source-backed pre-startup safe-ref authority."""
+
+    from .parallel_branch_runtime import (
+        BranchRuntimeFenceError,
+        build_safe_ref_prestartup_reissue_authority,
+        get_branch_context_by_runtime_context_id,
+        runtime_context_id_for_branch_context,
+        runtime_context_session_token_ref,
+    )
+
+    context = get_branch_context_by_runtime_context_id(
+        conn,
+        project_id,
+        runtime_context_id,
+    )
+    if context is None:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    expected_runtime_id = runtime_context_id_for_branch_context(context)
+    expected_task_id = str(context.task_id or "").strip()
+    expected_parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    expected_target_root = _runtime_context_effective_target_project_root(context)
+    expected_worker_id = str(context.worker_id or "").strip()
+    expected_worker_slot_id = str(
+        context.worker_slot_id or expected_worker_id
+    ).strip()
+    expected_agent_id = str(
+        context.worker_id or context.worker_slot_id or context.agent_id
+    ).strip()
+    expected_allocation_owner = str(
+        context.allocation_owner
+        or context.worker_id
+        or context.worker_slot_id
+        or context.agent_id
+        or ""
+    ).strip()
+    expected_actual_host_worker_id = str(
+        context.actual_host_worker_id or ""
+    ).strip()
+    expected_host_session_id = str(context.host_session_id or "").strip()
+    expected_host_startup_id = str(context.host_startup_id or "").strip()
+    presented_contract_execution_id = str(
+        body.get("contract_execution_id") or ""
+    ).strip()
+    presented_session_ref = str(body.get("session_token_ref") or "").strip()
+    exact_fields = {
+        "runtime_context_id": (
+            str(body.get("runtime_context_id") or expected_runtime_id).strip(),
+            expected_runtime_id,
+        ),
+        "task_id": (str(body.get("task_id") or "").strip(), expected_task_id),
+        "parent_task_id": (
+            str(body.get("parent_task_id") or "").strip(),
+            expected_parent_task_id,
+        ),
+        "target_project_root": (
+            str(
+                body.get("target_project_root")
+                or body.get("project_root")
+                or body.get("repo_root")
+                or ""
+            ).strip(),
+            expected_target_root,
+        ),
+        "worker_id": (
+            str(body.get("worker_id") or "").strip(),
+            expected_worker_id,
+        ),
+        "worker_slot_id": (
+            str(body.get("worker_slot_id") or "").strip(),
+            expected_worker_slot_id,
+        ),
+        "agent_id": (
+            str(body.get("agent_id") or "").strip(),
+            expected_agent_id,
+        ),
+        "allocation_owner": (
+            str(body.get("allocation_owner") or "").strip(),
+            expected_allocation_owner,
+        ),
+        "actual_host_worker_id": (
+            str(
+                body.get("actual_host_worker_id")
+                or body.get("host_worker_id")
+                or ""
+            ).strip(),
+            expected_actual_host_worker_id,
+        ),
+        "worker_session_id": (
+            str(body.get("worker_session_id") or "").strip(),
+            expected_host_session_id,
+        ),
+        "host_session_id": (
+            str(body.get("host_session_id") or "").strip(),
+            expected_host_session_id,
+        ),
+        "session_token_ref": (
+            presented_session_ref,
+            runtime_context_session_token_ref(context),
+        ),
+    }
+    if expected_host_startup_id:
+        exact_fields["host_startup_id"] = (
+            str(body.get("host_startup_id") or "").strip(),
+            expected_host_startup_id,
+        )
+    if (
+        not presented_contract_execution_id
+        or any(not actual or actual != expected for actual, expected in exact_fields.values())
+    ):
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    latest_revision = _runtime_context_latest_contract_revision_payload(
+        conn,
+        context,
+    )
+    revision_identity = _runtime_context_contract_execution_identity(
+        latest_revision
+    )
+    resolved_identity, resolution = _runtime_context_resolve_contract_execution_identity(
+        conn,
+        project_id=project_id,
+        context=context,
+        runtime_context_id=expected_runtime_id,
+        task_id=expected_task_id,
+        contract_identity=revision_identity,
+    )
+    if (
+        resolution.get("fail_closed")
+        or str(resolved_identity.get("contract_execution_id") or "").strip()
+        != presented_contract_execution_id
+    ):
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    try:
+        record = _contract_runtime_store(conn).get(presented_contract_execution_id)
+    except (ContractRuntimeError, sqlite3.Error) as exc:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown") from exc
+    if (
+        str(record.get("project_id") or "").strip() != project_id
+        or str(record.get("backlog_id") or "").strip()
+        != str(context.backlog_id or "").strip()
+        or str(record.get("contract_execution_id") or "").strip()
+        != presented_contract_execution_id
+    ):
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    sequence = _runtime_context_contract_runtime_worker_sequence_evidence(
+        conn,
+        project_id=project_id,
+        context=context,
+    )
+    if (
+        str(sequence.get("contract_execution_id") or "").strip()
+        != presented_contract_execution_id
+        or not str(sequence.get("read_receipt_ref") or "").strip()
+        or str(sequence.get("startup_ref") or "").strip()
+    ):
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    next_action = (
+        record.get("runtime_guide", {}).get("next_legal_action", {})
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    if str(next_action.get("line_id") or "").strip() != "worker_startup":
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    timeline_events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=expected_task_id,
+        backlog_id=str(context.backlog_id or "").strip(),
+    )
+    matching_initial_joins = []
+    for event in timeline_events:
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        if (
+            str(event.get("status") or "").strip().lower()
+            not in {"accepted", "ok", "pass", "passed", "success", "succeeded"}
+            or str(payload.get("action") or "").strip()
+            != "runtime_context_session_token_initial_join"
+            or str(payload.get("runtime_context_id") or "").strip()
+            != expected_runtime_id
+            or str(payload.get("task_id") or event.get("task_id") or "").strip()
+            != expected_task_id
+            or str(payload.get("session_token_ref") or "").strip()
+            != presented_session_ref
+            or str(payload.get("actual_host_worker_id") or "").strip()
+            != expected_actual_host_worker_id
+            or str(payload.get("worker_session_id") or "").strip()
+            != expected_host_session_id
+        ):
+            continue
+        event_execution_id = str(payload.get("contract_execution_id") or "").strip()
+        if event_execution_id and event_execution_id != presented_contract_execution_id:
+            continue
+        matching_initial_joins.append(event)
+    if len(matching_initial_joins) != 1:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+
+    supplied_route_identity = _runtime_context_request_route_identity_shapes(ctx)[
+        "supplied"
+    ]
+    route_token_ref = str(supplied_route_identity.get("route_token_ref") or "").strip()
+    try:
+        from . import observer_route_context
+
+        resolved_route_ref = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=str(context.backlog_id or "").strip(),
+            task_id=presented_contract_execution_id,
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown") from exc
+    expected_route_identity = {
+        field: str((resolved_route_ref or {}).get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if str((resolved_route_ref or {}).get(field) or "").strip()
+    }
+    revision_route_identity = _runtime_context_latest_route_identity(conn, context)
+    if (
+        not expected_route_identity
+        or str((resolved_route_ref or {}).get("status") or "").strip() != "active"
+        or (
+            revision_route_identity
+            and any(
+                str(revision_route_identity.get(field) or "").strip()
+                != str(expected_route_identity.get(field) or "").strip()
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                if str(revision_route_identity.get(field) or "").strip()
+            )
+        )
+        or any(
+            not str(supplied_route_identity.get(field) or "").strip()
+            or str(supplied_route_identity.get(field) or "").strip()
+            != str(expected_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            if str(expected_route_identity.get(field) or "").strip()
+        )
+    ):
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    route_identity_hash = _stable_public_hash(
+        {
+            field: str(expected_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+    )
+    return build_safe_ref_prestartup_reissue_authority(
+        context,
+        contract_execution_id=presented_contract_execution_id,
+        read_receipt_ref=str(sequence["read_receipt_ref"]),
+        initial_join_event_ref=f"timeline:{matching_initial_joins[0].get('id', '')}",
+        route_identity_hash=route_identity_hash,
+        now_iso=str(body.get("now_iso") or ""),
+    )
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/reissue")
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/renew")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/session-token/reissue")
@@ -30898,22 +31221,82 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
         from . import task_timeline
 
         try:
+            session_token_ref = str(body.get("session_token_ref") or "").strip()
+            raw_fence_token = str(body.get("fence_token") or "").strip()
+            raw_session_token = str(body.get("session_token") or "").strip()
+            safe_ref_authority = None
+            if session_token_ref and not (raw_fence_token and raw_session_token):
+                safe_ref_authority = (
+                    _runtime_context_safe_ref_prestartup_reissue_authority(
+                        ctx,
+                        conn,
+                        project_id=project_id,
+                        runtime_context_id=runtime_context_id,
+                        body=body,
+                    )
+                )
             result = reissue_mf_subagent_runtime_session_token(
                 conn,
                 project_id=project_id,
                 runtime_context_id=runtime_context_id,
                 task_id=str(body.get("task_id") or "").strip(),
                 parent_task_id=str(body.get("parent_task_id") or "").strip(),
-                fence_token=str(body.get("fence_token") or "").strip(),
-                session_token=str(body.get("session_token") or "").strip(),
+                fence_token=raw_fence_token,
+                session_token=raw_session_token,
+                session_token_ref=session_token_ref,
+                contract_execution_id=str(
+                    body.get("contract_execution_id") or ""
+                ).strip(),
                 target_project_root=str(
                     body.get("target_project_root")
                     or body.get("project_root")
                     or body.get("repo_root")
                     or ""
                 ).strip(),
+                worker_id=str(body.get("worker_id") or "").strip(),
+                worker_slot_id=str(body.get("worker_slot_id") or "").strip(),
+                agent_id=str(body.get("agent_id") or "").strip(),
+                allocation_owner=str(body.get("allocation_owner") or "").strip(),
+                actual_host_worker_id=str(
+                    body.get("actual_host_worker_id")
+                    or body.get("host_worker_id")
+                    or ""
+                ).strip(),
+                worker_session_id=str(body.get("worker_session_id") or "").strip(),
+                host_startup_id=str(body.get("host_startup_id") or "").strip(),
+                host_session_id=str(body.get("host_session_id") or "").strip(),
+                safe_ref_authority=safe_ref_authority,
                 ttl_seconds=body.get("ttl_seconds"),
+                now_iso=str(body.get("now_iso") or ""),
             )
+            if safe_ref_authority is not None:
+                result["contract_execution_id"] = (
+                    safe_ref_authority.contract_execution_id
+                )
+                result["safe_ref_reissue_authority"] = {
+                    "schema_version": safe_ref_authority.schema_version,
+                    "authority_hash": safe_ref_authority.authority_hash,
+                    "read_receipt_ref": safe_ref_authority.read_receipt_ref,
+                    "initial_join_event_ref": (
+                        safe_ref_authority.initial_join_event_ref
+                    ),
+                    "route_identity_hash": safe_ref_authority.route_identity_hash,
+                    "server_derived": True,
+                    "caller_claims_trusted": False,
+                }
+                expected_route_identity = {
+                    field: str(value or "").strip()
+                    for field, value in _runtime_context_request_route_identity_shapes(
+                        ctx
+                    )["supplied"].items()
+                    if str(value or "").strip()
+                }
+                result["route_identity"] = dict(expected_route_identity)
+                host_envelope = result.get("host_envelope")
+                if isinstance(host_envelope, dict):
+                    host_envelope["route_identity"] = dict(
+                        expected_route_identity
+                    )
         except BranchRuntimeFenceError as exc:
             reason = str(exc) or "fence_invalidated_or_unknown"
             recovery_details = _runtime_context_worker_recovery_details(
@@ -30925,6 +31308,7 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
                 parent_task_id=str(body.get("parent_task_id") or "").strip(),
                 fence_token=str(body.get("fence_token") or "").strip(),
                 session_token=str(body.get("session_token") or "").strip(),
+                session_token_ref=str(body.get("session_token_ref") or "").strip(),
                 target_project_root=str(
                     body.get("target_project_root")
                     or body.get("project_root")
@@ -30950,7 +31334,12 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
         audit_payload = {
             key: value
             for key, value in result.items()
-            if key not in {"session_token"}
+            if key
+            not in {
+                "session_token",
+                "fence_token",
+                "host_envelope",
+            }
         }
         audit_payload["raw_session_token_persisted"] = False
         audit_event = task_timeline.record_event(
@@ -31290,6 +31679,9 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 "operator_session_role": session_role(session),
                 "missing_lineage": missing_lineage,
                 "runtime_context_id": runtime_context_id_for_branch_context(context),
+                "contract_execution_id": str(
+                    body.get("contract_execution_id") or ""
+                ).strip(),
                 "agent_id": str(result.get("agent_id") or ""),
                 "actual_host_worker_id": str(
                     result.get("actual_host_worker_id") or ""
