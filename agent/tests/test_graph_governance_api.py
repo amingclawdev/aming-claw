@@ -121025,6 +121025,643 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
     ).fetchone()[0] == timeline_count_after_accept
 
 
+def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_inactive_lane(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-IMPLEMENTATION-WRITER-HASH-LANE-R2"
+    parent_task_id = "implementation-writer-hash-lane-r2-parent"
+    owned_paths = (
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    )
+    worker_specs = (
+        (
+            "implementation-writer-hash-lane-r2-a",
+            "fence-implementation-writer-hash-lane-r2-a",
+            "session-implementation-writer-hash-lane-r2-a",
+            owned_paths[0],
+        ),
+        (
+            "implementation-writer-hash-lane-r2-b",
+            "fence-implementation-writer-hash-lane-r2-b",
+            "session-implementation-writer-hash-lane-r2-b",
+            owned_paths[1],
+        ),
+    )
+    roots = {}
+    commits = {}
+    for task_id, _fence, _token, owned_file in worker_specs:
+        root = tmp_path / task_id
+        root.mkdir()
+        subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "worker@example.test"],
+            cwd=root,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "R2 Worker"],
+            cwd=root,
+            check=True,
+        )
+        path = root / owned_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", owned_file], cwd=root, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
+        roots[task_id] = root
+        commits[task_id] = batch_jobs.git_commit(root)
+
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-implementation-writer-hash-r2-root",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Exercise the inactive atomic worker lane.",
+                "backlog_id": backlog_id,
+                "task_id": parent_task_id,
+                "route_token_ref": "rtok-implementation-writer-hash-r2-root",
+                "worker_fence": {
+                    "fence_token": "fence-implementation-writer-hash-r2-root",
+                    "owned_files": list(owned_paths),
+                },
+                "owned_files": list(owned_paths),
+            },
+        )
+    )
+    execution_id = successor["contract_execution_id"]
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+            },
+        )
+    )
+    assert prefill["ok"] is True
+    first_task, first_fence, first_token, first_owned = worker_specs[0]
+    first_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id=first_task,
+        parent_task_id=execution_id,
+        fence_token=first_fence,
+        token=first_token,
+        worktree_path=str(roots[first_task]),
+        target_project_root=str(roots[first_task]),
+        base_commit=commits[first_task],
+        target_head_commit=commits[first_task],
+        merge_queue_id=f"mq-{first_task}",
+        owned_files=(first_owned,),
+    )
+    second_task, second_fence, second_token, second_owned = worker_specs[1]
+    second_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id=second_task,
+        parent_task_id=execution_id,
+        fence_token=second_fence,
+        token=second_token,
+        worktree_path=str(roots[second_task]),
+        target_project_root=str(roots[second_task]),
+        base_commit=commits[second_task],
+        target_head_commit=commits[second_task],
+        merge_queue_id=f"mq-{second_task}",
+        owned_files=(second_owned,),
+    )
+    contexts = [first_context, second_context]
+    secrets_by_context = {
+        first_context.runtime_context_id: (first_fence, first_token),
+        second_context.runtime_context_id: (second_fence, second_token),
+    }
+    dispatch_payloads = [
+        _mf_parallel_rev3_worker_dispatch_payload(
+            conn,
+            backlog_id=backlog_id,
+            runtime_context=context,
+            route_label=f"r2-{context.task_id}",
+            route_task_id=execution_id,
+            parent_task_id=execution_id,
+        )
+        for context in contexts
+    ]
+    dispatch_payloads.sort(key=lambda item: item["runtime_context_id"])
+    dispatch = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "payload": {
+                    "bounded_workers": dispatch_payloads,
+                    "worker_count": 2,
+                    "required_worker_count": 2,
+                    "atomic_dispatch": True,
+                    "all_or_nothing": True,
+                },
+            },
+        )
+    )
+    assert dispatch["ok"] is True
+    dispatch_by_context = {
+        item["runtime_context_id"]: item for item in dispatch_payloads
+    }
+    for index, context in enumerate(contexts, start=1):
+        payload = dispatch_by_context[context.runtime_context_id]
+        append_branch_contract_revision(
+            conn,
+            context,
+            revision_id=f"crev-implementation-writer-hash-r2-{index}",
+            payload={
+                **payload,
+                "contract_execution_id": execution_id,
+                "successor_contract_execution_id": execution_id,
+                "parent_contract_execution_id": successor[
+                    "parent_contract_execution_id"
+                ],
+                "root_contract_execution_id": successor[
+                    "root_contract_execution_id"
+                ],
+                "contract_chain_id": successor["contract_chain_id"],
+                "observer_command_id": execution_id,
+                "target_files": list(context.owned_files),
+            },
+            route_identity=payload["route_identity"],
+        )
+    conn.commit()
+
+    runtime = server._contract_runtime(conn)
+    dispatched_record = runtime.store.get(execution_id)
+    active_runtime_context_id = dispatched_record["runtime_guide"][
+        "next_legal_action"
+    ]["runtime_context_id"]
+    inactive_context = next(
+        context
+        for context in contexts
+        if context.runtime_context_id != active_runtime_context_id
+    )
+    active_context = next(
+        context
+        for context in contexts
+        if context.runtime_context_id == active_runtime_context_id
+    )
+    inactive_payload = next(
+        item
+        for item in dispatch_payloads
+        if item["runtime_context_id"] == inactive_context.runtime_context_id
+    )
+    inactive_fence, inactive_token = secrets_by_context[
+        inactive_context.runtime_context_id
+    ]
+    worker_session_id = f"codex-{inactive_context.task_id}"
+    worker_identity = inactive_context.worker_slot_id
+    inactive_context = upsert_branch_context(
+        conn,
+        replace(
+            inactive_context,
+            agent_id=worker_identity,
+            allocation_owner=worker_identity,
+        ),
+    )
+    conn.commit()
+    session_ref = runtime_context_session_token_ref(inactive_context)
+    route_identity = dict(inactive_payload["route_identity"])
+
+    read = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx(
+            {
+                "project_id": PID,
+                "runtime_context_id": inactive_context.runtime_context_id,
+            },
+            method="POST",
+            body={
+                "contract_execution_id": execution_id,
+                "parent_task_id": execution_id,
+                "fence_token": inactive_fence,
+                "session_token": inactive_token,
+                "session_token_ref": session_ref,
+                "target_project_root": inactive_context.target_project_root,
+                "actor": worker_identity,
+                "read_receipt_hash": _fake_sha("implementation-r2-read"),
+                "launch_text_hash": _fake_sha("implementation-r2-launch"),
+            },
+        )
+    )
+    assert read["ok"] is True
+    read_event = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=inactive_context.task_id,
+        event_kind="mf_subagent_read_receipt",
+    )[-1]
+    startup = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": inactive_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": inactive_context.task_id,
+                "parent_task_id": execution_id,
+                "runtime_context_id": inactive_context.runtime_context_id,
+                "session_token": inactive_token,
+                "session_token_ref": session_ref,
+                "fence_token": inactive_fence,
+                "agent_id": worker_identity,
+                "actual_host_worker_id": worker_identity,
+                "worker_session_id": worker_session_id,
+                "worker_transcript_ref": f"codex:{worker_session_id}",
+                "harness_type": "codex",
+                "filer_principal": worker_session_id,
+                "observer_command_id": execution_id,
+                "actual_cwd": inactive_context.target_project_root,
+                "actual_git_root": inactive_context.target_project_root,
+                "branch": inactive_context.branch_ref,
+                "branch_ref": inactive_context.branch_ref,
+                "head_commit": inactive_context.base_commit,
+                "base_commit": inactive_context.base_commit,
+                "target_head_commit": inactive_context.target_head_commit,
+                "merge_queue_id": inactive_context.merge_queue_id,
+                "owned_files": list(inactive_context.owned_files),
+                "read_receipt_hash": _fake_sha("implementation-r2-read"),
+                "read_receipt_event_id": str(read_event["id"]),
+                "startup_source": "codex_desktop_governed_dispatch",
+                **route_identity,
+            },
+        )
+    )
+    assert startup["ok"] is True
+
+    graph_trace_id = "gqt-implementation-writer-hash-r2"
+    snapshot_id = "scope-implementation-writer-hash-r2"
+    _activate_basic_graph(
+        conn,
+        snapshot_id,
+        commit_sha=inactive_context.base_commit,
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        parent_task_id=execution_id,
+        snapshot_id=snapshot_id,
+        runtime_context_id=inactive_context.runtime_context_id,
+        task_id=inactive_context.task_id,
+        worker_role="mf_sub",
+        fence_token=inactive_fence,
+        run_id=_mf_sub_run_id(inactive_context.task_id, inactive_fence),
+    )
+    graph_line = server._runtime_context_submit_canonical_contract_line(
+        conn,
+        project_id=PID,
+        context=inactive_context,
+        contract_execution_id=execution_id,
+        stage_id="worker_context",
+        line_id="worker_graph_context",
+        evidence_kind="graph_trace",
+        payload={
+            "runtime_context_id": inactive_context.runtime_context_id,
+            "task_id": inactive_context.task_id,
+            "parent_task_id": execution_id,
+            "worker_role": "mf_sub",
+            "worker_id": inactive_context.worker_id,
+            "worker_slot_id": inactive_context.worker_slot_id,
+            "target_project_root": inactive_context.target_project_root,
+            "graph_trace_ids": [graph_trace_id],
+            "graph_query_trace_ids": [graph_trace_id],
+            "graph_trace_evidence": {
+                "db_verified": True,
+                "graph_trace_ids": [graph_trace_id],
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+            },
+            "db_verified": True,
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+        },
+    )
+    assert graph_line["accepted"] is True
+    assert runtime.store.get(execution_id)["runtime_guide"]["next_legal_action"][
+        "runtime_context_id"
+    ] == active_context.runtime_context_id
+
+    guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": inactive_context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": execution_id,
+                    "session_token": inactive_token,
+                    "session_token_ref": session_ref,
+                    "fence_token": inactive_fence,
+                    "target_project_root": inactive_context.target_project_root,
+                    "view": "all",
+                },
+            )
+        )
+    )
+    implementation_body = copy.deepcopy(
+        guide["worker_guide"][
+            "implementation_evidence_facade_payload_skeleton"
+        ]["copy_safe_body"]
+    )
+    implementation_body.update(
+        {
+            "session_token": inactive_token,
+            "session_token_ref": session_ref,
+            "fence_token": inactive_fence,
+            "changed_files": list(inactive_context.owned_files),
+            "graph_trace_ids": [graph_trace_id],
+            "test_results": {
+                "status": "passed",
+                "passed": True,
+                "commands": [
+                    {"command": "pytest -q implementation-r2", "status": "passed"}
+                ],
+            },
+            "tests": [
+                {"command": "pytest -q implementation-r2", "status": "passed"}
+            ],
+            "summary": "inactive lane real facade implementation",
+            **route_identity,
+        }
+    )
+    implementation_body["payload"] = {
+        **dict(implementation_body.get("payload") or {}),
+        "graph_trace_ids": [graph_trace_id],
+    }
+    baseline_record = copy.deepcopy(runtime.store.get(execution_id))
+    baseline_timeline_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    global_hash = baseline_record["runtime_guide"]["runtime_guide_hash"]
+    rejection_cases = []
+    malformed_hash = copy.deepcopy(implementation_body)
+    malformed_hash["runtime_guide_hash"] = {
+        "secret": "must-not-reflect-implementation-r2"
+    }
+    rejection_cases.append(malformed_hash)
+    stale_hash = copy.deepcopy(implementation_body)
+    stale_hash["runtime_guide_hash"] = _fake_sha("stale-implementation-r2")
+    rejection_cases.append(stale_hash)
+    other_lane_hash = copy.deepcopy(implementation_body)
+    other_lane_hash["runtime_guide_hash"] = global_hash
+    rejection_cases.append(other_lane_hash)
+    other_lane_identity = copy.deepcopy(implementation_body)
+    other_lane_identity["lane_id"] = active_context.worker_slot_id
+    rejection_cases.append(other_lane_identity)
+    malformed_identity = copy.deepcopy(implementation_body)
+    malformed_identity["lane_id"] = {
+        "secret": "must-not-reflect-lane-identity-r2"
+    }
+    rejection_cases.append(malformed_identity)
+    for rejected_body in rejection_cases:
+        with pytest.raises(GovernanceError) as rejected:
+            server.handle_graph_governance_runtime_context_implementation_evidence(
+                _ctx(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": inactive_context.runtime_context_id,
+                    },
+                    method="POST",
+                    body=rejected_body,
+                )
+            )
+        public = server._public_zero_write_error_response(rejected.value)
+        for field in ("field", "expected", "actual", "guide", "source"):
+            assert field in public
+        for field, expected in {
+            "zero_write_rejection": True,
+            "zero_worker_implementation_write": True,
+            "zero_contract_runtime_write": True,
+            "zero_timeline_write": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "retry_same_world_allowed": True,
+            "public_safe": True,
+            "secret_safe": True,
+        }.items():
+            assert public[field] is expected
+        serialized = json.dumps(public, sort_keys=True)
+        assert "must-not-reflect-implementation-r2" not in serialized
+        assert "must-not-reflect-lane-identity-r2" not in serialized
+        assert runtime.store.get(execution_id) == baseline_record
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_timeline_events"
+        ).fetchone()[0] == baseline_timeline_count
+
+    implementation_path = (
+        Path(inactive_context.target_project_root) / inactive_context.owned_files[0]
+    )
+    implementation_path.write_text("implementation\n", encoding="utf-8")
+    implementation = (
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": inactive_context.runtime_context_id,
+                },
+                method="POST",
+                body=implementation_body,
+            )
+        )
+    )
+    assert implementation["ok"] is True
+    implementation_record = runtime.store.get(execution_id)
+    implementation_line = implementation_record["completed_lines"][-1]
+    assert implementation_line["line_id"] == "worker_implementation"
+    implementation_lineage = _worker_implementation_lineage(
+        implementation_record,
+        implementation_line,
+    )
+
+    subprocess.run(
+        ["git", "add", inactive_context.owned_files[0]],
+        cwd=inactive_context.target_project_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "implementation"],
+        cwd=inactive_context.target_project_root,
+        check=True,
+        capture_output=True,
+    )
+    worker_commit_sha = batch_jobs.git_commit(
+        Path(inactive_context.target_project_root)
+    )
+    inactive_context = upsert_branch_context(
+        conn,
+        replace(inactive_context, head_commit=worker_commit_sha),
+    )
+    conn.commit()
+    worker_commit = server.handle_graph_governance_runtime_context_worker_commit(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": inactive_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "contract_execution_id": execution_id,
+                "runtime_context_id": inactive_context.runtime_context_id,
+                "task_id": inactive_context.task_id,
+                "parent_task_id": execution_id,
+                "session_token": inactive_token,
+                "session_token_ref": session_ref,
+                "fence_token": inactive_fence,
+                "target_project_root": inactive_context.target_project_root,
+                "worker_session_id": worker_session_id,
+                "filer_principal": worker_session_id,
+                "actor": worker_session_id,
+                "implementation_lineage_ref": implementation_lineage[
+                    "implementation_lineage_ref"
+                ],
+                "worker_commit_sha": worker_commit_sha,
+                "commit_sha": worker_commit_sha,
+                "head_commit": worker_commit_sha,
+                "owned_files": list(inactive_context.owned_files),
+                "changed_files": list(inactive_context.owned_files),
+                "graph_trace_ids": [graph_trace_id],
+            },
+        )
+    )
+    assert worker_commit["ok"] is True
+
+    finish_attestation = (
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": inactive_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "contract_execution_id": execution_id,
+                    "parent_task_id": execution_id,
+                    "session_token": inactive_token,
+                    "session_token_ref": session_ref,
+                    "fence_token": inactive_fence,
+                    "target_project_root": inactive_context.target_project_root,
+                    "worker_session_id": worker_session_id,
+                    "filer_principal": worker_session_id,
+                    "actor": worker_session_id,
+                    "worker_transcript_ref": f"codex:{worker_session_id}",
+                    "harness_type": "codex",
+                    "graph_trace_ids": [graph_trace_id],
+                    "read_receipt_hash": _fake_sha("implementation-r2-read"),
+                    "read_receipt_event_id": str(read_event["id"]),
+                    "observer_command_id": execution_id,
+                    "head_commit": worker_commit_sha,
+                    "changed_files": list(inactive_context.owned_files),
+                    "owned_files": list(inactive_context.owned_files),
+                    "actual_cwd": inactive_context.target_project_root,
+                    "actual_git_root": inactive_context.target_project_root,
+                    "test_results": {
+                        "status": "passed",
+                        "passed": True,
+                        "command": "pytest -q implementation-r2",
+                    },
+                    **route_identity,
+                },
+            )
+        )
+    )
+    finish_trace_id = "gqt-implementation-writer-hash-r2-finish"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=finish_trace_id,
+        parent_task_id=execution_id,
+        snapshot_id=snapshot_id,
+        runtime_context_id=inactive_context.runtime_context_id,
+        task_id=inactive_context.task_id,
+        worker_role="mf_sub",
+        fence_token=inactive_fence,
+        run_id=_mf_sub_run_id(inactive_context.task_id, inactive_fence),
+    )
+    finish_body = dict(finish_attestation["finish_gate_submission"]["body"])
+    finish_body.update(
+        {
+            "session_token": inactive_token,
+            "fence_token": inactive_fence,
+            "graph_trace_ids": [finish_trace_id],
+            "read_receipt_hash": "<returned read_receipt_hash>",
+            "read_receipt_event_id": "<returned read_receipt_event_id>",
+            "finish_time_worker_self_attestation": (
+                "<returned finish_time_worker_self_attestation>"
+            ),
+            "test_results": {"status": "passed", "passed": True},
+        }
+    )
+    finish = server.handle_graph_governance_runtime_context_finish_gate(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": inactive_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=finish_body,
+        )
+    )
+    assert finish["ok"] is True
+    completed = runtime.store.get(execution_id)["completed_lines"]
+    inactive_line_ids = [
+        line["line_id"]
+        for line in completed
+        if line.get("runtime_context_id") == inactive_context.runtime_context_id
+        or line.get("payload", {}).get("runtime_context_id")
+        == inactive_context.runtime_context_id
+    ]
+    for line_id in (
+        "worker_read_runtime_guide",
+        "worker_startup",
+        "worker_graph_context",
+        "worker_implementation",
+        "worker_commit",
+        "worker_finish_time_attestation",
+        "worker_finish_gate",
+    ):
+        assert line_id in inactive_line_ids
+    assert runtime.store.get(execution_id)["runtime_guide"]["next_legal_action"][
+        "runtime_context_id"
+    ] == active_context.runtime_context_id
+
+
 def test_runtime_context_close_gate_success_projects_canonical_line_once():
     requested = {
         "stage_id": "worker_implementation",

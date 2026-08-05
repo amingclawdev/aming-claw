@@ -1173,7 +1173,11 @@ def _public_zero_write_error_response(error: GovernanceError) -> dict[str, Any]:
     for key in (
         *required,
         "field_mismatches",
+        "identity_mismatches",
         "zero_write_rejection",
+        "zero_worker_implementation_write",
+        "zero_contract_runtime_write",
+        "zero_timeline_write",
         "writes_performed",
         "mutation_performed",
         "retry_same_world_allowed",
@@ -1196,6 +1200,53 @@ def _public_zero_write_error_response(error: GovernanceError) -> dict[str, Any]:
         if key in details:
             body[key] = details[key]
     return body
+
+
+def _runtime_context_implementation_zero_write_details(
+    *,
+    field: str,
+    expected: Any,
+    actual: Any,
+    source: str,
+    identity_mismatches: list[dict[str, Any]] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build the public/secret-safe hard-rejection contract for this facade."""
+
+    guide = {
+        "action": "refresh_worker_guide_and_retry_implementation",
+        "mcp_tool": "runtime_context_worker_guide",
+        "submit_via": "runtime_context_implementation_evidence",
+        "same_world_retry": True,
+        "bypass_or_waive_required": False,
+    }
+    details = {
+        "field": field,
+        "expected": expected,
+        "actual": actual,
+        "guide": guide,
+        "source": source,
+        "identity_mismatches": list(identity_mismatches or []),
+        "field_mismatches": list(identity_mismatches or []),
+        "zero_write_rejection": True,
+        "zero_worker_implementation_write": True,
+        "zero_contract_runtime_write": True,
+        "zero_timeline_write": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "retry_same_world_allowed": True,
+        "contract_runtime_mutated": False,
+        "runtime_context_mutated": False,
+        "timeline_mutated": False,
+        "public_safe": True,
+        "secret_safe": True,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "next_legal_action": guide["action"],
+    }
+    details.update(extra)
+    return details
 
 
 class GovernanceHandler(BaseHTTPRequestHandler):
@@ -47603,13 +47654,20 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     finally:
         conn.close()
     lane_id = str(context.worker_slot_id or context.worker_id or "").strip()
-    submitted_lane_claims = [
-        ("lane_id", str(body.get("lane_id") or "").strip()),
-        (
-            "payload.lane_id",
-            str(supplied_payload.get("lane_id") or "").strip(),
-        ),
-    ]
+    submitted_lane_claims = []
+    for field, source in (
+        ("lane_id", body),
+        ("payload.lane_id", supplied_payload),
+    ):
+        raw_actual = source.get("lane_id")
+        actual = (
+            raw_actual.strip()
+            if isinstance(raw_actual, str)
+            else "<invalid-runtime-context-identity>"
+        )
+        if raw_actual in (None, ""):
+            actual = ""
+        submitted_lane_claims.append((field, actual))
     lane_identity_mismatches = [
         {"field": field, "expected": lane_id, "actual": actual}
         for field, actual in submitted_lane_claims
@@ -47623,19 +47681,15 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
                 "authenticated RuntimeContext worker lane"
             ),
             422,
-            {
-                "runtime_context_id": runtime_context_id,
-                "task_id": str(context.task_id or "").strip(),
-                "field": "lane_id",
-                "expected": lane_id,
-                "actual": lane_identity_mismatches[0]["actual"],
-                "identity_mismatches": lane_identity_mismatches,
-                "zero_contract_runtime_write": True,
-                "zero_timeline_write": True,
-                "next_legal_action": (
-                    "refresh_worker_guide_and_copy_authenticated_lane_id"
-                ),
-            },
+            _runtime_context_implementation_zero_write_details(
+                field=lane_identity_mismatches[0]["field"],
+                expected=lane_id,
+                actual=lane_identity_mismatches[0]["actual"],
+                source="runtime_context_authenticated_worker_lane",
+                identity_mismatches=lane_identity_mismatches,
+                runtime_context_id=runtime_context_id,
+                task_id=str(context.task_id or "").strip(),
+            ),
         )
     if historical_route_correction:
         event_route_identity = dict(
@@ -47877,6 +47931,12 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         "trace_id": body.get("trace_id") or "",
         "commit_sha": body.get("commit_sha") or "",
     }
+    if "runtime_guide_hash" in body:
+        # Preserve the caller claim for the ContractRuntime lane gate.  The
+        # gate performs the public-safe comparison; silently dropping this
+        # field would turn malformed, stale, or other-lane hashes into an
+        # omitted-hash server derivation.
+        event_body["runtime_guide_hash"] = body.get("runtime_guide_hash")
     if isinstance(body.get("route_token"), Mapping):
         event_body["route_token"] = body.get("route_token")
     elif isinstance(body.get("route_waiver"), Mapping):
@@ -47893,6 +47953,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
             },
         )
         if mismatched:
+            first_mismatch = mismatched[0]
             raise GovernanceError(
                 "route_identity_mismatch",
                 (
@@ -47900,11 +47961,15 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
                     "identity conflicts with server-derived route identity"
                 ),
                 422,
-                {
-                    "runtime_context_id": runtime_context_id,
-                    "mismatched_fields": mismatched,
-                    "source": "runtime_context_latest_route_identity",
-                },
+                _runtime_context_implementation_zero_write_details(
+                    field=str(first_mismatch.get("field") or "route_identity"),
+                    expected=first_mismatch.get("expected", "server-derived"),
+                    actual=first_mismatch.get("actual", "<mismatch>"),
+                    source="runtime_context_latest_route_identity",
+                    identity_mismatches=mismatched,
+                    runtime_context_id=runtime_context_id,
+                    mismatched_fields=mismatched,
+                ),
             )
 
     trusted_route_gate = _runtime_context_timeline_route_gate(
@@ -113129,6 +113194,7 @@ def _contract_runtime_close_gate(
                 if not value
             ]
             if missing_authenticated_identity:
+                missing_fields = list(missing_authenticated_identity)
                 raise GovernanceError(
                     "contract_runtime_close_evidence_rejected",
                     (
@@ -113136,26 +113202,30 @@ def _contract_runtime_close_gate(
                         "RuntimeContext lane identity"
                     ),
                     422,
-                    {
-                        "schema_version": (
+                    _runtime_context_implementation_zero_write_details(
+                        field="worker_evidence_provenance",
+                        expected="complete authenticated RuntimeContext lane identity",
+                        actual="missing authenticated identity fields",
+                        source="runtime_context_copy_safe_worker_proof",
+                        schema_version=(
                             _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
                         ),
-                        "accepted": False,
-                        "contract_execution_id": contract_execution_id,
-                        "actor_role": actor_role,
-                        "field": "worker_evidence_provenance",
-                        "missing_fields": missing_authenticated_identity,
-                        "zero_worker_implementation_write": True,
-                        "zero_contract_runtime_write": True,
-                        "zero_timeline_write": True,
-                        "next_legal_action": (
-                            "refresh_worker_guide_and_retry_implementation"
-                        ),
-                    },
+                        accepted=False,
+                        contract_execution_id=contract_execution_id,
+                        actor_role=actor_role,
+                        missing_fields=missing_fields,
+                    ),
                 )
             provenance_identity_mismatches = []
             for field, expected in authenticated_identity.items():
-                actual = str(canonical_norm_payload.get(field) or "").strip()
+                raw_actual = canonical_norm_payload.get(field)
+                actual = (
+                    raw_actual.strip()
+                    if isinstance(raw_actual, str)
+                    else "<invalid-runtime-context-identity>"
+                )
+                if raw_actual in (None, ""):
+                    actual = ""
                 if actual and actual != expected:
                     provenance_identity_mismatches.append(
                         {
@@ -113175,21 +113245,16 @@ def _contract_runtime_close_gate(
                         "authenticated RuntimeContext worker provenance"
                     ),
                     422,
-                    {
-                        "contract_execution_id": contract_execution_id,
-                        "runtime_context_id": authenticated_runtime_context_id,
-                        "task_id": authenticated_identity["task_id"],
-                        "field": first_mismatch["field"],
-                        "expected": first_mismatch["expected"],
-                        "actual": first_mismatch["actual"],
-                        "identity_mismatches": provenance_identity_mismatches,
-                        "zero_worker_implementation_write": True,
-                        "zero_contract_runtime_write": True,
-                        "zero_timeline_write": True,
-                        "next_legal_action": (
-                            "refresh_worker_guide_and_retry_implementation"
-                        ),
-                    },
+                    _runtime_context_implementation_zero_write_details(
+                        field=first_mismatch["field"],
+                        expected=first_mismatch["expected"],
+                        actual=first_mismatch["actual"],
+                        source="runtime_context_copy_safe_worker_proof",
+                        identity_mismatches=provenance_identity_mismatches,
+                        contract_execution_id=contract_execution_id,
+                        runtime_context_id=authenticated_runtime_context_id,
+                        task_id=authenticated_identity["task_id"],
+                    ),
                 )
         for field in trusted_writer_fields:
             value = canonical_norm_payload.get(field)
@@ -113255,6 +113320,29 @@ def _contract_runtime_close_gate(
                 write[field] = expected
             if lane_identity_mismatches:
                 first_mismatch = lane_identity_mismatches[0]
+                if trusted_worker_implementation_line:
+                    raise GovernanceError(
+                        "runtime_context_lane_identity_mismatch",
+                        (
+                            "worker-implementation identity does not match the "
+                            "exact ContractRuntime atomic lane binding"
+                        ),
+                        422,
+                        _runtime_context_implementation_zero_write_details(
+                            field=first_mismatch["field"],
+                            expected=first_mismatch["expected"],
+                            actual=first_mismatch["actual"],
+                            source="contract_runtime_atomic_lane_binding",
+                            identity_mismatches=lane_identity_mismatches,
+                            contract_execution_id=contract_execution_id,
+                            runtime_context_id=str(
+                                canonical_norm_payload.get("runtime_context_id") or ""
+                            ),
+                            task_id=str(
+                                canonical_norm_payload.get("task_id") or ""
+                            ),
+                        ),
+                    )
                 raise GovernanceError(
                     "runtime_context_lane_identity_mismatch",
                     (
@@ -113310,34 +113398,33 @@ def _contract_runtime_close_gate(
                     "atomic lane writer guide"
                 ),
                 422,
-                {
-                    "schema_version": (
+                _runtime_context_implementation_zero_write_details(
+                    field="atomic_lane_gate_binding",
+                    expected="bound lane writer_role_safe_copy_payload",
+                    actual="unbound",
+                    source="contract_runtime_atomic_lane_binding",
+                    schema_version=(
                         _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
                     ),
-                    "accepted": False,
-                    "contract_execution_id": contract_execution_id,
-                    "actor_role": actor_role,
-                    "field": "atomic_lane_gate_binding",
-                    "expected": "bound lane writer_role_safe_copy_payload",
-                    "actual": "unbound",
-                    "zero_worker_implementation_write": True,
-                    "zero_contract_runtime_write": True,
-                    "zero_timeline_write": True,
-                    "next_legal_action": (
-                        "refresh_worker_guide_and_retry_implementation"
-                    ),
-                },
+                    accepted=False,
+                    contract_execution_id=contract_execution_id,
+                    actor_role=actor_role,
+                ),
             )
         server_writer_hash = str(write.get("runtime_guide_hash") or "").strip()
-        allowed_hashes = {
-            value
-            for value in (
-                source_global_hash,
-                lane_hash,
-                server_writer_hash,
-            )
-            if value
-        }
+        allowed_hashes = (
+            {lane_hash}
+            if trusted_worker_implementation_line and lane_hash
+            else {
+                value
+                for value in (
+                    source_global_hash,
+                    lane_hash,
+                    server_writer_hash,
+                )
+                if value
+            }
+        )
         if supplied_hash_present and supplied_hash not in allowed_hashes:
             expected_hash = lane_hash or server_writer_hash
             identity_mismatch = {
@@ -113347,6 +113434,28 @@ def _contract_runtime_close_gate(
                     supplied_hash_value
                 ),
             }
+            if trusted_worker_implementation_line:
+                raise GovernanceError(
+                    "contract_runtime_close_evidence_rejected",
+                    (
+                        "RuntimeContext facade runtime_guide_hash does not match "
+                        "the current authenticated lane writer guide"
+                    ),
+                    422,
+                    _runtime_context_implementation_zero_write_details(
+                        field=identity_mismatch["field"],
+                        expected=identity_mismatch["expected"],
+                        actual=identity_mismatch["actual"],
+                        source="contract_runtime_lane_writer_role_safe_copy_payload",
+                        identity_mismatches=[identity_mismatch],
+                        schema_version=(
+                            _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
+                        ),
+                        accepted=False,
+                        contract_execution_id=contract_execution_id,
+                        actor_role=actor_role,
+                    ),
+                )
             raise GovernanceError(
                 "contract_runtime_close_evidence_rejected",
                 (
