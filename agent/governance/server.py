@@ -99443,6 +99443,108 @@ def _onboard_direct_main_transition_enter_event_is_authoritative(
     return False
 
 
+def _onboard_parentless_direct_main_worker_implementation_is_authoritative(
+    event: Mapping[str, Any],
+    *,
+    direct_event: Mapping[str, Any],
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+) -> bool:
+    """Accept only an immutable server-gated worker-owned direct-main event."""
+
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    actor = str(event.get("actor") or "").strip()
+    commit_sha = str(event.get("commit_sha") or "").strip().lower()
+    materialized_from = (
+        payload.get("materialized_from")
+        if isinstance(payload.get("materialized_from"), Mapping)
+        else {}
+    )
+    worker_task = str(materialized_from.get("worker_task") or "").strip()
+    decision = (
+        payload.get("contract_gate_decision")
+        if isinstance(payload.get("contract_gate_decision"), Mapping)
+        else {}
+    )
+    decision_hash = str(decision.get("decision_hash") or "").strip()
+    unsigned_decision = {
+        key: value for key, value in decision.items() if key != "decision_hash"
+    }
+    authority = _contract_runtime_close_authority_first_deep_mapping(
+        event,
+        "source_backed_contract_gate_authority",
+    )
+    route_gate = (
+        authority.get("route_token_gate")
+        if isinstance(authority.get("route_token_gate"), Mapping)
+        else {}
+    )
+    route_scope = (
+        route_gate.get("scope")
+        if isinstance(route_gate.get("scope"), Mapping)
+        else {}
+    )
+    direct_identity = _observer_root_route_identity_from_event(direct_event)
+    implementation_identity = _observer_root_route_identity_from_event(event)
+    route_identity_matches = bool(
+        str(direct_identity.get("route_id") or "").strip()
+        and str(direct_identity.get("route_context_hash") or "").strip()
+        and str(implementation_identity.get("route_id") or "").strip()
+        == str(direct_identity.get("route_id") or "").strip()
+        and str(implementation_identity.get("route_context_hash") or "").strip()
+        == str(direct_identity.get("route_context_hash") or "").strip()
+        and _observer_root_route_identity_matches_partial(
+            implementation_identity,
+            direct_identity,
+        )
+    )
+
+    return bool(
+        str(event.get("backlog_id") or "").strip() == backlog_id
+        and str(event.get("task_id") or "").strip() == task_id
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha)
+        and actor
+        and worker_task
+        and actor == f"worker:{worker_task}"
+        and str(payload.get("evidence_owner") or "").strip() == actor
+        and str(payload.get("authored_by") or "").strip() == actor
+        and payload.get("observer_authored") is False
+        and not _qa_request_has_impersonation_claim(event)
+        and str(materialized_from.get("schema_version") or "").strip()
+        == "immutable_worker_result.v1"
+        and materialized_from.get("immutable") is True
+        and str(materialized_from.get("implementation_commit") or "")
+        .strip()
+        .lower()
+        == commit_sha
+        and str(payload.get("implementation_commit") or "").strip().lower()
+        == commit_sha
+        and _contract_runtime_projection_timeline_actor_role(event) == "mf_sub"
+        and decision.get("ok") is True
+        and str(decision.get("decision") or "").strip() == "allow"
+        and str(decision.get("action") or "").strip()
+        == "task_timeline_append"
+        and str(decision.get("required_role") or "").strip() == "mf_sub"
+        and str(decision.get("actor_role") or "").strip() == "mf_sub"
+        and str(decision.get("source_of_authority") or "").strip()
+        == "route_token_gate"
+        and decision_hash
+        and decision_hash == stable_sha256(unsigned_decision)
+        and _contract_runtime_close_authority_route_token_backed_event(
+            event,
+            implementation_identity,
+            require_source_backed_authority=True,
+        )
+        and str(route_gate.get("action") or "").strip()
+        == "task_timeline_append"
+        and str(route_scope.get("project_id") or "").strip() == project_id
+        and str(route_scope.get("backlog_id") or "").strip() == backlog_id
+        and str(route_scope.get("task_id") or "").strip() == task_id
+        and route_identity_matches
+    )
+
+
 def _onboard_parentless_direct_main_failed_qa_state(
     conn,
     *,
@@ -99453,12 +99555,26 @@ def _onboard_parentless_direct_main_failed_qa_state(
 
     from . import task_timeline
 
-    direct_candidates = _onboard_parentless_direct_main_timeline_events(
-        conn,
-        project_id=project_id,
-        backlog_id=backlog_id,
-        event_kind="observer_direct_implementation_exception",
-    )
+    direct_candidates_by_id: dict[int, dict[str, Any]] = {}
+    for direct_event_kind in (
+        "observer_direct_implementation_exception",
+        "observer_direct_mutation_exception",
+    ):
+        for candidate in _onboard_parentless_direct_main_timeline_events(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            event_kind=direct_event_kind,
+        ):
+            event_id = int(
+                candidate.get("id") or candidate.get("event_id") or 0
+            )
+            if event_id:
+                direct_candidates_by_id[event_id] = candidate
+    direct_candidates = [
+        direct_candidates_by_id[event_id]
+        for event_id in sorted(direct_candidates_by_id, reverse=True)
+    ]
     direct_events = [
         event
         for event in direct_candidates
@@ -99496,13 +99612,24 @@ def _onboard_parentless_direct_main_failed_qa_state(
         return str(event.get("status") or event.get("decision") or "").strip().lower()
 
     def _is_direct_implementation(event: Mapping[str, Any]) -> bool:
-        return (
-            str(event.get("task_id") or "").strip() == task_id
+        common = bool(
+            str(event.get("backlog_id") or "").strip() == backlog_id
+            and str(event.get("task_id") or "").strip() == task_id
             and _event_id(event) > direct_event_id
-            and str(event.get("actor") or "").strip() == "observer"
             and str(event.get("event_kind") or event.get("phase") or "").strip()
             == "implementation"
             and _event_status(event) in passing_statuses
+        )
+        if not common:
+            return False
+        if str(event.get("actor") or "").strip() == "observer":
+            return True
+        return _onboard_parentless_direct_main_worker_implementation_is_authoritative(
+            event,
+            direct_event=direct_event,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
         )
 
     implementations = [
@@ -113420,11 +113547,23 @@ def _contract_runtime_premerge_candidate_qa_receipt_gate(
         bool(str(proof.get("qa_scope_binding_ref") or "").strip()),
     )
     require("graph_trace_ids", True, bool(proof_trace_ids))
+    evidence_status = str(normalized_status or "").strip().lower()
+    close_satisfying_verdict = evidence_status in _QA_TIMELINE_CLOSE_STATUSES
+    audit_only = evidence_status in _QA_TIMELINE_AUDIT_STATUSES
     require(
         "status",
         True,
-        str(normalized_status or "").strip().lower()
-        in _QA_TIMELINE_CLOSE_STATUSES,
+        close_satisfying_verdict or audit_only,
+    )
+    require(
+        "qa_session_proof.evidence_status",
+        evidence_status,
+        str(proof.get("evidence_status") or "").strip().lower(),
+    )
+    require(
+        "qa_session_proof.audit_only",
+        audit_only,
+        proof.get("audit_only") is True,
     )
 
     if mismatches:
@@ -113481,6 +113620,11 @@ def _contract_runtime_premerge_candidate_qa_receipt_gate(
         "qa_session_id": proof_session_id,
         "qa_scope_binding_ref": str(proof.get("qa_scope_binding_ref") or "").strip(),
         "graph_trace_ids": proof_trace_ids,
+        "evidence_status": evidence_status,
+        "qa_verdict_passing": close_satisfying_verdict,
+        "close_satisfying": False,
+        "audit_only": audit_only,
+        "materialize_satisfying": close_satisfying_verdict,
         "observer_merge_written": False,
         "observer_merge_bypassed": False,
         "observer_authorship_preserved": True,
@@ -113490,7 +113634,11 @@ def _contract_runtime_premerge_candidate_qa_receipt_gate(
     return {
         "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
         "accepted": True,
-        "status": "accepted_premerge_candidate_qa_receipt",
+        "status": (
+            "accepted_premerge_candidate_qa_audit_receipt"
+            if audit_only
+            else "accepted_premerge_candidate_qa_receipt"
+        ),
         "primary_decision_source": True,
         "agent_facing_decision_source": "source_backed_premerge_candidate_qa",
         "meta_contract_gate_decision_source": False,
@@ -113504,6 +113652,9 @@ def _contract_runtime_premerge_candidate_qa_receipt_gate(
         "next_legal_action": dict(next_line),
         "canonical_submit_required": False,
         "contract_runtime_mutated": False,
+        "close_satisfying": False,
+        "audit_only": audit_only,
+        "materialize_satisfying": close_satisfying_verdict,
         "observer_merge_written": False,
         "observer_merge_bypassed": False,
         "timeline_append_required": True,

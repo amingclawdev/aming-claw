@@ -29067,7 +29067,129 @@ def test_two_worker_premerge_qa_receipts_persist_at_observer_merge_without_writi
         for event in persisted
     )
 
-    persisted_count = len(persisted)
+    runtime_record_before_failed_receipt = copy.deepcopy(record)
+    worker_a_context_before = asdict(
+        get_branch_context(conn, PID, "worker-a")
+    )
+    merge_queues_before = {
+        worker["merge_queue_id"]: list_merge_queue_items(
+            conn,
+            PID,
+            worker["merge_queue_id"],
+        )
+        for worker in workers
+    }
+    active_proof.clear()
+    active_proof.update(
+        {
+            "schema_version": "qa_session_scope_proof.v1",
+            "source": "authenticated_qa_session",
+            "verified": True,
+            "role": "qa",
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": "worker-a",
+            "commit_sha": candidates["worker-a"],
+            "qa_principal": "qa:premerge-worker-a-failed",
+            "qa_session_id": "ses-premerge-worker-a-failed",
+            "qa_scope_binding_ref": (
+                f"qa-scope:worker-a:{candidates['worker-a']}"
+            ),
+            "graph_trace_ids": ["gqt-premerge-worker-a-failed"],
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "db_verified_graph_trace": True,
+            "query_root": "/tmp/two-worker-premerge-qa",
+            "observer_impersonation": False,
+            "evidence_status": "failed",
+            "authority_scope": "audit_only",
+            "close_satisfying": False,
+            "audit_only": True,
+            "passing_status_required_for_close": True,
+        }
+    )
+    failed_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+    )
+    failed_ctx._session.update(
+        {
+            "session_id": "ses-premerge-worker-a-failed",
+            "principal_id": "qa:premerge-worker-a-failed",
+        }
+    )
+    failed_ctx.body = {
+        "backlog_id": backlog_id,
+        "task_id": "worker-a",
+        "event_type": "qa.candidate.independent_verification",
+        "event_kind": "independent_verification",
+        "phase": "verification",
+        "actor": "qa:premerge-worker-a-failed",
+        "status": "failed",
+        "commit_sha": candidates["worker-a"],
+        "graph_trace_ids": ["gqt-premerge-worker-a-failed"],
+        "payload": {
+            "contract_execution_id": execution_id,
+            "runtime_context_id": "mfrctx-worker-a",
+            "candidate_commit_sha": candidates["worker-a"],
+        },
+        "verification": {
+            "verdict": "FAIL",
+            "candidate_new_failures": 1,
+            "candidate_specific_issues": ["candidate regression"],
+            "overall_release_pass_claimed": False,
+        },
+    }
+
+    failed_result = server.handle_task_timeline_append(failed_ctx)
+
+    failed_gate = failed_result["contract_runtime_close_evidence_gate"]
+    assert failed_gate["accepted"] is True
+    assert failed_gate["status"] == (
+        "accepted_premerge_candidate_qa_audit_receipt"
+    )
+    assert failed_gate["close_satisfying"] is False
+    assert failed_gate["audit_only"] is True
+    assert failed_gate["contract_runtime_mutated"] is False
+    assert failed_gate["observer_merge_written"] is False
+    assert failed_gate["next_legal_action"]["line_id"] == "observer_merge"
+    assert "guide" not in failed_gate
+    failed_authority = failed_result["payload"][
+        "premerge_candidate_qa_receipt_authority"
+    ]
+    assert failed_authority["evidence_status"] == "failed"
+    assert failed_authority["close_satisfying"] is False
+    assert failed_authority["audit_only"] is True
+    assert failed_result["status"] == "failed"
+    failed_persisted = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="independent_verification",
+        limit=10,
+    )
+    assert len(failed_persisted) == len(persisted) + 1
+    failed_receipt = next(
+        event
+        for event in failed_persisted
+        if event["id"] == failed_result["id"]
+    )
+    assert failed_receipt["status"] == "failed"
+    assert copy.deepcopy(record) == runtime_record_before_failed_receipt
+    assert asdict(get_branch_context(conn, PID, "worker-a")) == (
+        worker_a_context_before
+    )
+    assert {
+        worker["merge_queue_id"]: list_merge_queue_items(
+            conn,
+            PID,
+            worker["merge_queue_id"],
+        )
+        for worker in workers
+    } == merge_queues_before
+
+    persisted_count = len(failed_persisted)
     active_proof.update(
         {
             "task_id": "worker-a",
@@ -119386,6 +119508,9 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
     backlog_id: str,
     prepare_backlog: bool = True,
     record_failed_qa: bool = True,
+    worker_owned_implementation: bool = False,
+    worker_actor: str = "worker:/root/direct-main-worker",
+    worker_claim_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     if prepare_backlog:
         _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -119424,7 +119549,11 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
         backlog_id=backlog_id,
         task_id=task_id,
         event_type="mf.observer_direct_implementation_exception",
-        event_kind="observer_direct_implementation_exception",
+        event_kind=(
+            "observer_direct_mutation_exception"
+            if worker_owned_implementation
+            else "observer_direct_implementation_exception"
+        ),
         phase="pre_mutation",
         status="accepted",
         decision="operator_supervised_direct_main_approved",
@@ -119442,26 +119571,72 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
             }
         },
     )
+    implementation_payload = {
+        "source_backed_contract_gate_authority": (
+            task_timeline.source_backed_route_gate_authority(route_gate)
+        ),
+        "changed_files": [
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+    }
+    implementation_actor = "observer"
+    implementation_event_type = "observer.implementation"
+    if worker_owned_implementation:
+        implementation_actor = worker_actor
+        implementation_event_type = "worker.implementation"
+        meta_gate = {
+            "schema_version": "meta_contract_timeline_event_gate.v1",
+            "allowed": True,
+            "status": "passed",
+            "role": "mf_sub",
+            "action": "implementation",
+            "on_behalf": False,
+            "self_attesting": False,
+            "observer_worker_transport": False,
+        }
+        contract_gate_decision = {
+            "schema_version": "contract_gate_decision.v1",
+            "ok": True,
+            "decision": "allow",
+            "action": "task_timeline_append",
+            "required_role": "mf_sub",
+            "actor_role": "mf_sub",
+            "source_of_authority": "route_token_gate",
+            "meta_contract_gate": meta_gate,
+        }
+        contract_gate_decision["decision_hash"] = server.stable_sha256(
+            contract_gate_decision
+        )
+        implementation_payload.update(
+            {
+                "evidence_owner": worker_actor,
+                "authored_by": worker_actor,
+                "observer_authored": False,
+                "materialized_from": {
+                    "schema_version": "immutable_worker_result.v1",
+                    "worker_task": "/root/direct-main-worker",
+                    "implementation_commit": commit_sha,
+                    "immutable": True,
+                },
+                "implementation_commit": commit_sha,
+                "contract_gate_decision": contract_gate_decision,
+                "meta_contract_gate": meta_gate,
+            }
+        )
+        implementation_payload.update(dict(worker_claim_overrides or {}))
     implementation = task_timeline.record_event(
         conn,
         project_id=PID,
         backlog_id=backlog_id,
         task_id=task_id,
-        event_type="observer.implementation",
+        event_type=implementation_event_type,
         event_kind="implementation",
         phase="implementation",
         status="passed",
-        actor="observer",
+        actor=implementation_actor,
         commit_sha=commit_sha,
-        payload={
-            "source_backed_contract_gate_authority": (
-                task_timeline.source_backed_route_gate_authority(route_gate)
-            ),
-            "changed_files": [
-                "agent/governance/server.py",
-                "agent/tests/test_graph_governance_api.py",
-            ]
-        },
+        payload=implementation_payload,
     )
     failed_qa = None
     if record_failed_qa:
@@ -119489,6 +119664,109 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
             f"timeline:{failed_qa['id']}" if failed_qa is not None else ""
         ),
     }
+
+
+def test_direct_main_failed_qa_accepts_route_bound_worker_owned_implementation(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-DIRECT-MAIN-FAILED-QA-WORKER-OWNED-IMPLEMENTATION"
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+        worker_owned_implementation=True,
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_observer_direct_independent_verification_event",
+        lambda *_args, **_kwargs: True,
+    )
+
+    state = server._onboard_parentless_direct_main_failed_qa_state(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+
+    assert state["source_direct_main_event_ref"] == lineage["direct_event_ref"]
+    assert state["implementation_event_ref"] == lineage[
+        "implementation_event_ref"
+    ]
+    assert state["implementation_commit"] == lineage["commit_sha"]
+    assert state["failed_qa_source_ref"] == lineage["failed_qa_source_ref"]
+    action = server._onboard_parentless_direct_main_failed_qa_next_action(state)
+    assert action["id"] == "operator_supervised_direct_main_failed_qa_rework"
+    assert action["successor_generation"] == "fresh"
+    assert action["successor_work_type"] == "operator_supervised_direct_main"
+    assert action["same_row_resume_allowed"] is False
+    assert action["separate_bounded_successor_row_required"] is True
+
+
+@pytest.mark.parametrize(
+    ("worker_actor", "worker_claim_overrides"),
+    [
+        ("worker:/root/forged-worker", {}),
+        (
+            "worker:/root/direct-main-worker",
+            {"evidence_owner": "worker:/root/other-worker"},
+        ),
+        (
+            "worker:/root/direct-main-worker",
+            {"authored_by": "worker:/root/other-worker"},
+        ),
+        (
+            "worker:/root/direct-main-worker",
+            {"observer_authored": True},
+        ),
+        (
+            "worker:/root/direct-main-worker",
+            {"observer_impersonation": True},
+        ),
+        (
+            "worker:/root/direct-main-worker",
+            {"source_backed_contract_gate_authority": {}},
+        ),
+        (
+            "worker:/root/direct-main-worker",
+            {
+                "materialized_from": {
+                    "schema_version": "immutable_worker_result.v1",
+                    "worker_task": "/root/other-worker",
+                    "implementation_commit": "a" * 40,
+                    "immutable": True,
+                }
+            },
+        ),
+    ],
+)
+def test_direct_main_failed_qa_rejects_forged_worker_implementation_authority(
+    conn,
+    monkeypatch,
+    worker_actor,
+    worker_claim_overrides,
+):
+    suffix = server.stable_sha256(
+        {"actor": worker_actor, "claims": worker_claim_overrides}
+    )[7:15]
+    backlog_id = f"AC-DIRECT-MAIN-FAILED-QA-FORGED-WORKER-{suffix}"
+    _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+        worker_owned_implementation=True,
+        worker_actor=worker_actor,
+        worker_claim_overrides=worker_claim_overrides,
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_observer_direct_independent_verification_event",
+        lambda *_args, **_kwargs: True,
+    )
+
+    assert server._onboard_parentless_direct_main_failed_qa_state(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    ) == {}
 
 
 def test_direct_main_failed_qa_guide_forces_fresh_same_contract_successor(
