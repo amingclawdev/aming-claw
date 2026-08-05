@@ -4,7 +4,9 @@ from pathlib import Path
 from agent.governance.contract_state_runtime import (
     integration_epoch_resume_projection,
 )
+from agent.governance import server
 from agent.governance.contracts import ContractDefinitionRegistry
+from agent.mcp.tools import TOOLS
 
 
 DEFINITION_PATH = (
@@ -13,10 +15,20 @@ DEFINITION_PATH = (
     / "contract_definitions"
     / "mf_parallel.v2.rev4.json"
 )
+REV9_DEFINITION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "governance"
+    / "contract_definitions"
+    / "mf_parallel.v2.rev9.json"
+)
 
 
 def _definition() -> dict:
     return json.loads(DEFINITION_PATH.read_text())
+
+
+def _rev9_definition() -> dict:
+    return json.loads(REV9_DEFINITION_PATH.read_text())
 
 
 def _observer_reconcile_line(definition: dict) -> dict:
@@ -225,3 +237,84 @@ def test_non_reconcile_epoch_does_not_project_reconcile_action_input():
     assert action["id"] == "resume_batch_merge"
     assert action["action_input"] == {}
     assert action["action_input_copy_safe"] is False
+
+
+def test_rev9_reconcile_recipe_matches_mcp_and_surfaces_runtime_action():
+    definition = _rev9_definition()
+    recipe = _reconcile_policy(definition)[
+        "observer_reconcile_next_action"
+    ]
+    reconcile = recipe["sequence"][0]
+    required_fields = reconcile["required_copy_safe_fields"]
+    tool = next(
+        item for item in TOOLS if item["name"] == "graph_current_full_reconcile"
+    )
+    schema_properties = set(tool["inputSchema"]["properties"])
+
+    assert required_fields == [
+        "project_id",
+        "observer_session_id",
+        "route_token_ref",
+        "backlog_id",
+        "task_id",
+        "target_commit_sha",
+    ]
+    assert set(required_fields).issubset(schema_properties)
+    assert tool["inputSchema"][
+        "x-copy-safe-observer-reconcile-fields"
+    ] == required_fields
+    assert tool["inputSchema"][
+        "x-server-derived-reconcile-scope-fields"
+    ] == reconcile["server_derived_fields"]
+    assert "runtime_context_id" not in required_fields
+    assert "target_project_root" not in required_fields
+    assert "contract_execution_id" not in required_fields
+
+    guide = {
+        "schema_version": "contract_runtime_guide.v1",
+        "contract": {
+            "contract_id": "mf_parallel.v2",
+            "version": "v2",
+            "revision": "rev9",
+        },
+        "execution": {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-REV9-RECONCILE-SURFACE",
+            "contract_execution_id": "cex-rev9-reconcile-surface",
+            "execution_state_revision": 8,
+        },
+        "next_legal_action": {
+            "stage_id": "observer_integration",
+            "line_id": "observer_reconcile",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "reconcile",
+            "task_id": "rev9-reconcile-surface-worker-b",
+            "target_head_commit": "a" * 40,
+        },
+        "runtime_guide_hash": "sha256:rev9-reconcile-surface",
+    }
+
+    action = server._runtime_next_action_from_guide(guide)
+
+    assert action["line_id"] == "observer_reconcile"
+    assert action["required_tool"] == "graph_current_full_reconcile"
+    assert action["observer_reconcile_next_action"] == recipe
+    assert action["action_input_copy_safe"] is True
+    assert action["action_input"] == {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-REV9-RECONCILE-SURFACE",
+        "task_id": "rev9-reconcile-surface-worker-b",
+        "target_commit_sha": "a" * 40,
+        "activate": True,
+        "require_clean": True,
+        "semantic_use_ai": False,
+        "semantic_enrich": False,
+        "enqueue_stale": False,
+    }
+    assert action["action_input_required_copy_safe_fields"] == required_fields
+    assert action["action_input_missing_required_fields"] == [
+        "observer_session_id",
+        "route_token_ref",
+    ]
+    assert action["route_scopes_interchangeable"] is False

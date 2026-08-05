@@ -605,6 +605,8 @@
             "task_id_source": "dispatched_runtime_context.task_id",
             "runtime_context_id_source": "dispatched_runtime_context.runtime_context_id",
             "target_project_root_source": "dispatched_runtime_context.target_project_root",
+            "target_commit_sha_source": "canonical_target_head_commit",
+            "runtime_context_scope_submission": "server_derived_not_caller_supplied",
             "explicit_task_id_mismatch_policy": "fail_closed"
           },
           "sequence": [
@@ -615,14 +617,19 @@
               "route_task_id_source": "dispatched_runtime_context.task_id",
               "protected_action": "graph_current_full_reconcile",
               "required_copy_safe_fields": [
+                "project_id",
                 "observer_session_id",
                 "route_token_ref",
                 "backlog_id",
+                "task_id",
+                "target_commit_sha"
+              ],
+              "server_derived_fields": [
                 "contract_execution_id",
                 "runtime_context_id",
-                "task_id",
                 "target_project_root"
               ],
+              "task_scope_alias_policy": "submit_task_id_only_do_not_pair_with_contract_execution_id_alias",
               "raw_route_token_required": false,
               "produces": [
                 "active_snapshot_id",

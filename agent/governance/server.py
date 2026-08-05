@@ -60405,6 +60405,7 @@ def _record_pending_scope_reconcile_contract_event(
     result: Mapping[str, Any],
     target_commit_sha: str,
     runtime_context_scope: Mapping[str, Any] | None = None,
+    declared_actor_role: str = "",
     post_commit_hooks: bool = True,
 ) -> dict[str, Any]:
     if not isinstance(result, Mapping) or result.get("ok") is False:
@@ -60431,6 +60432,17 @@ def _record_pending_scope_reconcile_contract_event(
         scope["task_id"] = canonical_scope.get("task_id", scope["task_id"])
     if not scope["backlog_id"]:
         return {}
+    declared_role = str(declared_actor_role or "").strip().lower()
+    if declared_role and declared_role != "observer":
+        raise ValidationError(
+            "current-full reconcile timeline role must be observer",
+            {
+                "field": "declared_actor_role",
+                "expected": "observer",
+                "actual": declared_role,
+                "fail_closed": True,
+            },
+        )
     from . import task_timeline
 
     snapshot_id = str(
@@ -60508,6 +60520,7 @@ def _record_pending_scope_reconcile_contract_event(
             "requirement_id": "reconcile",
             "contract_evidence": [contract_evidence],
             "requested_by_actor": str(body.get("actor") or "").strip(),
+            **({"actor_role": declared_role} if declared_role else {}),
             "target_commit_sha": target_commit_sha,
             "snapshot_id": snapshot_id,
             "active_snapshot_id": str(
@@ -61769,6 +61782,12 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     result=result,
                     target_commit_sha=target_commit,
                     runtime_context_scope=runtime_context_scope,
+                    declared_actor_role=(
+                        "observer"
+                        if str(current_full_auth.get("role") or "").strip()
+                        == "observer"
+                        else ""
+                    ),
                     post_commit_hooks=False,
                 )
                 if route_bound and not timeline_event:
@@ -76338,6 +76357,143 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
     return projected, projection
 
 
+def _contract_runtime_observer_reconcile_action_projection(
+    guide: Mapping[str, Any],
+    next_line: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Surface the source contract's reconcile recipe with safe live inputs.
+
+    The ContractRuntime route ref authorizes the later submit-line write; it is
+    not interchangeable with the task-scoped reconcile-only route.  Therefore
+    this projection copies only values already bound to the reconcile call and
+    lists the observer session/ref inputs that the observer must obtain from
+    its active reconcile route context.
+    """
+
+    if str(next_line.get("line_id") or "").strip() != "observer_reconcile":
+        return {}
+    contract = (
+        guide.get("contract")
+        if isinstance(guide.get("contract"), Mapping)
+        else {}
+    )
+    if str(contract.get("contract_id") or "").strip() != MF_PARALLEL_CONTRACT_ID:
+        return {}
+    try:
+        definition = _CONTRACT_DEFINITION_REGISTRY.get(
+            MF_PARALLEL_CONTRACT_ID,
+            version=str(contract.get("version") or "") or None,
+            revision=str(contract.get("revision") or "") or None,
+            include_deprecated=True,
+        )
+    except Exception:
+        return {}
+    system_layer = (
+        definition.get("system_layer")
+        if isinstance(definition.get("system_layer"), Mapping)
+        else {}
+    )
+    graph_policy = (
+        system_layer.get("graph_binding_policy")
+        if isinstance(system_layer.get("graph_binding_policy"), Mapping)
+        else {}
+    )
+    reconcile_policy = (
+        graph_policy.get("current_full_reconcile_evidence_policy")
+        if isinstance(
+            graph_policy.get("current_full_reconcile_evidence_policy"),
+            Mapping,
+        )
+        else {}
+    )
+    recipe = (
+        reconcile_policy.get("observer_reconcile_next_action")
+        if isinstance(
+            reconcile_policy.get("observer_reconcile_next_action"),
+            Mapping,
+        )
+        else {}
+    )
+    sequence = [
+        item
+        for item in recipe.get("sequence") or []
+        if isinstance(item, Mapping)
+    ]
+    reconcile_step = next(
+        (
+            item
+            for item in sequence
+            if str(item.get("action") or "").strip()
+            == "graph_current_full_reconcile"
+        ),
+        {},
+    )
+    required_fields = [
+        str(field or "").strip()
+        for field in reconcile_step.get("required_copy_safe_fields") or []
+        if str(field or "").strip()
+    ]
+    if not recipe or not reconcile_step or not required_fields:
+        return {}
+
+    execution = (
+        guide.get("execution")
+        if isinstance(guide.get("execution"), Mapping)
+        else {}
+    )
+    action_input: dict[str, Any] = {}
+    for field, value in (
+        ("project_id", execution.get("project_id")),
+        ("backlog_id", execution.get("backlog_id")),
+        ("task_id", next_line.get("task_id")),
+    ):
+        token = str(value or "").strip()
+        if token:
+            action_input[field] = token
+    target_commit = str(
+        next_line.get("target_head_commit")
+        or next_line.get("merged_commit_sha")
+        or next_line.get("commit_sha")
+        or ""
+    ).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target_commit):
+        action_input["target_commit_sha"] = target_commit
+    action_input.update(
+        {
+            "activate": True,
+            "require_clean": True,
+            "semantic_use_ai": False,
+            "semantic_enrich": False,
+            "enqueue_stale": False,
+        }
+    )
+    missing = [
+        field for field in required_fields if not action_input.get(field)
+    ]
+    return {
+        "observer_reconcile_next_action": deepcopy(dict(recipe)),
+        "required_tool": "graph_current_full_reconcile",
+        "action_input_copy_safe": True,
+        "action_input_ready": not missing,
+        "action_input": action_input,
+        "action_input_required_copy_safe_fields": required_fields,
+        "action_input_missing_required_fields": missing,
+        "action_input_sources": {
+            "project_id": "contract_runtime.execution.project_id",
+            "backlog_id": "contract_runtime.execution.backlog_id",
+            "task_id": "dispatched_runtime_context.task_id",
+            "target_commit_sha": "canonical_target_head_commit",
+            "observer_session_id": "active_observer_session.session_id",
+            "route_token_ref": "reconcile_only_observer_route_context.route_token_ref",
+        },
+        "route_scopes_interchangeable": bool(
+            recipe.get("route_scopes_interchangeable")
+        ),
+        "contract_runtime_submit_route_ref_reused_for_reconcile": False,
+        "raw_route_token_required": False,
+    }
+
+
 def _runtime_next_action_from_guide(
     guide: Mapping[str, Any],
     *,
@@ -76486,6 +76642,14 @@ def _runtime_next_action_from_guide(
         if isinstance(guide.get("contract"), Mapping)
         else {}
     )
+    reconcile_projection = (
+        _contract_runtime_observer_reconcile_action_projection(
+            guide,
+            next_line,
+        )
+    )
+    if reconcile_projection:
+        result.update(reconcile_projection)
     if (
         not route_action_scope_blocked
         and line_id == "observer_dispatch_bounded_workers"
@@ -87264,14 +87428,16 @@ def _contract_runtime_server_postmerge_comparison_base_commit(
     merge = _contract_runtime_rev8_two_worker_merge_projection(
         record,
         required_worker_count=required_worker_count,
+        conn=conn,
+        project_id=project_id,
+    )
+    lane_merge_commit = _contract_runtime_full_commit_value(
+        project_id,
+        merge.get("merged_commit_sha"),
     )
     if (
         not expected_candidate
-        or _contract_runtime_full_commit_value(
-            project_id,
-            merge.get("merged_commit_sha"),
-        )
-        != expected_candidate
+        or not lane_merge_commit
     ):
         return ""
     dispatch_index = int(merge.get("dispatch_completed_line_index") or -1)
@@ -87280,7 +87446,10 @@ def _contract_runtime_server_postmerge_comparison_base_commit(
         for item in merge.get("lane_runtime_context_ids") or []
         if str(item or "").strip()
     }
-    from .parallel_branch_runtime import get_merge_queue_item
+    from .parallel_branch_runtime import (
+        get_merge_queue_item,
+        list_merge_queue_items,
+    )
 
     ordered: list[tuple[int, str, str]] = []
     for index, line in enumerate(record.get("completed_lines") or []):
@@ -87373,9 +87542,157 @@ def _contract_runtime_server_postmerge_comparison_base_commit(
     ):
         return ""
     comparison_base = ordered[0][1]
+    final_lane_head = ordered[-1][2]
+    exact_candidate_relation_verified = final_lane_head == expected_candidate
+    if not exact_candidate_relation_verified and required_worker_count == 1:
+        dispatch_line = (record.get("completed_lines") or [])[dispatch_index]
+        batch_contexts: dict[str, Any] = {}
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=dispatch_line,
+        ):
+            runtime_context_id, context_task_id, _parent_task_id = (
+                _contract_runtime_context_identity(context)
+            )
+            if (
+                runtime_context_id in lane_ids
+                and context_task_id
+                == str(merge.get("task_id") or "").strip()
+                and str(getattr(context, "batch_id", "") or "").strip()
+                and str(
+                    getattr(context, "merge_queue_id", "") or ""
+                ).strip()
+                == str(merge.get("merge_queue_id") or "").strip()
+            ):
+                batch_contexts[runtime_context_id] = context
+        if len(batch_contexts) == 1:
+            batch_context = next(iter(batch_contexts.values()))
+            batch_id = str(
+                getattr(batch_context, "batch_id", "") or ""
+            ).strip()
+            merge_queue_id = str(
+                getattr(batch_context, "merge_queue_id", "") or ""
+            ).strip()
+            try:
+                epoch_rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM parallel_branch_integration_epochs
+                    WHERE project_id = ? AND batch_id = ?
+                    LIMIT 2
+                    """,
+                    (project_id, batch_id),
+                ).fetchall()
+                queue_rows = list_merge_queue_items(
+                    conn,
+                    project_id,
+                    merge_queue_id,
+                )
+            except (sqlite3.Error, TypeError, ValueError):
+                epoch_rows = []
+                queue_rows = []
+            epoch = dict(epoch_rows[0]) if len(epoch_rows) == 1 else {}
+            queue_item_ids = [
+                str(item.queue_item_id or "").strip()
+                for item in queue_rows
+            ]
+            merged_prefix = _json_loads(
+                epoch.get("merged_prefix_json"),
+                [],
+            )
+            matching_child_rows = [
+                item
+                for item in queue_rows
+                if str(item.task_id or "").strip()
+                == str(merge.get("task_id") or "").strip()
+                and str(item.backlog_id or "").strip()
+                == str(record.get("backlog_id") or "").strip()
+                and str(item.queue_item_id or "").strip()
+                == str(merge.get("queue_item_id") or "").strip()
+                and _contract_runtime_full_commit_value(
+                    project_id,
+                    item.target_head_after_merge,
+                )
+                == final_lane_head
+            ]
+            queue_linear = bool(
+                len(queue_rows) >= 2
+                and all(
+                    str(item.status or "").strip() == "merged"
+                    and _contract_runtime_full_commit_value(
+                        project_id,
+                        item.target_head_before_merge,
+                    )
+                    and _contract_runtime_full_commit_value(
+                        project_id,
+                        item.target_head_after_merge,
+                    )
+                    for item in queue_rows
+                )
+                and all(
+                    _contract_runtime_full_commit_value(
+                        project_id,
+                        queue_rows[index - 1].target_head_after_merge,
+                    )
+                    == _contract_runtime_full_commit_value(
+                        project_id,
+                        queue_rows[index].target_head_before_merge,
+                    )
+                    for index in range(1, len(queue_rows))
+                )
+            )
+            final_queue_head = (
+                _contract_runtime_full_commit_value(
+                    project_id,
+                    queue_rows[-1].target_head_after_merge,
+                )
+                if queue_rows
+                else ""
+            )
+            epoch_head = _contract_runtime_full_commit_value(
+                project_id,
+                epoch.get("current_head"),
+            )
+            epoch_last_merge = _contract_runtime_full_commit_value(
+                project_id,
+                epoch.get("last_merge_commit"),
+            )
+            root = project_service.resolve_project_root(
+                project_id,
+                None,
+                fallback_self=True,
+            )
+            canonical_root = Path(root).resolve() if root else None
+            exact_candidate_relation_verified = bool(
+                len(matching_child_rows) == 1
+                and str(epoch.get("merge_queue_id") or "").strip()
+                == merge_queue_id
+                and str(epoch.get("coordination_backlog_id") or "").strip()
+                and str(epoch.get("status") or "").strip() == "closed"
+                and str(epoch.get("reconcile_state") or "").strip()
+                == "reconciled"
+                and str(epoch.get("snapshot_id") or "").strip()
+                and isinstance(merged_prefix, list)
+                and [str(item or "").strip() for item in merged_prefix]
+                == queue_item_ids
+                and queue_linear
+                and final_queue_head == expected_candidate
+                and epoch_head == expected_candidate
+                and epoch_last_merge == expected_candidate
+                and canonical_root is not None
+                and _git_head_commit(canonical_root).strip().lower()
+                == expected_candidate
+                and _git_commit_is_ancestor(
+                    canonical_root,
+                    final_lane_head,
+                    expected_candidate,
+                )
+            )
     return (
         comparison_base
-        if ordered[-1][2] == expected_candidate
+        if exact_candidate_relation_verified
         and comparison_base != expected_candidate
         else ""
     )
@@ -88080,6 +88397,8 @@ def _contract_runtime_rev8_postmerge_qa_authority(
     merge = _contract_runtime_rev8_two_worker_merge_projection(
         record,
         required_worker_count=required_worker_count,
+        conn=conn,
+        project_id=project_id,
     )
     merged_commit = str(
         merge.get("merged_commit_sha") or ""
@@ -93465,6 +93784,8 @@ def _contract_runtime_rev8_two_worker_merge_projection(
     record: Mapping[str, Any],
     *,
     required_worker_count: int = 2,
+    conn=None,
+    project_id: str = "",
 ) -> dict[str, Any]:
     """Join every required pre-QA lane merge to the pinned rev8 dispatch.
 
@@ -93615,7 +93936,7 @@ def _contract_runtime_rev8_two_worker_merge_projection(
         completed_merge_authorities,
         key=lambda item: int(item[1].get("merge_event_id") or 0),
     )
-    return {
+    projection = {
         **final_merge,
         "timeline_verified": True,
         "authority_verified": True,
@@ -93635,6 +93956,57 @@ def _contract_runtime_rev8_two_worker_merge_projection(
         "lane_runtime_context_ids": sorted(authority_lane_ids),
         "lane_merge_queue_ids": sorted(distinct_queue_ids),
     }
+    resolved_project_id = str(
+        project_id or record.get("project_id") or ""
+    ).strip()
+    if conn is None or not resolved_project_id:
+        return projection
+
+    dispatch_line = (record.get("completed_lines") or [])[dispatch_index]
+    final_runtime_context_id = str(
+        projection.get("runtime_context_id") or ""
+    ).strip()
+    matching_contexts: dict[str, Any] = {}
+    for context in _contract_runtime_contexts_for_dispatch_line(
+        conn,
+        project_id=resolved_project_id,
+        record=record,
+        line=dispatch_line,
+    ):
+        runtime_context_id, _task_id, _parent_task_id = (
+            _contract_runtime_context_identity(context)
+        )
+        if runtime_context_id == final_runtime_context_id:
+            matching_contexts[runtime_context_id] = context
+    if len(matching_contexts) != 1:
+        return projection
+    context = next(iter(matching_contexts.values()))
+    _runtime_context_id, task_id, _parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    timeline_events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=resolved_project_id,
+        task_id=task_id,
+        backlog_id=str(
+            getattr(context, "backlog_id", "")
+            or record.get("backlog_id")
+            or ""
+        ),
+    )
+    resolved_reconcile = _contract_runtime_completed_merge_reconcile_authority(
+        conn,
+        project_id=resolved_project_id,
+        record=record,
+        context=context,
+        timeline_events=timeline_events,
+        merge=projection,
+    )
+    return (
+        {**projection, **resolved_reconcile}
+        if resolved_reconcile
+        else projection
+    )
 
 
 def _contract_runtime_current_full_reconcile_authority(
@@ -93653,47 +94025,52 @@ def _contract_runtime_current_full_reconcile_authority(
                     project_id=project_id,
                 )
             ),
+            conn=conn,
+            project_id=project_id,
         )
-        final_runtime_context_id = str(
-            merge.get("runtime_context_id") or ""
-        ).strip()
-        for dispatch_line in record.get("completed_lines") or []:
-            if not isinstance(dispatch_line, Mapping) or str(
-                dispatch_line.get("line_id") or ""
-            ).strip() != "observer_dispatch_bounded_workers":
-                continue
-            for context in _contract_runtime_contexts_for_dispatch_line(
-                conn,
-                project_id=project_id,
-                record=record,
-                line=dispatch_line,
-            ):
-                runtime_context_id, task_id, _parent_task_id = (
-                    _contract_runtime_context_identity(context)
-                )
-                if runtime_context_id != final_runtime_context_id:
+        if not merge.get("reconcile_event_id"):
+            final_runtime_context_id = str(
+                merge.get("runtime_context_id") or ""
+            ).strip()
+            for dispatch_line in record.get("completed_lines") or []:
+                if not isinstance(dispatch_line, Mapping) or str(
+                    dispatch_line.get("line_id") or ""
+                ).strip() != "observer_dispatch_bounded_workers":
                     continue
-                timeline_events = _runtime_context_service_timeline_events(
-                    conn,
-                    project_id=project_id,
-                    task_id=task_id,
-                    backlog_id=str(
-                        getattr(context, "backlog_id", "")
-                        or record.get("backlog_id")
-                        or ""
-                    ),
-                )
-                merge = _contract_runtime_completed_merge_reconcile_authority(
+                for context in _contract_runtime_contexts_for_dispatch_line(
                     conn,
                     project_id=project_id,
                     record=record,
-                    context=context,
-                    timeline_events=timeline_events,
-                    merge=merge,
-                )
-                break
-            if merge.get("reconcile_event_id"):
-                break
+                    line=dispatch_line,
+                ):
+                    runtime_context_id, task_id, _parent_task_id = (
+                        _contract_runtime_context_identity(context)
+                    )
+                    if runtime_context_id != final_runtime_context_id:
+                        continue
+                    timeline_events = _runtime_context_service_timeline_events(
+                        conn,
+                        project_id=project_id,
+                        task_id=task_id,
+                        backlog_id=str(
+                            getattr(context, "backlog_id", "")
+                            or record.get("backlog_id")
+                            or ""
+                        ),
+                    )
+                    merge = (
+                        _contract_runtime_completed_merge_reconcile_authority(
+                            conn,
+                            project_id=project_id,
+                            record=record,
+                            context=context,
+                            timeline_events=timeline_events,
+                            merge=merge,
+                        )
+                    )
+                    break
+                if merge.get("reconcile_event_id"):
+                    break
     else:
         merge = _contract_runtime_trusted_merge_projection(
             conn,
@@ -94129,6 +94506,8 @@ def _contract_runtime_reconcile_record_authority(
                     project_id=project_id,
                 )
             ),
+            conn=conn,
+            project_id=project_id,
         )
     else:
         merge = _contract_runtime_trusted_merge_projection(

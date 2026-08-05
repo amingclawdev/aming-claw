@@ -12294,6 +12294,118 @@ def test_batch_parented_durable_merges_bind_dispatch_before_final_reconcile(
     )
 
 
+def test_nonfinal_batch_lane_merge_uses_ancestor_comparison_base(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+        nested_enter_queue_plan=True,
+        service_enter_task=True,
+        task_only_reconcile_task="batch",
+        batch_parented_children=True,
+    )
+    index = 0
+    context = fixture["child_contexts"][index]
+    execution_id = fixture["child_executions"][index]
+    dispatch_ref = f"contract_runtime:{execution_id}:completed_lines:0"
+    queue_item = get_merge_queue_item(
+        conn,
+        PID,
+        fixture["merge_queue_id"],
+        fixture["queue_item_ids"][index],
+    )
+    worker = {
+        "runtime_context_id": fixture["child_runtime_ids"][index],
+        "task_id": fixture["child_tasks"][index],
+        "parent_task_id": fixture["batch_id"],
+        "merge_queue_id": fixture["merge_queue_id"],
+    }
+    durable = {
+        "schema_version": (
+            "contract_runtime.observer_merge_durable_authority.v1"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "pre_qa_merge_authorized": True,
+        "final_qa_required_after_reconcile": True,
+        "project_id": PID,
+        "backlog_id": fixture["child_backlogs"][index],
+        "contract_execution_id": execution_id,
+        **worker,
+        "queue_item_id": fixture["queue_item_ids"][index],
+        "merge_commit": fixture["child_commits"][index],
+        "target_head_before_merge": queue_item.target_head_before_merge,
+        "target_head_after_merge": queue_item.target_head_after_merge,
+        "merge_event_ref": (
+            fixture["authorities"][worker["task_id"]]["merge_source_ref"]
+        ),
+        "merge_event_id": (
+            fixture["authorities"][worker["task_id"]]["merge_event_id"]
+        ),
+        "merge_event_created_at": (
+            fixture["authorities"][worker["task_id"]][
+                "merge_event_created_at"
+            ]
+        ),
+        "contract_runtime_dispatch_source_ref": dispatch_ref,
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": fixture["child_backlogs"][index],
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev9",
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "payload": {
+                    "worker_count": 1,
+                    "required_worker_count": 1,
+                    "atomic_dispatch": False,
+                    "bounded_workers": [worker],
+                },
+            },
+            {
+                "stage_id": "observer_lane_merge",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge",
+                "line_instance_id": (
+                    f"runtime_context:{context.runtime_context_id}"
+                ),
+                "payload": {"durable_merge_authority": durable},
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_current_generation_worker_count",
+        lambda *_args, **_kwargs: 1,
+    )
+
+    comparison_base = (
+        server._contract_runtime_server_postmerge_comparison_base_commit(
+            conn,
+            project_id=PID,
+            record=record,
+            expected_candidate_commit=fixture["final_head"],
+        )
+    )
+
+    assert fixture["child_commits"][index] != fixture["final_head"]
+    assert batch_jobs.git_commit(fixture["root"]) == fixture["final_head"]
+    assert comparison_base == queue_item.target_head_before_merge
+
+
 def test_durable_merge_dispatch_enrichment_rejects_forged_scope(
     conn,
     monkeypatch,

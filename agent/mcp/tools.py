@@ -3275,7 +3275,10 @@ TOOLS: list[dict] = [
             "Defaults to current clean HEAD and activate=true; route-proof "
             "calls use observer_session_id with exactly one of "
             "observer_route_token_ref or route_token_ref plus backlog_id and "
-            "task_id/contract_execution_id; failures return public-safe "
+            "exactly one of task_id or contract_execution_id; the mf_parallel "
+            "observer-reconcile recipe submits task_id only. Runtime-context "
+            "and target-root scope are server-derived, not caller fields. "
+            "Failures return public-safe "
             "route_proof_diagnostics and never require raw route tokens. "
             "For pre-QA non-descendant review, pass an explicit clean "
             "project_root with activate=false to build a non-activated exact "
@@ -3307,7 +3310,13 @@ TOOLS: list[dict] = [
                 "backlog_id": {"type": "string"},
                 "bug_id": {"type": "string", "description": "Alias for backlog_id."},
                 "task_id": {"type": "string"},
-                "contract_execution_id": {"type": "string", "description": "Alias for task_id."},
+                "contract_execution_id": {
+                    "type": "string",
+                    "description": (
+                        "Mutually exclusive alias for task_id. Do not pass both; "
+                        "mf_parallel observer-reconcile guidance uses task_id."
+                    ),
+                },
                 "observer_session_id": {
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
@@ -3335,6 +3344,19 @@ TOOLS: list[dict] = [
                 },
             },
             "required": ["project_id"],
+            "x-copy-safe-observer-reconcile-fields": [
+                "project_id",
+                "observer_session_id",
+                "route_token_ref",
+                "backlog_id",
+                "task_id",
+                "target_commit_sha",
+            ],
+            "x-server-derived-reconcile-scope-fields": [
+                "contract_execution_id",
+                "runtime_context_id",
+                "target_project_root",
+            ],
         },
     },
     {

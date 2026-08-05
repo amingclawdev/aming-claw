@@ -734,6 +734,236 @@ def test_mf_parallel_rev8_reconcile_accepts_two_pre_qa_lane_merges(monkeypatch):
     assert close_authority["db_verified"] is True
 
 
+def test_rev9_reconcile_record_resolves_final_two_lane_merge_timeline(
+    monkeypatch,
+):
+    execution_id = "cex-rev9-reconcile-record"
+    backlog_id = "AC-REV9-RECONCILE-RECORD"
+    workers = [
+        {
+            "runtime_context_id": "mfrctx-rev9-reconcile-record-a",
+            "task_id": "rev9-reconcile-record-a",
+            "parent_task_id": execution_id,
+            "merge_queue_id": "mq-rev9-reconcile-record-a",
+        },
+        {
+            "runtime_context_id": "mfrctx-rev9-reconcile-record-b",
+            "task_id": "rev9-reconcile-record-b",
+            "parent_task_id": execution_id,
+            "merge_queue_id": "mq-rev9-reconcile-record-b",
+        },
+    ]
+    dispatch_ref = f"contract_runtime:{execution_id}:completed_lines:0"
+    completed_lines = [
+        {
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "actor_role": "observer",
+            "evidence_kind": "dispatch_bounded_worker",
+            "payload": {
+                "worker_count": 2,
+                "required_worker_count": 2,
+                "atomic_dispatch": True,
+                "bounded_workers": workers,
+            },
+        }
+    ]
+    for index, worker in enumerate(workers, start=1):
+        completed_lines.append(
+            {
+                "stage_id": "observer_lane_merge",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge",
+                "line_instance_id": (
+                    f"runtime_context:{worker['runtime_context_id']}"
+                ),
+                "payload": {
+                    "durable_merge_authority": {
+                        "schema_version": (
+                            "contract_runtime.observer_merge_durable_authority.v1"
+                        ),
+                        "server_derived": True,
+                        "db_verified": True,
+                        "pre_qa_merge_authorized": True,
+                        "final_qa_required_after_reconcile": True,
+                        "project_id": "aming-claw",
+                        "backlog_id": backlog_id,
+                        "contract_execution_id": execution_id,
+                        **worker,
+                        "queue_item_id": f"mqi-rev9-reconcile-record-{index}",
+                        "merge_commit": str(index) * 40,
+                        "merge_event_ref": f"timeline:{200 + index}",
+                        "merge_event_id": 200 + index,
+                        "merge_event_created_at": (
+                            f"2026-08-05T10:00:0{index}Z"
+                        ),
+                        "contract_runtime_dispatch_source_ref": dispatch_ref,
+                    }
+                },
+            }
+        )
+    record = {
+        "project_id": "aming-claw",
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev9",
+        "contract_execution_id": execution_id,
+        "completed_lines": completed_lines,
+    }
+    final_context = SimpleNamespace(
+        **workers[-1],
+        backlog_id=backlog_id,
+        batch_id="",
+    )
+    resolver_calls = []
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [final_context],
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_timeline_events",
+        lambda *_args, **_kwargs: [
+            {
+                "id": 203,
+                "project_id": "aming-claw",
+                "backlog_id": backlog_id,
+                "task_id": workers[-1]["task_id"],
+                "event_type": "graph.reconcile",
+                "event_kind": "reconcile",
+                "phase": "reconcile",
+                "status": "passed",
+                "payload": {
+                    "actor_role": "observer",
+                    "runtime_context_id": workers[-1][
+                        "runtime_context_id"
+                    ],
+                    "task_id": workers[-1]["task_id"],
+                },
+                "created_at": "2026-08-05T10:00:03Z",
+            }
+        ],
+    )
+
+    def resolve_reconcile(
+        _conn,
+        *,
+        project_id,
+        record,
+        context,
+        timeline_events,
+        merge,
+    ):
+        resolver_calls.append(
+            {
+                "project_id": project_id,
+                "context": context.runtime_context_id,
+                "timeline_event_ids": [event["id"] for event in timeline_events],
+                "merge": dict(merge),
+            }
+        )
+        return {
+            **merge,
+            "reconcile_source_ref": "timeline:203",
+            "reconcile_event_id": 203,
+            "reconcile_event_created_at": "2026-08-05T10:00:03Z",
+            "reconcile_task_id": context.task_id,
+            "reconcile_runtime_context_id": context.runtime_context_id,
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_merge_reconcile_authority",
+        resolve_reconcile,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_full_reconcile_authority_from_merge",
+        lambda *_args, **_kwargs: {},
+    )
+
+    receipt = server._contract_runtime_reconcile_record_authority(
+        object(),
+        project_id="aming-claw",
+        record=record,
+    )
+
+    assert len(resolver_calls) == 1
+    assert resolver_calls[0]["project_id"] == "aming-claw"
+    assert resolver_calls[0]["context"] == workers[-1]["runtime_context_id"]
+    assert resolver_calls[0]["timeline_event_ids"] == [203]
+    assert resolver_calls[0]["merge"]["all_lane_merges_verified"] is True
+    assert receipt["record_verified"] is True
+    assert receipt["reconcile_event_recorded"] is True
+    assert receipt["reconcile_event_id"] == 203
+    assert receipt["reconcile_source_ref"] == "timeline:203"
+
+
+def test_current_full_reconcile_event_declares_authenticated_observer_role(
+    monkeypatch,
+):
+    from agent.governance import task_timeline
+
+    captured = {}
+
+    def capture_event(_conn, **kwargs):
+        captured.update(kwargs)
+        return {"id": 301, "created_at": "2026-08-05T10:30:00Z", **kwargs}
+
+    monkeypatch.setattr(task_timeline, "record_event", capture_event)
+    event = server._record_pending_scope_reconcile_contract_event(
+        None,
+        project_id="aming-claw",
+        body={
+            "backlog_id": "AC-DECLARED-RECONCILE-ROLE",
+            "task_id": "worker-declared-reconcile-role",
+            "actor": "codex-observer",
+        },
+        result={
+            "ok": True,
+            "status": "complete",
+            "snapshot_id": "full-declared-reconcile-role",
+            "active_snapshot_id": "full-declared-reconcile-role",
+            "current_full_reconcile": True,
+            "strategy": "current_full_reconcile",
+            "head_commit": "a" * 40,
+            "active_graph_commit": "a" * 40,
+            "activated": True,
+            "activation_verification": {
+                "verified": True,
+                "active_graph_commit": "a" * 40,
+                "active_snapshot_id": "full-declared-reconcile-role",
+            },
+        },
+        target_commit_sha="a" * 40,
+        runtime_context_scope={
+            "project_id": "aming-claw",
+            "backlog_id": "AC-DECLARED-RECONCILE-ROLE",
+            "task_id": "worker-declared-reconcile-role",
+            "parent_task_id": "cex-declared-reconcile-role",
+            "runtime_context_id": "mfrctx-declared-reconcile-role",
+            "merge_queue_id": "mq-declared-reconcile-role",
+            "contract_execution_id": "cex-declared-reconcile-role",
+        },
+        declared_actor_role="observer",
+        post_commit_hooks=False,
+    )
+
+    assert captured["actor"] == "codex-observer"
+    assert captured["payload"]["actor_role"] == "observer"
+    assert server._contract_runtime_declared_timeline_actor_role(event) == (
+        "observer"
+    )
+    roleless = deepcopy(event)
+    roleless["payload"].pop("actor_role")
+    assert roleless["actor"] == "codex-observer"
+    assert server._contract_runtime_declared_timeline_actor_role(roleless) == ""
+
+
 def test_mf_parallel_rev8_failed_final_qa_routes_to_bounded_worker_fix():
     record = {
         "contract_id": "mf_parallel.v2",
