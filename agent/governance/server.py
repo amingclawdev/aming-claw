@@ -88573,23 +88573,6 @@ def _contract_runtime_rev8_postmerge_qa_authority(
     )
     if target_owner is None:
         return blocked("target_ref_owner_unresolved")
-    target_alignment = _git_target_owner_alignment_evidence(
-        target_owner,
-        target_ref=target_ref,
-        merge_commit=merged_commit,
-        timeout_seconds=10,
-    )
-    if not (
-        target_owner_source == "git_worktree_target_ref_owner"
-        and target_alignment.get("passed") is True
-        and str(target_alignment.get("head_commit") or "").strip().lower()
-        == merged_commit
-        and str(target_alignment.get("target_commit") or "").strip().lower()
-        == merged_commit
-        and target_alignment.get("index_clean") is True
-        and target_alignment.get("worktree_clean") is True
-    ):
-        return blocked("target_ref_owner_not_clean_and_aligned")
 
     timeline_events = _runtime_context_service_timeline_events(
         conn,
@@ -88613,22 +88596,112 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         )
     ):
         return blocked("postmerge_reconcile_event_unverified")
-    current_full = _contract_runtime_current_full_reconcile_authority_from_merge(
-        conn,
-        project_id=project_id,
-        record=record,
-        merge=merge,
-        reconcile=reconciled_merge,
-        target_project_root_override=str(target_owner),
+
+    shared_batch_verified = (
+        _contract_runtime_shared_batch_reconcile_activation_verified(
+            reconciled_merge
+        )
+        or _contract_runtime_shared_batch_postmerge_qa_activation_verified(
+            reconciled_merge
+        )
+    )
+    shared_batch = (
+        reconciled_merge.get("shared_batch_reconcile_authority")
+        if isinstance(
+            reconciled_merge.get("shared_batch_reconcile_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    qa_candidate_commit = (
+        str(reconciled_merge.get("reconciled_commit_sha") or "")
+        .strip()
+        .lower()
+        if shared_batch_verified
+        else merged_commit
+    )
+    dispatch_source_ref = str(
+        merge.get("contract_runtime_dispatch_source_ref") or ""
+    ).strip()
+    if shared_batch_verified and not (
+        _contract_runtime_current_full_reconcile_activation_verified(
+            reconciled_merge
+        )
+        and re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}", qa_candidate_commit
+        )
+        and str(shared_batch.get("final_head_commit") or "")
+        .strip()
+        .lower()
+        == qa_candidate_commit
+        and queue_item_id
+        in {
+            str(item or "").strip()
+            for item in shared_batch.get("ordered_queue_item_ids") or []
+        }
+        and dispatch_source_ref
+        in {
+            str(item or "").strip()
+            for item in shared_batch.get("child_contract_dispatch_refs") or []
+        }
+        and str(reconciled_merge.get("merged_commit_sha") or "")
+        .strip()
+        .lower()
+        == merged_commit
+        and str(reconciled_merge.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(reconciled_merge.get("task_id") or "").strip() == task_id
+        and str(
+            reconciled_merge.get("parent_task_id") or ""
+        ).strip()
+        == parent_task_id
+        and str(reconciled_merge.get("merge_queue_id") or "").strip()
+        == merge_queue_id
+    ):
+        return blocked("shared_batch_final_reconcile_unverified")
+
+    target_alignment = _git_target_owner_alignment_evidence(
+        target_owner,
+        target_ref=target_ref,
+        merge_commit=qa_candidate_commit,
+        timeout_seconds=10,
+    )
+    if not (
+        target_owner_source == "git_worktree_target_ref_owner"
+        and target_alignment.get("passed") is True
+        and str(target_alignment.get("head_commit") or "").strip().lower()
+        == qa_candidate_commit
+        and str(target_alignment.get("target_commit") or "").strip().lower()
+        == qa_candidate_commit
+        and target_alignment.get("index_clean") is True
+        and target_alignment.get("worktree_clean") is True
+    ):
+        return blocked("target_ref_owner_not_clean_and_aligned")
+
+    current_full = (
+        dict(reconciled_merge)
+        if shared_batch_verified
+        else _contract_runtime_current_full_reconcile_authority_from_merge(
+            conn,
+            project_id=project_id,
+            record=record,
+            merge=merge,
+            reconcile=reconciled_merge,
+            target_project_root_override=str(target_owner),
+        )
     )
     if not (
         _contract_runtime_current_full_reconcile_activation_verified(current_full)
         and str(current_full.get("merged_commit_sha") or "").strip().lower()
         == merged_commit
         and str(current_full.get("reconciled_commit_sha") or "").strip().lower()
-        == merged_commit
+        == qa_candidate_commit
         and str(current_full.get("active_snapshot_commit") or "").strip().lower()
-        == merged_commit
+        == qa_candidate_commit
+        and str(current_full.get("canonical_head_commit") or "")
+        .strip()
+        .lower()
+        == qa_candidate_commit
         and str(current_full.get("target_project_root") or "").strip()
         == str(target_owner)
         and str(current_full.get("runtime_context_id") or "").strip()
@@ -88669,8 +88742,14 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         "target_ref": target_ref,
         "target_project_root": str(target_owner),
         "target_root_source": target_owner_source,
-        "candidate_commit_sha": merged_commit,
+        "candidate_commit_sha": qa_candidate_commit,
         "merged_commit_sha": merged_commit,
+        "comparison_lineage_merge_commit_sha": merged_commit,
+        "qa_candidate_commit_source": (
+            "shared_batch_final_reconcile"
+            if shared_batch_verified
+            else "standalone_final_merge"
+        ),
         "reconciled_commit_sha": str(
             current_full.get("reconciled_commit_sha") or ""
         ),
@@ -88708,6 +88787,8 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         ),
         "blocker_codes": [],
     }
+    if shared_batch_verified:
+        authority["shared_batch_reconcile_authority"] = dict(shared_batch)
     authority["authority_hash"] = stable_sha256(authority)
     return authority
 
@@ -89524,14 +89605,18 @@ def _contract_runtime_shared_batch_reconcile_authority(
     record: Mapping[str, Any],
     context: Any,
     merge: Mapping[str, Any],
+    allow_postmerge_qa_admission: bool = False,
 ) -> dict[str, Any]:
     """Project one closed batch reconcile onto an exact merged child.
 
-    The final batch reconcile is coordination-scoped by design.  It may close
-    each merged child only when the database proves the complete closed epoch,
-    ordered queue, every child's ContractRuntime QA/merge authority, and the
-    one active current-HEAD coordination reconcile.  No caller-shaped scope is
-    admitted into this projection.
+    The final batch reconcile is coordination-scoped by design.  The default
+    close projection requires every child's ContractRuntime QA/merge
+    authority.  The explicit rev8/rev9 post-merge QA-admission projection
+    instead requires every child to be either final-QA verified or still
+    carrying the server-owned pre-QA merge marker; it never claims close
+    satisfaction.  Both paths also prove the complete closed epoch, ordered
+    queue, and one active current-HEAD coordination reconcile.  No
+    caller-shaped scope is admitted into either projection.
     """
 
     from . import graph_snapshot_store
@@ -89565,10 +89650,26 @@ def _contract_runtime_shared_batch_reconcile_authority(
     merge_time = _contract_runtime_close_authority_time_order_value(
         merge.get("merge_event_created_at")
     )
+    final_qa_verified = bool(
+        merge.get("qa_contract_runtime_verified") is True
+        and merge.get("close_satisfying") is True
+        and qa_time is not None
+        and merge_time is not None
+        and qa_time <= merge_time
+    )
+    postmerge_qa_admission = bool(
+        allow_postmerge_qa_admission
+        and _is_mf_parallel_postmerge_revision(record)
+        and merge.get("authority_verified") is True
+        and merge.get("qa_contract_runtime_verified") is not True
+        and merge.get("close_satisfying") is not True
+        and merge.get("pre_qa_merge_authorized") is True
+        and merge.get("final_qa_required_after_reconcile") is True
+        and merge_time is not None
+    )
     if not (
         merge.get("timeline_verified") is True
-        and merge.get("qa_contract_runtime_verified") is True
-        and merge.get("close_satisfying") is True
+        and (final_qa_verified or postmerge_qa_admission)
         and dispatch_match
         and all(
             (
@@ -89587,9 +89688,6 @@ def _contract_runtime_shared_batch_reconcile_authority(
         and str(getattr(context, "merge_queue_id", "") or "").strip()
         == merge_queue_id
         and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit)
-        and qa_time is not None
-        and merge_time is not None
-        and qa_time <= merge_time
     ):
         return {}
 
@@ -89730,6 +89828,8 @@ def _contract_runtime_shared_batch_reconcile_authority(
 
     expected_head = str(epoch.get("base_head") or "").strip().lower()
     child_authorities: list[dict[str, Any]] = []
+    child_final_qa_verified: list[bool] = []
+    child_postmerge_qa_admission_verified: list[bool] = []
     child_merge_event_ids: list[int] = []
     child_binding_refs: list[str] = []
     for item in queue_rows:
@@ -89869,11 +89969,28 @@ def _contract_runtime_shared_batch_reconcile_authority(
                 child_merge.get("merge_event_created_at")
             )
         )
+        child_final_qa = bool(
+            child_merge.get("qa_contract_runtime_verified") is True
+            and child_merge.get("close_satisfying") is True
+            and child_qa_time is not None
+            and child_merge_time is not None
+            and child_qa_time <= child_merge_time
+        )
+        child_postmerge_qa_admission = bool(
+            postmerge_qa_admission
+            and child_merge.get("qa_contract_runtime_verified") is not True
+            and child_merge.get("close_satisfying") is not True
+            and child_merge.get("pre_qa_merge_authorized") is True
+            and child_merge.get("final_qa_required_after_reconcile") is True
+            and child_merge_time is not None
+        )
         if not (
             child_dispatch
             and child_merge.get("timeline_verified") is True
-            and child_merge.get("qa_contract_runtime_verified") is True
-            and child_merge.get("close_satisfying") is True
+            and (
+                child_final_qa
+                or child_postmerge_qa_admission
+            )
             and str(child_merge.get("runtime_context_id") or "").strip()
             == child_runtime_context_id
             and str(child_merge.get("task_id") or "").strip()
@@ -89890,13 +90007,15 @@ def _contract_runtime_shared_batch_reconcile_authority(
             .strip()
             .lower()
             == item_merge_commit
-            and child_qa_time is not None
             and child_merge_time is not None
-            and child_qa_time <= child_merge_time
             and int(child_merge.get("merge_event_id") or 0) > 0
         ):
             return {}
         child_authorities.append(child_merge)
+        child_final_qa_verified.append(child_final_qa)
+        child_postmerge_qa_admission_verified.append(
+            child_postmerge_qa_admission or child_final_qa
+        )
         child_merge_event_ids.append(
             int(child_merge.get("merge_event_id") or 0)
         )
@@ -90254,7 +90373,7 @@ def _contract_runtime_shared_batch_reconcile_authority(
         qa_acceptance_revision=int(
             merge.get("qa_acceptance_revision") or 0
         ),
-        qa_contract_runtime_verified=True,
+        qa_contract_runtime_verified=final_qa_verified,
         merge_event_id=int(merge.get("merge_event_id") or 0),
         merge_event_created_at=str(merge.get("merge_event_created_at") or ""),
         reconcile_event_id=reconcile_event_id,
@@ -90309,6 +90428,11 @@ def _contract_runtime_shared_batch_reconcile_authority(
         ),
         "server_derived": True,
         "db_verified": True,
+        "authority_purpose": (
+            "postmerge_qa_admission"
+            if postmerge_qa_admission
+            else "child_close"
+        ),
         "project_id": project_id,
         "batch_id": batch_id,
         "merge_queue_id": merge_queue_id,
@@ -90329,11 +90453,21 @@ def _contract_runtime_shared_batch_reconcile_authority(
         "active_snapshot_id": final_snapshot_id,
         "ordered_queue_item_ids": queue_item_ids,
         "child_contract_dispatch_refs": child_binding_refs,
-        "all_children_contract_qa_verified": True,
+        "all_children_contract_qa_verified": all(
+            child_final_qa_verified
+        ),
+        "all_children_postmerge_qa_admission_verified": all(
+            child_postmerge_qa_admission_verified
+        ),
+        "current_child_contract_qa_verified": final_qa_verified,
+        "final_qa_required_for_current_child": postmerge_qa_admission,
         "all_children_merged": True,
         "closed_epoch_verified": True,
         "final_snapshot_verified": True,
-        "strict_child_qa_merge_reconcile_order_verified": True,
+        "strict_child_qa_merge_reconcile_order_verified": (
+            not postmerge_qa_admission
+        ),
+        "strict_child_merge_reconcile_order_verified": True,
         "child_reconcile_required": False,
     }
     shared_binding["authority_hash"] = stable_sha256(shared_binding)
@@ -90343,7 +90477,7 @@ def _contract_runtime_shared_batch_reconcile_authority(
         "server_derived": True,
         "timeline_verified": True,
         "authority_verified": True,
-        "close_satisfying": True,
+        "close_satisfying": not postmerge_qa_admission,
         "db_verified": True,
         "live_verified": True,
         "canonical_head_verified": True,
@@ -90394,7 +90528,9 @@ def _contract_runtime_shared_batch_reconcile_authority(
         "qa_acceptance_created_at": str(
             merge.get("qa_acceptance_created_at") or ""
         ),
-        "qa_contract_runtime_verified": True,
+        "qa_contract_runtime_verified": final_qa_verified,
+        "pre_qa_merge_authorized": postmerge_qa_admission,
+        "final_qa_required_after_reconcile": postmerge_qa_admission,
         "reconcile_source_ref": f"timeline:{reconcile_event_id}",
         "reconcile_event_id": reconcile_event_id,
         "reconcile_event_created_at": str(
@@ -90493,6 +90629,12 @@ def _contract_runtime_completed_merge_reconcile_authority(
             record=record,
             context=context,
             merge=trusted_merge,
+            allow_postmerge_qa_admission=(
+                _is_mf_parallel_postmerge_revision(record)
+                and trusted_merge.get("pre_qa_merge_authorized") is True
+                and trusted_merge.get("final_qa_required_after_reconcile")
+                is True
+            ),
         )
         if not shared:
             return trusted_merge
@@ -94319,6 +94461,8 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
 
 def _contract_runtime_shared_batch_reconcile_activation_verified(
     authority: Mapping[str, Any],
+    *,
+    allow_postmerge_qa_admission: bool = False,
 ) -> bool:
     shared = authority.get("shared_batch_reconcile_authority")
     if not isinstance(shared, Mapping):
@@ -94336,12 +94480,17 @@ def _contract_runtime_shared_batch_reconcile_activation_verified(
     coordination_contract_execution_id = str(
         shared.get("coordination_contract_execution_id") or ""
     ).strip()
+    authority_purpose = str(
+        shared.get("authority_purpose") or "child_close"
+    ).strip()
+    postmerge_qa_admission = bool(
+        allow_postmerge_qa_admission
+        and authority_purpose == "postmerge_qa_admission"
+    )
     required_true_fields = (
-        "all_children_contract_qa_verified",
         "all_children_merged",
         "closed_epoch_verified",
         "final_snapshot_verified",
-        "strict_child_qa_merge_reconcile_order_verified",
     )
     return bool(
         str(shared.get("schema_version") or "")
@@ -94356,6 +94505,43 @@ def _contract_runtime_shared_batch_reconcile_activation_verified(
         and shared.get("server_derived") is True
         and shared.get("db_verified") is True
         and all(shared.get(field) is True for field in required_true_fields)
+        and (
+            (
+                postmerge_qa_admission
+                and shared.get(
+                    "all_children_postmerge_qa_admission_verified"
+                )
+                is True
+                and shared.get("current_child_contract_qa_verified")
+                is False
+                and shared.get("final_qa_required_for_current_child")
+                is True
+                and shared.get(
+                    "strict_child_qa_merge_reconcile_order_verified"
+                )
+                is False
+                and shared.get(
+                    "strict_child_merge_reconcile_order_verified"
+                )
+                is True
+                and authority.get("qa_contract_runtime_verified") is False
+                and authority.get("close_satisfying") is False
+                and authority.get("pre_qa_merge_authorized") is True
+                and authority.get("final_qa_required_after_reconcile")
+                is True
+            )
+            or (
+                not postmerge_qa_admission
+                and authority_purpose == "child_close"
+                and shared.get("all_children_contract_qa_verified") is True
+                and shared.get(
+                    "strict_child_qa_merge_reconcile_order_verified"
+                )
+                is True
+                and authority.get("qa_contract_runtime_verified") is True
+                and authority.get("close_satisfying") is True
+            )
+        )
         and shared.get("child_reconcile_required") is False
         and all(
             str(shared.get(field) or "").strip()
@@ -94410,6 +94596,15 @@ def _contract_runtime_shared_batch_reconcile_activation_verified(
         == str(authority.get("reconcile_source_ref") or "").strip()
         and str(shared.get("authority_hash") or "")
         == stable_sha256(unsigned_shared)
+    )
+
+
+def _contract_runtime_shared_batch_postmerge_qa_activation_verified(
+    authority: Mapping[str, Any],
+) -> bool:
+    return _contract_runtime_shared_batch_reconcile_activation_verified(
+        authority,
+        allow_postmerge_qa_admission=True,
     )
 
 
@@ -94468,6 +94663,9 @@ def _contract_runtime_current_full_reconcile_activation_verified(
         and (
             "shared_batch_reconcile_authority" not in authority
             or _contract_runtime_shared_batch_reconcile_activation_verified(
+                authority
+            )
+            or _contract_runtime_shared_batch_postmerge_qa_activation_verified(
                 authority
             )
         )

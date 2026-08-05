@@ -12406,6 +12406,309 @@ def test_nonfinal_batch_lane_merge_uses_ancestor_comparison_base(
     assert comparison_base == queue_item.target_head_before_merge
 
 
+def test_nonfinal_batch_child_enters_postmerge_qa_at_final_canonical_head(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+        nested_enter_queue_plan=True,
+        service_enter_task=True,
+        task_only_reconcile_task="batch",
+        batch_parented_children=True,
+    )
+    index = 0
+    execution_id = fixture["child_executions"][index]
+    context = replace(
+        fixture["child_contexts"][index],
+        worktree_path=str(fixture["root"]),
+    )
+    queue_item = get_merge_queue_item(
+        conn,
+        PID,
+        fixture["merge_queue_id"],
+        fixture["queue_item_ids"][index],
+    )
+    worker = {
+        "runtime_context_id": fixture["child_runtime_ids"][index],
+        "task_id": fixture["child_tasks"][index],
+        "parent_task_id": fixture["batch_id"],
+        "merge_queue_id": fixture["merge_queue_id"],
+    }
+    dispatch_ref = f"contract_runtime:{execution_id}:completed_lines:0"
+    durable = {
+        "schema_version": (
+            "contract_runtime.observer_merge_durable_authority.v1"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "pre_qa_merge_authorized": True,
+        "final_qa_required_after_reconcile": True,
+        "project_id": PID,
+        "backlog_id": fixture["child_backlogs"][index],
+        "contract_execution_id": execution_id,
+        **worker,
+        "queue_item_id": fixture["queue_item_ids"][index],
+        "target_ref": queue_item.target_ref,
+        "merge_commit": fixture["child_commits"][index],
+        "target_head_before_merge": queue_item.target_head_before_merge,
+        "target_head_after_merge": queue_item.target_head_after_merge,
+        "merge_event_ref": (
+            fixture["authorities"][worker["task_id"]]["merge_source_ref"]
+        ),
+        "merge_event_id": (
+            fixture["authorities"][worker["task_id"]]["merge_event_id"]
+        ),
+        "merge_event_created_at": (
+            fixture["authorities"][worker["task_id"]][
+                "merge_event_created_at"
+            ]
+        ),
+        "contract_runtime_dispatch_source_ref": dispatch_ref,
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": fixture["child_backlogs"][index],
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev9",
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "payload": {
+                    "worker_count": 1,
+                    "required_worker_count": 1,
+                    "atomic_dispatch": False,
+                    "bounded_workers": [worker],
+                },
+            },
+            {
+                "stage_id": "observer_lane_merge",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge",
+                "line_instance_id": (
+                    f"runtime_context:{context.runtime_context_id}"
+                ),
+                "payload": {"durable_merge_authority": durable},
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_current_generation_worker_count",
+        lambda *_args, **_kwargs: 1,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [context],
+    )
+
+    receipt = server._contract_runtime_reconcile_record_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    assert receipt["record_verified"] is True
+    assert receipt["merged_commit_sha"] == fixture["child_commits"][index]
+    record["completed_lines"].append(
+        {
+            "stage_id": "observer_integration",
+            "line_id": "observer_reconcile",
+            "actor_role": "observer",
+            "evidence_kind": "reconcile",
+            "status": "passed",
+            "commit_sha": fixture["child_commits"][index],
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.parent_task_id,
+            "merge_queue_id": fixture["merge_queue_id"],
+            "payload": {"reconcile_authority": receipt},
+        }
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_line_acceptance",
+        lambda *_args, **_kwargs: {
+            "db_verified": True,
+            "acceptance_ref": f"contract_runtime:{execution_id}:revision:12",
+            "completed_line_ref": (
+                f"contract_runtime:{execution_id}:completed_lines:2"
+            ),
+        },
+    )
+
+    captured: dict[str, Any] = {}
+
+    def qa_graph_refs(_conn, **kwargs):
+        captured.update(kwargs)
+        return {
+            "schema_version": "qa_graph_trace_db_evidence.v1",
+            "source": "graph_query_traces",
+            "db_verified": True,
+            "trace_ids": ["gqt-batch-child-final-head"],
+            "verified_trace_ids": ["gqt-batch-child-final-head"],
+            "requested_trace_ids": ["gqt-batch-child-final-head"],
+            "missing_trace_ids": [],
+            "identity_mismatches": [],
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.parent_task_id,
+            "backlog_id": record["backlog_id"],
+            "qa_principal": "qa:batch-child-final-head",
+            "qa_session_id": "ses-batch-child-final-head",
+            "target_project_root": str(fixture["root"]),
+            "candidate_commit_sha": fixture["final_head"],
+            "graph_basis": "exact_candidate_snapshot",
+            "comparison_authority_required": True,
+            "base_commit_sha": fixture["final_head"],
+            "comparison_base_commit_sha": (
+                queue_item.target_head_before_merge
+            ),
+            "comparison_base_commit_source": (
+                server._QA_POSTMERGE_COMPARISON_BASE_SOURCE
+            ),
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_qa_graph_trace_refs",
+        qa_graph_refs,
+    )
+
+    class QAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:batch-child-final-head",
+                "session_id": "ses-batch-child-final-head",
+            }
+
+    authority = server._contract_runtime_rev8_postmerge_qa_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    assert authority["verified"] is True, json.dumps(
+        authority,
+        indent=2,
+        sort_keys=True,
+    )
+
+    bound = server._contract_runtime_bind_qa_graph_authority(
+        QAContext(),
+        conn,
+        project_id=PID,
+        record=record,
+        write={"line_id": "qa_graph_context", "status": "accepted"},
+        body={"graph_trace_ids": ["gqt-batch-child-final-head"]},
+        policy={
+            "lookup_key_fields": ["graph_trace_ids"],
+            "authority_object_path": "payload.graph_trace_evidence",
+        },
+    )
+
+    assert fixture["child_commits"][index] != fixture["final_head"]
+    assert captured["expected_candidate_commit_sha"] == fixture["final_head"]
+    assert captured["expected_task_id"] == fixture["child_tasks"][index]
+    assert captured["target_project_root"] == str(fixture["root"])
+    assert bound["commit_sha"] == fixture["final_head"]
+    assert bound["runtime_context_id"] == fixture["child_runtime_ids"][index]
+    assert bound["task_id"] == fixture["child_tasks"][index]
+    postmerge = bound["payload"]["graph_trace_evidence"][
+        "postmerge_qa_authority"
+    ]
+    assert postmerge["candidate_commit_sha"] == fixture["final_head"]
+    assert postmerge["merged_commit_sha"] == fixture["child_commits"][index]
+    assert postmerge["comparison_lineage_merge_commit_sha"] == (
+        fixture["child_commits"][index]
+    )
+    assert postmerge["qa_candidate_commit_source"] == (
+        "shared_batch_final_reconcile"
+    )
+    assert postmerge["shared_batch_reconcile_authority"][
+        "final_head_commit"
+    ] == fixture["final_head"]
+    reconciled_projection = (
+        server._contract_runtime_rev8_two_worker_merge_projection(
+            record,
+            required_worker_count=1,
+            conn=conn,
+            project_id=PID,
+        )
+    )
+    assert server._contract_runtime_shared_batch_postmerge_qa_activation_verified(
+        reconciled_projection
+    )
+    assert not server._contract_runtime_shared_batch_reconcile_activation_verified(
+        reconciled_projection
+    )
+
+    for field, forged_value in (
+        ("final_qa_required_for_current_child", False),
+        ("child_contract_dispatch_refs", []),
+        ("authority_purpose", "child_close"),
+    ):
+        forged = copy.deepcopy(reconciled_projection)
+        forged_shared = forged["shared_batch_reconcile_authority"]
+        forged_shared[field] = forged_value
+        forged_shared["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in forged_shared.items()
+                if key != "authority_hash"
+            }
+        )
+        forged["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in forged.items()
+                if key != "authority_hash"
+            }
+        )
+        assert not (
+            server._contract_runtime_shared_batch_postmerge_qa_activation_verified(
+                forged
+            )
+        ), field
+
+    reconcile_event_id = int(fixture["reconcile_event"]["id"])
+    reconcile_row = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (reconcile_event_id,),
+    ).fetchone()
+    roleless_payload = json.loads(str(reconcile_row["payload_json"] or "{}"))
+    roleless_payload.pop("meta_contract_gate", None)
+    conn.execute(
+        """
+        UPDATE task_timeline_events
+        SET actor = '', payload_json = ?
+        WHERE id = ?
+        """,
+        (json.dumps(roleless_payload, sort_keys=True), reconcile_event_id),
+    )
+    conn.commit()
+    roleless = server._contract_runtime_rev8_postmerge_qa_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    assert roleless["verified"] is False
+    assert roleless["blocker_codes"] == [
+        "observer_reconcile_receipt_unverified"
+    ]
+
+
 def test_durable_merge_dispatch_enrichment_rejects_forged_scope(
     conn,
     monkeypatch,
