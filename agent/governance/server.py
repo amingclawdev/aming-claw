@@ -28127,21 +28127,31 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
     resolved_via_pre_lineage_descendant = False
 
     try:
-        if (
-            pre_lineage_recovery
-            and expected_ref
-            and route_token_ref == expected_ref
-            and not pre_resolution_mismatches
-        ):
-            resolved = _orc.resolve_route_token_ref_renewal_descendant(
-                conn,
-                project_id=project_id,
-                route_token_ref=route_token_ref,
+        if pre_lineage_recovery and expected_ref:
+            descendant_resolution = (
+                _orc.resolve_route_token_ref_renewal_descendant(
+                    conn,
+                    project_id=project_id,
+                    route_token_ref=expected_ref,
+                )
             )
-            resolved_via_pre_lineage_descendant = bool(
-                resolved
-                and isinstance(resolved.get("renewal_resolution"), Mapping)
+            descendant_renewal = (
+                descendant_resolution.get("renewal_resolution")
+                if isinstance(descendant_resolution, Mapping)
+                else None
             )
+            if isinstance(descendant_renewal, Mapping):
+                resolved = descendant_resolution
+                resolved_via_pre_lineage_descendant = True
+            elif route_token_ref == expected_ref and not pre_resolution_mismatches:
+                resolved = descendant_resolution
+            else:
+                resolved = _runtime_context_resolve_implementation_route_token_ref(
+                    resolution_body,
+                    project_id=project_id,
+                    context=context,
+                    contract_execution_id=contract_execution_id,
+                )
         else:
             resolved = _runtime_context_resolve_implementation_route_token_ref(
                 resolution_body,
@@ -28237,6 +28247,7 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
         if (
             not resolved_ref
             or resolved_ref == expected_ref
+            or route_token_ref not in {expected_ref, resolved_ref}
             or renewal_resolution.get("registry_verified") is not True
             or renewal_resolution.get("exact_scope_verified") is not True
             or any(
@@ -28303,7 +28314,10 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
             continue
         authoritative_identity = (
             expected_route_identity
-            if resolved_via_pre_lineage_descendant
+            if (
+                resolved_via_pre_lineage_descendant
+                and route_token_ref == expected_ref
+            )
             else resolved_identity
         )
         authoritative = str(authoritative_identity.get(field) or "").strip()
@@ -37087,6 +37101,20 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             is True
             else selected_route_identity
         )
+        pre_lineage_authority_body = body
+        if rejoin_route_lineage_payload.get(
+            "_runtime_context_pre_lineage_route_successor_resolved"
+        ) is True:
+            # The one-shot authority audits the immutable initial-join route.
+            # Descendant proof above authorizes the active identity separately;
+            # do not make historical audit validity depend on caller presentation.
+            pre_lineage_authority_body = dict(body)
+            pre_lineage_authority_body.update(
+                {
+                    field: str(expected_route_identity.get(field) or "").strip()
+                    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                }
+            )
         pre_lineage_bootstrap_rejoin_authority: dict[str, Any] = {}
         if missing_lineage:
             pre_lineage_bootstrap_rejoin_authority = (
@@ -37095,7 +37123,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     project_id=project_id,
                     context=context,
                     runtime_context_id=runtime_context_id,
-                    body=body,
+                    body=pre_lineage_authority_body,
                     contract_execution_id=resolved_contract_execution_id,
                     route_identity=pre_lineage_authority_route_identity,
                     timeline_events=timeline_events,

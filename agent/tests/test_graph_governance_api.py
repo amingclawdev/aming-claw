@@ -45689,16 +45689,26 @@ def test_runtime_context_pre_lineage_rejoin_rotates_auth_once_without_state_or_e
     )
 
 
+@pytest.mark.parametrize(
+    ("route_ref_presentation", "renewal_hops"),
+    [
+        ("ancestor", 1),
+        ("active_descendant", 1),
+        ("active_descendant", 2),
+    ],
+)
 def test_runtime_context_pre_lineage_rejoin_resolves_renewal_descendant_and_rebinds_contract(
     conn,
     monkeypatch,
     tmp_path,
+    route_ref_presentation,
+    renewal_hops,
 ):
     case = _setup_pre_lineage_rejoin_recovery_case(
         conn,
         monkeypatch,
         tmp_path,
-        suffix="renewal-descendant",
+        suffix=f"renewal-{route_ref_presentation}-{renewal_hops}-hop",
         source_backed_contract_runtime=True,
     )
     before_revision = get_latest_branch_contract_revision(
@@ -45706,18 +45716,30 @@ def test_runtime_context_pre_lineage_rejoin_resolves_renewal_descendant_and_rebi
         PID,
         case["context"].runtime_context_id,
     )
-    renewed = observer_route_context.renew_route_token_ref(
-        conn,
-        project_id=PID,
-        route_token_ref=case["route_identity"]["route_token_ref"],
-        backlog_id=case["backlog_id"],
-        task_id=case["task_id"],
-        allowed_actions=["task_timeline_append"],
-        ttl_hours=24.0,
-        now=datetime(2099, 8, 2, 1, 1, tzinfo=timezone.utc),
-    )
+    renewed = None
+    route_token_ref = case["route_identity"]["route_token_ref"]
+    renewal_refs = [route_token_ref]
+    for hop in range(renewal_hops):
+        renewed = observer_route_context.renew_route_token_ref(
+            conn,
+            project_id=PID,
+            route_token_ref=route_token_ref,
+            backlog_id=case["backlog_id"],
+            task_id=case["task_id"],
+            allowed_actions=["task_timeline_append"],
+            ttl_hours=24.0,
+            now=datetime(2099, 8, 2, 1, 1 + hop, tzinfo=timezone.utc),
+        )
+        route_token_ref = renewed["route_token_ref"]
+        renewal_refs.append(route_token_ref)
+    assert renewed is not None
 
-    rejoin = _pre_lineage_rejoin(case)
+    body_updates = (
+        renewed["route_identity"]
+        if route_ref_presentation == "active_descendant"
+        else None
+    )
+    rejoin = _pre_lineage_rejoin(case, body_updates=body_updates)
 
     assert rejoin["ok"] is True
     assert rejoin["pre_lineage_auth_only_rejoin"] is True
@@ -45730,6 +45752,7 @@ def test_runtime_context_pre_lineage_rejoin_resolves_renewal_descendant_and_rebi
         case["route_identity"]["route_token_ref"]
     )
     assert renewal["resolved_route_token_ref"] == renewed["route_token_ref"]
+    assert renewal["route_token_ref_chain"] == renewal_refs
     assert renewal["registry_verified"] is True
     assert renewal["exact_scope_verified"] is True
     after_revision = get_latest_branch_contract_revision(
@@ -45831,6 +45854,15 @@ def test_runtime_context_pre_lineage_rejoin_resolves_renewal_descendant_and_rebi
             case["context"].runtime_context_id
         )
         assert completed["task_id"] == case["task_id"]
+    persisted_timeline = json.dumps(
+        _pre_lineage_case_events(conn, case),
+        sort_keys=True,
+    )
+    assert rejoin["session_token"] not in persisted_timeline
+    assert rejoin["raw_tokens_persisted_to_timeline"] is False
+    assert rejoin["fence_token_hash"] == runtime_context_secret_hash(
+        rejoin["fence_token"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -45919,7 +45951,10 @@ def test_runtime_context_pre_lineage_rejoin_rejects_unproven_renewal_descendant_
     )
     before_events = _pre_lineage_case_events(conn, case)
     with pytest.raises(GovernanceError) as rejected:
-        _pre_lineage_rejoin(case)
+        _pre_lineage_rejoin(
+            case,
+            body_updates=renewed["route_identity"],
+        )
 
     assert rejected.value.code == "runtime_context_rejoin_route_token_ref_invalid"
     assert rejected.value.details["route_token_ref_error_code"] == (
@@ -45930,6 +45965,101 @@ def test_runtime_context_pre_lineage_rejoin_rejects_unproven_renewal_descendant_
     assert rejected.value.details["fail_closed"] is True
     assert rejected.value.details["identity_mismatches"]
     assert rejected.value.details["next_legal_action"]
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        rejected.value,
+        before_context=before_context,
+        before_events=before_events,
+        before_revision=before_revision,
+    )
+
+
+@pytest.mark.parametrize("lineage_fault", ["unrelated", "stale", "revoked"])
+def test_runtime_context_pre_lineage_rejoin_rejects_non_active_or_non_descendant_ref_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    lineage_fault,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"renewal-direct-{lineage_fault}",
+    )
+    first_renewal = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=case["route_identity"]["route_token_ref"],
+        backlog_id=case["backlog_id"],
+        task_id=case["task_id"],
+        allowed_actions=["task_timeline_append"],
+        ttl_hours=24.0,
+        now=datetime(2099, 8, 2, 1, 1, tzinfo=timezone.utc),
+    )
+    presented_identity = first_renewal["route_identity"]
+    expected_code = "runtime_context_pre_lineage_rejoin_route_descendant_unproven"
+    if lineage_fault == "unrelated":
+        unrelated = observer_route_context.issue_observer_write_route_context(
+            project_id=PID,
+            backlog_id=case["backlog_id"],
+            task_id=case["task_id"],
+            target_files=["agent/governance/server.py"],
+            allowed_actions=["task_timeline_append"],
+            ttl_hours=24.0,
+            now=datetime(2099, 8, 2, 1, 2, tzinfo=timezone.utc),
+        )
+        unrelated_token = unrelated["route_token"]
+        unrelated_token["owned_files"] = ["agent/governance/server.py"]
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=PID,
+            route_token_ref=unrelated["route_token_ref"],
+            token=unrelated_token,
+        )
+        presented_identity = {
+            field: (
+                unrelated["route_token_ref"]
+                if field == "route_token_ref"
+                else unrelated_token[field]
+            )
+            for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+    elif lineage_fault == "stale":
+        observer_route_context.renew_route_token_ref(
+            conn,
+            project_id=PID,
+            route_token_ref=first_renewal["route_token_ref"],
+            backlog_id=case["backlog_id"],
+            task_id=case["task_id"],
+            allowed_actions=["task_timeline_append"],
+            ttl_hours=24.0,
+            now=datetime(2099, 8, 2, 1, 2, tzinfo=timezone.utc),
+        )
+    else:
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status=? "
+            "WHERE project_id=? AND route_token_ref=?",
+            ("revoked", PID, first_renewal["route_token_ref"]),
+        )
+        conn.commit()
+        expected_code = "runtime_context_rejoin_route_token_ref_invalid"
+
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        case["context"].runtime_context_id,
+    )
+    before_events = _pre_lineage_case_events(conn, case)
+    with pytest.raises(GovernanceError) as rejected:
+        _pre_lineage_rejoin(case, body_updates=presented_identity)
+
+    assert rejected.value.code == expected_code
+    assert rejected.value.details["credential_rotated"] is False
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["fail_closed"] is True
     _assert_pre_lineage_rejoin_zero_write(
         conn,
         case,
