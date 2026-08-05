@@ -120669,6 +120669,362 @@ def test_worker_commit_close_facade_binds_exact_atomic_lane_identity_and_hash(
         assert len(fake_runtime.submitted_writes) == 1
 
 
+def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_hash(
+    conn,
+    monkeypatch,
+):
+    execution_id = "cex-implementation-two-worker-writer-hash"
+    backlog_id = "AC-IMPLEMENTATION-TWO-WORKER-WRITER-HASH"
+    global_lane_hash = _fake_sha("implementation-global-planner-lane")
+    worker_lane_hash = _fake_sha("implementation-authenticated-worker-lane")
+    target_root = "/tmp/implementation-two-worker-writer-hash"
+    lanes = [
+        {
+            "runtime_context_id": "mfrctx-implementation-planner-lane",
+            "task_id": "implementation-planner-lane",
+            "parent_task_id": execution_id,
+            "worker_role": "mf_sub",
+            "worker_id": "slot-implementation-planner-lane",
+            "worker_slot_id": "slot-implementation-planner-lane",
+            "lane_id": "slot-implementation-planner-lane",
+            "line_instance_id": (
+                "runtime_context:mfrctx-implementation-planner-lane"
+            ),
+        },
+        {
+            "runtime_context_id": "mfrctx-implementation-worker-lane",
+            "task_id": "implementation-worker-lane",
+            "parent_task_id": execution_id,
+            "worker_role": "mf_sub",
+            "worker_id": "slot-implementation-worker-lane",
+            "worker_slot_id": "slot-implementation-worker-lane",
+            "lane_id": "slot-implementation-worker-lane",
+            "line_instance_id": (
+                "runtime_context:mfrctx-implementation-worker-lane"
+            ),
+        },
+    ]
+    authenticated_lane = lanes[1]
+    for lane in lanes:
+        upsert_branch_context(
+            conn,
+            BranchTaskRuntimeContext(
+                project_id=PID,
+                backlog_id=backlog_id,
+                runtime_context_id=lane["runtime_context_id"],
+                task_id=lane["task_id"],
+                parent_task_id=execution_id,
+                root_task_id=execution_id,
+                stage_task_id=lane["task_id"],
+                stage_type="mf_sub",
+                worker_id=lane["worker_id"],
+                worker_slot_id=lane["worker_slot_id"],
+                branch_ref=f"refs/heads/codex/{lane['task_id']}",
+                target_project_root=target_root,
+                status=STATE_WORKTREE_READY,
+            ),
+        )
+    conn.commit()
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "definition_hash": _fake_sha("implementation-two-worker-definition"),
+        "instruction_bundle_hash": _fake_sha(
+            "implementation-two-worker-instructions"
+        ),
+        "execution_state_revision": 9,
+        "execution_state": {
+            "execution_state_revision": 9,
+            "execution_state_hash": _fake_sha(
+                "implementation-two-worker-state-before"
+            ),
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": _fake_sha(
+                "implementation-two-worker-reader-guide"
+            ),
+            "next_legal_action": {
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "actor_role": "mf_sub",
+                "evidence_kind": "implementation",
+                **lanes[0],
+            },
+            "writer_role_safe_copy_payload": {
+                "copy_payload": {
+                    "runtime_guide_hash": global_lane_hash,
+                    "stage_id": "worker_implementation",
+                    "line_id": "worker_implementation",
+                    "actor_role": "mf_sub",
+                    "evidence_kind": "implementation",
+                    **lanes[0],
+                }
+            },
+        },
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "status": "passed",
+                "payload": {
+                    "worker_count": 2,
+                    "atomic": True,
+                    "bounded_workers": copy.deepcopy(lanes),
+                },
+            }
+        ],
+    }
+    updated_record = {
+        **copy.deepcopy(record),
+        "execution_state_revision": 10,
+        "execution_state": {
+            "execution_state_revision": 10,
+            "execution_state_hash": _fake_sha(
+                "implementation-two-worker-state-after"
+            ),
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": _fake_sha(
+                "implementation-two-worker-reader-after"
+            ),
+            "next_legal_action": {
+                "stage_id": "worker_commit",
+                "line_id": "worker_commit",
+                "actor_role": "mf_sub",
+                "evidence_kind": "worker_commit",
+                **authenticated_lane,
+            },
+        },
+    }
+
+    class FakeRuntime:
+        def __init__(self):
+            self.accepted_writes = []
+            self.submit_attempts = []
+
+        def current_record(self, requested_execution_id, *, actor_role):
+            assert requested_execution_id == execution_id
+            assert actor_role in {"mf_sub", "observer"}
+            return copy.deepcopy(record)
+
+        def mf_parallel_atomic_lane_gate_view(
+            self,
+            gate_record,
+            guide,
+            write,
+            *,
+            source_record,
+            projection,
+        ):
+            assert source_record["contract_execution_id"] == execution_id
+            assert gate_record["contract_execution_id"] == execution_id
+            return (
+                copy.deepcopy(gate_record["execution_state"]),
+                {
+                    **copy.deepcopy(guide),
+                    "runtime_guide_hash": worker_lane_hash,
+                    "writer_role_safe_copy_payload": {
+                        "copy_payload": {
+                            "runtime_guide_hash": worker_lane_hash,
+                            "stage_id": "worker_implementation",
+                            "line_id": "worker_implementation",
+                            "actor_role": "mf_sub",
+                            "evidence_kind": "implementation",
+                            **authenticated_lane,
+                        }
+                    },
+                    "atomic_lane_gate_binding": {
+                        "schema_version": (
+                            "mf_parallel.atomic_lane_gate_binding.v1"
+                        ),
+                        "bound": True,
+                        **authenticated_lane,
+                        "source_global_runtime_guide_hash": global_lane_hash,
+                    },
+                },
+            )
+
+        def submit_line_write(
+            self,
+            requested_execution_id,
+            write,
+            *,
+            actor_role,
+            projected_completed_lines,
+            projection,
+        ):
+            assert requested_execution_id == execution_id
+            self.submit_attempts.append(copy.deepcopy(write))
+            exact_lane = all(
+                write.get(field) == value
+                and write.get("payload", {}).get(field) == value
+                for field, value in authenticated_lane.items()
+            )
+            if (
+                actor_role != "mf_sub"
+                or write.get("runtime_guide_hash") != worker_lane_hash
+                or not exact_lane
+            ):
+                return {
+                    "ok": False,
+                    "decision": {
+                        "ok": False,
+                        "errors": [
+                            "authenticated worker lane writer hash mismatch"
+                        ],
+                    },
+                }
+            self.accepted_writes.append(copy.deepcopy(write))
+            return {
+                "ok": True,
+                "decision": {"ok": True, "errors": []},
+                "record": copy.deepcopy(updated_record),
+            }
+
+    fake_runtime = FakeRuntime()
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: fake_runtime)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda _conn, **kwargs: (copy.deepcopy(kwargs["record"]), {}),
+    )
+    monkeypatch.setattr(
+        server,
+        "_onboard_guide_capsule_invalidate_contract_runtime_transition",
+        lambda **_kwargs: None,
+    )
+
+    session_token_ref = "wstref-implementation-two-worker-writer-hash"
+    fence_token_hash = _fake_sha("implementation-two-worker-fence")
+    provenance = {
+        "schema_version": "runtime_context.worker_provenance.v1",
+        "source": "runtime_context_copy_safe_worker_proof",
+        "verified": True,
+        "worker_owned": True,
+        "observer_impersonation": False,
+        **authenticated_lane,
+        "target_project_root": target_root,
+        "session_token_ref": session_token_ref,
+        "session_token_ref_present": True,
+        "fence_token_hash": fence_token_hash,
+        "fence_token_redacted": True,
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+    }
+    payload = {
+        **authenticated_lane,
+        "target_project_root": target_root,
+        "session_token_ref": session_token_ref,
+        "fence_token_hash": fence_token_hash,
+        "observer_impersonation": False,
+        "worker_evidence_provenance": provenance,
+        "changed_files": ["agent/governance/server.py"],
+        "graph_trace_ids": ["gqt-implementation-worker-lane"],
+        "test_results": {"status": "passed", "passed": True},
+    }
+    event_body = {
+        "backlog_id": backlog_id,
+        "task_id": authenticated_lane["task_id"],
+        "contract_execution_id": execution_id,
+        "event_type": "mf.implementation",
+        "event_kind": "implementation",
+        "phase": "implementation",
+        "actor": "mf_sub",
+        "status": "passed",
+        "contract_runtime_line": {
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "evidence_kind": "implementation",
+        },
+        "payload": payload,
+    }
+
+    def trusted_request(body):
+        return server._runtime_context_forward_request(
+            _ctx_with_role({"project_id": PID}, "mf_sub", method="POST"),
+            body=body,
+            trusted_runtime_context_worker_proof=True,
+        )
+
+    timeline_count_before = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    accepted = server.handle_task_timeline_append(
+        trusted_request(copy.deepcopy(event_body))
+    )
+
+    assert accepted["contract_runtime_close_evidence_gate"]["accepted"] is True
+    assert len(fake_runtime.accepted_writes) == 1
+    submitted = fake_runtime.accepted_writes[0]
+    assert submitted["runtime_guide_hash"] == worker_lane_hash
+    assert submitted["runtime_guide_hash"] != global_lane_hash
+    for field, value in authenticated_lane.items():
+        assert submitted[field] == value
+        assert submitted["payload"][field] == value
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == timeline_count_before + 1
+
+    accepted_write_count = len(fake_runtime.accepted_writes)
+    submit_attempt_count = len(fake_runtime.submit_attempts)
+    timeline_count_after_accept = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+
+    wrong_lane_body = copy.deepcopy(event_body)
+    wrong_lane_body["payload"]["lane_id"] = lanes[0]["lane_id"]
+    with pytest.raises(GovernanceError) as wrong_lane:
+        server.handle_task_timeline_append(trusted_request(wrong_lane_body))
+    assert wrong_lane.value.code == "runtime_context_lane_identity_mismatch"
+    assert wrong_lane.value.details["field"] == "lane_id"
+    assert wrong_lane.value.details["expected"] == authenticated_lane["lane_id"]
+    assert wrong_lane.value.details["actual"] == lanes[0]["lane_id"]
+    assert wrong_lane.value.details["zero_contract_runtime_write"] is True
+    assert wrong_lane.value.details["zero_timeline_write"] is True
+
+    malicious_hash_body = copy.deepcopy(event_body)
+    malicious_hash_body["runtime_guide_hash"] = {
+        "secret": "must-not-reflect-implementation-writer-hash"
+    }
+    with pytest.raises(GovernanceError) as malicious_hash:
+        server.handle_task_timeline_append(
+            trusted_request(malicious_hash_body)
+        )
+    assert malicious_hash.value.code == "contract_runtime_close_evidence_rejected"
+    assert malicious_hash.value.details["field"] == "runtime_guide_hash"
+    assert malicious_hash.value.details["actual"] == (
+        "<invalid-runtime-guide-hash>"
+    )
+    assert malicious_hash.value.details["zero_contract_runtime_write"] is True
+    assert malicious_hash.value.details["zero_timeline_write"] is True
+    assert "must-not-reflect-implementation-writer-hash" not in json.dumps(
+        malicious_hash.value.details,
+        sort_keys=True,
+    )
+
+    observer_body = copy.deepcopy(event_body)
+    observer_body["actor"] = "observer"
+    with pytest.raises(GovernanceError):
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=observer_body,
+            )
+        )
+
+    assert len(fake_runtime.accepted_writes) == accepted_write_count
+    assert len(fake_runtime.submit_attempts) == submit_attempt_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == timeline_count_after_accept
+
+
 def test_runtime_context_close_gate_success_projects_canonical_line_once():
     requested = {
         "stage_id": "worker_implementation",
