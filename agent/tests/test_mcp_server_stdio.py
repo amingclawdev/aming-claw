@@ -555,6 +555,55 @@ def test_mcp_stdio_backlog_upsert_schema_exposes_structured_acceptance_scope():
     assert object_schema["properties"]["required_scope"]["required"] == ["kind"]
 
 
+def test_governance_mcp_backlog_upsert_exposes_and_forwards_triage_resolution(
+    monkeypatch,
+):
+    tool = next(
+        item
+        for item in governance_mcp_server.TOOLS
+        if item["name"] == "backlog_upsert"
+    )
+    properties = tool["inputSchema"]["properties"]
+    assert properties["triage_action"] == {
+        "type": "string",
+        "enum": ["admit", "merge_into", "supersede", "reject_dup"],
+    }
+    assert properties["triage_target_bug_id"] == {"type": "string"}
+
+    calls = []
+
+    def fake_http(method, path, body=None, *args, **kwargs):
+        calls.append((method, path, body))
+        return {"ok": True}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    result = governance_mcp_server._dispatch_tool(
+        "backlog_upsert",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "AC-FRESH-TRIAGE-ROW",
+            "title": "Fresh bounded row",
+            "triage_action": "admit",
+            "triage_target_bug_id": "AC-OLD-UMBRELLA",
+        },
+    )
+
+    assert result["ok"] is True
+    assert calls == [
+        (
+            "POST",
+            "/api/backlog/aming-claw/AC-FRESH-TRIAGE-ROW",
+            {
+                "project_id": "aming-claw",
+                "bug_id": "AC-FRESH-TRIAGE-ROW",
+                "title": "Fresh bounded row",
+                "triage_action": "admit",
+                "triage_target_bug_id": "AC-OLD-UMBRELLA",
+            },
+        )
+    ]
+
+
 def test_runtime_context_finish_time_worker_attestation_schema_requires_harness_type():
     finish_attestation = next(
         tool

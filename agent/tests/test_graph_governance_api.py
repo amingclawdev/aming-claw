@@ -28739,6 +28739,413 @@ def test_parallel_branch_merge_queue_materialize_records_contract_event_after_fi
     assert raw_fence_token not in json.dumps(payload, sort_keys=True)
 
 
+@pytest.mark.parametrize(
+    ("contract_actor", "accepted"),
+    [
+        ("root_observer", True),
+        ("mf_sub", False),
+    ],
+)
+def test_parallel_branch_merge_queue_materialize_contract_actor_is_prevalidated_zero_write(
+    conn,
+    contract_actor,
+    accepted,
+):
+    """Regression for req-5fae9be93ba9: meta errors are never HTTP 5xx."""
+
+    root_task_id = f"root-materialize-contract-actor-{contract_actor}"
+    child_task_id = f"{root_task_id}-worker"
+    queue_id = f"mergeq-materialize-contract-actor-{contract_actor}"
+    checkpoint_id = f"ckpt-materialize-contract-actor-{contract_actor}"
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=root_task_id,
+        task_id=child_task_id,
+        target_files=["src/app.js"],
+        allowed_actions=["close_or_merge_after_evidence"],
+        evidence_refs=["timeline:qa-independent-verification"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            backlog_id=root_task_id,
+            root_task_id=root_task_id,
+            parent_task_id=root_task_id,
+            task_id=child_task_id,
+            branch_ref=f"refs/heads/codex/{child_task_id}",
+            status=STATE_VALIDATED,
+            base_commit="a" * 40,
+            head_commit="b" * 40,
+            target_head_commit="a" * 40,
+            checkpoint_id=checkpoint_id,
+            replay_source="mf_sub_finish_gate",
+        ),
+    )
+    conn.commit()
+    changes_before = conn.total_changes
+
+    result = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": child_task_id,
+                "backlog_id": root_task_id,
+                "merge_queue_id": queue_id,
+                "checkpoint_id": checkpoint_id,
+                "require_finish_gate": True,
+                "route_token_ref": issued["route_token_ref"],
+                "contract_actor": contract_actor,
+            },
+        )
+    )
+
+    if accepted:
+        assert result["ok"] is True
+        stored = task_timeline.list_events(
+            conn,
+            PID,
+            task_id=root_task_id,
+            event_kind="merge_queue_item_materialize",
+        )
+        assert len(stored) == 1
+        assert stored[0]["actor"] == "observer"
+        assert stored[0]["payload"]["route_token_gate"]["allowed"] is True
+        return
+
+    status, rejection = result
+    assert status == 422
+    assert rejection["error"] == "merge_queue_materialize_contract_actor_invalid"
+    assert rejection["field"] == "contract_actor"
+    assert rejection["expected"] == ["observer", "root_observer"]
+    assert rejection["actual"] == contract_actor
+    assert rejection["zero_write_rejection"] is True
+    assert rejection["writes_performed"] is False
+    assert rejection["mutation_performed"] is False
+    assert rejection["retry_same_world_allowed"] is True
+    assert rejection["guide"]["action"] == (
+        "remove_or_correct_contract_actor_and_retry_same_world"
+    )
+    assert rejection["source"] == (
+        "parallel_branch_merge_queue_materialize."
+        "contract_actor_prewrite_gate.v1"
+    )
+    assert conn.total_changes == changes_before
+    assert list_merge_queue_items(conn, PID, queue_id) == []
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=root_task_id,
+        event_kind="merge_queue_item_materialize",
+    ) == []
+
+
+def test_two_worker_premerge_qa_receipts_persist_at_observer_merge_without_writing_it(
+    conn,
+    monkeypatch,
+):
+    """Each candidate keeps its QA receipt after the shared CEX reaches merge."""
+
+    backlog_id = "AC-TWO-WORKER-PREMERGE-QA-RECEIPTS"
+    execution_id = "cex-two-worker-premerge-qa-receipts"
+    candidates = {"worker-a": "a" * 40, "worker-b": "b" * 40}
+    workers = []
+    for suffix, candidate_commit in candidates.items():
+        runtime_context = upsert_branch_context(
+            conn,
+            BranchTaskRuntimeContext(
+                project_id=PID,
+                backlog_id=backlog_id,
+                root_task_id=execution_id,
+                parent_task_id=execution_id,
+                task_id=suffix,
+                runtime_context_id=f"mfrctx-{suffix}",
+                worker_id=f"slot-{suffix}",
+                worker_slot_id=f"slot-{suffix}",
+                branch_ref=f"refs/heads/codex/{suffix}",
+                worktree_path=f"/tmp/{suffix}",
+                target_project_root="/tmp/two-worker-premerge-qa",
+                status=STATE_VALIDATED,
+                base_commit="0" * 40,
+                head_commit=candidate_commit,
+                target_head_commit="0" * 40,
+                merge_queue_id=f"mq-{suffix}",
+                owned_files=(f"src/{suffix}.py",),
+                target_files=(f"src/{suffix}.py",),
+            ),
+        )
+        workers.append(
+            {
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": execution_id,
+                "worker_id": runtime_context.worker_id,
+                "worker_slot_id": runtime_context.worker_slot_id,
+                "merge_queue_id": runtime_context.merge_queue_id,
+                "owned_files": list(runtime_context.owned_files),
+                "line_instance_id": (
+                    f"runtime_context:{runtime_context.runtime_context_id}"
+                ),
+            }
+        )
+    conn.commit()
+
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev8",
+        "contract_execution_id": execution_id,
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "status": "passed",
+                "payload": {
+                    "worker_count": 2,
+                    "atomic": True,
+                    "bounded_workers": workers,
+                },
+            }
+        ],
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": "observer_lane_merge",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "owner_role": "observer",
+                "evidence_kind": "merge",
+                "runtime_context_id": workers[0]["runtime_context_id"],
+                "task_id": workers[0]["task_id"],
+            }
+        },
+        "execution_state": {
+            "next_legal_action": {
+                "stage_id": "observer_lane_merge",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "owner_role": "observer",
+                "evidence_kind": "merge",
+                "runtime_context_id": workers[0]["runtime_context_id"],
+                "task_id": workers[0]["task_id"],
+            }
+        },
+    }
+
+    class FakeRuntime:
+        def current_record(self, requested_execution_id, *, actor_role):
+            assert requested_execution_id == execution_id
+            assert actor_role == "qa"
+            return copy.deepcopy(record)
+
+        def submit_line_write(self, *_args, **_kwargs):
+            raise AssertionError("premerge QA must not write observer_merge")
+
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: FakeRuntime())
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda _conn, **kwargs: (kwargs["record"], {}),
+    )
+
+    active_proof = {}
+
+    def trusted_qa(*_args, **_kwargs):
+        return dict(active_proof)
+
+    monkeypatch.setattr(
+        server,
+        "_timeline_trusted_qa_verification_authority",
+        trusted_qa,
+    )
+
+    event_refs = []
+    for index, (task_id, candidate_commit) in enumerate(candidates.items(), 1):
+        qa_principal = f"qa:premerge-{task_id}"
+        qa_session_id = f"ses-premerge-{task_id}"
+        ctx = _ctx_with_role({"project_id": PID}, "qa", method="POST")
+        ctx._session.update(
+            {
+                "session_id": qa_session_id,
+                "principal_id": qa_principal,
+            }
+        )
+        active_proof.clear()
+        active_proof.update(
+            {
+                "schema_version": "qa_session_scope_proof.v1",
+                "source": "authenticated_qa_session",
+                "verified": True,
+                "role": "qa",
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "commit_sha": candidate_commit,
+                "qa_principal": qa_principal,
+                "qa_session_id": qa_session_id,
+                "qa_scope_binding_ref": f"qa-scope:{task_id}:{candidate_commit}",
+                "graph_trace_ids": [f"gqt-premerge-{index}"],
+                "query_source": "qa",
+                "query_purpose": "independent_verification",
+                "db_verified_graph_trace": True,
+                "query_root": "/tmp/two-worker-premerge-qa",
+                "observer_impersonation": False,
+                "evidence_status": "passed",
+                "authority_scope": "candidate_premerge_materialize",
+                "close_satisfying": False,
+                "audit_only": False,
+                "passing_status_required_for_close": True,
+            }
+        )
+        ctx.body = {
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "event_type": "qa.candidate.independent_verification",
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "actor": qa_principal,
+            "status": "passed",
+            "commit_sha": candidate_commit,
+            "graph_trace_ids": [f"gqt-premerge-{index}"],
+            "payload": {
+                "contract_execution_id": execution_id,
+                "runtime_context_id": f"mfrctx-{task_id}",
+                "candidate_commit_sha": candidate_commit,
+            },
+            "verification": {
+                "verdict": "PASS",
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "overall_release_pass_claimed": False,
+            },
+        }
+
+        result = server.handle_task_timeline_append(ctx)
+
+        assert result["contract_runtime_close_evidence_gate"]["accepted"] is True
+        assert result["contract_runtime_close_evidence_gate"]["status"] == (
+            "accepted_premerge_candidate_qa_receipt"
+        )
+        assert result["contract_runtime_close_evidence_gate"][
+            "contract_runtime_mutated"
+        ] is False
+        assert result["contract_runtime_close_evidence_gate"][
+            "observer_merge_written"
+        ] is False
+        event_refs.append(f"timeline:{result['id']}")
+
+    assert len(set(event_refs)) == 2
+    persisted = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="independent_verification",
+        limit=10,
+    )
+    assert {event["task_id"] for event in persisted} == set(candidates)
+    assert {event["commit_sha"] for event in persisted} == set(candidates.values())
+    assert {
+        event["payload"]["premerge_candidate_qa_receipt_authority"][
+            "qa_principal"
+        ]
+        for event in persisted
+    } == {"qa:premerge-worker-a", "qa:premerge-worker-b"}
+    assert all(
+        event["payload"]["premerge_candidate_qa_receipt_authority"][
+            "observer_merge_written"
+        ]
+        is False
+        for event in persisted
+    )
+
+    persisted_count = len(persisted)
+    active_proof.update(
+        {
+            "task_id": "worker-a",
+            "commit_sha": candidates["worker-b"],
+            "candidate_commit_sha": candidates["worker-b"],
+            "qa_principal": "qa:premerge-worker-a",
+            "qa_session_id": "ses-premerge-worker-a",
+        }
+    )
+    forged_ctx = _ctx_with_role({"project_id": PID}, "qa", method="POST")
+    forged_ctx._session.update(
+        {
+            "session_id": "ses-premerge-worker-a",
+            "principal_id": "qa:premerge-worker-a",
+        }
+    )
+    forged_ctx.body = {
+        "backlog_id": backlog_id,
+        "task_id": "worker-a",
+        "event_type": "qa.candidate.independent_verification",
+        "event_kind": "independent_verification",
+        "phase": "verification",
+        "actor": "qa:premerge-worker-a",
+        "status": "passed",
+        "commit_sha": candidates["worker-b"],
+        "graph_trace_ids": ["gqt-premerge-forged"],
+        "payload": {
+            "contract_execution_id": execution_id,
+            "runtime_context_id": "mfrctx-worker-a",
+            "candidate_commit_sha": candidates["worker-b"],
+        },
+        "verification": {
+            "verdict": "PASS",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "overall_release_pass_claimed": False,
+        },
+    }
+
+    with pytest.raises(GovernanceError) as forged:
+        server.handle_task_timeline_append(forged_ctx)
+
+    assert forged.value.code == "premerge_candidate_qa_receipt_scope_mismatch"
+    details = forged.value.details
+    assert details["field"] == "runtime_context.candidate_commit"
+    assert details["expected"] == candidates["worker-a"]
+    assert details["actual"] == candidates["worker-b"]
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    assert details["mutation_performed"] is False
+    assert details["retry_same_world_allowed"] is True
+    assert details["contract_runtime_mutated"] is False
+    assert details["timeline_mutated"] is False
+    assert details["observer_merge_written"] is False
+    assert details["public_safe"] is True
+    assert details["secret_safe"] is True
+    assert details["raw_session_token_exposed"] is False
+    assert details["raw_fence_token_exposed"] is False
+    assert details["raw_route_token_exposed"] is False
+    assert details["guide"]["bypass_or_waive_required"] is False
+    public_rejection = server._public_zero_write_error_response(forged.value)
+    assert public_rejection["field"] == details["field"]
+    assert public_rejection["expected"] == details["expected"]
+    assert public_rejection["actual"] == details["actual"]
+    assert public_rejection["guide"] == details["guide"]
+    assert public_rejection["source"] == details["source"]
+    assert public_rejection["zero_write_rejection"] is True
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            event_kind="independent_verification",
+            limit=10,
+        )
+    ) == persisted_count
+
+
 def test_parallel_branch_merge_queue_materialize_rejects_cross_queue_and_corrects_before_apply(
     conn, tmp_path,
 ):

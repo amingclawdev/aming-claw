@@ -793,6 +793,40 @@ def test_backlog_upsert_accepts_structured_acceptance_scope_without_breaking_str
     assert closure["required_file_union"] == ["src/app.js"]
 
 
+def test_runtime_mcp_backlog_upsert_exposes_and_forwards_triage_resolution():
+    for registry in (governance_mcp_server.TOOLS, mcp_tools.TOOLS):
+        tool = next(item for item in registry if item["name"] == "backlog_upsert")
+        properties = tool["inputSchema"]["properties"]
+        assert properties["triage_action"] == {
+            "type": "string",
+            "enum": ["admit", "merge_into", "supersede", "reject_dup"],
+        }
+        assert properties["triage_target_bug_id"] == {"type": "string"}
+
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    dispatcher.dispatch(
+        "backlog_upsert",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "AC-FRESH-TRIAGE-ROW",
+            "title": "Fresh bounded row",
+            "triage_action": "admit",
+            "triage_target_bug_id": "AC-OLD-UMBRELLA",
+        },
+    )
+
+    assert recorder.calls[-1] == (
+        "POST",
+        "/api/backlog/aming-claw/AC-FRESH-TRIAGE-ROW",
+        {
+            "title": "Fresh bounded row",
+            "triage_action": "admit",
+            "triage_target_bug_id": "AC-OLD-UMBRELLA",
+        },
+    )
+
+
 def test_active_mcp_exposes_backlog_and_graph_governance_tools():
     names = _tool_names()
 

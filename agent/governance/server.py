@@ -50834,6 +50834,7 @@ def _record_parallel_branch_merge_queue_materialize_event(
     body: Mapping[str, Any],
     queued: Mapping[str, Any],
     route_gate: Mapping[str, Any],
+    actor: str = "observer",
 ) -> dict[str, Any]:
     """Record the contract line that makes a durable queue item visible."""
     from . import task_timeline
@@ -50861,7 +50862,7 @@ def _record_parallel_branch_merge_queue_materialize_event(
         or child_task_id
         or ""
     ).strip()
-    actor = str(body.get("contract_actor") or body.get("actor") or "codex-observer").strip()
+    actor = str(actor or "observer").strip()
     queue_item_id = str(queue_item.get("queue_item_id") or body.get("queue_item_id") or "").strip()
     merge_queue_id = str(
         queue_item.get("merge_queue_id") or body.get("merge_queue_id") or ""
@@ -50966,6 +50967,102 @@ def _record_parallel_branch_merge_queue_materialize_event(
         commit_sha=str(queue_item.get("branch_head") or context.get("head_commit") or ""),
     )
     return event
+
+
+_PARALLEL_MATERIALIZE_OBSERVER_ACTOR_TOKENS = frozenset(
+    {
+        "",
+        "observer",
+        "root_observer",
+        "codex_observer",
+        "observer_coordinator",
+        "coordinator",
+    }
+)
+
+
+def _parallel_merge_queue_materialize_contract_actor_prewrite(
+    *,
+    body: Mapping[str, Any],
+    route_gate: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Resolve the materialize timeline actor before any durable queue write.
+
+    ``contract_actor`` is a caller hint, never role authority.  A successfully
+    resolved observer route is the authority for the observer-owned queue
+    entry.  Known observer aliases are therefore canonicalized to
+    ``observer``; a non-observer hint is rejected before queue/context/timeline
+    mutation instead of surfacing the timeline meta-contract exception as a
+    generic HTTP 5xx.
+    """
+
+    supplied = str(body.get("contract_actor") or "").strip()
+    token = supplied.lower().replace("-", "_").replace(".", "_")
+    source = (
+        "parallel_branch_merge_queue_materialize."
+        "contract_actor_prewrite_gate.v1"
+    )
+    if token not in _PARALLEL_MATERIALIZE_OBSERVER_ACTOR_TOKENS:
+        return "", {
+            "ok": False,
+            "error": "merge_queue_materialize_contract_actor_invalid",
+            "message": (
+                "materialize is observer-owned; contract_actor must be an "
+                "observer alias or be omitted"
+            ),
+            "field": "contract_actor",
+            "expected": ["observer", "root_observer"],
+            "actual": supplied,
+            "guide": {
+                "action": (
+                    "remove_or_correct_contract_actor_and_retry_same_world"
+                ),
+                "copy_safe_patch": {"contract_actor": "observer"},
+                "preserve_fields": [
+                    "project_id",
+                    "backlog_id",
+                    "task_id",
+                    "merge_queue_id",
+                    "queue_item_id",
+                    "checkpoint_id",
+                    "verification_event_refs",
+                    "route_token_ref",
+                ],
+                "bypass_or_waive_required": False,
+            },
+            "source": source,
+            "public_safe": True,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "timeline_event_recorded": False,
+            "retry_same_world_allowed": True,
+        }
+
+    route_role = str(route_gate.get("caller_role") or "").strip().lower()
+    if route_role and route_role not in {"observer", "coordinator"}:
+        return "", {
+            "ok": False,
+            "error": "merge_queue_materialize_route_role_invalid",
+            "message": "materialize requires server-resolved observer route authority",
+            "field": "route_token_gate.caller_role",
+            "expected": "observer",
+            "actual": route_role,
+            "guide": {
+                "action": "issue_observer_scoped_merge_route_and_retry_same_world",
+                "bypass_or_waive_required": False,
+            },
+            "source": source,
+            "public_safe": True,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "timeline_event_recorded": False,
+            "retry_same_world_allowed": True,
+        }
+
+    # The route gate, not the caller spelling, owns the timeline role.
+    return "observer", {}
 
 
 def _dependency_revalidation_qa_candidate_authority(
@@ -52088,6 +52185,14 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
             action="merge_queue",
             task_id=task_id,
         )
+        materialize_actor, actor_rejection = (
+            _parallel_merge_queue_materialize_contract_actor_prewrite(
+                body=ctx.body,
+                route_gate=route_gate,
+            )
+        )
+        if actor_rejection:
+            return 422, actor_rejection
         active_epoch = get_active_integration_epoch(
             conn,
             project_id,
@@ -52371,6 +52476,7 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                 body=ctx.body,
                 queued=queued,
                 route_gate=route_gate,
+                actor=materialize_actor,
             )
             conn.commit()
         return {
@@ -112511,6 +112617,7 @@ def _contract_runtime_close_gate(
     normalized_status: str = "",
     trusted_actor_role: str = "",
     trusted_actor_session: Mapping[str, Any] | None = None,
+    trusted_qa_verification_authority: Mapping[str, Any] | None = None,
     trusted_worker_commit_facade: bool = False,
 ) -> dict[str, Any]:
     contract_execution_id = _contract_runtime_close_execution_id(body, conn=conn)
@@ -112601,6 +112708,24 @@ def _contract_runtime_close_gate(
         )
         if projection_gate:
             return projection_gate
+    premerge_candidate_qa_gate = (
+        _contract_runtime_premerge_candidate_qa_receipt_gate(
+            conn,
+            project_id=project_id,
+            record=authority_record,
+            body=body,
+            event_kind=event_kind,
+            normalized_status=normalized_status,
+            actor_role=actor_role,
+            trusted_qa_verification_authority=(
+                trusted_qa_verification_authority
+            ),
+            trusted_actor_session=trusted_actor_session,
+            current_state=current_state,
+        )
+    )
+    if premerge_candidate_qa_gate:
+        return premerge_candidate_qa_gate
     write = _contract_runtime_write_from_record(
         authority_record,
         actor_role=actor_role,
@@ -113094,6 +113219,296 @@ def _contract_runtime_close_gate(
         "execution_state_revision": current_state.get("execution_state_revision", 0),
         "execution_state_hash": current_state.get("execution_state_hash", ""),
         "next_legal_action": current_state.get("next_legal_action") or {},
+    }
+
+
+def _contract_runtime_premerge_candidate_qa_receipt_gate(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    body: Mapping[str, Any],
+    event_kind: str,
+    normalized_status: str,
+    actor_role: str,
+    trusted_qa_verification_authority: Mapping[str, Any] | None,
+    trusted_actor_session: Mapping[str, Any] | None,
+    current_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist per-candidate QA receipts without advancing observer_merge.
+
+    rev8/rev9 two-lane contracts intentionally reach the first lane-owned
+    ``observer_merge`` before durable materialization.  Candidate QA receipts
+    are inputs to that materialization, not ContractRuntime completion lines.
+    This gate recognizes only the already-authenticated, DB-verified QA
+    authority produced by ``_timeline_trusted_qa_verification_authority`` and
+    leaves the observer-owned line untouched.
+    """
+
+    contract_id = str(record.get("contract_id") or "").strip()
+    next_line = (
+        current_state.get("next_legal_action")
+        if isinstance(current_state.get("next_legal_action"), Mapping)
+        else {}
+    )
+    applicable = bool(
+        contract_id == "mf_parallel.v2"
+        and str(next_line.get("stage_id") or "").strip()
+        == "observer_lane_merge"
+        and str(next_line.get("line_id") or "").strip()
+        == "observer_merge"
+        and actor_role == "qa"
+        and _contract_runtime_close_normalized(event_kind)
+        in {"independent_verification", "qa_verification", "verification"}
+    )
+    if not applicable:
+        return {}
+
+    proof = (
+        dict(trusted_qa_verification_authority)
+        if isinstance(trusted_qa_verification_authority, Mapping)
+        else {}
+    )
+    session = (
+        dict(trusted_actor_session)
+        if isinstance(trusted_actor_session, Mapping)
+        else {}
+    )
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    commit_sha = str(body.get("commit_sha") or "").strip().lower()
+    payload = body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
+    runtime_context_id = str(payload.get("runtime_context_id") or "").strip()
+
+    from .parallel_branch_runtime import get_branch_context
+
+    context = get_branch_context(conn, project_id, task_id) if task_id else None
+    dispatch_workers: list[dict[str, Any]] = []
+    for completed in record.get("completed_lines") or []:
+        if not isinstance(completed, Mapping):
+            continue
+        if (
+            str(completed.get("line_id") or "").strip()
+            != "observer_dispatch_bounded_workers"
+            or str(completed.get("actor_role") or "").strip() != "observer"
+            or not _contract_runtime_line_status_passes(completed)
+        ):
+            continue
+        completed_payload = (
+            completed.get("payload")
+            if isinstance(completed.get("payload"), Mapping)
+            else {}
+        )
+        raw_workers = completed_payload.get("bounded_workers") or []
+        if isinstance(raw_workers, list):
+            dispatch_workers.extend(
+                dict(worker)
+                for worker in raw_workers
+                if isinstance(worker, Mapping)
+            )
+
+    matching_dispatch_workers = [
+        worker
+        for worker in dispatch_workers
+        if str(worker.get("task_id") or "").strip() == task_id
+        and str(worker.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(worker.get("parent_task_id") or "").strip() == execution_id
+    ]
+    expected_context_root = str(
+        getattr(context, "target_project_root", "")
+        or getattr(context, "worktree_path", "")
+        or ""
+    ).strip() if context is not None else ""
+    proof_trace_ids = [
+        str(value or "").strip()
+        for value in proof.get("graph_trace_ids") or []
+        if str(value or "").strip()
+    ]
+    session_principal = str(session.get("principal_id") or "").strip()
+    session_id = str(session.get("session_id") or "").strip()
+    proof_principal = str(
+        proof.get("qa_principal") or proof.get("principal_id") or ""
+    ).strip()
+    proof_session_id = str(proof.get("qa_session_id") or "").strip()
+    proof_commit = str(
+        proof.get("candidate_commit_sha") or proof.get("commit_sha") or ""
+    ).strip().lower()
+    proof_query_root = str(proof.get("query_root") or "").strip()
+    context_parent_ids = {
+        str(value or "").strip()
+        for value in (
+            getattr(context, "parent_task_id", "") if context is not None else "",
+            getattr(context, "root_task_id", "") if context is not None else "",
+            getattr(context, "chain_id", "") if context is not None else "",
+        )
+        if str(value or "").strip()
+    }
+    mismatches: list[dict[str, Any]] = []
+
+    def require(field: str, expected: Any, actual: Any) -> None:
+        if actual != expected:
+            mismatches.append(
+                {"field": field, "expected": expected, "actual": actual}
+            )
+
+    require("dispatch.worker_count", 2, len(dispatch_workers))
+    require("dispatch.worker_identity", 1, len(matching_dispatch_workers))
+    proof_requirements = {
+        "schema_version": "qa_session_scope_proof.v1",
+        "source": "authenticated_qa_session",
+        "verified": True,
+        "role": "qa",
+        "db_verified_graph_trace": True,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "observer_impersonation": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+    }
+    for field, expected in proof_requirements.items():
+        raw_actual = proof.get(field)
+        actual = (
+            raw_actual
+            if isinstance(expected, bool)
+            else str(raw_actual or "")
+        )
+        require(f"qa_session_proof.{field}", expected, actual)
+    require("qa_session_proof.commit_sha", commit_sha, proof_commit)
+    require("qa_session.principal", session_principal, proof_principal)
+    require("qa_session.session_id", session_id, proof_session_id)
+    require("request.actor", session_principal, str(body.get("actor") or "").strip())
+    require("runtime_context.present", True, context is not None)
+    if context is not None:
+        require(
+            "runtime_context.backlog_id",
+            backlog_id,
+            str(getattr(context, "backlog_id", "") or "").strip(),
+        )
+        require(
+            "runtime_context.runtime_context_id",
+            str(getattr(context, "runtime_context_id", "") or "").strip(),
+            runtime_context_id,
+        )
+        require(
+            "runtime_context.parent_task_id",
+            True,
+            execution_id in context_parent_ids,
+        )
+        require(
+            "runtime_context.candidate_commit",
+            str(getattr(context, "head_commit", "") or "")
+            .strip()
+            .lower(),
+            commit_sha,
+        )
+        if expected_context_root:
+            require(
+                "qa_session_proof.query_root",
+                str(Path(expected_context_root).resolve()),
+                (
+                    str(Path(proof_query_root).resolve())
+                    if proof_query_root
+                    else ""
+                ),
+            )
+    require(
+        "qa_session_scope_binding_ref",
+        True,
+        bool(str(proof.get("qa_scope_binding_ref") or "").strip()),
+    )
+    require("graph_trace_ids", True, bool(proof_trace_ids))
+    require(
+        "status",
+        True,
+        str(normalized_status or "").strip().lower()
+        in _QA_TIMELINE_CLOSE_STATUSES,
+    )
+
+    if mismatches:
+        first = mismatches[0]
+        source = (
+            "server._contract_runtime_premerge_candidate_qa_receipt_gate."
+            "source_backed_scope.v1"
+        )
+        raise GovernanceError(
+            "premerge_candidate_qa_receipt_scope_mismatch",
+            "premerge candidate QA receipt does not match its bounded worker lane",
+            422,
+            {
+                "field": first["field"],
+                "expected": first["expected"],
+                "actual": first["actual"],
+                "identity_mismatches": mismatches,
+                "guide": {
+                    "action": "refresh_exact_bounded_qa_scope_and_retry_same_world",
+                    "preserve_contract_runtime_line": "observer_merge",
+                    "bypass_or_waive_required": False,
+                },
+                "source": source,
+                "public_safe": True,
+                "secret_safe": True,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "retry_same_world_allowed": True,
+                "contract_runtime_mutated": False,
+                "runtime_context_mutated": False,
+                "timeline_mutated": False,
+                "observer_merge_written": False,
+                "raw_session_token_exposed": False,
+                "raw_fence_token_exposed": False,
+                "raw_route_token_exposed": False,
+            },
+        )
+
+    authority = {
+        "schema_version": (
+            "contract_runtime.premerge_candidate_qa_receipt_authority.v1"
+        ),
+        "server_derived": True,
+        "source": "authenticated_qa_session+graph_query_traces+runtime_context",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "candidate_commit_sha": commit_sha,
+        "target_project_root": expected_context_root,
+        "qa_principal": proof_principal,
+        "qa_session_id": proof_session_id,
+        "qa_scope_binding_ref": str(proof.get("qa_scope_binding_ref") or "").strip(),
+        "graph_trace_ids": proof_trace_ids,
+        "observer_merge_written": False,
+        "observer_merge_bypassed": False,
+        "observer_authorship_preserved": True,
+        "materialize_receipt_only": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return {
+        "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+        "accepted": True,
+        "status": "accepted_premerge_candidate_qa_receipt",
+        "primary_decision_source": True,
+        "agent_facing_decision_source": "source_backed_premerge_candidate_qa",
+        "meta_contract_gate_decision_source": False,
+        "contract_execution_id": execution_id,
+        "contract_id": contract_id,
+        "actor_role": "qa",
+        "requested_event_kind": event_kind,
+        "stage_id": "qa_candidate_premerge",
+        "line_id": "qa_candidate_premerge_receipt",
+        "evidence_kind": "independent_verification",
+        "next_legal_action": dict(next_line),
+        "canonical_submit_required": False,
+        "contract_runtime_mutated": False,
+        "observer_merge_written": False,
+        "observer_merge_bypassed": False,
+        "timeline_append_required": True,
+        "timeline_append_authoritative": True,
+        "premerge_candidate_qa_receipt_authority": authority,
     }
 
 
@@ -123110,6 +123525,9 @@ def handle_task_timeline_append(ctx: RequestContext):
                     normalized_status=norm_status,
                     trusted_actor_role=trusted_contract_runtime_actor_role,
                     trusted_actor_session=trusted_contract_runtime_actor_session,
+                    trusted_qa_verification_authority=(
+                        trusted_qa_verification_authority
+                    ),
                 )
             if meta_contract_error_message:
                 meta_contract_gate = {
@@ -123145,8 +123563,23 @@ def handle_task_timeline_append(ctx: RequestContext):
             norm_payload["contract_runtime_close_evidence_gate"] = (
                 contract_runtime_close_evidence_gate
             )
+            premerge_candidate_qa_receipt_authority = (
+                contract_runtime_close_evidence_gate.get(
+                    "premerge_candidate_qa_receipt_authority"
+                )
+            )
+            if isinstance(
+                premerge_candidate_qa_receipt_authority,
+                Mapping,
+            ):
+                norm_payload["premerge_candidate_qa_receipt_authority"] = (
+                    dict(premerge_candidate_qa_receipt_authority)
+                )
             norm_payload["agent_facing_decision_source"] = (
-                "contract_runtime_first_missing_line"
+                contract_runtime_close_evidence_gate.get(
+                    "agent_facing_decision_source"
+                )
+                or "contract_runtime_first_missing_line"
             )
             norm_payload["meta_contract_gate_decision_source"] = False
         source_authority = task_timeline._source_backed_timeline_authority_source(

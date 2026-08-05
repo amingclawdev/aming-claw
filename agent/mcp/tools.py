@@ -2135,6 +2135,11 @@ TOOLS: list[dict] = [
                 "mf_type": {"type": "string"},
                 "actor": {"type": "string"},
                 "force_admit": {"type": "boolean"},
+                "triage_action": {
+                    "type": "string",
+                    "enum": ["admit", "merge_into", "supersede", "reject_dup"],
+                },
+                "triage_target_bug_id": {"type": "string"},
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected backlog state/close evidence writes."},
                 "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit route-context-consuming waiver for protected route-token gates."},
