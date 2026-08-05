@@ -15002,7 +15002,12 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
     assert dispatch_payload["worktree_path"] == str(worktree)
     assert dispatch_payload["branch"] == context["branch_ref"]
     assert dispatch_payload["branch_ref"] == context["branch_ref"]
-    assert dispatch_payload["fence_token"] == "fence-allocate-contract"
+    assert "fence_token" not in dispatch_payload
+    assert dispatch_payload["fence_token_hash"] == runtime_context_secret_hash(
+        "fence-allocate-contract"
+    )
+    assert dispatch_payload["fence_token_redacted"] is True
+    assert dispatch_payload["raw_fence_token_persisted"] is False
     assert dispatch_payload["base_commit"] == "base-allocate-contract"
     assert dispatch_payload["target_head_commit"] == "target-allocate-contract"
     assert dispatch_payload["merge_queue_id"] == "mq-allocate-contract"
@@ -15059,6 +15064,120 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
     assert worker_guide["control_plane_summary"]["read_receipt_hash_action"][
         "worker_constraints"
     ]["scope"]["owned_files"] == ["agent/governance/server.py"]
+
+
+@pytest.mark.parametrize(
+    ("source", "lane"),
+    [
+        ("parallel_branch_allocate", "parallel"),
+        ("contract_runtime_execution", "batch-child"),
+    ],
+)
+def test_service_generated_dispatch_persistence_recursively_scrubs_credentials(
+    conn,
+    tmp_path,
+    source,
+    lane,
+):
+    raw_fence_token = f"raw-fence-sentinel-{lane}"
+    raw_session_token = f"raw-session-sentinel-{lane}"
+    raw_route_token = f"raw-route-sentinel-{lane}"
+    runtime_context_id = f"mfrctx-dispatch-scrub-{lane}"
+    task_id = f"dispatch-scrub-{lane}"
+    backlog_id = f"AC-DISPATCH-SCRUB-{lane.upper()}"
+    body = {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "parent_task_id": f"parent-{lane}",
+        "observer_command_id": f"observer-command-{lane}",
+        "runtime_context_id": runtime_context_id,
+        "worker_slot_id": f"worker-{lane}",
+        "fence_token": raw_fence_token,
+        "worktree_path": str(tmp_path / lane),
+        "branch_ref": f"refs/heads/codex/{lane}",
+        "base_commit": f"base-{lane}",
+        "target_head_commit": f"target-{lane}",
+        "merge_queue_id": f"merge-queue-{lane}",
+        "owned_files": ["agent/governance/server.py"],
+        "route_id": f"route-{lane}",
+        "route_context_hash": _fake_sha(f"route-context-{lane}"),
+        "prompt_contract_id": f"prompt-{lane}",
+        "prompt_contract_hash": _fake_sha(f"prompt-contract-{lane}"),
+        "route_token_ref": f"rtok-{lane}",
+        "visible_injection_manifest_hash": _fake_sha(f"manifest-{lane}"),
+        "profile_requirements": {
+            "nested_credentials": {
+                "fence_token": raw_fence_token,
+                "fence_token_hash": "sha256:caller-supplied-wrong-fence-hash",
+                "session_token": raw_session_token,
+                "raw_session_token_persisted": True,
+                "route_token": raw_route_token,
+                "route_token_hash": "sha256:caller-supplied-wrong-route-hash",
+                "echo": f"{raw_fence_token}:{raw_session_token}:{raw_route_token}",
+            }
+        },
+    }
+
+    recorded = server._record_bounded_worker_dispatch_event(
+        conn,
+        PID,
+        body=body,
+        source=source,
+        request_id=f"request-{lane}",
+    )
+    replayed = server._record_bounded_worker_dispatch_event(
+        conn,
+        PID,
+        body=body,
+        source=source,
+        request_id=f"request-{lane}-replayed",
+    )
+
+    assert recorded["status"] == "recorded"
+    assert replayed["status"] == "already_recorded"
+    assert replayed["event_id"] == recorded["event_id"]
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_kind="bounded_implementation_worker_dispatch",
+    )
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    dispatch = payload["bounded_implementation_worker_dispatch"]
+    expected_fence_hash = runtime_context_secret_hash(raw_fence_token)
+    for persisted in (payload, dispatch):
+        assert "fence_token" not in persisted
+        assert persisted["fence_token_hash"] == expected_fence_hash
+        assert persisted["fence_token_redacted"] is True
+        assert persisted["raw_fence_token_persisted"] is False
+    nested = dispatch["profile_requirements"]["nested_credentials"]
+    assert nested["fence_token_hash"] == expected_fence_hash
+    assert nested["fence_token_redacted"] is True
+    assert nested["raw_fence_token_persisted"] is False
+    assert nested["session_token_redacted"] is True
+    assert nested["raw_session_token_persisted"] is False
+    assert nested["route_token_hash"] == runtime_context_secret_hash(
+        raw_route_token
+    )
+    assert nested["route_token_redacted"] is True
+    assert nested["raw_route_token_persisted"] is False
+    assert nested["echo"] == ":".join(
+        (
+            expected_fence_hash,
+            "<read from env:AMING_WORKER_SESSION_TOKEN at submission time>",
+            runtime_context_secret_hash(raw_route_token),
+        )
+    )
+    persisted = conn.execute(
+        """SELECT payload_json, verification_json, artifact_refs_json
+           FROM task_timeline_events WHERE id = ?""",
+        (recorded["event_id"],),
+    ).fetchone()
+    serialized_event = "|".join(str(value or "") for value in persisted)
+    for raw_secret in (raw_fence_token, raw_session_token, raw_route_token):
+        assert raw_secret not in serialized_event
 
 
 def _ref_only_parallel_allocate_body(
@@ -19385,7 +19504,12 @@ def test_observer_runtime_text_prepare_resolves_runtime_context_registration_ref
     assert dispatch_payload["worktree_path"] == context["worktree_path"]
     assert dispatch_payload["branch"] == context["branch_ref"]
     assert dispatch_payload["branch_ref"] == context["branch_ref"]
-    assert dispatch_payload["fence_token"] == context["fence_token"]
+    assert "fence_token" not in dispatch_payload
+    assert dispatch_payload["fence_token_hash"] == runtime_context_secret_hash(
+        context["fence_token"]
+    )
+    assert dispatch_payload["fence_token_redacted"] is True
+    assert dispatch_payload["raw_fence_token_persisted"] is False
     assert dispatch_payload["base_commit"] == "base-api"
     assert dispatch_payload["target_head_commit"] == "target-api"
     assert dispatch_payload["merge_queue_id"] == "mq-runtime-text-api"

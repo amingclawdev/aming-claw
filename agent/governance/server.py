@@ -759,7 +759,7 @@ def _git_private_dir_for_worktree(worktree_path: Path) -> Path | None:
 def _observer_runtime_text_prepare_persistable_payload(
     prepared: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Return scratch-safe runtime-text payload without raw launch or tokens."""
+    """Return a persistence-safe payload without raw launch text or tokens."""
 
     launch_text_hash = str(prepared.get("launch_text_hash") or "")
 
@@ -774,6 +774,7 @@ def _observer_runtime_text_prepare_persistable_payload(
     raw_launch_text = str(prepared.get("launch_text") or "")
     raw_fence_values: set[str] = set()
     raw_session_values: set[str] = set()
+    raw_route_values: set[str] = set()
 
     def collect_raw_secrets(value: Any) -> None:
         if isinstance(value, Mapping):
@@ -792,6 +793,12 @@ def _observer_runtime_text_prepare_persistable_payload(
                     and not _looks_like_placeholder(nested_text)
                 ):
                     raw_session_values.add(nested_text)
+                elif (
+                    key_text == "route_token"
+                    and nested_text
+                    and not _looks_like_placeholder(nested_text)
+                ):
+                    raw_route_values.add(nested_text)
                 collect_raw_secrets(nested)
         elif isinstance(value, (list, tuple)):
             for item in value:
@@ -819,13 +826,47 @@ def _observer_runtime_text_prepare_persistable_payload(
                 return replacement
             if secret in text:
                 text = text.replace(secret, replacement)
+        for secret in sorted(raw_route_values, key=len, reverse=True):
+            if not secret:
+                continue
+            replacement = runtime_context_secret_hash(secret)
+            if text == secret:
+                return replacement
+            if secret in text:
+                text = text.replace(secret, replacement)
         return text
 
     def scrub(value: Any) -> Any:
         if isinstance(value, Mapping):
             result: dict[str, Any] = {}
+            protected_metadata = set()
+            if "fence_token" in value:
+                protected_metadata.update(
+                    {
+                        "fence_token_hash",
+                        "fence_token_redacted",
+                        "raw_fence_token_persisted",
+                    }
+                )
+            if "session_token" in value:
+                protected_metadata.update(
+                    {
+                        "session_token_redacted",
+                        "raw_session_token_persisted",
+                    }
+                )
+            if "route_token" in value:
+                protected_metadata.update(
+                    {
+                        "route_token_hash",
+                        "route_token_redacted",
+                        "raw_route_token_persisted",
+                    }
+                )
             for key, nested in value.items():
                 key_text = str(key)
+                if key_text in protected_metadata:
+                    continue
                 if key_text == "launch_text":
                     result["launch_text_redacted"] = True
                     if launch_text_hash and not result.get("launch_text_hash"):
@@ -855,6 +896,18 @@ def _observer_runtime_text_prepare_persistable_payload(
                     result["fence_token_env"] = str(
                         value.get("fence_token_env") or "AMING_WORKER_FENCE_TOKEN"
                     )
+                    continue
+                if key_text == "route_token":
+                    route_text = str(nested or "").strip()
+                    route_hash = (
+                        ""
+                        if _looks_like_placeholder(route_text)
+                        else runtime_context_secret_hash(route_text)
+                    )
+                    if route_hash:
+                        result["route_token_hash"] = route_hash
+                    result["route_token_redacted"] = bool(route_text)
+                    result["raw_route_token_persisted"] = False
                     continue
                 if key_text in {"env", "env_additions", "env_template"} and isinstance(
                     nested,
@@ -125568,12 +125621,12 @@ def _record_bounded_worker_dispatch_event(
                 "runtime_context_id": runtime_context_id,
             }
 
-    payload = {
+    payload = _observer_runtime_text_prepare_persistable_payload({
         **dispatch,
         "bounded_implementation_worker_dispatch": dispatch,
         "dispatch_source": source,
         "request_id": request_id,
-    }
+    })
     event = task_timeline.record_event(
         conn,
         project_id=project_id,
