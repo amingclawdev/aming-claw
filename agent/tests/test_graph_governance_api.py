@@ -86,7 +86,9 @@ from agent.governance.parallel_branch_runtime import (
     STATE_WORKTREE_READY,
     advance_integration_epoch_after_merge,
     append_branch_contract_revision,
+    branch_context_to_dict,
     build_runtime_context_action_plan_view,
+    build_runtime_context_current_view,
     build_runtime_context_lane_plan_view,
     decide_persisted_merge_queue,
     get_branch_context,
@@ -99,6 +101,7 @@ from agent.governance.parallel_branch_runtime import (
     queue_merge_item_for_branch_context,
     record_merge_queue_result,
     runtime_context_id_for_branch_context,
+    runtime_context_fence_token_verifier,
     runtime_context_secret_hash,
     runtime_context_session_token_ref,
     upsert_batch_merge_runtime,
@@ -44525,13 +44528,120 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         reissued["session_token"]
     )
     assert reissued["host_envelope"]["env"]["AMING_WORKER_FENCE_TOKEN"] == (
-        joined["fence_token"]
+        reissued["fence_token"]
     )
+    assert reissued["fence_token"] != joined["fence_token"]
+    assert reissued["fence_token_hash"] == runtime_context_secret_hash(
+        reissued["fence_token"]
+    )
+    saved_after_reissue = get_branch_context(conn, PID, allocated.task_id)
+    assert saved_after_reissue is not None
+    assert saved_after_reissue.fence_token == ""
+    assert saved_after_reissue.fence_token_verifier == reissued["fence_token_hash"]
+    assert runtime_context_fence_token_verifier(saved_after_reissue) == (
+        reissued["fence_token_hash"]
+    )
+    stored_context = conn.execute(
+        """
+        SELECT fence_token, fence_token_verifier
+        FROM parallel_branch_runtime_contexts
+        WHERE project_id = ? AND runtime_context_id = ?
+        """,
+        (PID, allocated.runtime_context_id),
+    ).fetchone()
+    assert stored_context["fence_token"] == ""
+    assert stored_context["fence_token_verifier"] == reissued["fence_token_hash"]
+    stored_context_json = json.dumps(dict(stored_context), sort_keys=True)
+    assert joined["fence_token"] not in stored_context_json
+    assert reissued["fence_token"] not in stored_context_json
     after_record = server._contract_runtime_store(conn).get(contract_execution_id)
     assert after_record["execution_state_revision"] == before_record[
         "execution_state_revision"
     ]
     assert after_record["completed_lines"] == before_record["completed_lines"]
+    serialized_record = json.dumps(after_record, sort_keys=True)
+    assert joined["fence_token"] not in serialized_record
+    assert reissued["fence_token"] not in serialized_record
+
+    serialized_context = json.dumps(
+        branch_context_to_dict(saved_after_reissue),
+        sort_keys=True,
+    )
+    serialized_current = json.dumps(
+        build_runtime_context_current_view(saved_after_reissue),
+        sort_keys=True,
+    )
+    for raw_fence in (joined["fence_token"], reissued["fence_token"]):
+        assert raw_fence not in serialized_context
+        assert raw_fence not in serialized_current
+
+    startup_body = {
+        "runtime_context_id": allocated.runtime_context_id,
+        "contract_execution_id": contract_execution_id,
+        "task_id": allocated.task_id,
+        "parent_task_id": contract_execution_id,
+        "session_token": reissued["session_token"],
+        "session_token_ref": reissued["session_token_ref"],
+        "fence_token": reissued["fence_token"],
+        "target_project_root": str(target_root),
+        "agent_id": allocated.worker_id,
+        "actual_host_worker_id": allocated.worker_id,
+        "worker_session_id": desktop_session_id,
+        "worker_transcript_ref": "codex:safe-ref-prestartup-worker",
+        "harness_type": "codex",
+        "filer_principal": desktop_session_id,
+        "actual_cwd": str(target_root),
+        "actual_git_root": str(target_root),
+        "branch": allocated.branch_ref,
+        "branch_ref": allocated.branch_ref,
+        "head_commit": head_commit,
+        "base_commit": head_commit,
+        "target_head_commit": head_commit,
+        "merge_queue_id": allocated.merge_queue_id,
+        "owned_files": list(allocated.owned_files),
+        "read_receipt_hash": receipt_hash,
+        "read_receipt_event_id": str(
+            (read.get("timeline_event") or {}).get("id") or ""
+        ),
+        "startup_source": "codex_desktop_governed_dispatch",
+        **route_identity,
+    }
+    before_hash_as_bearer_context = get_branch_context(
+        conn,
+        PID,
+        allocated.task_id,
+    )
+    before_hash_as_bearer_record = copy.deepcopy(after_record)
+    before_hash_as_bearer_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+    )
+    with pytest.raises(GovernanceError) as verifier_as_bearer:
+        server.handle_graph_governance_runtime_context_startup(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": allocated.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    **startup_body,
+                    "fence_token": reissued["fence_token_hash"],
+                },
+            )
+        )
+    assert verifier_as_bearer.value.code == "fence_invalidated_or_unknown"
+    assert get_branch_context(conn, PID, allocated.task_id) == (
+        before_hash_as_bearer_context
+    )
+    assert server._contract_runtime_store(conn).get(contract_execution_id) == (
+        before_hash_as_bearer_record
+    )
+    assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == (
+        before_hash_as_bearer_events
+    )
 
     startup = server.handle_graph_governance_runtime_context_startup(
         _ctx_with_role(
@@ -44541,40 +44651,14 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
             },
             "mf_sub",
             method="POST",
-            body={
-                "runtime_context_id": allocated.runtime_context_id,
-                "contract_execution_id": contract_execution_id,
-                "task_id": allocated.task_id,
-                "parent_task_id": contract_execution_id,
-                "session_token": reissued["session_token"],
-                "session_token_ref": reissued["session_token_ref"],
-                "fence_token": reissued["fence_token"],
-                "target_project_root": str(target_root),
-                "agent_id": allocated.worker_id,
-                "actual_host_worker_id": allocated.worker_id,
-                "worker_session_id": desktop_session_id,
-                "worker_transcript_ref": "codex:safe-ref-prestartup-worker",
-                "harness_type": "codex",
-                "filer_principal": desktop_session_id,
-                "actual_cwd": str(target_root),
-                "actual_git_root": str(target_root),
-                "branch": allocated.branch_ref,
-                "branch_ref": allocated.branch_ref,
-                "head_commit": head_commit,
-                "base_commit": head_commit,
-                "target_head_commit": head_commit,
-                "merge_queue_id": allocated.merge_queue_id,
-                "owned_files": list(allocated.owned_files),
-                "read_receipt_hash": receipt_hash,
-                "read_receipt_event_id": str(
-                    (read.get("timeline_event") or {}).get("id") or ""
-                ),
-                "startup_source": "codex_desktop_governed_dispatch",
-                **route_identity,
-            },
+            body=startup_body,
         )
     )
     assert startup["ok"] is True, startup
+    running_context = get_branch_context(conn, PID, allocated.task_id)
+    assert running_context is not None
+    assert running_context.fence_token == ""
+    assert running_context.fence_token_verifier == reissued["fence_token_hash"]
     final_record = server._contract_runtime_store(conn).get(contract_execution_id)
     assert final_record["runtime_guide"]["next_legal_action"]["line_id"] == (
         "worker_graph_context"
@@ -44590,6 +44674,20 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     assert joined["session_token"] not in serialized_audit
     assert reissued["session_token"] not in serialized_audit
     assert joined["fence_token"] not in serialized_audit
+    assert reissued["fence_token"] not in serialized_audit
+    serialized_timeline = json.dumps(
+        task_timeline.list_events(conn, PID, backlog_id=backlog_id),
+        sort_keys=True,
+    )
+    # Legacy dispatch fixtures may predate dispatch sanitization, but the
+    # rotated fence must never be persisted by the reissue/startup path.
+    assert reissued["fence_token"] not in serialized_timeline
+    serialized_startup_event = json.dumps(
+        startup.get("timeline_event_recorded") or {},
+        sort_keys=True,
+    )
+    assert joined["fence_token"] not in serialized_startup_event
+    assert reissued["fence_token"] not in serialized_startup_event
 
 
 def test_runtime_context_safe_ref_reissue_wrong_scope_and_replay_are_zero_write(
@@ -44680,8 +44778,17 @@ def test_runtime_context_safe_ref_reissue_wrong_scope_and_replay_are_zero_write(
         **route_identity,
     }
     for changed in (
+        {"task_id": "cross-task"},
+        {"parent_task_id": "cross-parent"},
+        {"target_project_root": str(tmp_path / "cross-root")},
         {"worker_id": "cross-worker"},
+        {"worker_slot_id": "cross-slot"},
+        {"agent_id": "cross-agent"},
+        {"allocation_owner": "cross-owner"},
+        {"actual_host_worker_id": "cross-host-worker"},
         {"worker_session_id": "cross-session"},
+        {"host_session_id": "cross-host-session"},
+        {"session_token_ref": "wstok-cross-ref"},
         {"contract_execution_id": "cex-wrong-scope"},
         {"route_context_hash": "sha256:wrong-route"},
     ):
@@ -44710,6 +44817,77 @@ def test_runtime_context_safe_ref_reissue_wrong_scope_and_replay_are_zero_write(
         assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == (
             before_events
         )
+
+    active_context = get_branch_context(conn, PID, allocated.task_id)
+    assert active_context is not None
+    for lease_id, lease_expires_at in (
+        (active_context.lease_id, "2099-08-05T05:00:30Z"),
+        ("", active_context.lease_expires_at),
+    ):
+        conn.execute(
+            """
+            UPDATE parallel_branch_runtime_contexts
+            SET lease_id = ?, lease_expires_at = ?
+            WHERE project_id = ? AND runtime_context_id = ?
+            """,
+            (
+                lease_id,
+                lease_expires_at,
+                PID,
+                allocated.runtime_context_id,
+            ),
+        )
+        conn.commit()
+        before_lease_rejection_context = get_branch_context(
+            conn,
+            PID,
+            allocated.task_id,
+        )
+        before_lease_rejection_record = copy.deepcopy(
+            server._contract_runtime_store(conn).get(contract_execution_id)
+        )
+        before_lease_rejection_events = task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+        )
+        with pytest.raises(GovernanceError) as lease_rejected:
+            server.handle_graph_governance_runtime_context_session_token_reissue(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": allocated.runtime_context_id,
+                    },
+                    "mf_sub",
+                    method="POST",
+                    body=base_body,
+                )
+            )
+        assert lease_rejected.value.code == "fence_invalidated_or_unknown"
+        assert get_branch_context(conn, PID, allocated.task_id) == (
+            before_lease_rejection_context
+        )
+        assert server._contract_runtime_store(conn).get(contract_execution_id) == (
+            before_lease_rejection_record
+        )
+        assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == (
+            before_lease_rejection_events
+        )
+
+    conn.execute(
+        """
+        UPDATE parallel_branch_runtime_contexts
+        SET lease_id = ?, lease_expires_at = ?
+        WHERE project_id = ? AND runtime_context_id = ?
+        """,
+        (
+            active_context.lease_id,
+            active_context.lease_expires_at,
+            PID,
+            allocated.runtime_context_id,
+        ),
+    )
+    conn.commit()
 
     accepted = server.handle_graph_governance_runtime_context_session_token_reissue(
         _ctx_with_role(

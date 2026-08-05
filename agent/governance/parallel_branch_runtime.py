@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS parallel_branch_runtime_contexts (
     lease_id          TEXT NOT NULL DEFAULT '',
     lease_expires_at  TEXT NOT NULL DEFAULT '',
     fence_token       TEXT NOT NULL DEFAULT '',
+    fence_token_verifier TEXT NOT NULL DEFAULT '',
     branch_ref        TEXT NOT NULL DEFAULT '',
     ref_name          TEXT NOT NULL DEFAULT '',
     worktree_id       TEXT NOT NULL DEFAULT '',
@@ -747,6 +748,49 @@ def runtime_context_secret_hash(value: str) -> str:
     return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def runtime_context_fence_token_verifier(
+    context: "BranchTaskRuntimeContext",
+) -> str:
+    """Return the explicit hash-backed verifier for a worker fence.
+
+    New hash-only contexts persist ``fence_token_verifier`` and no raw fence.
+    Legacy contexts continue to derive the same verifier from their persisted
+    raw fence until an authenticated rotation migrates them.
+    """
+
+    stored = str(getattr(context, "fence_token_verifier", "") or "").strip()
+    if stored:
+        return stored if re.fullmatch(r"sha256:[0-9a-f]{64}", stored) else ""
+    return runtime_context_secret_hash(getattr(context, "fence_token", ""))
+
+
+def runtime_context_has_fence_authority(
+    context: "BranchTaskRuntimeContext",
+) -> bool:
+    return bool(runtime_context_fence_token_verifier(context))
+
+
+def runtime_context_fence_token_matches(
+    context: "BranchTaskRuntimeContext",
+    presented_fence_token: str,
+) -> bool:
+    """Validate a raw fence against the stored verifier.
+
+    Hashes and copy-safe refs are not accepted as bearer credentials: the
+    presented value is always hashed before the constant-time comparison.
+    """
+
+    presented = str(presented_fence_token or "").strip()
+    expected = runtime_context_fence_token_verifier(context)
+    actual = runtime_context_secret_hash(presented)
+    return bool(
+        presented
+        and expected
+        and actual
+        and secrets.compare_digest(expected, actual)
+    )
+
+
 def mf_subagent_session_token_ref(
     *,
     project_id: str,
@@ -789,7 +833,7 @@ def runtime_context_session_token_ref(
         project_id=context.project_id,
         runtime_context_id=runtime_context_id_for_branch_context(context),
         task_id=context.task_id,
-        fence_token_hash=runtime_context_secret_hash(context.fence_token),
+        fence_token_hash=runtime_context_fence_token_verifier(context),
         session_token_hash=token_hash,
         worker_slot_id=context.worker_slot_id or context.worker_id,
     )
@@ -810,17 +854,14 @@ def issue_mf_subagent_session_token(
     """Issue an opaque worker token scoped by the stored runtime context hash."""
     token = secrets.token_urlsafe(32)
     token_hash = mf_subagent_session_token_hash(token)
-    fence_hash = ""
-    if context.fence_token:
-        fence_hash = hashlib.sha256(
-            str(context.fence_token or "").encode("utf-8")
-        ).hexdigest()[:16]
+    fence_verifier = runtime_context_fence_token_verifier(context)
+    fence_hash = fence_verifier.removeprefix("sha256:")[:16]
     runtime_context_id = runtime_context_id_for_branch_context(context)
     token_ref = mf_subagent_session_token_ref(
         project_id=context.project_id,
         runtime_context_id=runtime_context_id,
         task_id=context.task_id,
-        fence_token_hash=runtime_context_secret_hash(context.fence_token),
+        fence_token_hash=fence_verifier,
         session_token_hash=token_hash,
         worker_slot_id=context.worker_slot_id or context.worker_id,
     )
@@ -951,7 +992,7 @@ def runtime_context_session_token_lease_view(
     renewal_supported = bool(
         context.status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
         and context.session_token_hash
-        and context.fence_token
+        and runtime_context_has_fence_authority(context)
     )
     return {
         "schema_version": "mf_subagent_runtime_session_token_lease.v1",
@@ -1096,6 +1137,7 @@ class BranchTaskRuntimeContext:
     lease_id: str = ""
     lease_expires_at: str = ""
     fence_token: str = ""
+    fence_token_verifier: str = ""
     ref_name: str = "main"
     worktree_id: str = ""
     worktree_path: str = ""
@@ -2415,7 +2457,14 @@ def preserve_materialized_context_for_allocation(
         attempt=existing.attempt or planned.attempt,
         lease_id=existing.lease_id or planned.lease_id,
         lease_expires_at=existing.lease_expires_at or planned.lease_expires_at,
-        fence_token=existing.fence_token or planned.fence_token,
+        fence_token=(
+            ""
+            if existing.fence_token_verifier
+            else existing.fence_token or planned.fence_token
+        ),
+        fence_token_verifier=(
+            existing.fence_token_verifier or planned.fence_token_verifier
+        ),
         ref_name=existing.ref_name or planned.ref_name,
         branch_ref=existing.branch_ref or planned.branch_ref,
         worktree_id=existing.worktree_id or planned.worktree_id,
@@ -2496,6 +2545,7 @@ def _ensure_branch_runtime_context_columns(conn: sqlite3.Connection) -> None:
         "merge_queue_id",
         "merge_preview_id",
         "session_token_hash",
+        "fence_token_verifier",
     ):
         if column not in columns:
             conn.execute(
@@ -3272,6 +3322,12 @@ def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
         lease_id=row["lease_id"] or "",
         lease_expires_at=row["lease_expires_at"] or "",
         fence_token=row["fence_token"] or "",
+        fence_token_verifier=(
+            row["fence_token_verifier"]
+            if "fence_token_verifier" in row_keys
+            else ""
+        )
+        or "",
         branch_ref=row["branch_ref"] or "",
         ref_name=row["ref_name"] or "",
         worktree_id=row["worktree_id"] or "",
@@ -5301,7 +5357,7 @@ def _runtime_context_current_values(
     worker_self_attesting = worker_self_attesting and _runtime_context_text(
         worker_self_attestation.get("attestation_phase")
     ).lower() != "startup"
-    fence_token_hash = runtime_context_secret_hash(context.fence_token)
+    fence_token_hash = runtime_context_fence_token_verifier(context)
     session_token_ref = runtime_context_session_token_ref(context)
     target_project_root = runtime_context_effective_target_project_root(context)
     target_project_root_source = ""
@@ -5336,9 +5392,9 @@ def _runtime_context_current_values(
         "retry_round": context.retry_round,
         "runtime_context_status": context.status,
         "last_recovery_action": context.last_recovery_action,
-        "fence_token_present": bool(context.fence_token),
+        "fence_token_present": runtime_context_has_fence_authority(context),
         "fence_token_hash": fence_token_hash,
-        "fence_token_redacted": bool(context.fence_token),
+        "fence_token_redacted": runtime_context_has_fence_authority(context),
         "branch_ref": context.branch_ref,
         "ref_name": context.ref_name,
         "worktree_id": context.worktree_id,
@@ -5384,7 +5440,7 @@ def _runtime_context_current_values(
             "runtime_context_id": runtime_context_id,
             "merge_queue_id": context.merge_queue_id,
             "fence_token_hash": fence_token_hash,
-            "fence_token_redacted": bool(context.fence_token),
+            "fence_token_redacted": runtime_context_has_fence_authority(context),
             "session_token_ref": session_token_ref,
             "session_token_ref_present": bool(session_token_ref),
             "governance_project_id": context.governance_project_id
@@ -11085,6 +11141,7 @@ def upsert_branch_context(
             host_startup_id, host_session_id, governance_project_id,
             target_project_id, target_project_root, target_files_json,
             owned_files_json, attempt, lease_id, lease_expires_at, fence_token,
+            fence_token_verifier,
             branch_ref, ref_name, worktree_id, worktree_path,
             base_commit, head_commit, target_head_commit,
             session_token_hash,
@@ -11094,7 +11151,7 @@ def upsert_branch_context(
             created_at, updated_at
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(project_id, task_id) DO UPDATE SET
             runtime_context_id = excluded.runtime_context_id,
@@ -11125,6 +11182,7 @@ def upsert_branch_context(
             lease_id = excluded.lease_id,
             lease_expires_at = excluded.lease_expires_at,
             fence_token = excluded.fence_token,
+            fence_token_verifier = excluded.fence_token_verifier,
             branch_ref = excluded.branch_ref,
             ref_name = excluded.ref_name,
             worktree_id = excluded.worktree_id,
@@ -11177,6 +11235,7 @@ def upsert_branch_context(
             context.lease_id,
             context.lease_expires_at,
             context.fence_token,
+            context.fence_token_verifier,
             context.branch_ref,
             context.ref_name,
             context.worktree_id,
@@ -11379,7 +11438,7 @@ def reissue_mf_subagent_runtime_session_token(
     if not runtime_id or not task or not (raw_token_mode or safe_ref_mode):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     context = get_branch_context_by_runtime_context_id(conn, project_id, runtime_id)
-    if context is None or not context.fence_token:
+    if context is None or not runtime_context_has_fence_authority(context):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if context.task_id != task:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
@@ -11496,6 +11555,12 @@ def reissue_mf_subagent_runtime_session_token(
     expires_at = _runtime_context_iso(now_dt + timedelta(seconds=ttl))
     new_token = secrets.token_urlsafe(32)
     new_hash = mf_subagent_session_token_hash(new_token)
+    new_fence_token = secrets.token_urlsafe(32) if safe_ref_mode else ""
+    new_fence_verifier = (
+        runtime_context_secret_hash(new_fence_token)
+        if safe_ref_mode
+        else context.fence_token_verifier
+    )
     lease_id = "mfrlease-" + uuid.uuid4().hex[:16]
     saved = upsert_branch_context(
         conn,
@@ -11504,6 +11569,8 @@ def reissue_mf_subagent_runtime_session_token(
             lease_id=lease_id,
             lease_expires_at=expires_at,
             session_token_hash=new_hash,
+            fence_token="" if safe_ref_mode else context.fence_token,
+            fence_token_verifier=new_fence_verifier,
             last_recovery_action="mf_subagent_session_token_reissued",
         ),
         now_iso=_runtime_context_iso(now_dt),
@@ -11535,7 +11602,7 @@ def reissue_mf_subagent_runtime_session_token(
         "session_token_lease": lease,
     }
     if safe_ref_mode:
-        fence_hash = runtime_context_secret_hash(saved.fence_token)
+        fence_hash = runtime_context_fence_token_verifier(saved)
         principal_id = (
             saved.actual_host_worker_id
             or saved.worker_slot_id
@@ -11574,15 +11641,19 @@ def reissue_mf_subagent_runtime_session_token(
             "fence_token_redacted": bool(fence_hash),
             "env": {
                 "AMING_WORKER_SESSION_TOKEN": new_token,
-                "AMING_WORKER_FENCE_TOKEN": saved.fence_token,
+                "AMING_WORKER_FENCE_TOKEN": new_fence_token,
             },
             "raw_tokens_persisted_to_timeline": False,
         }
         result.update(
             {
                 "authorization_source": "safe_ref_prestartup_reissue_authority",
-                "fence_token": saved.fence_token,
+                "fence_token": new_fence_token,
                 "fence_token_hash": fence_hash,
+                "fence_token_verifier_schema_version": (
+                    "runtime_context.fence_token_verifier.sha256.v1"
+                ),
+                "raw_fence_token_persisted": False,
                 "raw_fence_token_returned_for_host_envelope": True,
                 "raw_fence_token_persisted_to_timeline": False,
                 "delivery": "worker_host_envelope",
@@ -11626,7 +11697,7 @@ def rejoin_mf_subagent_runtime_session_token(
     if not runtime_id or not task or not str(reason or "").strip():
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     context = get_branch_context_by_runtime_context_id(conn, project_id, runtime_id)
-    if context is None or not context.fence_token:
+    if context is None or not runtime_context_has_fence_authority(context):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if context.task_id != task:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
@@ -11668,7 +11739,7 @@ def rejoin_mf_subagent_runtime_session_token(
             ("runtime_context_id", runtime_id),
             ("worker_id", context.worker_id),
             ("worker_slot_id", context.worker_slot_id or context.worker_id),
-            ("fence_token_hash", runtime_context_secret_hash(context.fence_token)),
+            ("fence_token_hash", runtime_context_fence_token_verifier(context)),
             ("candidate_commit_sha", context.head_commit),
             ("branch_ref", context.branch_ref),
             (
@@ -11883,6 +11954,17 @@ def rejoin_mf_subagent_runtime_session_token(
     expires_at = _runtime_context_iso(now_dt + timedelta(seconds=ttl))
     new_token = secrets.token_urlsafe(32)
     new_hash = mf_subagent_session_token_hash(new_token)
+    verifier_backed_context = bool(context.fence_token_verifier)
+    rejoin_fence_token = (
+        secrets.token_urlsafe(32)
+        if verifier_backed_context
+        else context.fence_token
+    )
+    rejoin_fence_verifier = (
+        runtime_context_secret_hash(rejoin_fence_token)
+        if verifier_backed_context
+        else context.fence_token_verifier
+    )
     lease_id = "mfrlease-" + uuid.uuid4().hex[:16]
     if bounded_replacement_rejoin:
         recovery_action = (
@@ -11907,6 +11989,8 @@ def rejoin_mf_subagent_runtime_session_token(
             lease_id=lease_id,
             lease_expires_at=expires_at,
             session_token_hash=new_hash,
+            fence_token="" if verifier_backed_context else context.fence_token,
+            fence_token_verifier=rejoin_fence_verifier,
             status=STATE_WORKTREE_READY if revision_rejoin else context.status,
             retry_round=context.retry_round + (1 if revision_rejoin else 0),
             attempt=context.attempt + (1 if revision_rejoin else 0),
@@ -11918,7 +12002,7 @@ def rejoin_mf_subagent_runtime_session_token(
         saved,
         now_iso=_runtime_context_iso(now_dt),
     )
-    fence_hash = runtime_context_secret_hash(saved.fence_token)
+    fence_hash = runtime_context_fence_token_verifier(saved)
     return {
         "ok": True,
         "schema_version": "mf_subagent_session_token_rejoin_response.v1",
@@ -11958,7 +12042,7 @@ def rejoin_mf_subagent_runtime_session_token(
         "session_token_ref": runtime_context_session_token_ref(saved),
         "session_token_persisted": False,
         "raw_session_token_persisted": False,
-        "fence_token": saved.fence_token,
+        "fence_token": rejoin_fence_token,
         "fence_token_hash": fence_hash,
         "raw_fence_token_returned_for_host_envelope": True,
         "raw_fence_token_persisted_to_timeline": False,
@@ -12279,7 +12363,7 @@ def initial_join_mf_subagent_runtime_session_token(
         saved,
         now_iso=_runtime_context_iso(now_dt),
     )
-    fence_hash = runtime_context_secret_hash(saved.fence_token)
+    fence_hash = runtime_context_fence_token_verifier(saved)
     session_token_ref = runtime_context_session_token_ref(saved)
     principal_id = (
         saved.actual_host_worker_id
@@ -13789,7 +13873,9 @@ def _require_merge_queue_result_record_authority(
     target_head_before_merge: str,
     target_head_after_merge: str,
 ) -> None:
-    if context is None or not (context.fence_token or fence_token):
+    if context is None or not (
+        runtime_context_has_fence_authority(context) or fence_token
+    ):
         return
     if fence_token:
         _require_current_fence(context, fence_token)
@@ -13871,7 +13957,7 @@ def preflight_merge_queue_result_record_authority(
             {
                 "task_id": context.task_id,
                 "status": context.status,
-                "has_fence_token": bool(context.fence_token),
+                "has_fence_token": runtime_context_has_fence_authority(context),
             }
             if context is not None
             else None
@@ -15038,7 +15124,15 @@ def decide_persisted_batch_rollback_replay(
 
 
 def _require_current_fence(context: BranchTaskRuntimeContext, fence_token: str) -> None:
-    if context.fence_token and fence_token != context.fence_token:
+    expected_verifier = runtime_context_fence_token_verifier(context)
+    if getattr(context, "fence_token_verifier", "") and not expected_verifier:
+        raise BranchRuntimeFenceError(
+            "Fence token mismatch: branch context verifier is invalid"
+        )
+    if (
+        expected_verifier
+        and not runtime_context_fence_token_matches(context, fence_token)
+    ):
         raise BranchRuntimeFenceError("Fence token mismatch: branch context was reclaimed")
 
 
@@ -15152,7 +15246,7 @@ def validate_mf_subagent_graph_query_identity(
         )
     else:
         context = get_branch_context(conn, context_project_id, task)
-    if context is None or not context.fence_token:
+    if context is None or not runtime_context_has_fence_authority(context):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if runtime_id and task and task != context.task_id:
         raise _graph_query_fence_error(
@@ -16418,9 +16512,9 @@ def _startup_blocker(
             "agent_id": context.agent_id,
             "allocation_owner": context.allocation_owner or context.agent_id,
             "observer_allocation_owner": context.allocation_owner or context.agent_id,
-            "fence_token_present": bool(context.fence_token),
-            "fence_token_hash": runtime_context_secret_hash(context.fence_token),
-            "fence_token_redacted": bool(context.fence_token),
+            "fence_token_present": runtime_context_has_fence_authority(context),
+            "fence_token_hash": runtime_context_fence_token_verifier(context),
+            "fence_token_redacted": runtime_context_has_fence_authority(context),
             "raw_fence_token_exposed": False,
             "branch": context.branch_ref,
             "worktree": context.worktree_path,
@@ -17996,9 +18090,9 @@ def record_mf_subagent_startup(
         "host_adapter_startup_surrogate_not_close_satisfying": (
             surrogate_startup_not_close_satisfying
         ),
-        "fence_token_present": bool(saved.fence_token),
-        "fence_token_hash": runtime_context_secret_hash(saved.fence_token),
-        "fence_token_redacted": bool(saved.fence_token),
+        "fence_token_present": runtime_context_has_fence_authority(saved),
+        "fence_token_hash": runtime_context_fence_token_verifier(saved),
+        "fence_token_redacted": runtime_context_has_fence_authority(saved),
         "raw_fence_token_exposed": False,
         "branch": saved.branch_ref,
         "branch_ref": saved.branch_ref,
@@ -18164,7 +18258,7 @@ def validate_mf_subagent_runtime_context_lookup(
     query_project_id = str(project_id or "").strip()
     context_project_id = str(governance_project_id or query_project_id).strip()
     context = get_branch_context_by_runtime_context_id(conn, context_project_id, runtime_id)
-    if context is None or not context.fence_token:
+    if context is None or not runtime_context_has_fence_authority(context):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     try:
         _require_current_fence(context, fence)
@@ -18564,7 +18658,7 @@ def materialize_branch_worktree(
     context = get_branch_context(conn, project_id, task_id)
     if context is None:
         raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
-    if context.fence_token or fence_token:
+    if runtime_context_has_fence_authority(context) or fence_token:
         _require_current_fence(context, fence_token)
 
     strategy = branch_strategy_from_runtime_context(context, repo_root_path=repo_root_path)
@@ -18993,7 +19087,7 @@ def queue_merge_item_for_branch_context(
         allow_finish_checkpoint_without_fence=allow_finish_checkpoint_without_fence,
     )
     if (
-        (context.fence_token or fence_token)
+        (runtime_context_has_fence_authority(context) or fence_token)
         and not finish_checkpoint_route_gate
         and postmerge_recovery is None
     ):

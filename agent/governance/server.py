@@ -35684,6 +35684,7 @@ def _runtime_context_rotate_validated_missing_finish_auth(
         _runtime_context_iso,
         _runtime_context_now_dt,
         mf_subagent_session_token_hash,
+        runtime_context_fence_token_verifier,
         runtime_context_secret_hash,
         runtime_context_session_token_lease_view,
         runtime_context_session_token_ref,
@@ -35708,6 +35709,17 @@ def _runtime_context_rotate_validated_missing_finish_auth(
     expires_at = _runtime_context_iso(now_dt + timedelta(seconds=ttl))
     session_token = secrets.token_urlsafe(32)
     session_token_hash = mf_subagent_session_token_hash(session_token)
+    verifier_backed_context = bool(context.fence_token_verifier)
+    fence_token = (
+        secrets.token_urlsafe(32)
+        if verifier_backed_context
+        else context.fence_token
+    )
+    fence_token_verifier = (
+        runtime_context_secret_hash(fence_token)
+        if verifier_backed_context
+        else context.fence_token_verifier
+    )
     saved = upsert_branch_context(
         conn,
         replace(
@@ -35715,6 +35727,8 @@ def _runtime_context_rotate_validated_missing_finish_auth(
             lease_id="mfrlease-" + uuid.uuid4().hex[:16],
             lease_expires_at=expires_at,
             session_token_hash=session_token_hash,
+            fence_token="" if verifier_backed_context else context.fence_token,
+            fence_token_verifier=fence_token_verifier,
             last_recovery_action=(
                 "mf_subagent_validated_missing_finish_auth_rejoin_issued"
             ),
@@ -35755,8 +35769,8 @@ def _runtime_context_rotate_validated_missing_finish_auth(
         "session_token_ref": runtime_context_session_token_ref(saved),
         "session_token_persisted": False,
         "raw_session_token_persisted": False,
-        "fence_token": saved.fence_token,
-        "fence_token_hash": runtime_context_secret_hash(saved.fence_token),
+        "fence_token": fence_token,
+        "fence_token_hash": runtime_context_fence_token_verifier(saved),
         "raw_fence_token_returned_for_host_envelope": True,
         "raw_fence_token_persisted_to_timeline": False,
         "delivery": "worker_host_envelope",
@@ -46070,7 +46084,9 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             )
 
         session_token_ref = runtime_context_session_token_ref(context)
-        fence_token_hash = runtime_context_secret_hash(context.fence_token)
+        from .parallel_branch_runtime import runtime_context_fence_token_verifier
+
+        fence_token_hash = runtime_context_fence_token_verifier(context)
         payload = {
             "schema_version": "runtime_context.worker_commit.v1",
             "action": "record_worker_commit",
@@ -48487,6 +48503,9 @@ def _parallel_branch_finish_gate_contract_error_repair_response(
                 "merge_queue_id": str(getattr(context, "merge_queue_id", "") or ""),
                 "fence_token_required": bool(
                     str(getattr(context, "fence_token", "") or "").strip()
+                    or str(
+                        getattr(context, "fence_token_verifier", "") or ""
+                    ).strip()
                 ),
             },
             "payload_shape": {
@@ -48531,6 +48550,8 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
         get_branch_context,
         public_contract_revision_payload,
         record_branch_finish_gate,
+        runtime_context_fence_token_matches,
+        runtime_context_has_fence_authority,
         runtime_context_id_for_branch_context,
     )
 
@@ -48569,11 +48590,11 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             # INFO-01 unconditional fence gate
             # (AC-STARTUP-TOKEN-TOFU-MUTUAL-EXCLUSION-20260610):
             # The fence_token in the request body MUST be present AND must match
-            # the server-resolved runtime context's fence_token.  Body omission
+            # the server-resolved runtime context's fence verifier. Body omission
             # is no longer silently tolerated — a missing body fence_token means
             # the caller cannot prove it is operating on the correct lane.
             # Context lookup failure already raises above; here we also refuse if
-            # the context exists but has no fence_token (misconfigured lane).
+            # the context has neither a legacy raw fence nor a hash verifier.
             body_fence_token = str(ctx.body.get("fence_token") or "").strip()
             if not body_fence_token:
                 raise ValidationError(
@@ -48581,12 +48602,12 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                     "omission is not permitted — supply the lane's fence_token "
                     "to prove the request targets the correct lane"
                 )
-            if not context.fence_token:
+            if not runtime_context_has_fence_authority(context):
                 raise ValidationError(
-                    "fence_token not found on server-side runtime context for the "
+                    "fence verifier not found on server-side runtime context for the "
                     "resolved lane; lane may be misconfigured — contact the observer"
                 )
-            if body_fence_token != context.fence_token:
+            if not runtime_context_fence_token_matches(context, body_fence_token):
                 return _parallel_branch_finish_gate_contract_error_repair_response(
                     project_id=project_id,
                     context=context,
@@ -49057,7 +49078,7 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                 if result.get("ok"):
                     from .parallel_branch_runtime import (
                         get_branch_context,
-                        runtime_context_secret_hash,
+                        runtime_context_fence_token_verifier,
                         runtime_context_session_token_ref,
                     )
                     from .runtime_context import worker_proof_line_provenance
@@ -49096,7 +49117,7 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                     )
                     fence_token_hash = str(
                         startup_gate_payload.get("fence_token_hash")
-                        or runtime_context_secret_hash(runtime_context.fence_token)
+                        or runtime_context_fence_token_verifier(runtime_context)
                         or ""
                     )
                     worker_id = str(runtime_context.worker_id or "")
@@ -57999,7 +58020,7 @@ def handle_graph_governance_query(ctx: RequestContext):
                         return result
                     from .parallel_branch_runtime import (
                         get_branch_context_by_runtime_context_id,
-                        runtime_context_secret_hash,
+                        runtime_context_fence_token_verifier,
                         runtime_context_session_token_ref,
                     )
                     from .runtime_context import worker_proof_line_provenance
@@ -58130,8 +58151,8 @@ def handle_graph_governance_query(ctx: RequestContext):
                     session_token_ref = runtime_context_session_token_ref(
                         runtime_context
                     )
-                    fence_token_hash = runtime_context_secret_hash(
-                        runtime_context.fence_token
+                    fence_token_hash = runtime_context_fence_token_verifier(
+                        runtime_context
                     )
                     worker_provenance = worker_proof_line_provenance(
                         {

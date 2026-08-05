@@ -100,6 +100,7 @@ from agent.governance.parallel_branch_runtime import (
     redact_runtime_context_payload,
     runtime_context_audit_nodes_for_views,
     runtime_context_content_hash,
+    runtime_context_fence_token_verifier,
     runtime_context_filter_content_address,
     runtime_context_session_token_ref,
     runtime_context_session_token_lease_view,
@@ -6054,11 +6055,111 @@ def test_safe_ref_prestartup_reissue_authority_is_exact_active_and_single_use(
     assert result["host_envelope"]["session_token_ref"] == (
         result["session_token_ref"]
     )
+    assert result["fence_token"] != context.fence_token
+    assert result["host_envelope"]["env"]["AMING_WORKER_FENCE_TOKEN"] == (
+        result["fence_token"]
+    )
     assert result["raw_session_token_persisted"] is False
+    assert result["raw_fence_token_persisted"] is False
     assert result["raw_fence_token_persisted_to_timeline"] is False
 
     saved = get_branch_context(conn, PROJECT_ID, context.task_id)
     assert saved is not None
+    assert saved.fence_token == ""
+    assert saved.fence_token_verifier == runtime_context_secret_hash(
+        result["fence_token"]
+    )
+    assert runtime_context_fence_token_verifier(saved) == (
+        saved.fence_token_verifier
+    )
+    stored = conn.execute(
+        """
+        SELECT fence_token, fence_token_verifier
+        FROM parallel_branch_runtime_contexts
+        WHERE project_id = ? AND task_id = ?
+        """,
+        (PROJECT_ID, context.task_id),
+    ).fetchone()
+    assert stored["fence_token"] == ""
+    assert stored["fence_token_verifier"] == saved.fence_token_verifier
+    stored_json = json.dumps(dict(stored), sort_keys=True)
+    assert context.fence_token not in stored_json
+    assert result["fence_token"] not in stored_json
+
+    validated = validate_mf_subagent_graph_query_identity(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        worker_role="mf_sub",
+        target_project_root=str(target_root),
+        fence_token=result["fence_token"],
+        session_token=result["session_token"],
+        session_token_ref=result["session_token_ref"],
+    )
+    assert validated == saved
+
+    cross_worker = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            governance_project_id=PROJECT_ID,
+            target_project_id=PROJECT_ID,
+            target_project_root=str(target_root),
+            task_id="mf-sub-safe-ref-cross-worker",
+            parent_task_id="cex-safe-ref-cross-worker",
+            root_task_id="cex-safe-ref-cross-worker",
+            backlog_id="BUG-SAFE-REF-CROSS-WORKER",
+            worker_id="worker-safe-ref-cross-worker",
+            worker_slot_id="slot-safe-ref-cross-worker",
+            branch_ref="refs/heads/codex/mf-sub-safe-ref-cross-worker",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-safe-ref-cross-worker",
+            session_token_hash=mf_subagent_session_token_hash(
+                "session-safe-ref-cross-worker"
+            ),
+        ),
+        now_iso="2999-01-01T00:02:00Z",
+    )
+    cross_worker_before = get_branch_context(
+        conn,
+        PROJECT_ID,
+        cross_worker.task_id,
+    )
+    with pytest.raises(BranchRuntimeFenceError) as cross_worker_reuse:
+        validate_mf_subagent_graph_query_identity(
+            conn,
+            project_id=PROJECT_ID,
+            runtime_context_id=cross_worker.runtime_context_id,
+            task_id=cross_worker.task_id,
+            parent_task_id=cross_worker.parent_task_id,
+            worker_role="mf_sub",
+            target_project_root=str(target_root),
+            fence_token=result["fence_token"],
+            session_token=result["session_token"],
+            session_token_ref=result["session_token_ref"],
+        )
+    assert str(cross_worker_reuse.value) == "fence_invalidated_or_unknown"
+    assert get_branch_context(conn, PROJECT_ID, cross_worker.task_id) == (
+        cross_worker_before
+    )
+
+    with pytest.raises(BranchRuntimeFenceError) as verifier_as_bearer:
+        validate_mf_subagent_graph_query_identity(
+            conn,
+            project_id=PROJECT_ID,
+            runtime_context_id=context.runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=context.parent_task_id,
+            worker_role="mf_sub",
+            target_project_root=str(target_root),
+            fence_token=saved.fence_token_verifier,
+            session_token=result["session_token"],
+            session_token_ref=result["session_token_ref"],
+        )
+    assert str(verifier_as_bearer.value) == "fence_invalidated_or_unknown"
+
     before_replay = saved
     with pytest.raises(BranchRuntimeFenceError) as replay:
         reissue_mf_subagent_runtime_session_token(
@@ -6082,6 +6183,66 @@ def test_safe_ref_prestartup_reissue_authority_is_exact_active_and_single_use(
         )
     assert str(replay.value) == "fence_invalidated_or_unknown"
     assert get_branch_context(conn, PROJECT_ID, context.task_id) == before_replay
+
+    before_bad_checkpoint = get_branch_context(conn, PROJECT_ID, context.task_id)
+    with pytest.raises(BranchRuntimeFenceError):
+        record_branch_checkpoint(
+            conn,
+            project_id=PROJECT_ID,
+            task_id=context.task_id,
+            checkpoint_id="checkpoint-verifier-must-not-authorize",
+            fence_token=saved.fence_token_verifier,
+            now_iso="2999-01-01T00:04:00Z",
+        )
+    assert get_branch_context(conn, PROJECT_ID, context.task_id) == (
+        before_bad_checkpoint
+    )
+    checkpointed = record_branch_checkpoint(
+        conn,
+        project_id=PROJECT_ID,
+        task_id=context.task_id,
+        checkpoint_id="checkpoint-rotated-raw-fence",
+        fence_token=result["fence_token"],
+        now_iso="2999-01-01T00:04:00Z",
+    )
+    assert checkpointed.checkpoint_id == "checkpoint-rotated-raw-fence"
+    assert checkpointed.fence_token == ""
+    assert checkpointed.fence_token_verifier == saved.fence_token_verifier
+
+    raw_reissued = reissue_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        target_project_root=str(target_root),
+        fence_token=result["fence_token"],
+        session_token=result["session_token"],
+        now_iso="2999-01-01T00:05:00Z",
+    )
+    assert raw_reissued["ok"] is True
+    after_raw_reissue = get_branch_context(conn, PROJECT_ID, context.task_id)
+    assert after_raw_reissue is not None
+    assert after_raw_reissue.fence_token == ""
+    assert after_raw_reissue.fence_token_verifier == saved.fence_token_verifier
+
+    rejoined = rejoin_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        target_project_root=str(target_root),
+        reason="restore verifier-backed worker host envelope",
+        now_iso="2999-01-01T00:06:00Z",
+    )
+    assert rejoined["fence_token"] != result["fence_token"]
+    after_rejoin = get_branch_context(conn, PROJECT_ID, context.task_id)
+    assert after_rejoin is not None
+    assert after_rejoin.fence_token == ""
+    assert after_rejoin.fence_token_verifier == runtime_context_secret_hash(
+        rejoined["fence_token"]
+    )
 
     with pytest.raises(BranchRuntimeFenceError) as forged:
         reissue_mf_subagent_runtime_session_token(
@@ -9649,7 +9810,8 @@ def test_allocate_persists_merge_queue_id_for_finish_gate(tmp_path) -> None:
     # column defs in this DDL.
     import re as _re
     _col_def_pattern = _re.compile(
-        r"^\s+(parent_task_id|merge_queue_id|merge_preview_id)\s+TEXT NOT NULL DEFAULT ''"
+        r"^\s+(parent_task_id|merge_queue_id|merge_preview_id|fence_token_verifier)"
+        r"\s+TEXT NOT NULL DEFAULT ''"
     )
     from agent.governance.parallel_branch_runtime import PARALLEL_BRANCH_RUNTIME_SCHEMA_SQL
     old_schema_sql = "\n".join(
@@ -9679,6 +9841,7 @@ def test_allocate_persists_merge_queue_id_for_finish_gate(tmp_path) -> None:
         for r in conn_old.execute("PRAGMA table_info(parallel_branch_runtime_contexts)").fetchall()
     }
     assert "merge_queue_id" not in pre_cols, "pre-condition: old table must lack merge_queue_id"
+    assert "fence_token_verifier" not in pre_cols
 
     # Run migration
     ensure_branch_runtime_schema(conn_old)
@@ -9697,6 +9860,9 @@ def test_allocate_persists_merge_queue_id_for_finish_gate(tmp_path) -> None:
     assert "parent_task_id" in post_cols, (
         "ensure_branch_runtime_schema did not add parent_task_id column to old table"
     )
+    assert "fence_token_verifier" in post_cols, (
+        "ensure_branch_runtime_schema did not add fence_token_verifier to old table"
+    )
 
     # Existing row must be readable with merge_queue_id defaulting to empty string
     old_ctx = get_branch_context(conn_old, "proj-old", "task-old")
@@ -9706,6 +9872,10 @@ def test_allocate_persists_merge_queue_id_for_finish_gate(tmp_path) -> None:
     )
     assert old_ctx.parent_task_id == "", (
         f"old row parent_task_id should default to empty, got {old_ctx.parent_task_id!r}"
+    )
+    assert old_ctx.fence_token_verifier == ""
+    assert runtime_context_fence_token_verifier(old_ctx) == (
+        runtime_context_secret_hash("fence-old")
     )
 
     # After upsert with a merge_queue_id, the value must persist
