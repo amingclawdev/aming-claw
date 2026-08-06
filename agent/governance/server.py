@@ -15742,6 +15742,112 @@ def _parallel_branch_allocate_failed_qa_dispatch_revision(
     }
 
 
+def _parallel_branch_allocate_reject_merged_same_task_failed_qa_rework(
+    conn,
+    *,
+    project_id: str,
+    existing: Any,
+    planned: Any,
+    body: Mapping[str, Any],
+) -> None:
+    """Require a fresh task/runtime after failed QA of a merged context."""
+
+    if existing is None or str(getattr(existing, "status", "") or "") != "merged":
+        return
+    if str(getattr(planned, "stage_type", "") or "").strip() != (
+        "failed_qa_rework"
+    ):
+        return
+    if int(getattr(planned, "attempt", 0) or body.get("attempt") or 0) < 2:
+        return
+
+    contract_execution_id = _runtime_context_public_text(
+        body.get("contract_execution_id"),
+        body.get("successor_contract_execution_id"),
+        body.get("current_contract_execution_id"),
+    )
+    if not contract_execution_id:
+        return
+    try:
+        record = _contract_runtime(conn).store.get(contract_execution_id)
+    except ContractRuntimeError:
+        return
+    backlog_id = str(getattr(existing, "backlog_id", "") or "").strip()
+    if (
+        not _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+        or str(record.get("project_id") or "") != str(project_id)
+        or str(record.get("backlog_id") or "") != backlog_id
+    ):
+        return
+
+    completed_lines = list(record.get("completed_lines") or [])
+    failed_qa_index = _active_failed_qa_line_index(
+        completed_lines,
+        source_record=record,
+    )
+    if failed_qa_index < 0:
+        return
+    failed_qa_line = completed_lines[failed_qa_index]
+    if not isinstance(failed_qa_line, Mapping):
+        return
+    dispatch_match = _contract_runtime_dispatch_line_match(record, existing)
+    if not _runtime_context_failed_qa_line_matches_context(
+        failed_qa_line,
+        context=existing,
+        server_identity=dispatch_match,
+    ):
+        return
+
+    task_id = str(getattr(existing, "task_id", "") or "").strip()
+    raise GovernanceError(
+        (
+            "parallel_branch_allocate_failed_qa_rework_requires_"
+            "fresh_runtime_context"
+        ),
+        (
+            "failed-QA rework cannot reuse an already-merged task/runtime "
+            "identity; allocate one fresh failed_qa_rework task and worker "
+            "RuntimeContext in the same backlog and ContractRuntime execution"
+        ),
+        409,
+        {
+            "field": "task_id",
+            "expected": (
+                "fresh_task_id_distinct_from_merged_runtime_context"
+            ),
+            "actual": task_id,
+            "source": (
+                "ContractRuntime.next_legal_action."
+                "allocation_request_requirements."
+                "fresh_runtime_context_required"
+            ),
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "fresh_runtime_context_required": True,
+            "retry_same_world_allowed": True,
+            "minimum_attempt": 2,
+            "raw_credentials_required": False,
+            "guide": {
+                "action": (
+                    "allocate_fresh_failed_qa_rework_runtime_context"
+                ),
+                "preserve_project_id": str(project_id),
+                "preserve_backlog_id": backlog_id,
+                "preserve_contract_execution_id": contract_execution_id,
+                "task_id_must_be_fresh": True,
+                "worker_identity_must_be_fresh": True,
+                "stage_type": "failed_qa_rework",
+                "minimum_attempt": 2,
+                "append_only_history_required": True,
+                "resume_merged_runtime_context": False,
+            },
+        },
+    )
+
+
 def _parallel_branch_allocate_effective_route_body(
     conn,
     *,
@@ -16339,6 +16445,13 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             target_ref=allocation_target_ref,
         )
         preexisting_context = get_branch_context(conn, project_id, task_id)
+        _parallel_branch_allocate_reject_merged_same_task_failed_qa_rework(
+            conn,
+            project_id=project_id,
+            existing=preexisting_context,
+            planned=context,
+            body=effective_body,
+        )
         continuing_materialized_worker = (
             not create_worktree and is_materialized_branch_context(preexisting_context)
         )

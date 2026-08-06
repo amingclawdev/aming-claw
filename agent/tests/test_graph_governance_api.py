@@ -91635,6 +91635,7 @@ def _record_mf_parallel_contract_runtime_worker_prefix(
     head_commit: str,
     implementation_event_ref: str,
     include_worker_commit: bool = True,
+    include_worker_finish: bool = False,
     route_token_ref: str = "",
     changed_files: list[str] | None = None,
     owned_files: list[str] | None = None,
@@ -91725,6 +91726,45 @@ def _record_mf_parallel_contract_runtime_worker_prefix(
             actor_role="mf_sub",
         )
         assert result["ok"] is True, (line_id, result.get("decision"))
+    if include_worker_finish:
+        worker_finish_common = {
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": parent_task_id,
+            "line_instance_id": (
+                f"runtime_context:{runtime_context.runtime_context_id}"
+            ),
+            "commit_sha": head_commit,
+            "status": "passed",
+        }
+        for stage_id, line_id, evidence_kind in (
+            (
+                "worker_attestation",
+                "worker_finish_time_attestation",
+                "record_finish_time_worker_attestation",
+            ),
+            (
+                "worker_finish",
+                "worker_finish_gate",
+                "mf_subagent_finish_gate",
+            ),
+        ):
+            record = runtime.store.get(contract_execution_id)
+            write = server._contract_runtime_write_from_record(
+                record,
+                actor_role="mf_sub",
+                stage_id=stage_id,
+                line_id=line_id,
+                evidence_kind=evidence_kind,
+            )
+            write.update(worker_finish_common)
+            write["payload"] = dict(worker_finish_common)
+            result = runtime.submit_line_write(
+                contract_execution_id,
+                write,
+                actor_role="mf_sub",
+            )
+            assert result["ok"] is True, (line_id, result.get("decision"))
 
 
 def _record_mf_parallel_runtime_context_worker_evidence(
@@ -98541,6 +98581,237 @@ def test_fresh_failed_qa_context_read_receipt_persists_and_startup_discovers_it(
     ) == before_worker_startup_count
 
 
+def test_failed_qa_same_task_merged_allocate_requires_fresh_runtime_context_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-FAILED-QA-MERGED-SAME-TASK-FRESH-REQUIRED"
+    worker_task_id = "failed-qa-merged-same-task-worker"
+    target_root = tmp_path / worker_task_id
+    head_commit = _init_test_git_repo(target_root)
+    subprocess.run(
+        ["git", "checkout", "-b", f"codex/{worker_task_id}"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: target_root,
+    )
+    successor, old_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="failed-qa-merged-same-task-parent",
+        worker_task_id=worker_task_id,
+        fence_token="fence-failed-qa-merged-same-task",
+        token="failed-qa-merged-same-task-token",
+        worktree_path=str(target_root),
+        target_project_root=str(target_root),
+        base_commit=head_commit,
+    )
+    old_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        old_context,
+        backlog_id=backlog_id,
+        fence_token="fence-failed-qa-merged-same-task",
+        graph_trace_id="gqt-failed-qa-merged-same-task-worker",
+        head_commit=head_commit,
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=contract_execution_id,
+        runtime_context=old_context,
+        parent_task_id=backlog_id,
+        graph_trace_id="gqt-failed-qa-merged-same-task-worker",
+        head_commit=head_commit,
+        implementation_event_ref=f"timeline:{old_events['implementation']}",
+        include_worker_finish=True,
+    )
+
+    qa_trace_id = "gqt-failed-qa-merged-same-task-qa"
+    qa_evidence = _insert_exact_qa_graph_query_trace(
+        conn,
+        trace_id=qa_trace_id,
+        snapshot_id="scope-failed-qa-merged-same-task-qa",
+        candidate_commit_sha=head_commit,
+        backlog_id=backlog_id,
+        task_id=old_context.task_id,
+        target_project_root=str(target_root),
+        created_at="2026-08-06T02:00:00Z",
+    )
+    qa_graph = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa_graph_context",
+                "line_id": "qa_graph_context",
+                "evidence_kind": "graph_trace",
+                "graph_trace_ids": [qa_trace_id],
+                "db_verified": True,
+                "query_source": "qa",
+                "query_purpose": "independent_verification",
+                "payload": {
+                    "schema_version": "mf_parallel.qa_graph_context.v1",
+                    "graph_trace_ids": [qa_trace_id],
+                    "graph_trace_evidence": qa_evidence,
+                },
+            },
+        )
+    )
+    assert qa_graph["ok"] is True
+    failed_qa = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "runtime_context_id": old_context.runtime_context_id,
+                "task_id": old_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "payload": {
+                    "status": "failed",
+                    "verdict": "FAIL",
+                    "runtime_context_id": old_context.runtime_context_id,
+                    "task_id": old_context.task_id,
+                    "parent_task_id": backlog_id,
+                },
+                "verification": {
+                    "result": "failed",
+                    "verdict": "FAIL",
+                    "acceptance_failed": ["fresh_runtime_context_required"],
+                },
+            },
+        )
+    )
+    assert failed_qa["ok"] is True
+
+    merged_context = upsert_branch_context(
+        conn,
+        replace(
+            get_branch_context(conn, PID, worker_task_id),
+            status=STATE_MERGED,
+        ),
+        now_iso="2026-08-06T02:00:01Z",
+    )
+    route_identity = {
+        "route_id": "route-failed-qa-merged-same-task",
+        "route_context_hash": _fake_sha(
+            "failed-qa-merged-same-task-route"
+        ),
+        "prompt_contract_id": "rprompt-failed-qa-merged-same-task",
+        "prompt_contract_hash": _fake_sha(
+            "failed-qa-merged-same-task-prompt"
+        ),
+        "visible_injection_manifest_hash": _fake_sha(
+            "failed-qa-merged-same-task-visible"
+        ),
+        "route_token_ref": "rtok-failed-qa-merged-same-task",
+    }
+    _persist_parallel_allocate_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        **route_identity,
+    )
+    conn.commit()
+
+    before_record = copy.deepcopy(
+        server._contract_runtime_store(conn).get(contract_execution_id)
+    )
+    before_context = get_branch_context(conn, PID, worker_task_id)
+    before_events = copy.deepcopy(
+        task_timeline.list_events(conn, PID, backlog_id=backlog_id)
+    )
+    before_total_changes = conn.total_changes
+    allocate_body = {
+        "task_id": worker_task_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "parent_task_id": contract_execution_id,
+        "root_task_id": contract_execution_id,
+        "stage_type": "failed_qa_rework",
+        "attempt": 2,
+        "workspace_root": str(target_root),
+        "worktree_root": str(target_root),
+        "target_project_root": str(target_root),
+        "base_commit": head_commit,
+        "target_head_commit": head_commit,
+        "merge_queue_id": merged_context.merge_queue_id,
+        "owned_files": ["agent/governance/server.py"],
+        "target_files": ["agent/governance/server.py"],
+        "allocation_owner": "observer",
+        "worker_id": merged_context.worker_id,
+        "worker_slot_id": merged_context.worker_slot_id,
+        "create_worktree": False,
+        **route_identity,
+    }
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=allocate_body,
+            )
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_failed_qa_rework_requires_fresh_runtime_context"
+    )
+    details = rejected.value.details
+    assert details["field"] == "task_id"
+    assert details["expected"] == (
+        "fresh_task_id_distinct_from_merged_runtime_context"
+    )
+    assert details["actual"] == worker_task_id
+    assert details["source"] == (
+        "ContractRuntime.next_legal_action.allocation_request_requirements."
+        "fresh_runtime_context_required"
+    )
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    assert details["mutation_performed"] is False
+    assert details["fresh_runtime_context_required"] is True
+    assert details["retry_same_world_allowed"] is True
+    assert details["minimum_attempt"] == 2
+    assert details["guide"]["stage_type"] == "failed_qa_rework"
+    assert details["guide"]["preserve_backlog_id"] == backlog_id
+    assert details["guide"]["preserve_contract_execution_id"] == (
+        contract_execution_id
+    )
+    assert details["guide"]["task_id_must_be_fresh"] is True
+    assert details["guide"]["worker_identity_must_be_fresh"] is True
+    assert conn.total_changes == before_total_changes
+    assert server._contract_runtime_store(conn).get(contract_execution_id) == (
+        before_record
+    )
+    assert get_branch_context(conn, PID, worker_task_id) == before_context
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+    ) == before_events
+
+
 def test_failed_qa_fresh_allocate_appends_dispatch_then_initial_join_receipt_startup(
     conn,
     monkeypatch,
@@ -98590,6 +98861,7 @@ def test_failed_qa_fresh_allocate_appends_dispatch_then_initial_join_receipt_sta
         graph_trace_id="gqt-failed-qa-fresh-dispatch-old-worker",
         head_commit=head_commit,
         implementation_event_ref=f"timeline:{old_events['implementation']}",
+        include_worker_finish=True,
     )
 
     qa_trace_id = "gqt-failed-qa-fresh-dispatch-qa"
@@ -98935,10 +99207,8 @@ def test_failed_qa_fresh_allocate_appends_dispatch_then_initial_join_receipt_sta
                 "session_token": fresh_token,
                 "session_token_ref": fresh_session_ref,
                 "fence_token": fresh_fence,
-                "agent_id": "host-failed-qa-fresh-dispatch",
-                "actual_host_worker_id": (
-                    "host-failed-qa-fresh-dispatch"
-                ),
+                "agent_id": fresh_context.worker_id,
+                "actual_host_worker_id": fresh_context.worker_id,
                 "worker_session_id": "session-failed-qa-fresh-dispatch",
                 "worker_transcript_ref": (
                     "codex:session-failed-qa-fresh-dispatch"
