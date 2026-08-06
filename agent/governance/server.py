@@ -113570,6 +113570,263 @@ def _contract_runtime_completed_line_projection_preflight_gate(
     )
 
 
+def _contract_runtime_mf_parallel_concurrent_sibling_writer_rebase(
+    runtime: ContractRuntime,
+    *,
+    stored_record: Mapping[str, Any],
+    actor_role: str,
+    write: Mapping[str, Any],
+    submitted_writer_binding: Mapping[str, Any],
+    current_lane_writer_copy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate and rebind one historically exact sibling-concurrent writer.
+
+    The shared ``mf_parallel`` execution revision is global, while an atomic
+    worker lane is private.  A valid implementation body can therefore become
+    revision-stale solely because the other dispatched lane completed lines.
+    This helper recognizes only that narrow history: the submitted copy must
+    have been exact at its revision, every intervening line must belong to a
+    different dispatched RuntimeContext, and the same requested lane/line must
+    still be writable now.  It performs no mutation.
+    """
+
+    if str(stored_record.get("contract_id") or "").strip() not in {
+        "mf_parallel",
+        "mf_parallel.v2",
+    } or actor_role != "mf_sub":
+        return {}
+    submitted_revision = submitted_writer_binding.get(
+        "execution_state_revision"
+    )
+    current_revision = stored_record.get("execution_state_revision")
+    if (
+        isinstance(submitted_revision, bool)
+        or not isinstance(submitted_revision, int)
+        or isinstance(current_revision, bool)
+        or not isinstance(current_revision, int)
+        or submitted_revision < 1
+        or submitted_revision >= current_revision
+    ):
+        return {}
+
+    completed_lines = [
+        deepcopy(item)
+        for item in (stored_record.get("completed_lines") or [])
+        if isinstance(item, Mapping)
+    ]
+    # ContractRuntime starts at revision 1 and advances exactly once per
+    # persisted completed line.  Refuse reconstruction if that invariant is
+    # not exact rather than guessing at a historical boundary.
+    if len(completed_lines) != current_revision - 1:
+        return {}
+    historical_line_count = submitted_revision - 1
+    if (
+        historical_line_count < 1
+        or historical_line_count >= len(completed_lines)
+    ):
+        return {}
+    historical_lines = completed_lines[:historical_line_count]
+    intervening_lines = completed_lines[historical_line_count:]
+    if not intervening_lines:
+        return {}
+
+    dispatched_workers: dict[str, dict[str, str]] = {}
+    for completed in historical_lines:
+        if str(completed.get("line_id") or "").strip() != (
+            "observer_dispatch_bounded_workers"
+        ):
+            continue
+        payload = (
+            completed.get("payload")
+            if isinstance(completed.get("payload"), Mapping)
+            else {}
+        )
+        raw_workers = payload.get("bounded_workers") or payload.get("workers")
+        if not isinstance(raw_workers, list):
+            continue
+        for worker in raw_workers:
+            if not isinstance(worker, Mapping):
+                continue
+            runtime_context_id = str(
+                worker.get("runtime_context_id") or ""
+            ).strip()
+            if not runtime_context_id:
+                continue
+            dispatched_workers[runtime_context_id] = {
+                "task_id": str(worker.get("task_id") or "").strip(),
+                "lane_id": str(
+                    worker.get("lane_id")
+                    or worker.get("worker_slot_id")
+                    or worker.get("worker_id")
+                    or ""
+                ).strip(),
+            }
+    if len(dispatched_workers) != 2:
+        return {}
+
+    requested_runtime_context_id = str(
+        current_lane_writer_copy.get("runtime_context_id")
+        or write.get("runtime_context_id")
+        or ""
+    ).strip()
+    if requested_runtime_context_id not in dispatched_workers:
+        return {}
+    requested_task_id = dispatched_workers[requested_runtime_context_id][
+        "task_id"
+    ]
+    requested_lane_id = dispatched_workers[requested_runtime_context_id][
+        "lane_id"
+    ]
+    for completed in intervening_lines:
+        if str(completed.get("actor_role") or "").strip() != "mf_sub":
+            return {}
+        intervening_runtime_context_id = _timeline_first_deep_text(
+            completed,
+            "runtime_context_id",
+        )
+        if (
+            not intervening_runtime_context_id
+            or intervening_runtime_context_id == requested_runtime_context_id
+            or intervening_runtime_context_id not in dispatched_workers
+        ):
+            return {}
+        dispatched_identity = dispatched_workers[intervening_runtime_context_id]
+        intervening_task_id = _timeline_first_deep_text(completed, "task_id")
+        if (
+            dispatched_identity["task_id"]
+            and intervening_task_id != dispatched_identity["task_id"]
+        ):
+            return {}
+        intervening_lane_id = (
+            _timeline_first_deep_text(completed, "lane_id")
+            or _timeline_first_deep_text(completed, "worker_slot_id")
+            or _timeline_first_deep_text(completed, "worker_id")
+        )
+        if (
+            dispatched_identity["lane_id"]
+            and intervening_lane_id != dispatched_identity["lane_id"]
+        ):
+            return {}
+
+    current_identity = {
+        "runtime_context_id": requested_runtime_context_id,
+        "task_id": str(current_lane_writer_copy.get("task_id") or "").strip(),
+        "lane_id": str(current_lane_writer_copy.get("lane_id") or "").strip(),
+        "line_instance_id": str(
+            current_lane_writer_copy.get("line_instance_id") or ""
+        ).strip(),
+    }
+    if (
+        current_identity["task_id"] != requested_task_id
+        or current_identity["lane_id"] != requested_lane_id
+        or current_identity["line_instance_id"]
+        != f"runtime_context:{requested_runtime_context_id}"
+        or current_lane_writer_copy.get("execution_state_revision")
+        != current_revision
+    ):
+        return {}
+
+    historical_source = deepcopy(dict(stored_record))
+    historical_source["completed_lines"] = deepcopy(historical_lines)
+    historical_source["execution_state_revision"] = submitted_revision
+    historical_write = deepcopy(dict(write))
+    historical_payload = (
+        deepcopy(dict(historical_write.get("payload")))
+        if isinstance(historical_write.get("payload"), Mapping)
+        else {}
+    )
+    for field in _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS:
+        value = submitted_writer_binding.get(field)
+        historical_write[field] = value
+        historical_payload[field] = value
+    historical_write["payload"] = historical_payload
+    try:
+        historical_record = runtime._record_view(
+            historical_source,
+            actor_role=actor_role,
+            completed_lines=historical_lines,
+        )
+        _historical_state, historical_lane_guide = (
+            runtime.mf_parallel_atomic_lane_gate_view(
+                historical_record,
+                (
+                    historical_record.get("runtime_guide")
+                    if isinstance(
+                        historical_record.get("runtime_guide"), Mapping
+                    )
+                    else {}
+                ),
+                historical_write,
+                source_record=historical_source,
+                projection=None,
+            )
+        )
+    except (
+        ContractRuntimeError,
+        ContractDefinitionError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        return {}
+    historical_copy_container = (
+        historical_lane_guide.get("writer_role_safe_copy_payload")
+        if isinstance(
+            historical_lane_guide.get("writer_role_safe_copy_payload"),
+            Mapping,
+        )
+        else {}
+    )
+    historical_copy = (
+        historical_copy_container.get("copy_payload")
+        if isinstance(historical_copy_container.get("copy_payload"), Mapping)
+        else {}
+    )
+    if any(
+        submitted_writer_binding.get(field) != historical_copy.get(field)
+        for field in _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS
+    ):
+        return {}
+    if any(
+        historical_copy.get(field) != current_lane_writer_copy.get(field)
+        for field in (
+            "backlog_id",
+            "definition_hash",
+            "instruction_bundle_hash",
+            "stage_id",
+            "line_id",
+            "evidence_kind",
+            "line_instance_id",
+        )
+    ):
+        return {}
+
+    return {
+        "copy_payload": {
+            field: current_lane_writer_copy.get(field)
+            for field in _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS
+        },
+        "evidence": {
+            "schema_version": (
+                "contract_runtime.concurrent_sibling_revision_rebase.v1"
+            ),
+            "applied": True,
+            "source": "authenticated_historical_atomic_lane_copy",
+            "from_execution_state_revision": submitted_revision,
+            "to_execution_state_revision": current_revision,
+            "intervening_line_count": len(intervening_lines),
+            "intervening_lines_all_from_dispatched_sibling": True,
+            "same_lane_intervening_line": False,
+            "same_requested_line_still_current": True,
+            "server_derived": True,
+            "public_safe": True,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+            "raw_route_token_persisted": False,
+        },
+    }
+
+
 def _contract_runtime_close_gate(
     conn,
     *,
@@ -114252,29 +114509,50 @@ def _contract_runtime_close_gate(
                         }
                     )
             if binding_mismatches:
-                first_mismatch = binding_mismatches[0]
-                raise GovernanceError(
-                    "contract_runtime_close_evidence_rejected",
-                    (
-                        "RuntimeContext implementation writer binding does not "
-                        "match the exact authenticated atomic lane copy payload"
-                    ),
-                    422,
-                    _runtime_context_implementation_zero_write_details(
-                        field=first_mismatch["field"],
-                        expected=first_mismatch["expected"],
-                        actual=first_mismatch["actual"],
-                        source=(
-                            "contract_runtime_lane_writer_role_safe_copy_payload"
-                        ),
-                        identity_mismatches=binding_mismatches,
-                        contract_execution_id=contract_execution_id,
+                concurrent_sibling_rebase = (
+                    _contract_runtime_mf_parallel_concurrent_sibling_writer_rebase(
+                        runtime,
+                        stored_record=stored_record,
                         actor_role=actor_role,
-                    ),
+                        write=write,
+                        submitted_writer_binding=submitted_writer_binding,
+                        current_lane_writer_copy=lane_writer_copy,
+                    )
                 )
-            # The accepted write uses the caller's values verbatim after exact
-            # equality with the current lane copy.  No hash, revision, or line
-            # identity is inferred or substituted for this facade.
+                if not concurrent_sibling_rebase:
+                    first_mismatch = binding_mismatches[0]
+                    raise GovernanceError(
+                        "contract_runtime_close_evidence_rejected",
+                        (
+                            "RuntimeContext implementation writer binding does not "
+                            "match the exact authenticated atomic lane copy payload"
+                        ),
+                        422,
+                        _runtime_context_implementation_zero_write_details(
+                            field=first_mismatch["field"],
+                            expected=first_mismatch["expected"],
+                            actual=first_mismatch["actual"],
+                            source=(
+                                "contract_runtime_lane_writer_role_safe_copy_payload"
+                            ),
+                            identity_mismatches=binding_mismatches,
+                            contract_execution_id=contract_execution_id,
+                            actor_role=actor_role,
+                        ),
+                    )
+                submitted_writer_binding = dict(
+                    concurrent_sibling_rebase["copy_payload"]
+                )
+                canonical_norm_payload[
+                    "concurrent_sibling_revision_rebase"
+                ] = dict(concurrent_sibling_rebase["evidence"])
+                supplied_hash = str(
+                    submitted_writer_binding.get("runtime_guide_hash") or ""
+                ).strip()
+                supplied_hash_value = supplied_hash
+            # Exact-current bodies remain verbatim.  A historically exact body
+            # whose only intervening writes came from the dispatched sibling
+            # is narrowly rebound to the server-derived current revision/hash.
             for field, value in submitted_writer_binding.items():
                 write[field] = value
                 canonical_norm_payload[field] = value

@@ -122354,38 +122354,49 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
             }
         ],
     }
-    updated_record = {
-        **copy.deepcopy(record),
-        "execution_state_revision": 10,
-        "execution_state": {
-            "execution_state_revision": 10,
-            "execution_state_hash": _fake_sha(
-                "implementation-two-worker-state-after"
-            ),
-        },
-        "runtime_guide": {
-            "runtime_guide_hash": _fake_sha(
-                "implementation-two-worker-reader-after"
-            ),
-            "next_legal_action": {
-                "stage_id": "worker_commit",
-                "line_id": "worker_commit",
-                "actor_role": "mf_sub",
-                "evidence_kind": "worker_commit",
-                **authenticated_lane,
-            },
-        },
-    }
-
     class FakeRuntime:
         def __init__(self):
             self.accepted_writes = []
             self.submit_attempts = []
+            self.active_record = copy.deepcopy(record)
+            self.active_lane_hash = worker_lane_hash
 
         def current_record(self, requested_execution_id, *, actor_role):
             assert requested_execution_id == execution_id
             assert actor_role in {"mf_sub", "observer"}
-            return copy.deepcopy(record)
+            return copy.deepcopy(self.active_record)
+
+        def _record_view(
+            self,
+            source_record,
+            *,
+            actor_role,
+            completed_lines,
+            projection=None,
+        ):
+            historical = copy.deepcopy(source_record)
+            historical["completed_lines"] = copy.deepcopy(completed_lines)
+            historical["execution_state"] = {
+                "execution_state_revision": historical[
+                    "execution_state_revision"
+                ],
+                "execution_state_hash": _fake_sha(
+                    "implementation-two-worker-historical-state"
+                ),
+            }
+            historical["runtime_guide"] = {
+                "runtime_guide_hash": _fake_sha(
+                    "implementation-two-worker-historical-reader"
+                ),
+                "next_legal_action": {
+                    "stage_id": "worker_implementation",
+                    "line_id": "worker_implementation",
+                    "actor_role": actor_role,
+                    "evidence_kind": "implementation",
+                    **authenticated_lane,
+                },
+            }
+            return historical
 
         def mf_parallel_atomic_lane_gate_view(
             self,
@@ -122398,11 +122409,16 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
         ):
             assert source_record["contract_execution_id"] == execution_id
             assert gate_record["contract_execution_id"] == execution_id
+            lane_hash = (
+                worker_lane_hash
+                if gate_record["execution_state_revision"] == 9
+                else self.active_lane_hash
+            )
             return (
                 copy.deepcopy(gate_record["execution_state"]),
                 {
                     **copy.deepcopy(guide),
-                    "runtime_guide_hash": worker_lane_hash,
+                    "runtime_guide_hash": lane_hash,
                     "writer_role_safe_copy_payload": {
                         "copy_payload": {
                             "backlog_id": backlog_id,
@@ -122410,10 +122426,10 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
                             "instruction_bundle_hash": record[
                                 "instruction_bundle_hash"
                             ],
-                            "execution_state_revision": record[
+                            "execution_state_revision": gate_record[
                                 "execution_state_revision"
                             ],
-                            "runtime_guide_hash": worker_lane_hash,
+                            "runtime_guide_hash": lane_hash,
                             "stage_id": "worker_implementation",
                             "line_id": "worker_implementation",
                             "actor_role": "mf_sub",
@@ -122450,7 +122466,7 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
             )
             if (
                 actor_role != "mf_sub"
-                or write.get("runtime_guide_hash") != worker_lane_hash
+                or write.get("runtime_guide_hash") != self.active_lane_hash
                 or not exact_lane
             ):
                 return {
@@ -122463,10 +122479,15 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
                     },
                 }
             self.accepted_writes.append(copy.deepcopy(write))
+            accepted_record = copy.deepcopy(self.active_record)
+            accepted_record["execution_state_revision"] += 1
+            accepted_record["execution_state"][
+                "execution_state_revision"
+            ] = accepted_record["execution_state_revision"]
             return {
                 "ok": True,
                 "decision": {"ok": True, "errors": []},
-                "record": copy.deepcopy(updated_record),
+                "record": accepted_record,
             }
 
     fake_runtime = FakeRuntime()
@@ -122619,6 +122640,139 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
     assert conn.execute(
         "SELECT COUNT(*) FROM task_timeline_events"
     ).fetchone()[0] == timeline_count_after_accept
+
+    historical_prefix = [
+        copy.deepcopy(record["completed_lines"][0]),
+        *[
+            {
+                "stage_id": "worker_context",
+                "line_id": f"historical-prefix-{index}",
+                "actor_role": "mf_sub",
+                "evidence_kind": "graph_trace",
+                "status": "passed",
+                **authenticated_lane,
+                "payload": copy.deepcopy(authenticated_lane),
+            }
+            for index in range(1, 8)
+        ],
+    ]
+    sibling_suffix = [
+        {
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "actor_role": "mf_sub",
+            "evidence_kind": evidence_kind,
+            "status": "passed",
+            **lanes[0],
+            "payload": copy.deepcopy(lanes[0]),
+        }
+        for stage_id, line_id, evidence_kind in (
+            (
+                "worker_implementation",
+                "worker_implementation",
+                "implementation",
+            ),
+            ("worker_commit", "worker_commit", "worker_commit"),
+            (
+                "worker_finish_attestation",
+                "worker_finish_attestation",
+                "finish_attestation",
+            ),
+        )
+    ]
+    concurrent_record = copy.deepcopy(record)
+    concurrent_record["completed_lines"] = [
+        *historical_prefix,
+        *sibling_suffix,
+    ]
+    concurrent_record["execution_state_revision"] = 12
+    concurrent_record["execution_state"] = {
+        "execution_state_revision": 12,
+        "execution_state_hash": _fake_sha(
+            "implementation-two-worker-concurrent-state"
+        ),
+    }
+    concurrent_record["runtime_guide"] = {
+        "runtime_guide_hash": _fake_sha(
+            "implementation-two-worker-concurrent-reader"
+        ),
+        "next_legal_action": {
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "actor_role": "mf_sub",
+            "evidence_kind": "implementation",
+            **authenticated_lane,
+        },
+    }
+    concurrent_lane_hash = _fake_sha(
+        "implementation-authenticated-worker-lane-revision-12"
+    )
+    fake_runtime.active_record = concurrent_record
+    fake_runtime.active_lane_hash = concurrent_lane_hash
+    concurrent_submit_count = len(fake_runtime.submit_attempts)
+    concurrent_timeline_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+
+    rebased = server.handle_task_timeline_append(
+        trusted_request(copy.deepcopy(event_body))
+    )
+
+    assert rebased["contract_runtime_close_evidence_gate"]["accepted"] is True
+    assert len(fake_runtime.submit_attempts) == concurrent_submit_count + 1
+    rebased_write = fake_runtime.submit_attempts[-1]
+    assert rebased_write["execution_state_revision"] == 12
+    assert rebased_write["runtime_guide_hash"] == concurrent_lane_hash
+    assert rebased_write["payload"]["execution_state_revision"] == 12
+    assert rebased_write["payload"]["runtime_guide_hash"] == concurrent_lane_hash
+    rebase_evidence = rebased_write["payload"][
+        "concurrent_sibling_revision_rebase"
+    ]
+    assert rebase_evidence["applied"] is True
+    assert rebase_evidence["from_execution_state_revision"] == 9
+    assert rebase_evidence["to_execution_state_revision"] == 12
+    assert rebase_evidence["intervening_line_count"] == 3
+    assert rebase_evidence["same_lane_intervening_line"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == concurrent_timeline_count + 1
+
+    forged_historical = copy.deepcopy(event_body)
+    forged_historical["runtime_guide_hash"] = _fake_sha(
+        "forged-historical-worker-lane"
+    )
+    before_forged_submit = len(fake_runtime.submit_attempts)
+    before_forged_timeline = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError):
+        server.handle_task_timeline_append(
+            trusted_request(forged_historical)
+        )
+    assert len(fake_runtime.submit_attempts) == before_forged_submit
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == before_forged_timeline
+
+    same_lane_record = copy.deepcopy(concurrent_record)
+    same_lane_record["completed_lines"][-1] = {
+        **same_lane_record["completed_lines"][-1],
+        **authenticated_lane,
+        "payload": copy.deepcopy(authenticated_lane),
+    }
+    fake_runtime.active_record = same_lane_record
+    before_same_lane_submit = len(fake_runtime.submit_attempts)
+    before_same_lane_timeline = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError):
+        server.handle_task_timeline_append(
+            trusted_request(copy.deepcopy(event_body))
+        )
+    assert len(fake_runtime.submit_attempts) == before_same_lane_submit
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == before_same_lane_timeline
 
 
 def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_inactive_lane(

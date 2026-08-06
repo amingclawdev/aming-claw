@@ -25,7 +25,10 @@ from agent.governance.contracts.runtime import (
     read_backlog_contract_chain_current,
 )
 from agent.governance.contracts.hash import stable_sha256
-from agent.governance.server import _contract_runtime_direct_fix_close_authority_gate
+from agent.governance.server import (
+    _contract_runtime_direct_fix_close_authority_gate,
+    _contract_runtime_mf_parallel_concurrent_sibling_writer_rebase,
+)
 
 
 _SYSTEM_LAYER_POLICY_NAMES = [
@@ -2558,6 +2561,114 @@ def test_mf_parallel_runtime_binds_worker_lines_to_runtime_context_instances():
         ("worker_read_runtime_guide", lanes["b"]["runtime_context_id"]),
         ("worker_startup", lanes["b"]["runtime_context_id"]),
     }
+
+    record = accepted_a_startup["record"]
+    for lane in ("b", "a"):
+        accepted_graph = runtime.submit_line_write(
+            "cex-mf-parallel-lane-bound-test",
+            lane_write(
+                record,
+                lane,
+                stage_id="worker_context",
+                line_id="worker_graph_context",
+                evidence_kind="graph_trace",
+            ),
+        )
+        assert accepted_graph["ok"] is True
+        record = accepted_graph["record"]
+
+    stale_b_implementation = lane_write(
+        record,
+        "b",
+        stage_id="worker_implementation",
+        line_id="worker_implementation",
+        evidence_kind="implementation",
+    )
+    _lane_state, stale_b_guide = runtime.mf_parallel_atomic_lane_gate_view(
+        record,
+        record["runtime_guide"],
+        stale_b_implementation,
+        source_record=record,
+    )
+    stale_b_copy = stale_b_guide["writer_role_safe_copy_payload"][
+        "copy_payload"
+    ]
+    stale_b_binding = {
+        field: stale_b_copy[field]
+        for field in (
+            "backlog_id",
+            "definition_hash",
+            "instruction_bundle_hash",
+            "execution_state_revision",
+            "runtime_guide_hash",
+            "stage_id",
+            "line_id",
+            "evidence_kind",
+            "line_instance_id",
+        )
+    }
+
+    accepted_a_implementation = runtime.submit_line_write(
+        "cex-mf-parallel-lane-bound-test",
+        lane_write(
+            record,
+            "a",
+            stage_id="worker_implementation",
+            line_id="worker_implementation",
+            evidence_kind="implementation",
+        ),
+    )
+    assert accepted_a_implementation["ok"] is True
+    current = runtime.current_record(
+        "cex-mf-parallel-lane-bound-test",
+        actor_role="mf_sub",
+    )
+    current_b_write = lane_write(
+        current,
+        "b",
+        stage_id="worker_implementation",
+        line_id="worker_implementation",
+        evidence_kind="implementation",
+    )
+    _lane_state, current_b_guide = runtime.mf_parallel_atomic_lane_gate_view(
+        current,
+        current["runtime_guide"],
+        current_b_write,
+        source_record=current,
+    )
+    current_b_copy = current_b_guide["writer_role_safe_copy_payload"][
+        "copy_payload"
+    ]
+
+    rebased = _contract_runtime_mf_parallel_concurrent_sibling_writer_rebase(
+        runtime,
+        stored_record=current,
+        actor_role="mf_sub",
+        write=stale_b_implementation,
+        submitted_writer_binding=stale_b_binding,
+        current_lane_writer_copy=current_b_copy,
+    )
+    assert rebased["copy_payload"]["execution_state_revision"] == current[
+        "execution_state_revision"
+    ]
+    assert rebased["copy_payload"]["runtime_guide_hash"] == current_b_copy[
+        "runtime_guide_hash"
+    ]
+    assert rebased["evidence"]["intervening_line_count"] == 1
+    assert rebased["evidence"][
+        "intervening_lines_all_from_dispatched_sibling"
+    ] is True
+
+    forged_b_binding = dict(stale_b_binding)
+    forged_b_binding["runtime_guide_hash"] = "sha256:" + "f" * 64
+    assert not _contract_runtime_mf_parallel_concurrent_sibling_writer_rebase(
+        runtime,
+        stored_record=current,
+        actor_role="mf_sub",
+        write=stale_b_implementation,
+        submitted_writer_binding=forged_b_binding,
+        current_lane_writer_copy=current_b_copy,
+    )
 
 
 def test_mf_parallel_one_worker_dispatch_binds_exact_private_lane():
