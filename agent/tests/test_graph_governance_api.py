@@ -64422,6 +64422,425 @@ def test_mf_parallel_close_authority_still_requires_reconcile_evidence():
     ]
 
 
+def test_mf_parallel_close_ordering_uses_completed_sequence_not_legacy_semantic_rank():
+    reconcile_line = {
+        "line_id": "observer_reconcile",
+        "_completed_line_index": 8,
+    }
+    qa_line = {
+        "line_id": "qa_independent_verification",
+        "_completed_line_index": 9,
+    }
+
+    accepted = server._contract_runtime_mf_parallel_ordering_diagnostic(
+        before="observer_reconcile",
+        after="qa_independent_verification",
+        missing_id="contract_runtime.qa_after_reconcile",
+        before_line=reconcile_line,
+        after_line=qa_line,
+    )
+
+    assert accepted["passed"] is True
+    assert accepted["ordering_source"] == "completed_line_index_fallback"
+    assert accepted["before_completed_line_index"] == 8
+    assert accepted["after_completed_line_index"] == 9
+
+    rejected = server._contract_runtime_mf_parallel_ordering_diagnostic(
+        before="observer_reconcile",
+        after="qa_independent_verification",
+        missing_id="contract_runtime.qa_after_reconcile",
+        before_line={**reconcile_line, "_completed_line_index": 9},
+        after_line={**qa_line, "_completed_line_index": 8},
+    )
+
+    assert rejected["passed"] is False
+    assert rejected["ordering_source"] == "completed_line_index_fallback"
+
+
+def _retained_close_ready_authority_fixture() -> dict[str, Any]:
+    backlog_id = "AC-RETAINED-CLOSE-READY-AUTHORITY"
+    execution_id = "cex-retained-close-ready-authority"
+    runtime_context_id = "mfrctx-retained-close-ready-authority"
+    worker_task_id = "retained-close-ready-worker"
+    parent_task_id = execution_id
+    merge_queue_id = "mq-retained-close-ready-authority"
+    close_commit = "7" * 40
+    merge_event_id = 410
+    reconcile_event_id = 411
+    merge_event_created_at = "2026-08-06T01:00:00Z"
+    reconcile_event_created_at = "2026-08-06T01:01:00Z"
+    merge_event_ref = f"timeline:{merge_event_id}"
+    reconcile_event_ref = f"timeline:{reconcile_event_id}"
+    identity = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": worker_task_id,
+        "parent_task_id": parent_task_id,
+        "merge_queue_id": merge_queue_id,
+    }
+    durable_merge = {
+        "schema_version": (
+            "contract_runtime.observer_merge_durable_authority.v1"
+        ),
+        "source": "parallel_branch_merge_queue_items+task_timeline",
+        "server_derived": True,
+        "db_verified": True,
+        **identity,
+        "queue_item_id": "mqitem-retained-close-ready-authority",
+        "target_ref": "refs/heads/main",
+        "merge_commit": close_commit,
+        "target_head_after_merge": close_commit,
+        "merge_event_id": merge_event_id,
+        "merge_event_created_at": merge_event_created_at,
+        "merge_event_ref": merge_event_ref,
+        "timeline_event_refs": [merge_event_ref],
+        "contract_runtime_dispatch_source_ref": (
+            f"contract_runtime:{execution_id}:completed_lines:0"
+        ),
+    }
+    merge_projection = {
+        **identity,
+        "timeline_verified": True,
+        "authority_verified": True,
+        "qa_contract_runtime_verified": True,
+        "dispatch_lineage_verified": True,
+        "merged_commit_sha": close_commit,
+        "merge_event_id": merge_event_id,
+        "merge_event_created_at": merge_event_created_at,
+        "merge_source_ref": merge_event_ref,
+        "contract_runtime_dispatch_source_ref": (
+            f"contract_runtime:{execution_id}:completed_lines:0"
+        ),
+        "durable_merge_authority": durable_merge,
+    }
+    reconcile_authority = {
+        "schema_version": (
+            "graph_snapshot_store.current_full_reconcile_state.v1"
+        ),
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "server_derived": True,
+        "db_verified": True,
+        "live_verified": True,
+        "canonical_head_verified": True,
+        "active_snapshot_verified": True,
+        "active_snapshot_current_full_reconcile_verified": True,
+        "active_snapshot_matches_canonical_head": True,
+        "graph_reconciled": True,
+        "provenance_verified": True,
+        "provenance_scope_verified": True,
+        "durable_order_verified": True,
+        "reconcile_snapshot_verified": True,
+        "contract_execution_scope_verified": True,
+        "task_scope_verified": True,
+        "runtime_context_scope_verified": True,
+        "parent_task_scope_verified": True,
+        "merge_queue_scope_verified": True,
+        "dispatch_lineage_verified": True,
+        "current_full_reconcile": True,
+        "strategy": "current_full_reconcile",
+        **identity,
+        "merged_commit_sha": close_commit,
+        "reconciled_commit_sha": close_commit,
+        "canonical_head_commit": close_commit,
+        "current_canonical_commit_sha": close_commit,
+        "active_snapshot_id": "full-retained-close-ready-authority",
+        "active_snapshot_commit": close_commit,
+        "reconcile_snapshot_id": "full-retained-close-ready-authority",
+        "reconcile_snapshot_commit": close_commit,
+        "reconcile_provenance_target_commit": close_commit,
+        "merge_event_id": merge_event_id,
+        "merge_event_created_at": merge_event_created_at,
+        "merge_source_ref": merge_event_ref,
+        "reconcile_event_id": reconcile_event_id,
+        "reconcile_event_created_at": reconcile_event_created_at,
+        "reconcile_source_ref": reconcile_event_ref,
+        "reconcile_task_id": worker_task_id,
+        "reconcile_runtime_context_id": runtime_context_id,
+    }
+    reconcile_authority["authority_hash"] = server.stable_sha256(
+        reconcile_authority
+    )
+    merge_line = {
+        "stage_id": "observer_lane_merge",
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "evidence_kind": "merge",
+        "status": "passed",
+        "commit_sha": close_commit,
+        "_source_ref": merge_event_ref,
+        "payload": {"durable_merge_authority": durable_merge},
+    }
+    reconcile_line = {
+        "stage_id": "observer_reconcile",
+        "line_id": "observer_reconcile",
+        "actor_role": "observer",
+        "evidence_kind": "reconcile",
+        "status": "passed",
+        "commit_sha": close_commit,
+        "_source_ref": reconcile_event_ref,
+        "artifact_refs": {"reconcile_event_ref": reconcile_event_ref},
+        # This is an immutable persisted line, not the transient
+        # runtime-context post-worker projection shape.
+        "payload": {"reconcile_authority": reconcile_authority},
+    }
+    completed_lines = [merge_line, reconcile_line]
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "version": "v2",
+        "revision": "rev9",
+        "completed_lines": completed_lines,
+        "runtime_guide": {
+            "completed_lines": copy.deepcopy(completed_lines),
+            "next_legal_action": {
+                "stage_id": "observer_close",
+                "line_id": "observer_close_ready",
+                "owner_role": "observer",
+                "evidence_kind": "close_ready",
+            },
+        },
+    }
+    close_ready_write = {
+        "stage_id": "observer_close",
+        "line_id": "observer_close_ready",
+        "actor_role": "observer",
+        "evidence_kind": "close_ready",
+        "status": "passed",
+        "commit_sha": close_commit,
+        # Retain the ContractRuntime envelope at the top level; the worker
+        # identity remains explicit in payload and no authority is duplicated.
+        "runtime_context_id": runtime_context_id,
+        "task_id": execution_id,
+        "payload": {
+            "runtime_context_id": runtime_context_id,
+            "worker_task_id": worker_task_id,
+            "parent_task_id": parent_task_id,
+            "close_readiness": {
+                "qa_independent_verification": True,
+                "graph_reconcile": True,
+            },
+        },
+    }
+    return {
+        "record": record,
+        "write": close_ready_write,
+        "merge": merge_projection,
+        "authority": reconcile_authority,
+    }
+
+
+def test_close_ready_precheck_retains_server_derived_reconcile_authority_without_payload_duplication(
+    monkeypatch,
+):
+    fixture = _retained_close_ready_authority_fixture()
+    record = fixture["record"]
+    write = fixture["write"]
+    immutable_record_hash = server.stable_sha256(record)
+    immutable_write_hash = server.stable_sha256(write)
+    observed: dict[str, Any] = {}
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_trusted_merge_projection",
+        lambda *_args, **_kwargs: copy.deepcopy(fixture["merge"]),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_full_reconcile_authority_from_merge",
+        lambda *_args, **_kwargs: copy.deepcopy(fixture["authority"]),
+    )
+
+    def capture_gate(records, **_kwargs):
+        observed["record"] = copy.deepcopy(records[0])
+        authority = next(
+            line
+            for line in records[0]["completed_lines"]
+            if line["line_id"] == "observer_reconcile"
+        )["payload"]["reconcile_authority"]
+        return {
+            "passed": bool(authority),
+            "missing_requirement_ids": (
+                []
+                if authority
+                else ["contract_runtime.observer_reconcile_authority"]
+            ),
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_close_authority_gate",
+        capture_gate,
+    )
+
+    precheck = server._contract_runtime_mf_parallel_close_ready_precheck(
+        record,
+        write,
+        conn=object(),
+        project_id=PID,
+    )
+
+    assert precheck["passed"] is True, precheck
+    assert server.stable_sha256(record) == immutable_record_hash
+    assert server.stable_sha256(write) == immutable_write_hash
+    prospective = observed["record"]
+    rebound = next(
+        line
+        for line in prospective["completed_lines"]
+        if line["line_id"] == "observer_reconcile"
+    )["payload"]["reconcile_authority"]
+    assert rebound == fixture["authority"]
+    close_ready = prospective["completed_lines"][-1]
+    assert close_ready["line_id"] == "observer_close_ready"
+    assert "reconcile_authority" not in close_ready["payload"]
+    assert server._contract_runtime_server_line_identity(prospective) == {
+        "runtime_context_id": fixture["merge"]["runtime_context_id"],
+        "task_id": fixture["merge"]["task_id"],
+        "parent_task_id": fixture["merge"]["parent_task_id"],
+        "identity_status": "resolved",
+        "identity_source_line_id": "observer_close_ready",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "rehash"),
+    [
+        ("merged_commit_sha", "", True),
+        ("authority_hash", "sha256:" + "0" * 64, False),
+        ("task_id", "cross-task-authority", True),
+        ("runtime_context_id", "mfrctx-cross-authority", True),
+    ],
+)
+def test_close_binder_rejects_invalid_retained_authority_without_mutation(
+    monkeypatch,
+    field,
+    replacement,
+    rehash,
+):
+    fixture = _retained_close_ready_authority_fixture()
+    record = fixture["record"]
+    authority = record["completed_lines"][1]["payload"][
+        "reconcile_authority"
+    ]
+    authority[field] = replacement
+    if rehash:
+        authority["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in authority.items()
+                if key != "authority_hash"
+            }
+        )
+    record["runtime_guide"]["completed_lines"] = copy.deepcopy(
+        record["completed_lines"]
+    )
+    immutable_record_hash = server.stable_sha256(record)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_trusted_merge_projection",
+        lambda *_args, **_kwargs: copy.deepcopy(fixture["merge"]),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_full_reconcile_authority_from_merge",
+        lambda *_args, **_kwargs: copy.deepcopy(fixture["authority"]),
+    )
+
+    projected = server._contract_runtime_bind_close_reconcile_authority(
+        object(),
+        project_id=PID,
+        record=record,
+    )
+
+    assert server.stable_sha256(record) == immutable_record_hash
+    rejected = next(
+        line
+        for line in projected["completed_lines"]
+        if line["line_id"] == "observer_reconcile"
+    )["payload"]["reconcile_authority"]
+    assert rejected == {}, field
+
+
+@pytest.mark.parametrize(
+    ("case", "mutator"),
+    [
+        (
+            "missing_close_commit",
+            lambda write: write.pop("commit_sha"),
+        ),
+        (
+            "mismatched_close_commit",
+            lambda write: write.update({"commit_sha": "8" * 40}),
+        ),
+        (
+            "mismatched_contract_task",
+            lambda write: write.update({"task_id": "cex-cross-close-ready"}),
+        ),
+        (
+            "mismatched_runtime_context",
+            lambda write: write["payload"].update(
+                {"runtime_context_id": "mfrctx-cross-close-ready"}
+            ),
+        ),
+    ],
+)
+def test_close_ready_precheck_rejects_invalid_retained_envelope_zero_write_and_public_safe(
+    monkeypatch,
+    case,
+    mutator,
+):
+    fixture = _retained_close_ready_authority_fixture()
+    record = fixture["record"]
+    write = copy.deepcopy(fixture["write"])
+    mutator(write)
+    immutable_record_hash = server.stable_sha256(record)
+    immutable_write_hash = server.stable_sha256(write)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_bind_close_reconcile_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(record),
+    )
+
+    def commit_gate(records, *, close_commit, **_kwargs):
+        expected = fixture["authority"]["canonical_head_commit"]
+        return {
+            "passed": bool(close_commit and close_commit == expected),
+            "missing_requirement_ids": (
+                []
+                if close_commit == expected
+                else ["contract_runtime.observer_close_ready_close_commit"]
+            ),
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_close_authority_gate",
+        commit_gate,
+    )
+
+    precheck = server._contract_runtime_mf_parallel_close_ready_precheck(
+        record,
+        write,
+        conn=object(),
+        project_id=PID,
+    )
+
+    assert precheck["passed"] is False, case
+    assert precheck["zero_write_rejection"] is True, case
+    assert precheck["writes_performed"] is False, case
+    assert precheck["context_mutated"] is False, case
+    assert precheck["public_safe"] is True, case
+    assert precheck["secret_safe"] is True, case
+    assert server.stable_sha256(record) == immutable_record_hash, case
+    assert server.stable_sha256(write) == immutable_write_hash, case
+    serialized = json.dumps(precheck, sort_keys=True)
+    assert '"session_token"' not in serialized, case
+    assert '"fence_token"' not in serialized, case
+    assert '"route_token"' not in serialized, case
+
+
 def _insert_non_mf_backlog(conn, backlog_id: str) -> None:
     conn.execute(
         """INSERT INTO backlog_bugs
