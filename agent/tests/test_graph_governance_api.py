@@ -40824,6 +40824,13 @@ def test_exact_candidate_runtime_comparison_base_falls_through_missing_parent(
     root_execution_id = "cex-exact-candidate-runtime-base-root"
     base_commit = "b" * 40
     candidate_commit = "c" * 40
+    monkeypatch.setattr(
+        server,
+        "_qa_exact_candidate_direct_main_comparison_authority",
+        lambda *_args, **_kwargs: pytest.fail(
+            "managed mf runtime authority must not use the direct-main fallback"
+        ),
+    )
 
     upsert_branch_context(
         conn,
@@ -41723,6 +41730,13 @@ def test_exact_candidate_snapshot_uses_runtime_comparison_diff_tuple(
         "qa_exact_candidate_comparison_authority_rejected"
     )
     assert missing_comparison.value.details["write_performed"] is False
+    assert missing_comparison.value.details["zero_write_rejection"] is True
+    assert missing_comparison.value.details["writes_performed"] is False
+    assert missing_comparison.value.details["public_safe"] is True
+    assert missing_comparison.value.details["secret_safe"] is True
+    assert missing_comparison.value.details["source"] == (
+        "agent.governance.server::_require_graph_query_capability"
+    )
     assert missing_comparison.value.details[
         "exact_candidate_snapshot_required"
     ] is False
@@ -119610,6 +119624,7 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
     prepare_backlog: bool = True,
     record_failed_qa: bool = True,
     worker_owned_implementation: bool = False,
+    implementation_commit_sha: str = "a" * 40,
     worker_actor: str = "worker:/root/direct-main-worker",
     worker_claim_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
@@ -119624,7 +119639,7 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
             ),
         )
     task_id = server._onboard_service_execution_id(PID, backlog_id)
-    commit_sha = "a" * 40
+    commit_sha = implementation_commit_sha
     route_gate = {
         "schema_version": "route_token_mutation_gate.v1",
         "allowed": True,
@@ -119765,6 +119780,676 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
             f"timeline:{failed_qa['id']}" if failed_qa is not None else ""
         ),
     }
+
+
+def test_exact_candidate_direct_main_runtime_comparison_base_uses_server_lineage(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="direct-main-exact-comparison-authority",
+    )
+    project_root = fixture.root
+    base_commit = fixture.main_head
+    (project_root / "src" / "direct_main.py").write_text(
+        "def direct_main_marker():\n    return 'candidate'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "src/direct_main.py"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "direct-main candidate"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    backlog_id = "AC-DIRECT-MAIN-EXACT-COMPARISON-SERVER-LINEAGE"
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+        record_failed_qa=False,
+        worker_owned_implementation=True,
+        implementation_commit_sha=candidate_commit,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+
+    proof = {
+        "backlog_id": backlog_id,
+        "task_id": lineage["task_id"],
+        "commit_sha": candidate_commit,
+        # Caller comparison claims are never an authority source.
+        "comparison_base_commit_sha": "f" * 40,
+        "candidate_review_context": {
+            "comparison_base_commit_sha": "f" * 40,
+        },
+    }
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof=proof,
+    )
+
+    assert authority == {
+        "commit_sha": base_commit,
+        "source": server._QA_WORKER_COMPARISON_BASE_SOURCE,
+        "lineage_source": (
+            "task_timeline.accepted_direct_main_worker_implementation+"
+            "git.single_parent"
+        ),
+    }
+    assert server._qa_exact_candidate_comparison_authority_required(
+        conn,
+        project_id=PID,
+        proof=proof,
+    ) is True
+    exact_context = server._qa_exact_candidate_context(
+        project_root,
+        project_id=PID,
+        canonical_project_root=project_root,
+        candidate_commit_sha=candidate_commit,
+        comparison_base_commit_sha=authority["commit_sha"],
+        comparison_base_commit_source=authority["source"],
+        comparison_base_commit_lineage_source=authority["lineage_source"],
+        comparison_authority_required=True,
+    )
+    assert exact_context["root_identity"]["base_commit_sha"] == candidate_commit
+    assert exact_context["root_identity"]["candidate_commit_sha"] == candidate_commit
+    assert exact_context["comparison_base_commit_sha"] == base_commit
+    assert exact_context["root_identity"][
+        "comparison_base_commit_lineage_source"
+    ] == authority["lineage_source"]
+    assert exact_context["changed_files"] == ["src/direct_main.py"]
+    assert exact_context["changed_files_source"] == (
+        "server_runtime_context_base_to_exact_candidate_diff"
+    )
+    assert exact_context["candidate_diff_hash"].startswith("sha256:")
+
+
+def test_exact_candidate_direct_main_qa_persists_truthful_no_pass_and_rejects_forged_base(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="direct-main-exact-no-pass-lifecycle",
+    )
+    project_root = fixture.root
+    base_commit = fixture.main_head
+    changed_path = project_root / "agent" / "governance" / "server.py"
+    changed_path.parent.mkdir(parents=True, exist_ok=True)
+    changed_path.write_text("DIRECT_MAIN_EXACT_AUTHORITY = True\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "direct-main exact QA candidate"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    backlog_id = "AC-DIRECT-MAIN-EXACT-NO-PASS-LIFECYCLE"
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+        record_failed_qa=False,
+        worker_owned_implementation=True,
+        implementation_commit_sha=candidate_commit,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, explicit_root=None, **_kwargs: (
+            Path(explicit_root).resolve() if explicit_root else project_root
+        ),
+    )
+    snapshot_id = "full-direct-main-exact-no-pass"
+    _activate_basic_graph(conn, snapshot_id, commit_sha=candidate_commit)
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=lineage["task_id"],
+        commit_sha=candidate_commit,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{lineage['task_id']}",
+        f"commit:{candidate_commit}",
+        qa_scope_binding_ref,
+    ]
+    registered = server.role_service.register(
+        conn,
+        "qa:direct-main-exact-no-pass",
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    query_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": "active",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": backlog_id,
+            "task_id": lineage["task_id"],
+            "commit_sha": candidate_commit,
+            "project_root": str(project_root),
+        },
+    )
+    query_ctx._session.update(
+        {
+            "session_id": registered["session_id"],
+            "principal_id": "qa:direct-main-exact-no-pass",
+            "scope": qa_scope,
+        }
+    )
+
+    queried = server.handle_graph_governance_query(query_ctx)
+    trace = server.handle_graph_governance_query_trace_get(
+        _ctx({"project_id": PID, "trace_id": queried["trace_id"]})
+    )["trace"]
+    identity = trace["graph_query_identity"]
+    assert identity["base_commit_sha"] == candidate_commit
+    assert identity["candidate_commit_sha"] == candidate_commit
+    assert trace["root_identity"]["comparison_authority_required"] is True
+    assert trace["root_identity"]["comparison_base_commit_sha"] == base_commit
+    assert trace["root_identity"]["comparison_base_commit_source"] == (
+        server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE
+    )
+    assert trace["root_identity"][
+        "comparison_base_commit_lineage_source"
+    ] == server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+    assert identity["changed_files"] == ["agent/governance/server.py"]
+    assert identity["changed_files_source"] == (
+        "server_runtime_context_base_to_exact_candidate_diff"
+    )
+
+    no_pass_body = {
+        "backlog_id": backlog_id,
+        "task_id": lineage["task_id"],
+        "event_type": "qa.independent_verification",
+        "event_kind": "independent_verification",
+        "phase": "verification",
+        "actor": "qa:direct-main-exact-no-pass",
+        "status": "failed",
+        "commit_sha": candidate_commit,
+        "payload": {
+            "schema_version": "qa_independent_verification.v1",
+            "graph_trace_ids": [queried["trace_id"]],
+            "base_commit_sha": base_commit,
+            "candidate_commit_sha": candidate_commit,
+            "full_suite_claim": "not_claimed",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "observer_impersonation": False,
+        },
+        "artifact_refs": {
+            "external_no_pass_baseline_ledger": {
+                "schema_version": (
+                    "contract_runtime.external_no_pass_baseline_ledger.v2"
+                ),
+                "base_commit_sha": base_commit,
+                "candidate_commit_sha": candidate_commit,
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+            }
+        },
+    }
+    no_pass_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=no_pass_body,
+    )
+    no_pass_ctx._session = dict(query_ctx._session)
+    accepted = server.handle_task_timeline_append(no_pass_ctx)
+    ledger = accepted["artifact_refs"]["external_no_pass_baseline_ledger"]
+    proof = accepted["payload"]["source_backed_contract_gate_authority"][
+        "qa_session_proof"
+    ]
+    assert ledger["base_commit_sha"] == base_commit
+    assert ledger["candidate_commit_sha"] == candidate_commit
+    assert ledger["candidate_new_failures"] == 0
+    assert ledger["overall_release_pass_claimed"] is False
+    assert proof["comparison_base_commit_sha"] == base_commit
+    assert proof["comparison_base_commit_lineage_source"] == (
+        server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+    )
+    assert proof["audit_only"] is True
+    assert proof["close_satisfying"] is False
+
+    original_root_identity = copy.deepcopy(trace["root_identity"])
+    for mutation, expected_actual in (
+        ("forged", "caller.claimed_direct_main_lineage"),
+        ("missing", ""),
+    ):
+        mutated_root_identity = copy.deepcopy(original_root_identity)
+        if mutation == "forged":
+            mutated_root_identity[
+                "comparison_base_commit_lineage_source"
+            ] = expected_actual
+        else:
+            mutated_root_identity.pop(
+                "comparison_base_commit_lineage_source",
+                None,
+            )
+        conn.execute(
+            """UPDATE graph_query_traces
+               SET root_identity_json = ?, root_identity_hash = ?
+               WHERE project_id = ? AND trace_id = ?""",
+            (
+                json.dumps(mutated_root_identity, sort_keys=True),
+                server.stable_sha256(mutated_root_identity),
+                PID,
+                queried["trace_id"],
+            ),
+        )
+        conn.commit()
+        before_lineage_count = conn.execute(
+            """SELECT COUNT(*) FROM task_timeline_events
+               WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
+            (PID, backlog_id, lineage["task_id"]),
+        ).fetchone()[0]
+        before_lineage_changes = conn.total_changes
+        lineage_ctx = _ctx_with_role(
+            {"project_id": PID},
+            "qa",
+            method="POST",
+            body=json.loads(json.dumps(no_pass_body)),
+        )
+        lineage_ctx._session = dict(query_ctx._session)
+        with pytest.raises(GovernanceError) as lineage_rejected:
+            server.handle_task_timeline_append(lineage_ctx)
+        assert lineage_rejected.value.code == "qa_graph_trace_mismatch"
+        assert any(
+            mismatch["field"]
+            == "comparison_base_commit_lineage_source"
+            and mismatch["expected"]
+            == server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+            and mismatch["actual"] == expected_actual
+            for mismatch in lineage_rejected.value.details[
+                "identity_mismatches"
+            ]
+        )
+        assert conn.execute(
+            """SELECT COUNT(*) FROM task_timeline_events
+               WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
+            (PID, backlog_id, lineage["task_id"]),
+        ).fetchone()[0] == before_lineage_count
+        assert conn.total_changes == before_lineage_changes
+        conn.execute(
+            """UPDATE graph_query_traces
+               SET root_identity_json = ?, root_identity_hash = ?
+               WHERE project_id = ? AND trace_id = ?""",
+            (
+                json.dumps(original_root_identity, sort_keys=True),
+                server.stable_sha256(original_root_identity),
+                PID,
+                queried["trace_id"],
+            ),
+        )
+        conn.commit()
+
+    forged_body = json.loads(json.dumps(no_pass_body))
+    forged_body["artifact_refs"]["external_no_pass_baseline_ledger"][
+        "base_commit_sha"
+    ] = "f" * 40
+    forged_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=forged_body,
+    )
+    forged_ctx._session = dict(query_ctx._session)
+    before_count = conn.execute(
+        """SELECT COUNT(*) FROM task_timeline_events
+           WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
+        (PID, backlog_id, lineage["task_id"]),
+    ).fetchone()[0]
+    before_total_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_task_timeline_append(forged_ctx)
+    assert rejected.value.code == "qa_graph_review_context_mismatch"
+    assert conn.execute(
+        """SELECT COUNT(*) FROM task_timeline_events
+           WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
+        (PID, backlog_id, lineage["task_id"]),
+    ).fetchone()[0] == before_count
+    assert conn.total_changes == before_total_changes
+
+    _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+        prepare_backlog=False,
+        record_failed_qa=False,
+        worker_owned_implementation=True,
+        implementation_commit_sha=candidate_commit,
+    )
+    stale_before_count = conn.execute(
+        """SELECT COUNT(*) FROM task_timeline_events
+           WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
+        (PID, backlog_id, lineage["task_id"]),
+    ).fetchone()[0]
+    stale_before_changes = conn.total_changes
+    stale_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=json.loads(json.dumps(no_pass_body)),
+    )
+    stale_ctx._session = dict(query_ctx._session)
+    with pytest.raises(GovernanceError) as stale_rejected:
+        server.handle_task_timeline_append(stale_ctx)
+    assert stale_rejected.value.code == "qa_graph_trace_mismatch"
+    assert any(
+        mismatch["field"] == "comparison_authority"
+        and mismatch["actual"]
+        == "exact_candidate_direct_main_boundary_ambiguous"
+        for mismatch in stale_rejected.value.details["identity_mismatches"]
+    )
+    assert conn.execute(
+        """SELECT COUNT(*) FROM task_timeline_events
+           WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
+        (PID, backlog_id, lineage["task_id"]),
+    ).fetchone()[0] == stale_before_count
+    assert conn.total_changes == stale_before_changes
+
+
+def test_exact_candidate_direct_main_comparison_authority_rejects_untrusted_lineage(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="direct-main-exact-rejections",
+    )
+    project_root = fixture.root
+    changed_path = project_root / "src" / "direct_main.py"
+    changed_path.write_text("DIRECT_MAIN = 1\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "src/direct_main.py"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "direct-main candidate one"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+
+    missing_backlog = "AC-DIRECT-MAIN-EXACT-MISSING-IMPLEMENTATION"
+    missing = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=missing_backlog,
+        record_failed_qa=False,
+        worker_owned_implementation=False,
+        implementation_commit_sha=candidate_commit,
+    )
+    missing_before = conn.total_changes
+    missing_authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": missing_backlog,
+            "task_id": missing["task_id"],
+            "commit_sha": candidate_commit,
+        },
+    )
+    assert missing_authority["machine_reason"] == (
+        "exact_candidate_direct_main_implementation_missing"
+    )
+    assert missing_authority["zero_write_rejection"] is True
+    assert missing_authority["writes_performed"] is False
+    assert conn.total_changes == missing_before
+
+    forged_backlog = "AC-DIRECT-MAIN-EXACT-FORGED-IMPLEMENTATION"
+    forged = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=forged_backlog,
+        record_failed_qa=False,
+        worker_owned_implementation=True,
+        implementation_commit_sha=candidate_commit,
+        worker_claim_overrides={"evidence_owner": "worker:/root/forged"},
+    )
+    forged_before = conn.total_changes
+    forged_authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": forged_backlog,
+            "task_id": forged["task_id"],
+            "commit_sha": candidate_commit,
+        },
+    )
+    assert forged_authority["machine_reason"] == (
+        "exact_candidate_direct_main_implementation_missing"
+    )
+    assert forged_authority["fail_closed"] is True
+    assert conn.total_changes == forged_before
+
+    ambiguous_backlog = "AC-DIRECT-MAIN-EXACT-AMBIGUOUS-IMPLEMENTATION"
+    ambiguous = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=ambiguous_backlog,
+        record_failed_qa=False,
+        worker_owned_implementation=True,
+        implementation_commit_sha=candidate_commit,
+    )
+    implementation_id = int(
+        ambiguous["implementation_event_ref"].split(":", 1)[1]
+    )
+    implementation_row = conn.execute(
+        "SELECT * FROM task_timeline_events WHERE project_id = ? AND id = ?",
+        (PID, implementation_id),
+    ).fetchone()
+    implementation_event = task_timeline._row_to_dict(implementation_row)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=ambiguous_backlog,
+        task_id=ambiguous["task_id"],
+        event_type=implementation_event["event_type"],
+        event_kind=implementation_event["event_kind"],
+        phase=implementation_event["phase"],
+        status=implementation_event["status"],
+        actor=implementation_event["actor"],
+        commit_sha=implementation_event["commit_sha"],
+        payload=implementation_event["payload"],
+        verification=implementation_event["verification"],
+        artifact_refs=implementation_event["artifact_refs"],
+    )
+    conn.commit()
+    ambiguous_before = conn.total_changes
+    ambiguous_authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": ambiguous_backlog,
+            "task_id": ambiguous["task_id"],
+            "commit_sha": candidate_commit,
+        },
+    )
+    assert ambiguous_authority["machine_reason"] == (
+        "exact_candidate_direct_main_implementation_ambiguous"
+    )
+    assert ambiguous_authority["identity_mismatches"] == [
+        {
+            "field": "authoritative_implementation_event_count",
+            "expected": 1,
+            "actual": 2,
+        }
+    ]
+    assert conn.total_changes == ambiguous_before
+
+    changed_path.write_text("DIRECT_MAIN = 2\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "commit", "-am", "direct-main candidate two"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    other_candidate = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    mismatch_backlog = "AC-DIRECT-MAIN-EXACT-COMMIT-MISMATCH"
+    mismatch = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=mismatch_backlog,
+        record_failed_qa=False,
+        worker_owned_implementation=True,
+        implementation_commit_sha=candidate_commit,
+    )
+    mismatch_before = conn.total_changes
+    mismatch_authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": mismatch_backlog,
+            "task_id": mismatch["task_id"],
+            "commit_sha": other_candidate,
+        },
+    )
+    assert mismatch_authority["machine_reason"] == (
+        "exact_candidate_direct_main_implementation_commit_mismatch"
+    )
+    assert mismatch_authority["identity_mismatches"] == [
+        {
+            "field": "candidate_commit_sha",
+            "expected": candidate_commit,
+            "actual": other_candidate,
+        }
+    ]
+    assert conn.total_changes == mismatch_before
+
+    subprocess.run(
+        ["git", "checkout", "--orphan", "unrelated-comparison-base"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "rm", "-rf", "."],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (project_root / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "unrelated.txt"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "unrelated comparison base"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    unrelated_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "--detach", other_candidate],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    with pytest.raises(server._QACandidateOverlayError) as nonancestor:
+        server._qa_exact_candidate_context(
+            project_root,
+            project_id=PID,
+            canonical_project_root=project_root,
+            candidate_commit_sha=other_candidate,
+            comparison_base_commit_sha=unrelated_commit,
+            comparison_base_commit_source=(
+                server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE
+            ),
+            comparison_base_commit_lineage_source=(
+                server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+            ),
+            comparison_authority_required=True,
+        )
+    assert nonancestor.value.reason == (
+        "exact_candidate_comparison_base_not_ancestor"
+    )
+    assert server._qa_overlay_identity_mismatches(nonancestor.value) == [
+        {
+            "field": "comparison_base_commit_sha",
+            "expected": f"full ancestor of candidate {other_candidate}",
+            "actual": unrelated_commit,
+        }
+    ]
 
 
 def test_direct_main_failed_qa_accepts_route_bound_worker_owned_implementation(

@@ -7821,10 +7821,16 @@ _QA_POSTMERGE_COMPARISON_BASE_SOURCE = (
     "ContractRuntime.completed_lines.observer_merge+"
     "parallel_branch_merge_queue_items.target_head_before_merge"
 )
+_QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE = _QA_WORKER_COMPARISON_BASE_SOURCE
+_QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE = (
+    "task_timeline.accepted_direct_main_worker_implementation+"
+    "git.single_parent"
+)
 _QA_COMPARISON_BASE_SOURCES = frozenset(
     {
         _QA_WORKER_COMPARISON_BASE_SOURCE,
         _QA_POSTMERGE_COMPARISON_BASE_SOURCE,
+        _QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE,
     }
 )
 _QA_EXACT_COMPARISON_FAILURE_REASONS = frozenset(
@@ -9150,6 +9156,200 @@ def _contract_runtime_full_commit_value(project_id: str, value: Any) -> str:
     return _qa_post_merge_resolve_commit(Path(project_root), normalized)
 
 
+def _qa_exact_candidate_direct_main_comparison_failure(
+    machine_reason: str,
+    *,
+    field: str,
+    expected: Any,
+    actual: Any,
+) -> dict[str, Any]:
+    """Return one public-safe, non-authoritative direct-main diagnosis."""
+
+    return {
+        "source": _QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE,
+        "machine_reason": str(machine_reason or "").strip(),
+        "identity_mismatches": [
+            {
+                "field": str(field or "").strip(),
+                "expected": expected,
+                "actual": actual,
+            }
+        ],
+        "fail_closed": True,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+    }
+
+
+def _qa_exact_candidate_direct_main_events(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    """Return accepted direct-main boundaries for one exact onboard task."""
+
+    expected_task_id = _onboard_service_execution_id(project_id, backlog_id)
+    if not backlog_id or task_id != expected_task_id:
+        return []
+    by_id: dict[int, dict[str, Any]] = {}
+    for event_kind in (
+        "observer_direct_implementation_exception",
+        "observer_direct_mutation_exception",
+    ):
+        for event in _onboard_parentless_direct_main_timeline_events(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            event_kind=event_kind,
+        ):
+            event_id = int(event.get("id") or event.get("event_id") or 0)
+            if (
+                event_id > 0
+                and _onboard_parentless_direct_main_event_is_accepted(event)
+            ):
+                by_id[event_id] = event
+    return [by_id[event_id] for event_id in sorted(by_id, reverse=True)]
+
+
+def _qa_exact_candidate_direct_main_comparison_authority(
+    conn,
+    *,
+    project_id: str,
+    proof: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve a direct-main base only from durable event and Git lineage."""
+
+    backlog_id = str(proof.get("backlog_id") or "").strip()
+    task_id = str(proof.get("task_id") or "").strip()
+    direct_events = _qa_exact_candidate_direct_main_events(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    if not direct_events:
+        return {}
+    if len(direct_events) != 1:
+        return _qa_exact_candidate_direct_main_comparison_failure(
+            "exact_candidate_direct_main_boundary_ambiguous",
+            field="direct_main_pre_mutation_event_count",
+            expected=1,
+            actual=len(direct_events),
+        )
+    direct_event = direct_events[0]
+    direct_event_id = int(
+        direct_event.get("id") or direct_event.get("event_id") or 0
+    )
+    candidate_commit_sha = _contract_runtime_full_commit_value(
+        project_id,
+        proof.get("commit_sha"),
+    )
+    if not candidate_commit_sha:
+        return _qa_exact_candidate_direct_main_comparison_failure(
+            "exact_candidate_direct_main_candidate_commit_unavailable",
+            field="candidate_commit_sha",
+            expected="available full candidate commit",
+            actual="missing_or_unavailable",
+        )
+    implementation_events = (
+        _onboard_parentless_direct_main_timeline_events(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            event_kind="implementation",
+            after_event_id=direct_event_id,
+        )
+    )
+    authoritative_events = [
+        event
+        for event in implementation_events
+        if _onboard_parentless_direct_main_worker_implementation_is_authoritative(
+            event,
+            direct_event=direct_event,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    ]
+    authoritative_commits = sorted(
+        {
+            str(event.get("commit_sha") or "").strip().lower()
+            for event in authoritative_events
+            if str(event.get("commit_sha") or "").strip()
+        }
+    )
+    if len(authoritative_events) != 1:
+        return _qa_exact_candidate_direct_main_comparison_failure(
+            (
+                "exact_candidate_direct_main_implementation_missing"
+                if not authoritative_events
+                else "exact_candidate_direct_main_implementation_ambiguous"
+            ),
+            field="authoritative_implementation_event_count",
+            expected=1,
+            actual=len(authoritative_events),
+        )
+    if authoritative_commits != [candidate_commit_sha]:
+        return _qa_exact_candidate_direct_main_comparison_failure(
+            "exact_candidate_direct_main_implementation_commit_mismatch",
+            field="candidate_commit_sha",
+            expected=authoritative_commits[0] if authoritative_commits else "",
+            actual=candidate_commit_sha,
+        )
+
+    project_root = project_service.resolve_project_root(
+        project_id,
+        None,
+        fallback_self=True,
+    )
+    if project_root is None:
+        return _qa_exact_candidate_direct_main_comparison_failure(
+            "exact_candidate_direct_main_project_root_unavailable",
+            field="canonical_project_root",
+            expected="registered project root",
+            actual="unavailable",
+        )
+    parents = _qa_git_bytes(
+        Path(project_root).resolve(),
+        ["rev-list", "--parents", "--max-count=1", candidate_commit_sha],
+    )
+    parent_tokens = parents.stdout.decode(
+        "ascii", errors="ignore"
+    ).strip().lower().split()
+    if (
+        parents.returncode != 0
+        or not parent_tokens
+        or parent_tokens[0] != candidate_commit_sha
+        or len(parent_tokens) != 2
+    ):
+        return _qa_exact_candidate_direct_main_comparison_failure(
+            "exact_candidate_direct_main_base_lineage_ambiguous",
+            field="candidate_parent_count",
+            expected=1,
+            actual=max(len(parent_tokens) - 1, 0),
+        )
+    comparison_base = _contract_runtime_full_commit_value(
+        project_id,
+        parent_tokens[1],
+    )
+    if not comparison_base or comparison_base == candidate_commit_sha:
+        return _qa_exact_candidate_direct_main_comparison_failure(
+            "exact_candidate_direct_main_base_commit_unavailable",
+            field="comparison_base_commit_sha",
+            expected="available full commit distinct from candidate",
+            actual="missing_or_equal_to_candidate",
+        )
+    return {
+        "commit_sha": comparison_base,
+        "source": _QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE,
+        "lineage_source": _QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE,
+    }
+
+
 def _qa_exact_candidate_runtime_comparison_authority(
     conn,
     *,
@@ -9167,9 +9367,13 @@ def _qa_exact_candidate_runtime_comparison_authority(
         proof.get("commit_sha"),
     )
     context = get_branch_context(conn, project_id, task_id) if task_id else None
-    if context is None or str(
-        getattr(context, "backlog_id", "") or ""
-    ).strip() != backlog_id:
+    if context is None:
+        return _qa_exact_candidate_direct_main_comparison_authority(
+            conn,
+            project_id=project_id,
+            proof=proof,
+        )
+    if str(getattr(context, "backlog_id", "") or "").strip() != backlog_id:
         return {}
     execution_ids = [
         str(getattr(context, field, "") or "").strip()
@@ -9264,12 +9468,56 @@ def _qa_exact_candidate_comparison_authority_required(
     task_id = str(proof.get("task_id") or "").strip()
     backlog_id = str(proof.get("backlog_id") or "").strip()
     context = get_branch_context(conn, project_id, task_id) if task_id else None
-    return bool(
-        context is not None
-        and backlog_id
-        and str(getattr(context, "backlog_id", "") or "").strip()
-        == backlog_id
+    if context is not None:
+        return bool(
+            backlog_id
+            and str(getattr(context, "backlog_id", "") or "").strip()
+            == backlog_id
+        )
+    direct_events = _qa_exact_candidate_direct_main_events(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
     )
+    if not direct_events:
+        return False
+    direct_event_id = int(
+        direct_events[0].get("id")
+        or direct_events[0].get("event_id")
+        or 0
+    )
+    implementation_events = (
+        _onboard_parentless_direct_main_timeline_events(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            event_kind="implementation",
+            after_event_id=direct_event_id,
+        )
+    )
+    for event in implementation_events:
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        materialized_from = (
+            payload.get("materialized_from")
+            if isinstance(payload.get("materialized_from"), Mapping)
+            else {}
+        )
+        if any(
+            str(value or "").strip().startswith("worker:")
+            for value in (
+                event.get("actor"),
+                payload.get("evidence_owner"),
+                payload.get("authored_by"),
+            )
+        ) or str(materialized_from.get("worker_task") or "").strip():
+            return True
+    return False
 
 
 def _qa_exact_candidate_context(
@@ -9281,6 +9529,7 @@ def _qa_exact_candidate_context(
     escalation: Mapping[str, Any] | None = None,
     comparison_base_commit_sha: str = "",
     comparison_base_commit_source: str = "",
+    comparison_base_commit_lineage_source: str = "",
     comparison_authority_required: bool = False,
     registered_allocator_worktree_paths: Sequence[str] = (),
     exact_snapshot_materialization_provenance: Mapping[str, Any] | None = None,
@@ -9316,6 +9565,13 @@ def _qa_exact_candidate_context(
     root_identity["comparison_authority_required"] = (
         comparison_authority_required
     )
+    comparison_base_commit_lineage_source = str(
+        comparison_base_commit_lineage_source or ""
+    ).strip()
+    if comparison_base_commit_lineage_source:
+        root_identity["comparison_base_commit_lineage_source"] = (
+            comparison_base_commit_lineage_source
+        )
     if comparison_authority_required and not comparison_base_commit_sha:
         _qa_overlay_fail(
             "exact_candidate_comparison_base_required",
@@ -9376,6 +9632,9 @@ def _qa_exact_candidate_context(
     )
     return {
         **diff_identity,
+        "comparison_base_commit_lineage_source": (
+            comparison_base_commit_lineage_source
+        ),
         "comparison_authority_required": comparison_authority_required,
         "graph_basis_decision": graph_basis_decision,
         "graph_basis_decision_hash": stable_sha256(graph_basis_decision),
@@ -9756,6 +10015,9 @@ _QA_REVIEW_CLAIM_ALIASES = {
         "comparison_base_commit",
     ),
     "comparison_base_commit_source": ("comparison_base_commit_source",),
+    "comparison_base_commit_lineage_source": (
+        "comparison_base_commit_lineage_source",
+    ),
     "candidate_overlay_hash": ("candidate_overlay_hash",),
     "root_identity_hash": ("root_identity_hash",),
     "query_root": ("query_root",),
@@ -10135,6 +10397,16 @@ def _qa_graph_review_context_from_trace_row(
         "comparison_base_commit_source": (
             str(root_identity_raw.get("comparison_base_commit_source") or "")
             .strip()
+            if isinstance(root_identity_raw, Mapping)
+            else ""
+        ),
+        "comparison_base_commit_lineage_source": (
+            str(
+                root_identity_raw.get(
+                    "comparison_base_commit_lineage_source"
+                )
+                or ""
+            ).strip()
             if isinstance(root_identity_raw, Mapping)
             else ""
         ),
@@ -10929,6 +11201,68 @@ def _qa_reverify_candidate_trace_context(
         )
         return review_context, mismatches
     if review_context.get("graph_basis") == "exact_candidate_snapshot":
+        comparison_authority_required = bool(
+            review_context.get("comparison_authority_required")
+            or root_identity.get("comparison_authority_required")
+        )
+        if comparison_authority_required:
+            current_authority = (
+                _qa_exact_candidate_runtime_comparison_authority(
+                    conn,
+                    project_id=project_id,
+                    proof={
+                        "backlog_id": str(row["backlog_id"] or "").strip(),
+                        "task_id": str(row["task_id"] or "").strip(),
+                        "commit_sha": review_context[
+                            "candidate_commit_sha"
+                        ],
+                    },
+                )
+            )
+            current_commit = str(
+                current_authority.get("commit_sha") or ""
+            ).strip().lower()
+            if not current_commit:
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "comparison_authority",
+                        "expected": "current unambiguous server-owned lineage",
+                        "actual": str(
+                            current_authority.get("machine_reason")
+                            or "missing"
+                        ),
+                    }
+                )
+                return review_context, mismatches
+            current_fields = {
+                "comparison_base_commit_sha": current_commit,
+                "comparison_base_commit_source": str(
+                    current_authority.get("source") or ""
+                ).strip(),
+                "comparison_base_commit_lineage_source": str(
+                    current_authority.get("lineage_source") or ""
+                ).strip(),
+            }
+            persisted_fields = {
+                field: str(root_identity.get(field) or "").strip().lower()
+                if field == "comparison_base_commit_sha"
+                else str(root_identity.get(field) or "").strip()
+                for field in current_fields
+            }
+            for field, expected in current_fields.items():
+                actual = persisted_fields[field]
+                if actual != expected:
+                    mismatches.append(
+                        {
+                            "trace_id": trace_id,
+                            "field": field,
+                            "expected": expected,
+                            "actual": actual,
+                        }
+                    )
+            if mismatches:
+                return review_context, mismatches
         persisted_decision = review_context.get("graph_basis_decision")
         persisted_decision = (
             persisted_decision
@@ -10999,6 +11333,10 @@ def _qa_reverify_candidate_trace_context(
                 comparison_base_commit_source=str(
                     root_identity.get("comparison_base_commit_source") or ""
                 ),
+                comparison_base_commit_lineage_source=str(
+                    root_identity.get("comparison_base_commit_lineage_source")
+                    or ""
+                ),
                 comparison_authority_required=bool(
                     review_context.get("comparison_authority_required")
                     or root_identity.get("comparison_authority_required")
@@ -11033,6 +11371,7 @@ def _qa_reverify_candidate_trace_context(
             "changed_files_source",
             "comparison_base_commit_sha",
             "comparison_base_commit_source",
+            "comparison_base_commit_lineage_source",
             "query_root_identity_hash",
             "repository_identity_hash",
         ):
@@ -11712,6 +12051,31 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                         proof=proof,
                     )
                 )
+                if (
+                    comparison_authority_required
+                    and not comparison_authority.get("commit_sha")
+                    and comparison_authority.get("machine_reason")
+                ):
+                    _qa_overlay_fail(
+                        "exact_candidate_comparison_base_required",
+                        (
+                            "managed exact candidate review requires one "
+                            "unambiguous server-owned comparison base"
+                        ),
+                        authority_machine_reason=str(
+                            comparison_authority.get("machine_reason") or ""
+                        ),
+                        comparison_base_commit_source=str(
+                            comparison_authority.get("source") or ""
+                        ),
+                        identity_mismatches=list(
+                            comparison_authority.get("identity_mismatches")
+                            or []
+                        ),
+                        fail_closed=True,
+                        zero_write_rejection=True,
+                        writes_performed=False,
+                    )
                 review_context.update(
                     {
                         **_qa_exact_candidate_context(
@@ -11727,6 +12091,10 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                             ),
                             comparison_base_commit_source=(
                                 comparison_authority.get("source") or ""
+                            ),
+                            comparison_base_commit_lineage_source=(
+                                comparison_authority.get("lineage_source")
+                                or ""
                             ),
                             comparison_authority_required=(
                                 comparison_authority_required
@@ -11766,6 +12134,14 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                         "exact_candidate_snapshot_required": False,
                         "fail_closed": True,
                         "write_performed": False,
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                        "public_safe": True,
+                        "secret_safe": True,
+                        "source": (
+                            "agent.governance.server::"
+                            "_require_graph_query_capability"
+                        ),
                         "next_legal_action": (
                             "repair_the_existing_runtime_comparison_authority_"
                             "then_retry_the_same_graph_query"
@@ -17918,6 +18294,7 @@ def _runtime_context_service_qa_graph_trace_refs(
                 "changed_files_source",
                 "comparison_base_commit_sha",
                 "comparison_base_commit_source",
+                "comparison_base_commit_lineage_source",
                 "comparison_authority_required",
                 "candidate_overlay_hash",
                 "root_identity_hash",
@@ -58642,6 +59019,16 @@ def handle_graph_governance_query(ctx: RequestContext):
                             ).get("comparison_base_commit_source")
                             or ""
                         ),
+                        comparison_base_commit_lineage_source=str(
+                            (
+                                qa_proof.get("root_identity")
+                                if isinstance(
+                                    qa_proof.get("root_identity"), Mapping
+                                )
+                                else {}
+                            ).get("comparison_base_commit_lineage_source")
+                            or ""
+                        ),
                         comparison_authority_required=bool(
                             qa_proof.get("comparison_authority_required")
                             or (
@@ -58675,6 +59062,7 @@ def handle_graph_governance_query(ctx: RequestContext):
                             "changed_files_source",
                             "comparison_base_commit_sha",
                             "comparison_base_commit_source",
+                            "comparison_base_commit_lineage_source",
                             "root_identity_hash",
                             "query_root_identity_hash",
                             "repository_identity_hash",
@@ -81865,6 +82253,7 @@ def _contract_runtime_projected_qa_graph_line(
             "changed_files_source",
             "comparison_base_commit_sha",
             "comparison_base_commit_source",
+            "comparison_base_commit_lineage_source",
             "candidate_overlay_hash",
             "root_identity_hash",
             "query_root_identity_hash",
@@ -122891,6 +123280,7 @@ def _contract_runtime_persisted_post_merge_review_context(
                 "changed_files_source",
                 "comparison_base_commit_sha",
                 "comparison_base_commit_source",
+                "comparison_base_commit_lineage_source",
                 "comparison_authority_required",
                 "candidate_overlay_hash",
                 "root_identity_hash",
