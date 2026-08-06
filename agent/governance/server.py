@@ -96024,7 +96024,7 @@ def _contract_runtime_mf_parallel_required_worker_count(
         else {}
     )
     if not claimed:
-        return pinned_count
+        return selected_count
     backlog_lineage = (
         record.get("backlog_lineage")
         if isinstance(record.get("backlog_lineage"), Mapping)
@@ -137267,7 +137267,11 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                     ).strip(),
                 )
             )
-        if required_worker_count == 1 and observer_selected_cardinality:
+        if (
+            required_worker_count == 1
+            and observer_selected_cardinality
+            and claimed_parent_batch_id
+        ):
             if not batch_child_authority:
                 raise ValidationError(
                     "mf_parallel observer may select one worker only for a "
@@ -137781,10 +137785,14 @@ def handle_project_mf_parallel_revise(ctx: RequestContext):
                 project_id=project_id,
             )
         )
-        if (
-            required_worker_count > 1
-            and _parallel_branch_allocate_declares_batch_child(record)
-        ):
+        verified_batch_child_authority = (
+            _parallel_branch_allocate_verified_batch_child_lineage_authority(
+                conn,
+                project_id=project_id,
+                record=record,
+            )
+        )
+        if required_worker_count > 1 and verified_batch_child_authority:
             raise GovernanceError(
                 "mf_parallel_batch_child_nested_fanout_unsupported",
                 (
@@ -137850,7 +137858,7 @@ def handle_project_mf_parallel_revise(ctx: RequestContext):
                 else {}
             )
         )
-        if required_worker_count == 1:
+        if required_worker_count == 1 and batch_child_authority:
             verified_authority = (
                 _contract_runtime_mf_batch_child_worker_cardinality_authority(
                     conn,
