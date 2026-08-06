@@ -113587,7 +113587,75 @@ def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution
     assert entered["next_legal_action"]["id"] == "observer_prefill_child_contracts"
 
 
-def test_mf_parallel_revise_rejects_standalone_change_to_one_worker(conn):
+def test_mf_parallel_enter_accepts_explicit_standalone_one_worker(conn):
+    backlog_id = "AC-MF-PARALLEL-STANDALONE-ONE"
+    task_id = "mf-parallel-standalone-one"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-mf-parallel-standalone-one",
+    )
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    contract_execution_id = server._mf_parallel_execution_id(
+        PID,
+        backlog_id,
+        parent_execution_id,
+        task_id,
+    )
+    route_token_ref = "rtok-mf-parallel-standalone-one"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["mf_parallel_enter"],
+    )
+
+    entered = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "reason": "Observer selects one bounded standalone worker.",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+                "onboard_service_waiver": True,
+                "owned_files": ["agent/governance/server.py"],
+                "metadata": {"required_worker_count": 1},
+            },
+        )
+    )
+
+    assert entered["contract_execution_id"] == contract_execution_id
+    policy = entered["worker_cardinality_policy"]
+    assert policy["source"] == "observer_selected_standalone_cardinality"
+    assert policy["required_worker_count"] == 1
+    assert policy["atomic_dispatch_required"] is False
+    record = server._contract_runtime(conn).store.get(contract_execution_id)
+    selection = record["metadata"][
+        "observer_worker_cardinality_selection"
+    ]
+    assert selection["observer_selected"] is True
+    assert selection["selection_origin"] == "mf_parallel_enter"
+    assert selection["selection_frozen_at_enter"] is True
+    assert selection["required_worker_count"] == 1
+    assert selection["atomic_dispatch_required"] is False
+    projected = server._contract_runtime_read(
+        conn,
+        contract_execution_id=contract_execution_id,
+        actor_role="observer",
+    )
+    allocation_policy = projected["runtime_guide"][
+        "effective_allocation_precheck_policy"
+    ]
+    assert allocation_policy["expected_lane_count"] == 1
+    assert allocation_policy["atomic"] is False
+    assert allocation_policy["scope"] == "standalone_contract"
+
+
+def test_mf_parallel_revise_accepts_standalone_change_to_one_worker(conn):
     backlog_id = "AC-MF-PARALLEL-REVISE-STANDALONE"
     task_id = "mf-parallel-revise-standalone"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -113667,26 +113735,51 @@ def test_mf_parallel_revise_rejects_standalone_change_to_one_worker(conn):
             )
         )
 
-    with pytest.raises(
-        GovernanceError,
-        match="one worker may be selected only for a server-verified",
-    ):
-        server.handle_project_mf_parallel_revise(
-            _ctx(
-                {
-                    "project_id": PID,
-                    "contract_execution_id": contract_execution_id,
-                },
-                method="POST",
-                body={
-                    "backlog_id": backlog_id,
-                    "required_worker_count": 1,
-                    "reason": "Standalone one-worker downgrade must fail closed.",
-                    "observer_session_id": observer_session_id,
-                    "observer_route_token_ref": route_token_ref,
-                },
-            )
+    revised = server.handle_project_mf_parallel_revise(
+        _ctx(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "required_worker_count": 1,
+                "reason": "Use one bounded worker before allocation starts.",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+            },
         )
+    )
+
+    assert revised["revision"]["prior_required_worker_count"] == 2
+    assert revised["revision"]["required_worker_count"] == 1
+    assert revised["revision"][
+        "accepted_before_allocation_or_dispatch"
+    ] is True
+    policy = revised["worker_cardinality_policy"]
+    assert policy["source"] == "observer_selected_standalone_cardinality"
+    assert policy["required_worker_count"] == 1
+    assert policy["atomic_dispatch_required"] is False
+    record = server._contract_runtime(conn).store.get(contract_execution_id)
+    selection = record["metadata"][
+        "observer_worker_cardinality_selection"
+    ]
+    assert selection["selection_origin"] == "mf_parallel_revise"
+    assert selection["selection_frozen_at_enter"] is False
+    assert selection["required_worker_count"] == 1
+    assert len(record["metadata"]["observer_worker_cardinality_revisions"]) == 1
+    projected = server._contract_runtime_read(
+        conn,
+        contract_execution_id=contract_execution_id,
+        actor_role="observer",
+    )
+    allocation_policy = projected["runtime_guide"][
+        "effective_allocation_precheck_policy"
+    ]
+    assert allocation_policy["expected_lane_count"] == 1
+    assert allocation_policy["atomic"] is False
+    assert allocation_policy["scope"] == "standalone_contract"
 
 
 def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
