@@ -123488,3 +123488,93 @@ def test_runtime_context_close_gate_success_projects_canonical_line_once():
         runtime_context_id="mfrctx-single-write-regression",
         contract_execution_id="cex-single-write-regression",
     ) == {}
+
+
+def test_close_grade_merge_projection_pins_rev9_lane_merges_and_falls_back(
+    conn,
+    monkeypatch,
+):
+    """Close-grade authority must read the same merge projection as record-grade.
+
+    rev8/rev9 lane merges are authorized before the integration QA, so
+    ``_contract_runtime_trusted_merge_projection`` cannot rebuild them.  The
+    close-grade resolver therefore pins the same lane-merge projection the
+    record-grade receipt uses, and falls back to the trusted projection for
+    every shape the pinned projection declines.  It never invents authority.
+    """
+
+    record = _rev8_postmerge_qa_binding_record()
+    trusted_calls: list[str] = []
+    real_trusted = server._contract_runtime_trusted_merge_projection
+
+    def counting_trusted(conn_arg, *, project_id, record):
+        trusted_calls.append(str(record.get("revision") or ""))
+        return real_trusted(conn_arg, project_id=project_id, record=record)
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_trusted_merge_projection",
+        counting_trusted,
+    )
+
+    pinned = server._contract_runtime_close_grade_merge_projection(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    assert trusted_calls == []
+    assert pinned["timeline_verified"] is True
+    assert pinned["all_lane_merges_verified"] is True
+    assert pinned["lane_merge_count"] == 2
+    assert pinned["merged_commit_sha"] == "2" * 40
+    assert pinned["merge_source_ref"] == "timeline:902"
+    assert pinned["merge_event_id"] == 902
+    assert pinned["pre_qa_merge_authorized"] is True
+    assert pinned["close_satisfying"] is False
+    assert pinned == server._contract_runtime_rev8_two_worker_merge_projection(
+        record,
+        required_worker_count=2,
+        conn=conn,
+        project_id=PID,
+    )
+
+    # A revision outside the post-merge family keeps the trusted projection.
+    legacy_record = json.loads(json.dumps(record))
+    legacy_record["revision"] = "rev7"
+    legacy = server._contract_runtime_close_grade_merge_projection(
+        conn,
+        project_id=PID,
+        record=legacy_record,
+    )
+    assert trusted_calls == ["rev7"]
+    assert legacy["timeline_verified"] is False
+
+    # A rev9 lane that is no longer the server-owned pre-QA merge shape makes
+    # the pinned projection decline; the resolver must fail closed onto the
+    # trusted projection instead of widening the accepted shape.
+    drifted_record = json.loads(json.dumps(record))
+    drifted_record["revision"] = "rev9"
+    drifted_merge_line = next(
+        line
+        for line in drifted_record["completed_lines"]
+        if line.get("line_id") == "observer_merge"
+    )
+    drifted_merge_line["payload"]["durable_merge_authority"][
+        "pre_qa_merge_authorized"
+    ] = False
+    assert (
+        server._contract_runtime_rev8_two_worker_merge_projection(
+            drifted_record,
+            required_worker_count=2,
+            conn=conn,
+            project_id=PID,
+        )
+        == {}
+    )
+    drifted = server._contract_runtime_close_grade_merge_projection(
+        conn,
+        project_id=PID,
+        record=drifted_record,
+    )
+    assert trusted_calls == ["rev7", "rev9"]
+    assert drifted["timeline_verified"] is False

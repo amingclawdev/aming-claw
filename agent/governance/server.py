@@ -118702,6 +118702,53 @@ def _contract_runtime_later_durable_reconcile_supplement(
     return projected
 
 
+def _contract_runtime_close_grade_merge_projection(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve the merge projection close-grade authority derives from.
+
+    rev8/rev9 fan every worker lane in *before* canonical reconcile and run
+    the integration QA afterwards, so their accepted merge lines carry the
+    server-owned pre-QA marker and no pre-merge QA round.
+    ``_contract_runtime_trusted_merge_projection`` can never rebuild those
+    lanes: its completed-line path requires ``qa_contract_runtime_verified``
+    on the recomputed merge round, and its durable path deliberately skips a
+    lane that already owns an ``observer_merge`` line.  Record-grade authority
+    and the current-full projection already resolve these worlds through the
+    pinned lane-merge projection, so close-grade authority must read the same
+    projection or it is unsatisfiable by construction.
+
+    The pinned projection stays fail-closed on its own terms: it returns ``{}``
+    unless every required lane merge joins the selected dispatch, its durable
+    queue identity, and its own timeline event.  When it declines, the trusted
+    projection remains the authority, so this never widens an existing world.
+    """
+
+    if _is_mf_parallel_postmerge_revision(record):
+        merge = _contract_runtime_rev8_two_worker_merge_projection(
+            record,
+            required_worker_count=(
+                _contract_runtime_mf_parallel_current_generation_worker_count(
+                    record,
+                    conn=conn,
+                    project_id=project_id,
+                )
+            ),
+            conn=conn,
+            project_id=project_id,
+        )
+        if merge.get("timeline_verified") is True:
+            return merge
+    return _contract_runtime_trusted_merge_projection(
+        conn,
+        project_id=project_id,
+        record=record,
+    )
+
+
 def _contract_runtime_bind_close_reconcile_authority(
     conn,
     *,
@@ -118719,7 +118766,7 @@ def _contract_runtime_bind_close_reconcile_authority(
         str(projected.get("contract_id") or "")
     ):
         return projected
-    merge = _contract_runtime_trusted_merge_projection(
+    merge = _contract_runtime_close_grade_merge_projection(
         conn,
         project_id=project_id,
         record=projected,

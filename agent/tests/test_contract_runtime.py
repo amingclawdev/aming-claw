@@ -6,7 +6,12 @@ from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
 
-from agent.governance import parallel_branch_runtime, server
+from agent.governance import (
+    graph_snapshot_store,
+    parallel_branch_runtime,
+    server,
+    task_timeline,
+)
 from agent.governance.contracts import ContractDefinitionRegistry
 from agent.governance.contracts.runtime import (
     ContractRuntime,
@@ -2341,3 +2346,746 @@ def test_failed_qa_fresh_dispatch_revision_is_append_only_single_cas_and_replay_
         for error in multiple_current_authorities["decision"]["errors"]
     )
     assert store.update_calls == 2
+
+
+_CLOSE_GRADE_PROJECT_ID = "aming-claw"
+_CLOSE_GRADE_BACKLOG_ID = "AC-REV9-CLOSE-GRADE-RECONCILE-AUTHORITY"
+_CLOSE_GRADE_EXECUTION_ID = "cex-mf-parallel-close-grade-authority"
+_CLOSE_GRADE_BASE_COMMIT = "0" * 40
+_CLOSE_GRADE_LANE_A_COMMIT = "1" * 40
+_CLOSE_GRADE_LANE_B_COMMIT = "2" * 40
+
+
+class _CloseGradeNoCloseConn:
+    """Hand the shared in-memory connection to server-side helpers."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def close(self) -> None:
+        return None
+
+
+def _close_grade_graph_payload() -> dict:
+    return {
+        "deps_graph": {
+            "nodes": [{"id": "n1", "kind": "module", "path": "planner.py"}],
+            "edges": [],
+        }
+    }
+
+
+def _close_grade_connection(tmp_path, monkeypatch) -> sqlite3.Connection:
+    from agent.governance.db import _ensure_schema
+
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root",
+        lambda: tmp_path / "state",
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    graph_snapshot_store.ensure_schema(conn)
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _CloseGradeNoCloseConn(conn),
+    )
+    monkeypatch.setattr(
+        "agent.governance.db.get_connection",
+        lambda _project_id: _CloseGradeNoCloseConn(conn),
+    )
+    return conn
+
+
+def _close_grade_lane_context(conn, *, task_id, merge_queue_id, project_root):
+    return parallel_branch_runtime.upsert_branch_context(
+        conn,
+        parallel_branch_runtime.BranchTaskRuntimeContext(
+            project_id=_CLOSE_GRADE_PROJECT_ID,
+            task_id=task_id,
+            parent_task_id=_CLOSE_GRADE_EXECUTION_ID,
+            root_task_id=_CLOSE_GRADE_EXECUTION_ID,
+            backlog_id=_CLOSE_GRADE_BACKLOG_ID,
+            worker_id=f"worker-{task_id}",
+            worker_slot_id=f"slot-{task_id}",
+            governance_project_id=_CLOSE_GRADE_PROJECT_ID,
+            target_project_id=_CLOSE_GRADE_PROJECT_ID,
+            target_project_root=str(project_root),
+            branch_ref=f"refs/heads/codex/{task_id}",
+            worktree_path=str(project_root),
+            base_commit=_CLOSE_GRADE_BASE_COMMIT,
+            target_head_commit=_CLOSE_GRADE_BASE_COMMIT,
+            merge_queue_id=merge_queue_id,
+            status="worktree_ready",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-08-06T10:00:00Z",
+    )
+
+
+def _close_grade_lane_merge_event(conn, *, context, commit_sha):
+    return task_timeline.record_event(
+        conn,
+        project_id=_CLOSE_GRADE_PROJECT_ID,
+        backlog_id=_CLOSE_GRADE_BACKLOG_ID,
+        task_id=context.task_id,
+        event_type="merge.live",
+        event_kind="merge",
+        phase="merge",
+        actor="observer:rev9-close-grade",
+        status="passed",
+        commit_sha=commit_sha,
+        payload={
+            "actor_role": "observer",
+            "backlog_id": _CLOSE_GRADE_BACKLOG_ID,
+            "contract_execution_id": _CLOSE_GRADE_EXECUTION_ID,
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+            "merge_queue_id": context.merge_queue_id,
+            "merge_commit": commit_sha,
+            "target_head_after_merge": commit_sha,
+        },
+    )
+
+
+def _close_grade_durable_merge_line(
+    *,
+    context,
+    merge_event,
+    commit_sha,
+    target_head_before_merge,
+    dispatch_source_ref,
+):
+    return {
+        "stage_id": "observer_lane_merge",
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "evidence_kind": "merge",
+        "line_instance_id": f"runtime_context:{context.runtime_context_id}",
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+        "commit_sha": commit_sha,
+        "payload": {
+            "durable_merge_authority": {
+                "schema_version": (
+                    "contract_runtime.observer_merge_durable_authority.v1"
+                ),
+                "source": (
+                    "parallel_branch_merge_queue+task_timeline_merge"
+                ),
+                "server_derived": True,
+                "db_verified": True,
+                "project_id": _CLOSE_GRADE_PROJECT_ID,
+                "backlog_id": _CLOSE_GRADE_BACKLOG_ID,
+                "contract_execution_id": _CLOSE_GRADE_EXECUTION_ID,
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+                "merge_queue_id": context.merge_queue_id,
+                "queue_item_id": (
+                    f"{context.merge_queue_id}:{context.task_id}"
+                ),
+                "queue_item_status": "merged",
+                "branch_head": commit_sha,
+                "merge_commit": commit_sha,
+                "target_head_before_merge": target_head_before_merge,
+                "target_head_after_merge": commit_sha,
+                "merge_gate_passed": True,
+                "merge_event_ref": f"timeline:{merge_event['id']}",
+                "merge_event_id": int(merge_event["id"]),
+                "merge_event_created_at": str(merge_event["created_at"]),
+                "timeline_event_refs": [f"timeline:{merge_event['id']}"],
+                "contract_runtime_dispatch_source_ref": dispatch_source_ref,
+                # rev8/rev9 merge every lane before canonical reconcile and
+                # run the integration QA afterwards.
+                "pre_qa_merge_authorized": True,
+                "final_qa_required_after_reconcile": True,
+                "qa_contract_runtime_verified": False,
+                "qa_completed_line_index": -1,
+                "qa_graph_completed_line_index": -1,
+                "qa_acceptance_ref": "",
+                "qa_audit_only_no_pass_authority": {},
+                "close_satisfying": False,
+                "no_pass_claim": False,
+                "overall_release_pass_claimed": False,
+                "authoritative_pass_synthesized": False,
+                "worker_commit_completed_line_index": -1,
+            },
+            "merge_commit": commit_sha,
+            "merge_gate_passed": True,
+            "merge_queue_id": context.merge_queue_id,
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+        },
+    }
+
+
+def _close_grade_worker_lines(*, context, commit_sha):
+    lines = []
+    for stage_id, line_id, evidence_kind, status in (
+        ("worker_read", "worker_read_runtime_guide", "read_receipt", "accepted"),
+        ("worker_startup", "worker_startup", "mf_subagent_startup", "passed"),
+        ("worker_context", "worker_graph_context", "graph_trace", ""),
+        (
+            "worker_implementation",
+            "worker_implementation",
+            "implementation",
+            "passed",
+        ),
+        ("worker_commit", "worker_commit", "worker_commit", ""),
+        (
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "record_finish_time_worker_attestation",
+            "",
+        ),
+        ("worker_finish", "worker_finish_gate", "mf_subagent_finish_gate", ""),
+    ):
+        line = {
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "actor_role": "mf_sub",
+            "worker_role": "mf_sub",
+            "evidence_kind": evidence_kind,
+            "line_instance_id": (
+                f"runtime_context:{context.runtime_context_id}"
+            ),
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+            "payload": {
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+            },
+        }
+        if status:
+            line["status"] = status
+        if line_id in {"worker_commit", "worker_finish_gate"}:
+            line["commit_sha"] = commit_sha
+            line["payload"]["commit_sha"] = commit_sha
+        lines.append(line)
+    return lines
+
+
+def _rev9_close_grade_world(
+    tmp_path,
+    monkeypatch,
+    *,
+    record_reconcile_event: bool = True,
+    reconcile_before_final_lane_merge: bool = False,
+    reconcile_scope_execution_id: str = "",
+):
+    """Build one real rev9 post-merge world through the server projections.
+
+    Every authority here is derived by the shipped server code from durable
+    SQLite state: runtime contexts, task timeline events, the active graph
+    snapshot, and its current-full reconcile provenance.  Nothing patches an
+    authority producer and no reconcile identity is hand-fed onto a line.
+    """
+
+    conn = _close_grade_connection(tmp_path, monkeypatch)
+    project_root = tmp_path / "rev9-close-grade-target"
+    project_root.mkdir()
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_head_commit",
+        lambda _root: _CLOSE_GRADE_LANE_B_COMMIT,
+    )
+    ancestry = {
+        (_CLOSE_GRADE_BASE_COMMIT, _CLOSE_GRADE_LANE_A_COMMIT),
+        (_CLOSE_GRADE_LANE_A_COMMIT, _CLOSE_GRADE_LANE_B_COMMIT),
+        (_CLOSE_GRADE_BASE_COMMIT, _CLOSE_GRADE_LANE_B_COMMIT),
+    }
+    monkeypatch.setattr(
+        server,
+        "_git_commit_is_ancestor",
+        lambda _root, ancestor, descendant: (
+            ancestor == descendant or (ancestor, descendant) in ancestry
+        ),
+    )
+
+    lane_a = _close_grade_lane_context(
+        conn,
+        task_id="rev9-close-grade-models",
+        merge_queue_id="mq-rev9-close-grade-models",
+        project_root=project_root,
+    )
+    lane_b = _close_grade_lane_context(
+        conn,
+        task_id="rev9-close-grade-planner",
+        merge_queue_id="mq-rev9-close-grade-planner",
+        project_root=project_root,
+    )
+
+    merge_a = _close_grade_lane_merge_event(
+        conn,
+        context=lane_a,
+        commit_sha=_CLOSE_GRADE_LANE_A_COMMIT,
+    )
+    reconcile_event = None
+    runtime_scope = {
+        "project_id": _CLOSE_GRADE_PROJECT_ID,
+        "backlog_id": _CLOSE_GRADE_BACKLOG_ID,
+        "contract_execution_id": (
+            reconcile_scope_execution_id or _CLOSE_GRADE_EXECUTION_ID
+        ),
+        "runtime_context_id": lane_b.runtime_context_id,
+        "task_id": lane_b.task_id,
+        "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+        "merge_queue_id": lane_b.merge_queue_id,
+        "source": "parallel_branch_runtime_context",
+        "server_derived": True,
+    }
+
+    def _record_reconcile_event():
+        return task_timeline.record_event(
+            conn,
+            project_id=_CLOSE_GRADE_PROJECT_ID,
+            backlog_id=_CLOSE_GRADE_BACKLOG_ID,
+            task_id=lane_b.task_id,
+            event_type="graph.reconcile",
+            event_kind="reconcile",
+            phase="reconcile",
+            actor="observer:rev9-close-grade",
+            status="passed",
+            commit_sha=_CLOSE_GRADE_LANE_B_COMMIT,
+            payload={
+                "actor_role": "observer",
+                "backlog_id": _CLOSE_GRADE_BACKLOG_ID,
+                "contract_execution_id": _CLOSE_GRADE_EXECUTION_ID,
+                "runtime_context_id": lane_b.runtime_context_id,
+                "task_id": lane_b.task_id,
+                "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+                "merge_queue_id": lane_b.merge_queue_id,
+                "runtime_context_scope": runtime_scope,
+                "current_full_reconcile": True,
+                "reconcile_mode": "current_full",
+            },
+        )
+
+    # A reconcile recorded before the final lane merge is durably out of
+    # order; it is written first so its timeline id proves that.
+    if record_reconcile_event and reconcile_before_final_lane_merge:
+        reconcile_event = _record_reconcile_event()
+    merge_b = _close_grade_lane_merge_event(
+        conn,
+        context=lane_b,
+        commit_sha=_CLOSE_GRADE_LANE_B_COMMIT,
+    )
+    if record_reconcile_event and not reconcile_before_final_lane_merge:
+        reconcile_event = _record_reconcile_event()
+
+    event_times = [
+        (merge_a, "2026-08-06T16:00:27Z"),
+        (merge_b, "2026-08-06T16:00:29Z"),
+    ]
+    if reconcile_event is not None:
+        event_times.append(
+            (
+                reconcile_event,
+                "2026-08-06T16:00:28Z"
+                if reconcile_before_final_lane_merge
+                else "2026-08-06T16:01:26Z",
+            )
+        )
+    for event, created_at in event_times:
+        conn.execute(
+            "UPDATE task_timeline_events SET created_at = ? WHERE id = ?",
+            (created_at, int(event["id"])),
+        )
+        event["created_at"] = created_at
+    conn.commit()
+
+    snapshot = graph_snapshot_store.create_graph_snapshot(
+        conn,
+        _CLOSE_GRADE_PROJECT_ID,
+        snapshot_id="full-rev9-close-grade-head",
+        commit_sha=_CLOSE_GRADE_LANE_B_COMMIT,
+        snapshot_kind="full",
+        graph_json=_close_grade_graph_payload(),
+    )
+    graph_snapshot_store.index_graph_snapshot(
+        conn,
+        _CLOSE_GRADE_PROJECT_ID,
+        snapshot["snapshot_id"],
+        nodes=_close_grade_graph_payload()["deps_graph"]["nodes"],
+        edges=_close_grade_graph_payload()["deps_graph"]["edges"],
+    )
+    graph_snapshot_store.activate_graph_snapshot(
+        conn,
+        _CLOSE_GRADE_PROJECT_ID,
+        snapshot["snapshot_id"],
+    )
+    conn.commit()
+    if reconcile_event is not None:
+        graph_snapshot_store.record_current_full_reconcile_provenance(
+            conn,
+            project_id=_CLOSE_GRADE_PROJECT_ID,
+            snapshot_id=snapshot["snapshot_id"],
+            target_commit_sha=_CLOSE_GRADE_LANE_B_COMMIT,
+            request_id=f"req-{_CLOSE_GRADE_EXECUTION_ID}",
+            request_started_at=str(merge_b["created_at"]),
+            route_evidence={
+                "schema_version": (
+                    "graph_current_full_reconcile.route_evidence.v1"
+                ),
+                "authenticated_role": "observer",
+                "authentication_source": "test_protected_entrypoint",
+                "raw_route_token_persisted": False,
+                "protected_action": "graph_current_full_reconcile",
+                "contract_execution_id": (
+                    reconcile_scope_execution_id or _CLOSE_GRADE_EXECUTION_ID
+                ),
+                "runtime_context_id": lane_b.runtime_context_id,
+                "task_id": lane_b.task_id,
+                "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+                "merge_queue_id": lane_b.merge_queue_id,
+                "route_token_scope": {
+                    "project_id": _CLOSE_GRADE_PROJECT_ID,
+                    "backlog_id": _CLOSE_GRADE_BACKLOG_ID,
+                    "task_id": lane_b.task_id,
+                    "runtime_context_id": lane_b.runtime_context_id,
+                },
+                "runtime_context_scope": runtime_scope,
+            },
+            runtime_context_scope=runtime_scope,
+            reconcile_event_id=int(reconcile_event["id"]),
+            reconcile_event_created_at=str(reconcile_event["created_at"]),
+        )
+        conn.commit()
+
+    workers = [
+        {
+            "runtime_context_id": lane.runtime_context_id,
+            "task_id": lane.task_id,
+            "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+            "worker_id": lane.worker_id,
+            "worker_slot_id": lane.worker_slot_id,
+            "merge_queue_id": lane.merge_queue_id,
+        }
+        for lane in (lane_a, lane_b)
+    ]
+    dispatch_source_ref = (
+        f"contract_runtime:{_CLOSE_GRADE_EXECUTION_ID}:completed_lines:0"
+    )
+    completed_lines = [
+        {
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "actor_role": "observer",
+            "evidence_kind": "dispatch_bounded_worker",
+            "payload": {
+                "worker_count": 2,
+                "required_worker_count": 2,
+                "atomic_dispatch": True,
+                "bounded_workers": workers,
+            },
+        }
+    ]
+    for lane, commit_sha in (
+        (lane_a, _CLOSE_GRADE_LANE_A_COMMIT),
+        (lane_b, _CLOSE_GRADE_LANE_B_COMMIT),
+    ):
+        completed_lines.extend(
+            _close_grade_worker_lines(context=lane, commit_sha=commit_sha)
+        )
+    for lane, merge_event, commit_sha, before in (
+        (lane_a, merge_a, _CLOSE_GRADE_LANE_A_COMMIT, _CLOSE_GRADE_BASE_COMMIT),
+        (
+            lane_b,
+            merge_b,
+            _CLOSE_GRADE_LANE_B_COMMIT,
+            _CLOSE_GRADE_LANE_A_COMMIT,
+        ),
+    ):
+        completed_lines.append(
+            _close_grade_durable_merge_line(
+                context=lane,
+                merge_event=merge_event,
+                commit_sha=commit_sha,
+                target_head_before_merge=before,
+                dispatch_source_ref=dispatch_source_ref,
+            )
+        )
+    record = {
+        "project_id": _CLOSE_GRADE_PROJECT_ID,
+        "backlog_id": _CLOSE_GRADE_BACKLOG_ID,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev9",
+        "contract_execution_id": _CLOSE_GRADE_EXECUTION_ID,
+        "completed_lines": completed_lines,
+    }
+
+    # The observer_reconcile line carries exactly what the server records at
+    # reconcile time: the record-grade receipt it derives from durable state.
+    reconcile_receipt = server._contract_runtime_reconcile_record_authority(
+        conn,
+        project_id=_CLOSE_GRADE_PROJECT_ID,
+        record=record,
+    )
+    completed_lines.append(
+        {
+            "stage_id": "observer_reconcile",
+            "line_id": "observer_reconcile",
+            "actor_role": "observer",
+            "evidence_kind": "reconcile",
+            "line_instance_id": f"runtime_context:{lane_b.runtime_context_id}",
+            "runtime_context_id": lane_b.runtime_context_id,
+            "task_id": lane_b.task_id,
+            "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+            "commit_sha": _CLOSE_GRADE_LANE_B_COMMIT,
+            "payload": {"reconcile_authority": reconcile_receipt},
+        }
+    )
+    completed_lines.append(
+        {
+            "stage_id": "qa_graph_context",
+            "line_id": "qa_graph_context",
+            "actor_role": "qa",
+            "evidence_kind": "graph_trace",
+            "line_instance_id": f"runtime_context:{lane_b.runtime_context_id}",
+            "runtime_context_id": lane_b.runtime_context_id,
+            "task_id": lane_b.task_id,
+            "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+            "payload": {
+                "graph_trace_evidence": {
+                    "db_verified": True,
+                    "identity_mismatches": [],
+                    "verified_trace_ids": ["gqt-rev9-close-grade"],
+                    "trace_ids": ["gqt-rev9-close-grade"],
+                }
+            },
+        }
+    )
+    completed_lines.append(
+        {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "actor_role": "qa",
+            "evidence_kind": "independent_verification",
+            "status": "pass",
+            "line_instance_id": f"runtime_context:{lane_b.runtime_context_id}",
+            "runtime_context_id": lane_b.runtime_context_id,
+            "task_id": lane_b.task_id,
+            "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+            "commit_sha": _CLOSE_GRADE_LANE_B_COMMIT,
+            "payload": {
+                "verdict": "pass",
+                "candidate_new_failures": 0,
+                "verified_commit": _CLOSE_GRADE_LANE_B_COMMIT,
+            },
+        }
+    )
+    close_ready_write = {
+        "stage_id": "observer_close",
+        "line_id": "observer_close_ready",
+        "actor_role": "observer",
+        "evidence_kind": "close_ready",
+        "status": "pass",
+        "commit_sha": _CLOSE_GRADE_LANE_B_COMMIT,
+        "runtime_context_id": lane_b.runtime_context_id,
+        "task_id": _CLOSE_GRADE_EXECUTION_ID,
+        "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+        "payload": {
+            "close_commit": _CLOSE_GRADE_LANE_B_COMMIT,
+            "verdict": "pass",
+            "runtime_context_id": lane_b.runtime_context_id,
+            "worker_task_id": lane_b.task_id,
+            "parent_task_id": _CLOSE_GRADE_EXECUTION_ID,
+        },
+    }
+    return SimpleNamespace(
+        conn=conn,
+        record=record,
+        reconcile_receipt=reconcile_receipt,
+        close_ready_write=close_ready_write,
+        lane_a=lane_a,
+        lane_b=lane_b,
+        merge_a=merge_a,
+        merge_b=merge_b,
+        reconcile_event=reconcile_event,
+    )
+
+
+def _close_grade_reconcile_diagnostic(world):
+    bound = server._contract_runtime_bind_close_reconcile_authority(
+        world.conn,
+        project_id=_CLOSE_GRADE_PROJECT_ID,
+        record=world.record,
+    )
+    reconcile_line = next(
+        line
+        for line in bound["completed_lines"]
+        if str(line.get("line_id") or "") == "observer_reconcile"
+    )
+    return bound, server._contract_runtime_mf_parallel_reconcile_close_diagnostic(
+        bound,
+        reconcile_line,
+    )
+
+
+def _close_grade_close_ready_gate(world):
+    return server._contract_runtime_mf_parallel_close_ready_precheck(
+        world.record,
+        world.close_ready_write,
+        conn=world.conn,
+        project_id=_CLOSE_GRADE_PROJECT_ID,
+    )
+
+
+def _reconcile_requirement_ids(gate):
+    return [
+        requirement_id
+        for requirement_id in gate.get("missing_requirement_ids") or []
+        if str(requirement_id).startswith("contract_runtime.reconcile_")
+    ]
+
+
+def test_rev9_close_grade_reconcile_authority_binds_after_postmerge_qa_pass(
+    tmp_path,
+    monkeypatch,
+):
+    """Regression: observer_close_ready was unsatisfiable on every rev9 world.
+
+    rev8/rev9 merge both lanes before canonical reconcile and run the
+    integration QA afterwards, so their merge lines carry the server-owned
+    pre-QA marker.  The close binder used to read only
+    ``_contract_runtime_trusted_merge_projection``, which cannot rebuild that
+    shape, so close-grade authority derived nothing while the record-grade
+    receipt on the same execution was fully bound.  Before the fix this test
+    fails with the full ``contract_runtime.reconcile_*`` family that
+    ``contract_runtime_close_authority_incomplete`` reports.
+    """
+
+    world = _rev9_close_grade_world(tmp_path, monkeypatch)
+
+    # Record-grade authority is derived, not fed: it is what the server
+    # persists on observer_reconcile.
+    receipt = world.reconcile_receipt
+    assert receipt["record_verified"] is True
+    assert receipt["merge_projection_verified"] is True
+    assert receipt["all_lane_merges_verified"] is True
+    assert receipt["reconcile_event_recorded"] is True
+    assert receipt["reconcile_event_id"] == int(world.reconcile_event["id"])
+    assert receipt["reconcile_source_ref"] == (
+        f"timeline:{world.reconcile_event['id']}"
+    )
+    assert receipt["merge_event_id"] == int(world.merge_b["id"])
+    assert receipt["current_full_reconcile_activation_verified"] is True
+    assert receipt["close_grade_authority_deferred"] is True
+
+    _bound, diagnostic = _close_grade_reconcile_diagnostic(world)
+    assert diagnostic["missing_requirement_ids"] == []
+    assert diagnostic["passed"] is True
+    assert diagnostic["reconcile_event_id"] == int(
+        world.reconcile_event["id"]
+    )
+    assert diagnostic["next_action"] == "continue_close"
+
+    gate = _close_grade_close_ready_gate(world)
+    assert _reconcile_requirement_ids(gate) == []
+    assert gate["missing_requirement_ids"] == []
+    assert gate["passed"] is True
+
+
+def test_rev9_close_grade_reconcile_authority_fails_closed_without_reconcile_event(
+    tmp_path,
+    monkeypatch,
+):
+    """No durable reconcile event means no close-grade authority."""
+
+    world = _rev9_close_grade_world(
+        tmp_path,
+        monkeypatch,
+        record_reconcile_event=False,
+    )
+    assert world.reconcile_receipt["record_verified"] is True
+    assert world.reconcile_receipt["reconcile_event_recorded"] is False
+
+    _bound, diagnostic = _close_grade_reconcile_diagnostic(world)
+    assert diagnostic["passed"] is False
+    assert "contract_runtime.reconcile_event_missing" in (
+        diagnostic["missing_requirement_ids"]
+    )
+
+    gate = _close_grade_close_ready_gate(world)
+    assert gate["passed"] is False
+    assert gate["zero_write_rejection"] is True
+    assert "contract_runtime.reconcile_event_missing" in (
+        gate["missing_requirement_ids"]
+    )
+
+
+def test_rev9_close_grade_reconcile_authority_fails_closed_before_final_lane_merge(
+    tmp_path,
+    monkeypatch,
+):
+    """A reconcile that predates the final lane merge is never close-grade."""
+
+    world = _rev9_close_grade_world(
+        tmp_path,
+        monkeypatch,
+        reconcile_before_final_lane_merge=True,
+    )
+    assert int(world.reconcile_event["id"]) < int(world.merge_b["id"])
+    assert world.reconcile_receipt["record_verified"] is True
+    assert world.reconcile_receipt["reconcile_event_recorded"] is False
+
+    _bound, diagnostic = _close_grade_reconcile_diagnostic(world)
+    assert diagnostic["passed"] is False
+    assert "contract_runtime.reconcile_event_missing" in (
+        diagnostic["missing_requirement_ids"]
+    )
+    assert "contract_runtime.reconcile_durable_order" in (
+        diagnostic["missing_requirement_ids"]
+    )
+
+    gate = _close_grade_close_ready_gate(world)
+    assert gate["passed"] is False
+    assert gate["zero_write_rejection"] is True
+    assert "contract_runtime.reconcile_durable_order" in (
+        gate["missing_requirement_ids"]
+    )
+
+
+def test_rev9_close_grade_reconcile_authority_fails_closed_on_foreign_execution(
+    tmp_path,
+    monkeypatch,
+):
+    """Reconcile provenance scoped to another execution stays unusable."""
+
+    world = _rev9_close_grade_world(
+        tmp_path,
+        monkeypatch,
+        reconcile_scope_execution_id="cex-mf-parallel-some-other-execution",
+    )
+
+    _bound, diagnostic = _close_grade_reconcile_diagnostic(world)
+    assert diagnostic["passed"] is False
+    assert "contract_runtime.reconcile_contract_execution_scope" in (
+        diagnostic["missing_requirement_ids"]
+    )
+    assert "contract_runtime.reconcile_provenance_scope" in (
+        diagnostic["missing_requirement_ids"]
+    )
+
+    gate = _close_grade_close_ready_gate(world)
+    assert gate["passed"] is False
+    assert gate["zero_write_rejection"] is True
+    assert "contract_runtime.reconcile_contract_execution_scope" in (
+        gate["missing_requirement_ids"]
+    )
