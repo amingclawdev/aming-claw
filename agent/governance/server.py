@@ -85518,7 +85518,10 @@ def _contract_runtime_server_line_identity(
                 in {"", parent_task_id}
             )
             if retained_contract_envelope:
-                return durable_merge_identity
+                return {
+                    **durable_merge_identity,
+                    "identity_source_line_id": source_line_id,
+                }
             return {
                 **empty,
                 "identity_status": "ambiguous",
@@ -117680,7 +117683,19 @@ def _contract_runtime_mf_parallel_ordering_diagnostic(
     source = "completed_line_index_fallback"
     before_order: int | float = before_index
     after_order: int | float = after_index
-    if require_source_id_and_time:
+    completed_line_order_is_authoritative = bool(
+        before == "observer_reconcile"
+        and after == "qa_independent_verification"
+        and missing_id == "contract_runtime.qa_after_reconcile"
+        and before_index >= 0
+        and after_index >= 0
+    )
+    if completed_line_order_is_authoritative:
+        # Rev8 deliberately places the independent QA line after the durable
+        # reconcile line.  ContractRuntime completed_lines is append-only, so
+        # its persisted occurrence order is the authority for this pair.
+        source = "completed_line_index_fallback"
+    elif require_source_id_and_time:
         source = "source_event_id_and_time"
         before_order = before_source_id
         after_order = after_source_id
@@ -118520,18 +118535,8 @@ def _contract_runtime_bind_close_reconcile_authority(
             and _contract_runtime_line_status_passes(source_line)
             and str(source_line.get("actor_role") or "").strip()
             == "observer"
-            and str(source_payload.get("schema_version") or "")
-            == "mf_parallel.runtime_context_post_worker_line_projection.v1"
-            and str(source_payload.get("source") or "")
-            == "runtime_context_post_worker_timeline_evidence"
-            and source_payload.get("source_backed") is True
-            and source_payload.get("projection_persists_completed_line")
-            is False
-            and source_payload.get("observer_authored_worker_backfill")
-            is False
             and merge.get("timeline_verified") is True
             and merge.get("authority_verified") is True
-            and merge.get("qa_contract_runtime_verified") is True
             and merge.get("dispatch_lineage_verified") is True
             and str(
                 merge.get("contract_runtime_dispatch_source_ref") or ""
@@ -118550,25 +118555,91 @@ def _contract_runtime_bind_close_reconcile_authority(
                 or source_artifact_ref == expected_source_ref
             )
             and (
-                not projected_artifact_refs
-                or projected_artifact_refs == {expected_source_ref}
+                (
+                    str(source_payload.get("schema_version") or "")
+                    == (
+                        "mf_parallel."
+                        "runtime_context_post_worker_line_projection.v1"
+                    )
+                    and str(source_payload.get("source") or "")
+                    == "runtime_context_post_worker_timeline_evidence"
+                    and source_payload.get("source_backed") is True
+                    and source_payload.get(
+                        "projection_persists_completed_line"
+                    )
+                    is False
+                    and source_payload.get(
+                        "observer_authored_worker_backfill"
+                    )
+                    is False
+                    and merge.get("qa_contract_runtime_verified") is True
+                    and projected_source_ref == expected_source_ref
+                    and (
+                        not projected_artifact_refs
+                        or projected_artifact_refs == {expected_source_ref}
+                    )
+                    and _contract_runtime_close_authority_positive_int(
+                        source_payload.get("source_event_id")
+                    )
+                    == source_event_id
+                    and str(
+                        source_payload.get("source_event_created_at") or ""
+                    ).strip()
+                    == str(
+                        source_authority.get(
+                            "reconcile_event_created_at"
+                        )
+                        or ""
+                    ).strip()
+                )
+                or (
+                    # A persisted observer_reconcile line may already carry
+                    # the full server authority created at reconcile time.
+                    # Reuse only its immutable event identity and re-derive
+                    # the effective authority from trusted DB state below.
+                    source_authority.get("current_full_reconcile") is True
+                    and str(source_authority.get("strategy") or "")
+                    == "current_full_reconcile"
+                    and all(
+                        source_authority.get(field) is True
+                        for field in (
+                            "db_verified",
+                            "live_verified",
+                            "active_snapshot_verified",
+                            "graph_reconciled",
+                            "provenance_verified",
+                            "provenance_scope_verified",
+                            "durable_order_verified",
+                            "contract_execution_scope_verified",
+                            "task_scope_verified",
+                            "runtime_context_scope_verified",
+                            "parent_task_scope_verified",
+                            "merge_queue_scope_verified",
+                            "dispatch_lineage_verified",
+                        )
+                    )
+                    and identity_matches
+                    and (
+                        not projected_source_ref
+                        or projected_source_ref == expected_source_ref
+                    )
+                    and (
+                        not projected_artifact_refs
+                        or projected_artifact_refs == {expected_source_ref}
+                    )
+                    and _contract_runtime_close_authority_time_order_value(
+                        source_authority.get(
+                            "reconcile_event_created_at"
+                        )
+                    )
+                    is not None
+                )
             )
-            and _contract_runtime_close_authority_positive_int(
-                source_payload.get("source_event_id")
-            )
-            == source_event_id
-            and str(
-                source_payload.get("source_event_created_at") or ""
-            ).strip()
-            == str(
-                source_authority.get("reconcile_event_created_at") or ""
-            ).strip()
         ):
-            # Runtime-context projection may already carry a full close-grade
-            # authority.  Treat it only as an immutable event-identity hint:
-            # the close binder must re-derive the effective authority from
-            # the trusted merge and current database state below.  This keeps
-            # close/current parity without admitting caller-shaped authority.
+            # Treat the stored authority only as an immutable event-identity
+            # hint.  The close binder re-derives the effective authority from
+            # trusted merge and database state below, preserving close/current
+            # parity without admitting caller-shaped authority.
             reconcile = {
                 "reconcile_event_id": source_event_id,
                 "reconcile_event_created_at": str(
@@ -120030,7 +120101,16 @@ def _contract_runtime_mf_parallel_close_ready_precheck(
     )
     prospective_identity = _contract_runtime_server_line_identity(prospective)
     if prospective_identity["identity_status"] != "ambiguous":
-        return gate
+        if gate.get("passed") is True:
+            return gate
+        return {
+            **gate,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "context_mutated": False,
+            "public_safe": True,
+            "secret_safe": True,
+        }
 
     identity_mismatches = [
         {
@@ -120058,6 +120138,11 @@ def _contract_runtime_mf_parallel_close_ready_precheck(
             "identity_source_line_id"
         ],
         "identity_mismatches": identity_mismatches,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "context_mutated": False,
+        "public_safe": True,
+        "secret_safe": True,
     }
 
 
