@@ -2560,6 +2560,145 @@ def test_mf_parallel_runtime_binds_worker_lines_to_runtime_context_instances():
     }
 
 
+def test_mf_parallel_one_worker_dispatch_binds_exact_private_lane():
+    runtime = ContractRuntime(ContractCrudService().registry)
+    execution_id = "cex-mf-parallel-one-worker-lane-bound-test"
+    record = _start_mf_parallel_successor(
+        runtime,
+        project_id="aming-claw",
+        backlog_id="AC-MF-PARALLEL-ONE-WORKER-LANE-BOUND-TEST",
+        contract_execution_id=execution_id,
+        route_token_ref="rtok-one-worker-lane-bound",
+    )
+    record = runtime.submit_line_write(
+        execution_id,
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="orchestration",
+            line_id="observer_prefill_child_contracts",
+        ),
+    )["record"]
+    dispatch = _runtime_write_from(
+        record,
+        actor_role="observer",
+        stage_id="dispatch",
+        line_id="observer_dispatch_bounded_workers",
+    )
+    worker = {
+        "runtime_context_id": "mfrctx-one-worker-lane-bound",
+        "task_id": "one-worker-lane-bound",
+        "parent_task_id": execution_id,
+        "lane_id": "one-worker-lane-bound",
+        "worker_slot_id": "one-worker-lane-bound",
+        "worker_id": "one-worker-lane-bound",
+    }
+    dispatch["payload"] = {
+        "worker_count": 1,
+        "required_worker_count": 1,
+        "atomic_dispatch": False,
+        "workers": [worker],
+    }
+    dispatched = runtime.submit_line_write(execution_id, dispatch)
+    assert dispatched["ok"] is True
+    runtime.current_guide(execution_id, actor_role="mf_sub")
+    record = runtime.store.get(execution_id)
+
+    lane_read = _runtime_write_from(
+        record,
+        actor_role="mf_sub",
+        stage_id="worker_read",
+        line_id="worker_read_runtime_guide",
+    )
+    lane_read.update(
+        {
+            **worker,
+            "worker_role": "mf_sub",
+            "line_instance_id": (
+                f"runtime_context:{worker['runtime_context_id']}"
+            ),
+            "payload": {
+                **worker,
+                "worker_role": "mf_sub",
+                "read_receipt_hash": "sha256:one-worker-read",
+            },
+        }
+    )
+    _lane_state, lane_guide = runtime.mf_parallel_atomic_lane_gate_view(
+        record,
+        record["runtime_guide"],
+        lane_read,
+        source_record=record,
+    )
+    assert lane_guide["atomic_lane_gate_binding"]["bound"] is True
+    assert lane_guide["atomic_lane_gate_binding"][
+        "runtime_context_id"
+    ] == worker["runtime_context_id"]
+    accepted = runtime.submit_line_write(execution_id, lane_read)
+    assert accepted["ok"] is True
+
+    current = accepted["record"]
+    forged = _runtime_write_from(
+        current,
+        actor_role="mf_sub",
+        stage_id="worker_startup",
+        line_id="worker_startup",
+    )
+    forged.update(
+        {
+            **worker,
+            "runtime_context_id": "mfrctx-forged-second-lane",
+            "worker_role": "mf_sub",
+            "line_instance_id": "runtime_context:mfrctx-forged-second-lane",
+        }
+    )
+    before = runtime.store.get(execution_id)
+    rejected = runtime.precheck_line_write(execution_id, forged)
+    assert rejected["ok"] is False
+    assert rejected["record"]["runtime_guide"].get(
+        "atomic_lane_gate_binding"
+    ) is None
+    assert runtime.store.get(execution_id) == before
+
+    for stage_id, line_id, evidence_kind in (
+        ("worker_startup", "worker_startup", "mf_subagent_startup"),
+        ("worker_context", "worker_graph_context", "graph_trace"),
+        (
+            "worker_implementation",
+            "worker_implementation",
+            "implementation",
+        ),
+    ):
+        runtime.current_guide(execution_id, actor_role="mf_sub")
+        current = runtime.store.get(execution_id)
+        lane_write = _runtime_write_from(
+            current,
+            actor_role="mf_sub",
+            stage_id=stage_id,
+            line_id=line_id,
+        )
+        lane_write.update(
+            {
+                **worker,
+                "worker_role": "mf_sub",
+                "line_instance_id": (
+                    f"runtime_context:{worker['runtime_context_id']}"
+                ),
+                "evidence_kind": evidence_kind,
+            }
+        )
+        _lane_state, lane_guide = runtime.mf_parallel_atomic_lane_gate_view(
+            current,
+            current["runtime_guide"],
+            lane_write,
+            source_record=current,
+        )
+        assert lane_guide["atomic_lane_gate_binding"]["bound"] is True
+        assert lane_guide["next_legal_action"]["line_id"] == line_id
+        accepted = runtime.submit_line_write(execution_id, lane_write)
+        assert accepted["ok"] is True
+
+
 def test_mf_parallel_non_atomic_dispatch_keeps_global_lane_order():
     runtime = ContractRuntime(ContractCrudService().registry)
     execution_id = "cex-mf-parallel-non-atomic-lane-order-test"

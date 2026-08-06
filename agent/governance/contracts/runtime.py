@@ -5027,27 +5027,18 @@ def _mf_parallel_atomic_lane_gate_view(
         for item in completion_satisfying_lines
         if isinstance(item, Mapping)
     ]
-    atomic_dispatches: list[Mapping[str, Any]] = []
+    lane_dispatches: list[Mapping[str, Any]] = []
     for item in completed_lines:
         if (
             str(item.get("stage_id") or "").strip(),
             str(item.get("line_id") or "").strip(),
         ) != _MF_PARALLEL_ATOMIC_DISPATCH_LINE:
             continue
-        payload = (
-            item.get("payload")
-            if isinstance(item.get("payload"), Mapping)
-            else {}
-        )
-        if (
-            payload.get("atomic_dispatch") is True
-            and payload.get("all_or_nothing") is True
-        ):
-            atomic_dispatches.append(item)
-    if len(atomic_dispatches) != 1:
+        lane_dispatches.append(item)
+    if len(lane_dispatches) != 1:
         return state, guide
 
-    dispatch = atomic_dispatches[0]
+    dispatch = lane_dispatches[0]
     dispatch_payload = (
         dispatch.get("payload")
         if isinstance(dispatch.get("payload"), Mapping)
@@ -5060,6 +5051,17 @@ def _mf_parallel_atomic_lane_gate_view(
         worker_count = int(dispatch_payload.get("worker_count") or 0)
     except (TypeError, ValueError):
         return state, guide
+    atomic_dispatch = dispatch_payload.get("atomic_dispatch") is True
+    all_or_nothing = dispatch_payload.get("all_or_nothing") is True
+    cardinality_contract_valid = (
+        required_worker_count == 2
+        and atomic_dispatch
+        and all_or_nothing
+    ) or (
+        required_worker_count == 1
+        and not atomic_dispatch
+        and not all_or_nothing
+    )
     workers = _mf_parallel_worker_instances([dispatch])
     raw_workers = list(_iter_worker_payloads(dispatch_payload))
     runtime_context_ids = [
@@ -5083,7 +5085,7 @@ def _mf_parallel_atomic_lane_gate_view(
         "line_instance_id",
     )
     if (
-        required_worker_count != 2
+        not cardinality_contract_valid
         or worker_count != required_worker_count
         or len(workers) != required_worker_count
         or len(raw_workers) != required_worker_count
