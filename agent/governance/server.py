@@ -90540,6 +90540,216 @@ def _contract_runtime_shared_batch_enter_binding_verified(
     )
 
 
+def _contract_runtime_shared_batch_child_lane_merge_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    timeline_events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Resolve one rev8/rev9 batch child's pre-QA lane merge authority.
+
+    ``_contract_runtime_completed_merge_authority`` rebuilds a merge round in
+    which QA precedes the merge; it returns nothing for rev8/rev9, which merge
+    every lane *before* canonical reconcile and run the integration QA after
+    it.  Record-grade, current-full, and close-grade authority already resolve
+    those worlds through the pinned lane-merge projection, so the shared batch
+    projection has to read the same projection for its children or it can
+    never see a batch whose children are all still pre-QA - which is every
+    ``mf_batch_parallel`` batch at the moment its children reach post-merge QA.
+
+    The pinned projection stays fail-closed on its own terms: it returns ``{}``
+    unless every required lane merge joins the selected dispatch, its durable
+    queue identity, and its own timeline event.  Only the server-owned pre-QA
+    merge shape is admitted here, and this helper additionally re-derives the
+    merge line's acceptance revision, its durable merge-queue row, and its
+    merge timeline event from the database, so the returned merge event id and
+    time - which the caller uses to enforce strict merge-before-reconcile
+    order - never come from the completed line itself.  ``conn`` is
+    deliberately withheld from the projection: its reconcile join would
+    re-enter the shared batch projection for the same batch.
+    """
+
+    if not _is_mf_parallel_postmerge_revision(record):
+        return {}
+    projection = _contract_runtime_rev8_two_worker_merge_projection(
+        record,
+        required_worker_count=(
+            _contract_runtime_mf_parallel_current_generation_worker_count(
+                record,
+                conn=conn,
+                project_id=project_id,
+            )
+        ),
+    )
+    if not (
+        projection.get("timeline_verified") is True
+        and projection.get("authority_verified") is True
+        and projection.get("dispatch_lineage_verified") is True
+        and projection.get("all_lane_merges_verified") is True
+        and projection.get("pre_qa_merge_authorized") is True
+        and projection.get("final_qa_required_after_reconcile") is True
+        and projection.get("qa_contract_runtime_verified") is not True
+        and projection.get("close_satisfying") is not True
+        and not projection.get("qa_audit_only_no_pass_authority")
+        and projection.get("no_pass_claim") is not True
+    ):
+        return {}
+    if not _contract_runtime_dispatch_line_match(record, context):
+        return {}
+
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    backlog_id = str(
+        getattr(context, "backlog_id", "") or record.get("backlog_id") or ""
+    ).strip()
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    merged_commit = str(
+        projection.get("merged_commit_sha") or ""
+    ).strip().lower()
+    merge_queue_id = str(projection.get("merge_queue_id") or "").strip()
+    queue_item_id = str(projection.get("queue_item_id") or "").strip()
+    if not (
+        str(projection.get("project_id") or "").strip() == project_id
+        and str(projection.get("backlog_id") or "").strip() == backlog_id
+        and str(projection.get("contract_execution_id") or "").strip()
+        == execution_id
+        and str(projection.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(projection.get("task_id") or "").strip() == task_id
+        and str(projection.get("parent_task_id") or "").strip()
+        == parent_task_id
+        and all((project_id, backlog_id, execution_id, merge_queue_id))
+        and queue_item_id
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit)
+    ):
+        return {}
+
+    merge_line_index_value = projection.get("merge_completed_line_index")
+    merge_line_index = (
+        int(merge_line_index_value)
+        if isinstance(merge_line_index_value, int)
+        and not isinstance(merge_line_index_value, bool)
+        else -1
+    )
+    completed = [
+        line
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+    if not 0 <= merge_line_index < len(completed):
+        return {}
+    merge_line = completed[merge_line_index]
+    if not (
+        str(merge_line.get("line_id") or "").strip() == "observer_merge"
+        and str(merge_line.get("actor_role") or "").strip() == "observer"
+        and str(merge_line.get("evidence_kind") or "").strip() == "merge"
+    ):
+        return {}
+    merge_acceptance = _contract_runtime_completed_line_acceptance(
+        conn,
+        project_id=project_id,
+        record=record,
+        completed_line_index=merge_line_index,
+        expected_line=merge_line,
+    )
+    if merge_acceptance.get("db_verified") is not True:
+        return {}
+
+    from .parallel_branch_runtime import get_merge_queue_item
+
+    durable_item = get_merge_queue_item(
+        conn,
+        project_id,
+        merge_queue_id,
+        queue_item_id,
+    )
+    if (
+        durable_item is None
+        or str(durable_item.task_id or "").strip() != task_id
+        or str(durable_item.backlog_id or "").strip() != backlog_id
+        or str(durable_item.status or "").strip() != "merged"
+        or str(durable_item.merge_commit or "").strip().lower()
+        != merged_commit
+        or str(durable_item.target_head_after_merge or "").strip().lower()
+        != merged_commit
+    ):
+        return {}
+
+    merge_source_ref = str(projection.get("merge_source_ref") or "").strip()
+    merge_events: list[Mapping[str, Any]] = []
+    for event in timeline_events:
+        if not isinstance(event, Mapping):
+            continue
+        event_payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        event_commit = str(
+            event.get("commit_sha")
+            or event_payload.get("merge_commit")
+            or event_payload.get("target_head_after_merge")
+            or ""
+        ).strip().lower()
+        event_kind = str(
+            event.get("event_kind") or event.get("event_type") or ""
+        ).lower()
+        if (
+            event_commit == merged_commit
+            and "merge" in event_kind
+            and _runtime_context_event_ref(event) == merge_source_ref
+        ):
+            merge_events.append(event)
+    if len(merge_events) != 1:
+        return {}
+    merge_event = merge_events[0]
+    merge_event_id = _contract_runtime_projection_timeline_event_id(
+        merge_event
+    )
+    merge_event_created_at = (
+        _contract_runtime_projection_timeline_event_time(merge_event)
+    )
+    if merge_event_id <= 0 or not merge_event_created_at:
+        return {}
+
+    return {
+        "timeline_verified": True,
+        "authority_verified": True,
+        "authority_source": (
+            "contract_runtime_pinned_lane_merge_projection+"
+            "contract_runtime_completed_line_acceptance+"
+            "durable_merge_queue+task_timeline_merge"
+        ),
+        "no_pass_claim": False,
+        "overall_release_pass_claimed": False,
+        "authoritative_pass_synthesized": False,
+        "qa_audit_only_no_pass_authority": {},
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "merged_commit_sha": merged_commit,
+        "qa_contract_runtime_verified": False,
+        "close_satisfying": False,
+        "pre_qa_merge_authorized": True,
+        "final_qa_required_after_reconcile": True,
+        "merge_completed_line_index": merge_line_index,
+        "merge_acceptance_ref": str(
+            merge_acceptance.get("acceptance_ref") or ""
+        ),
+        "merge_source_ref": _runtime_context_event_ref(merge_event),
+        "merge_event_id": merge_event_id,
+        "merge_event_created_at": merge_event_created_at,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": queue_item_id,
+    }
+
+
 def _contract_runtime_shared_batch_reconcile_authority(
     conn,
     *,
@@ -90903,6 +91113,22 @@ def _contract_runtime_shared_batch_reconcile_authority(
             context=child_context,
             timeline_events=child_timeline,
         )
+        if not child_merge:
+            # rev8/rev9 lanes merge before canonical reconcile, so the
+            # pre-merge-QA round above resolves nothing for them.  Fall back to
+            # the same pinned lane-merge projection every other rev8/rev9
+            # authority reads.  It only ever yields the server-owned pre-QA
+            # merge shape, which the admission branch below still has to
+            # accept explicitly.
+            child_merge = (
+                _contract_runtime_shared_batch_child_lane_merge_authority(
+                    conn,
+                    project_id=project_id,
+                    record=child_record,
+                    context=child_context,
+                    timeline_events=child_timeline,
+                )
+            )
         child_qa_time = _contract_runtime_close_authority_time_order_value(
             child_merge.get("qa_acceptance_created_at")
         )

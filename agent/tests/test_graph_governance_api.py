@@ -13536,6 +13536,989 @@ def test_mf_batch_shared_reconcile_authority_rejects_scope_drift(
     assert authority == {}
 
 
+_BATCH_QA_BATCH_ID = "mf-batch-parallel-postmerge-qa"
+_BATCH_QA_MERGE_QUEUE_ID = "mq-batch-postmerge-qa"
+_BATCH_QA_COORDINATION_BACKLOG = "AC-BATCH-POSTMERGE-QA-PARENT"
+_BATCH_QA_ENTER_TASK_ID = "onboard-service-batch-postmerge-qa"
+_BATCH_QA_EPOCH_ID = "integration-epoch-batch-postmerge-qa"
+_BATCH_QA_SNAPSHOT_ID = "full-batch-postmerge-qa"
+_BATCH_QA_TARGET_REF = "refs/heads/main"
+_BATCH_QA_CHILD_BACKLOGS = (
+    "AC-BATCH-POSTMERGE-QA-CHILD-1",
+    "AC-BATCH-POSTMERGE-QA-CHILD-2",
+)
+_BATCH_QA_CHILD_EXECUTIONS = (
+    "cex-mf-parallel-postmerge-qa-1",
+    "cex-mf-parallel-postmerge-qa-2",
+)
+_BATCH_QA_CHILD_RUNTIME_IDS = (
+    "mfrctx-postmerge-qa-1",
+    "mfrctx-postmerge-qa-2",
+)
+_BATCH_QA_QUEUE_ITEM_IDS = (
+    "mqitem-postmerge-qa-1",
+    "mqitem-postmerge-qa-2",
+)
+_BATCH_QA_CHILD_TASKS = (
+    f"{_BATCH_QA_BATCH_ID}:row:1",
+    f"{_BATCH_QA_BATCH_ID}:row:2",
+)
+
+
+def _batch_qa_worker_lines(*, context, commit_sha, parent_task_id):
+    """The seven rev9 worker lines exactly as the lane records them."""
+
+    lines = []
+    for stage_id, line_id, evidence_kind, status in (
+        (
+            "worker_read",
+            "worker_read_runtime_guide",
+            "read_receipt",
+            "accepted",
+        ),
+        ("worker_startup", "worker_startup", "mf_subagent_startup", "passed"),
+        ("worker_context", "worker_graph_context", "graph_trace", ""),
+        (
+            "worker_implementation",
+            "worker_implementation",
+            "implementation",
+            "passed",
+        ),
+        ("worker_commit", "worker_commit", "worker_commit", ""),
+        (
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "record_finish_time_worker_attestation",
+            "",
+        ),
+        ("worker_finish", "worker_finish_gate", "mf_subagent_finish_gate", ""),
+    ):
+        line = {
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "actor_role": "mf_sub",
+            "worker_role": "mf_sub",
+            "evidence_kind": evidence_kind,
+            "line_instance_id": (
+                f"runtime_context:{context.runtime_context_id}"
+            ),
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
+            "payload": {
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": parent_task_id,
+            },
+        }
+        if status:
+            line["status"] = status
+        if line_id in {"worker_commit", "worker_finish_gate"}:
+            line["commit_sha"] = commit_sha
+            line["payload"]["commit_sha"] = commit_sha
+        lines.append(line)
+    return lines
+
+
+def _batch_qa_append_line(store_, record, line):
+    """Append one completed line through the real CAS store.
+
+    Every append advances ``execution_state_revision`` and writes the
+    immutable chain binding the server later reads back as the completed-line
+    acceptance receipt.  Nothing here hand-feeds an acceptance revision.
+    """
+
+    revision = int(record["execution_state_revision"])
+    updated = {
+        **record,
+        "completed_lines": [*record["completed_lines"], line],
+        "execution_state_revision": revision + 1,
+    }
+    store_.update(
+        record["contract_execution_id"],
+        updated,
+        expected_revision=revision,
+    )
+    record["completed_lines"] = updated["completed_lines"]
+    record["execution_state_revision"] = updated["execution_state_revision"]
+    return record
+
+
+def _mf_batch_child_postmerge_qa_world(
+    conn,
+    tmp_path,
+    monkeypatch,
+    *,
+    record_reconcile_event: bool = True,
+    reconcile_before_final_lane_merge: bool = False,
+    epoch_excludes_child: bool = False,
+    reconcile_at_intermediate_commit: bool = False,
+):
+    """Build one real two-child ``mf_batch_parallel`` post-merge world.
+
+    Both children are driven the way rev9 actually drives them: bounded
+    dispatch, worker lines, an ordered live lane merge per child recorded on
+    the child's own task timeline, then exactly one batch/parent-scoped
+    ``final_batch_reconcile`` on the coordination backlog.  Every authority is
+    derived by the shipped server code from durable SQLite state - runtime
+    contexts, the durable merge queue, the closed integration epoch, the
+    activated graph snapshot and its current-full reconcile provenance.  No
+    authority producer is patched and no reconcile identity is hand-fed onto a
+    completed line.
+    """
+
+    root = tmp_path / "batch-postmerge-qa-target"
+    base_head = _init_test_git_repo(root)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=root, check=True)
+    child_commits = []
+    for index in range(1, 3):
+        path = root / f"batch-child-{index}.txt"
+        path.write_text(f"child {index}\n", encoding="utf-8")
+        subprocess.run(["git", "add", path.name], cwd=root, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", f"merge child {index}"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        child_commits.append(batch_jobs.git_commit(root))
+    final_head = child_commits[-1]
+    reconcile_head = (
+        child_commits[0] if reconcile_at_intermediate_commit else final_head
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: root,
+    )
+
+    child_contexts = []
+    for index in range(2):
+        child_contexts.append(
+            upsert_branch_context(
+                conn,
+                BranchTaskRuntimeContext(
+                    project_id=PID,
+                    batch_id=_BATCH_QA_BATCH_ID,
+                    backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+                    parent_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+                    root_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+                    task_id=_BATCH_QA_CHILD_TASKS[index],
+                    runtime_context_id=_BATCH_QA_CHILD_RUNTIME_IDS[index],
+                    worker_id=f"worker-postmerge-qa-{index + 1}",
+                    worker_slot_id=f"slot-postmerge-qa-{index + 1}",
+                    governance_project_id=PID,
+                    target_project_id=PID,
+                    target_project_root=str(root),
+                    worktree_path=str(root),
+                    branch_ref=(
+                        f"refs/heads/codex/{_BATCH_QA_CHILD_TASKS[index]}"
+                    ),
+                    status=STATE_MERGED,
+                    merge_queue_id=_BATCH_QA_MERGE_QUEUE_ID,
+                    base_commit=base_head,
+                    head_commit=child_commits[index],
+                    target_head_commit=child_commits[index],
+                    lease_expires_at="2999-01-01T00:00:00Z",
+                ),
+            )
+        )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=_BATCH_QA_MERGE_QUEUE_ID,
+                queue_item_id=_BATCH_QA_QUEUE_ITEM_IDS[index],
+                backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+                task_id=_BATCH_QA_CHILD_TASKS[index],
+                branch_ref=child_contexts[index].branch_ref,
+                queue_index=index + 1,
+                status=STATE_MERGED,
+                target_ref=_BATCH_QA_TARGET_REF,
+                base_commit=base_head,
+                branch_head=child_commits[index],
+                current_target_head=child_commits[index],
+                merge_commit=child_commits[index],
+                target_head_before_merge=(
+                    base_head if index == 0 else child_commits[index - 1]
+                ),
+                target_head_after_merge=child_commits[index],
+                completed_at=f"2026-08-06T00:0{index * 2 + 2}:00Z",
+            )
+            for index in range(2)
+        ],
+    )
+    merged_prefix = (
+        _BATCH_QA_QUEUE_ITEM_IDS[:1]
+        if epoch_excludes_child
+        else _BATCH_QA_QUEUE_ITEM_IDS
+    )
+    upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id=_BATCH_QA_BATCH_ID,
+            epoch_id=_BATCH_QA_EPOCH_ID,
+            coordination_backlog_id=_BATCH_QA_COORDINATION_BACKLOG,
+            target_ref=_BATCH_QA_TARGET_REF,
+            base_head=base_head,
+            current_head=final_head,
+            merge_queue_id=_BATCH_QA_MERGE_QUEUE_ID,
+            merge_cursor=len(merged_prefix),
+            merged_prefix=merged_prefix,
+            remaining_queue_item_ids=(),
+            reconcile_state="reconciled",
+            status="closed",
+            last_merge_commit=final_head,
+            snapshot_id=_BATCH_QA_SNAPSHOT_ID,
+            closed_at="2026-08-06T00:06:00Z",
+        ),
+        now_iso="2026-08-06T00:06:00Z",
+    )
+
+    entered = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=_BATCH_QA_COORDINATION_BACKLOG,
+        task_id=_BATCH_QA_ENTER_TASK_ID,
+        event_type="mf_batch_parallel.entered",
+        event_kind="contract_binding",
+        phase="orchestration",
+        actor="observer",
+        status="accepted",
+        payload={
+            "batch_id": _BATCH_QA_BATCH_ID,
+            "backlog_id": _BATCH_QA_COORDINATION_BACKLOG,
+            "merge_queue_id": _BATCH_QA_MERGE_QUEUE_ID,
+            "merge_queue_plan": {
+                "merge_queue_id": _BATCH_QA_MERGE_QUEUE_ID,
+                "planner_only": False,
+                "durable_queue_write": True,
+                "durable_queue_item_count": 2,
+                "durable_queue_items": [
+                    {
+                        "project_id": PID,
+                        "merge_queue_id": _BATCH_QA_MERGE_QUEUE_ID,
+                        "queue_item_id": _BATCH_QA_QUEUE_ITEM_IDS[index],
+                        "backlog_id": _BATCH_QA_CHILD_BACKLOGS[index],
+                        "task_id": _BATCH_QA_CHILD_TASKS[index],
+                        "queue_index": index + 1,
+                    }
+                    for index in range(2)
+                ],
+                "source_of_authority": (
+                    "server.handle_project_mf_batch_parallel_enter"
+                ),
+            },
+            "fanout_policy": {
+                "fanout_ready": True,
+                "successor_contract_id": "mf_parallel.v2",
+                "per_row_successors": [
+                    {
+                        "backlog_id": _BATCH_QA_CHILD_BACKLOGS[index],
+                        "body": {
+                            "backlog_id": _BATCH_QA_CHILD_BACKLOGS[index],
+                            "task_id": _BATCH_QA_CHILD_TASKS[index],
+                            "parent_batch_id": _BATCH_QA_BATCH_ID,
+                            "merge_queue_id": _BATCH_QA_MERGE_QUEUE_ID,
+                        },
+                        "merge_queue": {
+                            "merge_queue_id": _BATCH_QA_MERGE_QUEUE_ID,
+                            "queue_item_id": (
+                                _BATCH_QA_QUEUE_ITEM_IDS[index]
+                            ),
+                            "queue_index": index + 1,
+                        },
+                    }
+                    for index in range(2)
+                ],
+            },
+        },
+    )
+
+    def _record_reconcile():
+        return task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=_BATCH_QA_COORDINATION_BACKLOG,
+            task_id=_BATCH_QA_BATCH_ID,
+            event_type="graph.reconcile",
+            event_kind="reconcile",
+            phase="reconcile",
+            actor="observer",
+            status="passed",
+            commit_sha=reconcile_head,
+            payload={
+                "actor_role": "observer",
+                "current_full_reconcile": True,
+                "reconcile_mode": "current_full",
+                "canonical_head_verified": True,
+                "active_snapshot_verified": True,
+                "graph_reconciled": True,
+            },
+        )
+
+    merge_events = []
+    reconcile_event = None
+    for index in range(2):
+        # A reconcile recorded before the final lane merge is durably out of
+        # order; it is written first so its timeline id proves that.
+        if (
+            index == 1
+            and record_reconcile_event
+            and reconcile_before_final_lane_merge
+        ):
+            reconcile_event = _record_reconcile()
+        merge_events.append(
+            task_timeline.record_event(
+                conn,
+                project_id=PID,
+                backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+                task_id=_BATCH_QA_CHILD_TASKS[index],
+                event_type="parallel.live_merge",
+                event_kind="live_merge",
+                phase="live_merge",
+                actor="observer",
+                status="passed",
+                commit_sha=child_commits[index],
+                payload={
+                    "actor_role": "observer",
+                    "backlog_id": _BATCH_QA_CHILD_BACKLOGS[index],
+                    "runtime_context_id": (
+                        _BATCH_QA_CHILD_RUNTIME_IDS[index]
+                    ),
+                    "task_id": _BATCH_QA_CHILD_TASKS[index],
+                    "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                    "merge_queue_id": _BATCH_QA_MERGE_QUEUE_ID,
+                    "queue_item_id": _BATCH_QA_QUEUE_ITEM_IDS[index],
+                    "merge_commit": child_commits[index],
+                    "target_head_after_merge": child_commits[index],
+                },
+            )
+        )
+    if record_reconcile_event and not reconcile_before_final_lane_merge:
+        reconcile_event = _record_reconcile()
+
+    event_times = [
+        (entered, "2026-08-06T00:00:00Z"),
+        (merge_events[0], "2026-08-06T00:02:00Z"),
+        (merge_events[1], "2026-08-06T00:04:00Z"),
+    ]
+    if reconcile_event is not None:
+        event_times.append(
+            (
+                reconcile_event,
+                "2026-08-06T00:03:00Z"
+                if reconcile_before_final_lane_merge
+                else "2026-08-06T00:05:00Z",
+            )
+        )
+    for event, created_at in event_times:
+        conn.execute(
+            "UPDATE task_timeline_events SET created_at = ? WHERE id = ?",
+            (created_at, int(event["id"])),
+        )
+        event["created_at"] = created_at
+    conn.commit()
+
+    _activate_basic_graph(
+        conn,
+        _BATCH_QA_SNAPSHOT_ID,
+        commit_sha=reconcile_head,
+    )
+    if reconcile_event is not None:
+        legacy_task_scope = {
+            "project_id": PID,
+            "backlog_id": _BATCH_QA_COORDINATION_BACKLOG,
+            "task_id": _BATCH_QA_BATCH_ID,
+        }
+        store.record_current_full_reconcile_provenance(
+            conn,
+            project_id=PID,
+            snapshot_id=_BATCH_QA_SNAPSHOT_ID,
+            target_commit_sha=reconcile_head,
+            request_id="req-batch-postmerge-qa",
+            request_started_at="2026-08-06T00:04:30Z",
+            route_evidence={
+                "schema_version": (
+                    "graph_current_full_reconcile.route_evidence.v1"
+                ),
+                "authenticated_role": "observer",
+                "authentication_source": (
+                    "observer_session_route_token_ref"
+                ),
+                "raw_route_token_persisted": False,
+                "protected_action": "graph_current_full_reconcile",
+                "route_token_scope": dict(legacy_task_scope),
+                "idempotency_scope": dict(legacy_task_scope),
+            },
+            reconcile_event_id=int(reconcile_event["id"]),
+            reconcile_event_created_at=str(reconcile_event["created_at"]),
+        )
+        conn.commit()
+
+    runtime_store = server._contract_runtime_store(conn)
+    records = []
+    for index in range(2):
+        context = child_contexts[index]
+        resolve_batch_child_cardinality = getattr(
+            server,
+            "_contract_runtime_mf_batch_child_worker_cardinality_authority",
+        )
+        cardinality = (
+            resolve_batch_child_cardinality(
+                conn,
+                project_id=PID,
+                backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+                task_id=_BATCH_QA_CHILD_TASKS[index],
+                batch_id=_BATCH_QA_BATCH_ID,
+                merge_queue_id=_BATCH_QA_MERGE_QUEUE_ID,
+                queue_item_id=_BATCH_QA_QUEUE_ITEM_IDS[index],
+            )
+        )
+        assert cardinality.get("required_worker_count") == 1
+        selection = {
+            "schema_version": (
+                "mf_parallel.observer_worker_cardinality_selection.v1"
+            ),
+            "source": "authenticated_observer_mf_parallel_enter",
+            "selection_origin": "mf_parallel_enter",
+            "observer_selected": True,
+            "selection_frozen": True,
+            "required_worker_count": 1,
+            "worker_count_policy": "exactly",
+            "batch_row_scoped_successor": True,
+            "batch_child_authority": cardinality,
+        }
+        selection["selection_hash"] = server.stable_sha256(selection)
+        record = {
+            "schema_version": "contract_runtime_execution_record.v1",
+            "project_id": PID,
+            "backlog_id": _BATCH_QA_CHILD_BACKLOGS[index],
+            "contract_id": "mf_parallel.v2",
+            "version": "v2",
+            "revision": "rev9",
+            "contract_execution_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+            "parent_contract_execution_id": "",
+            "root_contract_execution_id": "",
+            "contract_chain_id": f"cchain-postmerge-qa-{index + 1}",
+            "execution_state_revision": 1,
+            "completed_lines": [],
+            "backlog_lineage": {"task_id": _BATCH_QA_CHILD_TASKS[index]},
+            "metadata": {
+                "observer_worker_cardinality_selection": selection,
+            },
+        }
+        runtime_store.create(record)
+        conn.commit()
+        _batch_qa_append_line(
+            runtime_store,
+            record,
+            {
+                "stage_id": "prefill",
+                "line_id": "observer_prefill_child_contracts",
+                "actor_role": "observer",
+                "evidence_kind": "contract_binding",
+                "payload": {
+                    "batch_id": _BATCH_QA_BATCH_ID,
+                    "backlog_id": _BATCH_QA_CHILD_BACKLOGS[index],
+                },
+            },
+        )
+        worker = {
+            "schema_version": "mf_parallel.dispatch_bounded_worker.v2",
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+            "root_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id,
+            "worker_role": "mf_sub",
+            "merge_queue_id": _BATCH_QA_MERGE_QUEUE_ID,
+            "branch_ref": context.branch_ref,
+            "worktree_path": str(root),
+            "target_project_root": str(root),
+            "base_commit": base_head,
+            "line_instance_id": (
+                f"runtime_context:{context.runtime_context_id}"
+            ),
+        }
+        _batch_qa_append_line(
+            runtime_store,
+            record,
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "line_instance_id": (
+                    f"runtime_context:{context.runtime_context_id}"
+                ),
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                "payload": {
+                    "worker_count": 1,
+                    "required_worker_count": 1,
+                    "atomic_dispatch": False,
+                    "bounded_workers": [worker],
+                    **worker,
+                },
+            },
+        )
+        for line in _batch_qa_worker_lines(
+            context=context,
+            commit_sha=child_commits[index],
+            parent_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+        ):
+            _batch_qa_append_line(runtime_store, record, line)
+        dispatch_source_ref = (
+            f"contract_runtime:{_BATCH_QA_CHILD_EXECUTIONS[index]}:"
+            "completed_lines:1"
+        )
+        _batch_qa_append_line(
+            runtime_store,
+            record,
+            {
+                "stage_id": "observer_lane_merge",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge",
+                "line_instance_id": (
+                    f"runtime_context:{context.runtime_context_id}"
+                ),
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                "commit_sha": child_commits[index],
+                "payload": {
+                    "durable_merge_authority": {
+                        "schema_version": (
+                            "contract_runtime."
+                            "observer_merge_durable_authority.v1"
+                        ),
+                        "source": (
+                            "parallel_branch_merge_queue+task_timeline_merge"
+                        ),
+                        "server_derived": True,
+                        "db_verified": True,
+                        "project_id": PID,
+                        "backlog_id": _BATCH_QA_CHILD_BACKLOGS[index],
+                        "contract_execution_id": (
+                            _BATCH_QA_CHILD_EXECUTIONS[index]
+                        ),
+                        "runtime_context_id": context.runtime_context_id,
+                        "task_id": context.task_id,
+                        "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                        "merge_queue_id": _BATCH_QA_MERGE_QUEUE_ID,
+                        "queue_item_id": _BATCH_QA_QUEUE_ITEM_IDS[index],
+                        "queue_item_status": "merged",
+                        "branch_head": child_commits[index],
+                        "merge_commit": child_commits[index],
+                        "target_head_before_merge": (
+                            base_head
+                            if index == 0
+                            else child_commits[index - 1]
+                        ),
+                        "target_head_after_merge": child_commits[index],
+                        "merge_gate_passed": True,
+                        "merge_event_ref": (
+                            f"timeline:{merge_events[index]['id']}"
+                        ),
+                        "merge_event_id": int(merge_events[index]["id"]),
+                        "merge_event_created_at": str(
+                            merge_events[index]["created_at"]
+                        ),
+                        "timeline_event_refs": [
+                            f"timeline:{merge_events[index]['id']}"
+                        ],
+                        "contract_runtime_dispatch_source_ref": (
+                            dispatch_source_ref
+                        ),
+                        # rev8/rev9 merge every lane before canonical reconcile
+                        # and run the integration QA afterwards.
+                        "pre_qa_merge_authorized": True,
+                        "final_qa_required_after_reconcile": True,
+                        "qa_contract_runtime_verified": False,
+                        "qa_completed_line_index": -1,
+                        "qa_graph_completed_line_index": -1,
+                        "qa_acceptance_ref": "",
+                        "qa_audit_only_no_pass_authority": {},
+                        "close_satisfying": False,
+                        "no_pass_claim": False,
+                        "overall_release_pass_claimed": False,
+                        "authoritative_pass_synthesized": False,
+                        "worker_commit_completed_line_index": 6,
+                    },
+                    "merge_commit": child_commits[index],
+                    "merge_gate_passed": True,
+                    "merge_queue_id": _BATCH_QA_MERGE_QUEUE_ID,
+                    "queue_item_id": _BATCH_QA_QUEUE_ITEM_IDS[index],
+                    "queue_item_status": "merged",
+                    "branch_head": child_commits[index],
+                    "target_head_after_merge": child_commits[index],
+                    "runtime_context_id": context.runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                },
+            },
+        )
+        records.append(record)
+
+    # The observer_reconcile line carries exactly what the server derives at
+    # reconcile time from the durable state above.
+    receipts = []
+    for index in range(2):
+        record = records[index]
+        receipt = server._contract_runtime_reconcile_record_authority(
+            conn,
+            project_id=PID,
+            record=record,
+        )
+        receipts.append(receipt)
+        _batch_qa_append_line(
+            server._contract_runtime_store(conn),
+            record,
+            {
+                "stage_id": "observer_reconcile",
+                "line_id": "observer_reconcile",
+                "actor_role": "observer",
+                "evidence_kind": "reconcile",
+                "line_instance_id": (
+                    f"runtime_context:{_BATCH_QA_CHILD_RUNTIME_IDS[index]}"
+                ),
+                "runtime_context_id": _BATCH_QA_CHILD_RUNTIME_IDS[index],
+                "task_id": _BATCH_QA_CHILD_TASKS[index],
+                "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                "commit_sha": reconcile_head,
+                "payload": {"reconcile_authority": receipt},
+            },
+        )
+    conn.commit()
+
+    return SimpleNamespace(
+        root=root,
+        base_head=base_head,
+        child_commits=tuple(child_commits),
+        final_head=final_head,
+        reconcile_head=reconcile_head,
+        child_contexts=tuple(child_contexts),
+        merge_events=tuple(merge_events),
+        entered_event=entered,
+        reconcile_event=reconcile_event,
+        records=tuple(records),
+        receipts=tuple(receipts),
+    )
+
+
+def _batch_qa_postmerge_authority(world, index):
+    return server._contract_runtime_rev8_postmerge_qa_authority(
+        server.get_connection(PID),
+        project_id=PID,
+        record=world.records[index],
+    )
+
+
+class _BatchQaPostmergeGatePassed(Exception):
+    """Raised once the QA-line binder gets past the post-merge authority gate.
+
+    The binder authenticates the QA session immediately after that gate, which
+    is unrelated to this defect; reaching ``require_auth`` proves the line was
+    admitted, and never reaching it proves the gate rejected first.
+    """
+
+
+class _BatchQaGateProbeContext:
+    def require_auth(self, _conn):
+        raise _BatchQaPostmergeGatePassed()
+
+
+def _batch_qa_bind_qa_graph_line(world, index):
+    return server._contract_runtime_bind_qa_graph_authority(
+        _BatchQaGateProbeContext(),
+        server.get_connection(PID),
+        project_id=PID,
+        record=world.records[index],
+        write={
+            "stage_id": "qa_graph_context",
+            "line_id": "qa_graph_context",
+            "actor_role": "qa",
+            "evidence_kind": "graph_trace",
+        },
+        body={},
+        policy={},
+    )
+
+
+def test_mf_batch_child_postmerge_qa_accepts_batch_scoped_reconcile(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    """Regression: every mf_batch_parallel child was blocked before QA.
+
+    ``final_batch_reconcile`` prescribes a batch/parent-scoped reconcile, so
+    the only reconcile event a batch child can ever have is scoped to the
+    batch task and the coordination backlog.  The child post-merge QA gate
+    resolved reconcile authority only from the child's own task/backlog
+    timeline, and the shared-batch projection that is supposed to cover that
+    case could not resolve any child's lane merge in a rev8/rev9 world, so
+    ``qa_graph_context`` was unsatisfiable for both children.  Before the fix
+    this test fails with ``postmerge_reconcile_event_unverified``.
+    """
+
+    world = _mf_batch_child_postmerge_qa_world(conn, tmp_path, monkeypatch)
+
+    # The batch reconcile is parent-scoped by construction: it is recorded on
+    # the coordination backlog and the batch task, never on either child.
+    assert str(world.reconcile_event["backlog_id"]) == (
+        _BATCH_QA_COORDINATION_BACKLOG
+    )
+    assert str(world.reconcile_event["task_id"]) == _BATCH_QA_BATCH_ID
+    for index in range(2):
+        assert int(world.reconcile_event["id"]) > int(
+            world.merge_events[index]["id"]
+        )
+
+    for index in range(2):
+        authority = _batch_qa_postmerge_authority(world, index)
+        assert authority.get("blocker_codes") == []
+        assert authority["verified"] is True
+        assert authority["task_id"] == _BATCH_QA_CHILD_TASKS[index]
+        assert authority["queue_item_id"] == _BATCH_QA_QUEUE_ITEM_IDS[index]
+        assert authority["merged_commit_sha"] == world.child_commits[index]
+        # The QA candidate is the reconciled batch head, and it is bound to
+        # this child's own merge lane, queue item and dispatch ref.
+        assert authority["candidate_commit_sha"] == world.final_head
+        assert authority["qa_candidate_commit_source"] == (
+            "shared_batch_final_reconcile"
+        )
+        assert authority["reconcile_event_id"] == int(
+            world.reconcile_event["id"]
+        )
+        assert authority["reconcile_source_ref"] == (
+            f"timeline:{world.reconcile_event['id']}"
+        )
+        assert authority["active_snapshot_commit"] == world.final_head
+        shared = authority["shared_batch_reconcile_authority"]
+        assert shared["batch_id"] == _BATCH_QA_BATCH_ID
+        assert shared["merge_queue_id"] == _BATCH_QA_MERGE_QUEUE_ID
+        assert shared["final_head_commit"] == world.final_head
+        assert shared["ordered_queue_item_ids"] == list(
+            _BATCH_QA_QUEUE_ITEM_IDS
+        )
+        assert _BATCH_QA_QUEUE_ITEM_IDS[index] in (
+            shared["ordered_queue_item_ids"]
+        )
+        assert shared["authority_purpose"] == "postmerge_qa_admission"
+        assert shared["all_children_postmerge_qa_admission_verified"] is True
+        # Post-merge admission never claims close satisfaction.
+        assert shared["all_children_contract_qa_verified"] is False
+        assert shared["strict_child_merge_reconcile_order_verified"] is True
+
+        # The line-binding gate the live blocker came from now admits the line.
+        with pytest.raises(_BatchQaPostmergeGatePassed):
+            _batch_qa_bind_qa_graph_line(world, index)
+
+
+def _assert_batch_qa_child_qa_fails_closed(world):
+    for index in range(2):
+        authority = _batch_qa_postmerge_authority(world, index)
+        assert authority["verified"] is False
+        assert authority["fail_closed"] is True
+        assert authority["blocker_codes"]
+        with pytest.raises(GovernanceError) as exc:
+            _batch_qa_bind_qa_graph_line(world, index)
+        assert exc.value.code == (
+            "contract_runtime_rev8_postmerge_qa_authority_required"
+        )
+    return authority
+
+
+def test_mf_batch_child_postmerge_qa_fails_closed_without_reconcile_event(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    """No durable batch reconcile means no child post-merge QA authority."""
+
+    world = _mf_batch_child_postmerge_qa_world(
+        conn,
+        tmp_path,
+        monkeypatch,
+        record_reconcile_event=False,
+    )
+    assert world.reconcile_event is None
+    authority = _assert_batch_qa_child_qa_fails_closed(world)
+    assert "postmerge_reconcile_event_unverified" in (
+        authority["blocker_codes"]
+    )
+
+
+def test_mf_batch_child_postmerge_qa_fails_closed_before_final_lane_merge(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    """A reconcile that predates a lane merge never covers that lane."""
+
+    world = _mf_batch_child_postmerge_qa_world(
+        conn,
+        tmp_path,
+        monkeypatch,
+        reconcile_before_final_lane_merge=True,
+    )
+    assert int(world.reconcile_event["id"]) < int(world.merge_events[1]["id"])
+    authority = _assert_batch_qa_child_qa_fails_closed(world)
+    assert "postmerge_reconcile_event_unverified" in (
+        authority["blocker_codes"]
+    )
+
+
+def test_mf_batch_child_postmerge_qa_fails_closed_when_child_not_covered(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    """A closed epoch that never merged this child cannot cover it."""
+
+    world = _mf_batch_child_postmerge_qa_world(
+        conn,
+        tmp_path,
+        monkeypatch,
+        epoch_excludes_child=True,
+    )
+    epoch = get_integration_epoch(conn, PID, _BATCH_QA_BATCH_ID)
+    assert list(epoch.merged_prefix) == [_BATCH_QA_QUEUE_ITEM_IDS[0]]
+    authority = _assert_batch_qa_child_qa_fails_closed(world)
+    assert "postmerge_reconcile_event_unverified" in (
+        authority["blocker_codes"]
+    )
+
+
+def test_mf_batch_child_postmerge_qa_fails_closed_on_other_reconciled_commit(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    """A reconcile of a commit that is not the batch head covers nothing."""
+
+    world = _mf_batch_child_postmerge_qa_world(
+        conn,
+        tmp_path,
+        monkeypatch,
+        reconcile_at_intermediate_commit=True,
+    )
+    assert world.reconcile_head != world.final_head
+    authority = _assert_batch_qa_child_qa_fails_closed(world)
+    assert "postmerge_reconcile_event_unverified" in (
+        authority["blocker_codes"]
+    )
+
+
+def _batch_qa_child_lane_merge_authority(world, index):
+    lane_conn = server.get_connection(PID)
+    context = world.child_contexts[index]
+    return server._contract_runtime_shared_batch_child_lane_merge_authority(
+        lane_conn,
+        project_id=PID,
+        record=world.records[index],
+        context=context,
+        timeline_events=server._runtime_context_service_timeline_events(
+            lane_conn,
+            project_id=PID,
+            task_id=context.task_id,
+            backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        ),
+    )
+
+
+def test_mf_batch_child_lane_merge_authority_rejects_unaccepted_merge_line(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    """The child lane merge must be the exact accepted ContractRuntime line."""
+
+    world = _mf_batch_child_postmerge_qa_world(conn, tmp_path, monkeypatch)
+    resolved = _batch_qa_child_lane_merge_authority(world, 0)
+    assert resolved["merge_event_id"] == int(world.merge_events[0]["id"])
+
+    # Diverge the presented merge line from the accepted canonical line.  The
+    # durable acceptance join is what refuses it; nothing is written back.
+    merge_line = next(
+        line
+        for line in world.records[0]["completed_lines"]
+        if str(line.get("line_id") or "") == "observer_merge"
+    )
+    merge_line["payload"]["merge_gate_passed"] = False
+
+    assert _batch_qa_child_lane_merge_authority(world, 0) == {}
+    # The shared batch projection itself always re-reads every child from the
+    # canonical store, so a diverged in-memory line is never the authority the
+    # gate reads either.
+    assert _batch_qa_postmerge_authority(world, 0)["verified"] is True
+
+
+def test_mf_batch_child_lane_merge_authority_rejects_unmerged_queue_item(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    """The child's durable merge-queue row must still say merged."""
+
+    world = _mf_batch_child_postmerge_qa_world(conn, tmp_path, monkeypatch)
+    assert _batch_qa_child_lane_merge_authority(world, 0)
+
+    conn.execute(
+        """
+        UPDATE parallel_branch_merge_queue_items
+        SET status = 'merge_failed'
+        WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (PID, _BATCH_QA_MERGE_QUEUE_ID, _BATCH_QA_QUEUE_ITEM_IDS[0]),
+    )
+    conn.commit()
+
+    assert _batch_qa_child_lane_merge_authority(world, 0) == {}
+    for index in range(2):
+        authority = _batch_qa_postmerge_authority(world, index)
+        assert authority["verified"] is False
+        assert authority["fail_closed"] is True
+        assert authority["blocker_codes"]
+
+
+def test_mf_batch_child_lane_merge_authority_rejects_foreign_merge_event(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    """The merge event id and time come from the timeline, not the line."""
+
+    world = _mf_batch_child_postmerge_qa_world(conn, tmp_path, monkeypatch)
+    resolved = _batch_qa_child_lane_merge_authority(world, 0)
+    assert resolved["merge_source_ref"] == (
+        f"timeline:{world.merge_events[0]['id']}"
+    )
+    assert resolved["merge_event_created_at"] == str(
+        world.merge_events[0]["created_at"]
+    )
+
+    conn.execute(
+        "UPDATE task_timeline_events SET commit_sha = ? WHERE id = ?",
+        ("f" * 40, int(world.merge_events[0]["id"])),
+    )
+    conn.commit()
+
+    assert _batch_qa_child_lane_merge_authority(world, 0) == {}
+    authority = _batch_qa_postmerge_authority(world, 0)
+    assert authority["verified"] is False
+    assert authority["fail_closed"] is True
+    assert authority["blocker_codes"]
+
+
 def _append_authenticated_qa_verification(
     conn,
     *,

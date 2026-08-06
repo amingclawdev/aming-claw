@@ -3089,3 +3089,41 @@ def test_rev9_close_grade_reconcile_authority_fails_closed_on_foreign_execution(
     assert "contract_runtime.reconcile_contract_execution_scope" in (
         gate["missing_requirement_ids"]
     )
+
+
+def test_rev9_standalone_world_never_gains_shared_batch_reconcile_authority(
+    tmp_path,
+    monkeypatch,
+):
+    """Standalone rev9 stays outside the shared batch projection.
+
+    The pre-QA child lane-merge resolver exists so the batch projection can
+    see a rev8/rev9 lane at all; it never grants authority on its own.  A real
+    standalone rev9 world has no batch id, integration epoch or shared merge
+    queue, so the batch projection must keep declining it with and without
+    post-merge QA admission.
+    """
+
+    world = _rev9_close_grade_world(tmp_path, monkeypatch)
+    merge = server._contract_runtime_rev8_two_worker_merge_projection(
+        world.record,
+        required_worker_count=2,
+        conn=world.conn,
+        project_id=_CLOSE_GRADE_PROJECT_ID,
+    )
+    assert merge["pre_qa_merge_authorized"] is True
+    assert merge["qa_contract_runtime_verified"] is False
+    assert str(getattr(world.lane_b, "batch_id", "") or "") == ""
+
+    for allow_postmerge_qa_admission in (False, True):
+        assert (
+            server._contract_runtime_shared_batch_reconcile_authority(
+                world.conn,
+                project_id=_CLOSE_GRADE_PROJECT_ID,
+                record=world.record,
+                context=world.lane_b,
+                merge=merge,
+                allow_postmerge_qa_admission=allow_postmerge_qa_admission,
+            )
+            == {}
+        )
