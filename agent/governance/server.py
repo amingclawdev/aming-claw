@@ -1249,6 +1249,134 @@ def _runtime_context_implementation_zero_write_details(
     return details
 
 
+_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS = (
+    "backlog_id",
+    "definition_hash",
+    "instruction_bundle_hash",
+    "execution_state_revision",
+    "runtime_guide_hash",
+    "stage_id",
+    "line_id",
+    "evidence_kind",
+    "line_instance_id",
+)
+
+
+def _runtime_context_implementation_writer_binding(
+    body: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+) -> dict[str, Any]:
+    """Read the exact top-level ContractRuntime writer binding or fail closed."""
+
+    binding = {
+        field: body.get(field)
+        for field in _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS
+    }
+    missing = [field for field, value in binding.items() if value in (None, "")]
+    malformed: list[str] = []
+    for field, value in binding.items():
+        if value in (None, ""):
+            continue
+        if field == "execution_state_revision":
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                malformed.append(field)
+            continue
+        if not isinstance(value, str):
+            malformed.append(field)
+            continue
+        if field in {
+            "definition_hash",
+            "instruction_bundle_hash",
+            "runtime_guide_hash",
+        } and not re.fullmatch(r"sha256:[0-9a-f]{64}", binding[field]):
+            malformed.append(field)
+
+    static_expected = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+    }
+    mismatches = [
+        {
+            "field": field,
+            "expected": expected,
+            "actual": binding.get(field, ""),
+        }
+        for field, expected in static_expected.items()
+        if binding.get(field) not in (None, "") and binding.get(field) != expected
+    ]
+    if missing or malformed or mismatches:
+        field = (
+            missing[0]
+            if missing
+            else malformed[0]
+            if malformed
+            else str(mismatches[0]["field"])
+        )
+        expected = static_expected.get(field) or (
+            "positive integer"
+            if field == "execution_state_revision"
+            else "sha256:<64 lowercase hex>"
+            if field.endswith("_hash")
+            else f"exact {field} from writer_role_safe_copy_payload.copy_payload"
+        )
+        actual = (
+            "missing"
+            if field in missing
+            else f"<invalid-{field.replace('_', '-')}>"
+            if field in malformed
+            else f"<mismatched-{field.replace('_', '-')}>"
+        )
+        field_mismatches = [
+            *[
+                {"field": item, "expected": "present", "actual": "missing"}
+                for item in missing
+            ],
+            *[
+                {
+                    "field": item,
+                    "expected": (
+                        "positive integer"
+                        if item == "execution_state_revision"
+                        else "valid public-safe writer binding value"
+                    ),
+                    "actual": f"<invalid-{item.replace('_', '-')}>",
+                }
+                for item in malformed
+            ],
+            *[
+                {
+                    "field": item["field"],
+                    "expected": item["expected"],
+                    "actual": f"<mismatched-{item['field'].replace('_', '-')}>",
+                }
+                for item in mismatches
+            ],
+        ]
+        raise GovernanceError(
+            "runtime_context_implementation_writer_binding_invalid",
+            (
+                "implementation-evidence requires the exact current "
+                "ContractRuntime atomic writer binding"
+            ),
+            422,
+            _runtime_context_implementation_zero_write_details(
+                field=field,
+                expected=expected,
+                actual=actual,
+                source="writer_role_safe_copy_payload.copy_payload",
+                identity_mismatches=field_mismatches,
+                missing_fields=missing,
+                malformed_fields=malformed,
+                runtime_context_id=runtime_context_id,
+                zero_db_access=True,
+            ),
+        )
+    return binding
+
+
 class GovernanceHandler(BaseHTTPRequestHandler):
     """HTTP request handler with routing and middleware."""
 
@@ -18755,6 +18883,16 @@ def _runtime_context_projection_response(
             else {}
         ),
         session_token_rejoin_eligibility=session_token_rejoin_eligibility,
+        writer_role_safe_copy_payload=(
+            (
+                contract_runtime_projection.get(
+                    "contract_runtime_next_legal_action"
+                )
+                or {}
+            ).get("writer_role_safe_copy_payload")
+            if isinstance(contract_runtime_projection, Mapping)
+            else {}
+        ),
     )
     _runtime_context_patch_actionable_payload_worker_scope(
         current_actionable_payloads,
@@ -19790,7 +19928,7 @@ def _runtime_context_contract_runtime_worker_projection(
         return {}
     runtime = _contract_runtime(conn)
     try:
-        canonical_record = runtime.current_record(
+        source_record = runtime.current_record(
             execution_id,
             actor_role="mf_sub",
         )
@@ -19798,9 +19936,9 @@ def _runtime_context_contract_runtime_worker_projection(
             _contract_runtime_apply_mf_parallel_context_projection(
                 conn,
                 project_id=str(
-                    canonical_record.get("project_id") or ""
+                    source_record.get("project_id") or ""
                 ),
-                record=canonical_record,
+                record=source_record,
                 actor_role="mf_sub",
             )
         )
@@ -19833,6 +19971,53 @@ def _runtime_context_contract_runtime_worker_projection(
         if isinstance(canonical_record.get("runtime_guide"), Mapping)
         else {}
     )
+    if context is not None and _is_mf_parallel_record_contract_id(
+        str(canonical_record.get("contract_id") or "")
+    ):
+        worker_id = str(getattr(context, "worker_id", "") or "").strip()
+        worker_slot_id = str(
+            getattr(context, "worker_slot_id", "") or worker_id
+        ).strip()
+        lane_identity = {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+            "worker_role": "mf_sub",
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "lane_id": worker_slot_id or worker_id,
+            "line_instance_id": f"runtime_context:{runtime_context_id}",
+        }
+        lane_write = _contract_runtime_write_from_record(
+            canonical_record,
+            actor_role="mf_sub",
+            stage_id="worker_implementation",
+            line_id="worker_implementation",
+            evidence_kind="implementation",
+        )
+        lane_write.update(lane_identity)
+        lane_write["payload"] = dict(lane_identity)
+        try:
+            _lane_state, projected_lane_guide = (
+                runtime.mf_parallel_atomic_lane_gate_view(
+                    canonical_record,
+                    guide,
+                    lane_write,
+                    source_record=source_record,
+                    projection=context_projection,
+                )
+            )
+        except ContractRuntimeError:
+            projected_lane_guide = {}
+        if (
+            isinstance(projected_lane_guide, Mapping)
+            and (
+                projected_lane_guide.get("atomic_lane_gate_binding")
+                or {}
+            ).get("bound")
+            is True
+        ):
+            guide = projected_lane_guide
     current_state = _runtime_current_state_from_record(canonical_record)
     linked_bypass_diagnostics = (
         _contract_runtime_active_linked_bypass_diagnostics(
@@ -23266,6 +23451,7 @@ def _runtime_context_worker_guide_response(
                 "runtime_context_id",
                 "task_id",
                 "parent_task_id",
+                *_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS,
                 "fence_token",
                 "session_token or session_token_ref",
                 "target_project_root",
@@ -23278,11 +23464,16 @@ def _runtime_context_worker_guide_response(
                 "worker_role",
                 "worker_id",
                 "worker_slot_id",
-                "runtime_context_id",
-                "task_id",
-                "parent_task_id",
                 "route_identity",
             ],
+            "contract_runtime_writer_binding_source": (
+                "contract_runtime_current_state.next_legal_action."
+                "writer_role_safe_copy_payload.copy_payload"
+            ),
+            "contract_runtime_writer_binding_copy_rule": (
+                "copy every declared field exactly; never infer hashes, revision, "
+                "or line_instance_id"
+            ),
             "route_identity_policy": {
                 "top_level_route_identity_source": (
                     "copy_safe_body supplies route_token_ref; the server resolves "
@@ -23493,6 +23684,14 @@ def _runtime_context_worker_guide_response(
                 ),
                 Mapping,
             )
+            else {}
+        ),
+        writer_role_safe_copy_payload=(
+            (
+                current_state_response.get("contract_runtime_next_legal_action")
+                or {}
+            ).get("writer_role_safe_copy_payload")
+            if isinstance(current_state_response, Mapping)
             else {}
         ),
     )
@@ -24331,6 +24530,7 @@ def _runtime_context_worker_recovery_payloads(
     contract_runtime_dispatch_identity: Mapping[str, Any] | None = None,
     authority_revision: Mapping[str, Any] | None = None,
     session_token_rejoin_eligibility: Mapping[str, Any] | None = None,
+    writer_role_safe_copy_payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     safe_route_identity = {
         field: str((route_identity or {}).get(field) or "").strip()
@@ -24374,6 +24574,27 @@ def _runtime_context_worker_recovery_payloads(
             "never retry owned_files permutations after implementation."
         ),
     }
+    writer_copy_container = (
+        writer_role_safe_copy_payload
+        if isinstance(writer_role_safe_copy_payload, Mapping)
+        else {}
+    )
+    writer_copy_payload = (
+        writer_copy_container.get("copy_payload")
+        if isinstance(writer_copy_container.get("copy_payload"), Mapping)
+        else {}
+    )
+    implementation_writer_binding = {
+        field: writer_copy_payload.get(field)
+        for field in _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS
+        if writer_copy_payload.get(field) not in (None, "")
+    }
+    if set(implementation_writer_binding) != set(
+        _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS
+    ) or implementation_writer_binding.get("line_instance_id") != (
+        f"runtime_context:{runtime_context_id}"
+    ):
+        implementation_writer_binding = {}
     canonical_implementation_lineage = dict(
         worker_implementation_lineage
         if isinstance(worker_implementation_lineage, Mapping)
@@ -25194,6 +25415,7 @@ def _runtime_context_worker_recovery_payloads(
         "write_authorization_policy": dict(write_authorization_policy),
         "raw_session_token_persisted": False,
         "raw_fence_token_persisted": False,
+        **implementation_writer_binding,
         **implementation_route_reference,
     }
     implementation_evidence_body = {
@@ -25218,6 +25440,7 @@ def _runtime_context_worker_recovery_payloads(
         "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
         "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
         "write_authorization_policy": dict(write_authorization_policy),
+        **implementation_writer_binding,
         "payload": implementation_evidence_payload,
         **implementation_route_reference,
     }
@@ -25267,6 +25490,10 @@ def _runtime_context_worker_recovery_payloads(
         "changed_files": "copy_safe_body.changed_files",
         "tests": "copy_safe_body.tests",
         "route_token_ref": "copy_safe_body.route_token_ref",
+        **{
+            field: f"copy_safe_body.{field}"
+            for field in _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS
+        },
     }
     active_contract_execution_id = (
         str(successor_contract_execution_id or contract_execution_id or "").strip()
@@ -25940,6 +26167,7 @@ def _runtime_context_worker_recovery_payloads(
                 "changed_files",
                 "tests",
                 "route_token_ref",
+                *_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS,
             ],
             "forbidden_shapes": [
                 "nested_payload_only_identity",
@@ -25964,6 +26192,17 @@ def _runtime_context_worker_recovery_payloads(
             ),
             "worker_session_lifecycle_policy": worker_session_lifecycle_policy,
             "write_authorization_policy": write_authorization_policy,
+            "contract_runtime_writer_binding": {
+                "source": (
+                    "contract_runtime_current_state.next_legal_action."
+                    "writer_role_safe_copy_payload.copy_payload"
+                ),
+                "bound": bool(implementation_writer_binding),
+                "copy_exactly_without_derivation": True,
+                "required_fields": list(
+                    _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS
+                ),
+            },
             "route_token_policy": {
                 "prefer_route_token_ref": True,
                 "omit_stale_child_route_token_when_using_parent_route_token_ref": True,
@@ -47602,6 +47841,10 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
             zero_db_access=True,
         )
     )
+    writer_binding = _runtime_context_implementation_writer_binding(
+        body,
+        runtime_context_id=runtime_context_id_input,
+    )
     conn = get_connection(project_id)
     try:
         context, runtime_context_id, _session = _runtime_context_mf_sub_write_context(
@@ -47653,6 +47896,30 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         )
     finally:
         conn.close()
+    if writer_binding["backlog_id"] != str(context.backlog_id or "").strip():
+        raise GovernanceError(
+            "runtime_context_implementation_writer_binding_mismatch",
+            (
+                "implementation-evidence backlog_id conflicts with the "
+                "authenticated RuntimeContext worker lane"
+            ),
+            422,
+            _runtime_context_implementation_zero_write_details(
+                field="backlog_id",
+                expected=str(context.backlog_id or "").strip(),
+                actual=writer_binding["backlog_id"],
+                source="runtime_context_authenticated_worker_lane",
+                identity_mismatches=[
+                    {
+                        "field": "backlog_id",
+                        "expected": str(context.backlog_id or "").strip(),
+                        "actual": writer_binding["backlog_id"],
+                    }
+                ],
+                runtime_context_id=runtime_context_id,
+                task_id=str(context.task_id or "").strip(),
+            ),
+        )
     lane_id = str(context.worker_slot_id or context.worker_id or "").strip()
     submitted_lane_claims = []
     for field, source in (
@@ -47748,6 +48015,10 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         fence_token_hash=fence_token_hash,
         raw_session_token=raw_session_token,
     )
+    # These values are the caller's exact current writer-copy binding.  Keep
+    # them intact through the timeline compatibility envelope so the
+    # ContractRuntime atomic-lane gate can compare and consume this lane only.
+    payload.update(writer_binding)
     for key, value in route_lineage_payload.items():
         if (
             key
@@ -47905,15 +48176,15 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         "lane_id": lane_id,
         "worker_id": context.worker_id,
         "worker_slot_id": context.worker_slot_id or context.worker_id,
-        "backlog_id": context.backlog_id,
+        "backlog_id": writer_binding["backlog_id"],
         "contract_execution_id": contract_execution_identity.get(
             "contract_execution_id",
             "",
         ),
         "contract_runtime_line": {
-            "stage_id": "worker_implementation",
-            "line_id": "worker_implementation",
-            "evidence_kind": "implementation",
+            "stage_id": writer_binding["stage_id"],
+            "line_id": writer_binding["line_id"],
+            "evidence_kind": writer_binding["evidence_kind"],
         },
         "route_id": event_route_identity.get("route_id") or "",
         "route_context_hash": event_route_identity.get("route_context_hash") or "",
@@ -47930,13 +48201,8 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         "artifact_refs": body.get("artifact_refs") or {},
         "trace_id": body.get("trace_id") or "",
         "commit_sha": body.get("commit_sha") or "",
+        **writer_binding,
     }
-    if "runtime_guide_hash" in body:
-        # Preserve the caller claim for the ContractRuntime lane gate.  The
-        # gate performs the public-safe comparison; silently dropping this
-        # field would turn malformed, stale, or other-lane hashes into an
-        # omitted-hash server derivation.
-        event_body["runtime_guide_hash"] = body.get("runtime_guide_hash")
     if isinstance(body.get("route_token"), Mapping):
         event_body["route_token"] = body.get("route_token")
     elif isinstance(body.get("route_waiver"), Mapping):
@@ -113127,10 +113393,10 @@ def _contract_runtime_close_gate(
         == "worker_implementation"
     )
     if trusted_worker_commit_line or trusted_worker_implementation_line:
-        # The RuntimeContext facade is the authenticated writer boundary.  A
-        # valid MCP request therefore does not need to carry the private
-        # atomic-lane guide hash, but the ContractRuntime write must still be
-        # bound to the exact dispatched lane before it reaches the gate.
+        # The RuntimeContext facade is the authenticated writer boundary.
+        # Implementation requests must carry the exact private atomic-lane
+        # writer copy; worker-commit keeps its server-bound legacy path.  Both
+        # paths remain bound to the exact dispatched lane before the gate.
         trusted_identity_fields = (
             "runtime_context_id",
             "task_id",
@@ -113411,6 +113677,102 @@ def _contract_runtime_close_gate(
                     actor_role=actor_role,
                 ),
             )
+        if trusted_worker_implementation_line:
+            lane_writer_copy_container = (
+                lane_guide.get("writer_role_safe_copy_payload")
+                if isinstance(
+                    lane_guide.get("writer_role_safe_copy_payload"),
+                    Mapping,
+                )
+                else {}
+            )
+            lane_writer_copy = (
+                lane_writer_copy_container.get("copy_payload")
+                if isinstance(
+                    lane_writer_copy_container.get("copy_payload"),
+                    Mapping,
+                )
+                else {}
+            )
+            if any(
+                lane_writer_copy.get(field) in (None, "")
+                for field in _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS
+            ):
+                raise GovernanceError(
+                    "contract_runtime_close_evidence_rejected",
+                    (
+                        "worker-implementation lane guide does not expose a "
+                        "complete atomic writer copy payload"
+                    ),
+                    422,
+                    _runtime_context_implementation_zero_write_details(
+                        field="atomic_lane_gate_binding",
+                        expected="complete writer_role_safe_copy_payload.copy_payload",
+                        actual="unbound",
+                        source="contract_runtime_atomic_lane_binding",
+                        contract_execution_id=contract_execution_id,
+                        actor_role=actor_role,
+                    ),
+                )
+
+            def public_binding_value(field: str, value: Any) -> Any:
+                if field == "execution_state_revision":
+                    return (
+                        value
+                        if isinstance(value, int) and not isinstance(value, bool)
+                        else "<invalid-execution-state-revision>"
+                    )
+                if not isinstance(value, str):
+                    return f"<invalid-{field.replace('_', '-')}>"
+                if field == "runtime_guide_hash":
+                    return _public_safe_runtime_guide_hash(value)
+                return value
+
+            binding_mismatches = []
+            submitted_writer_binding: dict[str, Any] = {}
+            for field in _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS:
+                expected = lane_writer_copy.get(field)
+                actual = body.get(field)
+                submitted_writer_binding[field] = actual
+                if actual != expected:
+                    binding_mismatches.append(
+                        {
+                            "field": field,
+                            "expected": public_binding_value(field, expected),
+                            "actual": (
+                                "missing"
+                                if actual in (None, "")
+                                else public_binding_value(field, actual)
+                            ),
+                        }
+                    )
+            if binding_mismatches:
+                first_mismatch = binding_mismatches[0]
+                raise GovernanceError(
+                    "contract_runtime_close_evidence_rejected",
+                    (
+                        "RuntimeContext implementation writer binding does not "
+                        "match the exact authenticated atomic lane copy payload"
+                    ),
+                    422,
+                    _runtime_context_implementation_zero_write_details(
+                        field=first_mismatch["field"],
+                        expected=first_mismatch["expected"],
+                        actual=first_mismatch["actual"],
+                        source=(
+                            "contract_runtime_lane_writer_role_safe_copy_payload"
+                        ),
+                        identity_mismatches=binding_mismatches,
+                        contract_execution_id=contract_execution_id,
+                        actor_role=actor_role,
+                    ),
+                )
+            # The accepted write uses the caller's values verbatim after exact
+            # equality with the current lane copy.  No hash, revision, or line
+            # identity is inferred or substituted for this facade.
+            for field, value in submitted_writer_binding.items():
+                write[field] = value
+                canonical_norm_payload[field] = value
         server_writer_hash = str(write.get("runtime_guide_hash") or "").strip()
         allowed_hashes = (
             {lane_hash}
@@ -113487,12 +113849,11 @@ def _contract_runtime_close_gate(
                     ),
                 },
             )
-        # ContractRuntime independently re-derives the lane view.  Passing the
-        # current global hash lets its atomic-lane binder exchange it for the
-        # content-bound private writer hash.  A supplied exact private hash
-        # remains valid as-is; omitted hashes stay server-derived.
+        # ContractRuntime independently re-checks the atomic lane.  The
+        # implementation facade already proved the caller supplied the exact
+        # private writer hash; worker-commit retains its legacy derivation.
         write["runtime_guide_hash"] = (
-            lane_hash
+            supplied_hash
             if trusted_worker_implementation_line
             else (
                 supplied_hash

@@ -2360,6 +2360,35 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
     ]
 
 
+def test_runtime_context_implementation_schema_exposes_exact_atomic_writer_binding():
+    writer_binding_fields = {
+        "backlog_id",
+        "definition_hash",
+        "instruction_bundle_hash",
+        "execution_state_revision",
+        "runtime_guide_hash",
+        "stage_id",
+        "line_id",
+        "evidence_kind",
+        "line_instance_id",
+    }
+
+    for registry in (governance_mcp_server.TOOLS, mcp_tools.TOOLS):
+        tools_by_name = {str(tool.get("name") or ""): tool for tool in registry}
+        implementation_schema = tools_by_name[
+            "runtime_context_implementation_evidence"
+        ]["inputSchema"]
+        assert implementation_schema["properties"].keys() >= writer_binding_fields
+        assert set(implementation_schema["required"]) >= {
+            "project_id",
+            "runtime_context_id",
+            *writer_binding_fields,
+        }
+        assert tools_by_name["contract_runtime_submit_line"]["inputSchema"][
+            "properties"
+        ].keys() >= writer_binding_fields
+
+
 def test_managed_mcp_contract_runtime_timeout_policy_is_bounded_and_configurable(
     monkeypatch,
 ):

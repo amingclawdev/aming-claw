@@ -1148,6 +1148,11 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
 
     def submit_correction(*, intent=correction_intent):
         request_body = {
+            **_runtime_context_implementation_writer_binding_for_test(
+                backlog_id=backlog_id,
+                runtime_context_id=runtime_context.runtime_context_id,
+                label="precommit-implementation-correction",
+            ),
             "parent_task_id": backlog_id,
             "fence_token": active_fence_token,
             "session_token": active_session_token,
@@ -1650,6 +1655,27 @@ def test_route_token_ref_superseded_guidance_prefers_same_scope_issue():
 
 def _fake_sha(label: str) -> str:
     return "sha256:" + hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def _runtime_context_implementation_writer_binding_for_test(
+    *,
+    backlog_id: str,
+    runtime_context_id: str,
+    label: str,
+) -> dict[str, Any]:
+    """Build a syntactically exact non-secret writer copy for facade fixtures."""
+
+    return {
+        "backlog_id": backlog_id,
+        "definition_hash": _fake_sha(f"{label}:definition"),
+        "instruction_bundle_hash": _fake_sha(f"{label}:instructions"),
+        "execution_state_revision": 1,
+        "runtime_guide_hash": _fake_sha(f"{label}:runtime-guide"),
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+    }
 
 
 def _worker_commit_contract_proof():
@@ -20679,6 +20705,11 @@ def test_observer_runtime_text_prepare_mints_append_scoped_worker_route_ref(
             "mf_sub",
             method="POST",
             body={
+                **_runtime_context_implementation_writer_binding_for_test(
+                    backlog_id=bug_id,
+                    runtime_context_id=context.runtime_context_id,
+                    label="runtime-text-append-child",
+                ),
                 "parent_task_id": context.root_task_id,
                 "fence_token": "fence-runtime-text-append-child",
                 "session_token": session_token,
@@ -20796,6 +20827,11 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_route_ref(
     )
     session_token_ref = runtime_context_session_token_ref(context)
     implementation_body = {
+        **_runtime_context_implementation_writer_binding_for_test(
+            backlog_id=backlog_id,
+            runtime_context_id=context.runtime_context_id,
+            label="parent-bound-route-ref",
+        ),
         "parent_task_id": parent_task_id,
         "lane_id": context.worker_slot_id,
         "fence_token": "fence-runtime-parent-bound",
@@ -20994,6 +21030,11 @@ def test_runtime_context_implementation_route_ref_resolves_active_contract_execu
             "mf_sub",
             method="POST",
             body={
+                **_runtime_context_implementation_writer_binding_for_test(
+                    backlog_id=backlog_id,
+                    runtime_context_id=context.runtime_context_id,
+                    label="active-contract-execution-route-scope",
+                ),
                 "parent_task_id": context.parent_task_id,
                 "fence_token": "fence-runtime-contract-scoped-route",
                 "session_token": "session-runtime-contract-scoped-route",
@@ -21339,6 +21380,11 @@ def test_runtime_context_implementation_evidence_rejects_empty_or_fake_graph_tra
                 "mf_sub",
                 method="POST",
                 body={
+                    **_runtime_context_implementation_writer_binding_for_test(
+                        backlog_id=backlog_id,
+                        runtime_context_id=context.runtime_context_id,
+                        label="implementation-graph-trace-gate",
+                    ),
                     "parent_task_id": parent_task_id,
                     "fence_token": fence_token,
                     "session_token": session_token,
@@ -25253,6 +25299,11 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_child_rout
                 "mf_sub",
                 method="POST",
                 body={
+                    **_runtime_context_implementation_writer_binding_for_test(
+                        backlog_id=context.backlog_id,
+                        runtime_context_id=context.runtime_context_id,
+                        label="parent-bound-child-route-parent",
+                    ),
                     "parent_task_id": context.root_task_id,
                     "fence_token": "fence-child-route-token",
                     "session_token": "session-child-route-token",
@@ -25285,6 +25336,11 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_child_rout
             "mf_sub",
             method="POST",
             body={
+                **_runtime_context_implementation_writer_binding_for_test(
+                    backlog_id=context.backlog_id,
+                    runtime_context_id=context.runtime_context_id,
+                    label="parent-bound-child-route-child",
+                ),
                 "parent_task_id": context.root_task_id,
                 "fence_token": "fence-child-route-token",
                 "session_token": "session-child-route-token",
@@ -25339,6 +25395,11 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_child_rout
                 "mf_sub",
                 method="POST",
                 body={
+                    **_runtime_context_implementation_writer_binding_for_test(
+                        backlog_id=context.backlog_id,
+                        runtime_context_id=context.runtime_context_id,
+                        label="parent-bound-child-route-ref",
+                    ),
                     "parent_task_id": context.root_task_id,
                     "fence_token": "fence-child-route-token",
                     "session_token": "session-child-route-token",
@@ -25768,6 +25829,11 @@ def test_runtime_context_implementation_evidence_accepts_parent_backlog_route_re
             "mf_sub",
             method="POST",
             body={
+                **_runtime_context_implementation_writer_binding_for_test(
+                    backlog_id=context.backlog_id,
+                    runtime_context_id=context.runtime_context_id,
+                    label="parent-backlog-route-ref",
+                ),
                 "parent_task_id": context.root_task_id,
                 "fence_token": "fence-parent-backlog-route-ref",
                 "session_token": "session-parent-backlog-route-ref",
@@ -25887,6 +25953,11 @@ def test_runtime_context_implementation_evidence_recovery_body_uses_canonical_ro
     conn.commit()
 
     wrong_root_body = {
+        **_runtime_context_implementation_writer_binding_for_test(
+            backlog_id=context.backlog_id,
+            runtime_context_id=context.runtime_context_id,
+            label="implementation-canonical-root",
+        ),
         "parent_task_id": context.root_task_id,
         "fence_token": "fence-impl-canonical-root",
         "session_token_ref": runtime_context_session_token_ref(context),
@@ -25932,6 +26003,11 @@ def test_runtime_context_implementation_evidence_recovery_body_uses_canonical_ro
     )
     retry_body.update(
         {
+            **_runtime_context_implementation_writer_binding_for_test(
+                backlog_id=context.backlog_id,
+                runtime_context_id=context.runtime_context_id,
+                label="implementation-canonical-root",
+            ),
             "fence_token": "fence-impl-canonical-root",
             "changed_files": ["agent/governance/server.py"],
             "tests": [{"command": "pytest -q", "status": "passed"}],
@@ -26043,6 +26119,11 @@ def test_runtime_context_parent_route_lineage_error_retry_body_succeeds(
     )
     conn.commit()
     common_body = {
+        **_runtime_context_implementation_writer_binding_for_test(
+            backlog_id=context.backlog_id,
+            runtime_context_id=context.runtime_context_id,
+            label="parent-lineage-retry",
+        ),
         "parent_task_id": context.root_task_id,
         "fence_token": "fence-parent-lineage-retry",
         "session_token_ref": runtime_context_session_token_ref(context),
@@ -26079,6 +26160,11 @@ def test_runtime_context_parent_route_lineage_error_retry_body_succeeds(
     )
     retry_body.update(
         {
+            **_runtime_context_implementation_writer_binding_for_test(
+                backlog_id=context.backlog_id,
+                runtime_context_id=context.runtime_context_id,
+                label="parent-lineage-retry",
+            ),
             "fence_token": "fence-parent-lineage-retry",
             "changed_files": ["agent/governance/server.py"],
             "tests": [{"command": "pytest -q", "status": "passed"}],
@@ -26625,6 +26711,11 @@ def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_l
         token=token_without_parent["route_token"],
     )
     common_body = {
+        **_runtime_context_implementation_writer_binding_for_test(
+            backlog_id=context.backlog_id,
+            runtime_context_id=context.runtime_context_id,
+            label="unrelated-child-route-lineage",
+        ),
         "parent_task_id": context.root_task_id,
         "fence_token": "fence-child-route-reject",
         "session_token": "session-child-route-reject",
@@ -48960,6 +49051,11 @@ def test_runtime_context_session_token_rejoin_rebinds_superseded_route_ref(
             "mf_sub",
             method="POST",
             body={
+                **_runtime_context_implementation_writer_binding_for_test(
+                    backlog_id=context.backlog_id,
+                    runtime_context_id=context.runtime_context_id,
+                    label="rejoin-superseded-route-ref",
+                ),
                 "parent_task_id": context.root_task_id,
                 "fence_token": result["fence_token"],
                 "session_token": result["session_token"],
@@ -89569,6 +89665,11 @@ def test_timeline_precheck_enriches_ref_only_registry_child_lineage(conn, tmp_pa
             "mf_sub",
             method="POST",
             body={
+                **_runtime_context_implementation_writer_binding_for_test(
+                    backlog_id=backlog_id,
+                    runtime_context_id=runtime_context_id,
+                    label="timeline-precheck-child-lineage",
+                ),
                 "parent_task_id": backlog_id,
                 "fence_token": f"fence-{task_id}",
                 "session_token": f"session-token-{task_id}",
@@ -120754,6 +120855,14 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
             },
             "writer_role_safe_copy_payload": {
                 "copy_payload": {
+                    "backlog_id": backlog_id,
+                    "definition_hash": _fake_sha(
+                        "implementation-two-worker-definition"
+                    ),
+                    "instruction_bundle_hash": _fake_sha(
+                        "implementation-two-worker-instructions"
+                    ),
+                    "execution_state_revision": 9,
                     "runtime_guide_hash": global_lane_hash,
                     "stage_id": "worker_implementation",
                     "line_id": "worker_implementation",
@@ -120829,6 +120938,14 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
                     "runtime_guide_hash": worker_lane_hash,
                     "writer_role_safe_copy_payload": {
                         "copy_payload": {
+                            "backlog_id": backlog_id,
+                            "definition_hash": record["definition_hash"],
+                            "instruction_bundle_hash": record[
+                                "instruction_bundle_hash"
+                            ],
+                            "execution_state_revision": record[
+                                "execution_state_revision"
+                            ],
                             "runtime_guide_hash": worker_lane_hash,
                             "stage_id": "worker_implementation",
                             "line_id": "worker_implementation",
@@ -120915,7 +121032,19 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
         "raw_session_token_persisted": False,
         "raw_fence_token_persisted": False,
     }
+    worker_writer_binding = {
+        "backlog_id": backlog_id,
+        "definition_hash": record["definition_hash"],
+        "instruction_bundle_hash": record["instruction_bundle_hash"],
+        "execution_state_revision": record["execution_state_revision"],
+        "runtime_guide_hash": worker_lane_hash,
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        "line_instance_id": authenticated_lane["line_instance_id"],
+    }
     payload = {
+        **worker_writer_binding,
         **authenticated_lane,
         "target_project_root": target_root,
         "session_token_ref": session_token_ref,
@@ -120927,7 +121056,7 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
         "test_results": {"status": "passed", "passed": True},
     }
     event_body = {
-        "backlog_id": backlog_id,
+        **worker_writer_binding,
         "task_id": authenticated_lane["task_id"],
         "contract_execution_id": execution_id,
         "event_type": "mf.implementation",
@@ -121398,6 +121527,25 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
             "implementation_evidence_facade_payload_skeleton"
         ]["copy_safe_body"]
     )
+    writer_binding_fields = (
+        "backlog_id",
+        "definition_hash",
+        "instruction_bundle_hash",
+        "execution_state_revision",
+        "runtime_guide_hash",
+        "stage_id",
+        "line_id",
+        "evidence_kind",
+        "line_instance_id",
+    )
+    exact_writer_copy = guide["contract_runtime_next_legal_action"][
+        "writer_role_safe_copy_payload"
+    ]["copy_payload"]
+    for field in writer_binding_fields:
+        assert implementation_body[field] == exact_writer_copy[field]
+    assert implementation_body["line_instance_id"] == (
+        f"runtime_context:{inactive_context.runtime_context_id}"
+    )
     implementation_body.update(
         {
             "session_token": inactive_token,
@@ -121429,6 +121577,10 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
     ).fetchone()[0]
     global_hash = baseline_record["runtime_guide"]["runtime_guide_hash"]
     rejection_cases = []
+    for field in writer_binding_fields:
+        missing_binding = copy.deepcopy(implementation_body)
+        missing_binding.pop(field)
+        rejection_cases.append(missing_binding)
     malformed_hash = copy.deepcopy(implementation_body)
     malformed_hash["runtime_guide_hash"] = {
         "secret": "must-not-reflect-implementation-r2"
@@ -121443,6 +121595,11 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
     other_lane_identity = copy.deepcopy(implementation_body)
     other_lane_identity["lane_id"] = active_context.worker_slot_id
     rejection_cases.append(other_lane_identity)
+    other_lane_line_instance = copy.deepcopy(implementation_body)
+    other_lane_line_instance["line_instance_id"] = (
+        f"runtime_context:{active_context.runtime_context_id}"
+    )
+    rejection_cases.append(other_lane_line_instance)
     malformed_identity = copy.deepcopy(implementation_body)
     malformed_identity["lane_id"] = {
         "secret": "must-not-reflect-lane-identity-r2"
@@ -121503,6 +121660,10 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
     implementation_record = runtime.store.get(execution_id)
     implementation_line = implementation_record["completed_lines"][-1]
     assert implementation_line["line_id"] == "worker_implementation"
+    for field in writer_binding_fields:
+        assert implementation_line["payload"][field] == implementation_body[field]
+        if field in implementation_line:
+            assert implementation_line[field] == implementation_body[field]
     implementation_lineage = _worker_implementation_lineage(
         implementation_record,
         implementation_line,

@@ -535,6 +535,15 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
     properties.update(
         {
             "task_id": {"type": "string"},
+            "backlog_id": {"type": "string"},
+            "definition_hash": {"type": "string"},
+            "instruction_bundle_hash": {"type": "string"},
+            "execution_state_revision": {"type": "integer"},
+            "runtime_guide_hash": {"type": "string"},
+            "stage_id": {"type": "string"},
+            "line_id": {"type": "string"},
+            "evidence_kind": {"type": "string"},
+            "line_instance_id": {"type": "string"},
             "lane_id": {
                 "type": "string",
                 "description": (
@@ -2650,7 +2659,19 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": _runtime_context_write_schema_properties(),
-            "required": ["project_id", "runtime_context_id"],
+            "required": [
+                "project_id",
+                "runtime_context_id",
+                "backlog_id",
+                "definition_hash",
+                "instruction_bundle_hash",
+                "execution_state_revision",
+                "runtime_guide_hash",
+                "stage_id",
+                "line_id",
+                "evidence_kind",
+                "line_instance_id",
+            ],
         },
     },
     {
