@@ -89776,6 +89776,11 @@ def test_contract_runtime_qa_bridge_preserves_precheck_submit_and_failure_fields
         }
         if qa_status is not None:
             incomplete_body["status"] = qa_status
+        record_before = runtime.store.get(
+            incomplete_hotfix["contract_execution_id"]
+        )
+        completed_before = len(record_before["completed_lines"])
+        revision_before = record_before["execution_state_revision"]
         incomplete_qa = server.handle_project_contract_runtime_line_write(
             _ctx_with_role(
                 {
@@ -89789,10 +89794,38 @@ def test_contract_runtime_qa_bridge_preserves_precheck_submit_and_failure_fields
                 body=incomplete_body,
             )
         )
-        assert incomplete_qa["ok"] is True
         incomplete_record = runtime.store.get(
             incomplete_hotfix["contract_execution_id"]
         )
+
+        if not str(qa_status or "").strip():
+            # A passing nested verdict with no usable top-level status is the
+            # accept-then-silently-flip contradiction c07b7493 rejects: the
+            # completion gate is derived from the top-level status alone, so
+            # accepting this would normalize a passing verification into a
+            # failing one and drop the author into failed-QA rework unasked.
+            # The gate keys on "no non-empty status", so a blank status is
+            # rejected on the same evidence as an absent one.
+            assert incomplete_qa["ok"] is False, label
+            assert incomplete_qa["decision"]["errors"] == [
+                "qa_independent_verification records a passing verdict but "
+                "omits the top-level status field; the completion status gate "
+                "is derived from the top-level status alone and would "
+                "normalize this passing verification into a failing one"
+            ], label
+            # Zero write: no completed line appended, no revision bump, and no
+            # failed-QA world entered behind the author's back.
+            assert len(incomplete_record["completed_lines"]) == completed_before
+            assert incomplete_record["execution_state_revision"] == revision_before
+            assert incomplete_record["completed_lines"][-1]["line_id"] == (
+                "hotfix_post_action_summary"
+            )
+            continue
+
+        # A top-level status that is present but simply not passing is not a
+        # contradiction. It still writes, and it still lands in failed-QA
+        # rework exactly as it did before the rejection existed.
+        assert incomplete_qa["ok"] is True, label
         incomplete_line = incomplete_record["completed_lines"][-1]
         incomplete_status_gate = incomplete_line["qa_evidence_provenance"][
             "completion_status_gate"
