@@ -7008,6 +7008,42 @@ def _write_exact_runtime_context_qa_graph_line(
     return session
 
 
+def _assert_fence_rejection_details(details: dict) -> None:
+    """A fence refusal is caller-correctable, never a bare 500."""
+
+    assert details["field"] == "fence_token"
+    holder = details["expected"]["credential_holder"]
+    assert holder["observer_can_hold_fence_token"] is False
+    assert holder["role"] == "mf_sub_worker"
+    assert "worker_fence_token" in details["expected"]["accepted_authorities"]
+    assert (
+        "route_gated_finish_checkpoint_materialize"
+        in details["expected"]["accepted_authorities"]
+    )
+    assert details["actual"]["fence_token_matches"] is False
+    assert details["guide"]["bypass_or_waive_required"] is False
+    assert details["guide"]["fence_token_is_a_worker_credential"] is True
+    assert details["public_safe"] is True
+    assert details["secret_safe"] is True
+    assert details["raw_fence_token_exposed"] is False
+    assert details["zero_write_rejection"] is True
+
+
+def _assert_fence_rejection_error(exc: GovernanceError) -> None:
+    assert exc.code == "branch_runtime_fence_rejected"
+    assert exc.status == 409
+    _assert_fence_rejection_details(exc.details)
+
+
+def _assert_fence_rejection_response(result) -> dict:
+    status, body = result
+    assert status == 409
+    assert body["ok"] is False
+    assert body["error"] == "branch_runtime_fence_rejected"
+    _assert_fence_rejection_details(body)
+    return body
+
+
 def _route_waiver(action: str, *, task_id: str = "", backlog_id: str = "") -> dict:
     waiver = {
         "accepted": True,
@@ -29301,7 +29337,7 @@ def test_parallel_branch_recover_and_checkpoint_routes_enforce_fence(conn):
     assert context["attempt"] == 2
     assert context["fence_token"] != "fence-old"
 
-    with pytest.raises(BranchRuntimeFenceError):
+    with pytest.raises(GovernanceError) as stale_checkpoint:
         server.handle_graph_governance_parallel_branch_checkpoint(
             _ctx(
                 {"project_id": PID},
@@ -29313,6 +29349,7 @@ def test_parallel_branch_recover_and_checkpoint_routes_enforce_fence(conn):
                 },
             )
         )
+    _assert_fence_rejection_error(stale_checkpoint.value)
 
     checkpointed = server.handle_graph_governance_parallel_branch_checkpoint(
         _ctx(
@@ -29351,7 +29388,7 @@ def test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision(c
         now_iso="2026-05-17T07:20:00Z",
     )
 
-    with pytest.raises(BranchRuntimeFenceError):
+    _assert_fence_rejection_response(
         server.handle_graph_governance_parallel_branch_merge_queue(
             _ctx(
                 {"project_id": PID},
@@ -29364,6 +29401,7 @@ def test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision(c
                 },
             )
         )
+    )
 
     queued = server.handle_graph_governance_parallel_branch_merge_queue(
         _ctx(
@@ -34557,7 +34595,7 @@ def test_mf_sub_merge_queue_accepts_route_gate_finish_checkpoint_without_raw_fen
         )
     )
 
-    with pytest.raises(BranchRuntimeFenceError):
+    stale_fence_rejection = _assert_fence_rejection_response(
         server.handle_graph_governance_parallel_branch_merge_queue(
             _ctx(
                 {"project_id": PID},
@@ -34575,6 +34613,18 @@ def test_mf_sub_merge_queue_accepts_route_gate_finish_checkpoint_without_raw_fen
                 },
             )
         )
+    )
+    # The remediation names the fenceless route the observer can actually take.
+    finish_route = stale_fence_rejection["guide"][
+        "route_gated_finish_checkpoint_materialize"
+    ]
+    assert finish_route["available"] is True
+    assert finish_route["required_body"] == {
+        "task_id": "mf-sub-route-checkpoint-task",
+        "require_finish_gate": True,
+        "checkpoint_id": "ckpt-mf-sub-route-checkpoint",
+        "fence_token": None,
+    }
 
     queued = server.handle_graph_governance_parallel_branch_merge_queue(
         _ctx(
@@ -34599,6 +34649,396 @@ def test_mf_sub_merge_queue_accepts_route_gate_finish_checkpoint_without_raw_fen
     assert queued["context"]["checkpoint_id"] == "ckpt-mf-sub-route-checkpoint"
     assert queued["queue_item"]["task_id"] == "mf-sub-route-checkpoint-task"
     assert queued["route_token_gate"]["action"] == "merge_queue"
+
+
+_OVERLAP_FENCE_BATCH_ID = "mf-batch-parallel-overlapfence"
+_OVERLAP_FENCE_QUEUE_ID = "mq-overlapfence"
+_OVERLAP_FENCE_BASE = "a" * 40
+
+
+def _overlap_fence_row(index: int) -> dict:
+    return {
+        "index": index,
+        "backlog_id": f"AC-OVERLAP-FENCE-CHILD-{index}",
+        "row_task_id": f"{_OVERLAP_FENCE_BATCH_ID}:row:{index}",
+        "cex_task_id": f"cex-mf-parallel-overlapfence-{index}",
+        "checkpoint_id": f"ckpt-overlapfence-{index}",
+        "fence_token": f"fence-overlapfence-{index}",
+        "head_commit": f"{index}" * 40,
+    }
+
+
+def _seed_overlapping_fence_batch(conn) -> list[dict]:
+    """Seed the mf_batch_parallel geometry that owns one shared file per child.
+
+    Batch planning persists the ordering on plan rows keyed
+    ``<batch_id>:row:<n>`` with an empty branch_ref, while the worker lane that
+    actually produced the candidate is keyed by its contract execution id.
+    Overlapping fences make every later row depend on every earlier one.
+    """
+
+    rows = [_overlap_fence_row(index) for index in (1, 2, 3)]
+    planned: list[MergeQueueItem] = []
+    for row in rows:
+        predecessors = tuple(
+            f"{_OVERLAP_FENCE_BATCH_ID}:row:{prior}"
+            for prior in range(1, row["index"])
+        )
+        planned.append(
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=_OVERLAP_FENCE_QUEUE_ID,
+                queue_item_id=f"mqitem-overlapfence-plan-{row['index']}",
+                backlog_id=row["backlog_id"],
+                task_id=row["row_task_id"],
+                branch_ref="",
+                queue_index=row["index"],
+                status="planned",
+                depends_on=predecessors,
+                hard_depends_on=predecessors,
+                serializes_after=predecessors,
+                conflicts_with=predecessors,
+                same_node_or_file_conflicts=predecessors,
+                target_ref="refs/heads/main",
+                base_commit=_OVERLAP_FENCE_BASE,
+            )
+        )
+        upsert_branch_context(
+            conn,
+            BranchTaskRuntimeContext(
+                project_id=PID,
+                batch_id=_OVERLAP_FENCE_BATCH_ID,
+                backlog_id=row["backlog_id"],
+                task_id=row["cex_task_id"],
+                parent_task_id=row["cex_task_id"],
+                branch_ref=f"refs/heads/codex/{row['cex_task_id']}",
+                ref_name="main",
+                status=STATE_VALIDATED,
+                fence_token=row["fence_token"],
+                checkpoint_id=row["checkpoint_id"],
+                replay_source="mf_sub_finish_gate",
+                base_commit=_OVERLAP_FENCE_BASE,
+                head_commit=row["head_commit"],
+                target_head_commit=_OVERLAP_FENCE_BASE,
+                merge_queue_id=_OVERLAP_FENCE_QUEUE_ID,
+            ),
+            now_iso="2026-08-07T12:06:03Z",
+        )
+    upsert_merge_queue_items(conn, planned, now_iso="2026-08-07T12:06:03Z")
+    conn.commit()
+    return rows
+
+
+def _materialize_overlap_fence_row(row: dict, **overrides):
+    body = {
+        "task_id": row["cex_task_id"],
+        "merge_queue_id": _OVERLAP_FENCE_QUEUE_ID,
+        "require_finish_gate": True,
+        "checkpoint_id": row["checkpoint_id"],
+        "route_waiver": _route_waiver("merge_queue", task_id=row["cex_task_id"]),
+    }
+    body.update(overrides)
+    return server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+
+def test_overlapping_fence_batch_child_materialize_without_fence_names_the_route(conn):
+    """AC-MQMAT-FENCE-STRUCTURED-REJECTION / AC-MQMAT-REGRESSION.
+
+    The observer drives merge and structurally cannot hold the worker fence.
+    The refusal must say so, name the field, and hand back the route-gated
+    finish-checkpoint materialize instead of a bare internal_error.
+    """
+
+    rows = _seed_overlapping_fence_batch(conn)
+    changes_before = conn.total_changes
+
+    absent = _assert_fence_rejection_response(
+        _materialize_overlap_fence_row(
+            rows[0],
+            require_finish_gate=False,
+            checkpoint_id="",
+        )
+    )
+    assert absent["actual"]["reason"] == "fence_token_absent"
+    assert absent["actual"]["fence_token_present"] is False
+    assert absent["prewrite_gate"] is True
+    assert absent["timeline_event_recorded"] is False
+    holder = absent["expected"]["credential_holder"]
+    assert holder["task_id"] == rows[0]["cex_task_id"]
+    route = absent["guide"]["route_gated_finish_checkpoint_materialize"]
+    assert route["available"] is True
+    assert route["required_body"]["checkpoint_id"] == rows[0]["checkpoint_id"]
+    assert route["required_body"]["require_finish_gate"] is True
+    assert route["required_body"]["fence_token"] is None
+
+    stale = _assert_fence_rejection_response(
+        _materialize_overlap_fence_row(
+            rows[0],
+            require_finish_gate=False,
+            checkpoint_id="",
+            fence_token="fence-reclaimed-by-someone-else",
+        )
+    )
+    assert stale["actual"]["reason"] == "fence_token_stale"
+    assert stale["actual"]["fence_token_present"] is True
+    assert "fence-reclaimed-by-someone-else" not in json.dumps(stale)
+
+    assert conn.total_changes == changes_before
+
+
+def test_overlapping_fence_batch_row_task_id_is_disambiguated_not_route_token_required(
+    conn,
+):
+    """AC-MQMAT-TASK-ID-DISAMBIGUATED.
+
+    ``<batch>:row:<n>`` is a plan identity with no runtime context.  Reporting
+    ``route_token_required`` for it reads as a missing credential instead of a
+    wrong identifier.
+    """
+
+    rows = _seed_overlapping_fence_batch(conn)
+    changes_before = conn.total_changes
+
+    status, rejection = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": rows[0]["row_task_id"],
+                "merge_queue_id": _OVERLAP_FENCE_QUEUE_ID,
+                "require_finish_gate": True,
+                "checkpoint_id": rows[0]["checkpoint_id"],
+                "route_waiver": _route_waiver(
+                    "merge_queue",
+                    task_id=rows[0]["row_task_id"],
+                ),
+            },
+        )
+    )
+
+    assert status == 422
+    assert rejection["error"] == "merge_queue_task_id_must_be_contract_execution_id"
+    assert rejection["field"] == "task_id"
+    assert rejection["actual"] == rows[0]["row_task_id"]
+    assert rejection["expected"] == rows[0]["cex_task_id"]
+    assert rejection["guide"]["copy_safe_patch"] == {
+        "task_id": rows[0]["cex_task_id"]
+    }
+    assert rejection["batch_plan_row"]["batch_id"] == _OVERLAP_FENCE_BATCH_ID
+    assert rejection["batch_plan_row"]["row_index"] == 1
+    assert (
+        rejection["batch_plan_row"]["planned_queue_item_id"]
+        == "mqitem-overlapfence-plan-1"
+    )
+    assert rejection["route_token_required_is_misleading_here"] is True
+    assert rejection["zero_write_rejection"] is True
+    assert conn.total_changes == changes_before
+
+
+def test_overlapping_fence_batch_children_merge_in_order_through_one_queue(conn):
+    """The load-bearing outcome, with ordering intact.
+
+    Following the remediation binds the lane onto its own plan row -- same
+    queue_item_id, same queue_index, dependency edges rebound onto the lane --
+    so order and mergeability live on one row.  Row 2 must stay blocked until
+    row 1 has merged.
+    """
+
+    rows = _seed_overlapping_fence_batch(conn)
+
+    first = _materialize_overlap_fence_row(rows[0])
+    assert first["ok"] is True
+    assert first["queue_item"]["queue_item_id"] == "mqitem-overlapfence-plan-1"
+    assert first["queue_item"]["queue_index"] == 1
+    assert first["queue_item"]["task_id"] == rows[0]["cex_task_id"]
+    assert first["queue_item"]["branch_ref"] == (
+        f"refs/heads/codex/{rows[0]['cex_task_id']}"
+    )
+
+    second = _materialize_overlap_fence_row(rows[1])
+    assert second["ok"] is True
+    assert second["queue_item"]["queue_item_id"] == "mqitem-overlapfence-plan-2"
+    assert second["queue_item"]["queue_index"] == 2
+    # The plan-row dependency was rebound onto the materialized lane identity.
+    assert second["queue_item"]["serializes_after"] == [rows[0]["cex_task_id"]]
+
+    durable = list_merge_queue_items(
+        conn,
+        PID,
+        _OVERLAP_FENCE_QUEUE_ID,
+        target_ref="refs/heads/main",
+    )
+    assert [item.queue_item_id for item in durable] == [
+        "mqitem-overlapfence-plan-1",
+        "mqitem-overlapfence-plan-2",
+        "mqitem-overlapfence-plan-3",
+    ]
+    assert len(durable) == 3
+
+    decision = decide_persisted_merge_queue(
+        conn,
+        PID,
+        _OVERLAP_FENCE_QUEUE_ID,
+        target_ref="refs/heads/main",
+    )
+    assert rows[0]["cex_task_id"] in decision.mergeable_task_ids
+    assert rows[1]["cex_task_id"] not in decision.mergeable_task_ids
+    assert rows[1]["cex_task_id"] in decision.blocked_task_ids
+    blocked_row = next(
+        row
+        for row in decision.dashboard_rows
+        if row["task_id"] == rows[1]["cex_task_id"]
+    )
+    assert blocked_row["dependency_blockers"] == [rows[0]["cex_task_id"]]
+    assert blocked_row["merge_allowed"] is False
+
+    # The durable plan-row id is now selectable by the merge gate under either
+    # identifier -- the split that made both views unusable is closed.
+    for selector in (
+        {"queue_item_id": "mqitem-overlapfence-plan-1"},
+        {"task_id": rows[0]["cex_task_id"]},
+    ):
+        gate = server.handle_graph_governance_parallel_branch_merge_gate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "merge_queue_id": _OVERLAP_FENCE_QUEUE_ID,
+                    "target_ref": "refs/heads/main",
+                    **selector,
+                },
+            )
+        )
+        assert gate["ok"] is True
+        assert gate["plan"]["queue_item_id"] == "mqitem-overlapfence-plan-1"
+        assert gate["plan"]["task_id"] == rows[0]["cex_task_id"]
+        assert gate["plan"]["branch_ref"] == (
+            f"refs/heads/codex/{rows[0]['cex_task_id']}"
+        )
+
+    blocked_gate = server.handle_graph_governance_parallel_branch_merge_gate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "merge_queue_id": _OVERLAP_FENCE_QUEUE_ID,
+                "target_ref": "refs/heads/main",
+                "queue_item_id": "mqitem-overlapfence-plan-2",
+            },
+        )
+    )
+    assert blocked_gate["plan"]["merge_allowed"] is False
+
+    merged_first = replace(
+        get_merge_queue_item(
+            conn,
+            PID,
+            _OVERLAP_FENCE_QUEUE_ID,
+            "mqitem-overlapfence-plan-1",
+        ),
+        status=STATE_MERGED,
+    )
+    upsert_merge_queue_item(conn, merged_first, now_iso="2026-08-07T13:00:00Z")
+    conn.commit()
+
+    after = decide_persisted_merge_queue(
+        conn,
+        PID,
+        _OVERLAP_FENCE_QUEUE_ID,
+        target_ref="refs/heads/main",
+    )
+    assert rows[1]["cex_task_id"] in after.mergeable_task_ids
+    assert rows[1]["cex_task_id"] not in after.blocked_task_ids
+
+
+def test_merge_execute_unknown_queue_item_names_the_visible_durable_set(conn):
+    """AC-MQMAT-NO-UNHANDLED-BRANCH-RUNTIME-ERROR.
+
+    Read-model recovery rows keyed by the contract execution id are not durable
+    queue members.  Selecting one must be a 404 naming the visible set, not an
+    uncaught KeyError behind ``internal_error``.
+    """
+
+    rows = _seed_overlapping_fence_batch(conn)
+    read_model_only_id = "mqitem-overlapfence-read-model-only"
+
+    with pytest.raises(GovernanceError) as unknown_item:
+        server.handle_graph_governance_parallel_branch_merge_execute(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "merge_queue_id": _OVERLAP_FENCE_QUEUE_ID,
+                    "queue_item_id": read_model_only_id,
+                    "target_ref": "refs/heads/main",
+                    "dry_run": True,
+                },
+            )
+        )
+
+    error = unknown_item.value
+    assert error.code == "merge_queue_item_not_found"
+    assert error.status == 404
+    assert error.details["field"] == "queue_item_id"
+    assert error.details["actual"]["queue_item_id"] == read_model_only_id
+    assert error.details["expected"]["one_of_queue_item_ids"] == [
+        "mqitem-overlapfence-plan-1",
+        "mqitem-overlapfence-plan-2",
+        "mqitem-overlapfence-plan-3",
+    ]
+    assert error.details["expected"]["one_of_task_ids"] == [
+        row["row_task_id"] for row in rows
+    ]
+    assert error.details["guide"]["read_model_only_ids_are_not_selectable"] is True
+    assert error.details["visible_items"][0]["never_materialized_plan_row"] is True
+    assert error.details["zero_write_rejection"] is True
+
+
+def test_parallel_branch_runtime_errors_never_reach_the_bare_500_path():
+    """Every expected branch runtime refusal has a public envelope."""
+
+    fence_error = BranchRuntimeFenceError(
+        "Fence token mismatch: branch context was reclaimed",
+        {"reason": "fence_token_stale", "fence_token_present": True},
+    )
+    converted = server._parallel_branch_runtime_governance_error(
+        fence_error,
+        endpoint="parallel-branches/merge-queue/materialize",
+        project_id=PID,
+        task_id="cex-mf-parallel-overlapfence-1",
+    )
+    assert isinstance(converted, GovernanceError)
+    assert converted.code == "branch_runtime_fence_rejected"
+    assert converted.status == 409
+
+    not_found = parallel_branch_runtime.MergeQueueItemNotFoundError(
+        "merge queue item not found: mqitem-unknown",
+        parallel_branch_runtime.merge_queue_item_selector_details(
+            [],
+            queue_item_id="mqitem-unknown",
+        ),
+    )
+    assert isinstance(not_found, KeyError)
+    converted_not_found = server._parallel_branch_runtime_governance_error(
+        not_found,
+        endpoint="parallel-branches/merge-execute",
+        project_id=PID,
+        merge_queue_id=_OVERLAP_FENCE_QUEUE_ID,
+    )
+    assert isinstance(converted_not_found, GovernanceError)
+    assert converted_not_found.code == "merge_queue_item_not_found"
+    assert converted_not_found.status == 404
+
+    assert (
+        server._parallel_branch_runtime_governance_error(
+            RuntimeError("unrelated"),
+            endpoint="parallel-branches/merge-execute",
+        )
+        is None
+    )
+
 
 
 def test_mf_sub_merge_queue_normalizes_ready_for_merge_alias_after_finish_checkpoint(conn):
@@ -36602,7 +37042,7 @@ def test_parallel_branch_merge_execute_preflights_fence_before_live_writer(
         fake_write_merge_with_trailer,
     )
 
-    with pytest.raises(BranchRuntimeFenceError):
+    with pytest.raises(GovernanceError) as merge_execute_stale_fence:
         server.handle_graph_governance_parallel_branch_merge_execute(
             _ctx(
                 {"project_id": PID},
@@ -36626,6 +37066,7 @@ def test_parallel_branch_merge_execute_preflights_fence_before_live_writer(
             )
         )
 
+    _assert_fence_rejection_error(merge_execute_stale_fence.value)
     assert writer_calls == []
     assert subprocess.run(
         ["git", "rev-parse", "main"],
@@ -36833,7 +37274,7 @@ def test_parallel_branch_merge_result_route_records_with_fence(conn, tmp_path):
         now_iso="2026-05-17T08:25:00Z",
     )
 
-    with pytest.raises(BranchRuntimeFenceError):
+    with pytest.raises(GovernanceError) as merge_result_stale_fence:
         server.handle_graph_governance_parallel_branch_merge_result(
             _ctx(
                 {"project_id": PID},
@@ -36852,6 +37293,7 @@ def test_parallel_branch_merge_result_route_records_with_fence(conn, tmp_path):
             )
         )
 
+    _assert_fence_rejection_error(merge_result_stale_fence.value)
     result = server.handle_graph_governance_parallel_branch_merge_result(
         _ctx(
             {"project_id": PID},
@@ -36957,7 +37399,7 @@ def test_parallel_branch_merge_result_parent_route_records_reclaimed_context_wit
     )
     conn.commit()
 
-    with pytest.raises(BranchRuntimeFenceError):
+    with pytest.raises(GovernanceError) as merge_result_parent_route_missing_fence:
         server.handle_graph_governance_parallel_branch_merge_result(
             _ctx(
                 {"project_id": PID},
@@ -36976,7 +37418,8 @@ def test_parallel_branch_merge_result_parent_route_records_reclaimed_context_wit
             )
         )
 
-    with pytest.raises(BranchRuntimeFenceError):
+    _assert_fence_rejection_error(merge_result_parent_route_missing_fence.value)
+    with pytest.raises(GovernanceError) as merge_result_parent_route_stale_fence:
         server.handle_graph_governance_parallel_branch_merge_result(
             _ctx(
                 {"project_id": PID},
@@ -36997,6 +37440,7 @@ def test_parallel_branch_merge_result_parent_route_records_reclaimed_context_wit
             )
         )
 
+    _assert_fence_rejection_error(merge_result_parent_route_stale_fence.value)
     result = server.handle_graph_governance_parallel_branch_merge_result(
         _ctx(
             {"project_id": PID},

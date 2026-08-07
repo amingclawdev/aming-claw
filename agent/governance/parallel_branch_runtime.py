@@ -1083,7 +1083,30 @@ def _bounded_reissue_ttl_seconds(value: Any) -> int:
 
 
 class BranchRuntimeFenceError(ValueError):
-    """Raised when a stale worker attempts to mutate branch runtime state."""
+    """Raised when a stale worker attempts to mutate branch runtime state.
+
+    ``details`` carries the public/secret-safe correction for the HTTP surface.
+    It is always a mapping so a handler never has to guess the shape, and it
+    never contains a raw fence/session/route credential.
+    """
+
+    def __init__(self, message: str, details: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.details: dict[str, Any] = dict(details or {})
+
+
+class MergeQueueItemNotFoundError(KeyError):
+    """Raised when a merge queue selector matches no durable queue item.
+
+    Subclasses ``KeyError`` so existing ``except KeyError`` callers keep their
+    behaviour, while HTTP handlers can name the requested selector and the
+    visible durable set instead of returning a bare 500.
+    """
+
+    def __init__(self, message: str, details: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.message = message
+        self.details: dict[str, Any] = dict(details or {})
 
 
 class IntegrationEpochFrozenError(ValueError):
@@ -12630,6 +12653,86 @@ def list_branch_contexts(
     return [_context_from_row(row) for row in rows]
 
 
+BATCH_PLAN_ROW_TASK_ID_RE = re.compile(r"^(?P<batch_id>.+):row:(?P<row_index>\d+)$")
+
+
+def batch_plan_row_task_identity(task_id: str) -> dict[str, Any]:
+    """Split a Batch plan row task id, or return ``{}`` for any other id.
+
+    Batch planning names its queue placeholders ``<batch_id>:row:<n>``.  A
+    branch runtime context is never allocated under that name -- the worker
+    lane owns a contract execution id -- so every runtime-context-keyed
+    endpoint has to be able to recognise the plan id and say so.
+    """
+
+    match = BATCH_PLAN_ROW_TASK_ID_RE.match(str(task_id or "").strip())
+    if not match:
+        return {}
+    return {
+        "batch_id": match.group("batch_id"),
+        "row_index": int(match.group("row_index")),
+    }
+
+
+def resolve_batch_plan_row_task_binding(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    task_id: str,
+    merge_queue_id: str = "",
+) -> dict[str, Any]:
+    """Name the contract execution ids that a Batch plan row task stands for.
+
+    Returns ``{}`` when ``task_id`` is not a Batch plan row id.  Otherwise the
+    result always carries ``batch_id``/``row_index`` and, when the lineage is
+    unambiguous, the single ``contract_execution_id`` the caller should have
+    used.  Ambiguous or missing lineage is reported as such rather than
+    guessed.
+    """
+
+    identity = batch_plan_row_task_identity(task_id)
+    if not identity:
+        return {}
+    ensure_branch_runtime_schema(conn)
+    batch_id = identity["batch_id"]
+    queue_id = str(merge_queue_id or "").strip()
+    planned_item = get_merge_queue_item_for_branch_context(
+        conn,
+        project_id,
+        str(task_id or "").strip(),
+        merge_queue_id=queue_id,
+    )
+    backlog_id = str(planned_item.backlog_id or "") if planned_item else ""
+    candidates = [
+        context
+        for context in list_branch_contexts(conn, project_id, batch_id=batch_id)
+        if (not backlog_id or context.backlog_id == backlog_id)
+        and (not queue_id or not context.merge_queue_id or context.merge_queue_id == queue_id)
+    ]
+    candidate_ids = [context.task_id for context in candidates]
+    return {
+        **identity,
+        "is_batch_plan_row_task_id": True,
+        "backlog_id": backlog_id,
+        "merge_queue_id": queue_id,
+        "planned_queue_item_id": (
+            str(planned_item.queue_item_id or "") if planned_item else ""
+        ),
+        "planned_queue_index": (
+            int(planned_item.queue_index or 0) if planned_item else 0
+        ),
+        "contract_execution_id": (
+            candidate_ids[0] if len(candidate_ids) == 1 else ""
+        ),
+        "contract_execution_id_candidates": candidate_ids,
+        "contract_execution_ids_ambiguous": len(candidate_ids) > 1,
+        "runtime_context_allocated_for_plan_row": (
+            get_branch_context(conn, project_id, str(task_id or "").strip())
+            is not None
+        ),
+    }
+
+
 def _merge_queue_item_from_row(row: sqlite3.Row) -> MergeQueueItem:
     return MergeQueueItem(
         project_id=row["project_id"],
@@ -15172,6 +15275,131 @@ def _finish_checkpoint_route_gate_allows_merge_queue_without_fence(
     if context_status not in _FINISH_CHECKPOINT_MERGE_QUEUE_STATUSES:
         raise ValueError("branch context is not merge-ready from a finish gate")
     return True
+
+
+def merge_queue_fence_credential_holder(
+    context: BranchTaskRuntimeContext,
+) -> dict[str, Any]:
+    """Name who holds the fence for this branch context, never its value."""
+
+    return {
+        "role": "mf_sub_worker",
+        "task_id": context.task_id,
+        "runtime_context_id": str(
+            getattr(context, "runtime_context_id", "") or ""
+        ),
+        "parent_task_id": str(getattr(context, "parent_task_id", "") or ""),
+        "backlog_id": str(context.backlog_id or ""),
+        "observer_can_hold_fence_token": False,
+        "fence_authority_present": runtime_context_has_fence_authority(context),
+    }
+
+
+def merge_queue_fence_finish_checkpoint_route(
+    context: BranchTaskRuntimeContext,
+    *,
+    route_gated: bool,
+) -> dict[str, Any]:
+    """Describe the fenceless observer route onto a validated finish gate.
+
+    The fence is a worker credential.  An observer driving merge holds a route
+    token instead, and the only sanctioned fenceless materialize is the one
+    bound to the worker's already-validated finish-gate checkpoint.
+    """
+
+    checkpoint_id = str(context.checkpoint_id or "").strip()
+    context_status = _normalize_merge_queue_status(context.status)
+    unmet: list[str] = []
+    if not route_gated:
+        unmet.append("route_token_gate_required")
+    if not checkpoint_id:
+        unmet.append("context_has_no_validated_finish_checkpoint")
+    if str(context.replay_source or "") != "mf_sub_finish_gate":
+        unmet.append("context_replay_source_is_not_mf_sub_finish_gate")
+    if context_status not in _FINISH_CHECKPOINT_MERGE_QUEUE_STATUSES:
+        unmet.append("context_status_is_not_merge_ready_from_finish_gate")
+    return {
+        "available": not unmet,
+        "unmet": unmet,
+        "required_body": {
+            "task_id": context.task_id,
+            "require_finish_gate": True,
+            "checkpoint_id": checkpoint_id,
+            "fence_token": None,
+        },
+        "requires_route_token": True,
+        "context_status": context.status,
+        "context_replay_source": str(context.replay_source or ""),
+    }
+
+
+def merge_queue_materialize_fence_precheck(
+    context: BranchTaskRuntimeContext,
+    *,
+    fence_token: str,
+    checkpoint_id: str,
+    require_finish_gate: bool,
+    allow_finish_checkpoint_without_fence: bool,
+    has_postmerge_recovery_authority: bool = False,
+) -> dict[str, Any]:
+    """Replay the materialize fence gate without writing anything.
+
+    Returns ``{}`` when :func:`queue_merge_item_for_branch_context` would
+    accept the request, otherwise a public/secret-safe correction naming the
+    field, the expected credential holder and the remediation.  Both use the
+    same predicate so the prewrite answer cannot drift from the hard gate.
+    """
+
+    presented = str(fence_token or "").strip()
+    if has_postmerge_recovery_authority:
+        return {}
+    if not (runtime_context_has_fence_authority(context) or presented):
+        return {}
+    finish_route = merge_queue_fence_finish_checkpoint_route(
+        context,
+        route_gated=bool(allow_finish_checkpoint_without_fence),
+    )
+    route_error = ""
+    try:
+        if _finish_checkpoint_route_gate_allows_merge_queue_without_fence(
+            context,
+            fence_token=presented,
+            checkpoint_id=checkpoint_id,
+            require_finish_gate=require_finish_gate,
+            allow_finish_checkpoint_without_fence=(
+                allow_finish_checkpoint_without_fence
+            ),
+        ):
+            return {}
+    except ValueError as exc:
+        route_error = str(exc)
+    if presented and runtime_context_fence_token_matches(context, presented):
+        return {}
+    if presented:
+        reason = "fence_token_stale"
+        message = (
+            "fence_token does not match the current branch runtime context; "
+            "the context was reclaimed or rotated"
+        )
+    else:
+        reason = "fence_token_absent"
+        message = (
+            "merge queue materialize requires either the worker fence token or "
+            "the route-gated finish-checkpoint materialize"
+        )
+    if route_error:
+        reason = "finish_checkpoint_route_unavailable"
+    return {
+        "reason": reason,
+        "field": "fence_token",
+        "message": message,
+        "fence_token_present": bool(presented),
+        "fence_token_matches": False,
+        "credential_holder": merge_queue_fence_credential_holder(context),
+        "finish_checkpoint_route": finish_route,
+        "finish_checkpoint_route_error": route_error,
+        "raw_fence_token_exposed": False,
+    }
 
 
 def _finish_checkpoint_context_status_after_merge_queue_materialize(
@@ -19091,7 +19319,30 @@ def queue_merge_item_for_branch_context(
         and not finish_checkpoint_route_gate
         and postmerge_recovery is None
     ):
-        _require_current_fence(context, fence_token)
+        try:
+            _require_current_fence(context, fence_token)
+        except BranchRuntimeFenceError as exc:
+            # The hard gate stays authoritative; only its diagnosis is enriched
+            # so an HTTP handler can name the field, the credential holder and
+            # the route-gated finish-checkpoint remediation.
+            raise BranchRuntimeFenceError(
+                str(exc),
+                {
+                    **merge_queue_materialize_fence_precheck(
+                        context,
+                        fence_token=fence_token,
+                        checkpoint_id=checkpoint_id,
+                        require_finish_gate=require_finish_gate,
+                        allow_finish_checkpoint_without_fence=(
+                            allow_finish_checkpoint_without_fence
+                        ),
+                        has_postmerge_recovery_authority=False,
+                    ),
+                    "merge_queue_id": queue_id,
+                    "task_id": task_id,
+                    "surface": "queue_merge_item_for_branch_context",
+                },
+            ) from exc
     if require_finish_gate:
         expected_checkpoint = str(checkpoint_id or "").strip()
         if not expected_checkpoint:
@@ -19715,7 +19966,54 @@ def _select_merge_gate_item(
             return item
     if len(items) == 1 and not item_id and not task:
         return items[0]
-    raise KeyError(f"merge queue item not found: {item_id or task or '<unspecified>'}")
+    raise MergeQueueItemNotFoundError(
+        f"merge queue item not found: {item_id or task or '<unspecified>'}",
+        merge_queue_item_selector_details(
+            items,
+            queue_item_id=item_id,
+            task_id=task,
+        ),
+    )
+
+
+def merge_queue_item_selector_details(
+    items: Sequence[MergeQueueItem],
+    *,
+    queue_item_id: str = "",
+    task_id: str = "",
+) -> dict[str, Any]:
+    """Describe an unmatched merge queue selector against the durable set.
+
+    The durable queue is the only membership authority for merge selection.
+    Read-model projections may surface additional recovery rows keyed by a
+    contract execution id; those ids are *not* selectable until the planned
+    row is materialized, so the visible durable set is reported verbatim.
+    """
+
+    visible = sorted(items, key=lambda it: (it.queue_index, it.queue_item_id))
+    return {
+        "requested_queue_item_id": str(queue_item_id or "").strip(),
+        "requested_task_id": str(task_id or "").strip(),
+        "durable_item_count": len(visible),
+        "visible_queue_item_ids": [item.queue_item_id for item in visible],
+        "visible_task_ids": [item.task_id for item in visible],
+        "visible_items": [
+            {
+                "queue_item_id": item.queue_item_id,
+                "task_id": item.task_id,
+                "backlog_id": item.backlog_id,
+                "queue_index": item.queue_index,
+                "status": item.status,
+                "branch_ref_resolved": bool(str(item.branch_ref or "").strip()),
+                "never_materialized_plan_row": (
+                    is_never_materialized_planned_merge_queue_item(item)
+                ),
+            }
+            for item in visible
+        ],
+        "membership_authority": "parallel_branch_merge_queue_items",
+        "read_model_ids_are_not_selectable": True,
+    }
 
 
 def select_merge_queue_item(

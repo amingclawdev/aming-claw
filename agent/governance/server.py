@@ -1667,6 +1667,21 @@ class GovernanceHandler(BaseHTTPRequestHandler):
             body["request_id"] = request_id
             self._respond(e.status, body)
         except Exception as e:
+            # Backstop: expected parallel branch runtime refusals (stale/absent
+            # fence, unknown merge queue selector) are caller-correctable and
+            # must never reach the bare internal_error path from any handler.
+            try:
+                converted = _parallel_branch_runtime_governance_error(
+                    e,
+                    endpoint=str(self.path or ""),
+                )
+            except Exception:
+                converted = None
+            if converted is not None:
+                body = _public_zero_write_error_response(converted)
+                body["request_id"] = request_id
+                self._respond(converted.status, body)
+                return
             traceback.print_exc()
             self._respond(500, {
                 "error": "internal_error",
@@ -16917,9 +16932,19 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         if same_owner_worker_session:
             response["same_owner_worker_session"] = same_owner_worker_session
         return 201, response
-    except Exception:
+    except Exception as exc:
         conn.rollback()
-        raise
+        converted = _parallel_branch_runtime_governance_error(
+            exc,
+            endpoint="parallel-branches/allocate",
+            project_id=project_id,
+            task_id=str(ctx.body.get("task_id") or "").strip(),
+            merge_queue_id=str(ctx.body.get("merge_queue_id") or "").strip(),
+            target_ref=str(ctx.body.get("target_ref") or "").strip(),
+        )
+        if converted is None:
+            raise
+        raise converted from exc
     finally:
         conn.close()
 
@@ -49043,6 +49068,18 @@ def handle_graph_governance_parallel_branch_checkpoint(ctx: RequestContext):
             )
             conn.commit()
         return {"ok": True, "project_id": project_id, "context": branch_context_to_dict(context)}
+    except Exception as exc:
+        converted = _parallel_branch_runtime_governance_error(
+            exc,
+            endpoint="parallel-branches/checkpoint",
+            project_id=project_id,
+            task_id=str(ctx.body.get("task_id") or "").strip(),
+            merge_queue_id=str(ctx.body.get("merge_queue_id") or "").strip(),
+            target_ref=str(ctx.body.get("target_ref") or "").strip(),
+        )
+        if converted is None:
+            raise
+        raise converted from exc
     finally:
         conn.close()
 
@@ -50170,6 +50207,18 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             "contract_runtime_canonical_line": canonical_finish_line,
             "contract_runtime_canonical_handoff_line": canonical_handoff_line,
         }
+    except Exception as exc:
+        converted = _parallel_branch_runtime_governance_error(
+            exc,
+            endpoint="parallel-branches/finish-gate",
+            project_id=project_id,
+            task_id=str(ctx.body.get("task_id") or "").strip(),
+            merge_queue_id=str(ctx.body.get("merge_queue_id") or "").strip(),
+            target_ref=str(ctx.body.get("target_ref") or "").strip(),
+        )
+        if converted is None:
+            raise
+        raise converted from exc
     finally:
         conn.close()
 
@@ -50525,6 +50574,18 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                 return result
             conn.commit()
             return result
+    except Exception as exc:
+        converted = _parallel_branch_runtime_governance_error(
+            exc,
+            endpoint="parallel-branches/startup",
+            project_id=project_id,
+            task_id=str(ctx.body.get("task_id") or "").strip(),
+            merge_queue_id=str(ctx.body.get("merge_queue_id") or "").strip(),
+            target_ref=str(ctx.body.get("target_ref") or "").strip(),
+        )
+        if converted is None:
+            raise
+        raise converted from exc
     finally:
         conn.close()
 
@@ -51916,6 +51977,338 @@ _PARALLEL_MATERIALIZE_OBSERVER_ACTOR_TOKENS = frozenset(
 )
 
 
+_PARALLEL_BRANCH_FENCE_REJECTION_SOURCE = (
+    "parallel_branch_runtime.fence_rejection_envelope.v1"
+)
+_MERGE_QUEUE_ITEM_NOT_FOUND_SOURCE = (
+    "parallel_branch_runtime.merge_queue_item_selector.v1"
+)
+_PARALLEL_MERGE_QUEUE_TASK_ID_DISAMBIGUATION_SOURCE = (
+    "parallel_branch_merge_queue.task_id_disambiguation_prewrite_gate.v1"
+)
+
+
+def _parallel_branch_fence_rejection_details(
+    supplied: Mapping[str, Any],
+    *,
+    reason: str,
+    endpoint: str,
+    project_id: str,
+    task_id: str = "",
+    merge_queue_id: str = "",
+) -> dict[str, Any]:
+    """Build the public/secret-safe fence correction shared by both surfaces.
+
+    A stale/absent fence is an ordinary, caller-correctable condition.  It must
+    never reach the generic 500 path, and the envelope must name the field, who
+    is expected to hold the credential, and what to send instead.
+    """
+
+    finish_route = (
+        supplied.get("finish_checkpoint_route")
+        if isinstance(supplied.get("finish_checkpoint_route"), Mapping)
+        else {}
+    )
+    holder = (
+        supplied.get("credential_holder")
+        if isinstance(supplied.get("credential_holder"), Mapping)
+        else {}
+    )
+    guide: dict[str, Any] = {
+        "action": (
+            "materialize_with_route_gated_finish_checkpoint"
+            if finish_route.get("available")
+            else "re_present_the_worker_fence_or_restore_the_finish_checkpoint"
+        ),
+        "fence_token_is_a_worker_credential": True,
+        "observer_can_hold_fence_token": False,
+        "bypass_or_waive_required": False,
+        "retry_same_world_allowed": True,
+    }
+    if finish_route:
+        guide["route_gated_finish_checkpoint_materialize"] = dict(finish_route)
+    details: dict[str, Any] = {
+        "field": str(supplied.get("field") or "fence_token"),
+        "expected": {
+            "credential_holder": holder
+            or {
+                "role": "mf_sub_worker",
+                "task_id": task_id,
+                "observer_can_hold_fence_token": False,
+            },
+            "accepted_authorities": [
+                "worker_fence_token",
+                "route_gated_finish_checkpoint_materialize",
+            ],
+        },
+        "actual": {
+            "fence_token_present": bool(supplied.get("fence_token_present")),
+            "fence_token_matches": False,
+            "reason": str(supplied.get("reason") or "fence_invalidated_or_unknown"),
+        },
+        "guide": guide,
+        "source": _PARALLEL_BRANCH_FENCE_REJECTION_SOURCE,
+        "endpoint": endpoint,
+        "project_id": project_id,
+        "task_id": task_id or str(supplied.get("task_id") or ""),
+        "merge_queue_id": merge_queue_id or str(supplied.get("merge_queue_id") or ""),
+        "underlying_reason": reason,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "public_safe": True,
+        "secret_safe": True,
+        "raw_fence_token_exposed": False,
+        "retry_same_world_allowed": True,
+    }
+    for key, value in supplied.items():
+        details.setdefault(key, value)
+    return details
+
+
+_PARALLEL_BRANCH_FENCE_REJECTION_MESSAGE = (
+    "branch runtime fence authority is absent or stale for this runtime context"
+)
+
+
+def _parallel_branch_fence_rejection_error(
+    exc: Exception,
+    *,
+    endpoint: str,
+    project_id: str,
+    task_id: str = "",
+    merge_queue_id: str = "",
+) -> GovernanceError:
+    """Turn a branch runtime fence refusal into a caller-actionable rejection."""
+
+    raw_details = getattr(exc, "details", None)
+    return GovernanceError(
+        "branch_runtime_fence_rejected",
+        _PARALLEL_BRANCH_FENCE_REJECTION_MESSAGE,
+        409,
+        _parallel_branch_fence_rejection_details(
+            dict(raw_details) if isinstance(raw_details, Mapping) else {},
+            reason=str(exc) or "fence_invalidated_or_unknown",
+            endpoint=endpoint,
+            project_id=project_id,
+            task_id=task_id,
+            merge_queue_id=merge_queue_id,
+        ),
+    )
+
+
+def _merge_queue_item_not_found_error(
+    exc: Exception,
+    *,
+    endpoint: str,
+    project_id: str,
+    merge_queue_id: str,
+    target_ref: str = "",
+) -> GovernanceError:
+    """Name an unknown queue selector and the durable set it was matched against."""
+
+    raw_details = getattr(exc, "details", None)
+    supplied = dict(raw_details) if isinstance(raw_details, Mapping) else {}
+    requested_item = str(supplied.get("requested_queue_item_id") or "")
+    requested_task = str(supplied.get("requested_task_id") or "")
+    details: dict[str, Any] = {
+        "field": "queue_item_id" if requested_item else "task_id",
+        "expected": {
+            "one_of_queue_item_ids": supplied.get("visible_queue_item_ids") or [],
+            "one_of_task_ids": supplied.get("visible_task_ids") or [],
+            "membership_authority": "parallel_branch_merge_queue_items",
+        },
+        "actual": {
+            "queue_item_id": requested_item,
+            "task_id": requested_task,
+        },
+        "guide": {
+            "action": "select_a_durable_queue_item_or_materialize_first",
+            "read_model_only_ids_are_not_selectable": True,
+            "note": (
+                "merge queue status projections may surface recovery rows keyed "
+                "by a contract execution id; those ids become selectable only "
+                "after the planned row is materialized"
+            ),
+            "bypass_or_waive_required": False,
+            "retry_same_world_allowed": True,
+        },
+        "source": _MERGE_QUEUE_ITEM_NOT_FOUND_SOURCE,
+        "endpoint": endpoint,
+        "project_id": project_id,
+        "merge_queue_id": merge_queue_id,
+        "target_ref": target_ref,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "public_safe": True,
+        "secret_safe": True,
+        "retry_same_world_allowed": True,
+    }
+    for key, value in supplied.items():
+        details.setdefault(key, value)
+    return GovernanceError(
+        "merge_queue_item_not_found",
+        "no durable merge queue item matches the requested selector",
+        404,
+        details,
+    )
+
+
+def _parallel_branch_runtime_governance_error(
+    exc: Exception,
+    *,
+    endpoint: str,
+    project_id: str = "",
+    task_id: str = "",
+    merge_queue_id: str = "",
+    target_ref: str = "",
+) -> GovernanceError | None:
+    """Map an expected parallel branch runtime failure onto a public envelope."""
+
+    from .parallel_branch_runtime import (
+        BranchRuntimeFenceError,
+        MergeQueueItemNotFoundError,
+    )
+
+    if isinstance(exc, BranchRuntimeFenceError):
+        return _parallel_branch_fence_rejection_error(
+            exc,
+            endpoint=endpoint,
+            project_id=project_id,
+            task_id=task_id,
+            merge_queue_id=merge_queue_id,
+        )
+    if isinstance(exc, MergeQueueItemNotFoundError):
+        return _merge_queue_item_not_found_error(
+            exc,
+            endpoint=endpoint,
+            project_id=project_id,
+            merge_queue_id=merge_queue_id,
+            target_ref=target_ref,
+        )
+    return None
+
+
+def _parallel_merge_queue_task_id_disambiguation_prewrite(
+    conn,
+    *,
+    project_id: str,
+    task_id: str,
+    merge_queue_id: str,
+    endpoint: str,
+) -> dict[str, Any]:
+    """Reject a Batch plan row task id before the route gate misreads it.
+
+    ``get_branch_context`` and the merge route gate both key on the runtime
+    context task id.  A Batch plan row id (``<batch>:row:<n>``) never has one,
+    so the route gate reports ``route_token_required`` -- a missing-credential
+    story for what is actually a wrong-identifier request.
+    """
+
+    from .parallel_branch_runtime import resolve_batch_plan_row_task_binding
+
+    binding = resolve_batch_plan_row_task_binding(
+        conn,
+        project_id,
+        task_id=task_id,
+        merge_queue_id=merge_queue_id,
+    )
+    if not binding:
+        return {}
+    if binding.get("runtime_context_allocated_for_plan_row"):
+        # A real runtime context exists under this name; it is not a placeholder.
+        return {}
+    contract_execution_id = str(binding.get("contract_execution_id") or "")
+    candidates = list(binding.get("contract_execution_id_candidates") or [])
+    guide: dict[str, Any] = {
+        "action": "resend_with_the_contract_execution_id_as_task_id",
+        "bypass_or_waive_required": False,
+        "retry_same_world_allowed": True,
+        "route_token_scope_must_match_task_id": True,
+    }
+    if contract_execution_id:
+        guide["copy_safe_patch"] = {"task_id": contract_execution_id}
+    elif candidates:
+        guide["candidate_task_ids"] = candidates
+        guide["action"] = "disambiguate_the_child_lane_then_resend"
+    else:
+        guide["action"] = "allocate_the_child_lane_runtime_context_first"
+    return {
+        "ok": False,
+        "error": "merge_queue_task_id_must_be_contract_execution_id",
+        "message": (
+            "task_id is a Batch plan row id; this endpoint keys on the child "
+            "lane contract execution id that owns the runtime context"
+        ),
+        "field": "task_id",
+        "expected": contract_execution_id or candidates or (
+            "an allocated child lane contract execution id"
+        ),
+        "actual": task_id,
+        "guide": guide,
+        "source": _PARALLEL_MERGE_QUEUE_TASK_ID_DISAMBIGUATION_SOURCE,
+        "endpoint": endpoint,
+        "batch_plan_row": binding,
+        "route_token_required_is_misleading_here": True,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "timeline_event_recorded": False,
+        "public_safe": True,
+        "secret_safe": True,
+        "retry_same_world_allowed": True,
+    }
+
+
+def _parallel_merge_queue_materialize_fence_prewrite(
+    *,
+    body: Mapping[str, Any],
+    route_gate: Mapping[str, Any],
+    runtime_context,
+    project_id: str,
+    task_id: str,
+    merge_queue_id: str,
+) -> dict[str, Any]:
+    """Answer the materialize fence gate before any durable write is attempted."""
+
+    if runtime_context is None:
+        return {}
+    if body.get("audited_postmerge_recovery") is not None:
+        return {}
+
+    from .parallel_branch_runtime import merge_queue_materialize_fence_precheck
+
+    precheck = merge_queue_materialize_fence_precheck(
+        runtime_context,
+        fence_token=str(body.get("fence_token") or ""),
+        checkpoint_id=str(body.get("checkpoint_id") or ""),
+        require_finish_gate=(
+            _query_bool(body, "require_finish_gate", False)
+            or str(body.get("worker_role") or "") == "mf_sub"
+        ),
+        allow_finish_checkpoint_without_fence=bool(route_gate),
+        has_postmerge_recovery_authority=False,
+    )
+    if not precheck:
+        return {}
+    return {
+        "ok": False,
+        "error": "branch_runtime_fence_rejected",
+        "message": _PARALLEL_BRANCH_FENCE_REJECTION_MESSAGE,
+        **_parallel_branch_fence_rejection_details(
+            precheck,
+            reason=str(precheck.get("reason") or "fence_invalidated_or_unknown"),
+            endpoint="parallel-branches/merge-queue/materialize",
+            project_id=project_id,
+            task_id=task_id,
+            merge_queue_id=merge_queue_id,
+        ),
+        "timeline_event_recorded": False,
+        "prewrite_gate": True,
+    }
+
+
 def _parallel_merge_queue_materialize_contract_actor_prewrite(
     *,
     body: Mapping[str, Any],
@@ -53113,6 +53506,15 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.merge-queue")
+        task_id_rejection = _parallel_merge_queue_task_id_disambiguation_prewrite(
+            conn,
+            project_id=project_id,
+            task_id=task_id,
+            merge_queue_id=merge_queue_id,
+            endpoint="parallel-branches/merge-queue/materialize",
+        )
+        if task_id_rejection:
+            return 422, task_id_rejection
         route_gate = _require_parallel_branch_merge_route_gate(
             ctx,
             conn,
@@ -53134,6 +53536,47 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
             target_ref=target_ref,
         )
         runtime_context = get_branch_context(conn, project_id, task_id)
+        if runtime_context is None:
+            raise GovernanceError(
+                "branch_runtime_context_not_found",
+                "no branch runtime context exists for this task_id",
+                404,
+                {
+                    "field": "task_id",
+                    "expected": (
+                        "an allocated child lane contract execution id with a "
+                        "branch runtime context"
+                    ),
+                    "actual": task_id,
+                    "guide": {
+                        "action": "allocate_or_correct_the_child_lane_task_id",
+                        "bypass_or_waive_required": False,
+                        "retry_same_world_allowed": True,
+                    },
+                    "source": (
+                        "parallel_branch_merge_queue_materialize."
+                        "runtime_context_lookup.v1"
+                    ),
+                    "project_id": project_id,
+                    "merge_queue_id": merge_queue_id,
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                    "public_safe": True,
+                    "secret_safe": True,
+                    "retry_same_world_allowed": True,
+                },
+            )
+        fence_rejection = _parallel_merge_queue_materialize_fence_prewrite(
+            body=ctx.body,
+            route_gate=route_gate,
+            runtime_context=runtime_context,
+            project_id=project_id,
+            task_id=task_id,
+            merge_queue_id=merge_queue_id,
+        )
+        if fence_rejection:
+            return 409, fence_rejection
         requested_serializes_after = tuple(
             _query_statuses(ctx.body, "serializes_after")
         )
@@ -53439,6 +53882,18 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                 "rows": list(decision.dashboard_rows),
             },
         }
+    except Exception as exc:
+        converted = _parallel_branch_runtime_governance_error(
+            exc,
+            endpoint="parallel-branches/merge-queue/materialize",
+            project_id=project_id,
+            task_id=str(ctx.body.get("task_id") or "").strip(),
+            merge_queue_id=str(ctx.body.get("merge_queue_id") or "").strip(),
+            target_ref=str(ctx.body.get("target_ref") or "").strip(),
+        )
+        if converted is None:
+            raise
+        raise converted from exc
     finally:
         conn.close()
 
@@ -53480,6 +53935,18 @@ def handle_graph_governance_parallel_branch_merge_gate(ctx: RequestContext):
             "project_id": project_id,
             "plan": merge_gate_plan_to_dict(plan),
         }
+    except Exception as exc:
+        converted = _parallel_branch_runtime_governance_error(
+            exc,
+            endpoint="parallel-branches/merge-gate",
+            project_id=project_id,
+            task_id=str(ctx.body.get("task_id") or "").strip(),
+            merge_queue_id=str(ctx.body.get("merge_queue_id") or "").strip(),
+            target_ref=str(ctx.body.get("target_ref") or "").strip(),
+        )
+        if converted is None:
+            raise
+        raise converted from exc
     finally:
         conn.close()
 
@@ -53691,6 +54158,18 @@ def handle_graph_governance_parallel_branch_merge_preview(ctx: RequestContext):
             "preview": preview,
             "gate_plan": merge_gate_plan_to_dict(gate_plan) if gate_plan is not None else None,
         }
+    except Exception as exc:
+        converted = _parallel_branch_runtime_governance_error(
+            exc,
+            endpoint="parallel-branches/merge-preview",
+            project_id=project_id,
+            task_id=str(ctx.body.get("task_id") or "").strip(),
+            merge_queue_id=str(ctx.body.get("merge_queue_id") or "").strip(),
+            target_ref=str(ctx.body.get("target_ref") or "").strip(),
+        )
+        if converted is None:
+            raise
+        raise converted from exc
     finally:
         conn.close()
 
@@ -53831,6 +54310,18 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
                 "rows": list(decision.dashboard_rows),
             },
         }
+    except Exception as exc:
+        converted = _parallel_branch_runtime_governance_error(
+            exc,
+            endpoint="parallel-branches/merge-result",
+            project_id=project_id,
+            task_id=str(ctx.body.get("task_id") or "").strip(),
+            merge_queue_id=str(ctx.body.get("merge_queue_id") or "").strip(),
+            target_ref=str(ctx.body.get("target_ref") or "").strip(),
+        )
+        if converted is None:
+            raise
+        raise converted from exc
     finally:
         conn.close()
 
@@ -54065,6 +54556,18 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                 "rows": list(decision.dashboard_rows),
             },
         }
+    except Exception as exc:
+        converted = _parallel_branch_runtime_governance_error(
+            exc,
+            endpoint="parallel-branches/merge-execute",
+            project_id=project_id,
+            task_id=str(ctx.body.get("task_id") or "").strip(),
+            merge_queue_id=str(ctx.body.get("merge_queue_id") or "").strip(),
+            target_ref=str(ctx.body.get("target_ref") or "").strip(),
+        )
+        if converted is None:
+            raise
+        raise converted from exc
     finally:
         conn.close()
 
