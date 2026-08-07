@@ -175,6 +175,120 @@ SERVER_VERSION = get_server_version()
 SERVER_PID = os.getpid()
 
 
+# --- Loaded runtime identity (frozen at import, never re-read from git) ---
+#
+# get_server_version() reads the worktree git HEAD at request time, so it moves
+# the instant a commit or merge lands even though this process keeps serving the
+# bytecode it imported at startup. Everything below is captured once, at import,
+# and is therefore an identity of the code actually loaded. handle_health()
+# reports both identities and says explicitly when they disagree, so a caller can
+# never mistake the worktree HEAD for the running code.
+LOADED_RUNTIME_IDENTITY_SCHEMA = "governance_loaded_runtime_identity.v1"
+
+
+def _loaded_module_source_path() -> str:
+    """Absolute path of this module's source file as imported."""
+    path = os.path.abspath(__file__)
+    if path.endswith((".pyc", ".pyo")):
+        path = path[:-1]
+    return path
+
+
+def _source_file_fingerprint(path: str) -> dict[str, Any]:
+    """Size/mtime/sha256 of a source file, or an explicit unreadable marker."""
+    try:
+        stat_result = os.stat(path)
+        with open(path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+    except Exception:
+        return {"path": path, "size": -1, "mtime_ns": -1, "sha256": "unknown"}
+    return {
+        "path": path,
+        "size": int(stat_result.st_size),
+        "mtime_ns": int(stat_result.st_mtime_ns),
+        "sha256": "sha256:" + digest,
+    }
+
+
+LOADED_RUNTIME_IDENTITY: dict[str, Any] = {
+    "schema_version": LOADED_RUNTIME_IDENTITY_SCHEMA,
+    "loaded_commit": SERVER_VERSION,
+    "loaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "loaded_pid": SERVER_PID,
+    "loaded_source": _source_file_fingerprint(_loaded_module_source_path()),
+}
+
+# Re-hash the module source only when stat() says it changed; this file is large
+# and /api/health is polled.
+_loaded_source_probe_cache: dict[str, Any] = {"key": None, "fingerprint": None}
+
+
+def _current_module_source_fingerprint() -> dict[str, Any]:
+    """Fingerprint the module source as it exists on disk right now."""
+    loaded_source = LOADED_RUNTIME_IDENTITY["loaded_source"]
+    path = loaded_source.get("path", "")
+    try:
+        stat_result = os.stat(path)
+        key = (int(stat_result.st_size), int(stat_result.st_mtime_ns))
+    except Exception:
+        return {"path": path, "size": -1, "mtime_ns": -1, "sha256": "unknown"}
+    if key == (loaded_source.get("size"), loaded_source.get("mtime_ns")):
+        return loaded_source
+    if _loaded_source_probe_cache["key"] == key:
+        return _loaded_source_probe_cache["fingerprint"]
+    fingerprint = _source_file_fingerprint(path)
+    _loaded_source_probe_cache["key"] = key
+    _loaded_source_probe_cache["fingerprint"] = fingerprint
+    return fingerprint
+
+
+def governance_loaded_runtime_identity(worktree_version: str = "") -> dict[str, Any]:
+    """Report the identity of the code this process loaded, plus worktree drift.
+
+    ``worktree_version`` is the live git HEAD (``get_server_version()``). It
+    tracks the checkout, not the running process, so it is never deploy proof on
+    its own. This returns the commit recorded at import together with a content
+    fingerprint of the module source as loaded, and sets ``runtime_stale`` when
+    the worktree has moved away from either.
+    """
+    loaded_source = LOADED_RUNTIME_IDENTITY["loaded_source"]
+    current_source = _current_module_source_fingerprint()
+    loaded_commit = LOADED_RUNTIME_IDENTITY["loaded_commit"]
+    reasons: list[str] = []
+    if (
+        worktree_version
+        and loaded_commit
+        and worktree_version != "unknown"
+        and loaded_commit != "unknown"
+        and worktree_version != loaded_commit
+    ):
+        reasons.append("worktree_head_moved")
+    if current_source.get("sha256") != loaded_source.get("sha256"):
+        reasons.append("loaded_source_file_changed")
+    return {
+        "schema_version": LOADED_RUNTIME_IDENTITY_SCHEMA,
+        "loaded_commit": loaded_commit,
+        "loaded_at": LOADED_RUNTIME_IDENTITY["loaded_at"],
+        "loaded_pid": LOADED_RUNTIME_IDENTITY["loaded_pid"],
+        "loaded_source_path": loaded_source.get("path", ""),
+        "loaded_source_sha256": loaded_source.get("sha256", "unknown"),
+        "loaded_source_size": loaded_source.get("size", -1),
+        "loaded_source_mtime_ns": loaded_source.get("mtime_ns", -1),
+        "worktree_head_version": worktree_version,
+        "worktree_source_sha256": current_source.get("sha256", "unknown"),
+        "runtime_stale": bool(reasons),
+        "runtime_stale_reasons": reasons,
+        "identity_source": "frozen_at_import",
+        "worktree_head_version_source": "live_git_head_at_request_time",
+        "meaning": (
+            "loaded_* describe the code this process is running; worktree_* "
+            "describe the checkout on disk. When runtime_stale is true the "
+            "worktree HEAD is not proof of what is deployed; redeploy and "
+            "re-read before trusting it."
+        ),
+    }
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -131349,6 +131463,7 @@ def handle_task_recover(ctx: RequestContext):
 def handle_health(ctx: RequestContext):
     health_version = get_server_version()
     gov_runtime_version = get_governance_runtime_version()
+    loaded_runtime = governance_loaded_runtime_identity(health_version)
     return {
         "status": "ok",
         "service": "governance",
@@ -131357,6 +131472,16 @@ def handle_health(ctx: RequestContext):
         "health_version": health_version,
         "gov_runtime_version": gov_runtime_version,
         "governance_runtime_version": gov_runtime_version,
+        # version/health_version track the worktree HEAD and move on any commit
+        # or merge. The runtime_loaded_* fields below are frozen at import and
+        # are the only fields that describe the code this process is running.
+        "worktree_head_version": health_version,
+        "runtime_loaded_version": loaded_runtime["loaded_commit"],
+        "runtime_loaded_source_sha256": loaded_runtime["loaded_source_sha256"],
+        "runtime_loaded_at": loaded_runtime["loaded_at"],
+        "runtime_stale": loaded_runtime["runtime_stale"],
+        "runtime_stale_reasons": loaded_runtime["runtime_stale_reasons"],
+        "loaded_runtime_identity": loaded_runtime,
         "mcp_tool_schema_version": MCP_TOOL_SCHEMA_VERSION,
         "mcp_tool_schema_min_client_version": (
             MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION

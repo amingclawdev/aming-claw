@@ -7682,6 +7682,89 @@ def test_health_and_version_check_distinguish_head_from_loaded_runtime(conn, tmp
     assert version["governance_runtime"]["runtime_match"] is False
 
 
+def test_health_reports_loaded_runtime_identity_and_flags_worktree_drift(monkeypatch):
+    """Regression: AC-GOVERNANCE-HEALTH-VERSION-REPORTS-WORKTREE-NOT-LOADED-CODE-R1.
+
+    /api/health used to report only the worktree git HEAD, which moves the
+    instant a commit or merge lands even though the running process keeps
+    serving the bytecode it imported. Health must expose an identity of the
+    loaded runtime captured at import, and must say explicitly when the
+    worktree has drifted away from it.
+    """
+    loaded = server.LOADED_RUNTIME_IDENTITY
+    # The loaded identity is captured at import, not re-read from git per
+    # request: it carries the import-time commit, the process that loaded it,
+    # and a content fingerprint of the module source as loaded.
+    assert loaded["schema_version"] == "governance_loaded_runtime_identity.v1"
+    assert loaded["loaded_pid"] == server.SERVER_PID
+    loaded_sha = loaded["loaded_source"]["sha256"]
+    assert loaded_sha.startswith("sha256:")
+    assert loaded["loaded_source"]["path"].endswith("agent/governance/server.py")
+    assert loaded["loaded_source"]["size"] > 0
+
+    # Pin the import-time commit so the assertions below do not depend on the
+    # checkout's real git HEAD.
+    loaded_commit = "abc1234"
+    monkeypatch.setitem(server.LOADED_RUNTIME_IDENTITY, "loaded_commit", loaded_commit)
+
+    # Fresh runtime: the worktree HEAD still matches the code this process
+    # loaded, so health reports both and does not raise the stale signal.
+    monkeypatch.setattr(server, "get_server_version", lambda: loaded_commit)
+    fresh = server.handle_health(_ctx({"project_id": PID}))
+    assert fresh["runtime_loaded_version"] == loaded_commit
+    assert fresh["runtime_loaded_source_sha256"] == loaded_sha
+    assert fresh["worktree_head_version"] == loaded_commit
+    assert fresh["runtime_stale"] is False
+    assert fresh["runtime_stale_reasons"] == []
+    # Backward compatibility: the pre-existing fields keep their meaning.
+    assert fresh["version"] == loaded_commit
+    assert fresh["health_version"] == loaded_commit
+
+    # A commit/merge lands with no redeploy: the worktree HEAD moves, the loaded
+    # runtime does not. Health must report both values and flag the drift rather
+    # than presenting the worktree HEAD as the running version.
+    drifted_head = "deadbee"
+    assert drifted_head != loaded_commit
+    monkeypatch.setattr(server, "get_server_version", lambda: drifted_head)
+    drifted = server.handle_health(_ctx({"project_id": PID}))
+    assert drifted["version"] == drifted_head
+    assert drifted["worktree_head_version"] == drifted_head
+    assert drifted["runtime_loaded_version"] == loaded_commit
+    assert drifted["runtime_loaded_version"] != drifted["worktree_head_version"]
+    assert drifted["runtime_stale"] is True
+    assert "worktree_head_moved" in drifted["runtime_stale_reasons"]
+    identity = drifted["loaded_runtime_identity"]
+    assert identity["schema_version"] == "governance_loaded_runtime_identity.v1"
+    assert identity["loaded_commit"] == loaded_commit
+    assert identity["worktree_head_version"] == drifted_head
+    assert identity["identity_source"] == "frozen_at_import"
+
+    # Content drift is caught even when the commit string is unchanged: the
+    # module source on disk no longer matches the bytes this process loaded.
+    monkeypatch.setattr(server, "get_server_version", lambda: loaded_commit)
+    monkeypatch.setitem(
+        server.LOADED_RUNTIME_IDENTITY,
+        "loaded_source",
+        {
+            **loaded["loaded_source"],
+            "size": loaded["loaded_source"]["size"] + 1,
+            "mtime_ns": loaded["loaded_source"]["mtime_ns"] - 1,
+            "sha256": "sha256:" + "0" * 64,
+        },
+    )
+    monkeypatch.setitem(server._loaded_source_probe_cache, "key", None)
+    monkeypatch.setitem(server._loaded_source_probe_cache, "fingerprint", None)
+    content_drift = server.handle_health(_ctx({"project_id": PID}))
+    assert content_drift["worktree_head_version"] == loaded_commit
+    assert content_drift["runtime_stale"] is True
+    assert "loaded_source_file_changed" in content_drift["runtime_stale_reasons"]
+    assert (
+        content_drift["loaded_runtime_identity"]["worktree_source_sha256"]
+        == loaded_sha
+    )
+    assert content_drift["runtime_loaded_source_sha256"] != loaded_sha
+
+
 def _graph(node_id: str = "L7.1") -> dict:
     return {
         "deps_graph": {
