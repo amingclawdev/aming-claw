@@ -19,6 +19,7 @@ from agent.governance.contracts.runtime import (
     WriteGateDecision,
     _active_failed_qa_line,
     _contract_completion_satisfying_lines,
+    _enrich_qa_evidence_provenance,
     _line_status_allows_contract_completion,
     _mf_parallel_worker_commit_errors,
     _worker_commit_completed_implementation,
@@ -3127,3 +3128,173 @@ def test_rev9_standalone_world_never_gains_shared_batch_reconcile_authority(
             )
             == {}
         )
+
+
+_QA_STATUS_FLIP_EXECUTION_ID = "cex-qa-status-silent-flip"
+
+
+def _qa_status_flip_record() -> dict:
+    return {
+        "contract_execution_id": _QA_STATUS_FLIP_EXECUTION_ID,
+        "completed_lines": [],
+        "execution_state": {
+            "execution_state_revision": 4,
+            "execution_state_hash": "sha256:qa-status-silent-flip-state",
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": "sha256:qa-status-silent-flip-guide"
+        },
+    }
+
+
+def _qa_pass_verification_without_top_level_status() -> dict:
+    """Reproduce the line shape that was accepted and then inverted.
+
+    This is the 2026-08-07 batch-world submission: a genuine independent QA
+    PASS carrying ``verdict`` plus a full nested verification, but no
+    top-level ``status`` field.
+    """
+
+    return {
+        "contract_execution_id": _QA_STATUS_FLIP_EXECUTION_ID,
+        "stage_id": "qa_verification",
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "verdict": "PASS",
+        "verification": {
+            "verdict": "PASS",
+            "independent": True,
+            "summary": "Independent QA re-ran the affected suite; all green.",
+        },
+        "test_results": {"status": "passed", "passed": 12, "failed": 0},
+        "payload": {"summary": "Independent QA verification passed."},
+    }
+
+
+def _qa_completion_status_gate(write: dict) -> dict:
+    """Return the completion gate ContractRuntime derives for one QA line."""
+
+    enriched = deepcopy(write)
+    _enrich_qa_evidence_provenance(enriched, "qa")
+    return dict(enriched["qa_evidence_provenance"]["completion_status_gate"])
+
+
+def test_qa_pass_without_top_level_status_is_rejected_not_silently_failed():
+    """A passing QA verification must never be inverted behind the author.
+
+    ContractRuntime derives ``completion_status_gate`` from the top-level
+    ``status`` field alone.  A verdict-PASS line that omits ``status`` was
+    therefore accepted -- decision allow, no missing_proof_fields, state
+    revision advanced -- and then normalized into a *failing* verdict, which
+    drove the world into the failed-QA rework loop with no error, no warning
+    and no remediation hint.  The server must now fail loudly instead, with a
+    zero-write rejection naming the exact missing field.
+    """
+
+    record = _qa_status_flip_record()
+    write = _qa_pass_verification_without_top_level_status()
+
+    observed_gate = _qa_completion_status_gate(write)
+    assert observed_gate["top_level_status_present"] is False
+    assert observed_gate["top_level_status_passing"] is False
+    assert observed_gate["normalized_status"] == ""
+    assert observed_gate["nested_payload_decision_satisfies"] is False
+
+    # Deliberate getattr: on the pre-fix server this guard does not exist, and
+    # the assertion below must report the observed silent inversion rather
+    # than dying on an AttributeError.
+    guard = getattr(
+        server,
+        "_contract_runtime_qa_missing_status_rejection",
+        None,
+    )
+    rejection = (
+        guard(record, write, actor_role="qa") if guard is not None else {}
+    )
+    assert rejection, (
+        "qa_independent_verification carrying verdict PASS with no top-level "
+        "status was accepted; ContractRuntime then silently normalized the "
+        f"passing verification into a failing one: {observed_gate}"
+    )
+
+    assert rejection["ok"] is False
+    assert rejection["decision"]["ok"] is False
+    assert rejection["missing_proof_fields"] == ["status"]
+    assert rejection["nested_passing_verdict_field"] == "verdict"
+    assert rejection["nested_passing_verdict_value"] == "pass"
+    assert rejection["silent_failing_normalization_prevented"] is True
+    assert rejection["completed_line_mutated"] is False
+    assert rejection["zero_contract_runtime_write"] is True
+    assert 'status: "passed"' in rejection["remediation"]
+    errors = rejection["decision"]["errors"]
+    assert errors and "top-level status" in errors[0]
+
+    # Zero-write: the rejection reports the record unchanged.
+    assert rejection["completed_lines_count"] == 0
+    assert rejection["execution_state_revision"] == 4
+
+    # The nested verdict is honoured wherever it is recorded, not only at the
+    # top level, so the same trap cannot be re-entered through verification.
+    nested_only = _qa_pass_verification_without_top_level_status()
+    nested_only.pop("verdict")
+    nested_rejection = guard(record, nested_only, actor_role="qa")
+    assert nested_rejection
+    assert nested_rejection["nested_passing_verdict_field"] == (
+        "verification.verdict"
+    )
+
+
+def test_qa_verification_that_genuinely_fails_still_fails():
+    """The loud-failure guard must not become a way to pass failing QA."""
+
+    guard = server._contract_runtime_qa_missing_status_rejection
+    record = _qa_status_flip_record()
+
+    failing = _qa_pass_verification_without_top_level_status()
+    failing["verdict"] = "FAIL"
+    failing["verification"] = {
+        "verdict": "FAIL",
+        "independent": True,
+        "summary": "Independent QA found 3 regressions.",
+    }
+    failing["test_results"] = {"status": "failed", "passed": 9, "failed": 3}
+    failing["payload"] = {
+        "summary": "Independent QA failed the worker commit."
+    }
+
+    # No nested passing verdict, so the guard stays out of the way and the
+    # line keeps failing exactly as it did before.
+    assert guard(record, failing, actor_role="qa") == {}
+    failing_gate = _qa_completion_status_gate(failing)
+    assert failing_gate["top_level_status_passing"] is False
+    assert not _line_status_allows_contract_completion(
+        {**failing, "status": "failed"},
+        source_record={
+            "contract_execution_id": _QA_STATUS_FLIP_EXECUTION_ID,
+            "completed_lines": [{**failing, "status": "failed"}],
+        },
+        source_line_index=0,
+    )
+
+    # An explicitly failing status is likewise untouched.
+    explicit_failed = {**failing, "status": "failed"}
+    assert guard(record, explicit_failed, actor_role="qa") == {}
+
+    # A correctly formed passing line is never blocked.
+    passing = _qa_pass_verification_without_top_level_status()
+    passing["status"] = "passed"
+    assert guard(record, passing, actor_role="qa") == {}
+    passing_gate = _qa_completion_status_gate(passing)
+    assert passing_gate["top_level_status_present"] is True
+    assert passing_gate["top_level_status_passing"] is True
+
+    # Lines that are not independent QA verification stay out of scope.
+    other_line = _qa_pass_verification_without_top_level_status()
+    other_line["line_id"] = "worker_implementation"
+    other_line["evidence_kind"] = "implementation"
+    other_line["actor_role"] = "mf_sub"
+    assert guard(record, other_line, actor_role="mf_sub") == {}
+
+    other_role = _qa_pass_verification_without_top_level_status()
+    assert guard(record, other_role, actor_role="observer") == {}

@@ -97322,6 +97322,110 @@ def _contract_runtime_finish_attestation_facade_only_rejection(
     return rejected
 
 
+_CONTRACT_RUNTIME_QA_NESTED_VERDICT_PATHS: tuple[tuple[str, ...], ...] = (
+    ("verdict",),
+    ("verification", "verdict"),
+    ("verification", "status"),
+    ("verification", "result"),
+    ("test_results", "verdict"),
+    ("test_results", "status"),
+    ("payload", "verdict"),
+    ("payload", "status"),
+)
+
+
+def _contract_runtime_qa_nested_passing_verdict(
+    write: Mapping[str, Any],
+) -> dict[str, str]:
+    """Return the first nested QA verdict that records a passing result."""
+
+    for path in _CONTRACT_RUNTIME_QA_NESTED_VERDICT_PATHS:
+        node: Any = write
+        for key in path:
+            if not isinstance(node, Mapping):
+                node = None
+                break
+            node = node.get(key)
+        if not isinstance(node, str):
+            continue
+        text = node.strip().lower()
+        if text in _CONTRACT_RUNTIME_QA_PASSING_STATUSES:
+            return {"field": ".".join(path), "value": text}
+    return {}
+
+
+def _contract_runtime_qa_missing_status_rejection(
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    *,
+    actor_role: str,
+) -> dict[str, Any]:
+    """Reject a passing QA verification that omits the top-level status.
+
+    ``_enrich_qa_evidence_provenance`` derives ``completion_status_gate``
+    from the top-level ``status`` field alone.  A ``qa_independent_
+    verification`` line whose nested evidence records a passing verdict but
+    which carries no top-level ``status`` is therefore accepted and then
+    normalized into a *failing* completion gate, flipping the world into
+    failed-QA rework without ever telling the author.  Fail loudly here,
+    before any write, and name the exact remediation instead.
+
+    Only the contradiction is rejected.  A QA line whose evidence genuinely
+    does not pass carries no nested passing verdict, so it falls through and
+    keeps failing exactly as before.
+    """
+
+    if (
+        str(write.get("line_id") or "").strip()
+        != "qa_independent_verification"
+    ):
+        return {}
+    if (
+        str(write.get("evidence_kind") or "").strip()
+        != "independent_verification"
+    ):
+        return {}
+    effective_role = (
+        str(actor_role or "").strip()
+        or str(write.get("actor_role") or "").strip()
+    )
+    if effective_role != "qa":
+        return {}
+    if str(write.get("status") or "").strip():
+        return {}
+    nested = _contract_runtime_qa_nested_passing_verdict(write)
+    if not nested:
+        return {}
+    rejected = _contract_runtime_unchanged_line_rejection(
+        record,
+        [
+            "qa_independent_verification records a passing "
+            f"{nested['field']} but omits the top-level status field; "
+            "the completion status gate is derived from the top-level "
+            "status alone and would normalize this passing verification "
+            "into a failing one"
+        ],
+    )
+    rejected.update(
+        {
+            "missing_proof_fields": ["status"],
+            "nested_passing_verdict_field": nested["field"],
+            "nested_passing_verdict_value": nested["value"],
+            "silent_failing_normalization_prevented": True,
+            "completed_line_mutated": False,
+            "zero_contract_runtime_write": True,
+            "remediation": (
+                "resubmit the same evidence with top-level "
+                'status: "passed"'
+            ),
+            "next_legal_action": (
+                "resubmit_qa_independent_verification_with_top_level_status"
+            ),
+        }
+    )
+    return rejected
+
+
 def _contract_runtime_observer_reconcile_idempotency(
     *,
     record: Mapping[str, Any],
@@ -114908,6 +115012,37 @@ def _contract_runtime_close_gate(
                     "line_id": "qa_independent_verification",
                     "actor_role": actor_role,
                     "authority_source": "authenticated_qa_session",
+                },
+            )
+        qa_missing_status = _contract_runtime_qa_missing_status_rejection(
+            authority_record,
+            write,
+            actor_role=actor_role,
+        )
+        if qa_missing_status:
+            raise GovernanceError(
+                "contract_runtime_close_evidence_rejected",
+                (
+                    "qa_independent_verification records a passing verdict "
+                    "without the top-level status field"
+                ),
+                422,
+                {
+                    "schema_version": (
+                        _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
+                    ),
+                    "accepted": False,
+                    "contract_execution_id": contract_execution_id,
+                    "actor_role": actor_role,
+                    "line_id": "qa_independent_verification",
+                    "missing_proof_fields": ["status"],
+                    "nested_passing_verdict_field": qa_missing_status.get(
+                        "nested_passing_verdict_field"
+                    ),
+                    "silent_failing_normalization_prevented": True,
+                    "zero_contract_runtime_write": True,
+                    "zero_timeline_write": True,
+                    "remediation": qa_missing_status.get("remediation"),
                 },
             )
         write = _contract_runtime_bind_authenticated_qa_provenance(
@@ -141921,6 +142056,13 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                             actor_role=actor_role,
                         )
                     )
+                    qa_missing_status = (
+                        _contract_runtime_qa_missing_status_rejection(
+                            record,
+                            write,
+                            actor_role=actor_role,
+                        )
+                    )
                     if reconcile_idempotency:
                         result = reconcile_idempotency
                     elif dispatch_errors:
@@ -141930,6 +142072,8 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                         )
                     elif finish_attestation_facade_only:
                         result = finish_attestation_facade_only
+                    elif qa_missing_status:
+                        result = qa_missing_status
                     elif (
                         close_authority_precheck
                         and not close_authority_precheck.get("passed")
@@ -142514,6 +142658,13 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                             actor_role=actor_role,
                         )
                     )
+                    qa_missing_status = (
+                        _contract_runtime_qa_missing_status_rejection(
+                            record,
+                            write,
+                            actor_role=actor_role,
+                        )
+                    )
                     if reconcile_idempotency:
                         result = reconcile_idempotency
                     elif dispatch_errors:
@@ -142523,6 +142674,8 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                         )
                     elif finish_attestation_facade_only:
                         result = finish_attestation_facade_only
+                    elif qa_missing_status:
+                        result = qa_missing_status
                     elif (
                         close_authority_precheck
                         and not close_authority_precheck.get("passed")
