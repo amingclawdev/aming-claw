@@ -1049,6 +1049,7 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
         "bounded_replacement_rejoin"
     )
     assert replacement["bounded_replacement_rejoin"] is True
+
     assert replacement["bounded_replacement_generation"] == 1
     replacement_context = get_branch_context(conn, PID, runtime_context.task_id)
     assert replacement_context is not None
@@ -50003,6 +50004,7 @@ def test_runtime_context_session_token_reissue_endpoint_audits_and_rotates(
 
 def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_before_startup(
     conn,
+    monkeypatch,
     tmp_path,
 ):
     backlog_id = "AC-SAFE-REF-PRESTARTUP-REISSUE"
@@ -50087,6 +50089,23 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     )
     assert read["ok"] is True
 
+    # The latest ref remains a copy-safe recovery identifier after its lease
+    # expires.  It is not presented to, or accepted by, an ordinary write gate.
+    conn.execute(
+        """
+        UPDATE parallel_branch_runtime_contexts
+        SET lease_expires_at = ?
+        WHERE project_id = ? AND runtime_context_id = ?
+        """,
+        (
+            "2099-08-05T04:00:30Z",
+            PID,
+            allocated.runtime_context_id,
+        ),
+    )
+    conn.commit()
+    monkeypatch.setattr(server, "_utc_now", lambda: "2099-08-05T04:01:00Z")
+
     guide_payloads = server._runtime_context_worker_recovery_payloads(
         project_id=PID,
         runtime_context_id=allocated.runtime_context_id,
@@ -50137,6 +50156,18 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     assert reissued["contract_execution_id"] == contract_execution_id
     assert reissued["session_token_ref"] != joined["session_token_ref"]
     assert reissued["safe_ref_reissue_authority"]["server_derived"] is True
+    assert reissued["safe_ref_reissue_authority"][
+        "lease_status_at_authorization"
+    ] == "expired"
+    assert reissued["safe_ref_reissue_authority"][
+        "latest_ref_identifier_only"
+    ] is True
+    assert reissued["safe_ref_reissue_authority"]["stage_checkpoint_id"].startswith(
+        "sha256:"
+    )
+    assert reissued["safe_ref_reissue_authority"][
+        "stage_checkpoint_server_verified"
+    ] is True
     assert reissued["host_envelope"]["env"]["AMING_WORKER_SESSION_TOKEN"] == (
         reissued["session_token"]
     )
@@ -50149,6 +50180,20 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     )
     saved_after_reissue = get_branch_context(conn, PID, allocated.task_id)
     assert saved_after_reissue is not None
+    post_reissue_checkpoint = server._runtime_context_rejoin_worker_write_baseline(
+        conn,
+        project_id=PID,
+        context=saved_after_reissue,
+        timeline_events=server._runtime_context_service_timeline_events(
+            conn,
+            project_id=PID,
+            task_id=allocated.task_id,
+            backlog_id=backlog_id,
+        ),
+    )
+    assert post_reissue_checkpoint["stage_checkpoint_id"] == reissued[
+        "safe_ref_reissue_authority"
+    ]["stage_checkpoint_id"]
     assert saved_after_reissue.fence_token == ""
     assert saved_after_reissue.fence_token_verifier == reissued["fence_token_hash"]
     assert runtime_context_fence_token_verifier(saved_after_reissue) == (
@@ -50550,6 +50595,7 @@ def test_startup_facades_reject_empty_missing_or_conflicting_identity_zero_write
 
 def test_runtime_context_safe_ref_reissue_wrong_scope_and_replay_are_zero_write(
     conn,
+    monkeypatch,
     tmp_path,
 ):
     backlog_id = "AC-SAFE-REF-REISSUE-ZERO-WRITE"
@@ -50682,7 +50728,6 @@ def test_runtime_context_safe_ref_reissue_wrong_scope_and_replay_are_zero_write(
     active_context = get_branch_context(conn, PID, allocated.task_id)
     assert active_context is not None
     for lease_id, lease_expires_at in (
-        (active_context.lease_id, "2099-08-05T05:00:30Z"),
         ("", active_context.lease_expires_at),
     ):
         conn.execute(
@@ -50749,6 +50794,76 @@ def test_runtime_context_safe_ref_reissue_wrong_scope_and_replay_are_zero_write(
         ),
     )
     conn.commit()
+
+    from agent.governance import parallel_branch_runtime as branch_runtime
+
+    original_context_reader = (
+        branch_runtime.get_branch_context_by_runtime_context_id
+    )
+    context_read_count = 0
+
+    def _drift_current_ref_after_authority(*args, **kwargs):
+        nonlocal context_read_count
+        context_read_count += 1
+        current = original_context_reader(*args, **kwargs)
+        if context_read_count >= 2 and current is not None:
+            return replace(
+                current,
+                session_token_hash=mf_subagent_session_token_hash(
+                    "toctou-drift-session"
+                ),
+            )
+        return current
+
+    before_toctou_dump = "\n".join(conn.iterdump())
+    monkeypatch.setattr(
+        branch_runtime,
+        "get_branch_context_by_runtime_context_id",
+        _drift_current_ref_after_authority,
+    )
+    with pytest.raises(GovernanceError) as toctou_rejected:
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": allocated.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=base_body,
+            )
+        )
+    assert toctou_rejected.value.code == "fence_invalidated_or_unknown"
+    assert "\n".join(conn.iterdump()) == before_toctou_dump
+    monkeypatch.setattr(
+        branch_runtime,
+        "get_branch_context_by_runtime_context_id",
+        original_context_reader,
+    )
+
+    original_record_event = task_timeline.record_event
+
+    def _fail_reissue_audit(*args, **kwargs):
+        if kwargs.get("event_kind") == "mf_subagent_session_token_reissue":
+            raise RuntimeError("forced safe-ref audit failure")
+        return original_record_event(*args, **kwargs)
+
+    before_rollback_dump = "\n".join(conn.iterdump())
+    monkeypatch.setattr(task_timeline, "record_event", _fail_reissue_audit)
+    with pytest.raises(RuntimeError, match="forced safe-ref audit failure"):
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": allocated.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=base_body,
+            )
+        )
+    assert "\n".join(conn.iterdump()) == before_rollback_dump
+    monkeypatch.setattr(task_timeline, "record_event", original_record_event)
 
     accepted = server.handle_graph_governance_runtime_context_session_token_reissue(
         _ctx_with_role(
@@ -52592,6 +52707,158 @@ def test_special_then_ordinary_rejoin_counts_only_current_ordinary_authority(
         "bounded_replacement_rejoin"
     )
     assert replacement["bounded_replacement_rejoin"] is True
+
+    first_checkpoint_id = replacement["rejoin_stage_checkpoint_id"]
+    graph_trace_id = "gqt-special-ordinary-next-stage"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        parent_task_id=case["parent_task_id"],
+        snapshot_id="scope-special-ordinary-next-stage",
+        runtime_context_id=case["context"].runtime_context_id,
+        task_id=case["task_id"],
+        worker_role="mf_sub",
+        fence_token=replacement["fence_token"],
+        run_id=_mf_sub_run_id(case["task_id"], replacement["fence_token"]),
+        created_at="2026-08-08T20:00:00Z",
+    )
+    runtime = server._contract_runtime(conn)
+    runtime.current_guide(case["parent_task_id"], actor_role="mf_sub")
+    record = runtime.store.get(case["parent_task_id"])
+    graph_payload = {
+        "runtime_context_id": case["context"].runtime_context_id,
+        "task_id": case["task_id"],
+        "parent_task_id": case["parent_task_id"],
+        "worker_role": "mf_sub",
+        "worker_id": case["worker_id"],
+        "worker_slot_id": case["worker_id"],
+        "lane_id": case["worker_id"],
+        "target_project_root": str(case["target_root"]),
+        "session_token_ref": replacement["session_token_ref"],
+        "graph_trace_ids": [graph_trace_id],
+        "graph_query_trace_ids": [graph_trace_id],
+        "db_verified": True,
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+    }
+    graph_write = server._contract_runtime_write_from_record(
+        record,
+        actor_role="mf_sub",
+        stage_id="worker_context",
+        line_id="worker_graph_context",
+        evidence_kind="graph_trace",
+    )
+    graph_write.update(graph_payload)
+    graph_write["payload"] = dict(graph_payload)
+    graph_write["graph_trace_evidence"] = dict(graph_payload)
+    advanced = runtime.submit_line_write(
+        case["parent_task_id"],
+        graph_write,
+        actor_role="mf_sub",
+    )
+    assert advanced["ok"] is True, advanced["decision"].get("errors")
+
+    advanced_context = get_branch_context(conn, PID, case["task_id"])
+    assert advanced_context is not None
+    next_checkpoint_guide = (
+        server._runtime_context_session_rejoin_guidance_eligibility(
+            conn,
+            project_id=PID,
+            context=advanced_context,
+        )
+    )
+    assert next_checkpoint_guide["eligible"] is True, next_checkpoint_guide
+    assert next_checkpoint_guide["mode"] == "active_context_auth_only"
+
+    next_issuance = _pre_lineage_rejoin(
+        case,
+        body_updates={
+            "session_token_ref": runtime_context_session_token_ref(
+                advanced_context
+            ),
+            "reason": "issue the next stage checkpoint host envelope",
+        },
+    )
+    assert next_issuance["bounded_rejoin_kind"] == "ordinary_initial_rejoin"
+    assert next_issuance["rejoin_stage_checkpoint_id"] != first_checkpoint_id
+    next_context = get_branch_context(conn, PID, case["task_id"])
+    assert next_context is not None
+    next_replacement = _pre_lineage_rejoin(
+        case,
+        body_updates={
+            "session_token_ref": runtime_context_session_token_ref(next_context),
+            "reason": "replace the one lost next-stage envelope",
+        },
+    )
+    assert next_replacement["bounded_rejoin_kind"] == (
+        "bounded_replacement_rejoin"
+    )
+    exhausted_context = get_branch_context(conn, PID, case["task_id"])
+    assert exhausted_context is not None
+    before_exhausted_events = _pre_lineage_case_events(conn, case)
+    with pytest.raises(GovernanceError) as exhausted:
+        _pre_lineage_rejoin(
+            case,
+            body_updates={
+                "session_token_ref": runtime_context_session_token_ref(
+                    exhausted_context
+                ),
+                "reason": "reject a second loss replacement at one checkpoint",
+            },
+        )
+    assert exhausted.value.code == (
+        "runtime_context_bounded_replacement_rejoin_exhausted"
+    )
+    assert _pre_lineage_case_events(conn, case) == before_exhausted_events
+
+    issuance_event = next(
+        event
+        for event in _pre_lineage_case_events(conn, case)
+        if int(event.get("id") or 0) == int(next_issuance["audit_event_id"])
+    )
+    tampered_payload = copy.deepcopy(issuance_event["payload"])
+    tampered_baseline = dict(
+        tampered_payload["bounded_replacement_worker_write_baseline"]
+    )
+    tampered_baseline["timeline_worker_write_hash"] = _fake_sha(
+        "recomputed-checkpoint-audit-drift"
+    )
+    tampered_baseline.pop("stage_checkpoint_id", None)
+    tampered_checkpoint = server._runtime_context_rejoin_stage_checkpoint(
+        tampered_baseline
+    )
+    tampered_baseline["stage_checkpoint_id"] = tampered_checkpoint[
+        "stage_checkpoint_id"
+    ]
+    tampered_payload["bounded_replacement_worker_write_baseline"] = (
+        tampered_baseline
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (
+            json.dumps(tampered_payload, sort_keys=True),
+            next_issuance["audit_event_id"],
+        ),
+    )
+    conn.commit()
+    drifted_dump = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError) as checkpoint_drift:
+        _pre_lineage_rejoin(
+            case,
+            body_updates={
+                "session_token_ref": runtime_context_session_token_ref(
+                    exhausted_context
+                ),
+                "reason": "reject recomputed checkpoint audit drift",
+            },
+        )
+    assert checkpoint_drift.value.code == (
+        "runtime_context_bounded_replacement_rejoin_rejected"
+    )
+    assert checkpoint_drift.value.details["field"] == (
+        "accepted_rejoin_stage_checkpoint"
+    )
+    assert "\n".join(conn.iterdump()) == drifted_dump
 
 
 def test_runtime_context_pre_lineage_legacy_agent_plus_route_drift_is_zero_write(
@@ -55094,58 +55361,53 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
         },
     )
     conn.commit()
-    before_blocked_replacement_context = get_branch_context(
+    before_next_checkpoint_context = get_branch_context(
         conn,
         PID,
         "worker-runtime-rejoin",
     )
-    before_blocked_replacement_events = task_timeline.list_events(
+    before_next_checkpoint_events = task_timeline.list_events(
         conn,
         PID,
         task_id="worker-runtime-rejoin",
         backlog_id="AC-RUNTIME-TOKEN-REJOIN",
         limit=1000,
     )
-    with pytest.raises(GovernanceError) as post_write_replacement:
-        server.handle_graph_governance_runtime_context_session_token_rejoin(
-            _ctx_with_role(
-                {
-                    "project_id": PID,
-                    "runtime_context_id": context.runtime_context_id,
-                },
-                "coordinator",
-                method="POST",
-                body={
-                    "task_id": "worker-runtime-rejoin",
-                    "parent_task_id": "parent-runtime-rejoin",
-                    "target_project_root": str(target_root),
-                    "session_token_ref": result["session_token_ref"],
-                    "reason": "reject replacement after worker progress",
-                },
-            )
+    next_checkpoint = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": "worker-runtime-rejoin",
+                "parent_task_id": "parent-runtime-rejoin",
+                "target_project_root": str(target_root),
+                "session_token_ref": result["session_token_ref"],
+                "reason": "issue the next checkpoint after accepted worker progress",
+            },
         )
-    assert post_write_replacement.value.code == (
-        "runtime_context_bounded_replacement_rejoin_rejected"
     )
-    assert "worker evidence or protected write advanced" in " ".join(
-        post_write_replacement.value.details[
-            "bounded_replacement_rejoin_authority"
-        ]["errors"]
-    )
-    assert post_write_replacement.value.details["mutation_performed"] is False
-    assert post_write_replacement.value.details["zero_timeline_write"] is True
+    assert next_checkpoint["bounded_rejoin_kind"] == "ordinary_initial_rejoin"
+    assert next_checkpoint["rejoin_stage_checkpoint_id"] != result[
+        "rejoin_stage_checkpoint_id"
+    ]
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            task_id="worker-runtime-rejoin",
+            backlog_id="AC-RUNTIME-TOKEN-REJOIN",
+            limit=1000,
+        )
+    ) == len(before_next_checkpoint_events) + 1
     assert get_branch_context(
         conn,
         PID,
         "worker-runtime-rejoin",
-    ) == before_blocked_replacement_context
-    assert task_timeline.list_events(
-        conn,
-        PID,
-        task_id="worker-runtime-rejoin",
-        backlog_id="AC-RUNTIME-TOKEN-REJOIN",
-        limit=1000,
-    ) == before_blocked_replacement_events
+    ) != before_next_checkpoint_context
 
 
 def test_runtime_context_session_token_rejoin_accepts_contract_runtime_only_worker_sequence(

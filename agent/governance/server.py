@@ -33430,6 +33430,7 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
     project_id: str,
     runtime_context_id: str,
     body: Mapping[str, Any],
+    now_iso: str,
 ):
     """Resolve one exact source-backed pre-startup safe-ref authority."""
 
@@ -33601,6 +33602,17 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         task_id=expected_task_id,
         backlog_id=str(context.backlog_id or "").strip(),
     )
+    checkpoint_baseline = _runtime_context_rejoin_worker_write_baseline(
+        conn,
+        project_id=project_id,
+        context=context,
+        timeline_events=timeline_events,
+    )
+    stage_checkpoint = _runtime_context_rejoin_stage_checkpoint(
+        checkpoint_baseline
+    )
+    if not stage_checkpoint:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     matching_initial_joins = []
     matching_session_authorities: list[tuple[Mapping[str, Any], str]] = []
     for event in timeline_events:
@@ -33635,8 +33647,12 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         elif (
             action == "runtime_context_session_token_rejoin"
             and str(payload.get("bounded_rejoin_kind") or "").strip()
-            == "bounded_replacement_rejoin"
-            and payload.get("bounded_replacement_rejoin") is True
+            in {"ordinary_initial_rejoin", "bounded_replacement_rejoin"}
+            and (
+                str(payload.get("bounded_rejoin_kind") or "").strip()
+                != "bounded_replacement_rejoin"
+                or payload.get("bounded_replacement_rejoin") is True
+            )
             and event_session_ref == presented_session_ref
             and str(payload.get("worker_id") or "").strip()
             == expected_worker_id
@@ -33654,9 +33670,17 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
                 or expected_host_session_id
             ).strip()
             == expected_host_session_id
+            and _runtime_context_rejoin_checkpoint_relation(
+                payload.get("bounded_replacement_worker_write_baseline"),
+                checkpoint_baseline,
+            )
+            in {"exact", "advanced"}
         ):
             matching_session_authorities.append(
-                (event, "bounded_replacement_rejoin")
+                (
+                    event,
+                    str(payload.get("bounded_rejoin_kind") or "").strip(),
+                )
             )
     if len(matching_initial_joins) != 1:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
@@ -33725,7 +33749,10 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         ),
         session_authority_kind=session_authority_kind,
         route_identity_hash=route_identity_hash,
-        now_iso=str(body.get("now_iso") or ""),
+        stage_checkpoint_id=str(
+            stage_checkpoint.get("stage_checkpoint_id") or ""
+        ),
+        now_iso=now_iso,
     )
 
 
@@ -33744,6 +33771,7 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
     if not runtime_context_id:
         raise ValidationError("runtime_context_id is required")
     body = dict(ctx.body or {})
+    authoritative_now_iso = _utc_now()
     from .db import sqlite_write_lock
 
     conn = get_connection(project_id)
@@ -33770,6 +33798,7 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
                         project_id=project_id,
                         runtime_context_id=runtime_context_id,
                         body=body,
+                        now_iso=authoritative_now_iso,
                     )
                 )
             result = reissue_mf_subagent_runtime_session_token(
@@ -33804,7 +33833,11 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
                 host_session_id=str(body.get("host_session_id") or "").strip(),
                 safe_ref_authority=safe_ref_authority,
                 ttl_seconds=body.get("ttl_seconds"),
-                now_iso=str(body.get("now_iso") or ""),
+                now_iso=(
+                    authoritative_now_iso
+                    if safe_ref_authority is not None
+                    else str(body.get("now_iso") or "")
+                ),
             )
             if safe_ref_authority is not None:
                 result["contract_execution_id"] = (
@@ -33824,6 +33857,18 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
                         safe_ref_authority.session_authority_kind
                     ),
                     "route_identity_hash": safe_ref_authority.route_identity_hash,
+                    "stage_checkpoint_id": (
+                        safe_ref_authority.stage_checkpoint_id
+                    ),
+                    "stage_checkpoint_server_verified": (
+                        safe_ref_authority.stage_checkpoint_server_verified
+                    ),
+                    "lease_status_at_authorization": (
+                        safe_ref_authority.lease_status_at_authorization
+                    ),
+                    "latest_ref_identifier_only": (
+                        safe_ref_authority.latest_ref_identifier_only
+                    ),
                     "server_derived": True,
                     "caller_claims_trusted": False,
                 }
@@ -33884,6 +33929,7 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
                 "host_envelope",
             }
         }
+        audit_payload["action"] = "runtime_context_session_token_reissue"
         audit_payload["raw_session_token_persisted"] = False
         audit_event = task_timeline.record_event(
             conn,
@@ -40353,6 +40399,100 @@ _RUNTIME_CONTEXT_REJOIN_FIRST_RECOVERY_ACTION = (
 _RUNTIME_CONTEXT_REJOIN_REPLACEMENT_RECOVERY_ACTION = (
     "mf_subagent_session_token_rejoin_replacement_issued"
 )
+_RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS = (
+    "runtime_context_id",
+    "contract_execution_id",
+    "timeline_worker_write_count",
+    "timeline_worker_write_hash",
+    "contract_runtime_completed_line_count",
+    "contract_runtime_completed_lines_hash",
+)
+
+
+def _runtime_context_rejoin_stage_checkpoint(
+    baseline: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the closed durable protected-write checkpoint for one baseline."""
+
+    source = baseline if isinstance(baseline, Mapping) else {}
+    try:
+        timeline_count = int(source.get("timeline_worker_write_count"))
+        contract_count = int(source.get("contract_runtime_completed_line_count"))
+    except (TypeError, ValueError):
+        return {}
+    core = {
+        "schema_version": "runtime_context.rejoin_stage_checkpoint.v1",
+        "runtime_context_id": str(
+            source.get("runtime_context_id") or ""
+        ).strip(),
+        "contract_execution_id": str(
+            source.get("contract_execution_id") or ""
+        ).strip(),
+        "timeline_worker_write_count": timeline_count,
+        "timeline_worker_write_hash": str(
+            source.get("timeline_worker_write_hash") or ""
+        ).strip(),
+        "contract_runtime_completed_line_count": contract_count,
+        "contract_runtime_completed_lines_hash": str(
+            source.get("contract_runtime_completed_lines_hash") or ""
+        ).strip(),
+    }
+    if (
+        not core["runtime_context_id"]
+        or timeline_count < 0
+        or contract_count < 0
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            core["timeline_worker_write_hash"],
+        )
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            core["contract_runtime_completed_lines_hash"],
+        )
+    ):
+        return {}
+    checkpoint_id = stable_sha256(core)
+    supplied_checkpoint_id = str(
+        source.get("stage_checkpoint_id") or ""
+    ).strip()
+    if supplied_checkpoint_id and supplied_checkpoint_id != checkpoint_id:
+        return {}
+    return {**core, "stage_checkpoint_id": checkpoint_id}
+
+
+def _runtime_context_rejoin_checkpoint_relation(
+    prior: Mapping[str, Any] | None,
+    current: Mapping[str, Any] | None,
+) -> str:
+    """Classify an audited checkpoint as exact, an older prefix, or invalid."""
+
+    prior_checkpoint = _runtime_context_rejoin_stage_checkpoint(prior)
+    current_checkpoint = _runtime_context_rejoin_stage_checkpoint(current)
+    if not prior_checkpoint or not current_checkpoint:
+        return "invalid"
+    if any(
+        prior_checkpoint.get(field) != current_checkpoint.get(field)
+        for field in ("runtime_context_id", "contract_execution_id")
+    ):
+        return "invalid"
+    advanced = False
+    for count_field, hash_field in (
+        ("timeline_worker_write_count", "timeline_worker_write_hash"),
+        (
+            "contract_runtime_completed_line_count",
+            "contract_runtime_completed_lines_hash",
+        ),
+    ):
+        prior_count = int(prior_checkpoint[count_field])
+        current_count = int(current_checkpoint[count_field])
+        if prior_count > current_count:
+            return "invalid"
+        if prior_count == current_count:
+            if prior_checkpoint[hash_field] != current_checkpoint[hash_field]:
+                return "invalid"
+        else:
+            advanced = True
+    return "advanced" if advanced else "exact"
 
 
 def _runtime_context_rejoin_worker_write_baseline(
@@ -40413,6 +40553,9 @@ def _runtime_context_rejoin_worker_write_baseline(
         if str(payload.get("action") or "").strip() in {
             "runtime_context_session_token_rejoin",
             "runtime_context_session_token_initial_join",
+            "runtime_context_session_token_reissue",
+        } or str(event.get("event_kind") or "").strip() in {
+            "mf_subagent_session_token_reissue",
         }:
             continue
         event_type = str(event.get("event_type") or "").strip().lower()
@@ -40472,7 +40615,7 @@ def _runtime_context_rejoin_worker_write_baseline(
         contract_execution_id = ""
         contract_lines = []
 
-    return {
+    baseline = {
         "schema_version": "runtime_context.rejoin_worker_write_baseline.v1",
         "runtime_context_id": runtime_context_id,
         "contract_execution_id": contract_execution_id,
@@ -40481,6 +40624,10 @@ def _runtime_context_rejoin_worker_write_baseline(
         "contract_runtime_completed_line_count": len(contract_lines),
         "contract_runtime_completed_lines_hash": stable_sha256(contract_lines),
     }
+    checkpoint = _runtime_context_rejoin_stage_checkpoint(baseline)
+    if checkpoint:
+        baseline["stage_checkpoint_id"] = checkpoint["stage_checkpoint_id"]
+    return baseline
 
 
 def _runtime_context_bounded_replacement_rejoin_authority(
@@ -40491,49 +40638,54 @@ def _runtime_context_bounded_replacement_rejoin_authority(
     timeline_events: Sequence[Mapping[str, Any]],
     body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Authorize one post-lineage replacement only before any worker write."""
+    """Authorize one loss replacement for the exact current stage checkpoint."""
 
     from .parallel_branch_runtime import runtime_context_session_token_ref
 
     last_action = str(
         getattr(context, "last_recovery_action", "") or ""
     ).strip()
+    current_baseline = _runtime_context_rejoin_worker_write_baseline(
+        conn,
+        project_id=project_id,
+        context=context,
+        timeline_events=timeline_events,
+    )
+    current_checkpoint = _runtime_context_rejoin_stage_checkpoint(
+        current_baseline
+    )
     projection: dict[str, Any] = {
         "schema_version": (
-            "runtime_context.bounded_replacement_rejoin_authority.v1"
+            "runtime_context.bounded_replacement_rejoin_authority.v2"
         ),
         "server_derived": True,
         "caller_claims_trusted": False,
-        "applicable": last_action
-        in {
-            "mf_subagent_pre_lineage_session_token_rejoin_issued",
-            _RUNTIME_CONTEXT_REJOIN_FIRST_RECOVERY_ACTION,
-            _RUNTIME_CONTEXT_REJOIN_REPLACEMENT_RECOVERY_ACTION,
-        },
+        "applicable": False,
         "eligible": False,
         "mode": "not_applicable",
         "replacement_generation": 0,
         "last_recovery_action": last_action,
+        "current_worker_write_baseline": dict(current_baseline),
+        "current_stage_checkpoint": dict(current_checkpoint),
+        "current_stage_checkpoint_id": str(
+            current_checkpoint.get("stage_checkpoint_id") or ""
+        ),
         "errors": [],
         "identity_mismatches": [],
     }
-    if not projection["applicable"]:
-        return projection
-    if last_action == _RUNTIME_CONTEXT_REJOIN_REPLACEMENT_RECOVERY_ACTION:
+    if not current_checkpoint:
         projection.update(
             {
-                "mode": "replacement_exhausted",
-                "replacement_generation": 1,
-                "errors": ["bounded replacement rejoin already consumed"],
+                "applicable": True,
+                "mode": "checkpoint_invalid",
+                "errors": ["current stage checkpoint is invalid"],
                 "identity_mismatches": [
                     {
-                        "field": "bounded_replacement_rejoin_count",
-                        "expected": "at most 1",
-                        "actual": "2",
-                        "guide": (
-                            "stop_and_report_bounded_rejoin_recovery_exhausted"
-                        ),
-                        "source": "runtime_context.last_recovery_action",
+                        "field": "current_stage_checkpoint",
+                        "expected": "closed server-derived checkpoint",
+                        "actual": "invalid",
+                        "guide": "stop_and_report_rejoin_checkpoint_invalid",
+                        "source": "runtime_context.current",
                     }
                 ],
             }
@@ -40543,8 +40695,11 @@ def _runtime_context_bounded_replacement_rejoin_authority(
     runtime_context_id = str(
         getattr(context, "runtime_context_id", "") or ""
     ).strip()
-    ordinary_audit_events = []
-    special_bootstrap_audit_events = []
+    current_ordinary_events: list[Mapping[str, Any]] = []
+    current_replacement_events: list[Mapping[str, Any]] = []
+    current_special_events: list[Mapping[str, Any]] = []
+    advanced_checkpoint_events: list[Mapping[str, Any]] = []
+    invalid_checkpoint_events: list[Mapping[str, Any]] = []
     for event in timeline_events:
         payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
         bounded_rejoin_kind = str(
@@ -40558,38 +40713,147 @@ def _runtime_context_bounded_replacement_rejoin_authority(
             and _timeline_first_deep_text(event, "runtime_context_id")
             in {"", runtime_context_id}
         ):
-            if bounded_rejoin_kind == "ordinary_initial_rejoin":
-                ordinary_audit_events.append(event)
-            elif (
+            if bounded_rejoin_kind not in {
+                "ordinary_initial_rejoin",
+                "bounded_replacement_rejoin",
+                "special_authority_rejoin",
+            }:
+                continue
+            if (
                 bounded_rejoin_kind == "special_authority_rejoin"
-                and payload.get("pre_lineage_auth_only_rejoin") is True
+                and payload.get("pre_lineage_auth_only_rejoin") is not True
             ):
-                special_bootstrap_audit_events.append(event)
-    # An ordinary current rejoin supersedes the earlier pre-lineage bootstrap
-    # audit as replacement authority.  When no ordinary rejoin exists yet, the
-    # sole special bootstrap rejoin retains the legacy one-retry behavior.
-    audit_events = (
-        ordinary_audit_events
-        if ordinary_audit_events
-        else special_bootstrap_audit_events
-    )
-    projection["mode"] = "bounded_post_lineage_replacement_auth_only"
-    if len(audit_events) != 1:
-        projection["errors"].append(
-            "exactly one accepted prior rejoin audit is required"
-        )
-        projection["identity_mismatches"].append(
+                continue
+            relation = _runtime_context_rejoin_checkpoint_relation(
+                payload.get("bounded_replacement_worker_write_baseline"),
+                current_baseline,
+            )
+            if relation == "invalid":
+                invalid_checkpoint_events.append(event)
+            elif relation == "advanced":
+                advanced_checkpoint_events.append(event)
+            elif bounded_rejoin_kind == "ordinary_initial_rejoin":
+                current_ordinary_events.append(event)
+            elif bounded_rejoin_kind == "bounded_replacement_rejoin":
+                current_replacement_events.append(event)
+            else:
+                current_special_events.append(event)
+
+    projection["historical_advanced_checkpoint_event_refs"] = [
+        f"timeline:{event.get('id', '')}"
+        for event in advanced_checkpoint_events
+    ]
+    if invalid_checkpoint_events:
+        projection.update(
             {
-                "field": "accepted_prior_rejoin_audit_count",
-                "expected": "1",
-                "actual": str(len(audit_events)),
-                "guide": "stop_and_report_rejoin_audit_cardinality_drift",
-                "source": "task_timeline",
+                "applicable": True,
+                "mode": "checkpoint_audit_drift",
+                "errors": ["accepted rejoin audit checkpoint is malformed or divergent"],
+                "identity_mismatches": [
+                    {
+                        "field": "accepted_rejoin_stage_checkpoint",
+                        "expected": "exact current or monotonic prior checkpoint",
+                        "actual": "invalid",
+                        "guide": "stop_and_report_rejoin_checkpoint_audit_drift",
+                        "source": f"timeline:{invalid_checkpoint_events[0].get('id', '')}",
+                    }
+                ],
             }
         )
         return projection
 
-    prior_event = audit_events[0]
+    # Once protected worker evidence advances, prior issuance/replacement rows
+    # belong to an older immutable checkpoint.  They cannot consume the new
+    # checkpoint's issuance budget or authorize its replacement.
+    current_issuance_events = (
+        current_ordinary_events
+        if current_ordinary_events
+        else current_special_events
+    )
+    current_event_count = len(current_issuance_events) + len(
+        current_replacement_events
+    )
+    projection["current_checkpoint_issuance_event_refs"] = [
+        f"timeline:{event.get('id', '')}" for event in current_issuance_events
+    ]
+    projection["current_checkpoint_replacement_event_refs"] = [
+        f"timeline:{event.get('id', '')}" for event in current_replacement_events
+    ]
+    if current_event_count == 0 and advanced_checkpoint_events:
+        projection.update(
+            {
+                "applicable": False,
+                "mode": "next_stage_checkpoint_issuance",
+                "next_checkpoint_issuance_allowed": True,
+            }
+        )
+        return projection
+
+    if current_event_count == 0:
+        projection["applicable"] = last_action in {
+            "mf_subagent_pre_lineage_session_token_rejoin_issued",
+            _RUNTIME_CONTEXT_REJOIN_FIRST_RECOVERY_ACTION,
+            _RUNTIME_CONTEXT_REJOIN_REPLACEMENT_RECOVERY_ACTION,
+        }
+        if projection["applicable"]:
+            projection.update(
+                {
+                    "mode": "checkpoint_audit_missing",
+                    "errors": ["current recovery action lacks an accepted checkpoint audit"],
+                    "identity_mismatches": [
+                        {
+                            "field": "accepted_prior_rejoin_audit_count",
+                            "expected": "1",
+                            "actual": "0",
+                            "guide": "stop_and_report_rejoin_audit_cardinality_drift",
+                            "source": "task_timeline",
+                        }
+                    ],
+                }
+            )
+        return projection
+
+    projection["applicable"] = True
+    if (
+        len(current_issuance_events) != 1
+        or len(current_replacement_events) > 1
+    ):
+        projection.update(
+            {
+                "mode": "checkpoint_audit_cardinality_drift",
+                "errors": ["current checkpoint rejoin audit cardinality is invalid"],
+                "identity_mismatches": [
+                    {
+                        "field": "accepted_prior_rejoin_audit_count",
+                        "expected": "one issuance and at most one replacement",
+                        "actual": str(current_event_count),
+                        "guide": "stop_and_report_rejoin_audit_cardinality_drift",
+                        "source": "task_timeline",
+                    }
+                ],
+            }
+        )
+        return projection
+    if current_replacement_events:
+        projection.update(
+            {
+                "mode": "replacement_exhausted",
+                "replacement_generation": 1,
+                "errors": ["bounded replacement rejoin already consumed for current checkpoint"],
+                "identity_mismatches": [
+                    {
+                        "field": "bounded_replacement_rejoin_count",
+                        "expected": "at most 1",
+                        "actual": "2",
+                        "guide": "stop_and_report_bounded_rejoin_recovery_exhausted",
+                        "source": f"timeline:{current_replacement_events[0].get('id', '')}",
+                    }
+                ],
+            }
+        )
+        return projection
+
+    prior_event = current_issuance_events[0]
     prior_payload = (
         prior_event.get("payload")
         if isinstance(prior_event.get("payload"), Mapping)
@@ -40603,12 +40867,8 @@ def _runtime_context_bounded_replacement_rejoin_authority(
         )
         else {}
     )
-    actual_baseline = _runtime_context_rejoin_worker_write_baseline(
-        conn,
-        project_id=project_id,
-        context=context,
-        timeline_events=timeline_events,
-    )
+    actual_baseline = current_baseline
+    projection["mode"] = "bounded_post_lineage_replacement_auth_only"
     projection["source_event_ref"] = f"timeline:{prior_event.get('id', '')}"
     projection["expected_worker_write_baseline"] = dict(expected_baseline)
     projection["actual_worker_write_baseline"] = dict(actual_baseline)
@@ -40626,14 +40886,7 @@ def _runtime_context_bounded_replacement_rejoin_authority(
             }
         )
     else:
-        for field in (
-            "runtime_context_id",
-            "contract_execution_id",
-            "timeline_worker_write_count",
-            "timeline_worker_write_hash",
-            "contract_runtime_completed_line_count",
-            "contract_runtime_completed_lines_hash",
-        ):
+        for field in _RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS:
             if expected_baseline.get(field) != actual_baseline.get(field):
                 projection["identity_mismatches"].append(
                     {
@@ -41816,6 +42069,9 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         result["bounded_rejoin_kind"] = bounded_rejoin_kind
         result["bounded_replacement_worker_write_baseline"] = dict(
             rejoin_worker_write_baseline
+        )
+        result["rejoin_stage_checkpoint_id"] = str(
+            rejoin_worker_write_baseline.get("stage_checkpoint_id") or ""
         )
         if bounded_replacement_rejoin_authority:
             result["bounded_replacement_rejoin_authority"] = dict(

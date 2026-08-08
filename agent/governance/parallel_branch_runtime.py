@@ -1574,8 +1574,12 @@ class SafeRefPrestartupReissueAuthority:
     route_identity_hash: str
     authorized_at: str
     authority_hash: str
+    stage_checkpoint_id: str = ""
+    stage_checkpoint_server_verified: bool = False
+    lease_status_at_authorization: str = ""
+    latest_ref_identifier_only: bool = False
     schema_version: str = (
-        "runtime_context.safe_ref_prestartup_reissue_authority.v1"
+        "runtime_context.safe_ref_prestartup_reissue_authority.v2"
     )
     server_derived: bool = True
     caller_claims_trusted: bool = False
@@ -11460,9 +11464,15 @@ def build_safe_ref_prestartup_reissue_authority(
     route_identity_hash: str,
     session_authority_event_ref: str = "",
     session_authority_kind: str = "initial_join",
+    stage_checkpoint_id: str = "",
     now_iso: str = "",
 ) -> SafeRefPrestartupReissueAuthority:
-    """Bind server-verified pre-startup lineage to the active opaque ref."""
+    """Bind server-verified pre-startup lineage to the latest opaque ref.
+
+    An expired latest ref is only a copy-safe recovery identifier.  The server
+    must supply the exact current stage checkpoint; neither the ref nor this
+    object is accepted by ordinary worker write gates.
+    """
 
     lease = runtime_context_session_token_lease_view(context, now_iso=now_iso)
     runtime_id = runtime_context_id_for_branch_context(context)
@@ -11475,11 +11485,15 @@ def build_safe_ref_prestartup_reissue_authority(
     ).strip()
     session_authority_type = str(session_authority_kind or "").strip()
     route_hash = str(route_identity_hash or "").strip()
+    checkpoint_id = str(stage_checkpoint_id or "").strip()
+    checkpoint_server_verified = bool(checkpoint_id)
     worker_id = str(context.worker_id or "").strip()
     worker_slot_id = str(context.worker_slot_id or worker_id).strip()
     actual_host_worker_id = str(context.actual_host_worker_id or "").strip()
     host_session_id = str(context.host_session_id or "").strip()
     authorized_at = str(lease.get("now") or "").strip()
+    lease_status = str(lease.get("status") or "").strip()
+    latest_ref_identifier_only = lease_status == "expired"
     if (
         not all(
             (
@@ -11511,14 +11525,41 @@ def build_safe_ref_prestartup_reissue_authority(
         or not join_ref.startswith("timeline:")
         or not session_authority_ref.startswith("timeline:")
         or session_authority_type
-        not in {"initial_join", "bounded_replacement_rejoin"}
+        not in {
+            "initial_join",
+            "ordinary_initial_rejoin",
+            "bounded_replacement_rejoin",
+        }
         or not route_hash.startswith("sha256:")
-        or str(lease.get("status") or "") != "active"
-        or lease.get("authorization_valid") is not True
-        or lease.get("expired") is not False
+        or lease_status not in {"active", "expired"}
+        or lease.get("lease_record_valid") is not True
+        or (
+            lease_status == "active"
+            and (
+                lease.get("authorization_valid") is not True
+                or lease.get("expired") is not False
+            )
+        )
+        or (
+            lease_status == "expired"
+            and (
+                lease.get("authorization_valid") is not False
+                or lease.get("expired") is not True
+            )
+        )
         or str(lease.get("session_token_ref") or "") != session_ref
+        or (latest_ref_identifier_only and not checkpoint_server_verified)
     ):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if not checkpoint_id:
+        checkpoint_id = _stable_authority_hash(
+            {
+                "schema_version": "runtime_context.rejoin_stage_checkpoint.compat.v1",
+                "runtime_context_id": runtime_id,
+                "contract_execution_id": execution_id,
+                "read_receipt_ref": read_ref,
+            }
+        )
     authority = SafeRefPrestartupReissueAuthority(
         project_id=context.project_id,
         backlog_id=context.backlog_id,
@@ -11551,6 +11592,10 @@ def build_safe_ref_prestartup_reissue_authority(
         route_identity_hash=route_hash,
         authorized_at=authorized_at,
         authority_hash="",
+        stage_checkpoint_id=checkpoint_id,
+        stage_checkpoint_server_verified=checkpoint_server_verified,
+        lease_status_at_authorization=lease_status,
+        latest_ref_identifier_only=latest_ref_identifier_only,
     )
     payload = asdict(authority)
     payload.pop("authority_hash", None)
@@ -11661,7 +11706,7 @@ def reissue_mf_subagent_runtime_session_token(
         }
         if (
             authority.schema_version
-            != "runtime_context.safe_ref_prestartup_reissue_authority.v1"
+            != "runtime_context.safe_ref_prestartup_reissue_authority.v2"
             or authority.server_derived is not True
             or authority.caller_claims_trusted is not False
             or not authority.read_receipt_ref.startswith(
@@ -11672,9 +11717,25 @@ def reissue_mf_subagent_runtime_session_token(
                 "timeline:"
             )
             or authority.session_authority_kind
-            not in {"initial_join", "bounded_replacement_rejoin"}
+            not in {
+                "initial_join",
+                "ordinary_initial_rejoin",
+                "bounded_replacement_rejoin",
+            }
             or not authority.route_identity_hash.startswith("sha256:")
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                str(authority.stage_checkpoint_id or ""),
+            )
+            or (
+                authority.latest_ref_identifier_only
+                and authority.stage_checkpoint_server_verified is not True
+            )
             or not authority.authorized_at
+            or authority.lease_status_at_authorization
+            != str(lease.get("status") or "")
+            or authority.latest_ref_identifier_only
+            is not (str(lease.get("status") or "") == "expired")
             or authority_hash != _stable_authority_hash(authority_payload)
             or any(
                 str(getattr(authority, field_name, "") or "").strip()
@@ -11688,9 +11749,22 @@ def reissue_mf_subagent_runtime_session_token(
                 for field_name, value in supplied_scope.items()
                 if field_name != "host_startup_id" or expected_scope[field_name]
             )
-            or str(lease.get("status") or "") != "active"
-            or lease.get("authorization_valid") is not True
-            or lease.get("expired") is not False
+            or str(lease.get("status") or "") not in {"active", "expired"}
+            or lease.get("lease_record_valid") is not True
+            or (
+                str(lease.get("status") or "") == "active"
+                and (
+                    lease.get("authorization_valid") is not True
+                    or lease.get("expired") is not False
+                )
+            )
+            or (
+                str(lease.get("status") or "") == "expired"
+                and (
+                    lease.get("authorization_valid") is not False
+                    or lease.get("expired") is not True
+                )
+            )
             or str(lease.get("session_token_ref") or "") != presented_ref
         ):
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
