@@ -158,12 +158,13 @@ removes only the profile's disposable container state.
 8. Push the exact deployed commit and create annotated tag `v0.2.1` only if its
    target equals the deployed/full-graph commit. The audit-archived `v0.2.0`
    tag is immutable and must never move.
-9. Refresh the local Codex plugin cache from the exact tag with the
+9. Install the local Codex plugin cache from that exact tag with the
    plugin-creator cachebuster workflow, validate the manifest, reinstall from
    the configured local marketplace, require plugin doctor to pass, and test
    from a new Codex task.
-10. Append postdeploy verification and close-ready, then close release rows
-    normally only after the publish, install, and doctor evidence is durable.
+10. Append postdeploy verification and close-ready. Only after that evidence,
+    close release rows normally; the publish, install, and doctor evidence must
+    already be durable.
 
 ## Troubleshooting and known baselines
 

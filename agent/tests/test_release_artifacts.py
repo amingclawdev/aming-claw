@@ -129,10 +129,24 @@ def test_release_docs_name_replay_and_chain_trailer_boundaries():
     assert "audit-archived `v0.2.0`" in runbook
     assert "tag is immutable and must never move" in runbook
     assert "`v2.0.0`" not in runbook
+    deployed_smoke_index = runbook.index("Rerun the happy-path smoke after deploy")
     publish_index = runbook.index("create annotated tag `v0.2.1`")
+    install_index = runbook.index(
+        "Install the local Codex plugin cache from that exact tag"
+    )
     doctor_index = runbook.index("require plugin doctor to pass")
-    close_index = runbook.index("Append postdeploy verification and close-ready")
-    assert publish_index < doctor_index < close_index
+    close_ready_index = runbook.index(
+        "Append postdeploy verification and close-ready"
+    )
+    normal_close_index = runbook.index("close release rows normally")
+    assert (
+        deployed_smoke_index
+        < publish_index
+        < install_index
+        < doctor_index
+        < close_ready_index
+        < normal_close_index
+    )
 
 
 def test_docker_release_identity_is_exact_and_health_checked():
