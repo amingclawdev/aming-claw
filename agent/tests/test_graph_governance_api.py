@@ -125376,6 +125376,90 @@ def _explicit_epoch_release_named_route_proof(
     return body
 
 
+def _explicit_epoch_release_route_handler():
+    handlers = [
+        handler
+        for method, path, handler in server.ROUTES
+        if method == "POST"
+        and path
+        == (
+            "/api/projects/{project_id}/integration-epochs/{batch_id}/"
+            "release-unlandable-child"
+        )
+    ]
+    assert handlers == [
+        server.handle_integration_epoch_release_unlandable_child
+    ]
+    return handlers[0]
+
+
+def _establish_explicit_epoch_release_authority_rollover(
+    conn,
+    *,
+    suffix: str,
+):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    route_handler = _explicit_epoch_release_route_handler()
+    old_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id=f"obs-f410-audit-{suffix}",
+        route_token_ref=f"rtok-a1-audit-{suffix}",
+    )
+    first = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=old_body,
+        )
+    )
+    assert first["ok"] is True
+    conn.execute(
+        "UPDATE parallel_branch_runtime_contexts SET status = 'running' "
+        "WHERE project_id = ? AND task_id = ?",
+        (PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK),
+    )
+    conn.execute(
+        "UPDATE parallel_branch_batch_items SET status = 'running' "
+        "WHERE project_id = ? AND batch_id = ? AND task_id = ?",
+        (
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_BATCH,
+            _EXPLICIT_EPOCH_RELEASE_PLAN_TASK,
+        ),
+    )
+    conn.commit()
+    renewed_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id=f"obs-f594-audit-{suffix}",
+        route_token_ref=f"rtok-9d-audit-{suffix}",
+        allowed_actions=[
+            "integration_epoch_release_unlandable_child",
+            "task_timeline_append",
+        ],
+    )
+    repaired = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=renewed_body,
+        )
+    )
+    assert repaired["replay_authority_renewed"] is True
+    assert repaired["projection_repaired"] is True
+    assert len(_explicit_epoch_release_events(conn)) == 1
+    return route_handler, renewed_body
+
+
 @pytest.mark.parametrize(
     ("route_backlog_id", "route_task_id"),
     [
@@ -126380,6 +126464,177 @@ def test_release_route_replay_rolls_authority_and_repairs_projection_once(
         replay_epoch.incomplete_fanin["released_children"][0]["binding_audit"]
         ["replay_authority_rollovers"]
     ) == 1
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "raw_credentials_flag",
+        "route_ref",
+        "governing_scope",
+        "authorized_action",
+        "operator_principal",
+        "rollover_id",
+        "audit_core",
+        "immutable_event_ref",
+        "duplicate_id",
+        "malformed_list",
+        "malformed_entry",
+        "invalid_recorded_at",
+        "unexpected_field",
+        "missing_field",
+    ],
+)
+def test_release_route_replay_rejects_tampered_persisted_rollover_audit(
+    conn,
+    tamper_mode,
+):
+    route_handler, renewed_body = (
+        _establish_explicit_epoch_release_authority_rollover(
+            conn,
+            suffix=tamper_mode,
+        )
+    )
+    epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    incomplete_fanin = copy.deepcopy(epoch.incomplete_fanin)
+    binding_audit = incomplete_fanin["released_children"][0]["binding_audit"]
+    audits = binding_audit["replay_authority_rollovers"]
+    audit = audits[0]
+    if tamper_mode == "raw_credentials_flag":
+        audit["raw_credentials_persisted"] = True
+    elif tamper_mode == "route_ref":
+        audit["new_observer_route_token_ref"] = (
+            "observer-route-token-ref:tampered"
+        )
+    elif tamper_mode == "governing_scope":
+        audit["governing_backlog_ref"] = "governing-backlog:tampered"
+    elif tamper_mode == "authorized_action":
+        audit["authorized_action_ref"] = "authorized-action:tampered"
+    elif tamper_mode == "operator_principal":
+        audit["new_operator_principal"] = "observer-session:tampered"
+    elif tamper_mode == "rollover_id":
+        audit["rollover_id"] = "release-rollover-tampered"
+    elif tamper_mode == "audit_core":
+        audit["source"] = "tampered-source"
+    elif tamper_mode == "immutable_event_ref":
+        audit["immutable_release_event_ref"] = "release-event:999999"
+    elif tamper_mode == "duplicate_id":
+        audits.append(dict(audit))
+    elif tamper_mode == "malformed_list":
+        binding_audit["replay_authority_rollovers"] = {
+            "not": "an-audit-list"
+        }
+    elif tamper_mode == "malformed_entry":
+        audits.append("not-an-audit-object")
+    elif tamper_mode == "invalid_recorded_at":
+        audit["recorded_at"] = ""
+    elif tamper_mode == "unexpected_field":
+        audit["untrusted_extension"] = True
+    elif tamper_mode == "missing_field":
+        audit.pop("copy_safe")
+
+    upsert_integration_epoch(
+        conn,
+        replace(epoch, incomplete_fanin=incomplete_fanin),
+    )
+    conn.commit()
+    before_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_context = get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    )
+    before_batch = parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_events = [
+        dict(row) for row in _explicit_epoch_release_events(conn)
+    ]
+    changes_before = conn.total_changes
+
+    status, result = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=renewed_body,
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == (
+        "integration_epoch_release_replay_identity_mismatch"
+    )
+    assert result["zero_write_rejection"] is True
+    assert conn.total_changes == changes_before
+    assert get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_epoch
+    assert get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    ) == before_context
+    assert parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_batch
+    assert [dict(row) for row in _explicit_epoch_release_events(conn)] == (
+        before_events
+    )
+    assert len(before_events) == 1
+
+
+def test_release_route_replay_allows_only_original_recorded_at_difference(
+    conn,
+):
+    route_handler, renewed_body = (
+        _establish_explicit_epoch_release_authority_rollover(
+            conn,
+            suffix="recorded-at",
+        )
+    )
+    epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    incomplete_fanin = copy.deepcopy(epoch.incomplete_fanin)
+    audit = incomplete_fanin["released_children"][0]["binding_audit"][
+        "replay_authority_rollovers"
+    ][0]
+    audit["recorded_at"] = "2000-01-01T00:00:00Z"
+    upsert_integration_epoch(
+        conn,
+        replace(epoch, incomplete_fanin=incomplete_fanin),
+    )
+    conn.commit()
+    changes_before = conn.total_changes
+
+    replay = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=renewed_body,
+        )
+    )
+
+    assert replay["replayed"] is True
+    assert replay["replay_authority_renewed"] is False
+    assert replay["projection_repaired"] is False
+    assert replay["writes_performed"] is False
+    assert conn.total_changes == changes_before
+    replay_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    persisted_audits = replay_epoch.incomplete_fanin["released_children"][0][
+        "binding_audit"
+    ]["replay_authority_rollovers"]
+    assert len(persisted_audits) == 1
+    assert persisted_audits[0]["recorded_at"] == "2000-01-01T00:00:00Z"
+    assert len(_explicit_epoch_release_events(conn)) == 1
 
 
 @pytest.mark.parametrize(

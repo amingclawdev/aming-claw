@@ -15488,14 +15488,22 @@ def _with_release_binding_audit(
             else {}
         )
         next_binding_audit = dict(binding_audit)
-        existing_rollovers = [
-            dict(candidate)
-            for candidate in existing_binding_audit.get(
-                "replay_authority_rollovers"
+        raw_existing_rollovers = existing_binding_audit.get(
+            "replay_authority_rollovers"
+        )
+        existing_rollovers = (
+            _validated_existing_release_rollover_audits(
+                raw_existing_rollovers,
+                expected=replay_authority_rollover_audit,
+                queue_item_id=queue_item_id,
             )
-            or []
-            if isinstance(candidate, Mapping)
-        ]
+            if replay_authority_rollover_audit
+            else [
+                dict(candidate)
+                for candidate in raw_existing_rollovers or []
+                if isinstance(candidate, Mapping)
+            ]
+        )
         if existing_rollovers:
             next_binding_audit["replay_authority_rollovers"] = (
                 existing_rollovers
@@ -15539,6 +15547,190 @@ _RELEASE_OBSERVER_ROUTE_REF_PREFIX = "observer-route-token-ref:"
 _RELEASE_GOVERNING_BACKLOG_REF_PREFIX = "governing-backlog:"
 _RELEASE_GOVERNING_TASK_REF_PREFIX = "governing-task:"
 _RELEASE_AUTHORIZED_ACTION_REF_PREFIX = "authorized-action:"
+_RELEASE_ROLLOVER_AUDIT_SCHEMA = (
+    "mf_batch_parallel.release_replay_authority_rollover.v1"
+)
+_RELEASE_ROLLOVER_AUDIT_SOURCE = (
+    "server_validated_observer_session_route_token_ref"
+)
+_RELEASE_ROLLOVER_AUDIT_CORE_FIELDS = (
+    "schema_version",
+    "source",
+    "immutable_release_event_ref",
+    "old_operator_principal",
+    "old_observer_route_token_ref",
+    "new_operator_principal",
+    "new_observer_route_token_ref",
+    "governing_backlog_ref",
+    "governing_task_ref",
+    "authorized_action_ref",
+    "projection_repair_authority",
+    "copy_safe",
+    "raw_credentials_persisted",
+)
+_RELEASE_ROLLOVER_AUDIT_FIELDS = frozenset(
+    (*_RELEASE_ROLLOVER_AUDIT_CORE_FIELDS, "rollover_id", "recorded_at")
+)
+_RELEASE_ROLLOVER_AUDIT_STABLE_FIELDS = (
+    "schema_version",
+    "source",
+    "immutable_release_event_ref",
+    "old_operator_principal",
+    "old_observer_route_token_ref",
+    "governing_backlog_ref",
+    "governing_task_ref",
+    "authorized_action_ref",
+    "projection_repair_authority",
+    "copy_safe",
+    "raw_credentials_persisted",
+)
+
+
+def _release_rollover_audit_id(audit: Mapping[str, Any]) -> str:
+    core = {
+        field: audit.get(field)
+        for field in _RELEASE_ROLLOVER_AUDIT_CORE_FIELDS
+    }
+    rollover_hash = hashlib.sha256(
+        json.dumps(
+            core,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"release-rollover-{rollover_hash[:24]}"
+
+
+def _reject_release_rollover_audit(
+    reason: str,
+    *,
+    queue_item_id: str,
+    **details: Any,
+) -> None:
+    raise IntegrationEpochUnlandableChildReleaseError(
+        "integration_epoch_release_replay_identity_mismatch",
+        "persisted release replay authority audit failed immutable validation",
+        queue_item_id=queue_item_id,
+        rollover_rejection=reason,
+        zero_write_rejection=True,
+        **details,
+    )
+
+
+def _validated_existing_release_rollover_audits(
+    value: Any,
+    *,
+    expected: Mapping[str, Any],
+    queue_item_id: str,
+) -> list[dict[str, Any]]:
+    """Validate the closed persisted audit schema before idempotent reuse.
+
+    ``recorded_at`` is the sole field whose persisted value may differ from a
+    newly derived audit.  It remains required and non-empty, while every core
+    field and the core-derived rollover id are immutable.
+    """
+
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        _reject_release_rollover_audit(
+            "persisted_rollover_audit_list_malformed",
+            queue_item_id=queue_item_id,
+        )
+    expected_audit = dict(expected)
+    expected_core = {
+        field: expected_audit.get(field)
+        for field in _RELEASE_ROLLOVER_AUDIT_CORE_FIELDS
+    }
+    expected_id = str(expected_audit.get("rollover_id") or "")
+    validated: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    matching_expected_count = 0
+    for index, candidate in enumerate(value):
+        if not isinstance(candidate, Mapping):
+            _reject_release_rollover_audit(
+                "persisted_rollover_audit_entry_malformed",
+                queue_item_id=queue_item_id,
+                audit_index=index,
+            )
+        stored = dict(candidate)
+        if set(stored) != _RELEASE_ROLLOVER_AUDIT_FIELDS:
+            _reject_release_rollover_audit(
+                "persisted_rollover_audit_schema_drift",
+                queue_item_id=queue_item_id,
+                audit_index=index,
+                missing_fields=sorted(
+                    _RELEASE_ROLLOVER_AUDIT_FIELDS - set(stored)
+                ),
+                unexpected_fields=sorted(
+                    set(stored) - _RELEASE_ROLLOVER_AUDIT_FIELDS
+                ),
+            )
+        if not isinstance(stored["recorded_at"], str) or not stored[
+            "recorded_at"
+        ].strip():
+            _reject_release_rollover_audit(
+                "persisted_rollover_audit_recorded_at_invalid",
+                queue_item_id=queue_item_id,
+                audit_index=index,
+            )
+        stored_id = str(stored.get("rollover_id") or "")
+        if not stored_id or stored_id != _release_rollover_audit_id(stored):
+            _reject_release_rollover_audit(
+                "persisted_rollover_audit_id_mismatch",
+                queue_item_id=queue_item_id,
+                audit_index=index,
+            )
+        if stored_id in seen_ids:
+            _reject_release_rollover_audit(
+                "persisted_rollover_audit_duplicate_id",
+                queue_item_id=queue_item_id,
+                audit_index=index,
+            )
+        seen_ids.add(stored_id)
+        if (
+            any(
+                stored.get(field) != expected_audit.get(field)
+                for field in _RELEASE_ROLLOVER_AUDIT_STABLE_FIELDS
+            )
+            or stored.get("projection_repair_authority") is not True
+            or stored.get("copy_safe") is not True
+            or stored.get("raw_credentials_persisted") is not False
+            or not str(stored.get("new_operator_principal") or "").startswith(
+                _RELEASE_OBSERVER_SESSION_REF_PREFIX
+            )
+            or str(stored.get("new_operator_principal") or "")
+            == _RELEASE_OBSERVER_SESSION_REF_PREFIX
+            or not str(
+                stored.get("new_observer_route_token_ref") or ""
+            ).startswith(_RELEASE_OBSERVER_ROUTE_REF_PREFIX)
+            or str(stored.get("new_observer_route_token_ref") or "")
+            == _RELEASE_OBSERVER_ROUTE_REF_PREFIX
+        ):
+            _reject_release_rollover_audit(
+                "persisted_rollover_audit_core_invalid",
+                queue_item_id=queue_item_id,
+                audit_index=index,
+            )
+        if stored_id == expected_id:
+            matching_expected_count += 1
+            stored_core = {
+                field: stored.get(field)
+                for field in _RELEASE_ROLLOVER_AUDIT_CORE_FIELDS
+            }
+            if stored_core != expected_core:
+                _reject_release_rollover_audit(
+                    "persisted_rollover_audit_core_drift",
+                    queue_item_id=queue_item_id,
+                    audit_index=index,
+                )
+        validated.append(stored)
+    if matching_expected_count > 1:
+        _reject_release_rollover_audit(
+            "persisted_rollover_audit_duplicate_id",
+            queue_item_id=queue_item_id,
+        )
+    return validated
 
 
 def _release_replay_authority_ref_projection(
@@ -15692,10 +15884,8 @@ def _validated_release_replay_authority_rollover_audit(
             reject("server_rollover_proof_marker_mismatch", field=key)
 
     audit_core = {
-        "schema_version": (
-            "mf_batch_parallel.release_replay_authority_rollover.v1"
-        ),
-        "source": "server_validated_observer_session_route_token_ref",
+        "schema_version": _RELEASE_ROLLOVER_AUDIT_SCHEMA,
+        "source": _RELEASE_ROLLOVER_AUDIT_SOURCE,
         "immutable_release_event_ref": f"release-event:{event_id}",
         "old_operator_principal": event_operator_principal,
         "old_observer_route_token_ref": old_projection[
@@ -15712,16 +15902,9 @@ def _validated_release_replay_authority_rollover_audit(
         "copy_safe": True,
         "raw_credentials_persisted": False,
     }
-    rollover_hash = hashlib.sha256(
-        json.dumps(
-            audit_core,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
     return {
         **audit_core,
-        "rollover_id": f"release-rollover-{rollover_hash[:24]}",
+        "rollover_id": _release_rollover_audit_id(audit_core),
         "recorded_at": now_iso,
     }
 
