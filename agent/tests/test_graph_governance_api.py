@@ -126471,6 +126471,7 @@ def test_release_route_replay_rolls_authority_and_repairs_projection_once(
     [
         "raw_credentials_flag",
         "route_ref",
+        "route_ref_recomputed_id",
         "governing_scope",
         "authorized_action",
         "operator_principal",
@@ -126478,6 +126479,8 @@ def test_release_route_replay_rolls_authority_and_repairs_projection_once(
         "audit_core",
         "immutable_event_ref",
         "duplicate_id",
+        "extra_distinct_id",
+        "reordered_set",
         "malformed_list",
         "malformed_entry",
         "invalid_recorded_at",
@@ -126508,6 +126511,13 @@ def test_release_route_replay_rejects_tampered_persisted_rollover_audit(
         audit["new_observer_route_token_ref"] = (
             "observer-route-token-ref:tampered"
         )
+    elif tamper_mode == "route_ref_recomputed_id":
+        audit["new_observer_route_token_ref"] = (
+            "observer-route-token-ref:tampered-recomputed"
+        )
+        audit["rollover_id"] = (
+            parallel_branch_runtime._release_rollover_audit_id(audit)
+        )
     elif tamper_mode == "governing_scope":
         audit["governing_backlog_ref"] = "governing-backlog:tampered"
     elif tamper_mode == "authorized_action":
@@ -126522,12 +126532,29 @@ def test_release_route_replay_rejects_tampered_persisted_rollover_audit(
         audit["immutable_release_event_ref"] = "release-event:999999"
     elif tamper_mode == "duplicate_id":
         audits.append(dict(audit))
+    elif tamper_mode in {"extra_distinct_id", "reordered_set"}:
+        extra_audit = dict(audit)
+        extra_audit["new_observer_route_token_ref"] = (
+            "observer-route-token-ref:extra-distinct"
+        )
+        extra_audit["rollover_id"] = (
+            parallel_branch_runtime._release_rollover_audit_id(extra_audit)
+        )
+        if tamper_mode == "extra_distinct_id":
+            audits.append(extra_audit)
+        else:
+            binding_audit["replay_authority_rollovers"] = [
+                extra_audit,
+                dict(audit),
+            ]
     elif tamper_mode == "malformed_list":
         binding_audit["replay_authority_rollovers"] = {
             "not": "an-audit-list"
         }
     elif tamper_mode == "malformed_entry":
-        audits.append("not-an-audit-object")
+        binding_audit["replay_authority_rollovers"] = [
+            "not-an-audit-object"
+        ]
     elif tamper_mode == "invalid_recorded_at":
         audit["recorded_at"] = ""
     elif tamper_mode == "unexpected_field":
@@ -126571,9 +126598,15 @@ def test_release_route_replay_rejects_tampered_persisted_rollover_audit(
     )
     assert result["zero_write_rejection"] is True
     assert conn.total_changes == changes_before
-    assert get_integration_epoch(
+    after_epoch = get_integration_epoch(
         conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
-    ) == before_epoch
+    )
+    assert after_epoch == before_epoch
+    if tamper_mode == "route_ref_recomputed_id":
+        persisted_audits = after_epoch.incomplete_fanin[
+            "released_children"
+        ][0]["binding_audit"]["replay_authority_rollovers"]
+        assert len(persisted_audits) == 1
     assert get_branch_context(
         conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
     ) == before_context

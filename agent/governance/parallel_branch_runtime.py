@@ -15571,19 +15571,6 @@ _RELEASE_ROLLOVER_AUDIT_CORE_FIELDS = (
 _RELEASE_ROLLOVER_AUDIT_FIELDS = frozenset(
     (*_RELEASE_ROLLOVER_AUDIT_CORE_FIELDS, "rollover_id", "recorded_at")
 )
-_RELEASE_ROLLOVER_AUDIT_STABLE_FIELDS = (
-    "schema_version",
-    "source",
-    "immutable_release_event_ref",
-    "old_operator_principal",
-    "old_observer_route_token_ref",
-    "governing_backlog_ref",
-    "governing_task_ref",
-    "authorized_action_ref",
-    "projection_repair_authority",
-    "copy_safe",
-    "raw_credentials_persisted",
-)
 
 
 def _release_rollover_audit_id(audit: Mapping[str, Any]) -> str:
@@ -15627,7 +15614,9 @@ def _validated_existing_release_rollover_audits(
 
     ``recorded_at`` is the sole field whose persisted value may differ from a
     newly derived audit.  It remains required and non-empty, while every core
-    field and the core-derived rollover id are immutable.
+    field and the core-derived rollover id are immutable.  Without a separate
+    durable chain proof, the current binding may contain only zero audits or
+    the one exact audit derived for this replay.
     """
 
     if value is None:
@@ -15637,6 +15626,13 @@ def _validated_existing_release_rollover_audits(
             "persisted_rollover_audit_list_malformed",
             queue_item_id=queue_item_id,
         )
+    if len(value) > 1:
+        _reject_release_rollover_audit(
+            "persisted_rollover_audit_set_cardinality_mismatch",
+            queue_item_id=queue_item_id,
+            expected_count="zero_or_one_expected_audit",
+            actual_count=len(value),
+        )
     expected_audit = dict(expected)
     expected_core = {
         field: expected_audit.get(field)
@@ -15644,8 +15640,6 @@ def _validated_existing_release_rollover_audits(
     }
     expected_id = str(expected_audit.get("rollover_id") or "")
     validated: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    matching_expected_count = 0
     for index, candidate in enumerate(value):
         if not isinstance(candidate, Mapping):
             _reject_release_rollover_audit(
@@ -15681,55 +15675,17 @@ def _validated_existing_release_rollover_audits(
                 queue_item_id=queue_item_id,
                 audit_index=index,
             )
-        if stored_id in seen_ids:
+        stored_core = {
+            field: stored.get(field)
+            for field in _RELEASE_ROLLOVER_AUDIT_CORE_FIELDS
+        }
+        if stored_id != expected_id or stored_core != expected_core:
             _reject_release_rollover_audit(
-                "persisted_rollover_audit_duplicate_id",
+                "persisted_rollover_audit_set_identity_mismatch",
                 queue_item_id=queue_item_id,
                 audit_index=index,
             )
-        seen_ids.add(stored_id)
-        if (
-            any(
-                stored.get(field) != expected_audit.get(field)
-                for field in _RELEASE_ROLLOVER_AUDIT_STABLE_FIELDS
-            )
-            or stored.get("projection_repair_authority") is not True
-            or stored.get("copy_safe") is not True
-            or stored.get("raw_credentials_persisted") is not False
-            or not str(stored.get("new_operator_principal") or "").startswith(
-                _RELEASE_OBSERVER_SESSION_REF_PREFIX
-            )
-            or str(stored.get("new_operator_principal") or "")
-            == _RELEASE_OBSERVER_SESSION_REF_PREFIX
-            or not str(
-                stored.get("new_observer_route_token_ref") or ""
-            ).startswith(_RELEASE_OBSERVER_ROUTE_REF_PREFIX)
-            or str(stored.get("new_observer_route_token_ref") or "")
-            == _RELEASE_OBSERVER_ROUTE_REF_PREFIX
-        ):
-            _reject_release_rollover_audit(
-                "persisted_rollover_audit_core_invalid",
-                queue_item_id=queue_item_id,
-                audit_index=index,
-            )
-        if stored_id == expected_id:
-            matching_expected_count += 1
-            stored_core = {
-                field: stored.get(field)
-                for field in _RELEASE_ROLLOVER_AUDIT_CORE_FIELDS
-            }
-            if stored_core != expected_core:
-                _reject_release_rollover_audit(
-                    "persisted_rollover_audit_core_drift",
-                    queue_item_id=queue_item_id,
-                    audit_index=index,
-                )
         validated.append(stored)
-    if matching_expected_count > 1:
-        _reject_release_rollover_audit(
-            "persisted_rollover_audit_duplicate_id",
-            queue_item_id=queue_item_id,
-        )
     return validated
 
 
