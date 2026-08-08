@@ -125249,15 +125249,43 @@ def _explicit_epoch_release_events(conn) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+@pytest.mark.parametrize(
+    ("queue_status", "target_head_after_merge"),
+    [
+        ("planned", ""),
+        (STATE_MERGE_FAILED, _EXPLICIT_EPOCH_RELEASE_HEAD),
+    ],
+)
 def test_explicit_unlandable_child_release_records_incomplete_fanin_without_merge_credit(
     conn,
     monkeypatch,
+    queue_status,
+    target_head_after_merge,
 ):
     before = _explicit_epoch_release_fixture(
         conn,
         child_status="WAIVED",
-        queue_status="planned",
+        queue_status=queue_status,
     )
+    preflight_item = get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    )
+    assert preflight_item is not None
+    upsert_merge_queue_item(
+        conn,
+        replace(
+            preflight_item,
+            target_head_before_merge=_EXPLICIT_EPOCH_RELEASE_HEAD,
+            target_head_after_merge=target_head_after_merge,
+            merge_preview_id="preview-explicit-epoch-release",
+            snapshot_id="snapshot-explicit-epoch-release",
+            projection_id="projection-explicit-epoch-release-preflight",
+        ),
+    )
+    conn.commit()
     monkeypatch.setattr(
         server,
         "_require_graph_governance_operator",
@@ -125274,7 +125302,7 @@ def test_explicit_unlandable_child_release_records_incomplete_fanin_without_merg
         PID,
         _EXPLICIT_EPOCH_RELEASE_QUEUE,
         _EXPLICIT_EPOCH_RELEASE_ITEM,
-    ).status == "planned"
+    ).status == queue_status
     assert before.remaining_queue_item_ids == (_EXPLICIT_EPOCH_RELEASE_ITEM,)
 
     result = server.handle_integration_epoch_release_unlandable_child(
@@ -125488,6 +125516,75 @@ def test_explicit_unlandable_child_release_refuses_merge_in_doubt_zero_write(
         PID,
         _EXPLICIT_EPOCH_RELEASE_BATCH,
     ) == before
+    assert _explicit_epoch_release_events(conn) == []
+
+
+def test_explicit_unlandable_child_release_refuses_possible_landed_after_head_zero_write(
+    conn,
+    monkeypatch,
+):
+    before_epoch = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    item = get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    )
+    assert item is not None
+    before_item = upsert_merge_queue_item(
+        conn,
+        replace(
+            item,
+            target_head_after_merge="d" * 40,
+            merge_commit="",
+        ),
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {
+            "role": "observer",
+            "principal_id": "release-operator",
+        },
+    )
+
+    status, result = server.handle_integration_epoch_release_unlandable_child(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            "observer",
+            method="POST",
+            body=_explicit_epoch_release_body(),
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == "integration_epoch_release_child_may_have_landed"
+    assert result["zero_write_rejection"] is True
+    assert result["possible_landed_evidence"]["reasons"] == [
+        "target_head_after_merge"
+    ]
+    assert result["possible_landed_evidence"][
+        "confirmed_failed_without_target_mutation"
+    ] is False
+    assert get_integration_epoch(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_BATCH,
+    ) == before_epoch
+    assert get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    ) == before_item
     assert _explicit_epoch_release_events(conn) == []
 
 

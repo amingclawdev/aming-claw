@@ -15170,6 +15170,48 @@ def advance_integration_epoch_after_merge(
     )
 
 
+def _merge_queue_item_possible_landed_evidence(
+    item: MergeQueueItem,
+) -> dict[str, Any]:
+    """Project durable evidence that makes an unlandable release unsafe.
+
+    Preview, snapshot, projection, validation-head, and before-head fields are
+    pre-mutation evidence.  An after-head is different: unless a failed merge
+    durably proves the target stayed at the exact before-head, it may describe
+    a target mutation whose merge commit result was never recorded.
+    """
+
+    status = str(item.status or "").strip()
+    merge_commit = str(item.merge_commit or "").strip()
+    before = str(item.target_head_before_merge or "").strip()
+    after = str(item.target_head_after_merge or "").strip()
+    confirmed_failed_without_target_mutation = bool(
+        status == STATE_MERGE_FAILED
+        and before
+        and after
+        and before == after
+        and not merge_commit
+    )
+    reasons = []
+    if status in {STATE_MERGED, STATE_MERGING}:
+        reasons.append("merge_state")
+    if merge_commit:
+        reasons.append("merge_commit")
+    if after and not confirmed_failed_without_target_mutation:
+        reasons.append("target_head_after_merge")
+    return {
+        "possible_landed": bool(reasons),
+        "reasons": reasons,
+        "observed_status": status,
+        "merge_commit": merge_commit,
+        "target_head_before_merge": before,
+        "target_head_after_merge": after,
+        "confirmed_failed_without_target_mutation": (
+            confirmed_failed_without_target_mutation
+        ),
+    }
+
+
 def release_integration_epoch_unlandable_child(
     conn: sqlite3.Connection,
     *,
@@ -15341,13 +15383,16 @@ def release_integration_epoch_unlandable_child(
             expected_child_backlog_id=item.backlog_id,
             actual_child_backlog_id=child_backlog,
         )
-    if item.status in {STATE_MERGED, STATE_MERGING} or item.merge_commit:
+    possible_landed = _merge_queue_item_possible_landed_evidence(item)
+    if possible_landed["possible_landed"]:
         raise IntegrationEpochUnlandableChildReleaseError(
             "integration_epoch_release_child_may_have_landed",
-            "a merged or merging child cannot be released as unlandable",
+            (
+                "a child with durable actual or possible target mutation "
+                "evidence cannot be released as unlandable"
+            ),
             queue_item_id=item_id,
-            observed_status=item.status,
-            merge_commit=item.merge_commit,
+            possible_landed_evidence=possible_landed,
         )
 
     backlog_rows = conn.execute(
