@@ -23180,6 +23180,14 @@ def test_worker_results_deadlock_invalid_guide_and_stored_bypass_remain_terminal
             "reason": "preserve terminal no-PASS audit without resurrection",
             "decision": "continue_with_audited_exception",
             "evidence_refs": ["timeline:historical-worker-commit-waiver"],
+            "continuation_authority": {
+                "runtime_context_id": (
+                    case.runtime_context.runtime_context_id
+                ),
+                "task_id": case.runtime_context.task_id,
+                "parent_task_id": case.backlog_id,
+                "commit_sha": case.implementation_commit,
+            },
         },
         actor_role="observer",
     )
@@ -23202,6 +23210,199 @@ def test_worker_results_deadlock_invalid_guide_and_stored_bypass_remain_terminal
     assert bypassed_projection["contract_runtime_next_legal_action"].get(
         "line_id"
     ) != "worker_commit"
+    active_bypassed_current = (
+        server.handle_project_contract_runtime_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": (
+                        case.successor["contract_execution_id"]
+                    ),
+                },
+                "observer",
+            )
+        )
+    )
+    assert active_bypassed_current["contract_runtime_current_state"].get(
+        "terminal"
+    ) is not True
+    assert active_bypassed_current["next_legal_action"]["line_id"] == (
+        "worker_finish_time_attestation"
+    )
+
+    immutable_terminal_source = case.runtime.store.get(
+        case.successor["contract_execution_id"]
+    )
+    conn.execute(
+        """
+        UPDATE parallel_branch_runtime_contexts
+        SET status = 'released_unlandable',
+            last_recovery_action = 'released_unlandable',
+            updated_at = '2026-08-08T09:01:23Z'
+        WHERE project_id = ?
+          AND runtime_context_id = ?
+        """,
+        (PID, case.runtime_context.runtime_context_id),
+    )
+    conn.commit()
+    terminal_current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": (
+                    case.successor["contract_execution_id"]
+                ),
+            },
+            "observer",
+        )
+    )
+    assert terminal_current["next_legal_action"] == {}
+    assert terminal_current["contract_runtime_current_state"]["terminal"] is True
+    assert terminal_current["contract_runtime_current_state"][
+        "terminal_disposition"
+    ]["bypass_audit_valid"] is True
+    assert terminal_current["contract_runtime_current_state"][
+        "readiness_state"
+    ] == "completed_with_exception"
+    assert terminal_current["runtime_context"]["status"] == (
+        "released_unlandable"
+    )
+    terminal_projection = server._contract_runtime_mf_parallel_context_projection(
+        conn,
+        project_id=PID,
+        record=immutable_terminal_source,
+        actor_role="observer",
+    )
+    tampered_bypass_record = copy.deepcopy(immutable_terminal_source)
+    tampered_bypass_record["completed_lines"][-1]["payload"][
+        "source_backlog_id"
+    ] = "AC-UNRELATED-BACKLOG"
+    blocked_terminal = (
+        server._contract_runtime_apply_terminal_context_audit_only_projection(
+            tampered_bypass_record,
+            projection=terminal_projection,
+        )
+    )
+    blocked_terminal_guide = blocked_terminal["runtime_guide"]
+    assert blocked_terminal_guide["next_legal_action"] is None
+    assert blocked_terminal_guide["terminal_disposition"][
+        "bypass_audit_valid"
+    ] is False
+    assert blocked_terminal_guide["readiness_state"] == (
+        "blocked_terminal_context_audit_identity"
+    )
+    terminal_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": (
+                        case.runtime_context.runtime_context_id
+                    ),
+                },
+                "observer",
+            )
+        )
+    )
+    assert terminal_guide["next_legal_action"] == "no_runtime_action"
+    assert terminal_guide["next_required_evidence"] == []
+    assert terminal_guide["missing_evidence"] == []
+    assert terminal_guide["runtime_context"]["status"] == (
+        "released_unlandable"
+    )
+    assert terminal_guide["runtime_context"]["terminal"] is True
+    assert terminal_guide["contract_worker_commit_required"] is False
+    assert terminal_guide["contract_runtime_next_legal_action"] == {}
+    assert terminal_guide["worker_guide"]["recovery_actions"] == [
+        {
+            "id": "refresh_current_state",
+            "action": "read_current_state",
+            "status": "read_only",
+        }
+    ]
+    assert "worker_commit_facade_payload_skeleton" not in terminal_guide
+    assert terminal_guide[
+        "implementation_evidence_facade_payload_skeleton"
+    ] == {}
+    terminal_chain_current = server._contract_chain_current_projection(
+        conn,
+        project_id=PID,
+        backlog_id=case.backlog_id,
+        rebuild_if_missing=False,
+    )
+    assert terminal_chain_current, "fixture must expose source-backed chain current"
+    assert terminal_chain_current.get("terminal") is True, {
+        key: terminal_chain_current.get(key)
+        for key in (
+            "terminal",
+            "scheduler_eligible",
+            "readiness_state",
+            "next_legal_action",
+            "current_contract_execution_id",
+            "source",
+        )
+    }
+    chain_root = case.runtime.store.get(
+        case.successor["root_contract_execution_id"]
+    )
+    monkeypatch.setattr(
+        server,
+        "_onboard_service_materialize_parent_record",
+        lambda *_args, **_kwargs: copy.deepcopy(chain_root),
+    )
+    onboard_terminal = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": case.backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "response_view": "compact",
+            },
+        )
+    )
+    assert onboard_terminal["next_legal_action"]["action"] == (
+        "no_runtime_action"
+    )
+    assert case.runtime.store.get(
+        case.successor["contract_execution_id"]
+    ) == immutable_terminal_source
+
+
+def test_terminal_runtime_context_projection_does_not_terminalize_sibling_execution():
+    record = {
+        "runtime_guide": {
+            "next_legal_action": {
+                "line_id": "worker_finish_time_attestation",
+            }
+        },
+        "completed_lines": [],
+    }
+    terminal = {
+        "runtime_context_id": "mfrctx-terminal-sibling",
+        "task_id": "worker-terminal-sibling",
+        "runtime_context_status": "released_unlandable",
+        "last_recovery_action": "released_unlandable",
+    }
+    projection = {
+        "expected_context_summaries": [
+            terminal,
+            {
+                "runtime_context_id": "mfrctx-active-sibling",
+                "task_id": "worker-active-sibling",
+                "runtime_context_status": "running",
+            },
+        ],
+        "terminal_audit_only_contexts": [terminal],
+    }
+
+    projected = server._contract_runtime_apply_terminal_context_audit_only_projection(
+        record,
+        projection=projection,
+    )
+
+    assert projected == record
 
 
 def test_worker_results_deadlock_first_correction_auth_rotation_and_rollback(

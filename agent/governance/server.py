@@ -19197,6 +19197,12 @@ def _runtime_context_projection_response(
         "profile_requirements": profile_requirements,
         "retry_policy": retry_policy,
         "runtime_context_id": runtime_context_id,
+        "runtime_context_status": str(
+            getattr(context, "status", "") or ""
+        ).strip(),
+        "runtime_context_last_recovery_action": str(
+            getattr(context, "last_recovery_action", "") or ""
+        ).strip(),
         "task_id": getattr(context, "task_id", ""),
         "role_scope": role_scope,
         "view": view_name,
@@ -19423,6 +19429,20 @@ def _runtime_context_projection_response(
             )
         )
     except ContractRuntimeError:
+        contract_worker_commit_required = False
+    contract_runtime_terminal_audit_only = bool(
+        str(getattr(context, "status", "") or "").strip()
+        == "released_unlandable"
+        and (
+            response.get("contract_runtime_current_state")
+            if isinstance(
+                response.get("contract_runtime_current_state"), Mapping
+            )
+            else {}
+        ).get("terminal")
+        is True
+    )
+    if contract_runtime_terminal_audit_only:
         contract_worker_commit_required = False
     if contract_worker_commit_required:
         for container in (
@@ -23260,13 +23280,36 @@ def _runtime_context_worker_guide_response(
     authoritative_merge_queue_id = str(
         runtime_context_current_values.get("merge_queue_id") or ""
     ).strip()
+    durable_runtime_context_status = str(
+        current_state_response.get("runtime_context_status")
+        or runtime_context_current_values.get("status")
+        or current_view.get("status")
+        or worker_view_current_source.get("status")
+        or worker_task_current_source.get("status")
+        or ""
+    ).strip()
+    durable_last_recovery_action = str(
+        current_state_response.get("runtime_context_last_recovery_action")
+        or runtime_context_current_values.get("last_recovery_action")
+        or ""
+    ).strip()
+    terminal_audit_only = (
+        durable_runtime_context_status == "released_unlandable"
+    )
     runtime_context_projection = {
         "schema_version": "runtime_context.authoritative_current_values.v1",
         "status": (
-            "ready"
-            if authoritative_merge_queue_id
-            else "blocked_missing_authoritative_merge_queue_id"
+            "released_unlandable"
+            if terminal_audit_only
+            else (
+                "ready"
+                if authoritative_merge_queue_id
+                else "blocked_missing_authoritative_merge_queue_id"
+            )
         ),
+        "terminal": terminal_audit_only,
+        "actionable": not terminal_audit_only,
+        "last_recovery_action": durable_last_recovery_action,
         "source": "parallel_branch_runtime_contexts",
         "source_of_authority": "RuntimeContext.current_values",
         "current_values": {
@@ -23281,6 +23324,8 @@ def _runtime_context_worker_guide_response(
                 "base_commit",
                 "target_head_commit",
                 "merge_queue_id",
+                "status",
+                "last_recovery_action",
             )
         },
         "required_worker_startup_field": (
@@ -23319,7 +23364,7 @@ def _runtime_context_worker_guide_response(
     task = dict(worker_view.get("task") or {})
     contract_worker_commit_required = bool(
         current_state_response.get("contract_worker_commit_required")
-    )
+    ) and not terminal_audit_only
     route_identity = dict(worker_view.get("route_identity") or {})
     source_refs = (
         current_state_response.get("source_refs")
@@ -25453,6 +25498,115 @@ def _runtime_context_worker_guide_response(
             "worker_evidence_substitution_allowed": False,
         },
     }
+    if terminal_audit_only:
+        terminal_disposition = (
+            dict(contract_runtime_current_state.get("terminal_disposition") or {})
+            if isinstance(
+                contract_runtime_current_state.get("terminal_disposition"),
+                Mapping,
+            )
+            else {}
+        )
+        terminal_action = "no_runtime_action"
+        terminal_policy = {
+            "schema_version": (
+                "runtime_context.terminal_audit_only_write_policy.v1"
+            ),
+            "status": "terminal",
+            "reason": "released_unlandable",
+            "worker_mutations_allowed": False,
+            "historical_source_rewrite_allowed": False,
+            "correction_allowed": False,
+            "finish_evidence_allowed": False,
+            "authoritative_pass_synthesized": False,
+            "no_pass_claim": True,
+        }
+        terminal_actions = {
+            "schema_version": (
+                "runtime_context.terminal_audit_only_actions.v1"
+            ),
+            "status": "terminal",
+            "next_legal_action": terminal_action,
+            "action_input": {},
+            "write_authorization_policy": terminal_policy,
+        }
+        terminal_row_head = {
+            **dict(row_scoped_finish_head_projection),
+            "status": "terminal_audit_only",
+            "next_legal_action": terminal_action,
+            "finish_gate_allowed_against_current_branch_head": False,
+            "worker_commit_must_record_current_branch_head": False,
+        }
+        terminal_executable = {
+            "schema_version": (
+                "runtime_context.terminal_audit_only_executable_contract.v1"
+            ),
+            "status": "terminal",
+            "effective_next_legal_action": terminal_action,
+            "action_input": {},
+            "write_authorization_policy": terminal_policy,
+            "terminal_disposition": terminal_disposition,
+        }
+        response.update(
+            {
+                "runtime_context": runtime_context_projection,
+                "contract_worker_commit_required": False,
+                "contract_runtime_next_legal_action": {},
+                "contract_runtime_next_action_took_precedence": True,
+                "next_legal_action": terminal_action,
+                "next_legal_action_decision_source": (
+                    "runtime_context_terminal_audit_only"
+                ),
+                "next_required_evidence": [],
+                "missing_evidence": [],
+                "blocking_reasons": [],
+                "row_scoped_finish_head_projection": terminal_row_head,
+                "executable_contract": terminal_executable,
+                "actionable_payloads": terminal_actions,
+                "write_authorization_policy": terminal_policy,
+                "read_receipt_facade_payload_skeleton": {},
+                "startup_facade_payload_skeleton": {},
+                "implementation_evidence_facade_payload_skeleton": {},
+                "scope_insufficiency_request_facade_payload_skeleton": {},
+                "finish_time_transcript_readiness": {},
+            }
+        )
+        response.pop("worker_commit_facade_payload_skeleton", None)
+        nested_guide = (
+            response.get("worker_guide")
+            if isinstance(response.get("worker_guide"), dict)
+            else {}
+        )
+        nested_guide.update(
+            {
+                "runtime_context": runtime_context_projection,
+                "contract_worker_commit_required": False,
+                "contract_runtime_next_legal_action": {},
+                "next_legal_action": terminal_action,
+                "next_legal_action_decision_source": (
+                    "runtime_context_terminal_audit_only"
+                ),
+                "next_required_evidence": [],
+                "missing_evidence": [],
+                "blocking_reasons": [],
+                "row_scoped_finish_head_projection": terminal_row_head,
+                "executable_contract": terminal_executable,
+                "actionable_payloads": terminal_actions,
+                "write_authorization_policy": terminal_policy,
+                "read_receipt_facade_payload_skeleton": {},
+                "startup_facade_payload_skeleton": {},
+                "implementation_evidence_facade_payload_skeleton": {},
+                "scope_insufficiency_request_facade_payload_skeleton": {},
+                "finish_time_transcript_readiness": {},
+                "recovery_actions": [
+                    {
+                        "id": "refresh_current_state",
+                        "action": "read_current_state",
+                        "status": "read_only",
+                    }
+                ],
+            }
+        )
     if contract_worker_commit_required:
         response["worker_commit_facade_payload_skeleton"] = (
             actionable_payloads.get("worker_commit_facade_payload_skeleton", {})
@@ -78827,6 +78981,11 @@ def _contract_runtime_authoritative_runtime_context_projection(
 
     runtime_context_id, context = next(iter(contexts.items()))
     merge_queue_id = str(getattr(context, "merge_queue_id", "") or "").strip()
+    durable_status = str(getattr(context, "status", "") or "").strip()
+    last_recovery_action = str(
+        getattr(context, "last_recovery_action", "") or ""
+    ).strip()
+    terminal_audit_only = durable_status == "released_unlandable"
     current_values = {
         "runtime_context_id": runtime_context_id,
         "task_id": str(getattr(context, "task_id", "") or "").strip(),
@@ -78843,14 +79002,22 @@ def _contract_runtime_authoritative_runtime_context_projection(
             getattr(context, "target_head_commit", "") or ""
         ).strip(),
         "merge_queue_id": merge_queue_id,
+        "status": durable_status,
+        "last_recovery_action": last_recovery_action,
     }
     return {
         "schema_version": "runtime_context.authoritative_current_values.v1",
         "status": (
-            "ready"
-            if merge_queue_id
-            else "blocked_missing_authoritative_merge_queue_id"
+            "released_unlandable"
+            if terminal_audit_only
+            else (
+                "ready"
+                if merge_queue_id
+                else "blocked_missing_authoritative_merge_queue_id"
+            )
         ),
+        "terminal": terminal_audit_only,
+        "actionable": not terminal_audit_only,
         "source": "parallel_branch_runtime_contexts",
         "source_of_authority": "RuntimeContext.current_values",
         "current_values": current_values,
@@ -80528,6 +80695,39 @@ def _contract_chain_current_with_terminal_bypass_fallback(
     return current
 
 
+def _contract_chain_apply_terminal_current_state(
+    current_projection: Mapping[str, Any],
+    *,
+    current_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Carry one authoritative terminal ContractRuntime state into chain reads."""
+
+    current = dict(current_projection or {})
+    if current_state.get("terminal") is not True:
+        return current
+    for field in (
+        "row_status",
+        "source_row_status",
+        "disposition",
+        "terminal",
+        "scheduler_eligible",
+        "schedulable",
+        "current_eligible",
+        "close_eligible",
+        "closeable",
+        "resume_eligible",
+        "resumable",
+    ):
+        if field in current_state:
+            current[field] = current_state[field]
+    terminal_disposition = current_state.get("terminal_disposition")
+    if isinstance(terminal_disposition, Mapping):
+        current["terminal_disposition"] = dict(terminal_disposition)
+    current["active_child_contract_execution_id"] = ""
+    current.pop("parent_to_resume_contract_execution_id", None)
+    return current
+
+
 def _contract_chain_current_with_runtime_freshness(
     conn,
     current_projection: Mapping[str, Any],
@@ -80588,6 +80788,9 @@ def _contract_chain_current_with_runtime_freshness(
         if isinstance(projected_record.get("runtime_guide"), Mapping)
         else {}
     )
+    projected_record = dict(projected_record)
+    projected_record["runtime_guide"] = guide
+    current_state = _runtime_current_state_from_record(projected_record)
     fresh_next_action = _runtime_next_action_from_guide(
         guide,
         source="backlog_contract_chain_current",
@@ -80601,7 +80804,19 @@ def _contract_chain_current_with_runtime_freshness(
     next_action_changed = _contract_chain_next_action_freshness_key(
         previous_next_action
     ) != _contract_chain_next_action_freshness_key(fresh_next_action)
-    if not next_action_changed and not readiness_changed:
+    terminal_projection_changed = bool(
+        current_state.get("terminal") is True
+        and (
+            current.get("terminal") is not True
+            or dict(current.get("terminal_disposition") or {})
+            != dict(current_state.get("terminal_disposition") or {})
+        )
+    )
+    if (
+        not next_action_changed
+        and not readiness_changed
+        and not terminal_projection_changed
+    ):
         return current
 
     if fresh_next_action:
@@ -80615,9 +80830,6 @@ def _contract_chain_current_with_runtime_freshness(
             "authority_decision_source", "contract_runtime_current_state"
         )
 
-    projected_record = dict(projected_record)
-    projected_record["runtime_guide"] = guide
-    current_state = _runtime_current_state_from_record(projected_record)
     current_state["next_legal_action"] = dict(fresh_next_action)
     if fresh_readiness_state:
         current_state["readiness_state"] = fresh_readiness_state
@@ -80661,6 +80873,10 @@ def _contract_chain_current_with_runtime_freshness(
             "runtime_context_projection"
         ] = runtime_context_projection
     overlay["contract_runtime_current_state"] = current_state
+    overlay = _contract_chain_apply_terminal_current_state(
+        overlay,
+        current_state=current_state,
+    )
     source_ref = (
         f"contract_runtime:{current_execution_id}:revision:"
         f"{int(current_state.get('execution_state_revision') or 0)}"
@@ -80763,6 +80979,7 @@ def _contract_chain_current_with_unique_active_mf_parallel(
         _runtime_readiness_state_from_guide(guide) or "contract_active"
     )
     current_state = _runtime_current_state_from_record(projected_record)
+    terminal_audit_only = current_state.get("terminal") is True
     revision = int(current_state.get("execution_state_revision") or 0)
     chain_records = [
         record
@@ -80785,7 +81002,9 @@ def _contract_chain_current_with_unique_active_mf_parallel(
             "current_contract_execution_id": candidate_id,
             "current_contract_id": str(candidate.get("contract_id") or ""),
             "parent_to_resume_contract_execution_id": "",
-            "active_child_contract_execution_id": candidate_id,
+            "active_child_contract_execution_id": (
+                "" if terminal_audit_only else candidate_id
+            ),
             "readiness_state": readiness_state,
             "generation": revision,
             "active_chain": {
@@ -80816,8 +81035,14 @@ def _contract_chain_current_with_unique_active_mf_parallel(
         overlay["projection_selection_correction"][
             "runtime_context_projection"
         ] = runtime_context_projection
-    overlay.pop("terminal", None)
-    overlay.pop("terminal_disposition", None)
+    if terminal_audit_only:
+        overlay = _contract_chain_apply_terminal_current_state(
+            overlay,
+            current_state=current_state,
+        )
+    else:
+        overlay.pop("terminal", None)
+        overlay.pop("terminal_disposition", None)
     source_ref = f"contract_runtime:{candidate_id}:revision:{revision}"
     source_refs = list(overlay.get("source_refs") or [])
     if source_ref not in source_refs:
@@ -82893,6 +83118,10 @@ def _contract_runtime_apply_mf_parallel_context_projection(
             guide["same_lane_worker_commit_recovery"] = dict(recovery)
             guide["same_lane_worker_commit_recovery_projection"] = True
             projected["runtime_guide"] = guide
+    projected = _contract_runtime_apply_terminal_context_audit_only_projection(
+        projected,
+        projection=projection,
+    )
     return projected, projection
 
 
@@ -83049,6 +83278,12 @@ def _contract_runtime_mf_parallel_context_projection(
         expected_context_summaries=expected_context_summaries,
         existing_keys=existing_keys,
     )
+    terminal_audit_only_contexts = [
+        dict(item)
+        for item in expected_context_summaries
+        if str(item.get("runtime_context_status") or "").strip()
+        == "released_unlandable"
+    ]
     failed_qa_rejoin_contexts = [
         {
             "runtime_context_id": str(item.get("runtime_context_id") or ""),
@@ -83088,6 +83323,7 @@ def _contract_runtime_mf_parallel_context_projection(
         and not same_lane_recoveries
         and not persisted_revision_resets
         and not authoritative_qa_superseded_indices
+        and not terminal_audit_only_contexts
     ):
         return {}
     superseded_line_indices = {
@@ -83151,6 +83387,14 @@ def _contract_runtime_mf_parallel_context_projection(
             "observer_authored_worker_backfill": False,
         },
     }
+    if terminal_audit_only_contexts:
+        projection["expected_context_summaries"] = (
+            expected_context_summaries
+        )
+        projection["terminal_audit_only_contexts"] = (
+            terminal_audit_only_contexts
+        )
+        projection["status"] = "terminal_audit_only"
     if failed_qa_rejoin_contexts:
         projection["failed_qa_revision_rejoin_contexts"] = (
             failed_qa_rejoin_contexts
@@ -83867,6 +84111,12 @@ def _contract_runtime_projection_context_summary(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "runtime_context_status": str(
+            getattr(context, "status", "") or ""
+        ).strip(),
+        "last_recovery_action": str(
+            getattr(context, "last_recovery_action", "") or ""
+        ).strip(),
         "projected_line_count": len(line_ids),
         "worker_projected_line_count": len(worker_line_ids),
         "projected_line_ids": line_ids,
@@ -83886,6 +84136,170 @@ def _contract_runtime_projection_context_summary(
             else {}
         ),
     }
+
+
+def _contract_runtime_apply_terminal_context_audit_only_projection(
+    record: Mapping[str, Any],
+    *,
+    projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Stop read-side resurrection after an explicit unlandable release.
+
+    The ContractRuntime history remains immutable.  This overlay is admitted
+    only for one exact dispatched RuntimeContext; a terminal sibling must not
+    terminate a multi-context execution.
+    """
+
+    expected_contexts = [
+        dict(item)
+        for item in projection.get("expected_context_summaries") or []
+        if isinstance(item, Mapping)
+    ]
+    terminal_contexts = [
+        dict(item)
+        for item in projection.get("terminal_audit_only_contexts") or []
+        if isinstance(item, Mapping)
+    ]
+    if len(expected_contexts) != 1 or len(terminal_contexts) != 1:
+        return dict(record)
+    terminal_context = terminal_contexts[0]
+    runtime_context_id = str(
+        terminal_context.get("runtime_context_id") or ""
+    ).strip()
+    task_id = str(terminal_context.get("task_id") or "").strip()
+    if not runtime_context_id or not task_id:
+        return dict(record)
+
+    matching_bypasses: list[tuple[int, Mapping[str, Any]]] = []
+    for index, line in enumerate(record.get("completed_lines") or []):
+        if not isinstance(line, Mapping):
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        context_keys = _contract_runtime_line_context_keys(line)
+        line_instance_id = str(
+            line.get("line_instance_id")
+            or payload.get("line_instance_id")
+            or ""
+        ).strip()
+        runtime_context_matches = bool(
+            ("runtime_context_id", runtime_context_id) in context_keys
+            or line_instance_id == f"runtime_context:{runtime_context_id}"
+        )
+        task_context_keys = {
+            value for kind, value in context_keys if kind == "task_id"
+        }
+        task_matches = bool(
+            task_context_keys == {task_id}
+            or (
+                not task_context_keys
+                and line_instance_id == f"runtime_context:{runtime_context_id}"
+            )
+        )
+        try:
+            bypass_revision = int(
+                payload.get("execution_state_revision") or 0
+            )
+        except (TypeError, ValueError):
+            bypass_revision = 0
+        if (
+            str(line.get("line_id") or "").strip() == "worker_commit"
+            and str(line.get("actor_role") or "").strip()
+            in {"observer", "qa"}
+            and str(line.get("evidence_kind") or "").strip()
+            == "contract_line_bypass"
+            and str(line.get("status") or "").strip().lower() == "waived"
+            and str(line.get("disposition") or "").strip()
+            == "proceeded_with_exception"
+            and line.get("no_pass_claim") is True
+            and str(payload.get("schema_version") or "").strip()
+            == "contract_line_bypass.v1"
+            and str(payload.get("disposition") or "").strip()
+            == "proceeded_with_exception"
+            and payload.get("no_pass_claim") is True
+            and str(payload.get("source_backlog_id") or "").strip()
+            == str(record.get("backlog_id") or "").strip()
+            and str(payload.get("bypass_identity") or "").strip()
+            and str(payload.get("diagnostic_backlog_id") or "").strip()
+            and str(payload.get("classification") or "").strip()
+            and str(payload.get("decision") or "").strip()
+            and bypass_revision > 0
+            and runtime_context_matches
+            and task_matches
+        ):
+            matching_bypasses.append((index, line))
+
+    bypass_valid = len(matching_bypasses) == 1
+    bypass_index = matching_bypasses[0][0] if bypass_valid else -1
+    terminal = {
+        "schema_version": (
+            "contract_runtime.released_unlandable_terminal_audit_only.v1"
+        ),
+        "status": "released_unlandable",
+        "row_status": "WAIVED" if bypass_valid else "BLOCKED",
+        "source_row_status": "WAIVED" if bypass_valid else "BLOCKED",
+        "readiness_state": (
+            "completed_with_exception"
+            if bypass_valid
+            else "blocked_terminal_context_audit_identity"
+        ),
+        "disposition": (
+            "completed_with_exception"
+            if bypass_valid
+            else "blocked_terminal_context_audit_identity"
+        ),
+        "terminal": True,
+        "scheduler_eligible": False,
+        "schedulable": False,
+        "current_eligible": False,
+        "close_eligible": False,
+        "closeable": False,
+        "resume_eligible": False,
+        "resumable": False,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "runtime_context_status": "released_unlandable",
+        "last_recovery_action": str(
+            terminal_context.get("last_recovery_action") or ""
+        ).strip(),
+        "bypass_completed_line_index": bypass_index,
+        "bypass_audit_valid": bypass_valid,
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+        "historical_source_rewrite_allowed": False,
+        "correction_allowed": False,
+        "worker_mutations_allowed": False,
+        "next_legal_action": {},
+        "source_of_authority": (
+            "parallel_branch_runtime_contexts"
+            "+ContractRuntime.completed_lines.contract_line_bypass"
+        ),
+    }
+    guide = (
+        dict(record.get("runtime_guide") or {})
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    guide["next_legal_action"] = None
+    guide["readiness_state"] = terminal["readiness_state"]
+    guide["disposition"] = terminal["disposition"]
+    guide["terminal_disposition"] = terminal
+    guide["runtime_context_terminal_audit_only"] = terminal
+    guide.pop("writer_role_safe_copy_payload", None)
+    guide["runtime_guide_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in guide.items()
+            if key != "runtime_guide_hash"
+        }
+    )
+    projected = dict(record)
+    projected["runtime_guide"] = guide
+    projected["runtime_context_terminal_audit_only"] = terminal
+    return projected
 
 
 def _contract_runtime_mf_parallel_dispatch_identity_mismatch(
@@ -109137,10 +109551,19 @@ def _onboard_route_guide_service_response(
     )
     if runtime_resume:
         resume_next = runtime_resume.get("next_legal_action")
-        if (
-            runtime_resume.get("terminal") is True
-            or runtime_resume.get("scheduler_eligible") is False
-        ):
+        if runtime_resume.get("terminal") is True:
+            next_action = _onboard_route_guide_completed_next_action(
+                role=role,
+                work_type=work_type,
+                runtime_resume=runtime_resume,
+                backlog_row_status=backlog_row_status,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                route_token_ref=route_token_ref,
+                target_files=target_files,
+                request_body=batch_action_request_body,
+            )
+        elif runtime_resume.get("scheduler_eligible") is False:
             next_action = {}
         elif isinstance(resume_next, Mapping) and resume_next:
             next_action = dict(resume_next)
