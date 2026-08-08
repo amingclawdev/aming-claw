@@ -125290,6 +125290,22 @@ def _explicit_epoch_release_events(conn) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def _explicit_epoch_release_rollover_ledger_rows(conn) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT *
+        FROM parallel_branch_integration_epoch_release_rollovers
+        WHERE project_id = ? AND batch_id = ? AND queue_item_id = ?
+        ORDER BY sequence
+        """,
+        (
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_BATCH,
+            _EXPLICIT_EPOCH_RELEASE_ITEM,
+        ),
+    ).fetchall()
+
+
 def _explicit_epoch_release_route_proof(
     conn,
     *,
@@ -126438,7 +126454,31 @@ def test_release_route_replay_rolls_authority_and_repairs_projection_once(
     assert rollover["new_observer_route_token_ref"] == (
         "observer-route-token-ref:rtok-9d-live-shaped"
     )
+    assert rollover["schema_version"] == (
+        "mf_batch_parallel.release_replay_authority_rollover.v2"
+    )
+    assert rollover["source"] == "canonical_release_rollover_ledger"
+    assert rollover["immutable_release_event_ref"] == (
+        f"release-event:{immutable_event['id']}"
+    )
+    assert rollover["sequence"] == 1
+    assert rollover["previous_rollover_id"] == ""
+    for anchor_field in (
+        "old_session_registry_anchor_hash",
+        "old_route_registry_anchor_hash",
+        "new_session_registry_anchor_hash",
+        "new_route_registry_anchor_hash",
+    ):
+        assert rollover[anchor_field].startswith("sha256:")
     assert rollover["raw_credentials_persisted"] is False
+    ledger_rows = _explicit_epoch_release_rollover_ledger_rows(conn)
+    assert len(ledger_rows) == 1
+    ledger_row = dict(ledger_rows[0])
+    assert ledger_row["release_event_id"] == immutable_event["id"]
+    assert ledger_row["sequence"] == 1
+    assert ledger_row["previous_rollover_id"] == ""
+    assert ledger_row["rollover_id"] == rollover["rollover_id"]
+    assert json.loads(ledger_row["audit_json"]) == rollover
 
     changes_before_replay = conn.total_changes
     replay = route_handler(
@@ -126464,6 +126504,197 @@ def test_release_route_replay_rolls_authority_and_repairs_projection_once(
         replay_epoch.incomplete_fanin["released_children"][0]["binding_audit"]
         ["replay_authority_rollovers"]
     ) == 1
+
+
+def test_release_route_replay_appends_fresh2_fresh3_canonical_chain(conn):
+    route_handler, fresh1_body = (
+        _establish_explicit_epoch_release_authority_rollover(
+            conn,
+            suffix="fresh-chain-1",
+        )
+    )
+    immutable_event = dict(_explicit_epoch_release_events(conn)[0])
+    fresh1_ref = fresh1_body["observer_route_token_ref"]
+    conn.execute(
+        "UPDATE observer_route_token_refs "
+        "SET status = 'superseded', expires_at = '2020-01-01T00:00:00Z' "
+        "WHERE project_id = ? AND route_token_ref = ?",
+        (PID, fresh1_ref),
+    )
+    conn.execute(
+        "UPDATE observer_sessions "
+        "SET status = 'revoked', revoked_at = '2020-01-01T00:00:00Z' "
+        "WHERE project_id = ? AND session_id = ?",
+        (PID, fresh1_body["observer_session_id"]),
+    )
+    conn.commit()
+
+    previous_audit: dict[str, Any] = {}
+    for renewal_index in (2, 3):
+        body = _explicit_epoch_release_named_route_proof(
+            conn,
+            observer_session_id=f"obs-fresh-chain-{renewal_index}",
+            route_token_ref=f"rtok-fresh-chain-{renewal_index}",
+            allowed_actions=[
+                "integration_epoch_release_unlandable_child",
+                "task_timeline_append",
+                "graph_current_full_reconcile",
+            ],
+        )
+        renewed = route_handler(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+                },
+                method="POST",
+                body=body,
+            )
+        )
+        assert renewed["replayed"] is True
+        assert renewed["replay_authority_renewed"] is True
+        assert renewed["projection_repaired"] is True
+        assert renewed["writes_performed"] is True
+
+        ledger_rows = _explicit_epoch_release_rollover_ledger_rows(conn)
+        assert len(ledger_rows) == renewal_index
+        ledger_audits = [json.loads(row["audit_json"]) for row in ledger_rows]
+        audit = ledger_audits[-1]
+        assert audit["sequence"] == renewal_index
+        assert audit["previous_rollover_id"] == ledger_audits[-2][
+            "rollover_id"
+        ]
+        assert audit["old_operator_principal"] == ledger_audits[-2][
+            "new_operator_principal"
+        ]
+        assert audit["old_observer_route_token_ref"] == ledger_audits[-2][
+            "new_observer_route_token_ref"
+        ]
+        assert audit["new_operator_principal"] == (
+            f"observer-session:obs-fresh-chain-{renewal_index}"
+        )
+        assert audit["new_observer_route_token_ref"] == (
+            f"observer-route-token-ref:rtok-fresh-chain-{renewal_index}"
+        )
+        assert audit["raw_credentials_persisted"] is False
+        epoch = get_integration_epoch(
+            conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+        )
+        projected = epoch.incomplete_fanin["released_children"][0][
+            "binding_audit"
+        ]["replay_authority_rollovers"]
+        assert projected == ledger_audits
+        previous_audit = audit
+
+        changes_before = conn.total_changes
+        exact = route_handler(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+                },
+                method="POST",
+                body=body,
+            )
+        )
+        assert exact["replay_authority_renewed"] is False
+        assert exact["projection_repaired"] is False
+        assert exact["writes_performed"] is False
+        assert conn.total_changes == changes_before
+        assert len(_explicit_epoch_release_rollover_ledger_rows(conn)) == (
+            renewal_index
+        )
+        assert [dict(row) for row in _explicit_epoch_release_events(conn)] == [
+            immutable_event
+        ]
+    assert previous_audit["sequence"] == 3
+
+
+def test_release_route_replay_refuses_unanchored_legacy_projection(conn):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    route_handler = _explicit_epoch_release_route_handler()
+    old_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id="obs-legacy-projection-old",
+        route_token_ref="rtok-legacy-projection-old",
+    )
+    first = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=old_body,
+        )
+    )
+    assert first["ok"] is True
+
+    epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    incomplete_fanin = json.loads(json.dumps(epoch.incomplete_fanin))
+    incomplete_fanin["released_children"][0]["binding_audit"][
+        "replay_authority_rollovers"
+    ] = [
+        {
+            "schema_version": (
+                "mf_batch_parallel.release_replay_authority_rollover.v1"
+            ),
+            "rollover_id": "release-rollover-unanchored-legacy",
+            "copy_safe": True,
+            "raw_credentials_persisted": False,
+        }
+    ]
+    upsert_integration_epoch(
+        conn,
+        replace(epoch, incomplete_fanin=incomplete_fanin),
+    )
+    conn.commit()
+    renewed_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id="obs-legacy-projection-new",
+        route_token_ref="rtok-legacy-projection-new",
+    )
+    before_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_events = [
+        dict(row) for row in _explicit_epoch_release_events(conn)
+    ]
+    changes_before = conn.total_changes
+
+    status, result = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=renewed_body,
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == (
+        "integration_epoch_release_replay_identity_mismatch"
+    )
+    assert result["rollover_rejection"] == (
+        "unanchored_legacy_rollover_projection_refused"
+    )
+    assert result["zero_write_rejection"] is True
+    assert conn.total_changes == changes_before
+    assert get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_epoch
+    assert _explicit_epoch_release_rollover_ledger_rows(conn) == []
+    assert [dict(row) for row in _explicit_epoch_release_events(conn)] == (
+        before_events
+    )
 
 
 @pytest.mark.parametrize(
@@ -126570,6 +126801,12 @@ def test_release_route_replay_rejects_tampered_persisted_rollover_audit(
     before_epoch = get_integration_epoch(
         conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
     )
+    before_item = get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    )
     before_context = get_branch_context(
         conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
     )
@@ -126619,7 +126856,7 @@ def test_release_route_replay_rejects_tampered_persisted_rollover_audit(
     assert len(before_events) == 1
 
 
-def test_release_route_replay_allows_only_original_recorded_at_difference(
+def test_release_route_replay_rejects_projection_recorded_at_ledger_drift(
     conn,
 ):
     route_handler, renewed_body = (
@@ -126641,9 +126878,18 @@ def test_release_route_replay_allows_only_original_recorded_at_difference(
         replace(epoch, incomplete_fanin=incomplete_fanin),
     )
     conn.commit()
+    before_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_ledger = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT * FROM parallel_branch_integration_epoch_release_rollovers"
+        ).fetchall()
+    ]
     changes_before = conn.total_changes
 
-    replay = route_handler(
+    status, result = route_handler(
         _ctx(
             {
                 "project_id": PID,
@@ -126654,20 +126900,228 @@ def test_release_route_replay_allows_only_original_recorded_at_difference(
         )
     )
 
-    assert replay["replayed"] is True
-    assert replay["replay_authority_renewed"] is False
-    assert replay["projection_repaired"] is False
-    assert replay["writes_performed"] is False
+    assert status == 409
+    assert result["error"] == (
+        "integration_epoch_release_replay_identity_mismatch"
+    )
+    assert result["zero_write_rejection"] is True
     assert conn.total_changes == changes_before
-    replay_epoch = get_integration_epoch(
+    assert get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_epoch
+    assert [
+        dict(row)
+        for row in conn.execute(
+            "SELECT * FROM parallel_branch_integration_epoch_release_rollovers"
+        ).fetchall()
+    ] == before_ledger
+    assert len(_explicit_epoch_release_events(conn)) == 1
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "self_consistent_recomputed_identity",
+        "row_rollover_id",
+        "previous_id",
+        "missing_ledger",
+        "extra_ledger_entry",
+        "registry_scope",
+        "recorded_at",
+    ],
+)
+def test_release_route_replay_rejects_canonical_ledger_drift_zero_write(
+    conn,
+    tamper_mode,
+):
+    route_handler, renewed_body = (
+        _establish_explicit_epoch_release_authority_rollover(
+            conn,
+            suffix=f"ledger-{tamper_mode}",
+        )
+    )
+    event_id = int(_explicit_epoch_release_events(conn)[0]["id"])
+    row = dict(_explicit_epoch_release_rollover_ledger_rows(conn)[0])
+    audit = json.loads(row["audit_json"])
+    alternate_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id=f"obs-ledger-alternate-{tamper_mode}",
+        route_token_ref=f"rtok-ledger-alternate-{tamper_mode}",
+        allowed_actions=[
+            "integration_epoch_release_unlandable_child",
+            "task_timeline_append",
+        ],
+    )
+    alternate_audit = parallel_branch_runtime._build_release_rollover_ledger_audit(
+        conn,
+        project_id=PID,
+        event_id=event_id,
+        sequence=int(audit["sequence"]),
+        previous_rollover_id=str(audit["previous_rollover_id"]),
+        old_operator_principal=str(audit["old_operator_principal"]),
+        old_observer_route_token_ref=str(
+            audit["old_observer_route_token_ref"]
+        ),
+        new_operator_principal=(
+            f"observer-session:{alternate_body['observer_session_id']}"
+        ),
+        new_observer_route_token_ref=(
+            "observer-route-token-ref:"
+            f"{alternate_body['observer_route_token_ref']}"
+        ),
+        governing_backlog_ref=str(audit["governing_backlog_ref"]),
+        governing_task_ref=str(audit["governing_task_ref"]),
+        authorized_action_ref=str(audit["authorized_action_ref"]),
+        queue_item_id=_EXPLICIT_EPOCH_RELEASE_ITEM,
+        recorded_at=str(audit["recorded_at"]),
+    )
+    if tamper_mode == "self_consistent_recomputed_identity":
+        conn.execute(
+            """
+            UPDATE parallel_branch_integration_epoch_release_rollovers
+            SET rollover_id = ?, audit_json = ?
+            WHERE project_id = ? AND batch_id = ? AND queue_item_id = ?
+            """,
+            (
+                alternate_audit["rollover_id"],
+                json.dumps(alternate_audit, sort_keys=True, separators=(",", ":")),
+                PID,
+                _EXPLICIT_EPOCH_RELEASE_BATCH,
+                _EXPLICIT_EPOCH_RELEASE_ITEM,
+            ),
+        )
+    elif tamper_mode == "row_rollover_id":
+        conn.execute(
+            "UPDATE parallel_branch_integration_epoch_release_rollovers "
+            "SET rollover_id = 'release-rollover-row-tampered'"
+        )
+    elif tamper_mode == "previous_id":
+        audit["previous_rollover_id"] = "release-rollover-forged-previous"
+        audit["rollover_id"] = (
+            parallel_branch_runtime._release_rollover_audit_id(audit)
+        )
+        conn.execute(
+            """
+            UPDATE parallel_branch_integration_epoch_release_rollovers
+            SET previous_rollover_id = ?, rollover_id = ?, audit_json = ?
+            """,
+            (
+                audit["previous_rollover_id"],
+                audit["rollover_id"],
+                json.dumps(audit, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+    elif tamper_mode == "missing_ledger":
+        conn.execute(
+            "DELETE FROM parallel_branch_integration_epoch_release_rollovers"
+        )
+    elif tamper_mode == "extra_ledger_entry":
+        extra_audit = parallel_branch_runtime._build_release_rollover_ledger_audit(
+            conn,
+            project_id=PID,
+            event_id=event_id,
+            sequence=2,
+            previous_rollover_id=str(audit["rollover_id"]),
+            old_operator_principal=str(audit["new_operator_principal"]),
+            old_observer_route_token_ref=str(
+                audit["new_observer_route_token_ref"]
+            ),
+            new_operator_principal=(
+                f"observer-session:{alternate_body['observer_session_id']}"
+            ),
+            new_observer_route_token_ref=(
+                "observer-route-token-ref:"
+                f"{alternate_body['observer_route_token_ref']}"
+            ),
+            governing_backlog_ref=str(audit["governing_backlog_ref"]),
+            governing_task_ref=str(audit["governing_task_ref"]),
+            authorized_action_ref=str(audit["authorized_action_ref"]),
+            queue_item_id=_EXPLICIT_EPOCH_RELEASE_ITEM,
+            recorded_at="2030-01-01T00:00:00Z",
+        )
+        parallel_branch_runtime._insert_release_rollover_ledger_audit(
+            conn,
+            project_id=PID,
+            batch_id=_EXPLICIT_EPOCH_RELEASE_BATCH,
+            queue_item_id=_EXPLICIT_EPOCH_RELEASE_ITEM,
+            event_id=event_id,
+            audit=extra_audit,
+        )
+    elif tamper_mode == "registry_scope":
+        historical_route_ref = str(
+            audit["old_observer_route_token_ref"]
+        ).removeprefix("observer-route-token-ref:")
+        conn.execute(
+            "UPDATE observer_route_token_refs SET backlog_id = 'AC-TAMPERED' "
+            "WHERE project_id = ? AND route_token_ref = ?",
+            (PID, historical_route_ref),
+        )
+    elif tamper_mode == "recorded_at":
+        audit["recorded_at"] = "2000-01-01T00:00:00Z"
+        conn.execute(
+            "UPDATE parallel_branch_integration_epoch_release_rollovers "
+            "SET audit_json = ?, created_at = ?",
+            (
+                json.dumps(audit, sort_keys=True, separators=(",", ":")),
+                audit["recorded_at"],
+            ),
+        )
+    conn.commit()
+
+    before_epoch = get_integration_epoch(
         conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
     )
-    persisted_audits = replay_epoch.incomplete_fanin["released_children"][0][
-        "binding_audit"
-    ]["replay_authority_rollovers"]
-    assert len(persisted_audits) == 1
-    assert persisted_audits[0]["recorded_at"] == "2000-01-01T00:00:00Z"
-    assert len(_explicit_epoch_release_events(conn)) == 1
+    before_item = get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    )
+    before_context = get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    )
+    before_batch = parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_events = [dict(row) for row in _explicit_epoch_release_events(conn)]
+    before_ledger = [
+        dict(row) for row in _explicit_epoch_release_rollover_ledger_rows(conn)
+    ]
+    changes_before = conn.total_changes
+
+    status, result = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=renewed_body,
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == (
+        "integration_epoch_release_replay_identity_mismatch"
+    )
+    assert result["zero_write_rejection"] is True
+    assert conn.total_changes == changes_before
+    assert get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_epoch
+    assert get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    ) == before_context
+    assert parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_batch
+    assert [dict(row) for row in _explicit_epoch_release_events(conn)] == (
+        before_events
+    )
+    assert [
+        dict(row) for row in _explicit_epoch_release_rollover_ledger_rows(conn)
+    ] == before_ledger
+    assert len(before_events) == 1
 
 
 @pytest.mark.parametrize(
@@ -126903,6 +127357,12 @@ def test_release_replay_authority_rollover_projection_failure_rolls_back(
     before_epoch = get_integration_epoch(
         conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
     )
+    before_item = get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    )
     before_context = get_branch_context(
         conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
     )
@@ -126912,13 +127372,22 @@ def test_release_replay_authority_rollover_projection_failure_rolls_back(
     before_events = [
         dict(row) for row in _explicit_epoch_release_events(conn)
     ]
+    before_ledger = [
+        dict(row) for row in _explicit_epoch_release_rollover_ledger_rows(conn)
+    ]
+
+    original_upsert_integration_epoch = (
+        parallel_branch_runtime.upsert_integration_epoch
+    )
+
+    def _write_projection_then_fail(*args, **kwargs):
+        original_upsert_integration_epoch(*args, **kwargs)
+        raise RuntimeError("forced rollover audit persistence failure")
 
     monkeypatch.setattr(
         parallel_branch_runtime,
         "upsert_integration_epoch",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("forced rollover audit persistence failure")
-        ),
+        _write_projection_then_fail,
     )
     with pytest.raises(
         RuntimeError,
@@ -126938,6 +127407,12 @@ def test_release_replay_authority_rollover_projection_failure_rolls_back(
     assert get_integration_epoch(
         conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
     ) == before_epoch
+    assert get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    ) == before_item
     assert get_branch_context(
         conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
     ) == before_context
@@ -126947,6 +127422,9 @@ def test_release_replay_authority_rollover_projection_failure_rolls_back(
     assert [dict(row) for row in _explicit_epoch_release_events(conn)] == (
         before_events
     )
+    assert [
+        dict(row) for row in _explicit_epoch_release_rollover_ledger_rows(conn)
+    ] == before_ledger
 
 
 def test_released_projection_upserts_cannot_resurrect_or_remove_child(
