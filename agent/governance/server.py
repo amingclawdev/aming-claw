@@ -7879,9 +7879,17 @@ def _current_full_reconcile_route_evidence(
                 }
             }
         )
+        authority_source = str(
+            (runtime_context_scope or {}).get("source")
+            or "parallel_branch_runtime_context"
+        ).strip()
         evidence["runtime_context_scope"] = {
             **canonical_scope,
+            # Compatibility with the existing immutable provenance schema;
+            # authority_source distinguishes the bounded contextless epoch
+            # proof without widening that schema's persisted field set.
             "source": "parallel_branch_runtime_context",
+            "authority_source": authority_source,
             "server_derived": True,
         }
     return evidence
@@ -55600,17 +55608,82 @@ def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
     from .parallel_branch_runtime import integration_epoch_resume_payload
 
     current_target_head = ""
+    current_target_head_validated = False
+    current_target_head_blocker = ""
     if getattr(epoch, "incomplete_fanin", None):
         try:
-            current_target_head = _git_head_commit(
-                _graph_governance_project_root(epoch.project_id, {})
+            project_root = project_service.resolve_project_root(
+                epoch.project_id,
+                None,
+                fallback_self=False,
             )
         except Exception:
-            current_target_head = ""
+            project_root = None
+            current_target_head_blocker = (
+                "integration_epoch_current_head_project_resolution_failed"
+            )
+        if project_root is None and not current_target_head_blocker:
+            current_target_head_blocker = (
+                "integration_epoch_current_head_project_not_registered"
+            )
+        if project_root is not None and not current_target_head_blocker:
+            try:
+                clean_worktree_verified = _git_clean_worktree_verified(
+                    Path(project_root)
+                )
+            except Exception:
+                clean_worktree_verified = False
+            if not clean_worktree_verified:
+                current_target_head_blocker = (
+                    "integration_epoch_current_head_worktree_not_clean"
+                )
+            else:
+                try:
+                    current_target_head = _git_head_commit(
+                        Path(project_root)
+                    ).lower()
+                except Exception:
+                    current_target_head = ""
+                    current_target_head_blocker = (
+                        "integration_epoch_current_head_lookup_failed"
+                    )
+                if not current_target_head:
+                    if not current_target_head_blocker:
+                        current_target_head_blocker = (
+                            "integration_epoch_current_head_unavailable"
+                        )
+                elif not re.fullmatch(
+                    r"[0-9a-f]{40}|[0-9a-f]{64}",
+                    current_target_head,
+                ):
+                    current_target_head_blocker = (
+                        "integration_epoch_current_head_not_full"
+                    )
+                else:
+                    try:
+                        resolved_head = _parallel_branch_resolve_canonical_commit(
+                            Path(project_root),
+                            current_target_head,
+                            field="current_head",
+                        )
+                    except Exception:
+                        current_target_head_blocker = (
+                            "integration_epoch_current_head_not_git_object"
+                        )
+                    else:
+                        current_target_head_validated = (
+                            resolved_head == current_target_head
+                        )
+                        if not current_target_head_validated:
+                            current_target_head_blocker = (
+                                "integration_epoch_current_head_not_canonical"
+                            )
     return integration_epoch_resume_payload(
         conn,
         epoch,
         current_target_head=current_target_head,
+        current_target_head_validated=current_target_head_validated,
+        current_target_head_blocker=current_target_head_blocker,
     )
 
 
@@ -61788,6 +61861,63 @@ def _current_full_reconcile_runtime_context_scope(
                         str(trusted_merge.get("task_id") or "").strip(),
                     )
     if context is None:
+        # An incomplete-fanin batch parent is the one route-bound current-full
+        # authority that intentionally has no child BranchTaskRuntimeContext.
+        # Accept it only from the canonical observer route mode and only when
+        # every explicit request/scope field selects the same active durable
+        # reconcile-pending epoch.  Ordinary contextless batch/parallel routes
+        # continue through the fail-closed path below.
+        explicit_project_id = str(body.get("project_id") or "").strip()
+        explicit_backlog_id = str(body.get("backlog_id") or "").strip()
+        explicit_task_id = str(body.get("task_id") or "").strip()
+        contextless_incomplete_epoch = None
+        if (
+            str(auth.get("role_source") or "").strip()
+            == "observer_session_route_token_ref"
+            and "graph_current_full_reconcile" in route_allowed_actions
+            and not claimed_runtime_context_id
+            and explicit_project_id == project_id
+            and explicit_backlog_id
+            and explicit_task_id
+            and merge_queue_id
+            and explicit_backlog_id == backlog_id
+            and explicit_task_id == task_id == route_task_id
+        ):
+            from .parallel_branch_runtime import (
+                INTEGRATION_EPOCH_RECONCILE_PENDING,
+                get_active_integration_epoch,
+            )
+
+            candidate_epoch = get_active_integration_epoch(
+                conn,
+                project_id,
+                merge_queue_id=merge_queue_id,
+            )
+            if (
+                candidate_epoch is not None
+                and candidate_epoch.status
+                == INTEGRATION_EPOCH_RECONCILE_PENDING
+                and bool(candidate_epoch.incomplete_fanin)
+                and candidate_epoch.project_id == project_id
+                and candidate_epoch.coordination_backlog_id
+                == explicit_backlog_id
+                and candidate_epoch.batch_id == explicit_task_id
+                and candidate_epoch.merge_queue_id == merge_queue_id
+            ):
+                contextless_incomplete_epoch = candidate_epoch
+        if contextless_incomplete_epoch is not None:
+            return {
+                "project_id": project_id,
+                "backlog_id": explicit_backlog_id,
+                "task_id": explicit_task_id,
+                "merge_queue_id": merge_queue_id,
+                "integration_epoch_id": contextless_incomplete_epoch.epoch_id,
+                "integration_epoch_batch_id": contextless_incomplete_epoch.batch_id,
+                "source": "durable_incomplete_fanin_batch_parent_epoch",
+                "server_derived": True,
+                "runtime_context_required": False,
+                "contextless_batch_parent_authority": True,
+            }
         route_bound_onboard_identity = bool(
             contract_record
             and str(contract_record.get("project_id") or "").strip()

@@ -126343,11 +126343,21 @@ def test_incomplete_fanin_resume_uses_server_current_full_head(conn, monkeypatch
     _call_explicit_epoch_release_as_operator(conn, monkeypatch)
     epoch = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
     current_full_head = "f" * 40
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: Path("/tmp"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_clean_worktree_verified",
+        lambda _root: True,
+    )
     monkeypatch.setattr(server, "_git_head_commit", lambda _root: current_full_head)
     monkeypatch.setattr(
         server,
-        "_graph_governance_project_root",
-        lambda *_args, **_kwargs: Path("/tmp"),
+        "_parallel_branch_resolve_canonical_commit",
+        lambda _root, commit, *, field: str(commit),
     )
 
     resume = server._server_integration_epoch_resume_payload(conn, epoch)
@@ -126358,6 +126368,133 @@ def test_incomplete_fanin_resume_uses_server_current_full_head(conn, monkeypatch
         _EXPLICIT_EPOCH_RELEASE_QUEUE
     )
     assert len(resume["action_input"]["target_commit_sha"]) == 40
+
+
+@pytest.mark.parametrize(
+    ("current_head", "validated"),
+    [
+        ("", False),
+        ("ac8abb2c", False),
+        ("f" * 40, False),
+    ],
+)
+def test_incomplete_fanin_runtime_resume_without_validated_full_head_blocks(
+    conn,
+    current_head,
+    validated,
+):
+    epoch = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+        epoch_status=parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILE_PENDING,
+    )
+    epoch = upsert_integration_epoch(
+        conn,
+        replace(
+            epoch,
+            incomplete_fanin={"status": "incomplete"},
+        ),
+    )
+
+    resume = parallel_branch_runtime.integration_epoch_resume_payload(
+        conn,
+        epoch,
+        current_target_head=current_head,
+        current_target_head_validated=validated,
+    )
+
+    assert resume["id"] == "resolve_incomplete_fanin_reconcile_target"
+    assert resume["blocked"] is True
+    assert resume["executable_action_available"] is False
+    assert resume["action_input"] == {}
+    assert resume["target_ref_frozen"] is True
+    assert resume["blocker"][
+        "credited_epoch_head_is_not_executable_target"
+    ] is True
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "project_resolution_exception",
+        "unregistered_project",
+        "dirty_worktree",
+        "head_exception",
+        "empty_head",
+        "short_head",
+        "non_object_head",
+    ],
+)
+def test_incomplete_fanin_server_resume_head_failures_block_without_mutation(
+    conn,
+    monkeypatch,
+    failure_mode,
+):
+    epoch = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+        epoch_status=parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILE_PENDING,
+    )
+    epoch = upsert_integration_epoch(
+        conn,
+        replace(epoch, incomplete_fanin={"status": "incomplete"}),
+    )
+    before = get_integration_epoch(conn, PID, epoch.batch_id)
+    root = Path("/tmp/canonical-incomplete-fanin-root")
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: root,
+    )
+    monkeypatch.setattr(server, "_git_clean_worktree_verified", lambda _root: True)
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: "f" * 40)
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_resolve_canonical_commit",
+        lambda _root, commit, *, field: str(commit),
+    )
+    if failure_mode == "project_resolution_exception":
+        monkeypatch.setattr(
+            server.project_service,
+            "resolve_project_root",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+    elif failure_mode == "unregistered_project":
+        monkeypatch.setattr(
+            server.project_service,
+            "resolve_project_root",
+            lambda *_args, **_kwargs: None,
+        )
+    elif failure_mode == "dirty_worktree":
+        monkeypatch.setattr(server, "_git_clean_worktree_verified", lambda _root: False)
+    elif failure_mode == "head_exception":
+        monkeypatch.setattr(
+            server,
+            "_git_head_commit",
+            lambda _root: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+    elif failure_mode == "empty_head":
+        monkeypatch.setattr(server, "_git_head_commit", lambda _root: "")
+    elif failure_mode == "short_head":
+        monkeypatch.setattr(server, "_git_head_commit", lambda _root: "ac8abb2c")
+    elif failure_mode == "non_object_head":
+        monkeypatch.setattr(
+            server,
+            "_parallel_branch_resolve_canonical_commit",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                GovernanceError("not_object", "not object", 409, {})
+            ),
+        )
+
+    resume = server._server_integration_epoch_resume_payload(conn, epoch)
+
+    assert resume["blocked"] is True
+    assert resume["action_input"] == {}
+    assert resume["executable_action_available"] is False
+    assert resume["target_ref_frozen"] is True
+    assert get_integration_epoch(conn, PID, epoch.batch_id) == before
 
 
 def test_normal_full_fanin_reconcile_keeps_exact_credit_head_behavior(conn):
@@ -126392,6 +126529,9 @@ def test_normal_full_fanin_reconcile_keeps_exact_credit_head_behavior(conn):
     assert reconciled.status == parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILED
     assert reconciled.current_head == epoch.current_head
     assert reconciled.reconciled_target_head == head
+    resume = parallel_branch_runtime.integration_epoch_resume_payload(conn, epoch)
+    assert resume["action_input"]["target_commit_sha"] == head
+    assert "merge_queue_id" not in resume["action_input"]
 
 
 def test_current_full_reconcile_executes_incomplete_fanin_descendant_target(
@@ -126464,6 +126604,218 @@ def test_current_full_reconcile_executes_incomplete_fanin_descendant_target(
     assert result["merge_queue_graph_epoch_auto_record"][
         "integration_epoch_barrier"
     ] == "satisfied_and_closed"
+
+
+def _incomplete_epoch_current_full_route_proof(
+    conn,
+    *,
+    route_project_id: str = PID,
+    backlog_id: str = _EXPLICIT_EPOCH_RELEASE_COORD,
+    task_id: str = _EXPLICIT_EPOCH_RELEASE_BATCH,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    registered = observer_session.register_session(
+        conn,
+        project_id=PID,
+        session_id=f"obs-incomplete-current-full-{backlog_id}-{task_id}",
+    )
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=route_project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=[
+            "agent/governance/server.py",
+            "agent/governance/parallel_branch_runtime.py",
+        ],
+        allowed_actions=["graph_current_full_reconcile"],
+        evidence_refs=["timeline:21950"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=route_project_id,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    conn.commit()
+    return registered, issued
+
+
+def test_current_full_reconcile_route_dispatch_accepts_canonical_incomplete_batch_parent(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    credited = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: tmp_path,
+    )
+    monkeypatch.setattr(server, "_git_clean_worktree_verified", lambda _root: True)
+
+    def resolve_commit(_root, ref, *, field):
+        del field
+        normalized = str(ref)
+        if normalized.startswith(credited.current_head):
+            return credited.current_head
+        if normalized.startswith(head):
+            return head
+        raise AssertionError(f"unexpected commit ref: {ref}")
+
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_resolve_canonical_commit",
+        resolve_commit,
+    )
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_require_commit_ancestor",
+        lambda *_args, **_kwargs: None,
+    )
+    epoch = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+    resume = server._server_integration_epoch_resume_payload(conn, epoch)
+    assert resume["id"] == "final_batch_reconcile"
+    registered, issued = _incomplete_epoch_current_full_route_proof(conn)
+    body = dict(resume["action_input"])
+    body.update(
+        {
+            "observer_session_id": registered["observer_session_id"],
+            "observer_route_token_ref": issued["route_token_ref"],
+        }
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("canonical route-ref mode must not use operator auth")
+        ),
+    )
+    route_handlers = [
+        handler
+        for method, path, handler in server.ROUTES
+        if method == "POST"
+        and path
+        == "/api/graph-governance/{project_id}/reconcile/current-full"
+    ]
+    assert route_handlers == [server.handle_graph_governance_current_full_reconcile]
+
+    status, result = route_handlers[0](
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    assert status == 201
+    assert calls[0]["commit_sha"] == head
+    route_runtime_scope = result["current_full_reconcile_provenance"][
+        "route_evidence"
+    ]["runtime_context_scope"]
+    assert route_runtime_scope["source"] == "parallel_branch_runtime_context"
+    assert route_runtime_scope["authority_source"] == (
+        "durable_incomplete_fanin_batch_parent_epoch"
+    )
+    closed = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+    assert closed.status == parallel_branch_runtime.INTEGRATION_EPOCH_CLOSED
+    assert closed.current_head == credited.current_head
+    assert closed.reconciled_target_head == head
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "wrong_queue",
+        "wrong_backlog",
+        "wrong_task",
+        "body_project_conflict",
+        "wrong_route_project",
+        "normal_full_fanin_epoch",
+    ],
+)
+def test_contextless_incomplete_batch_parent_route_scope_drift_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    failure_mode,
+):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = _EXPLICIT_EPOCH_RELEASE_COORD
+    task_id = _EXPLICIT_EPOCH_RELEASE_BATCH
+    merge_queue_id = _EXPLICIT_EPOCH_RELEASE_QUEUE
+    body_project_id = PID
+    route_project_id = PID
+    if failure_mode == "wrong_queue":
+        merge_queue_id = "mq-unrelated-contextless-batch"
+    elif failure_mode == "wrong_backlog":
+        backlog_id = "AC-UNRELATED-CONTEXTLESS-BATCH"
+    elif failure_mode == "wrong_task":
+        task_id = "mf-batch-parallel-unrelated-contextless"
+    elif failure_mode == "body_project_conflict":
+        body_project_id = "different-project"
+    elif failure_mode == "wrong_route_project":
+        route_project_id = "different-route-project"
+    elif failure_mode == "normal_full_fanin_epoch":
+        epoch = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+        upsert_integration_epoch(conn, replace(epoch, incomplete_fanin={}))
+        conn.commit()
+    registered, issued = _incomplete_epoch_current_full_route_proof(
+        conn,
+        route_project_id=route_project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    before = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+    zero_write_tables = (
+        "graph_snapshots",
+        "graph_current_full_reconcile_provenance",
+        "reconcile_run_metrics",
+        "task_timeline_events",
+    )
+    counts_before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    }
+    body = {
+        "project_id": body_project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "merge_queue_id": merge_queue_id,
+        "target_commit_sha": head,
+        "activate": True,
+        "semantic_enrich": False,
+        "observer_session_id": registered["observer_session_id"],
+        "observer_route_token_ref": issued["route_token_ref"],
+    }
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    expected_error = (
+        "observer_route_token_proof_required"
+        if failure_mode == "wrong_route_project"
+        else "current_full_reconcile_runtime_context_not_found"
+    )
+    assert exc.value.code == expected_error
+    if failure_mode == "wrong_route_project":
+        assert exc.value.details["zero_write_rejection"] is True
+    else:
+        assert exc.value.details["fail_closed"] is True
+    assert calls == []
+    assert get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH) == before
+    assert {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    } == counts_before
 
 
 def test_incomplete_fanin_server_ancestry_rejection_is_zero_write(

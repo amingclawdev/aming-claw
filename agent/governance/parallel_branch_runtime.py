@@ -14727,6 +14727,8 @@ def integration_epoch_resume_payload(
     epoch: IntegrationEpoch,
     *,
     current_target_head: str = "",
+    current_target_head_validated: bool = False,
+    current_target_head_blocker: str = "",
 ) -> dict[str, Any]:
     """Build the copy-safe canonical restart/onboard instruction."""
 
@@ -14742,36 +14744,72 @@ def integration_epoch_resume_payload(
     action_backlog_id = epoch.active_backlog_id
     action_task_id = epoch.active_task_id
     action_input: dict[str, Any] = {}
+    resume_blocker: dict[str, Any] = {}
     child_backlog_ids: tuple[str, ...] = ()
     pending_child_backlog_ids: tuple[str, ...] = ()
     if epoch.status == INTEGRATION_EPOCH_RECONCILE_PENDING:
-        action_id = "final_batch_reconcile"
         action_backlog_id = epoch.coordination_backlog_id
         action_task_id = epoch.batch_id
-        reconcile_target = (
-            str(current_target_head or "").strip()
-            if epoch.incomplete_fanin
-            else ""
-        ) or epoch.current_head
-        action_input = {
-            "project_id": epoch.project_id,
-            "backlog_id": epoch.coordination_backlog_id,
-            "task_id": epoch.batch_id,
-            "target_commit_sha": reconcile_target,
-            "merge_queue_id": epoch.merge_queue_id,
-            "activate": True,
-            "require_clean": True,
-            "semantic_use_ai": False,
-            "semantic_enrich": False,
-            "enqueue_stale": False,
-            "notes_extra": {
-                "integration_epoch_authority": {
-                    "batch_id": epoch.batch_id,
-                    "epoch_id": epoch.epoch_id,
-                    "merge_queue_id": epoch.merge_queue_id,
+        reconcile_target = str(current_target_head or "").strip().lower()
+        validated_incomplete_target = bool(
+            epoch.incomplete_fanin
+            and current_target_head_validated
+            and re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                reconcile_target,
+            )
+        )
+        if epoch.incomplete_fanin and not validated_incomplete_target:
+            action_id = "resolve_incomplete_fanin_reconcile_target"
+            resume_blocker = {
+                "code": (
+                    str(current_target_head_blocker or "").strip()
+                    or "integration_epoch_incomplete_fanin_current_head_unverified"
+                ),
+                "message": (
+                    "incomplete-fanin final reconcile requires a server-validated "
+                    "full canonical current Git HEAD"
+                ),
+                "credited_epoch_head_is_not_executable_target": True,
+                "target_ref_remains_frozen": True,
+                "required_evidence": [
+                    "registered_project_root",
+                    "clean_canonical_worktree",
+                    "full_current_git_head",
+                    "git_commit_object_verified",
+                ],
+                "remediation": (
+                    "repair project/root or Git HEAD availability, make the canonical "
+                    "worktree clean, then refresh onboard guidance"
+                ),
+                "copy_safe": True,
+            }
+        else:
+            action_id = "final_batch_reconcile"
+            reconcile_target = reconcile_target or epoch.current_head
+            action_input = {
+                "project_id": epoch.project_id,
+                "backlog_id": epoch.coordination_backlog_id,
+                "task_id": epoch.batch_id,
+                "target_commit_sha": reconcile_target,
+                "activate": True,
+                "require_clean": True,
+                "semantic_use_ai": False,
+                "semantic_enrich": False,
+                "enqueue_stale": False,
+                "notes_extra": {
+                    "integration_epoch_authority": {
+                        "batch_id": epoch.batch_id,
+                        "epoch_id": epoch.epoch_id,
+                        "merge_queue_id": epoch.merge_queue_id,
+                    },
                 },
-            },
-        }
+            }
+            if epoch.incomplete_fanin:
+                # The queue id selects the durable incomplete epoch whose
+                # credited head is the ancestry base.  Normal full-fanin
+                # reconcile keeps its stable public action-input shape.
+                action_input["merge_queue_id"] = epoch.merge_queue_id
     elif epoch.status == INTEGRATION_EPOCH_RECONCILED:
         child_backlog_ids = integration_epoch_child_backlog_ids(conn, epoch)
         child_statuses: dict[str, str] = {}
@@ -14829,9 +14867,12 @@ def integration_epoch_resume_payload(
         ),
         "incomplete_fanin": dict(epoch.incomplete_fanin),
         "full_batch_completion_claimed": not bool(epoch.incomplete_fanin),
+        "blocked": bool(resume_blocker),
+        "blocker": resume_blocker,
+        "executable_action_available": bool(action_input),
         "required_tool": (
             "graph_current_full_reconcile"
-            if epoch.status
+            if action_input and epoch.status
             in {
                 INTEGRATION_EPOCH_RECONCILE_PENDING,
                 INTEGRATION_EPOCH_RECONCILED,
