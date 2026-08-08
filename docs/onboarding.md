@@ -358,10 +358,10 @@ synonyms `redeployed`, `governance_redeploy`, `runtime_sync`, and
 
 Before stopping or replacing a worker, audit progress from the latest runtime
 current state, worker guide, task timeline, graph traces, branch head, changed
-files, tests, finish gate, and blockers. Complete direct-fix work with
-independent QA, branch-service validation on canonical governance port when
-runtime code changed, merge or redeploy, full graph reconcile, and protected
-backlog close.
+files, tests, finish gate, and blockers. Complete bounded
+operator-supervised repairs with independent QA, branch-service validation on
+the canonical governance port when runtime code changed, merge or redeploy,
+full graph reconcile, and protected backlog close.
 
 When a bounded QA graph query rejects a non-descendant or otherwise unsafe
 candidate overlay and requires an exact candidate snapshot, do not reuse an old

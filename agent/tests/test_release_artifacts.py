@@ -107,6 +107,12 @@ def test_release_docs_name_replay_and_chain_trailer_boundaries():
     assert "work_type=direct_fix" not in onboarding
     assert "exact successor contract" in onboarding
     assert "returned by the live guide" in onboarding
+    direct_fix_lines = [
+        line for line in onboarding.splitlines() if "direct-fix" in line.lower()
+    ]
+    assert direct_fix_lines == [
+        "The retired direct-fix route names are audit history only and must never be"
+    ]
     assert "`v0.2.0`" in runbook
     assert "`v2.0.0`" not in runbook
 

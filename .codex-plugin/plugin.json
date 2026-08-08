@@ -1,6 +1,6 @@
 {
   "name": "aming-claw",
-  "version": "0.2.0+codex.20260808145520",
+  "version": "0.2.0+codex.20260808150148",
   "description": "Codex plugin packaging for Aming Claw governance with one onboard-first skill entrypoint and the onboard_route_guide MCP tool.",
   "license": "FSL-1.1-MIT",
   "keywords": [
