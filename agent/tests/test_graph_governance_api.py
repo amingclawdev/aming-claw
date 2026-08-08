@@ -125121,3 +125121,441 @@ def test_close_grade_merge_projection_pins_rev9_lane_merges_and_falls_back(
     )
     assert trusted_calls == ["rev7", "rev9"]
     assert drifted["timeline_verified"] is False
+
+
+_EXPLICIT_EPOCH_RELEASE_BATCH = "mf-batch-parallel-explicit-release"
+_EXPLICIT_EPOCH_RELEASE_QUEUE = "mq-explicit-epoch-release"
+_EXPLICIT_EPOCH_RELEASE_CHILD = "AC-EXPLICIT-EPOCH-UNLANDABLE-CHILD"
+_EXPLICIT_EPOCH_RELEASE_BLOCKER = "AC-EXPLICIT-EPOCH-BLOCKING-DEFECT"
+_EXPLICIT_EPOCH_RELEASE_COORD = "AC-EXPLICIT-EPOCH-COORDINATION"
+_EXPLICIT_EPOCH_RELEASE_ITEM = "mqitem-explicit-epoch-release-row3"
+_EXPLICIT_EPOCH_RELEASE_HEAD = "c" * 40
+
+
+def _explicit_epoch_release_fixture(
+    conn,
+    *,
+    child_status: str,
+    queue_status: str,
+    epoch_status: str = parallel_branch_runtime.INTEGRATION_EPOCH_OPEN,
+):
+    for backlog_id, status in (
+        (_EXPLICIT_EPOCH_RELEASE_COORD, "OPEN"),
+        ("AC-EXPLICIT-EPOCH-SIBLING-ONE", "OPEN"),
+        ("AC-EXPLICIT-EPOCH-SIBLING-TWO", "OPEN"),
+        (_EXPLICIT_EPOCH_RELEASE_CHILD, child_status),
+        (_EXPLICIT_EPOCH_RELEASE_BLOCKER, "OPEN"),
+    ):
+        _insert_simple_mf_close_backlog(conn, backlog_id)
+        conn.execute(
+            "UPDATE backlog_bugs SET status = ? WHERE bug_id = ?",
+            (status, backlog_id),
+        )
+    items = (
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+            queue_item_id="mqitem-explicit-epoch-release-row1",
+            task_id="cex-explicit-epoch-release-row1",
+            backlog_id="AC-EXPLICIT-EPOCH-SIBLING-ONE",
+            branch_ref="refs/heads/codex/explicit-epoch-release-row1",
+            queue_index=1,
+            status=STATE_MERGED,
+            target_ref="refs/heads/main",
+            current_target_head="b" * 40,
+            merge_commit="b" * 40,
+            target_head_after_merge="b" * 40,
+        ),
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+            queue_item_id="mqitem-explicit-epoch-release-row2",
+            task_id="cex-explicit-epoch-release-row2",
+            backlog_id="AC-EXPLICIT-EPOCH-SIBLING-TWO",
+            branch_ref="refs/heads/codex/explicit-epoch-release-row2",
+            queue_index=2,
+            status=STATE_MERGED,
+            target_ref="refs/heads/main",
+            current_target_head=_EXPLICIT_EPOCH_RELEASE_HEAD,
+            merge_commit=_EXPLICIT_EPOCH_RELEASE_HEAD,
+            target_head_after_merge=_EXPLICIT_EPOCH_RELEASE_HEAD,
+        ),
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+            queue_item_id=_EXPLICIT_EPOCH_RELEASE_ITEM,
+            task_id="cex-explicit-epoch-release-row3",
+            backlog_id=_EXPLICIT_EPOCH_RELEASE_CHILD,
+            branch_ref="refs/heads/codex/explicit-epoch-release-row3",
+            queue_index=3,
+            status=queue_status,
+            target_ref="refs/heads/main",
+            current_target_head=_EXPLICIT_EPOCH_RELEASE_HEAD,
+        ),
+    )
+    upsert_merge_queue_items(conn, items)
+    epoch = upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id=_EXPLICIT_EPOCH_RELEASE_BATCH,
+            epoch_id="epoch-explicit-unlandable-child-release",
+            coordination_backlog_id=_EXPLICIT_EPOCH_RELEASE_COORD,
+            target_ref="refs/heads/main",
+            base_head="a" * 40,
+            current_head=_EXPLICIT_EPOCH_RELEASE_HEAD,
+            merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+            merge_cursor=2,
+            merged_prefix=(items[0].queue_item_id, items[1].queue_item_id),
+            remaining_queue_item_ids=(_EXPLICIT_EPOCH_RELEASE_ITEM,),
+            status=epoch_status,
+            active_queue_item_id=_EXPLICIT_EPOCH_RELEASE_ITEM,
+            active_task_id=items[2].task_id,
+            active_backlog_id=_EXPLICIT_EPOCH_RELEASE_CHILD,
+            last_merge_commit=_EXPLICIT_EPOCH_RELEASE_HEAD,
+        ),
+    )
+    conn.commit()
+    return epoch
+
+
+def _explicit_epoch_release_body() -> dict[str, Any]:
+    return {
+        "queue_item_id": _EXPLICIT_EPOCH_RELEASE_ITEM,
+        "child_backlog_id": _EXPLICIT_EPOCH_RELEASE_CHILD,
+        "blocking_backlog_id": _EXPLICIT_EPOCH_RELEASE_BLOCKER,
+        "operator_approved": True,
+        "permanently_unlandable": True,
+        "recoverable": False,
+        "approval_ref": "operator-approval:release-unlandable-row3",
+        "reason": (
+            "The already-WAIVED child has immutable failed evidence and can "
+            "never produce a legal merge commit."
+        ),
+        "evidence_refs": [
+            "timeline:waived-child-audit",
+            "backlog:AC-EXPLICIT-EPOCH-BLOCKING-DEFECT",
+        ],
+    }
+
+
+def _explicit_epoch_release_events(conn) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT * FROM parallel_branch_integration_epoch_release_events
+        WHERE project_id = ? AND batch_id = ? ORDER BY id
+        """,
+        (PID, _EXPLICIT_EPOCH_RELEASE_BATCH),
+    ).fetchall()
+
+
+def test_explicit_unlandable_child_release_records_incomplete_fanin_without_merge_credit(
+    conn,
+    monkeypatch,
+):
+    before = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {
+            "role": "observer",
+            "principal_id": "release-operator",
+        },
+    )
+
+    # Terminalizing the backlog remains ledger-only.  The epoch is unchanged
+    # until this separate, authenticated action is invoked.
+    assert get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    ).status == "planned"
+    assert before.remaining_queue_item_ids == (_EXPLICIT_EPOCH_RELEASE_ITEM,)
+
+    result = server.handle_integration_epoch_release_unlandable_child(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            "observer",
+            method="POST",
+            body=_explicit_epoch_release_body(),
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["action"] == "integration_epoch_release_unlandable_child"
+    assert result["merge_credit_granted"] is False
+    assert result["target_head_mutated"] is False
+    assert result["full_batch_completion_claimed"] is False
+    replay = server.handle_integration_epoch_release_unlandable_child(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            "observer",
+            method="POST",
+            body=_explicit_epoch_release_body(),
+        )
+    )
+    assert replay["replayed"] is True
+    assert replay["release_event_id"] == result["release_event_id"]
+    assert replay["writes_performed"] is False
+    drift_body = _explicit_epoch_release_body()
+    drift_body["reason"] = "different replay reason must not rewrite audit"
+    drift_status, drift = (
+        server.handle_integration_epoch_release_unlandable_child(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+                },
+                "observer",
+                method="POST",
+                body=drift_body,
+            )
+        )
+    )
+    assert drift_status == 409
+    assert drift["error"] == "integration_epoch_release_replay_identity_mismatch"
+    released_item = get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    )
+    assert released_item.status == (
+        parallel_branch_runtime.STATE_RELEASED_UNLANDABLE
+    )
+    released = get_integration_epoch(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_BATCH,
+    )
+    assert released.status == (
+        parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILE_PENDING
+    )
+    assert released.remaining_queue_item_ids == ()
+    assert released.current_head == before.current_head
+    assert released.last_merge_commit == before.last_merge_commit
+    assert released.merged_prefix == before.merged_prefix
+    assert released.merge_cursor == before.merge_cursor
+    assert released.incomplete_fanin["status"] == "incomplete"
+    assert released.incomplete_fanin["released_queue_item_ids"] == [
+        _EXPLICIT_EPOCH_RELEASE_ITEM
+    ]
+    audit_events = _explicit_epoch_release_events(conn)
+    assert len(audit_events) == 1
+    assert audit_events[0]["child_backlog_id"] == _EXPLICIT_EPOCH_RELEASE_CHILD
+    assert audit_events[0]["blocking_backlog_id"] == (
+        _EXPLICIT_EPOCH_RELEASE_BLOCKER
+    )
+    assert audit_events[0]["operator_principal"] == "release-operator"
+
+    reconciled = parallel_branch_runtime.mark_integration_epoch_reconciled(
+        conn,
+        project_id=PID,
+        target_head_commit=_EXPLICIT_EPOCH_RELEASE_HEAD,
+        snapshot_id="full-explicit-epoch-release",
+        projection_id="projection-explicit-epoch-release",
+        merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+    )
+    close_gate = parallel_branch_runtime.validate_integration_epoch_backlog_close(
+        reconciled,
+        backlog_scope="child",
+        target_head_commit=_EXPLICIT_EPOCH_RELEASE_HEAD,
+    )
+    assert close_gate["passed"] is True
+    assert close_gate["normal_close_allowed_with_recorded_incomplete_fanin"] is True
+    assert close_gate["full_batch_completion_claimed"] is False
+    closed = parallel_branch_runtime.close_integration_epoch(
+        conn,
+        project_id=PID,
+        batch_id=_EXPLICIT_EPOCH_RELEASE_BATCH,
+        target_head_commit=_EXPLICIT_EPOCH_RELEASE_HEAD,
+    )
+    assert closed.status == parallel_branch_runtime.INTEGRATION_EPOCH_CLOSED
+    assert closed.incomplete_fanin["status"] == "incomplete"
+
+    with pytest.raises(
+        parallel_branch_runtime.IntegrationEpochUnlandableChildReleaseError,
+        match="permanently terminal",
+    ):
+        upsert_merge_queue_item(
+            conn,
+            replace(released_item, status=STATE_VALIDATED),
+        )
+    decision = parallel_branch_runtime.decide_merge_queue(
+        list_merge_queue_items(conn, PID, _EXPLICIT_EPOCH_RELEASE_QUEUE)
+    ).decisions[-1]
+    assert decision.action == (
+        parallel_branch_runtime.ACTION_LEAVE_RELEASED_UNLANDABLE
+    )
+    assert decision.merge_allowed is False
+    assert decision.target_branch_mutation_allowed is False
+
+
+@pytest.mark.parametrize("queue_status", ["planned", "running", STATE_MERGE_FAILED])
+def test_explicit_unlandable_child_release_refuses_recoverable_children_zero_write(
+    conn,
+    monkeypatch,
+    queue_status,
+):
+    before = _explicit_epoch_release_fixture(
+        conn,
+        child_status="OPEN",
+        queue_status=queue_status,
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {
+            "role": "observer",
+            "principal_id": "release-operator",
+        },
+    )
+
+    status, result = server.handle_integration_epoch_release_unlandable_child(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            "observer",
+            method="POST",
+            body=_explicit_epoch_release_body(),
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == "integration_epoch_child_not_terminal_unlandable"
+    assert result["recoverable_child_refused"] is True
+    assert result["zero_write_rejection"] is True
+    unchanged = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+    assert unchanged == before
+    assert get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    ).status == queue_status
+    assert _explicit_epoch_release_events(conn) == []
+
+
+def test_explicit_unlandable_child_release_refuses_merge_in_doubt_zero_write(
+    conn,
+    monkeypatch,
+):
+    before = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+        epoch_status=parallel_branch_runtime.INTEGRATION_EPOCH_MERGE_IN_DOUBT,
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {
+            "role": "observer",
+            "principal_id": "release-operator",
+        },
+    )
+
+    status, result = server.handle_integration_epoch_release_unlandable_child(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            "observer",
+            method="POST",
+            body=_explicit_epoch_release_body(),
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == "integration_epoch_merge_in_doubt"
+    assert result["zero_write_rejection"] is True
+    assert get_integration_epoch(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_BATCH,
+    ) == before
+    assert _explicit_epoch_release_events(conn) == []
+
+
+def test_explicit_unlandable_child_release_refuses_middle_child_and_preserves_successor(
+    conn,
+    monkeypatch,
+):
+    before = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    successor = MergeQueueItem(
+        project_id=PID,
+        merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+        queue_item_id="mqitem-explicit-epoch-release-row4",
+        task_id="cex-explicit-epoch-release-row4",
+        backlog_id="AC-EXPLICIT-EPOCH-SUCCESSOR",
+        branch_ref="refs/heads/codex/explicit-epoch-release-row4",
+        queue_index=4,
+        status="planned",
+        target_ref="refs/heads/main",
+        current_target_head=_EXPLICIT_EPOCH_RELEASE_HEAD,
+    )
+    _insert_simple_mf_close_backlog(conn, successor.backlog_id)
+    upsert_merge_queue_item(conn, successor)
+    before = upsert_integration_epoch(
+        conn,
+        replace(
+            before,
+            remaining_queue_item_ids=(
+                _EXPLICIT_EPOCH_RELEASE_ITEM,
+                successor.queue_item_id,
+            ),
+        ),
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {
+            "role": "observer",
+            "principal_id": "release-operator",
+        },
+    )
+
+    status, result = server.handle_integration_epoch_release_unlandable_child(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            "observer",
+            method="POST",
+            body=_explicit_epoch_release_body(),
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == (
+        "integration_epoch_release_requires_sole_remaining_child"
+    )
+    assert result["successor_merge_preserved"] is True
+    assert get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH) == before
+    assert get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        successor.queue_item_id,
+    ).status == "planned"
+    assert _explicit_epoch_release_events(conn) == []

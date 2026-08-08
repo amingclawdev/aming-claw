@@ -238,6 +238,7 @@ CREATE TABLE IF NOT EXISTS parallel_branch_integration_epochs (
     snapshot_id       TEXT NOT NULL DEFAULT '',
     projection_id     TEXT NOT NULL DEFAULT '',
     failure_reason    TEXT NOT NULL DEFAULT '',
+    incomplete_fanin_json TEXT NOT NULL DEFAULT '{}',
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL,
     closed_at         TEXT NOT NULL DEFAULT '',
@@ -248,6 +249,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_parallel_branch_integration_epoch_active_t
   WHERE status != 'closed';
 CREATE INDEX IF NOT EXISTS idx_parallel_branch_integration_epoch_queue
   ON parallel_branch_integration_epochs(project_id, merge_queue_id, status);
+
+CREATE TABLE IF NOT EXISTS parallel_branch_integration_epoch_release_events (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id        TEXT NOT NULL,
+    batch_id          TEXT NOT NULL,
+    epoch_id          TEXT NOT NULL,
+    merge_queue_id    TEXT NOT NULL,
+    queue_item_id     TEXT NOT NULL,
+    child_backlog_id  TEXT NOT NULL,
+    blocking_backlog_id TEXT NOT NULL,
+    operator_principal TEXT NOT NULL,
+    approval_ref      TEXT NOT NULL,
+    reason            TEXT NOT NULL,
+    evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+    created_at        TEXT NOT NULL,
+    UNIQUE(project_id, batch_id, queue_item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_epoch_release_events
+  ON parallel_branch_integration_epoch_release_events(
+      project_id, batch_id, id
+  );
 """
 
 STATE_MERGED = "merged"
@@ -265,6 +287,11 @@ STATE_MERGE_READY = "merge_ready"
 STATE_MERGE_BLOCKED = "merge_blocked"
 STATE_MERGING = "merging"
 STATE_ABANDONED = "abandoned"
+# Explicit terminal disposition for a child that an authenticated operator has
+# proven can never land.  It is deliberately distinct from WAIVED backlog state:
+# audit archive does not mutate integration epochs, and only the dedicated
+# release action may write this queue state.
+STATE_RELEASED_UNLANDABLE = "released_unlandable"
 STATE_ROLLBACK_REQUIRED = "rollback_required"
 STATE_ALLOCATED = "allocated"
 STATE_WORKTREE_READY = "worktree_ready"
@@ -329,6 +356,7 @@ MERGE_EXECUTION_FLOWS = frozenset(
 )
 
 ACTION_LEAVE_MERGED = "leave_merged"
+ACTION_LEAVE_RELEASED_UNLANDABLE = "leave_released_unlandable"
 ACTION_OBSERVER_DECISION_REQUIRED = "observer_decision_required"
 ACTION_RECLAIM_FROM_CHECKPOINT = "reclaim_from_checkpoint"
 ACTION_RECLAIM_AFTER_DEPENDENCY = "reclaim_after_dependency"
@@ -408,7 +436,12 @@ RUNTIME_CONTEXT_ACCESS_AUDIT_SCHEMA_VERSION = "runtime_context.access_audit.v1"
 RUNTIME_CONTEXT_LANE_FOLD_SCHEMA_VERSION = "runtime_context.lane_fold.v1"
 RUNTIME_CONTEXT_WORKER_ROLE = "mf_sub"
 MERGE_DONE_STATES = {STATE_MERGED}
-MERGE_BLOCKING_STATES = {STATE_MERGE_FAILED, STATE_ABANDONED, STATE_ROLLBACK_REQUIRED}
+MERGE_BLOCKING_STATES = {
+    STATE_MERGE_FAILED,
+    STATE_ABANDONED,
+    STATE_RELEASED_UNLANDABLE,
+    STATE_ROLLBACK_REQUIRED,
+}
 MERGE_REVALIDATION_BLOCKING_STATES = {
     STATE_RUNNING,
     STATE_WAITING_DEPENDENCY,
@@ -1115,6 +1148,23 @@ class IntegrationEpochFrozenError(ValueError):
     def __init__(self, message: str, epoch: "IntegrationEpoch"):
         super().__init__(message)
         self.epoch = epoch
+
+
+class IntegrationEpochUnlandableChildReleaseError(ValueError):
+    """Fail-closed refusal for the explicit incomplete-fan-in action."""
+
+    def __init__(self, error: str, message: str, **details: Any):
+        super().__init__(message)
+        self.error = str(error or "integration_epoch_release_refused")
+        self.message = message
+        self.details: dict[str, Any] = {
+            "error": self.error,
+            "message": message,
+            "release_performed": False,
+            "merge_credit_granted": False,
+            "zero_write_rejection": True,
+            **details,
+        }
 
 
 @dataclass(frozen=True)
@@ -2325,6 +2375,7 @@ class IntegrationEpoch:
     snapshot_id: str = ""
     projection_id: str = ""
     failure_reason: str = ""
+    incomplete_fanin: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
     closed_at: str = ""
@@ -2535,6 +2586,12 @@ def _ensure_integration_epoch_columns(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE parallel_branch_integration_epochs "
             "ADD COLUMN coordination_backlog_id TEXT NOT NULL DEFAULT ''"
+        )
+        columns.add("coordination_backlog_id")
+    if "incomplete_fanin_json" not in columns:
+        conn.execute(
+            "ALTER TABLE parallel_branch_integration_epochs "
+            "ADD COLUMN incomplete_fanin_json TEXT NOT NULL DEFAULT '{}'"
         )
 
 
@@ -11096,6 +11153,8 @@ def integration_epoch_to_dict(epoch: IntegrationEpoch) -> dict[str, Any]:
     payload = asdict(epoch)
     payload["merged_prefix"] = list(epoch.merged_prefix)
     payload["remaining_queue_item_ids"] = list(epoch.remaining_queue_item_ids)
+    payload["incomplete_fanin"] = dict(epoch.incomplete_fanin)
+    payload["full_fanin"] = not bool(epoch.incomplete_fanin)
     payload["frozen"] = epoch.status in INTEGRATION_EPOCH_ACTIVE_STATES
     payload["next_legal_action"] = (
         "resume_batch_merge"
@@ -12775,6 +12834,30 @@ def upsert_merge_queue_item(
     now_iso: str = "",
 ) -> MergeQueueItem:
     ensure_branch_runtime_schema(conn)
+    previous_status_row = conn.execute(
+        """
+        SELECT status FROM parallel_branch_merge_queue_items
+        WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (item.project_id, item.merge_queue_id, item.queue_item_id),
+    ).fetchone()
+    if (
+        previous_status_row is not None
+        and str(previous_status_row["status"] or "")
+        == STATE_RELEASED_UNLANDABLE
+        and item.status != STATE_RELEASED_UNLANDABLE
+    ):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "released_unlandable_child_cannot_be_resurrected",
+            "released unlandable merge queue item is permanently terminal",
+            project_id=item.project_id,
+            merge_queue_id=item.merge_queue_id,
+            queue_item_id=item.queue_item_id,
+            child_backlog_id=item.backlog_id,
+            observed_status=STATE_RELEASED_UNLANDABLE,
+            requested_status=item.status,
+            recovery="file a new backlog row and allocate a new child lane",
+        )
     now = now_iso or utc_now()
     conn.execute(
         """
@@ -14305,6 +14388,7 @@ def _integration_epoch_from_row(row: sqlite3.Row) -> IntegrationEpoch:
         snapshot_id=str(row["snapshot_id"] or ""),
         projection_id=str(row["projection_id"] or ""),
         failure_reason=str(row["failure_reason"] or ""),
+        incomplete_fanin=_parse_json_object(row["incomplete_fanin_json"]),
         created_at=str(row["created_at"] or ""),
         updated_at=str(row["updated_at"] or ""),
         closed_at=str(row["closed_at"] or ""),
@@ -14332,9 +14416,9 @@ def upsert_integration_epoch(
             active_queue_item_id, active_task_id, active_backlog_id,
             active_checkpoint_id, expected_head_before, expected_branch_head,
             last_merge_commit, snapshot_id, projection_id, failure_reason,
-            created_at, updated_at, closed_at
+            incomplete_fanin_json, created_at, updated_at, closed_at
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(project_id, batch_id) DO UPDATE SET
             epoch_id = excluded.epoch_id,
@@ -14358,6 +14442,7 @@ def upsert_integration_epoch(
             snapshot_id = excluded.snapshot_id,
             projection_id = excluded.projection_id,
             failure_reason = excluded.failure_reason,
+            incomplete_fanin_json = excluded.incomplete_fanin_json,
             updated_at = excluded.updated_at,
             closed_at = excluded.closed_at
         """,
@@ -14385,6 +14470,7 @@ def upsert_integration_epoch(
             epoch.snapshot_id,
             epoch.projection_id,
             epoch.failure_reason,
+            _json_object(epoch.incomplete_fanin),
             created,
             now,
             epoch.closed_at,
@@ -14558,6 +14644,14 @@ def validate_integration_epoch_backlog_close(
         "child_protected_close_required": scope == "child",
         "backlog_close_independent_of_epoch_release": True,
         "epoch_release_source": "activated_terminal_full_reconcile_projection",
+        "fanin_status": (
+            "incomplete" if epoch.incomplete_fanin else "complete"
+        ),
+        "incomplete_fanin": dict(epoch.incomplete_fanin),
+        "full_batch_completion_claimed": not bool(epoch.incomplete_fanin),
+        "normal_close_allowed_with_recorded_incomplete_fanin": bool(
+            epoch.incomplete_fanin
+        ),
     }
 
 
@@ -14655,6 +14749,11 @@ def integration_epoch_resume_payload(
         "pending_child_backlog_ids_observational_only": True,
         "backlog_close_required_for_epoch_release": False,
         "backlog_close_independent": True,
+        "fanin_status": (
+            "incomplete" if epoch.incomplete_fanin else "complete"
+        ),
+        "incomplete_fanin": dict(epoch.incomplete_fanin),
+        "full_batch_completion_claimed": not bool(epoch.incomplete_fanin),
         "required_tool": (
             "graph_current_full_reconcile"
             if epoch.status
@@ -15069,6 +15168,330 @@ def advance_integration_epoch_after_merge(
         ),
         now_iso=now_iso,
     )
+
+
+def release_integration_epoch_unlandable_child(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    batch_id: str,
+    queue_item_id: str,
+    child_backlog_id: str,
+    blocking_backlog_id: str,
+    operator_principal: str,
+    approval_ref: str,
+    reason: str,
+    evidence_refs: Sequence[str],
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Explicitly release one terminal child without inventing merge credit.
+
+    The child backlog must already be audit-terminal ``WAIVED``.  That durable
+    server state, plus authenticated operator approval at the HTTP facade, is
+    what separates a permanently unlandable lane from a slow, unstarted, or
+    otherwise recoverable child.  Audit archive itself never calls this helper.
+    """
+
+    ensure_branch_runtime_schema(conn)
+    project = str(project_id or "").strip()
+    batch = str(batch_id or "").strip()
+    item_id = str(queue_item_id or "").strip()
+    child_backlog = str(child_backlog_id or "").strip()
+    blocking_backlog = str(blocking_backlog_id or "").strip()
+    operator = str(operator_principal or "").strip()
+    approval = str(approval_ref or "").strip()
+    bounded_reason = str(reason or "").strip()
+    refs = tuple(
+        dict.fromkeys(
+            str(ref or "").strip()
+            for ref in evidence_refs
+            if str(ref or "").strip()
+        )
+    )
+    required = {
+        "project_id": project,
+        "batch_id": batch,
+        "queue_item_id": item_id,
+        "child_backlog_id": child_backlog,
+        "blocking_backlog_id": blocking_backlog,
+        "operator_principal": operator,
+        "approval_ref": approval,
+        "reason": bounded_reason,
+    }
+    missing = [key for key, value in required.items() if not value]
+    if missing or not refs:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_evidence_required",
+            "explicit release requires complete operator, backlog, reason, and evidence bindings",
+            missing_fields=[*missing, *([] if refs else ["evidence_refs"])],
+        )
+    if child_backlog == blocking_backlog:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_blocking_backlog_must_be_distinct",
+            "blocking backlog must name the defect that made the child unlandable",
+            child_backlog_id=child_backlog,
+            blocking_backlog_id=blocking_backlog,
+        )
+
+    existing_event = conn.execute(
+        """
+        SELECT * FROM parallel_branch_integration_epoch_release_events
+        WHERE project_id = ? AND batch_id = ? AND queue_item_id = ?
+        """,
+        (project, batch, item_id),
+    ).fetchone()
+    if existing_event is not None:
+        exact_replay = (
+            str(existing_event["child_backlog_id"] or "") == child_backlog
+            and str(existing_event["blocking_backlog_id"] or "")
+            == blocking_backlog
+            and str(existing_event["operator_principal"] or "") == operator
+            and str(existing_event["approval_ref"] or "") == approval
+            and str(existing_event["reason"] or "") == bounded_reason
+            and _parse_json_array(existing_event["evidence_refs_json"]) == refs
+        )
+        if not exact_replay:
+            raise IntegrationEpochUnlandableChildReleaseError(
+                "integration_epoch_release_replay_identity_mismatch",
+                "release replay must exactly match the immutable audit event",
+                event_id=int(existing_event["id"] or 0),
+                queue_item_id=item_id,
+            )
+        replay_epoch = get_integration_epoch(conn, project, batch)
+        replay_item = get_merge_queue_item(
+            conn,
+            project,
+            str(existing_event["merge_queue_id"] or ""),
+            item_id,
+        )
+        return {
+            "schema_version": "mf_batch_parallel.explicit_unlandable_release.v1",
+            "ok": True,
+            "replayed": True,
+            "release_event_id": int(existing_event["id"] or 0),
+            "integration_epoch": (
+                integration_epoch_to_dict(replay_epoch) if replay_epoch else {}
+            ),
+            "queue_item": (
+                merge_queue_item_to_dict(replay_item) if replay_item else {}
+            ),
+            "merge_credit_granted": False,
+            "target_head_mutated": False,
+            "full_batch_completion_claimed": False,
+        }
+
+    epoch = get_integration_epoch(conn, project, batch)
+    if epoch is None:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_not_found",
+            "explicit release requires an existing durable integration epoch",
+            project_id=project,
+            batch_id=batch,
+        )
+    if epoch.status == INTEGRATION_EPOCH_MERGE_IN_DOUBT:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_merge_in_doubt",
+            "resolve the in-doubt merge before considering an unlandable-child release",
+            integration_epoch=integration_epoch_to_dict(epoch),
+        )
+    if epoch.status != INTEGRATION_EPOCH_OPEN:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_requires_open_epoch",
+            "explicit child release is allowed only at the open merge cursor",
+            observed_status=epoch.status,
+            integration_epoch=integration_epoch_to_dict(epoch),
+        )
+    if (
+        epoch.active_queue_item_id != item_id
+        or item_id not in epoch.remaining_queue_item_ids
+        or item_id in epoch.merged_prefix
+    ):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_requires_active_outstanding_child",
+            "release target must be the exact active unmerged epoch child",
+            queue_item_id=item_id,
+            active_queue_item_id=epoch.active_queue_item_id,
+            remaining_queue_item_ids=list(epoch.remaining_queue_item_ids),
+            merged_prefix=list(epoch.merged_prefix),
+        )
+    if epoch.remaining_queue_item_ids != (item_id,):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_requires_sole_remaining_child",
+            (
+                "the bounded recovery may release only the final outstanding "
+                "child; a released middle child would make later merge credit "
+                "non-contiguous"
+            ),
+            queue_item_id=item_id,
+            remaining_queue_item_ids=list(epoch.remaining_queue_item_ids),
+            successor_merge_preserved=True,
+        )
+    item = get_merge_queue_item(conn, project, epoch.merge_queue_id, item_id)
+    if item is None:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_queue_item_not_found",
+            "active epoch queue item is missing from the durable merge queue",
+            merge_queue_id=epoch.merge_queue_id,
+            queue_item_id=item_id,
+        )
+    if item.backlog_id != child_backlog:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_child_backlog_mismatch",
+            "child backlog must match the durable merge queue item",
+            expected_child_backlog_id=item.backlog_id,
+            actual_child_backlog_id=child_backlog,
+        )
+    if item.status in {STATE_MERGED, STATE_MERGING} or item.merge_commit:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_child_may_have_landed",
+            "a merged or merging child cannot be released as unlandable",
+            queue_item_id=item_id,
+            observed_status=item.status,
+            merge_commit=item.merge_commit,
+        )
+
+    backlog_rows = conn.execute(
+        """
+        SELECT bug_id, status FROM backlog_bugs
+        WHERE bug_id IN (?, ?)
+        """,
+        (child_backlog, blocking_backlog),
+    ).fetchall()
+    backlog_statuses = {
+        str(row["bug_id"] or ""): str(row["status"] or "").upper()
+        for row in backlog_rows
+    }
+    if child_backlog not in backlog_statuses:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_child_backlog_not_found",
+            "child backlog row is required before release",
+            child_backlog_id=child_backlog,
+        )
+    if blocking_backlog not in backlog_statuses:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_blocking_backlog_not_found",
+            "blocking defect backlog row is required before release",
+            blocking_backlog_id=blocking_backlog,
+        )
+    if backlog_statuses[child_backlog] != "WAIVED":
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_child_not_terminal_unlandable",
+            (
+                "slow, unstarted, or recoverable children cannot be released; "
+                "the child backlog must already be WAIVED"
+            ),
+            child_backlog_id=child_backlog,
+            child_backlog_status=backlog_statuses[child_backlog],
+            recoverable_child_refused=True,
+        )
+
+    now = now_iso or utc_now()
+    remaining = tuple(
+        candidate
+        for candidate in epoch.remaining_queue_item_ids
+        if candidate != item_id
+    )
+    next_item_id = remaining[0] if remaining else ""
+    next_task, next_backlog, next_checkpoint = _integration_epoch_next_item_fields(
+        conn,
+        project_id=project,
+        merge_queue_id=epoch.merge_queue_id,
+        queue_item_id=next_item_id,
+    )
+    release_record = {
+        "queue_item_id": item_id,
+        "child_backlog_id": child_backlog,
+        "blocking_backlog_id": blocking_backlog,
+        "operator_principal": operator,
+        "approval_ref": approval,
+        "reason": bounded_reason,
+        "evidence_refs": list(refs),
+        "released_at": now,
+        "pre_release_queue_status": item.status,
+        "merge_credit_granted": False,
+        "target_head_mutated": False,
+    }
+    previous_records = list(epoch.incomplete_fanin.get("released_children") or [])
+    incomplete_fanin = {
+        "schema_version": "mf_batch_parallel.incomplete_fanin.v1",
+        "status": "incomplete",
+        "full_batch_completion_claimed": False,
+        "merge_credit_granted": False,
+        "released_children": [*previous_records, release_record],
+        "released_queue_item_ids": [
+            *[
+                str(value)
+                for value in epoch.incomplete_fanin.get("released_queue_item_ids")
+                or []
+            ],
+            item_id,
+        ],
+    }
+    saved_item = upsert_merge_queue_item(
+        conn,
+        replace(
+            item,
+            status=STATE_RELEASED_UNLANDABLE,
+            completed_at=now,
+            failure_reason=bounded_reason,
+        ),
+        now_iso=now,
+    )
+    saved_epoch = upsert_integration_epoch(
+        conn,
+        replace(
+            epoch,
+            remaining_queue_item_ids=remaining,
+            status=(
+                INTEGRATION_EPOCH_OPEN
+                if remaining
+                else INTEGRATION_EPOCH_RECONCILE_PENDING
+            ),
+            active_queue_item_id=next_item_id,
+            active_task_id=next_task,
+            active_backlog_id=next_backlog,
+            active_checkpoint_id=next_checkpoint,
+            reconcile_state="pending",
+            failure_reason="",
+            incomplete_fanin=incomplete_fanin,
+        ),
+        now_iso=now,
+    )
+    cursor = conn.execute(
+        """
+        INSERT INTO parallel_branch_integration_epoch_release_events (
+            project_id, batch_id, epoch_id, merge_queue_id, queue_item_id,
+            child_backlog_id, blocking_backlog_id, operator_principal,
+            approval_ref, reason, evidence_refs_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            project,
+            batch,
+            epoch.epoch_id,
+            epoch.merge_queue_id,
+            item_id,
+            child_backlog,
+            blocking_backlog,
+            operator,
+            approval,
+            bounded_reason,
+            _json_array(list(refs)),
+            now,
+        ),
+    )
+    release_event_id = int(cursor.lastrowid or 0)
+    return {
+        "schema_version": "mf_batch_parallel.explicit_unlandable_release.v1",
+        "ok": True,
+        "release_event_id": release_event_id,
+        "integration_epoch": integration_epoch_to_dict(saved_epoch),
+        "queue_item": merge_queue_item_to_dict(saved_item),
+        "incomplete_fanin": dict(saved_epoch.incomplete_fanin),
+        "merge_credit_granted": False,
+        "target_head_mutated": False,
+        "full_batch_completion_claimed": False,
+    }
 
 
 def mark_integration_epoch_reconciled(
@@ -19774,6 +20197,8 @@ def _target_head_moved_after_validation(item: MergeQueueItem) -> bool:
 
 
 def _merge_queue_actions_for(action: str) -> tuple[str, ...]:
+    if action == ACTION_LEAVE_RELEASED_UNLANDABLE:
+        return ("retain_terminal_audit", "do_not_merge", "do_not_resurrect")
     if action == ACTION_WAIT_FOR_DEPENDENCY:
         return ("wait_for_dependency", "do_not_merge")
     if action == ACTION_BLOCKED_BY_DEPENDENCY:
@@ -19831,6 +20256,13 @@ def decide_merge_queue(
             target_mutation_allowed = False
             graph_allowed = True
             semantic_allowed = True
+        elif item.status == STATE_RELEASED_UNLANDABLE:
+            queue_state = STATE_RELEASED_UNLANDABLE
+            action = ACTION_LEAVE_RELEASED_UNLANDABLE
+            merge_allowed = False
+            target_mutation_allowed = False
+            graph_allowed = False
+            semantic_allowed = False
         elif item.status == STATE_MERGE_FAILED:
             queue_state = STATE_MERGE_BLOCKED
             action = ACTION_OBSERVER_DECISION_REQUIRED

@@ -140587,6 +140587,137 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
     }
 
 
+@route(
+    "POST",
+    "/api/projects/{project_id}/integration-epochs/{batch_id}/release-unlandable-child",
+)
+def handle_integration_epoch_release_unlandable_child(ctx: RequestContext):
+    """Run the explicit audited escape hatch for one terminal batch child."""
+
+    from .parallel_branch_runtime import (
+        IntegrationEpochUnlandableChildReleaseError,
+        ensure_branch_runtime_schema,
+        release_integration_epoch_unlandable_child,
+    )
+
+    project_id = ctx.get_project_id()
+    batch_id = str(ctx.path_params.get("batch_id") or "").strip()
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    queue_item_id = str(body.get("queue_item_id") or "").strip()
+    child_backlog_id = str(body.get("child_backlog_id") or "").strip()
+    blocking_backlog_id = str(body.get("blocking_backlog_id") or "").strip()
+    approval_ref = str(body.get("approval_ref") or "").strip()
+    reason = str(body.get("reason") or "").strip()
+    evidence_refs = _body_string_list(body, "evidence_refs") or []
+    missing = [
+        field
+        for field, value in (
+            ("batch_id", batch_id),
+            ("queue_item_id", queue_item_id),
+            ("child_backlog_id", child_backlog_id),
+            ("blocking_backlog_id", blocking_backlog_id),
+            ("approval_ref", approval_ref),
+            ("reason", reason),
+            ("evidence_refs", evidence_refs),
+        )
+        if not value
+    ]
+    if missing:
+        return 422, {
+            "ok": False,
+            "error": "integration_epoch_release_evidence_required",
+            "missing_fields": missing,
+            "release_performed": False,
+            "zero_write_rejection": True,
+        }
+    if not _body_bool(body, "operator_approved", False):
+        return 422, {
+            "ok": False,
+            "error": "integration_epoch_release_operator_approval_required",
+            "required": "operator_approved=true",
+            "release_performed": False,
+            "zero_write_rejection": True,
+        }
+    if not _body_bool(body, "permanently_unlandable", False) or _body_bool(
+        body, "recoverable", True
+    ):
+        return 409, {
+            "ok": False,
+            "error": "integration_epoch_release_permanent_disposition_required",
+            "required": {
+                "permanently_unlandable": True,
+                "recoverable": False,
+            },
+            "release_performed": False,
+            "recoverable_child_refused": True,
+            "zero_write_rejection": True,
+        }
+
+    conn = get_connection(project_id)
+    try:
+        operator = _require_graph_governance_operator(
+            ctx,
+            conn,
+            "parallel-branches.integration-epoch.release-unlandable-child",
+        )
+        ensure_branch_runtime_schema(conn)
+        operator_principal = str(
+            operator.get("principal_id") or operator.get("role") or "operator"
+        ).strip()
+        canonical_refs = list(
+            dict.fromkeys(
+                [
+                    *evidence_refs,
+                    f"backlog:{child_backlog_id}",
+                    f"backlog:{blocking_backlog_id}",
+                    f"operator-approval:{approval_ref}",
+                ]
+            )
+        )
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = release_integration_epoch_unlandable_child(
+                conn,
+                project_id=project_id,
+                batch_id=batch_id,
+                queue_item_id=queue_item_id,
+                child_backlog_id=child_backlog_id,
+                blocking_backlog_id=blocking_backlog_id,
+                operator_principal=operator_principal,
+                approval_ref=approval_ref,
+                reason=reason,
+                evidence_refs=canonical_refs,
+            )
+        except IntegrationEpochUnlandableChildReleaseError as exc:
+            conn.rollback()
+            return 409, {"ok": False, **exc.details}
+        conn.commit()
+        return {
+            **result,
+            "action": "integration_epoch_release_unlandable_child",
+            "project_id": project_id,
+            "batch_id": batch_id,
+            "authorization": {
+                "mode": "graph_governance_operator_session",
+                "operator_principal": operator_principal,
+                "operator_approved": True,
+                "approval_ref": approval_ref,
+                "raw_credentials_exposed": False,
+            },
+            "runtime_entrypoint": {
+                "method": "POST",
+                "path": (
+                    "/api/projects/{project_id}/integration-epochs/"
+                    "{batch_id}/release-unlandable-child"
+                ),
+            },
+            "writes_performed": not bool(result.get("replayed")),
+        }
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/projects/{project_id}/release-operator-head-queue")
 @route("POST", "/api/projects/{project_id}/release-operator-head-queue")
 def handle_project_release_operator_head_queue(ctx: RequestContext):
