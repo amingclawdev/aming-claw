@@ -26695,11 +26695,7 @@ def _runtime_context_worker_recovery_payloads(
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
-            **(
-                {"contract_execution_id": contract_execution_id}
-                if contract_execution_id
-                else {}
-            ),
+            "contract_execution_id": contract_execution_id or parent_task_id,
             "target_project_root": target_project_root,
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
@@ -26715,11 +26711,7 @@ def _runtime_context_worker_recovery_payloads(
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
-            **(
-                {"contract_execution_id": contract_execution_id}
-                if contract_execution_id
-                else {}
-            ),
+            "contract_execution_id": contract_execution_id or parent_task_id,
             "target_project_root": target_project_root,
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
@@ -28947,7 +28939,10 @@ def _runtime_context_worker_recovery_details(
                         "runtime_context_id": expected_runtime_context_id,
                         "task_id": str(getattr(context, "task_id", "") or ""),
                         "parent_task_id": expected_parent_task_id,
+                        "contract_execution_id": expected_parent_task_id,
                         "target_project_root": expected_target_root,
+                        "worker_id": expected_worker_id,
+                        "worker_slot_id": expected_worker_slot_id,
                         **safe_route_identity,
                         "reason": (
                             "<operator reason: host adapter needs first worker auth env>"
@@ -28958,7 +28953,10 @@ def _runtime_context_worker_recovery_details(
                         "runtime_context_id": expected_runtime_context_id,
                         "task_id": str(getattr(context, "task_id", "") or ""),
                         "parent_task_id": expected_parent_task_id,
+                        "contract_execution_id": expected_parent_task_id,
                         "target_project_root": expected_target_root,
+                        "worker_id": expected_worker_id,
+                        "worker_slot_id": expected_worker_slot_id,
                         **safe_route_identity,
                         "reason": (
                             "<operator reason: host adapter needs first worker auth env>"
@@ -33720,6 +33718,7 @@ def _runtime_context_initial_join_expected_canonical_identity_binding(
     host_startup_id: str,
     host_session_id: str,
     route_identity: Mapping[str, Any],
+    dispatch_identity_anchor: Mapping[str, Any],
     missing_lineage: Sequence[str],
     now_iso: str = "",
 ) -> dict[str, Any]:
@@ -33778,6 +33777,12 @@ def _runtime_context_initial_join_expected_canonical_identity_binding(
             field: str(route_identity.get(field) or "").strip()
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
         },
+        "contract_dispatch_identity_anchor_required": bool(
+            dispatch_identity_anchor
+        ),
+        "contract_dispatch_identity_anchor": dict(
+            dispatch_identity_anchor
+        ),
         "session_token_lease": {
             "schema_version": str(lease.get("schema_version") or ""),
             "lease_id": str(lease.get("lease_id") or ""),
@@ -33805,6 +33810,7 @@ def _runtime_context_initial_join_canonical_identity_binding(
     expected_host_startup_id: str,
     expected_host_session_id: str,
     route_identity: Mapping[str, Any],
+    dispatch_identity_anchor: Mapping[str, Any],
     expected_missing_lineage: Sequence[str],
     actual_missing_lineage: Sequence[str],
     now_iso: str = "",
@@ -33828,6 +33834,7 @@ def _runtime_context_initial_join_canonical_identity_binding(
         host_startup_id=expected_host_startup_id,
         host_session_id=expected_host_session_id,
         route_identity=route_identity,
+        dispatch_identity_anchor=dispatch_identity_anchor,
         missing_lineage=expected_missing_lineage,
         now_iso=now_iso,
     )
@@ -34027,6 +34034,72 @@ def _runtime_context_initial_join_identity_binding_anchor(
     return {**core, "anchor_hash": _stable_public_hash(core)}
 
 
+def _runtime_context_initial_join_cutover_authority(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    contract_execution_id: str,
+    task_id: str,
+    parent_task_id: str,
+    backlog_id: str,
+    initial_join_event_ref: str,
+    identity_anchor_ref: str,
+    canonical_binding: Mapping[str, Any],
+    identity_anchor: Mapping[str, Any],
+    operator_principal_id: str,
+    operator_session_id: str,
+    operator_role: str,
+    created_at: str,
+) -> dict[str, Any]:
+    """Build the closed append-only access-audit authority for the v2 cutover."""
+
+    route_identity = (
+        canonical_binding.get("route_identity")
+        if isinstance(canonical_binding.get("route_identity"), Mapping)
+        else {}
+    )
+    core = {
+        "schema_version": "runtime_context.initial_join_identity_cutover.v1",
+        "server_derived": True,
+        "project_id": str(project_id or "").strip(),
+        "runtime_context_id": str(runtime_context_id or "").strip(),
+        "contract_execution_id": str(
+            contract_execution_id or ""
+        ).strip(),
+        "task_id": str(task_id or "").strip(),
+        "parent_task_id": str(parent_task_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "initial_join_event_ref": str(initial_join_event_ref or "").strip(),
+        "identity_anchor_ref": str(identity_anchor_ref or "").strip(),
+        "canonical_binding_hash": str(
+            canonical_binding.get("binding_hash") or ""
+        ).strip(),
+        "identity_anchor_hash": str(
+            identity_anchor.get("anchor_hash") or ""
+        ).strip(),
+        "operator_principal_id": str(
+            operator_principal_id or ""
+        ).strip(),
+        "operator_session_id": str(operator_session_id or "").strip(),
+        "operator_role": str(operator_role or "").strip(),
+        "created_at": str(created_at or "").strip(),
+        "session_token_ref": str(
+            canonical_binding.get("session_token_ref") or ""
+        ).strip(),
+        "route_identity_hash": _stable_public_hash(dict(route_identity)),
+        "raw_credentials_persisted": False,
+    }
+    return {**core, "cutover_hash": _stable_public_hash(core)}
+
+
+def _runtime_context_initial_join_cutover_audit_id(
+    cutover: Mapping[str, Any],
+) -> str:
+    cutover_hash = str(cutover.get("cutover_hash") or "").strip()
+    digest = cutover_hash.removeprefix("sha256:")
+    return f"rtca-initial-join-binding-{digest[:24]}"
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/initial-join")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/session-token/initial-join")
 def handle_graph_governance_runtime_context_session_token_initial_join(ctx: RequestContext):
@@ -34088,6 +34161,14 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
         supplied_contract_execution_id = str(
             body.get("contract_execution_id") or ""
         ).strip()
+        supplied_worker_id = str(body.get("worker_id") or "").strip()
+        supplied_worker_slot_id = str(
+            body.get("worker_slot_id") or ""
+        ).strip()
+        canonical_worker_id = str(context.worker_id or "").strip()
+        canonical_worker_slot_id = str(
+            context.worker_slot_id or context.worker_id or ""
+        ).strip()
         identity_mismatch_fields = [
             field
             for field, supplied, canonical in (
@@ -34102,14 +34183,20 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                     supplied_contract_execution_id,
                     canonical_parent_task_id,
                 ),
+                ("worker_id", supplied_worker_id, canonical_worker_id),
+                (
+                    "worker_slot_id",
+                    supplied_worker_slot_id,
+                    canonical_worker_slot_id,
+                ),
             )
-            if supplied and supplied != canonical
+            if supplied != canonical
         ]
         if identity_mismatch_fields:
             conn.rollback()
             raise GovernanceError(
                 "runtime_context_initial_join_contract_identity_mismatch",
-                "runtime-context initial join requires exact canonical task and parent contract identity",
+                "runtime-context initial join requires exact canonical task, parent contract, and worker identity",
                 403,
                 {
                     "runtime_context_id": runtime_context_id,
@@ -34118,7 +34205,7 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                     "mutation_performed": False,
                     "fail_closed": True,
                     "next_legal_action": (
-                        "submit_the_server_advertised_parent_contract_execution_id"
+                        "submit_the_server_advertised_initial_join_identity"
                     ),
                 },
             )
@@ -34361,15 +34448,52 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 },
             )
         context = locked_context
-        locked_session = _require_graph_governance_mf_subagent(
-            ctx,
-            conn,
-            "graph-governance.runtime-context.session-token-initial-join",
-        )
+        try:
+            if ctx.token:
+                locked_session = role_service.authenticate(conn, ctx.token)
+            else:
+                locked_session = _require_graph_governance_mf_subagent(
+                    ctx,
+                    conn,
+                    (
+                        "graph-governance.runtime-context."
+                        "session-token-initial-join"
+                    ),
+                )
+        except Exception:
+            conn.rollback()
+            raise
         require_operator_capability(
             locked_session,
             "graph-governance.runtime-context.session-token-initial-join",
         )
+        if any(
+            str(locked_session.get(field) or "").strip()
+            != str(session.get(field) or "").strip()
+            for field in (
+                "session_id",
+                "principal_id",
+                "project_id",
+                "role",
+            )
+        ):
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_session_authority_changed",
+                "runtime-context role-service session changed before issuance",
+                403,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": canonical_task_id,
+                    "mutation_performed": False,
+                    "timeline_event_persisted": False,
+                    "credential_rotated": False,
+                    "fail_closed": True,
+                    "next_legal_action": (
+                        "reauthenticate_active_role_service_session_before_initial_join"
+                    ),
+                },
+            )
         locked_expected_route_identity = (
             _runtime_context_latest_route_identity(conn, context)
         )
@@ -34420,6 +34544,43 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 },
             )
         session = locked_session
+        contract_dispatch_anchor_required = (
+            _runtime_context_contract_dispatch_anchor_required(
+                conn,
+                context=context,
+                contract_execution_id=contract_execution_id,
+            )
+        )
+        contract_dispatch_identity_anchor = (
+            _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
+                conn,
+                project_id=project_id,
+                context=context,
+                runtime_context_id=runtime_context_id,
+                contract_execution_id=contract_execution_id,
+            )
+        )
+        if (
+            contract_dispatch_anchor_required
+            and not contract_dispatch_identity_anchor
+        ):
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_dispatch_identity_mismatch",
+                "runtime-context identity does not match the accepted ContractRuntime dispatch",
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": canonical_task_id,
+                    "mutation_performed": False,
+                    "timeline_event_persisted": False,
+                    "credential_rotated": False,
+                    "fail_closed": True,
+                    "next_legal_action": (
+                        "repair_runtime_context_from_accepted_dispatch_before_initial_join"
+                    ),
+                },
+            )
         try:
             result = initial_join_mf_subagent_runtime_session_token(
                 conn,
@@ -34546,6 +34707,9 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 expected_host_startup_id=expected_host_startup_id,
                 expected_host_session_id=expected_host_session_id,
                 route_identity=safe_route_identity,
+                dispatch_identity_anchor=(
+                    contract_dispatch_identity_anchor
+                ),
                 expected_missing_lineage=missing_lineage,
                 actual_missing_lineage=post_join_missing_lineage,
                 now_iso=str(body.get("now_iso") or ""),
@@ -34598,6 +34762,13 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                     "AMING_WORKER_FENCE_TOKEN",
                 ],
                 "reason": reason,
+                "operator_principal_id": str(
+                    session.get("principal_id") or ""
+                ).strip(),
+                "operator_session_id": str(
+                    session.get("session_id") or ""
+                ).strip(),
+                "operator_role": session_role(session),
                 "operator_session_role": session_role(session),
                 "missing_lineage": missing_lineage,
                 "runtime_context_id": runtime_context_id_for_branch_context(context),
@@ -34654,6 +34825,60 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 actor=str(session.get("principal_id") or "observer"),
                 payload=anchor_payload,
             )
+            identity_anchor_ref = f"timeline:{anchor_event.get('id', '')}"
+            cutover_authority = (
+                _runtime_context_initial_join_cutover_authority(
+                    project_id=project_id,
+                    runtime_context_id=runtime_context_id,
+                    contract_execution_id=contract_execution_id,
+                    task_id=context.task_id,
+                    parent_task_id=parent_task_id,
+                    backlog_id=context.backlog_id,
+                    initial_join_event_ref=initial_join_event_ref,
+                    identity_anchor_ref=identity_anchor_ref,
+                    canonical_binding=canonical_binding,
+                    identity_anchor=anchor_payload,
+                    operator_principal_id=str(
+                        locked_session.get("principal_id") or ""
+                    ).strip(),
+                    operator_session_id=str(
+                        locked_session.get("session_id") or ""
+                    ).strip(),
+                    operator_role=session_role(locked_session),
+                    created_at=str(audit_event.get("created_at") or "").strip(),
+                )
+            )
+            cutover_audit_id = (
+                _runtime_context_initial_join_cutover_audit_id(
+                    cutover_authority
+                )
+            )
+            conn.execute(
+                """
+                INSERT INTO parallel_branch_runtime_access_audit (
+                    audit_id, project_id, runtime_context_id, task_id,
+                    principal_id, session_id, role, view_name, decision,
+                    reason, projection_hash, nodes_read_json, metadata_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cutover_audit_id,
+                    project_id,
+                    runtime_context_id,
+                    context.task_id,
+                    str(locked_session.get("principal_id") or "").strip(),
+                    str(locked_session.get("session_id") or "").strip(),
+                    session_role(locked_session),
+                    "initial_join_identity_cutover",
+                    "allowed",
+                    "canonical_identity_binding_required",
+                    cutover_authority["cutover_hash"],
+                    "[]",
+                    json.dumps(cutover_authority, sort_keys=True),
+                    cutover_authority["created_at"],
+                ),
+            )
         except Exception:
             conn.rollback()
             raise
@@ -34665,6 +34890,10 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
         )
         result["canonical_identity_binding_anchor_hash"] = (
             anchor_payload["anchor_hash"]
+        )
+        result["canonical_identity_cutover_audit_id"] = cutover_audit_id
+        result["canonical_identity_cutover_hash"] = (
+            cutover_authority["cutover_hash"]
         )
         result["raw_tokens_persisted_to_timeline"] = False
         return result
@@ -38743,6 +38972,257 @@ def _runtime_context_rotate_validated_missing_finish_auth(
     }
 
 
+def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    runtime_context_id: str,
+    contract_execution_id: str,
+) -> dict[str, Any]:
+    """Read the independent accepted dispatch identity for legacy joins."""
+
+    execution_id = str(contract_execution_id or "").strip()
+    runtime_id = str(runtime_context_id or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    try:
+        record = _contract_runtime(conn).store.get(execution_id)
+    except Exception:
+        return {}
+    if (
+        str(record.get("project_id") or "").strip() != project_id
+        or str(record.get("backlog_id") or "").strip() != backlog_id
+        or str(record.get("contract_execution_id") or "").strip()
+        != execution_id
+    ):
+        return {}
+
+    dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+    if not dispatch_match:
+        return {}
+    dispatch_line = (
+        dispatch_match.get("line")
+        if isinstance(dispatch_match.get("line"), Mapping)
+        else {}
+    )
+    dispatch_payload = (
+        dispatch_match.get("payload")
+        if isinstance(dispatch_match.get("payload"), Mapping)
+        else {}
+    )
+    line_index = dispatch_match.get("line_index")
+    dispatch_schema_version = str(
+        dispatch_payload.get("schema_version")
+        or dispatch_line.get("schema_version")
+        or ""
+    ).strip()
+    if (
+        not isinstance(line_index, int)
+        or str(dispatch_line.get("stage_id") or "").strip() != "dispatch"
+        or str(dispatch_line.get("line_id") or "").strip()
+        != "observer_dispatch_bounded_workers"
+        or str(dispatch_line.get("evidence_kind") or "").strip()
+        != "dispatch_bounded_worker"
+        or str(dispatch_line.get("actor_role") or "").strip() != "observer"
+        or str(dispatch_line.get("status") or "").strip().lower()
+        not in {"", "accepted"}
+        or not dispatch_schema_version
+    ):
+        return {}
+    identity = {
+        "runtime_context_id": runtime_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": _runtime_context_effective_target_project_root(
+            context
+        ),
+        "worktree_path": str(
+            getattr(context, "worktree_path", "") or ""
+        ).strip(),
+        "branch_ref": str(
+            getattr(context, "branch_ref", "") or ""
+        ).strip(),
+        "base_commit": str(
+            getattr(context, "base_commit", "") or ""
+        ).strip(),
+        "target_head_commit": str(
+            getattr(context, "target_head_commit", "") or ""
+        ).strip(),
+        "merge_queue_id": str(
+            getattr(context, "merge_queue_id", "") or ""
+        ).strip(),
+    }
+    if any(
+        not identity.get(field)
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "target_project_root",
+            "worktree_path",
+            "branch_ref",
+            "base_commit",
+            "target_head_commit",
+            "merge_queue_id",
+        )
+    ):
+        return {}
+    exact_runtime_dispatch_candidates = [
+        candidate
+        for source in (dispatch_line, dispatch_payload)
+        for candidate in _contract_runtime_mapping_candidates(source)
+        if str(candidate.get("runtime_context_id") or "").strip()
+        == runtime_id
+    ]
+    if not exact_runtime_dispatch_candidates:
+        return {}
+    for candidate in exact_runtime_dispatch_candidates:
+        for field, expected in (
+            ("task_id", task_id),
+            ("worker_id", worker_id),
+            ("worker_slot_id", worker_slot_id),
+        ):
+            actual = str(candidate.get(field) or "").strip()
+            if actual and actual != expected:
+                return {}
+    for field in (
+        "target_project_root",
+        "worktree_path",
+        "branch_ref",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+    ):
+        durable_values = {
+            str(candidate.get(field) or "").strip()
+            for candidate in exact_runtime_dispatch_candidates
+            if str(candidate.get(field) or "").strip()
+        }
+        if durable_values != {identity[field]}:
+            return {}
+    expected_owned_files = list(
+        getattr(context, "owned_files", ())
+        or getattr(context, "target_files", ())
+        or ()
+    )
+    dispatch_owned_files = [
+        list(candidate.get("owned_files") or [])
+        for candidate in exact_runtime_dispatch_candidates
+        if isinstance(candidate.get("owned_files"), (list, tuple))
+    ]
+    if (
+        not expected_owned_files
+        or not dispatch_owned_files
+        or any(files != expected_owned_files for files in dispatch_owned_files)
+    ):
+        return {}
+    agent_candidates = {
+        str(candidate.get("agent_id") or "").strip()
+        for candidate in exact_runtime_dispatch_candidates
+        if str(candidate.get("agent_id") or "").strip()
+    }
+    if len(agent_candidates) > 1:
+        return {}
+    dispatch_agent_id = next(iter(agent_candidates), "")
+    core = {
+        "schema_version": (
+            "runtime_context.pre_lineage_legacy_dispatch_identity_anchor.v1"
+        ),
+        "server_derived": True,
+        "source": (
+            "ContractRuntime.completed_lines."
+            "observer_dispatch_bounded_workers"
+        ),
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "source_line_index": line_index,
+        "source_ref": str(dispatch_match.get("source_ref") or "").strip(),
+        "source_line_hash": _stable_public_hash(dict(dispatch_line)),
+        "dispatch_schema_version": dispatch_schema_version,
+        "dispatch_actor_role": "observer",
+        "dispatch_status": str(
+            dispatch_line.get("status") or "accepted"
+        ).strip().lower(),
+        **identity,
+        "owned_files": expected_owned_files,
+        "agent_id": dispatch_agent_id,
+        "raw_credentials_persisted": False,
+    }
+    return {**core, "anchor_hash": _stable_public_hash(core)}
+
+
+def _runtime_context_contract_execution_record_exists(
+    conn,
+    contract_execution_id: str,
+) -> bool:
+    try:
+        _contract_runtime(conn).store.get(
+            str(contract_execution_id or "").strip()
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _runtime_context_contract_dispatch_anchor_required(
+    conn,
+    *,
+    context: Any,
+    contract_execution_id: str,
+) -> bool:
+    """Fail closed for contexts whose parent is a ContractRuntime execution.
+
+    The allocation contract revision is independent of the ContractRuntime
+    row.  Keeping that signal prevents a deleted or malformed execution row
+    from being reclassified as an old hand-authored runtime context.
+    """
+
+    execution_id = str(contract_execution_id or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    if not execution_id or execution_id != parent_task_id:
+        return False
+    if _runtime_context_contract_execution_record_exists(conn, execution_id):
+        return True
+    runtime_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    rows = conn.execute(
+        """
+        SELECT payload_json
+        FROM parallel_branch_runtime_contract_revisions
+        WHERE project_id = ? AND runtime_context_id = ?
+        """,
+        (
+            str(getattr(context, "project_id", "") or "").strip(),
+            runtime_id,
+        ),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("schema_version")
+            == "parallel_branch_allocate_contract_revision.v1"
+            and payload.get("source") == "parallel_branch_allocate"
+        ):
+            return True
+    return False
+
+
 def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
     conn,
     *,
@@ -38917,6 +39397,22 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
         if isinstance(identity_anchor.get("payload"), Mapping)
         else {}
     )
+    cutover_audit_rows = conn.execute(
+        """
+        SELECT audit_id, project_id, runtime_context_id, task_id,
+               principal_id, session_id, role, view_name, decision, reason,
+               projection_hash, nodes_read_json, metadata_json, created_at
+        FROM parallel_branch_runtime_access_audit
+        WHERE project_id = ? AND runtime_context_id = ?
+          AND view_name = ?
+        ORDER BY created_at, audit_id
+        """,
+        (
+            project_id,
+            runtime_id,
+            "initial_join_identity_cutover",
+        ),
+    ).fetchall()
     discriminator_present = any(
         field in initial_join_payload
         for field in (
@@ -38929,6 +39425,7 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
         discriminator_present
         or canonical_binding_present
         or candidate_identity_anchors
+        or cutover_audit_rows
     )
     worker_session_id = str(
         initial_join_payload.get("worker_session_id") or ""
@@ -38977,6 +39474,27 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
     durable_allocation_owner = str(
         getattr(context, "allocation_owner", "") or ""
     ).strip()
+    contract_dispatch_anchor_required = (
+        _runtime_context_contract_dispatch_anchor_required(
+            conn,
+            context=context,
+            contract_execution_id=contract_execution_id,
+        )
+    )
+    legacy_dispatch_anchor = (
+        _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_id,
+            contract_execution_id=contract_execution_id,
+        )
+    )
+    if contract_dispatch_anchor_required and not legacy_dispatch_anchor:
+        errors.append("initial_join_audit_dispatch_identity_anchor_invalid")
+    dispatch_agent_id = str(
+        legacy_dispatch_anchor.get("agent_id") or ""
+    ).strip()
     for field, expected in expected_audit_identity.items():
         actual = str(initial_join_payload.get(field) or "").strip()
         if field == "agent_id" and expected and actual != expected:
@@ -38985,6 +39503,7 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
                 and actual
                 and actual == durable_allocation_agent_id
                 and actual == durable_allocation_owner
+                and actual == dispatch_agent_id
                 and durable_allocation_agent_id != expected
             ):
                 legacy_agent_id_normalization_candidate = True
@@ -39046,6 +39565,27 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
     expected_canonical_binding: dict[str, Any] = {}
     expected_identity_anchor: dict[str, Any] = {}
     if fresh_identity_cutover:
+        operator_principal_id = str(
+            initial_join_payload.get("operator_principal_id") or ""
+        ).strip()
+        operator_session_id = str(
+            initial_join_payload.get("operator_session_id") or ""
+        ).strip()
+        operator_role = str(
+            initial_join_payload.get("operator_role") or ""
+        ).strip()
+        if (
+            not operator_principal_id
+            or operator_principal_id
+            != str(initial_join_audit.get("actor") or "").strip()
+            or not operator_session_id
+            or operator_role not in {"observer", "coordinator"}
+            or str(
+                initial_join_payload.get("operator_session_role") or ""
+            ).strip()
+            != operator_role
+        ):
+            errors.append("initial_join_audit_operator_identity_invalid")
         if (
             initial_join_payload.get("initial_join_identity_contract_version")
             != "runtime_context.initial_join_identity.v2"
@@ -39079,6 +39619,7 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
                 host_startup_id=host_startup_id,
                 host_session_id=host_session_id,
                 route_identity=canonical_route_identity,
+                dispatch_identity_anchor=legacy_dispatch_anchor,
                 missing_lineage=expected_missing_lineage,
                 now_iso=now_iso,
             )
@@ -39160,6 +39701,95 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
             != dict(expected_meta_contract_gate)
         ):
             errors.append("initial_join_audit_identity_anchor_mismatch")
+        expected_cutover_authority: dict[str, Any] = {}
+        expected_cutover_audit_id = ""
+        if initial_join_audit and identity_anchor and expected_identity_anchor:
+            expected_cutover_authority = (
+                _runtime_context_initial_join_cutover_authority(
+                    project_id=project_id,
+                    runtime_context_id=runtime_id,
+                    contract_execution_id=contract_execution_id,
+                    task_id=task_id,
+                    parent_task_id=parent_task_id,
+                    backlog_id=backlog_id,
+                    initial_join_event_ref=(
+                        f"timeline:{initial_join_audit.get('id', '')}"
+                    ),
+                    identity_anchor_ref=(
+                        f"timeline:{identity_anchor.get('id', '')}"
+                    ),
+                    canonical_binding=expected_canonical_binding,
+                    identity_anchor=expected_identity_anchor,
+                    operator_principal_id=operator_principal_id,
+                    operator_session_id=operator_session_id,
+                    operator_role=operator_role,
+                    created_at=str(
+                        initial_join_audit.get("created_at") or ""
+                    ).strip(),
+                )
+            )
+            expected_cutover_audit_id = (
+                _runtime_context_initial_join_cutover_audit_id(
+                    expected_cutover_authority
+                )
+            )
+        if len(cutover_audit_rows) != 1:
+            errors.append("initial_join_audit_cutover_cardinality_invalid")
+        else:
+            cutover_row = cutover_audit_rows[0]
+            try:
+                cutover_metadata = json.loads(
+                    str(cutover_row["metadata_json"] or "")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                cutover_metadata = None
+            created_at = str(cutover_row["created_at"] or "").strip()
+            try:
+                created_at_dt = datetime.fromisoformat(
+                    created_at.replace("Z", "+00:00")
+                )
+                created_at_valid = bool(
+                    created_at.endswith("Z")
+                    and 20 <= len(created_at) <= 32
+                    and created_at_dt.tzinfo is not None
+                )
+            except (TypeError, ValueError):
+                created_at_valid = False
+            cutover_row_exact = bool(
+                expected_cutover_authority
+                and str(cutover_row["audit_id"] or "").strip()
+                == expected_cutover_audit_id
+                and str(cutover_row["project_id"] or "").strip()
+                == project_id
+                and str(cutover_row["runtime_context_id"] or "").strip()
+                == runtime_id
+                and str(cutover_row["task_id"] or "").strip() == task_id
+                and str(cutover_row["principal_id"] or "").strip()
+                == operator_principal_id
+                and str(cutover_row["session_id"] or "").strip()
+                == operator_session_id
+                and str(cutover_row["role"] or "").strip()
+                == operator_role
+                and str(cutover_row["view_name"] or "").strip()
+                == "initial_join_identity_cutover"
+                and str(cutover_row["decision"] or "").strip() == "allowed"
+                and str(cutover_row["reason"] or "").strip()
+                == "canonical_identity_binding_required"
+                and str(cutover_row["projection_hash"] or "").strip()
+                == str(
+                    expected_cutover_authority.get("cutover_hash") or ""
+                ).strip()
+                and str(cutover_row["nodes_read_json"] or "").strip()
+                == "[]"
+                and cutover_metadata == expected_cutover_authority
+                and created_at_valid
+                and created_at
+                == str(
+                    expected_cutover_authority.get("created_at") or ""
+                ).strip()
+            )
+            if not cutover_row_exact:
+                errors.append("initial_join_audit_cutover_identity_mismatch")
 
     errors = list(dict.fromkeys(errors))
     audit_errors = [
@@ -39290,13 +39920,28 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
             if identity_anchor
             else ""
         ),
+        "canonical_identity_cutover_audit_id": (
+            str(cutover_audit_rows[0]["audit_id"] or "").strip()
+            if len(cutover_audit_rows) == 1
+            else ""
+        ),
+        "canonical_identity_cutover_valid": bool(
+            fresh_identity_cutover
+            and len(cutover_audit_rows) == 1
+            and not any("cutover_" in error for error in errors)
+        ),
         "legacy_agent_id_normalized": bool(
             legacy_agent_id_normalization_candidate and not errors
         ),
         "legacy_agent_id_normalization_source": (
-            "durable_pre_fix_allocation_context_agent_id"
+            "accepted_contract_runtime_dispatch_worker_agent_id"
             if legacy_agent_id_normalization_candidate and not errors
             else ""
+        ),
+        "legacy_dispatch_identity_anchor": (
+            dict(legacy_dispatch_anchor)
+            if legacy_agent_id_normalization_candidate and not errors
+            else {}
         ),
         "route_identity": canonical_route_identity,
         "lease": {
@@ -79470,6 +80115,7 @@ def _mf_sub_worker_host_envelope_handoff(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "contract_execution_id": parent_task_id,
         "target_project_root": target_project_root,
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,

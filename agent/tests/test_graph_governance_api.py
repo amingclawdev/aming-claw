@@ -65,7 +65,12 @@ from agent.governance.contract_runtime_visualization import (
     build_contract_runtime_visualization,
 )
 from agent.governance.db import _ensure_schema
-from agent.governance.errors import GovernanceError, PermissionDeniedError, ValidationError
+from agent.governance.errors import (
+    AuthError,
+    GovernanceError,
+    PermissionDeniedError,
+    ValidationError,
+)
 from agent.mcp.schema_contract import MCP_TOOL_SCHEMA_VERSION
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
 from agent.governance.mf_subagent_contract import (
@@ -49976,6 +49981,8 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
                 "contract_execution_id": contract_execution_id,
                 "task_id": allocated.task_id,
                 "parent_task_id": contract_execution_id,
+                "worker_id": allocated.worker_id,
+                "worker_slot_id": allocated.worker_slot_id,
                 "target_project_root": str(target_root),
                 "agent_id": allocated.worker_id,
                 "actual_host_worker_id": allocated.worker_id,
@@ -50002,6 +50009,8 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
                 "contract_execution_id": contract_execution_id,
                 "task_id": allocated.task_id,
                 "parent_task_id": contract_execution_id,
+                "worker_id": allocated.worker_id,
+                "worker_slot_id": allocated.worker_slot_id,
                 "fence_token": joined["fence_token"],
                 "session_token": joined["session_token"],
                 "session_token_ref": joined["session_token_ref"],
@@ -50511,6 +50520,22 @@ def test_runtime_context_worker_guide_missing_auth_points_to_initial_join_before
         "mf_subagent_read_receipt",
         "mf_subagent_startup",
     ]
+    assert {
+        field: submission["copy_safe_body"][field]
+        for field in (
+            "task_id",
+            "parent_task_id",
+            "contract_execution_id",
+            "worker_id",
+            "worker_slot_id",
+        )
+    } == {
+        "task_id": context.task_id,
+        "parent_task_id": context.root_task_id,
+        "contract_execution_id": context.root_task_id,
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+    }
     assert submission["security_boundary"]["session_token_ref_alone_authorizes_writes"] is False
     capacity_guidance = details["actionable_payloads"]["capacity_fallback_guidance"]
     assert capacity_guidance["official_fallback_options"] == [
@@ -50576,6 +50601,13 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
         payload={"route_identity": route_identity},
     )
     conn.commit()
+    canonical_join_scope = {
+        "task_id": context.task_id,
+        "parent_task_id": context.root_task_id,
+        "contract_execution_id": context.root_task_id,
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+    }
 
     with pytest.raises(GovernanceError) as wrong_route:
         server.handle_graph_governance_runtime_context_session_token_initial_join(
@@ -50584,8 +50616,7 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
                 "coordinator",
                 method="POST",
                 body={
-                    "task_id": "worker-runtime-initial-join",
-                    "parent_task_id": "parent-runtime-initial-join",
+                    **canonical_join_scope,
                     "target_project_root": str(target_root),
                     "route_context_hash": "sha256:wrong-route",
                     "prompt_contract_id": "prompt-runtime-initial-join",
@@ -50634,8 +50665,7 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
                     "coordinator",
                     method="POST",
                     body={
-                        "task_id": "worker-runtime-initial-join",
-                        "parent_task_id": "parent-runtime-initial-join",
+                        **canonical_join_scope,
                         "target_project_root": str(target_root),
                         **route_identity,
                         **identity_updates,
@@ -50682,6 +50712,7 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
                     "coordinator",
                     method="POST",
                     body={
+                        **canonical_join_scope,
                         field: bad_value,
                         "target_project_root": str(target_root),
                         **route_identity,
@@ -50719,8 +50750,7 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
             "coordinator",
             method="POST",
             body={
-                "task_id": "worker-runtime-initial-join",
-                "parent_task_id": "parent-runtime-initial-join",
+                **canonical_join_scope,
                 "target_project_root": str(target_root),
                 **route_identity,
                 "agent_id": governed_worker_id,
@@ -50813,8 +50843,7 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
                 "coordinator",
                 method="POST",
                 body={
-                    "task_id": "worker-runtime-initial-join",
-                    "parent_task_id": "parent-runtime-initial-join",
+                    **canonical_join_scope,
                     "target_project_root": str(target_root),
                     **route_identity,
                     "agent_id": governed_worker_id,
@@ -50884,6 +50913,11 @@ def _setup_pre_lineage_rejoin_recovery_case(
     allocation_agent_id: str = "",
     omit_initial_join_agent_id: bool = False,
     batch_id: str = "",
+    pre_initial_join_worker_identity: Mapping[str, str] | None = None,
+    delete_source_contract_runtime_before_join: bool = False,
+    initial_join_context_factory=None,
+    initial_join_omit_identity_field: str = "",
+    pre_initial_join_dispatch_drift_field: str = "",
 ):
     """Create one accepted initial join with no read/startup lineage."""
 
@@ -50897,6 +50931,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
     host_startup_id = f"desktop-startup-pre-lineage-rejoin-{suffix}"
     target_root = tmp_path / f"pre-lineage-rejoin-{suffix}"
     target_root.mkdir()
+    dispatched_context = None
     if source_backed_contract_runtime:
         successor, dispatched_context = (
             _setup_mf_parallel_contract_runtime_worker_dispatch(
@@ -50951,7 +50986,11 @@ def _setup_pre_lineage_rejoin_recovery_case(
             base_commit="a" * 40,
             head_commit="a" * 40,
             target_head_commit="a" * 40,
-            merge_queue_id=f"mq-pre-lineage-rejoin-{suffix}",
+            merge_queue_id=(
+                dispatched_context.merge_queue_id
+                if dispatched_context is not None
+                else f"mq-pre-lineage-rejoin-{suffix}"
+            ),
             status=STATE_WORKTREE_READY,
             fence_token=f"fence-pre-lineage-rejoin-{suffix}",
             attempt=1,
@@ -50959,6 +50998,124 @@ def _setup_pre_lineage_rejoin_recovery_case(
         ),
         now_iso=now_iso,
     )
+    if source_backed_contract_runtime:
+        runtime = server._contract_runtime(conn)
+        record = runtime.store.get(parent_task_id)
+        revision = int(record["execution_state_revision"])
+        lines = copy.deepcopy(record["completed_lines"])
+        dispatch = next(
+            line
+            for line in lines
+            if line.get("line_id") == "observer_dispatch_bounded_workers"
+        )
+        dispatch_payload = dict(dispatch.get("payload") or {})
+        dispatch_payload["bounded_workers"] = [
+            {
+                **dispatch_payload,
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": context.parent_task_id,
+                "worker_id": context.worker_id,
+                "worker_slot_id": context.worker_slot_id,
+                "agent_id": durable_allocation_agent_id,
+                "target_project_root": context.target_project_root,
+                "worktree_path": context.worktree_path,
+                "branch_ref": context.branch_ref,
+                "base_commit": context.base_commit,
+                "target_head_commit": context.target_head_commit,
+                "merge_queue_id": context.merge_queue_id,
+                "owned_files": list(context.owned_files),
+            }
+        ]
+        dispatch["payload"] = dispatch_payload
+        record["completed_lines"] = lines
+        runtime_guide = copy.deepcopy(record.get("runtime_guide") or {})
+        guide_lines = copy.deepcopy(runtime_guide.get("completed_lines") or [])
+        guide_dispatch = next(
+            line
+            for line in guide_lines
+            if line.get("line_id") == "observer_dispatch_bounded_workers"
+            and line.get("runtime_context_id") == context.runtime_context_id
+        )
+        guide_payload = dict(guide_dispatch.get("payload") or {})
+        guide_payload["bounded_workers"] = copy.deepcopy(
+            dispatch_payload["bounded_workers"]
+        )
+        guide_dispatch["payload"] = guide_payload
+        runtime_guide["completed_lines"] = guide_lines
+        record["runtime_guide"] = runtime_guide
+        record["execution_state_revision"] = revision + 1
+        runtime.store.update(
+            parent_task_id,
+            record,
+            expected_revision=revision,
+        )
+        if delete_source_contract_runtime_before_join:
+            conn.execute(
+                "DELETE FROM contract_runtime_executions "
+                "WHERE contract_execution_id = ?",
+                (parent_task_id,),
+            )
+    if pre_initial_join_worker_identity:
+        changed_worker_id = str(
+            pre_initial_join_worker_identity.get("worker_id") or worker_id
+        )
+        changed_worker_slot_id = str(
+            pre_initial_join_worker_identity.get("worker_slot_id")
+            or changed_worker_id
+        )
+        changed_agent_id = str(
+            pre_initial_join_worker_identity.get("agent_id")
+            or changed_worker_id
+        )
+        changed_allocation_owner = str(
+            pre_initial_join_worker_identity.get("allocation_owner")
+            or changed_agent_id
+        )
+        conn.execute(
+            """
+            UPDATE parallel_branch_runtime_contexts
+            SET worker_id = ?, worker_slot_id = ?, agent_id = ?,
+                allocation_owner = ?
+            WHERE project_id = ? AND task_id = ?
+            """,
+            (
+                changed_worker_id,
+                changed_worker_slot_id,
+                changed_agent_id,
+                changed_allocation_owner,
+                PID,
+                task_id,
+            ),
+        )
+        context = get_branch_context(conn, PID, task_id)
+        assert context is not None
+        worker_id = changed_worker_id
+        durable_allocation_agent_id = changed_agent_id
+    if pre_initial_join_dispatch_drift_field:
+        allowed_dispatch_fields = {
+            "target_project_root": str(target_root / "forged-root"),
+            "worktree_path": str(target_root / "forged-worktree"),
+            "branch_ref": "refs/heads/codex/forged-dispatch-branch",
+            "base_commit": "b" * 40,
+            "target_head_commit": "c" * 40,
+            "merge_queue_id": "mq-forged-dispatch-binding",
+        }
+        assert pre_initial_join_dispatch_drift_field in allowed_dispatch_fields
+        conn.execute(
+            f"""
+            UPDATE parallel_branch_runtime_contexts
+            SET {pre_initial_join_dispatch_drift_field} = ?
+            WHERE project_id = ? AND task_id = ?
+            """,
+            (
+                allowed_dispatch_fields[pre_initial_join_dispatch_drift_field],
+                PID,
+                task_id,
+            ),
+        )
+        context = get_branch_context(conn, PID, task_id)
+        assert context is not None
     _persist_append_route_token_ref(
         conn,
         backlog_id=backlog_id,
@@ -50972,6 +51129,16 @@ def _setup_pre_lineage_rejoin_recovery_case(
         revision_id=f"crev-pre-lineage-rejoin-{suffix}",
         route_identity=route_identity,
         payload={
+            **(
+                {
+                    "schema_version": (
+                        "parallel_branch_allocate_contract_revision.v1"
+                    ),
+                    "source": "parallel_branch_allocate",
+                }
+                if source_backed_contract_runtime
+                else {}
+            ),
             "contract_execution_id": parent_task_id,
             "runtime_context_id": context.runtime_context_id,
             "task_id": task_id,
@@ -51003,17 +51170,25 @@ def _setup_pre_lineage_rejoin_recovery_case(
     }
     if not omit_initial_join_agent_id:
         initial_join_body["agent_id"] = worker_id
+    if initial_join_omit_identity_field:
+        initial_join_body.pop(initial_join_omit_identity_field, None)
+    initial_join_path = {
+        "project_id": PID,
+        "runtime_context_id": context.runtime_context_id,
+    }
+    initial_join_ctx = (
+        initial_join_context_factory(initial_join_path, initial_join_body)
+        if initial_join_context_factory is not None
+        else _ctx_with_role(
+            initial_join_path,
+            "coordinator",
+            method="POST",
+            body=initial_join_body,
+        )
+    )
     initial_join = (
         server.handle_graph_governance_runtime_context_session_token_initial_join(
-            _ctx_with_role(
-                {
-                    "project_id": PID,
-                    "runtime_context_id": context.runtime_context_id,
-                },
-                "coordinator",
-                method="POST",
-                body=initial_join_body,
-            )
+            initial_join_ctx
         )
     )
     assert initial_join["ok"] is True
@@ -51132,6 +51307,21 @@ def _pre_lineage_case_events(conn, case: Mapping[str, Any]) -> list[dict[str, An
     )
 
 
+def _pre_lineage_cutover_rows(conn, case: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT * FROM parallel_branch_runtime_access_audit
+            WHERE project_id = ? AND runtime_context_id = ?
+              AND view_name = 'initial_join_identity_cutover'
+            ORDER BY created_at, audit_id
+            """,
+            (PID, case["context"].runtime_context_id),
+        ).fetchall()
+    ]
+
+
 def _assert_pre_lineage_rejoin_zero_write(
     conn,
     case: Mapping[str, Any],
@@ -51171,6 +51361,14 @@ def _convert_pre_lineage_case_to_legacy_initial_join_audit(
     conn.execute(
         "DELETE FROM task_timeline_events WHERE id = ?",
         (case["identity_anchor_event"]["id"],),
+    )
+    conn.execute(
+        """
+        DELETE FROM parallel_branch_runtime_access_audit
+        WHERE project_id = ? AND runtime_context_id = ?
+          AND view_name = 'initial_join_identity_cutover'
+        """,
+        (PID, case["context"].runtime_context_id),
     )
     conn.execute(
         "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
@@ -51219,6 +51417,21 @@ def test_runtime_context_initial_join_omitted_agent_uses_canonical_worker_and_fr
     assert case["identity_anchor_event"]["payload"][
         "canonical_binding_hash"
     ] == binding["binding_hash"]
+    cutover_rows = _pre_lineage_cutover_rows(conn, case)
+    assert len(cutover_rows) == 1
+    cutover = json.loads(cutover_rows[0]["metadata_json"])
+    assert cutover_rows[0]["audit_id"] == result[
+        "canonical_identity_cutover_audit_id"
+    ]
+    assert cutover["operator_principal_id"] == "coordinator-principal"
+    assert cutover["operator_session_id"] == "ses-coordinator"
+    assert cutover["operator_role"] == "coordinator"
+    assert cutover_rows[0]["principal_id"] == cutover[
+        "operator_principal_id"
+    ]
+    assert cutover_rows[0]["session_id"] == cutover["operator_session_id"]
+    assert cutover_rows[0]["role"] == cutover["operator_role"]
+    assert cutover_rows[0]["created_at"] == cutover["created_at"]
 
     rejoin = _pre_lineage_rejoin(case)
     authority = rejoin["pre_lineage_rejoin_authority"]
@@ -51231,6 +51444,73 @@ def test_runtime_context_initial_join_omitted_agent_uses_canonical_worker_and_fr
     serialized = json.dumps(_pre_lineage_case_events(conn, case), sort_keys=True)
     assert result["session_token"] not in serialized
     assert result["fence_token"] not in serialized
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "task_id",
+        "parent_task_id",
+        "contract_execution_id",
+        "worker_id",
+        "worker_slot_id",
+    ],
+)
+def test_runtime_context_initial_join_requires_explicit_contract_identity_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    missing_field,
+):
+    suffix = f"missing-{missing_field.replace('_', '-')}"
+    with pytest.raises(GovernanceError) as rejected:
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=suffix,
+            initial_join_omit_identity_field=missing_field,
+        )
+
+    assert rejected.value.code == (
+        "runtime_context_initial_join_contract_identity_mismatch"
+    )
+    assert rejected.value.details["identity_mismatch_fields"] == [missing_field]
+    assert rejected.value.details["mutation_performed"] is False
+    task_id = f"pre-lineage-rejoin-{suffix}-worker"
+    backlog_id = f"AC-PRE-LINEAGE-REJOIN-{suffix.upper()}"
+    saved = get_branch_context(conn, PID, task_id)
+    assert saved is not None
+    assert saved.actual_host_worker_id == ""
+    assert saved.host_session_id == ""
+    assert saved.lease_id == ""
+    assert saved.session_token_hash == ""
+    assert saved.last_recovery_action == ""
+    assert not [
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            task_id=task_id,
+            backlog_id=backlog_id,
+        )
+        if (event.get("payload") or {}).get("action")
+        in {
+            "runtime_context_session_token_initial_join",
+            (
+                "runtime_context_session_token_initial_join_"
+                "identity_binding_anchor"
+            ),
+        }
+    ]
+    assert not conn.execute(
+        """
+        SELECT 1 FROM parallel_branch_runtime_access_audit
+        WHERE project_id = ? AND task_id = ?
+          AND view_name = 'initial_join_identity_cutover'
+        """,
+        (PID, task_id),
+    ).fetchone()
 
 
 def test_runtime_context_pre_lineage_fresh_marker_removal_is_not_legacy_zero_write(
@@ -51273,6 +51553,232 @@ def test_runtime_context_pre_lineage_fresh_marker_removal_is_not_legacy_zero_wri
     )
 
 
+def test_runtime_context_pre_lineage_durable_cutover_blocks_full_timeline_downgrade(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="fresh-full-timeline-downgrade",
+        omit_initial_join_agent_id=True,
+    )
+    payload = copy.deepcopy(case["initial_join_event"]["payload"])
+    payload.pop("canonical_identity_binding", None)
+    payload.pop("initial_join_identity_contract_version", None)
+    payload.pop("canonical_identity_binding_required", None)
+    conn.execute(
+        "DELETE FROM task_timeline_events WHERE id = ?",
+        (case["identity_anchor_event"]["id"],),
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(payload, sort_keys=True), case["initial_join_event"]["id"]),
+    )
+    conn.commit()
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_events = _pre_lineage_case_events(conn, case)
+    before_cutover = _pre_lineage_cutover_rows(conn, case)
+    assert len(before_cutover) == 1
+
+    with pytest.raises(GovernanceError) as rejected:
+        _pre_lineage_rejoin(case)
+
+    assert rejected.value.code == (
+        "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid"
+    )
+    authority = rejected.value.details["pre_lineage_rejoin_authority"]
+    assert authority["identity_contract_version"] == (
+        "runtime_context.initial_join_identity.v2"
+    )
+    assert authority["canonical_identity_binding_required"] is True
+    assert "initial_join_audit_canonical_binding_missing" in authority["errors"]
+    assert "initial_join_audit_identity_anchor_cardinality_invalid" in authority[
+        "errors"
+    ]
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        rejected.value,
+        before_context=before_context,
+        before_events=before_events,
+    )
+    assert _pre_lineage_cutover_rows(conn, case) == before_cutover
+
+
+@pytest.mark.parametrize(
+    ("metadata_field", "replacement"),
+    [
+        ("operator_principal_id", "forged-cutover-principal"),
+        ("operator_session_id", "ses-forged-cutover"),
+        ("operator_role", "observer"),
+        ("created_at", "2099-08-02T01:00:01Z"),
+    ],
+)
+def test_runtime_context_pre_lineage_cutover_operator_or_time_drift_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    metadata_field,
+    replacement,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"cutover-{metadata_field.replace('_', '-')}",
+    )
+    row = _pre_lineage_cutover_rows(conn, case)[0]
+    metadata = json.loads(row["metadata_json"])
+    metadata[metadata_field] = replacement
+    core = dict(metadata)
+    core.pop("cutover_hash", None)
+    metadata["cutover_hash"] = server._stable_public_hash(core)
+    forged_audit_id = server._runtime_context_initial_join_cutover_audit_id(
+        metadata
+    )
+    row_column = {
+        "operator_principal_id": "principal_id",
+        "operator_session_id": "session_id",
+        "operator_role": "role",
+        "created_at": "created_at",
+    }[metadata_field]
+    conn.execute(
+        f"""
+        UPDATE parallel_branch_runtime_access_audit
+        SET audit_id = ?, projection_hash = ?, metadata_json = ?,
+            {row_column} = ?
+        WHERE audit_id = ?
+        """,
+        (
+            forged_audit_id,
+            metadata["cutover_hash"],
+            json.dumps(metadata, sort_keys=True),
+            replacement,
+            row["audit_id"],
+        ),
+    )
+    conn.commit()
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_events = _pre_lineage_case_events(conn, case)
+    before_cutover = _pre_lineage_cutover_rows(conn, case)
+
+    with pytest.raises(GovernanceError) as rejected:
+        _pre_lineage_rejoin(case)
+
+    assert rejected.value.code == (
+        "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid"
+    )
+    authority = rejected.value.details["pre_lineage_rejoin_authority"]
+    assert "initial_join_audit_cutover_identity_mismatch" in authority["errors"]
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        rejected.value,
+        before_context=before_context,
+        before_events=before_events,
+    )
+    assert _pre_lineage_cutover_rows(conn, case) == before_cutover
+
+
+def test_runtime_context_pre_lineage_duplicate_cutover_authority_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="duplicate-cutover-authority",
+    )
+    row = _pre_lineage_cutover_rows(conn, case)[0]
+    conn.execute(
+        """
+        INSERT INTO parallel_branch_runtime_access_audit (
+            audit_id, project_id, runtime_context_id, task_id, principal_id,
+            session_id, role, view_name, decision, reason, projection_hash,
+            nodes_read_json, metadata_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "rtca-initial-join-binding-duplicate",
+            row["project_id"],
+            row["runtime_context_id"],
+            row["task_id"],
+            row["principal_id"],
+            row["session_id"],
+            row["role"],
+            row["view_name"],
+            row["decision"],
+            row["reason"],
+            row["projection_hash"],
+            row["nodes_read_json"],
+            row["metadata_json"],
+            row["created_at"],
+        ),
+    )
+    conn.commit()
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_events = _pre_lineage_case_events(conn, case)
+    before_cutover = _pre_lineage_cutover_rows(conn, case)
+
+    with pytest.raises(GovernanceError) as rejected:
+        _pre_lineage_rejoin(case)
+
+    authority = rejected.value.details["pre_lineage_rejoin_authority"]
+    assert "initial_join_audit_cutover_cardinality_invalid" in authority["errors"]
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        rejected.value,
+        before_context=before_context,
+        before_events=before_events,
+    )
+    assert _pre_lineage_cutover_rows(conn, case) == before_cutover
+
+
+def test_runtime_context_pre_lineage_missing_cutover_authority_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="missing-cutover-authority",
+    )
+    conn.execute(
+        """
+        DELETE FROM parallel_branch_runtime_access_audit
+        WHERE project_id = ? AND runtime_context_id = ?
+          AND view_name = 'initial_join_identity_cutover'
+        """,
+        (PID, case["context"].runtime_context_id),
+    )
+    conn.commit()
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_events = _pre_lineage_case_events(conn, case)
+    assert _pre_lineage_cutover_rows(conn, case) == []
+
+    with pytest.raises(GovernanceError) as rejected:
+        _pre_lineage_rejoin(case)
+
+    authority = rejected.value.details["pre_lineage_rejoin_authority"]
+    assert "initial_join_audit_cutover_cardinality_invalid" in authority["errors"]
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        rejected.value,
+        before_context=before_context,
+        before_events=before_events,
+    )
+    assert _pre_lineage_cutover_rows(conn, case) == []
+
+
 def test_runtime_context_pre_lineage_legacy_stale_allocation_agent_only_normalizes(
     conn,
     monkeypatch,
@@ -51283,6 +51789,7 @@ def test_runtime_context_pre_lineage_legacy_stale_allocation_agent_only_normaliz
         monkeypatch,
         tmp_path,
         suffix="legacy-stale-agent",
+        source_backed_contract_runtime=True,
         allocation_agent_id="legacy-stale-allocation-agent",
         omit_initial_join_agent_id=True,
     )
@@ -51303,7 +51810,10 @@ def test_runtime_context_pre_lineage_legacy_stale_allocation_agent_only_normaliz
     )
     assert authority["legacy_agent_id_normalized"] is True
     assert authority["legacy_agent_id_normalization_source"] == (
-        "durable_pre_fix_allocation_context_agent_id"
+        "accepted_contract_runtime_dispatch_worker_agent_id"
+    )
+    assert authority["legacy_dispatch_identity_anchor"]["agent_id"] == (
+        "legacy-stale-allocation-agent"
     )
     persisted = next(
         event
@@ -51326,6 +51836,7 @@ def test_runtime_context_pre_lineage_legacy_agent_plus_route_drift_is_zero_write
         monkeypatch,
         tmp_path,
         suffix="legacy-agent-route-drift",
+        source_backed_contract_runtime=True,
         allocation_agent_id="legacy-stale-allocation-agent-drift",
         omit_initial_join_agent_id=True,
     )
@@ -51356,6 +51867,204 @@ def test_runtime_context_pre_lineage_legacy_agent_plus_route_drift_is_zero_write
         before_context=before_context,
         before_events=before_events,
     )
+
+
+def test_legacy_dual_context_column_tamper_cannot_replace_contract_allocation_anchor(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="legacy-dual-context-tamper",
+        source_backed_contract_runtime=True,
+        allocation_agent_id="contract-dispatched-legacy-agent",
+        omit_initial_join_agent_id=True,
+    )
+    _convert_pre_lineage_case_to_legacy_initial_join_audit(conn, case)
+    event = next(
+        event
+        for event in _pre_lineage_case_events(conn, case)
+        if (event.get("payload") or {}).get("action")
+        == "runtime_context_session_token_initial_join"
+    )
+    payload = copy.deepcopy(event["payload"])
+    payload["agent_id"] = "post-hoc-dual-column-agent"
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(payload, sort_keys=True), event["id"]),
+    )
+    conn.execute(
+        """
+        UPDATE parallel_branch_runtime_contexts
+        SET agent_id = ?, allocation_owner = ?
+        WHERE project_id = ? AND task_id = ?
+        """,
+        (
+            "post-hoc-dual-column-agent",
+            "post-hoc-dual-column-agent",
+            PID,
+            case["task_id"],
+        ),
+    )
+    conn.commit()
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_events = _pre_lineage_case_events(conn, case)
+    dispatch_record = server._contract_runtime(conn).store.get(
+        case["parent_task_id"]
+    )
+    dispatch_worker = next(
+        line
+        for line in dispatch_record["completed_lines"]
+        if line.get("line_id") == "observer_dispatch_bounded_workers"
+    )["payload"]["bounded_workers"][0]
+    assert dispatch_worker["agent_id"] == "contract-dispatched-legacy-agent"
+
+    with pytest.raises(GovernanceError) as rejected:
+        _pre_lineage_rejoin(case)
+
+    assert rejected.value.code == (
+        "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid"
+    )
+    authority = rejected.value.details["pre_lineage_rejoin_authority"]
+    assert authority["legacy_agent_id_normalized"] is False
+    assert authority["legacy_dispatch_identity_anchor"] == {}
+    assert "initial_join_audit_agent_id_mismatch" in authority["errors"]
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        rejected.value,
+        before_context=before_context,
+        before_events=before_events,
+    )
+
+
+def test_fresh_join_worker_identity_is_anchored_to_contract_dispatch_not_context_only(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    suffix = "fresh-contract-dispatch-tamper"
+    with pytest.raises(GovernanceError) as rejected:
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=suffix,
+            source_backed_contract_runtime=True,
+            pre_initial_join_worker_identity={
+                "worker_id": "attacker-worker",
+                "worker_slot_id": "attacker-worker",
+                "agent_id": "attacker-worker",
+                "allocation_owner": "attacker-worker",
+            },
+        )
+
+    assert rejected.value.code == (
+        "runtime_context_initial_join_dispatch_identity_mismatch"
+    )
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["credential_rotated"] is False
+    task_id = f"pre-lineage-rejoin-{suffix}-worker"
+    context = get_branch_context(conn, PID, task_id)
+    assert context is not None
+    assert context.worker_id == "attacker-worker"
+    assert context.worker_slot_id == "attacker-worker"
+    assert context.agent_id == "attacker-worker"
+    assert context.allocation_owner == "attacker-worker"
+    assert context.actual_host_worker_id == ""
+    assert context.lease_id == ""
+    assert context.session_token_hash == ""
+    assert context.last_recovery_action == ""
+    assert not [
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            task_id=task_id,
+            backlog_id=f"AC-PRE-LINEAGE-REJOIN-{suffix.upper()}",
+        )
+        if (event.get("payload") or {}).get("action")
+        in {
+            "runtime_context_session_token_initial_join",
+            (
+                "runtime_context_session_token_initial_join_"
+                "identity_binding_anchor"
+            ),
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "drift_field",
+    [
+        "target_project_root",
+        "worktree_path",
+        "branch_ref",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+    ],
+)
+def test_fresh_join_scope_is_anchored_to_full_contract_dispatch(
+    conn,
+    monkeypatch,
+    tmp_path,
+    drift_field,
+):
+    suffix = f"fresh-dispatch-{drift_field.replace('_', '-')}"
+    with pytest.raises(GovernanceError) as rejected:
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=suffix,
+            source_backed_contract_runtime=True,
+            pre_initial_join_dispatch_drift_field=drift_field,
+        )
+
+    assert rejected.value.code == (
+        "runtime_context_initial_join_dispatch_identity_mismatch"
+    )
+    assert rejected.value.details["mutation_performed"] is False
+    task_id = f"pre-lineage-rejoin-{suffix}-worker"
+    context = get_branch_context(conn, PID, task_id)
+    assert context is not None
+    assert context.actual_host_worker_id == ""
+    assert context.lease_id == ""
+    assert context.session_token_hash == ""
+    assert context.last_recovery_action == ""
+
+
+def test_source_backed_initial_join_missing_contract_runtime_is_fail_closed(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    suffix = "missing-contract-dispatch-source"
+    with pytest.raises(GovernanceError) as rejected:
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=suffix,
+            source_backed_contract_runtime=True,
+            delete_source_contract_runtime_before_join=True,
+        )
+
+    assert rejected.value.code == (
+        "runtime_context_initial_join_dispatch_identity_mismatch"
+    )
+    assert rejected.value.details["mutation_performed"] is False
+    task_id = f"pre-lineage-rejoin-{suffix}-worker"
+    context = get_branch_context(conn, PID, task_id)
+    assert context is not None
+    assert context.actual_host_worker_id == ""
+    assert context.lease_id == ""
+    assert context.session_token_hash == ""
+    assert context.last_recovery_action == ""
 
 
 def test_runtime_context_initial_join_rejects_post_issue_identity_drift_and_rolls_back(
@@ -51484,6 +52193,57 @@ def test_runtime_context_initial_join_anchor_failure_rolls_back_context_and_audi
     ]
 
 
+def test_runtime_context_initial_join_cutover_failure_rolls_back_all_join_writes(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    def _fail_cutover(**_kwargs):
+        raise RuntimeError("forced durable cutover authority failure")
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_initial_join_cutover_authority",
+        _fail_cutover,
+    )
+    suffix = "cutover-failure-rollback"
+    with pytest.raises(
+        RuntimeError,
+        match="forced durable cutover authority failure",
+    ):
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=suffix,
+            omit_initial_join_agent_id=True,
+        )
+
+    task_id = f"pre-lineage-rejoin-{suffix}-worker"
+    backlog_id = f"AC-PRE-LINEAGE-REJOIN-{suffix.upper()}"
+    saved = get_branch_context(conn, PID, task_id)
+    assert saved is not None
+    assert saved.actual_host_worker_id == ""
+    assert saved.host_session_id == ""
+    assert saved.lease_id == ""
+    assert saved.session_token_hash == ""
+    assert saved.last_recovery_action == ""
+    assert not task_timeline.list_events(
+        conn,
+        PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
+    assert not conn.execute(
+        """
+        SELECT 1 FROM parallel_branch_runtime_access_audit
+        WHERE project_id = ? AND task_id = ?
+          AND view_name = 'initial_join_identity_cutover'
+        """,
+        (PID, task_id),
+    ).fetchone()
+
+
 def test_runtime_context_initial_join_lock_revalidation_rejects_route_drift_zero_write(
     conn,
     monkeypatch,
@@ -51550,6 +52310,85 @@ def test_runtime_context_initial_join_lock_revalidation_rejects_route_drift_zero
             ),
         }
     ]
+
+
+def test_initial_join_revalidates_role_session_registry_inside_write_lock(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    registered = server.role_service.register(
+        conn,
+        principal_id="locked-initial-join-coordinator",
+        project_id=PID,
+        role="coordinator",
+    )
+    conn.commit()
+    token = registered["token"]
+    original_require = server._require_graph_governance_mf_subagent
+    require_calls = 0
+
+    def _require_then_revoke(request_ctx, auth_conn, capability):
+        nonlocal require_calls
+        authenticated = original_require(request_ctx, auth_conn, capability)
+        require_calls += 1
+        server.role_service.deregister(
+            auth_conn,
+            authenticated["session_id"],
+        )
+        return authenticated
+
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_mf_subagent",
+        _require_then_revoke,
+    )
+
+    def _real_token_context(path, body):
+        return server.RequestContext(
+            None,
+            "POST",
+            path,
+            {},
+            body,
+            "req-initial-join-lock-auth",
+            token,
+            "",
+        )
+
+    suffix = "locked-role-session-revoked"
+    with pytest.raises(AuthError):
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=suffix,
+            initial_join_context_factory=_real_token_context,
+        )
+
+    assert require_calls == 1
+    task_id = f"pre-lineage-rejoin-{suffix}-worker"
+    backlog_id = f"AC-PRE-LINEAGE-REJOIN-{suffix.upper()}"
+    saved = get_branch_context(conn, PID, task_id)
+    assert saved is not None
+    assert saved.actual_host_worker_id == ""
+    assert saved.lease_id == ""
+    assert saved.session_token_hash == ""
+    assert saved.last_recovery_action == ""
+    assert not task_timeline.list_events(
+        conn,
+        PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
+    assert not conn.execute(
+        """
+        SELECT 1 FROM parallel_branch_runtime_access_audit
+        WHERE project_id = ? AND task_id = ?
+          AND view_name = 'initial_join_identity_cutover'
+        """,
+        (PID, task_id),
+    ).fetchone()
 
 
 @pytest.mark.parametrize(
@@ -52649,6 +53488,13 @@ def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_
             fence_token="fence-runtime-initial-join-renewed",
         ),
     )
+    canonical_join_scope = {
+        "task_id": context.task_id,
+        "parent_task_id": context.root_task_id,
+        "contract_execution_id": context.root_task_id,
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+    }
     old_issue = observer_route_context.issue_observer_write_route_context(
         project_id=PID,
         backlog_id="AC-RUNTIME-TOKEN-INITIAL-JOIN-RENEWED",
@@ -52753,8 +53599,7 @@ def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_
                 "coordinator",
                 method="POST",
                 body={
-                    "task_id": "worker-runtime-initial-join-renewed",
-                    "parent_task_id": "parent-runtime-initial-join-renewed",
+                    **canonical_join_scope,
                     "target_project_root": str(target_root),
                     **fake_ref_identity,
                     "reason": "host adapter retries with unrelated active ref",
@@ -52771,8 +53616,7 @@ def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_
             "coordinator",
             method="POST",
             body={
-                "task_id": "worker-runtime-initial-join-renewed",
-                "parent_task_id": "parent-runtime-initial-join-renewed",
+                **canonical_join_scope,
                 "target_project_root": str(target_root),
                 **renewed_identity,
                 "agent_id": context.worker_id,
@@ -52965,6 +53809,9 @@ def test_runtime_context_session_token_initial_join_accepts_parent_scope_renewal
             body={
                 "task_id": worker_task_id,
                 "parent_task_id": parent_task_id,
+                "contract_execution_id": parent_task_id,
+                "worker_id": context.worker_id,
+                "worker_slot_id": context.worker_slot_id,
                 "target_project_root": str(target_root),
                 **renewed_identity,
                 "agent_id": context.worker_id,
@@ -53187,6 +54034,9 @@ def test_runtime_context_initial_join_accepts_registry_verified_superseded_ref_t
             body={
                 "task_id": worker_task_id,
                 "parent_task_id": parent_task_id,
+                "contract_execution_id": parent_task_id,
+                "worker_id": context.worker_id,
+                "worker_slot_id": context.worker_slot_id,
                 "target_project_root": str(target_root),
                 **renewed_identity,
                 "agent_id": context.worker_id,
@@ -104029,9 +104879,12 @@ def test_failed_qa_fresh_allocate_appends_dispatch_then_initial_join_receipt_sta
                 "coordinator",
                 method="POST",
                 body={
-                    "task_id": fresh_task_id,
-                    "parent_task_id": contract_execution_id,
-                    "target_project_root": str(target_root),
+                        "task_id": fresh_task_id,
+                        "parent_task_id": contract_execution_id,
+                        "contract_execution_id": contract_execution_id,
+                        "target_project_root": str(target_root),
+                        "worker_id": fresh_context.worker_id,
+                        "worker_slot_id": fresh_context.worker_slot_id,
                     "agent_id": "/root/failed_qa_fresh_dispatch_worker",
                     "actual_host_worker_id": (
                         "/root/failed_qa_fresh_dispatch_worker"
@@ -104073,9 +104926,12 @@ def test_failed_qa_fresh_allocate_appends_dispatch_then_initial_join_receipt_sta
                 "coordinator",
                 method="POST",
                 body={
-                    "task_id": fresh_task_id,
-                    "parent_task_id": contract_execution_id,
-                    "target_project_root": str(target_root),
+                        "task_id": fresh_task_id,
+                        "parent_task_id": contract_execution_id,
+                        "contract_execution_id": contract_execution_id,
+                        "target_project_root": str(target_root),
+                        "worker_id": fresh_context.worker_id,
+                        "worker_slot_id": fresh_context.worker_slot_id,
                     "agent_id": fresh_context.worker_id,
                     "actual_host_worker_id": fresh_context.worker_id,
                     "worker_session_id": (
