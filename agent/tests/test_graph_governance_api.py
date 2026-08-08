@@ -52259,24 +52259,25 @@ def test_runtime_context_initial_join_lock_revalidation_rejects_route_drift_zero
     monkeypatch,
     tmp_path,
 ):
-    original_latest_route_identity = (
-        server._runtime_context_latest_route_identity
+    original_expected_route_identity = (
+        server._runtime_context_initial_join_expected_route_identity
     )
     calls = 0
 
     def _route_changes_after_preflight(*args, **kwargs):
         nonlocal calls
         calls += 1
-        identity = dict(original_latest_route_identity(*args, **kwargs))
+        identity, source = original_expected_route_identity(*args, **kwargs)
+        identity = dict(identity)
         if calls >= 2:
             identity["route_context_hash"] = (
                 "sha256:route-drifted-after-preflight"
             )
-        return identity
+        return identity, source
 
     monkeypatch.setattr(
         server,
-        "_runtime_context_latest_route_identity",
+        "_runtime_context_initial_join_expected_route_identity",
         _route_changes_after_preflight,
     )
     suffix = "locked-route-drift"

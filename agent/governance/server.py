@@ -34730,6 +34730,29 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 locked_contract_dispatch_identity_anchor,
             )
         )
+        if (
+            dict(locked_expected_route_identity)
+            != dict(expected_route_identity)
+            or locked_expected_route_identity_source
+            != expected_route_identity_source
+        ):
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_route_authority_changed",
+                "runtime-context route authority changed before issuance",
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": canonical_task_id,
+                    "mutation_performed": False,
+                    "timeline_event_persisted": False,
+                    "credential_rotated": False,
+                    "fail_closed": True,
+                    "next_legal_action": (
+                        "refresh_active_route_and_session_authority_before_initial_join"
+                    ),
+                },
+            )
         locked_resolved_route_identity, locked_route_lineage_payload = (
             _runtime_context_initial_join_resolved_ref_route_identity(
                 body,
@@ -34752,11 +34775,7 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
         }
         if (
-            dict(locked_expected_route_identity)
-            != dict(expected_route_identity)
-            or locked_expected_route_identity_source
-            != expected_route_identity_source
-            or locked_safe_route_identity != safe_route_identity
+            locked_safe_route_identity != safe_route_identity
             or dict(locked_route_lineage_payload)
             != dict(initial_join_route_lineage_payload)
             or not conn.in_transaction
