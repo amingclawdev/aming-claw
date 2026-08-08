@@ -15468,24 +15468,262 @@ def _with_release_binding_audit(
     *,
     queue_item_id: str,
     binding_audit: Mapping[str, Any],
-) -> tuple[IntegrationEpoch, bool]:
+    replay_authority_rollover_audit: Mapping[str, Any] | None = None,
+) -> tuple[IntegrationEpoch, bool, bool]:
     incomplete = dict(epoch.incomplete_fanin)
     records = list(incomplete.get("released_children") or [])
     changed = False
+    rollover_added = False
+    matching_record_count = 0
     next_records: list[Any] = []
     for record in records:
         if not isinstance(record, Mapping) or str(record.get("queue_item_id") or "") != queue_item_id:
             next_records.append(record)
             continue
+        matching_record_count += 1
         next_record = dict(record)
-        if next_record.get("binding_audit") != dict(binding_audit):
-            next_record["binding_audit"] = dict(binding_audit)
+        existing_binding_audit = (
+            dict(next_record.get("binding_audit") or {})
+            if isinstance(next_record.get("binding_audit"), Mapping)
+            else {}
+        )
+        next_binding_audit = dict(binding_audit)
+        existing_rollovers = [
+            dict(candidate)
+            for candidate in existing_binding_audit.get(
+                "replay_authority_rollovers"
+            )
+            or []
+            if isinstance(candidate, Mapping)
+        ]
+        if existing_rollovers:
+            next_binding_audit["replay_authority_rollovers"] = (
+                existing_rollovers
+            )
+        if replay_authority_rollover_audit:
+            rollover = dict(replay_authority_rollover_audit)
+            rollover_id = str(rollover.get("rollover_id") or "").strip()
+            if rollover_id and not any(
+                str(candidate.get("rollover_id") or "").strip()
+                == rollover_id
+                for candidate in existing_rollovers
+            ):
+                next_binding_audit["replay_authority_rollovers"] = [
+                    *existing_rollovers,
+                    rollover,
+                ]
+                rollover_added = True
+        if next_record.get("binding_audit") != next_binding_audit:
+            next_record["binding_audit"] = next_binding_audit
             changed = True
         next_records.append(next_record)
+    if replay_authority_rollover_audit and matching_record_count != 1:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_projection_missing",
+            (
+                "release replay authority rollover requires exactly one "
+                "durable released-child audit projection"
+            ),
+            queue_item_id=queue_item_id,
+            released_child_record_count=matching_record_count,
+            zero_write_rejection=True,
+        )
     if changed:
         incomplete["released_children"] = next_records
-        return replace(epoch, incomplete_fanin=incomplete), True
-    return epoch, False
+        return replace(epoch, incomplete_fanin=incomplete), True, rollover_added
+    return epoch, False, False
+
+
+_RELEASE_OBSERVER_SESSION_REF_PREFIX = "observer-session:"
+_RELEASE_OBSERVER_ROUTE_REF_PREFIX = "observer-route-token-ref:"
+_RELEASE_GOVERNING_BACKLOG_REF_PREFIX = "governing-backlog:"
+_RELEASE_GOVERNING_TASK_REF_PREFIX = "governing-task:"
+_RELEASE_AUTHORIZED_ACTION_REF_PREFIX = "authorized-action:"
+
+
+def _release_replay_authority_ref_projection(
+    refs: Sequence[str],
+) -> dict[str, Any]:
+    prefixes = {
+        "observer_session_ref": _RELEASE_OBSERVER_SESSION_REF_PREFIX,
+        "observer_route_token_ref": _RELEASE_OBSERVER_ROUTE_REF_PREFIX,
+        "governing_backlog_ref": _RELEASE_GOVERNING_BACKLOG_REF_PREFIX,
+        "governing_task_ref": _RELEASE_GOVERNING_TASK_REF_PREFIX,
+        "authorized_action_ref": _RELEASE_AUTHORIZED_ACTION_REF_PREFIX,
+    }
+    projected = {
+        key: tuple(ref for ref in refs if ref.startswith(prefix))
+        for key, prefix in prefixes.items()
+    }
+    projected["stable_refs"] = tuple(
+        ref
+        for ref in refs
+        if not ref.startswith(_RELEASE_OBSERVER_SESSION_REF_PREFIX)
+        and not ref.startswith(_RELEASE_OBSERVER_ROUTE_REF_PREFIX)
+    )
+    return projected
+
+
+def _validated_release_replay_authority_rollover_audit(
+    *,
+    project_id: str,
+    event_id: int,
+    event_operator_principal: str,
+    event_refs: Sequence[str],
+    current_operator_principal: str,
+    current_refs: Sequence[str],
+    rollover_proof: Mapping[str, Any] | None,
+    now_iso: str,
+) -> dict[str, Any]:
+    """Validate a server-authorized observer route identity rollover."""
+
+    def reject(reason: str, **details: Any) -> None:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "release replay authority rollover did not match the immutable audit event",
+            event_id=event_id,
+            rollover_rejection=reason,
+            zero_write_rejection=True,
+            **details,
+        )
+
+    proof = dict(rollover_proof or {})
+    if (
+        str(proof.get("schema_version") or "")
+        != "integration_epoch.release_replay_rollover_proof.v1"
+        or proof.get("required_action_membership_validated") is not True
+        or proof.get("raw_credentials_included") is not False
+        or proof.get("server_validated") is not True
+        or str(proof.get("authority_mode") or "")
+        != "observer_session_route_token_ref"
+        or str(proof.get("project_id") or "") != project_id
+        or str(proof.get("operator_principal") or "")
+        != current_operator_principal
+    ):
+        reject("server_validated_route_rollover_proof_required")
+
+    old_projection = _release_replay_authority_ref_projection(event_refs)
+    new_projection = _release_replay_authority_ref_projection(current_refs)
+    for projection_name, projection in (
+        ("immutable_event", old_projection),
+        ("current_request", new_projection),
+    ):
+        invalid_markers = {
+            key: len(projection[key])
+            for key in (
+                "observer_session_ref",
+                "observer_route_token_ref",
+                "governing_backlog_ref",
+                "governing_task_ref",
+                "authorized_action_ref",
+            )
+            if len(projection[key]) != 1
+        }
+        if invalid_markers:
+            reject(
+                "release_authority_markers_not_unique",
+                projection=projection_name,
+                marker_counts=invalid_markers,
+            )
+        empty_markers = [
+            key
+            for key, prefix in (
+                (
+                    "observer_session_ref",
+                    _RELEASE_OBSERVER_SESSION_REF_PREFIX,
+                ),
+                (
+                    "observer_route_token_ref",
+                    _RELEASE_OBSERVER_ROUTE_REF_PREFIX,
+                ),
+                (
+                    "governing_backlog_ref",
+                    _RELEASE_GOVERNING_BACKLOG_REF_PREFIX,
+                ),
+                (
+                    "governing_task_ref",
+                    _RELEASE_GOVERNING_TASK_REF_PREFIX,
+                ),
+                (
+                    "authorized_action_ref",
+                    _RELEASE_AUTHORIZED_ACTION_REF_PREFIX,
+                ),
+            )
+            if projection[key][0] == prefix
+        ]
+        if empty_markers:
+            reject(
+                "release_authority_markers_empty",
+                projection=projection_name,
+                empty_markers=empty_markers,
+            )
+
+    old_session_ref = old_projection["observer_session_ref"][0]
+    new_session_ref = new_projection["observer_session_ref"][0]
+    if (
+        not event_operator_principal.startswith(
+            _RELEASE_OBSERVER_SESSION_REF_PREFIX
+        )
+        or event_operator_principal != old_session_ref
+        or not current_operator_principal.startswith(
+            _RELEASE_OBSERVER_SESSION_REF_PREFIX
+        )
+        or current_operator_principal != new_session_ref
+    ):
+        reject("observer_session_principal_binding_invalid")
+    if old_projection["stable_refs"] != new_projection["stable_refs"]:
+        reject("non_ephemeral_evidence_refs_changed")
+
+    proof_marker_values = {
+        "observer_session_ref": str(proof.get("observer_session_ref") or ""),
+        "observer_route_token_ref": str(
+            proof.get("observer_route_token_ref") or ""
+        ),
+        "governing_backlog_ref": str(
+            proof.get("governing_backlog_ref") or ""
+        ),
+        "governing_task_ref": str(proof.get("governing_task_ref") or ""),
+        "authorized_action_ref": str(
+            proof.get("authorized_action_ref") or ""
+        ),
+    }
+    for key, expected in proof_marker_values.items():
+        if not expected or new_projection[key] != (expected,):
+            reject("server_rollover_proof_marker_mismatch", field=key)
+
+    audit_core = {
+        "schema_version": (
+            "mf_batch_parallel.release_replay_authority_rollover.v1"
+        ),
+        "source": "server_validated_observer_session_route_token_ref",
+        "immutable_release_event_ref": f"release-event:{event_id}",
+        "old_operator_principal": event_operator_principal,
+        "old_observer_route_token_ref": old_projection[
+            "observer_route_token_ref"
+        ][0],
+        "new_operator_principal": current_operator_principal,
+        "new_observer_route_token_ref": new_projection[
+            "observer_route_token_ref"
+        ][0],
+        "governing_backlog_ref": new_projection["governing_backlog_ref"][0],
+        "governing_task_ref": new_projection["governing_task_ref"][0],
+        "authorized_action_ref": new_projection["authorized_action_ref"][0],
+        "projection_repair_authority": True,
+        "copy_safe": True,
+        "raw_credentials_persisted": False,
+    }
+    rollover_hash = hashlib.sha256(
+        json.dumps(
+            audit_core,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        **audit_core,
+        "rollover_id": f"release-rollover-{rollover_hash[:24]}",
+        "recorded_at": now_iso,
+    }
 
 
 def release_integration_epoch_unlandable_child(
@@ -15500,6 +15738,7 @@ def release_integration_epoch_unlandable_child(
     approval_ref: str,
     reason: str,
     evidence_refs: Sequence[str],
+    replay_authority_rollover: Mapping[str, Any] | None = None,
     now_iso: str = "",
 ) -> dict[str, Any]:
     """Explicitly release one terminal child without inventing merge credit.
@@ -15559,16 +15798,35 @@ def release_integration_epoch_unlandable_child(
         (project, batch, item_id),
     ).fetchone()
     if existing_event is not None:
-        exact_replay = (
+        event_refs = _parse_json_array(existing_event["evidence_refs_json"])
+        business_replay = (
             str(existing_event["child_backlog_id"] or "") == child_backlog
             and str(existing_event["blocking_backlog_id"] or "")
             == blocking_backlog
-            and str(existing_event["operator_principal"] or "") == operator
             and str(existing_event["approval_ref"] or "") == approval
             and str(existing_event["reason"] or "") == bounded_reason
-            and _parse_json_array(existing_event["evidence_refs_json"]) == refs
         )
-        if not exact_replay:
+        exact_replay = bool(
+            business_replay
+            and str(existing_event["operator_principal"] or "") == operator
+            and event_refs == refs
+        )
+        now = now_iso or utc_now()
+        rollover_audit: dict[str, Any] = {}
+        if not exact_replay and business_replay:
+            rollover_audit = _validated_release_replay_authority_rollover_audit(
+                project_id=project,
+                event_id=int(existing_event["id"] or 0),
+                event_operator_principal=str(
+                    existing_event["operator_principal"] or ""
+                ),
+                event_refs=event_refs,
+                current_operator_principal=operator,
+                current_refs=refs,
+                rollover_proof=replay_authority_rollover,
+                now_iso=now,
+            )
+        elif not exact_replay:
             raise IntegrationEpochUnlandableChildReleaseError(
                 "integration_epoch_release_replay_identity_mismatch",
                 "release replay must exactly match the immutable audit event",
@@ -15596,7 +15854,16 @@ def release_integration_epoch_unlandable_child(
                 item=replay_item,
             )
         )
-        now = now_iso or utc_now()
+        (
+            replay_epoch_with_audit,
+            audit_repaired,
+            replay_authority_renewed,
+        ) = _with_release_binding_audit(
+            replay_epoch,
+            queue_item_id=item_id,
+            binding_audit=binding_audit,
+            replay_authority_rollover_audit=rollover_audit,
+        )
         replay_item, _, _, projection_repaired = (
             _terminalize_unlandable_release_projections(
                 conn,
@@ -15607,11 +15874,6 @@ def release_integration_epoch_unlandable_child(
                 reason=bounded_reason,
                 now_iso=now,
             )
-        )
-        replay_epoch_with_audit, audit_repaired = _with_release_binding_audit(
-            replay_epoch,
-            queue_item_id=item_id,
-            binding_audit=binding_audit,
         )
         if audit_repaired:
             replay_epoch = upsert_integration_epoch(
@@ -15624,6 +15886,7 @@ def release_integration_epoch_unlandable_child(
             "schema_version": "mf_batch_parallel.explicit_unlandable_release.v1",
             "ok": True,
             "replayed": True,
+            "replay_authority_renewed": replay_authority_renewed,
             "projection_repaired": projection_repaired,
             "writes_performed": projection_repaired,
             "release_event_id": int(existing_event["id"] or 0),

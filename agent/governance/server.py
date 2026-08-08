@@ -141235,6 +141235,41 @@ def handle_integration_epoch_release_unlandable_child(ctx: RequestContext):
         operator_principal = str(
             operator.get("principal_id") or operator.get("role") or "operator"
         ).strip()
+        replay_authority_rollover: dict[str, Any] = {}
+        if (
+            operator.get("role_source")
+            == "observer_session_route_token_ref"
+        ):
+            replay_authority_rollover = {
+                "schema_version": (
+                    "integration_epoch.release_replay_rollover_proof.v1"
+                ),
+                "server_validated": True,
+                "authority_mode": "observer_session_route_token_ref",
+                "project_id": project_id,
+                "operator_principal": operator_principal,
+                "observer_session_ref": (
+                    f"observer-session:{operator['observer_session_id']}"
+                ),
+                "observer_route_token_ref": (
+                    "observer-route-token-ref:"
+                    f"{operator['route_token_ref']}"
+                ),
+                "governing_backlog_ref": (
+                    "governing-backlog:"
+                    f"{operator['route_scope']['backlog_id']}"
+                ),
+                "governing_task_ref": (
+                    f"governing-task:{operator['route_scope']['task_id']}"
+                ),
+                "authorized_action_ref": (
+                    "authorized-action:"
+                    f"{_INTEGRATION_EPOCH_RELEASE_ROUTE_ACTION}"
+                ),
+                "required_action_membership_validated": True,
+                "extra_allowed_actions_ignored": True,
+                "raw_credentials_included": False,
+            }
         canonical_refs = list(
             dict.fromkeys(
                 [
@@ -141271,6 +141306,7 @@ def handle_integration_epoch_release_unlandable_child(ctx: RequestContext):
                 approval_ref=approval_ref,
                 reason=reason,
                 evidence_refs=canonical_refs,
+                replay_authority_rollover=replay_authority_rollover,
             )
         except IntegrationEpochUnlandableChildReleaseError as exc:
             conn.rollback()

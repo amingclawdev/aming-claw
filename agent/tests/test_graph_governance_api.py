@@ -125337,6 +125337,45 @@ def _explicit_epoch_release_route_proof(
     return registered, issued, body
 
 
+def _explicit_epoch_release_named_route_proof(
+    conn,
+    *,
+    observer_session_id: str,
+    route_token_ref: str,
+    route_backlog_id: str = _EXPLICIT_EPOCH_RELEASE_GOVERNING_BACKLOG,
+    route_task_id: str = _EXPLICIT_EPOCH_RELEASE_GOVERNING_TASK,
+    allowed_actions: list[str] | None = None,
+) -> dict[str, Any]:
+    observer_session.register_session(
+        conn,
+        project_id=PID,
+        session_id=observer_session_id,
+    )
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=route_backlog_id,
+        contract_execution_id=route_task_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=(
+            allowed_actions
+            if allowed_actions is not None
+            else ["integration_epoch_release_unlandable_child"]
+        ),
+    )
+    conn.commit()
+    body = _explicit_epoch_release_body()
+    body.update(
+        {
+            "project_id": PID,
+            "observer_session_id": observer_session_id,
+            "observer_route_token_ref": route_token_ref,
+            "backlog_id": route_backlog_id,
+            "task_id": route_task_id,
+        }
+    )
+    return body
+
+
 @pytest.mark.parametrize(
     ("route_backlog_id", "route_task_id"),
     [
@@ -126198,6 +126237,428 @@ def test_exact_release_replay_repairs_projection_once_and_read_model_deduplicate
     assert replay["projection_repaired"] is False
     assert replay["writes_performed"] is False
     assert len(_explicit_epoch_release_events(conn)) == event_count
+
+
+def test_release_route_replay_rolls_authority_and_repairs_projection_once(
+    conn,
+):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    old_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id="obs-f410-live-shaped",
+        route_token_ref="rtok-a1-live-shaped",
+        allowed_actions=[
+            "integration_epoch_release_unlandable_child",
+            "task_timeline_append",
+        ],
+    )
+    route_handlers = [
+        handler
+        for method, path, handler in server.ROUTES
+        if method == "POST"
+        and path
+        == (
+            "/api/projects/{project_id}/integration-epochs/{batch_id}/"
+            "release-unlandable-child"
+        )
+    ]
+    assert route_handlers == [
+        server.handle_integration_epoch_release_unlandable_child
+    ]
+    route_handler = route_handlers[0]
+    first = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=old_body,
+        )
+    )
+    assert first["ok"] is True
+    immutable_event = dict(_explicit_epoch_release_events(conn)[0])
+
+    conn.execute(
+        "UPDATE parallel_branch_runtime_contexts SET status = 'running' "
+        "WHERE project_id = ? AND task_id = ?",
+        (PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK),
+    )
+    conn.execute(
+        "UPDATE parallel_branch_batch_items SET status = 'running' "
+        "WHERE project_id = ? AND batch_id = ? AND task_id = ?",
+        (
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_BATCH,
+            _EXPLICIT_EPOCH_RELEASE_PLAN_TASK,
+        ),
+    )
+    conn.commit()
+    renewed_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id="obs-f594-live-shaped",
+        route_token_ref="rtok-9d-live-shaped",
+        allowed_actions=[
+            "integration_epoch_release_unlandable_child",
+            "task_timeline_append",
+            "graph_current_full_reconcile",
+            "backlog_close",
+        ],
+    )
+
+    repaired = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=renewed_body,
+        )
+    )
+
+    assert repaired["replayed"] is True
+    assert repaired["replay_authority_renewed"] is True
+    assert repaired["projection_repaired"] is True
+    assert repaired["writes_performed"] is True
+    assert [dict(row) for row in _explicit_epoch_release_events(conn)] == [
+        immutable_event
+    ]
+    assert get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    ).status == parallel_branch_runtime.STATE_RELEASED_UNLANDABLE
+    assert parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ).items[0].status == parallel_branch_runtime.STATE_RELEASED_UNLANDABLE
+    repaired_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    rollover_audits = repaired_epoch.incomplete_fanin["released_children"][0][
+        "binding_audit"
+    ]["replay_authority_rollovers"]
+    assert len(rollover_audits) == 1
+    rollover = rollover_audits[0]
+    assert rollover["old_operator_principal"] == (
+        "observer-session:obs-f410-live-shaped"
+    )
+    assert rollover["old_observer_route_token_ref"] == (
+        "observer-route-token-ref:rtok-a1-live-shaped"
+    )
+    assert rollover["new_operator_principal"] == (
+        "observer-session:obs-f594-live-shaped"
+    )
+    assert rollover["new_observer_route_token_ref"] == (
+        "observer-route-token-ref:rtok-9d-live-shaped"
+    )
+    assert rollover["raw_credentials_persisted"] is False
+
+    changes_before_replay = conn.total_changes
+    replay = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=renewed_body,
+        )
+    )
+    assert replay["replayed"] is True
+    assert replay["replay_authority_renewed"] is False
+    assert replay["projection_repaired"] is False
+    assert replay["writes_performed"] is False
+    assert conn.total_changes == changes_before_replay
+    assert len(_explicit_epoch_release_events(conn)) == 1
+    replay_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    assert len(
+        replay_epoch.incomplete_fanin["released_children"][0]["binding_audit"]
+        ["replay_authority_rollovers"]
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "legacy_role_session",
+        "mixed_authority_mode",
+        "wrong_scope",
+        "wrong_action",
+        "changed_business_ref",
+        "reordered_business_refs",
+        "changed_child",
+        "changed_blocker",
+        "changed_reason",
+        "changed_approval",
+        "duplicate_current_session_marker",
+        "empty_immutable_session_marker",
+        "missing_immutable_route_marker",
+        "duplicate_immutable_route_marker",
+    ],
+)
+def test_release_replay_authority_rollover_drift_is_zero_write(
+    conn,
+    failure_mode,
+):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    old_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id=f"obs-f410-{failure_mode}",
+        route_token_ref=f"rtok-a1-{failure_mode}",
+    )
+    first = server.handle_integration_epoch_release_unlandable_child(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=old_body,
+        )
+    )
+    assert first["ok"] is True
+
+    renewed_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id=f"obs-f594-{failure_mode}",
+        route_token_ref=f"rtok-9d-{failure_mode}",
+        route_backlog_id=(
+            "AC-WRONG-ROLLOVER-SCOPE"
+            if failure_mode == "wrong_scope"
+            else _EXPLICIT_EPOCH_RELEASE_GOVERNING_BACKLOG
+        ),
+        allowed_actions=(
+            ["task_timeline_append"]
+            if failure_mode == "wrong_action"
+            else [
+                "integration_epoch_release_unlandable_child",
+                "task_timeline_append",
+                "backlog_close",
+            ]
+        ),
+    )
+    ctx = _ctx(
+        {
+            "project_id": PID,
+            "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+        },
+        method="POST",
+        body=renewed_body,
+    )
+    if failure_mode == "legacy_role_session":
+        role_session = server.role_service.register(
+            conn,
+            principal_id="legacy-rollover-observer",
+            project_id=PID,
+            role="observer",
+        )
+        conn.commit()
+        ctx.body = _explicit_epoch_release_body()
+        ctx.token = role_session["token"]
+    elif failure_mode == "mixed_authority_mode":
+        role_session = server.role_service.register(
+            conn,
+            principal_id="mixed-rollover-observer",
+            project_id=PID,
+            role="observer",
+        )
+        conn.commit()
+        ctx.token = role_session["token"]
+    elif failure_mode == "changed_business_ref":
+        ctx.body["evidence_refs"] = [
+            *ctx.body["evidence_refs"],
+            "timeline:changed-business-evidence",
+        ]
+    elif failure_mode == "reordered_business_refs":
+        ctx.body["evidence_refs"] = list(
+            reversed(ctx.body["evidence_refs"])
+        )
+    elif failure_mode == "changed_child":
+        ctx.body["child_backlog_id"] = "AC-CHANGED-ROLLOVER-CHILD"
+    elif failure_mode == "changed_blocker":
+        ctx.body["blocking_backlog_id"] = "AC-CHANGED-ROLLOVER-BLOCKER"
+    elif failure_mode == "changed_reason":
+        ctx.body["reason"] = "changed release reason"
+    elif failure_mode == "changed_approval":
+        ctx.body["approval_ref"] = "operator-approval:changed"
+    elif failure_mode == "duplicate_current_session_marker":
+        ctx.body["evidence_refs"] = [
+            *ctx.body["evidence_refs"],
+            "observer-session:forged-duplicate",
+        ]
+    elif failure_mode in {
+        "empty_immutable_session_marker",
+        "missing_immutable_route_marker",
+        "duplicate_immutable_route_marker",
+    }:
+        event = _explicit_epoch_release_events(conn)[0]
+        event_refs = json.loads(event["evidence_refs_json"])
+        if failure_mode == "empty_immutable_session_marker":
+            event_refs = [
+                "observer-session:"
+                if ref.startswith("observer-session:")
+                else ref
+                for ref in event_refs
+            ]
+        elif failure_mode == "missing_immutable_route_marker":
+            event_refs = [
+                ref
+                for ref in event_refs
+                if not ref.startswith("observer-route-token-ref:")
+            ]
+        else:
+            event_refs.append("observer-route-token-ref:duplicate-immutable")
+        conn.execute(
+            "UPDATE parallel_branch_integration_epoch_release_events "
+            "SET evidence_refs_json = ? WHERE id = ?",
+            (json.dumps(event_refs), int(event["id"])),
+        )
+        conn.commit()
+
+    before_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_context = get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    )
+    before_batch = parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_events = [
+        dict(row) for row in _explicit_epoch_release_events(conn)
+    ]
+    changes_before = conn.total_changes
+
+    status, result = (
+        server.handle_integration_epoch_release_unlandable_child(ctx)
+    )
+
+    assert status in {403, 409, 422}
+    assert result["error"] in {
+        "integration_epoch_release_authorization_required",
+        "integration_epoch_release_replay_identity_mismatch",
+    }
+    assert result["zero_write_rejection"] is True
+    assert conn.total_changes == changes_before
+    assert get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_epoch
+    assert get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    ) == before_context
+    assert parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_batch
+    assert [dict(row) for row in _explicit_epoch_release_events(conn)] == (
+        before_events
+    )
+
+
+def test_release_replay_authority_rollover_projection_failure_rolls_back(
+    conn,
+    monkeypatch,
+):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    old_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id="obs-f410-rollover-rollback",
+        route_token_ref="rtok-a1-rollover-rollback",
+    )
+    first = server.handle_integration_epoch_release_unlandable_child(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=old_body,
+        )
+    )
+    assert first["ok"] is True
+    conn.execute(
+        "UPDATE parallel_branch_runtime_contexts SET status = 'running' "
+        "WHERE project_id = ? AND task_id = ?",
+        (PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK),
+    )
+    conn.execute(
+        "UPDATE parallel_branch_batch_items SET status = 'running' "
+        "WHERE project_id = ? AND batch_id = ? AND task_id = ?",
+        (
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_BATCH,
+            _EXPLICIT_EPOCH_RELEASE_PLAN_TASK,
+        ),
+    )
+    conn.commit()
+    renewed_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id="obs-f594-rollover-rollback",
+        route_token_ref="rtok-9d-rollover-rollback",
+        allowed_actions=[
+            "integration_epoch_release_unlandable_child",
+            "task_timeline_append",
+        ],
+    )
+    before_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_context = get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    )
+    before_batch = parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_events = [
+        dict(row) for row in _explicit_epoch_release_events(conn)
+    ]
+
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "upsert_integration_epoch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("forced rollover audit persistence failure")
+        ),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="forced rollover audit persistence failure",
+    ):
+        server.handle_integration_epoch_release_unlandable_child(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+                },
+                method="POST",
+                body=renewed_body,
+            )
+        )
+
+    assert get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_epoch
+    assert get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    ) == before_context
+    assert parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_batch
+    assert [dict(row) for row in _explicit_epoch_release_events(conn)] == (
+        before_events
+    )
 
 
 def test_released_projection_upserts_cannot_resurrect_or_remove_child(
