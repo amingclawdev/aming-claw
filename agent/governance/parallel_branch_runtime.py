@@ -291,6 +291,22 @@ CREATE INDEX IF NOT EXISTS idx_parallel_branch_epoch_release_rollovers
   ON parallel_branch_integration_epoch_release_rollovers(
       project_id, batch_id, queue_item_id, release_event_id, sequence
   );
+
+CREATE TABLE IF NOT EXISTS parallel_branch_integration_epoch_release_projection_repairs (
+    project_id        TEXT NOT NULL,
+    batch_id          TEXT NOT NULL,
+    queue_item_id     TEXT NOT NULL,
+    release_event_id  INTEGER NOT NULL,
+    repair_id         TEXT NOT NULL,
+    audit_json        TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    PRIMARY KEY (project_id, batch_id, queue_item_id, release_event_id),
+    UNIQUE (project_id, batch_id, queue_item_id, repair_id)
+);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_epoch_release_projection_repairs
+  ON parallel_branch_integration_epoch_release_projection_repairs(
+      project_id, batch_id, queue_item_id, release_event_id
+  );
 """
 
 STATE_MERGED = "merged"
@@ -15348,37 +15364,109 @@ def _merge_queue_item_possible_landed_evidence(
     }
 
 
-def _derive_missing_release_batch_runtime_projection(
+_RELEASE_BATCH_PROJECTION_REPAIR_SCHEMA = (
+    "mf_batch_parallel.release_batch_runtime_projection_repair.v2"
+)
+
+
+def _release_projection_nonempty_value(
+    *values: Any,
+) -> str:
+    return next(
+        (
+            str(value or "").strip()
+            for value in values
+            if str(value or "").strip()
+        ),
+        "",
+    )
+
+
+def _release_projection_source_mismatch(
+    sources: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = {
+        str(source): str(value or "").strip()
+        for source, value in sources.items()
+        if str(value or "").strip()
+    }
+    if len(set(normalized.values())) <= 1:
+        return {}
+    return {"sources": normalized}
+
+
+def _release_replay_possible_landed_evidence(
+    item: MergeQueueItem,
+) -> dict[str, Any]:
+    """Re-run the landed guard without stranding a proven failed replay.
+
+    The release write replaces a safe ``merge_failed`` status with the
+    permanent terminal disposition.  Equal before/after heads and no merge
+    commit remain the same durable no-mutation proof after that status change.
+    No other terminal replay evidence is weakened.
+    """
+
+    candidate = item
+    if (
+        item.status == STATE_RELEASED_UNLANDABLE
+        and item.target_head_before_merge
+        and item.target_head_before_merge == item.target_head_after_merge
+        and not item.merge_commit
+    ):
+        candidate = replace(item, status=STATE_MERGE_FAILED)
+    return _merge_queue_item_possible_landed_evidence(candidate)
+
+
+def _release_batch_item_possible_landed_evidence(
+    item: MergeQueueItem,
+    batch_item: BatchMergeItem,
+) -> dict[str, Any]:
+    projected = replace(
+        item,
+        status=batch_item.status,
+        merge_commit=batch_item.merge_commit,
+        target_head_before_merge=batch_item.target_head_before_merge,
+        target_head_after_merge=batch_item.target_head_after_merge,
+    )
+    if (
+        batch_item.status == STATE_RELEASED_UNLANDABLE
+        and batch_item.target_head_before_merge
+        and batch_item.target_head_before_merge
+        == batch_item.target_head_after_merge
+        and not batch_item.merge_commit
+    ):
+        projected = replace(projected, status=STATE_MERGE_FAILED)
+    return _merge_queue_item_possible_landed_evidence(projected)
+
+
+def _release_projection_repair_id(audit: Mapping[str, Any]) -> str:
+    core = {
+        key: value
+        for key, value in audit.items()
+        if key not in {"repair_id", "recorded_at"}
+    }
+    return "release-projection-repair-" + hashlib.sha256(
+        json.dumps(
+            core,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _release_batch_runtime_projection_authority(
     conn: sqlite3.Connection,
     *,
     epoch: IntegrationEpoch,
     item: MergeQueueItem,
     context: BranchTaskRuntimeContext,
     binding: Mapping[str, Any],
-) -> tuple[BatchMergeRuntime, BatchMergeItem, dict[str, Any]]:
-    """Derive one absent Batch projection from independent durable lineage.
-
-    This repair is deliberately narrower than ordinary Batch materialization:
-    it is available only after an immutable release event exists, only when
-    the whole parent projection is absent, and only for the uniquely bound
-    planned row.  No caller input participates in the reconstructed values.
-    """
-
-    orphan_items = list_batch_merge_items(
-        conn,
-        epoch.project_id,
-        epoch.batch_id,
-    )
-    if orphan_items:
-        raise IntegrationEpochUnlandableChildReleaseError(
-            "integration_epoch_release_batch_runtime_projection_partial",
-            (
-                "missing BatchMergeRuntime cannot be reconstructed while "
-                "orphan BatchMergeItem rows exist"
-            ),
-            batch_id=epoch.batch_id,
-            orphan_task_ids=[candidate.task_id for candidate in orphan_items],
-        )
+    release_event_id: int,
+    now_iso: str,
+    batch_runtime: BatchMergeRuntime | None = None,
+    batch_item: BatchMergeItem | None = None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Validate independent lineage and return its closed repair authority."""
 
     try:
         contract_row = conn.execute(
@@ -15422,20 +15510,75 @@ def _derive_missing_release_batch_runtime_projection(
     compact = dict(compact_row) if compact_row is not None else {}
     revision = dict(revision_row) if revision_row is not None else {}
 
+    source_values: dict[str, dict[str, Any]] = {
+        "branch_ref": {
+            "merge_queue_item": item.branch_ref,
+            "runtime_context": context.branch_ref,
+        },
+        "worktree_path": {
+            "runtime_context": context.worktree_path,
+        },
+        "base_commit": {
+            "integration_epoch": epoch.base_head,
+            "merge_queue_item": item.base_commit,
+            "runtime_context": context.base_commit,
+        },
+        "branch_head": {
+            "merge_queue_item": item.branch_head,
+            "runtime_context": context.head_commit,
+        },
+        "checkpoint_id": {
+            "runtime_context": context.checkpoint_id,
+        },
+        "snapshot_id": {
+            "merge_queue_item": item.snapshot_id,
+            "runtime_context": context.snapshot_id,
+        },
+        "projection_id": {
+            "merge_queue_item": item.projection_id,
+            "runtime_context": context.projection_id,
+        },
+        "merge_preview_id": {
+            "merge_queue_item": item.merge_preview_id,
+            "runtime_context": context.merge_preview_id,
+        },
+        "validated_target_head": {
+            "merge_queue_item.validated_target_head": (
+                item.validated_target_head
+            ),
+            "merge_queue_item.current_target_head": item.current_target_head,
+            "runtime_context.target_head_commit": context.target_head_commit,
+        },
+        "merge_commit": {"merge_queue_item": item.merge_commit},
+        "target_head_before_merge": {
+            "merge_queue_item": item.target_head_before_merge
+        },
+        "target_head_after_merge": {
+            "merge_queue_item": item.target_head_after_merge
+        },
+    }
+    resolved = {
+        field_name: _release_projection_nonempty_value(*sources.values())
+        for field_name, sources in source_values.items()
+    }
+    source_mismatches = {
+        field_name: mismatch
+        for field_name, sources in source_values.items()
+        if (mismatch := _release_projection_source_mismatch(sources))
+    }
+
     required_values = {
         "epoch_target_ref": epoch.target_ref,
         "epoch_base_head": epoch.base_head,
         "epoch_current_head": epoch.current_head,
         "queue_item_backlog_id": item.backlog_id,
         "queue_item_target_ref": item.target_ref,
-        "queue_item_base_commit": item.base_commit,
         "context_runtime_context_id": runtime_context_id_for_branch_context(
             context
         ),
-        "context_branch_ref": context.branch_ref,
-        "context_worktree_path": context.worktree_path,
-        "context_base_commit": context.base_commit,
-        "context_head_commit": context.head_commit,
+        "resolved_branch_ref": resolved["branch_ref"],
+        "resolved_worktree_path": resolved["worktree_path"],
+        "resolved_base_commit": resolved["base_commit"],
         "contract_runtime_revision": contract.get(
             "execution_state_revision"
         ),
@@ -15453,6 +15596,8 @@ def _derive_missing_release_batch_runtime_projection(
         )
         if not value
     )
+    if batch_item is None and not resolved["branch_head"]:
+        missing.append("resolved_branch_head")
     mismatches = {
         key: {"expected": expected, "actual": actual}
         for key, expected, actual in (
@@ -15486,11 +15631,15 @@ def _derive_missing_release_batch_runtime_projection(
                 item.merge_queue_id,
             ),
             ("queue_target_ref", epoch.target_ref, item.target_ref),
-            ("queue_base_commit", epoch.base_head, item.base_commit),
-            ("context_base_commit", epoch.base_head, context.base_commit),
+            (
+                "queue_status",
+                STATE_RELEASED_UNLANDABLE,
+                item.status,
+            ),
         )
         if expected != actual
     }
+    mismatches.update(source_mismatches)
     compact_execution_ids = sorted({
         str(value or "").strip()
         for value in (
@@ -15535,12 +15684,120 @@ def _derive_missing_release_batch_runtime_projection(
         if expected != actual
     }
     mismatches.update(contract_mismatches)
+    queue_landing = _release_replay_possible_landed_evidence(item)
+    batch_landing: dict[str, Any] = {}
+    if batch_item is not None:
+        batch_landing = _release_batch_item_possible_landed_evidence(
+            item,
+            batch_item,
+        )
+        missing_permitted_fields = {
+            "item_branch_ref",
+            "item_worktree_path",
+            "item_base_commit",
+            "item_branch_head",
+            "item_checkpoint_id",
+            "item_merge_commit",
+            "item_target_head_before_merge",
+            "item_target_head_after_merge",
+            "item_snapshot_id",
+            "item_projection_id",
+            "item_merge_preview_id",
+        }
+        batch_projection_mismatches = {
+            key: {"expected": expected, "actual": actual}
+            for key, expected, actual in (
+                ("batch_project_id", epoch.project_id, batch_runtime.project_id),
+                ("batch_id", epoch.batch_id, batch_runtime.batch_id),
+                ("target_ref", epoch.target_ref, batch_runtime.target_ref),
+                (
+                    "batch_base_commit",
+                    epoch.base_head,
+                    batch_runtime.batch_base_commit,
+                ),
+                (
+                    "current_target_head",
+                    epoch.current_head,
+                    batch_runtime.current_target_head,
+                ),
+                ("batch_status", BATCH_STATE_OPEN, batch_runtime.batch_status),
+                ("rollback_epoch", "", batch_runtime.rollback_epoch),
+                ("replay_epoch", "", batch_runtime.replay_epoch),
+                (
+                    "rollback_target_commit",
+                    "",
+                    batch_runtime.rollback_target_commit,
+                ),
+                (
+                    "rollback_snapshot_id",
+                    "",
+                    batch_runtime.rollback_snapshot_id,
+                ),
+                (
+                    "rollback_projection_id",
+                    "",
+                    batch_runtime.rollback_projection_id,
+                ),
+                ("batch_failure_reason", "", batch_runtime.failure_reason),
+                ("item_task_id", item.task_id, batch_item.task_id),
+                ("item_queue_index", item.queue_index, batch_item.queue_index),
+                (
+                    "item_merge_queue_id",
+                    epoch.merge_queue_id,
+                    batch_item.merge_queue_id,
+                ),
+                ("item_branch_ref", resolved["branch_ref"], batch_item.branch_ref),
+                (
+                    "item_worktree_path",
+                    resolved["worktree_path"],
+                    batch_item.worktree_path,
+                ),
+                ("item_base_commit", resolved["base_commit"], batch_item.base_commit),
+                ("item_branch_head", resolved["branch_head"], batch_item.branch_head),
+                (
+                    "item_checkpoint_id",
+                    resolved["checkpoint_id"],
+                    batch_item.checkpoint_id,
+                ),
+                ("item_merge_commit", resolved["merge_commit"], batch_item.merge_commit),
+                (
+                    "item_target_head_before_merge",
+                    resolved["target_head_before_merge"],
+                    batch_item.target_head_before_merge,
+                ),
+                (
+                    "item_target_head_after_merge",
+                    resolved["target_head_after_merge"],
+                    batch_item.target_head_after_merge,
+                ),
+                ("item_snapshot_id", resolved["snapshot_id"], batch_item.snapshot_id),
+                (
+                    "item_projection_id",
+                    resolved["projection_id"],
+                    batch_item.projection_id,
+                ),
+                (
+                    "item_merge_preview_id",
+                    resolved["merge_preview_id"],
+                    batch_item.merge_preview_id,
+                ),
+                ("item_depends_on", item.depends_on, batch_item.depends_on),
+                ("item_retained", True, batch_item.retained),
+            )
+            if expected != actual
+            and not (
+                key in missing_permitted_fields
+                and not str(actual or "").strip()
+            )
+        }
+        mismatches.update(batch_projection_mismatches)
+    context_possible_landed = context.status in {STATE_MERGED, STATE_MERGING}
     if missing or mismatches or item.queue_index <= 0:
         raise IntegrationEpochUnlandableChildReleaseError(
-            "integration_epoch_release_batch_runtime_reconstruction_authority_insufficient",
+            "integration_epoch_release_batch_runtime_binding_invalid",
             (
-                "missing BatchMergeRuntime requires complete exact epoch, "
-                "planned-row, queue, and runtime-context authority"
+                "release requires complete exact epoch, plan-row, queue, "
+                "runtime-context, contract, and Batch projection authority"
             ),
             batch_id=epoch.batch_id,
             queue_item_id=item.queue_item_id,
@@ -15548,23 +15805,130 @@ def _derive_missing_release_batch_runtime_projection(
             identity_mismatches=mismatches,
             queue_index=item.queue_index,
         )
+    if (
+        queue_landing.get("possible_landed")
+        or batch_landing.get("possible_landed")
+        or context_possible_landed
+    ):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_projection_possible_landed",
+            "release replay refuses any durable projection that may have landed",
+            batch_id=epoch.batch_id,
+            queue_item_id=item.queue_item_id,
+            merge_queue_item_evidence=queue_landing,
+            batch_merge_item_evidence=batch_landing,
+            runtime_context_status=context.status,
+        )
+
+    audit = {
+        "schema_version": _RELEASE_BATCH_PROJECTION_REPAIR_SCHEMA,
+        "source": "server_derived_epoch_queue_context_contract_binding",
+        "project_id": epoch.project_id,
+        "batch_id": epoch.batch_id,
+        "epoch_id": epoch.epoch_id,
+        "release_event_id": int(release_event_id),
+        "plan_row_task_id": item.task_id,
+        "child_backlog_id": item.backlog_id,
+        "contract_execution_id": context.task_id,
+        "runtime_context_id": runtime_context_id_for_branch_context(context),
+        "merge_queue_id": epoch.merge_queue_id,
+        "queue_item_id": item.queue_item_id,
+        "queue_index": item.queue_index,
+        "target_ref": epoch.target_ref,
+        "batch_base_commit": epoch.base_head,
+        "credited_current_head": epoch.current_head,
+        "validated_target_head": resolved["validated_target_head"],
+        "batch_status": BATCH_STATE_OPEN,
+        "item_count": 1,
+        "item_terminal_status": STATE_RELEASED_UNLANDABLE,
+        "branch_ref": resolved["branch_ref"],
+        "worktree_path": resolved["worktree_path"],
+        "base_commit": resolved["base_commit"],
+        "branch_head": resolved["branch_head"],
+        "checkpoint_id": resolved["checkpoint_id"],
+        "merge_commit": resolved["merge_commit"],
+        "target_head_before_merge": resolved["target_head_before_merge"],
+        "target_head_after_merge": resolved["target_head_after_merge"],
+        "snapshot_id": resolved["snapshot_id"],
+        "projection_id": resolved["projection_id"],
+        "merge_preview_id": resolved["merge_preview_id"],
+        "depends_on": list(item.depends_on),
+        "hard_depends_on": list(item.hard_depends_on),
+        "serializes_after": list(item.serializes_after),
+        "conflicts_with": list(item.conflicts_with),
+        "same_node_or_file_conflicts": list(
+            item.same_node_or_file_conflicts
+        ),
+        "requires_graph_epoch": list(item.requires_graph_epoch),
+        "contract_runtime_revision": int(
+            contract.get("execution_state_revision") or 0
+        ),
+        "compact_chain_generation": int(compact.get("generation") or 0),
+        "compact_projection_hash": str(compact.get("projection_hash") or ""),
+        "runtime_contract_revision_id": str(revision.get("revision_id") or ""),
+        "merge_credit_granted": False,
+        "full_batch_completion_claimed": False,
+        "raw_credentials_persisted": False,
+        "copy_safe": True,
+        "recorded_at": str(now_iso or ""),
+    }
+    audit["repair_id"] = _release_projection_repair_id(audit)
+    return audit, resolved
+
+
+def _derive_missing_release_batch_runtime_projection(
+    conn: sqlite3.Connection,
+    *,
+    epoch: IntegrationEpoch,
+    item: MergeQueueItem,
+    context: BranchTaskRuntimeContext,
+    binding: Mapping[str, Any],
+    release_event_id: int,
+    now_iso: str,
+) -> tuple[BatchMergeRuntime, BatchMergeItem, dict[str, Any]]:
+    """Derive one absent Batch projection from independent durable lineage."""
+
+    orphan_items = list_batch_merge_items(
+        conn,
+        epoch.project_id,
+        epoch.batch_id,
+    )
+    if orphan_items:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_batch_runtime_projection_partial",
+            (
+                "missing BatchMergeRuntime cannot be reconstructed while "
+                "orphan BatchMergeItem rows exist"
+            ),
+            batch_id=epoch.batch_id,
+            orphan_task_ids=[candidate.task_id for candidate in orphan_items],
+        )
+    repair_audit, resolved = _release_batch_runtime_projection_authority(
+        conn,
+        epoch=epoch,
+        item=item,
+        context=context,
+        binding=binding,
+        release_event_id=release_event_id,
+        now_iso=now_iso,
+    )
 
     batch_item = BatchMergeItem(
         task_id=item.task_id,
-        branch_ref=item.branch_ref or context.branch_ref,
-        worktree_path=context.worktree_path,
+        branch_ref=resolved["branch_ref"],
+        worktree_path=resolved["worktree_path"],
         queue_index=item.queue_index,
-        status=item.status,
-        branch_head=item.branch_head or context.head_commit,
-        base_commit=item.base_commit,
-        checkpoint_id=context.checkpoint_id,
-        merge_commit=item.merge_commit,
-        target_head_before_merge=item.target_head_before_merge,
-        target_head_after_merge=item.target_head_after_merge,
-        snapshot_id=item.snapshot_id or context.snapshot_id,
-        projection_id=item.projection_id or context.projection_id,
+        status=STATE_RELEASED_UNLANDABLE,
+        branch_head=resolved["branch_head"],
+        base_commit=resolved["base_commit"],
+        checkpoint_id=resolved["checkpoint_id"],
+        merge_commit=resolved["merge_commit"],
+        target_head_before_merge=resolved["target_head_before_merge"],
+        target_head_after_merge=resolved["target_head_after_merge"],
+        snapshot_id=resolved["snapshot_id"],
+        projection_id=resolved["projection_id"],
         merge_queue_id=epoch.merge_queue_id,
-        merge_preview_id=item.merge_preview_id or context.merge_preview_id,
+        merge_preview_id=resolved["merge_preview_id"],
         depends_on=item.depends_on,
         retained=True,
     )
@@ -15577,38 +15941,6 @@ def _derive_missing_release_batch_runtime_projection(
         items=(batch_item,),
         batch_status=BATCH_STATE_OPEN,
     )
-    repair_audit = {
-        "schema_version": (
-            "mf_batch_parallel.release_batch_runtime_projection_repair.v1"
-        ),
-        "source": "server_derived_epoch_queue_context_binding",
-        "batch_id": epoch.batch_id,
-        "plan_row_task_id": item.task_id,
-        "contract_execution_id": context.task_id,
-        "runtime_context_id": runtime_context_id_for_branch_context(context),
-        "merge_queue_id": epoch.merge_queue_id,
-        "queue_item_id": item.queue_item_id,
-        "target_ref": epoch.target_ref,
-        "batch_base_commit": epoch.base_head,
-        "credited_current_head": epoch.current_head,
-        "batch_status": BATCH_STATE_OPEN,
-        "item_count": 1,
-        "item_terminal_status": STATE_RELEASED_UNLANDABLE,
-        "contract_runtime_execution_id": context.task_id,
-        "contract_runtime_revision": int(
-            contract.get("execution_state_revision") or 0
-        ),
-        "compact_chain_generation": int(compact.get("generation") or 0),
-        "compact_projection_hash": str(
-            compact.get("projection_hash") or ""
-        ),
-        "runtime_contract_revision_id": str(
-            revision.get("revision_id") or ""
-        ),
-        "merge_credit_granted": False,
-        "full_batch_completion_claimed": False,
-        "copy_safe": True,
-    }
     return runtime, batch_item, repair_audit
 
 
@@ -15618,6 +15950,8 @@ def _resolve_unlandable_release_projection_binding(
     epoch: IntegrationEpoch,
     item: MergeQueueItem,
     allow_missing_batch_runtime_reconstruction: bool = False,
+    release_event_id: int = 0,
+    now_iso: str = "",
 ) -> tuple[
     BranchTaskRuntimeContext,
     BatchMergeRuntime,
@@ -15680,6 +16014,8 @@ def _resolve_unlandable_release_projection_binding(
                 item=item,
                 context=context,
                 binding=binding,
+                release_event_id=release_event_id,
+                now_iso=now_iso,
             )
         )
         batch_items = [batch_item]
@@ -15701,6 +16037,63 @@ def _resolve_unlandable_release_projection_binding(
             candidate_count=len(batch_items),
         )
     batch_item = batch_items[0]
+    if allow_missing_batch_runtime_reconstruction and batch_runtime is not None:
+        expected_repair_audit, _ = (
+            _release_batch_runtime_projection_authority(
+                conn,
+                epoch=epoch,
+                item=item,
+                context=context,
+                binding=binding,
+                release_event_id=release_event_id,
+                now_iso=now_iso,
+                batch_runtime=batch_runtime,
+                batch_item=batch_item,
+            )
+        )
+        repair_anchor_present = bool(
+            conn.execute(
+                """
+                SELECT 1
+                FROM parallel_branch_integration_epoch_release_projection_repairs
+                WHERE project_id = ? AND batch_id = ? AND queue_item_id = ?
+                LIMIT 1
+                """,
+                (epoch.project_id, epoch.batch_id, item.queue_item_id),
+            ).fetchone()
+        )
+        projection_repair_marker_present = any(
+            isinstance(record, Mapping)
+            and str(record.get("queue_item_id") or "") == item.queue_item_id
+            and isinstance(record.get("binding_audit"), Mapping)
+            and "batch_runtime_projection_repair" in record["binding_audit"]
+            for record in (
+                epoch.incomplete_fanin.get("released_children") or []
+            )
+        )
+        if repair_anchor_present and len(batch_runtime.items) != 1:
+            raise IntegrationEpochUnlandableChildReleaseError(
+                "integration_epoch_release_replay_identity_mismatch",
+                (
+                    "reconstructed Batch projection must remain the exact "
+                    "single-item shape bound by its canonical repair anchor"
+                ),
+                batch_id=epoch.batch_id,
+                batch_item_count=len(batch_runtime.items),
+            )
+        if repair_anchor_present or projection_repair_marker_present:
+            if projection_repair_marker_present:
+                _, mirror_value = _release_projection_repair_mirror(
+                    epoch,
+                    queue_item_id=item.queue_item_id,
+                )
+                if isinstance(mirror_value, Mapping) and str(
+                    mirror_value.get("recorded_at") or ""
+                ):
+                    expected_repair_audit["recorded_at"] = str(
+                        mirror_value["recorded_at"]
+                    )
+            repair_audit = expected_repair_audit
     batch_projection_mismatches = {
         key: {"expected": expected, "actual": actual}
         for key, expected, actual in (
@@ -15840,13 +16233,6 @@ def _with_release_binding_audit(
             else {}
         )
         next_binding_audit = dict(binding_audit)
-        if (
-            "batch_runtime_projection_repair" in existing_binding_audit
-            and "batch_runtime_projection_repair" not in next_binding_audit
-        ):
-            next_binding_audit["batch_runtime_projection_repair"] = (
-                existing_binding_audit["batch_runtime_projection_repair"]
-            )
         if canonical_rollover_audits is None:
             if "replay_authority_rollovers" in existing_binding_audit:
                 next_binding_audit["replay_authority_rollovers"] = (
@@ -15875,6 +16261,191 @@ def _with_release_binding_audit(
         incomplete["released_children"] = next_records
         return replace(epoch, incomplete_fanin=incomplete), True
     return epoch, False
+
+
+def _release_projection_repair_mirror(
+    epoch: IntegrationEpoch,
+    *,
+    queue_item_id: str,
+) -> tuple[bool, Any]:
+    matching = [
+        record
+        for record in (epoch.incomplete_fanin.get("released_children") or [])
+        if isinstance(record, Mapping)
+        and str(record.get("queue_item_id") or "") == queue_item_id
+    ]
+    if len(matching) != 1:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "release replay requires exactly one released-child projection",
+            queue_item_id=queue_item_id,
+            released_child_projection_count=len(matching),
+        )
+    binding_audit = matching[0].get("binding_audit")
+    if binding_audit is None:
+        return False, None
+    if not isinstance(binding_audit, Mapping):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "released-child binding audit must be an object",
+            queue_item_id=queue_item_id,
+        )
+    if "batch_runtime_projection_repair" not in binding_audit:
+        return False, None
+    return True, binding_audit.get("batch_runtime_projection_repair")
+
+
+def _validate_release_projection_repair_audit(
+    value: Any,
+    *,
+    expected: Mapping[str, Any],
+    allow_recorded_at_variance: bool,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "release Batch projection repair audit must be an object",
+        )
+    actual = dict(value)
+    expected_dict = dict(expected)
+    if set(actual) != set(expected_dict):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "release Batch projection repair audit uses a closed schema",
+            missing_fields=sorted(set(expected_dict) - set(actual)),
+            extra_fields=sorted(set(actual) - set(expected_dict)),
+        )
+    actual_id = str(actual.get("repair_id") or "")
+    if (
+        not actual_id
+        or actual_id != _release_projection_repair_id(actual)
+        or actual.get("raw_credentials_persisted") is not False
+        or actual.get("merge_credit_granted") is not False
+        or actual.get("full_batch_completion_claimed") is not False
+        or actual.get("copy_safe") is not True
+    ):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "release Batch projection repair audit core is invalid",
+            repair_id=actual_id,
+        )
+    comparison_actual = dict(actual)
+    comparison_expected = dict(expected_dict)
+    if allow_recorded_at_variance:
+        comparison_actual.pop("recorded_at", None)
+        comparison_expected.pop("recorded_at", None)
+    if comparison_actual != comparison_expected:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "release Batch projection repair audit does not match authority",
+            repair_id=actual_id,
+        )
+    return actual
+
+
+def _prepare_release_projection_repair_anchor(
+    conn: sqlite3.Connection,
+    *,
+    epoch: IntegrationEpoch,
+    queue_item_id: str,
+    release_event_id: int,
+    expected_audit: Mapping[str, Any] | None,
+    batch_runtime_projection_missing: bool,
+    now_iso: str,
+) -> bool:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM parallel_branch_integration_epoch_release_projection_repairs
+        WHERE project_id = ? AND batch_id = ? AND queue_item_id = ?
+        ORDER BY release_event_id, created_at, repair_id
+        """,
+        (epoch.project_id, epoch.batch_id, queue_item_id),
+    ).fetchall()
+    mirror_present, mirror_value = _release_projection_repair_mirror(
+        epoch,
+        queue_item_id=queue_item_id,
+    )
+    expected = dict(expected_audit or {})
+    if batch_runtime_projection_missing:
+        if rows or mirror_present or not expected:
+            raise IntegrationEpochUnlandableChildReleaseError(
+                "integration_epoch_release_replay_identity_mismatch",
+                (
+                    "whole-parent reconstruction requires empty canonical "
+                    "repair authority"
+                ),
+                canonical_repair_count=len(rows),
+                projection_repair_present=mirror_present,
+            )
+        _validate_release_projection_repair_audit(
+            expected,
+            expected=expected,
+            allow_recorded_at_variance=False,
+        )
+        conn.execute(
+            """
+            INSERT INTO parallel_branch_integration_epoch_release_projection_repairs (
+                project_id, batch_id, queue_item_id, release_event_id,
+                repair_id, audit_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                epoch.project_id,
+                epoch.batch_id,
+                queue_item_id,
+                int(release_event_id),
+                str(expected["repair_id"]),
+                json.dumps(expected, sort_keys=True, separators=(",", ":")),
+                str(now_iso or ""),
+            ),
+        )
+        return True
+    if not rows:
+        if mirror_present:
+            raise IntegrationEpochUnlandableChildReleaseError(
+                "integration_epoch_release_replay_identity_mismatch",
+                "projection repair mirror has no canonical repair anchor",
+            )
+        return False
+    if len(rows) != 1 or not expected or not mirror_present:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "release Batch projection repair authority is incomplete or ambiguous",
+            canonical_repair_count=len(rows),
+            projection_repair_present=mirror_present,
+        )
+    row = rows[0]
+    if int(row["release_event_id"] or 0) != int(release_event_id):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "release Batch projection repair anchor binds another event",
+        )
+    try:
+        canonical_value = json.loads(str(row["audit_json"] or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        canonical_value = None
+    canonical = _validate_release_projection_repair_audit(
+        canonical_value,
+        expected=expected,
+        allow_recorded_at_variance=True,
+    )
+    if str(row["repair_id"] or "") != canonical["repair_id"]:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "release Batch projection repair row id does not match its core",
+        )
+    mirror = _validate_release_projection_repair_audit(
+        mirror_value,
+        expected=canonical,
+        allow_recorded_at_variance=True,
+    )
+    if mirror["repair_id"] != canonical["repair_id"]:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "release Batch projection repair mirror id drifted",
+        )
+    return False
 
 
 _RELEASE_OBSERVER_SESSION_REF_PREFIX = "observer-session:"
@@ -16705,6 +17276,23 @@ def release_integration_epoch_unlandable_child(
             epoch=replay_epoch,
             item=replay_item,
             allow_missing_batch_runtime_reconstruction=True,
+            release_event_id=int(existing_event["id"] or 0),
+            now_iso=now,
+        )
+        _prepare_release_projection_repair_anchor(
+            conn,
+            epoch=replay_epoch,
+            queue_item_id=item_id,
+            release_event_id=int(existing_event["id"] or 0),
+            expected_audit=(
+                binding_audit.get("batch_runtime_projection_repair")
+                if isinstance(binding_audit, Mapping)
+                else None
+            ),
+            batch_runtime_projection_missing=(
+                batch_runtime_projection_missing
+            ),
+            now_iso=now,
         )
         canonical_rollover_audits: list[dict[str, Any]] | None = None
         replay_authority_renewed = False

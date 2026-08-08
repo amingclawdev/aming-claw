@@ -125196,6 +125196,9 @@ def _explicit_epoch_release_fixture(
             queue_index=3,
             status=queue_status,
             target_ref="refs/heads/main",
+            base_commit="a" * 40,
+            branch_head="d" * 40,
+            validated_target_head=_EXPLICIT_EPOCH_RELEASE_HEAD,
             current_target_head=_EXPLICIT_EPOCH_RELEASE_HEAD,
         ),
     )
@@ -125212,6 +125215,10 @@ def _explicit_epoch_release_fixture(
             ref_name="refs/heads/main",
             merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
             status="running",
+            worktree_path="/tmp/explicit-epoch-release-row3",
+            base_commit="a" * 40,
+            head_commit="d" * 40,
+            target_head_commit=_EXPLICIT_EPOCH_RELEASE_HEAD,
         ),
     )
     upsert_batch_merge_runtime(
@@ -125229,7 +125236,8 @@ def _explicit_epoch_release_fixture(
                     worktree_path="/tmp/explicit-epoch-release-row3",
                     queue_index=3,
                     status=queue_status,
-                    branch_head="",
+                    branch_head="d" * 40,
+                    base_commit="a" * 40,
                     merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
                 ),
             ),
@@ -125254,6 +125262,71 @@ def _explicit_epoch_release_fixture(
             active_task_id=items[2].task_id,
             active_backlog_id=_EXPLICIT_EPOCH_RELEASE_CHILD,
             last_merge_commit=_EXPLICIT_EPOCH_RELEASE_HEAD,
+        ),
+    )
+    from agent.governance.contracts.runtime import SQLiteContractExecutionStore
+
+    SQLiteContractExecutionStore(conn)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO contract_runtime_executions (
+            contract_execution_id, project_id, backlog_id, contract_id,
+            version, revision, parent_contract_execution_id,
+            root_contract_execution_id, contract_chain_id,
+            execution_state_revision, record_json, created_at, updated_at
+        ) VALUES (?, ?, ?, 'mf_parallel.v2', 'v2', 'rev8', '', '', ?, 8,
+                  '{}', ?, ?)
+        """,
+        (
+            _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK,
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_CHILD,
+            "chain-explicit-epoch-release",
+            "2026-08-08T00:00:00Z",
+            "2026-08-08T00:00:00Z",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO backlog_contract_chain_current (
+            project_id, backlog_id, contract_chain_id,
+            root_contract_execution_id, current_contract_execution_id,
+            current_contract_id, parent_to_resume_contract_execution_id,
+            active_child_contract_execution_id, readiness_state, generation,
+            projection_watermark, projection_hash, active_chain_json,
+            next_legal_action_json, degraded_flags_json, source_refs_json,
+            updated_at
+        ) VALUES (?, ?, ?, '', ?, 'mf_parallel.v2', '', ?,
+                  'contract_active', 8, 1, ?, '{}', '{}', '{}', '[]', ?)
+        """,
+        (
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_CHILD,
+            "chain-explicit-epoch-release",
+            _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK,
+            _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK,
+            "sha256:"
+            + hashlib.sha256(b"compact-explicit-epoch-release").hexdigest(),
+            "2026-08-08T00:00:00Z",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO parallel_branch_runtime_contract_revisions (
+            project_id, runtime_context_id, revision_id, task_id,
+            parent_task_id, backlog_id, contract_version, payload_json,
+            route_identity_json, route_gate_json, route_evidence_type, actor,
+            created_at
+        ) VALUES (?, ?, 'revision-explicit-epoch-release', ?, '', ?,
+                  'mf_parallel.v2', '{}', '{}', '{}', 'server_registered',
+                  'fixture', ?)
+        """,
+        (
+            PID,
+            "rtctx-explicit-epoch-release-row3",
+            _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK,
+            _EXPLICIT_EPOCH_RELEASE_CHILD,
+            "2026-08-08T00:00:00Z",
         ),
     )
     conn.commit()
@@ -125304,6 +125377,26 @@ def _explicit_epoch_release_rollover_ledger_rows(conn) -> list[sqlite3.Row]:
             _EXPLICIT_EPOCH_RELEASE_ITEM,
         ),
     ).fetchall()
+
+
+def _explicit_epoch_release_projection_repair_rows(conn) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT *
+        FROM parallel_branch_integration_epoch_release_projection_repairs
+        WHERE project_id = ? AND batch_id = ? AND queue_item_id = ?
+        ORDER BY release_event_id, created_at, repair_id
+        """,
+        (
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_BATCH,
+            _EXPLICIT_EPOCH_RELEASE_ITEM,
+        ),
+    ).fetchall()
+
+
+def _explicit_epoch_release_database_dump(conn) -> str:
+    return "\n".join(conn.iterdump())
 
 
 def _explicit_epoch_release_route_proof(
@@ -125514,9 +125607,11 @@ def _prepare_live_missing_batch_runtime_release_replay(
     conn.execute(
         "UPDATE parallel_branch_runtime_contexts "
         "SET status = 'running', worktree_path = ?, base_commit = ?, "
-        "head_commit = ? WHERE project_id = ? AND task_id = ?",
+        "head_commit = ?, target_head_commit = ? "
+        "WHERE project_id = ? AND task_id = ?",
         (
             "/tmp/live-missing-batch-runtime-row3",
+            "a" * 40,
             "a" * 40,
             "a" * 40,
             PID,
@@ -125524,9 +125619,13 @@ def _prepare_live_missing_batch_runtime_release_replay(
         ),
     )
     conn.execute(
-        "UPDATE parallel_branch_merge_queue_items SET base_commit = ? "
+        "UPDATE parallel_branch_merge_queue_items "
+        "SET branch_ref = '', base_commit = ?, branch_head = '', "
+        "validated_target_head = ?, current_target_head = ? "
         "WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?",
         (
+            "a" * 40,
+            "a" * 40,
             "a" * 40,
             PID,
             _EXPLICIT_EPOCH_RELEASE_QUEUE,
@@ -125629,6 +125728,32 @@ def _prepare_live_missing_batch_runtime_release_replay(
             "task_timeline_append",
         ],
     )
+    return route_handler, renewed_body
+
+
+def _establish_live_missing_batch_runtime_reconstruction(
+    conn,
+    *,
+    suffix: str,
+):
+    route_handler, renewed_body = (
+        _prepare_live_missing_batch_runtime_release_replay(
+            conn,
+            suffix=suffix,
+        )
+    )
+    repaired = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=renewed_body,
+        )
+    )
+    assert repaired["batch_runtime_projection_repaired"] is True
+    assert len(_explicit_epoch_release_projection_repair_rows(conn)) == 1
     return route_handler, renewed_body
 
 
@@ -126839,16 +126964,21 @@ def test_release_route_replay_reconstructs_wholly_missing_batch_runtime_once(
     ]
     projection_repair = binding_audit["batch_runtime_projection_repair"]
     assert projection_repair["source"] == (
-        "server_derived_epoch_queue_context_binding"
+        "server_derived_epoch_queue_context_contract_binding"
     )
     assert projection_repair["credited_current_head"] == (
         _EXPLICIT_EPOCH_RELEASE_HEAD
     )
     assert projection_repair["item_count"] == 1
     assert projection_repair["merge_credit_granted"] is False
+    assert projection_repair["raw_credentials_persisted"] is False
     assert projection_repair["copy_safe"] is True
     assert len(binding_audit["replay_authority_rollovers"]) == 1
     assert len(_explicit_epoch_release_rollover_ledger_rows(conn)) == 1
+    repair_rows = _explicit_epoch_release_projection_repair_rows(conn)
+    assert len(repair_rows) == 1
+    assert repair_rows[0]["repair_id"] == projection_repair["repair_id"]
+    assert json.loads(repair_rows[0]["audit_json"]) == projection_repair
     assert [dict(row) for row in _explicit_epoch_release_events(conn)] == [
         before_event
     ]
@@ -126889,6 +127019,7 @@ def test_release_route_replay_reconstructs_wholly_missing_batch_runtime_once(
     assert conn.total_changes == changes_before
     assert len(_explicit_epoch_release_events(conn)) == 1
     assert len(_explicit_epoch_release_rollover_ledger_rows(conn)) == 1
+    assert len(_explicit_epoch_release_projection_repair_rows(conn)) == 1
 
 
 @pytest.mark.parametrize(
@@ -127089,6 +127220,7 @@ def test_release_route_replay_missing_batch_runtime_binding_rejects_zero_write(
         conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
     ) == before_batch_items
     assert _explicit_epoch_release_rollover_ledger_rows(conn) == []
+    assert _explicit_epoch_release_projection_repair_rows(conn) == []
     assert [dict(row) for row in _explicit_epoch_release_events(conn)] == (
         before_events
     )
@@ -127164,9 +127296,470 @@ def test_release_route_replay_missing_batch_runtime_failure_rolls_back_all(
         conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
     ) == []
     assert _explicit_epoch_release_rollover_ledger_rows(conn) == []
+    assert _explicit_epoch_release_projection_repair_rows(conn) == []
     assert [dict(row) for row in _explicit_epoch_release_events(conn)] == (
         before_events
     )
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "branch_ref",
+        "worktree_path",
+        "base_commit",
+        "branch_head",
+        "merge_commit",
+        "before_head",
+        "after_head",
+        "snapshot_id",
+        "projection_id",
+        "merge_preview_id",
+        "depends_on",
+        "merged_status",
+        "extra_item",
+        "parent_recovery_fields",
+        "combined_live_repro",
+    ],
+)
+def test_release_route_replay_rejects_existing_batch_projection_tamper_full_db_zero_write(
+    conn,
+    tamper_mode,
+):
+    route_handler, renewed_body = (
+        _establish_live_missing_batch_runtime_reconstruction(
+            conn,
+            suffix=f"existing-tamper-{tamper_mode}",
+        )
+    )
+    if tamper_mode == "extra_item":
+        runtime = parallel_branch_runtime.get_batch_merge_runtime(
+            conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+        )
+        upsert_batch_merge_runtime(
+            conn,
+            replace(
+                runtime,
+                items=(
+                    *runtime.items,
+                    replace(
+                        runtime.items[0],
+                        task_id="tampered-extra-item",
+                        queue_index=4,
+                    ),
+                ),
+            ),
+        )
+    elif tamper_mode == "parent_recovery_fields":
+        conn.execute(
+            "UPDATE parallel_branch_batch_runtimes "
+            "SET rollback_epoch = 'tampered', failure_reason = 'tampered' "
+            "WHERE project_id = ? AND batch_id = ?",
+            (PID, _EXPLICIT_EPOCH_RELEASE_BATCH),
+        )
+    elif tamper_mode == "before_head":
+        conn.execute(
+            "UPDATE parallel_branch_merge_queue_items "
+            "SET target_head_before_merge = ? "
+            "WHERE project_id = ? AND queue_item_id = ?",
+            ("b" * 40, PID, _EXPLICIT_EPOCH_RELEASE_ITEM),
+        )
+        conn.execute(
+            "UPDATE parallel_branch_batch_items "
+            "SET target_head_before_merge = ? "
+            "WHERE project_id = ? AND batch_id = ? AND task_id = ?",
+            (
+                "e" * 40,
+                PID,
+                _EXPLICIT_EPOCH_RELEASE_BATCH,
+                _EXPLICIT_EPOCH_RELEASE_PLAN_TASK,
+            ),
+        )
+    elif tamper_mode == "depends_on":
+        conn.execute(
+            "UPDATE parallel_branch_batch_items "
+            "SET depends_on_json = '[\"tampered-task\"]' "
+            "WHERE project_id = ? AND batch_id = ? AND task_id = ?",
+            (
+                PID,
+                _EXPLICIT_EPOCH_RELEASE_BATCH,
+                _EXPLICIT_EPOCH_RELEASE_PLAN_TASK,
+            ),
+        )
+    elif tamper_mode == "combined_live_repro":
+        conn.execute(
+            """
+            UPDATE parallel_branch_batch_items
+            SET branch_ref = 'refs/heads/codex/cross-lane',
+                worktree_path = '/tmp/cross-lane', base_commit = ?,
+                branch_head = ?, merge_commit = ?,
+                target_head_before_merge = ?, target_head_after_merge = ?
+            WHERE project_id = ? AND batch_id = ? AND task_id = ?
+            """,
+            (
+                "e" * 40,
+                "f" * 40,
+                "d" * 40,
+                "c" * 40,
+                "d" * 40,
+                PID,
+                _EXPLICIT_EPOCH_RELEASE_BATCH,
+                _EXPLICIT_EPOCH_RELEASE_PLAN_TASK,
+            ),
+        )
+    else:
+        column, value = {
+            "branch_ref": ("branch_ref", "refs/heads/codex/cross-lane"),
+            "worktree_path": ("worktree_path", "/tmp/cross-lane"),
+            "base_commit": ("base_commit", "e" * 40),
+            "branch_head": ("branch_head", "f" * 40),
+            "merge_commit": ("merge_commit", "d" * 40),
+            "after_head": ("target_head_after_merge", "d" * 40),
+            "snapshot_id": ("snapshot_id", "snapshot-tampered"),
+            "projection_id": ("projection_id", "projection-tampered"),
+            "merge_preview_id": ("merge_preview_id", "preview-tampered"),
+            "merged_status": ("status", parallel_branch_runtime.STATE_MERGED),
+        }[tamper_mode]
+        conn.execute(
+            f"UPDATE parallel_branch_batch_items SET {column} = ? "
+            "WHERE project_id = ? AND batch_id = ? AND task_id = ?",
+            (
+                value,
+                PID,
+                _EXPLICIT_EPOCH_RELEASE_BATCH,
+                _EXPLICIT_EPOCH_RELEASE_PLAN_TASK,
+            ),
+        )
+    conn.commit()
+    before_dump = _explicit_epoch_release_database_dump(conn)
+    changes_before = conn.total_changes
+
+    status, result = route_handler(
+        _ctx(
+            {"project_id": PID, "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH},
+            method="POST",
+            body=renewed_body,
+        )
+    )
+
+    assert status == 409
+    assert result["error"] in {
+        "integration_epoch_release_batch_runtime_binding_invalid",
+        "integration_epoch_release_projection_possible_landed",
+        "integration_epoch_release_replay_identity_mismatch",
+    }
+    assert result["zero_write_rejection"] is True
+    assert conn.total_changes == changes_before
+    assert _explicit_epoch_release_database_dump(conn) == before_dump
+    assert len(_explicit_epoch_release_events(conn)) == 1
+    assert len(_explicit_epoch_release_projection_repair_rows(conn)) == 1
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "branch_ref_conflict",
+        "branch_head_conflict",
+        "merge_commit",
+        "after_head",
+        "merging_status",
+        "combined_live_repro",
+    ],
+)
+def test_release_route_replay_rejects_missing_parent_mq_tamper_full_db_zero_write(
+    conn,
+    tamper_mode,
+):
+    route_handler, renewed_body = (
+        _prepare_live_missing_batch_runtime_release_replay(
+            conn,
+            suffix=f"missing-parent-tamper-{tamper_mode}",
+        )
+    )
+    assignments = {
+        "branch_ref_conflict": ("branch_ref = ?", ("refs/heads/cross-lane",)),
+        "branch_head_conflict": ("branch_head = ?", ("f" * 40,)),
+        "merge_commit": ("merge_commit = ?", ("d" * 40,)),
+        "after_head": ("target_head_after_merge = ?", ("d" * 40,)),
+        "merging_status": (
+            "status = ?",
+            (parallel_branch_runtime.STATE_MERGING,),
+        ),
+        "combined_live_repro": (
+            (
+                "branch_ref = ?, branch_head = ?, merge_commit = ?, "
+                "target_head_after_merge = ?"
+            ),
+            ("refs/heads/cross-lane", "f" * 40, "d" * 40, "d" * 40),
+        ),
+    }
+    assignment, values = assignments[tamper_mode]
+    conn.execute(
+        f"UPDATE parallel_branch_merge_queue_items SET {assignment} "
+        "WHERE project_id = ? AND queue_item_id = ?",
+        (*values, PID, _EXPLICIT_EPOCH_RELEASE_ITEM),
+    )
+    conn.commit()
+    before_dump = _explicit_epoch_release_database_dump(conn)
+    changes_before = conn.total_changes
+
+    status, result = route_handler(
+        _ctx(
+            {"project_id": PID, "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH},
+            method="POST",
+            body=renewed_body,
+        )
+    )
+
+    assert status == 409
+    assert result["error"] in {
+        "integration_epoch_release_batch_runtime_binding_invalid",
+        "integration_epoch_release_projection_possible_landed",
+    }
+    assert conn.total_changes == changes_before
+    assert _explicit_epoch_release_database_dump(conn) == before_dump
+    assert parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) is None
+    assert _explicit_epoch_release_projection_repair_rows(conn) == []
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "projection_source",
+        "projection_core_recomputed_id",
+        "projection_missing",
+        "projection_extra_field",
+        "projection_malformed",
+        "canonical_core_recomputed_id",
+        "canonical_missing",
+        "canonical_extra",
+    ],
+)
+def test_release_route_replay_rejects_projection_repair_authority_tamper_zero_write(
+    conn,
+    tamper_mode,
+):
+    route_handler, renewed_body = (
+        _establish_live_missing_batch_runtime_reconstruction(
+            conn,
+            suffix=f"repair-audit-tamper-{tamper_mode}",
+        )
+    )
+    epoch = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+    incomplete = copy.deepcopy(epoch.incomplete_fanin)
+    binding = incomplete["released_children"][0]["binding_audit"]
+    projection_audit = binding["batch_runtime_projection_repair"]
+    if tamper_mode.startswith("projection_"):
+        if tamper_mode == "projection_missing":
+            binding.pop("batch_runtime_projection_repair")
+        elif tamper_mode == "projection_malformed":
+            binding["batch_runtime_projection_repair"] = ["malformed"]
+        elif tamper_mode == "projection_extra_field":
+            projection_audit["unexpected"] = True
+        else:
+            projection_audit["source"] = "attacker"
+            if tamper_mode == "projection_core_recomputed_id":
+                projection_audit["repair_id"] = (
+                    parallel_branch_runtime._release_projection_repair_id(
+                        projection_audit
+                    )
+                )
+        upsert_integration_epoch(
+            conn,
+            replace(epoch, incomplete_fanin=incomplete),
+        )
+    else:
+        rows = _explicit_epoch_release_projection_repair_rows(conn)
+        canonical = json.loads(rows[0]["audit_json"])
+        if tamper_mode == "canonical_missing":
+            conn.execute(
+                "DELETE FROM parallel_branch_integration_epoch_release_projection_repairs "
+                "WHERE project_id = ? AND batch_id = ?",
+                (PID, _EXPLICIT_EPOCH_RELEASE_BATCH),
+            )
+        elif tamper_mode == "canonical_extra":
+            alternate = dict(canonical)
+            alternate["release_event_id"] += 1
+            alternate["repair_id"] = (
+                parallel_branch_runtime._release_projection_repair_id(alternate)
+            )
+            conn.execute(
+                """
+                INSERT INTO parallel_branch_integration_epoch_release_projection_repairs (
+                    project_id, batch_id, queue_item_id, release_event_id,
+                    repair_id, audit_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    PID,
+                    _EXPLICIT_EPOCH_RELEASE_BATCH,
+                    _EXPLICIT_EPOCH_RELEASE_ITEM,
+                    alternate["release_event_id"],
+                    alternate["repair_id"],
+                    json.dumps(alternate, sort_keys=True, separators=(",", ":")),
+                    "2026-08-08T00:00:01Z",
+                ),
+            )
+        else:
+            canonical["source"] = "attacker"
+            canonical["repair_id"] = (
+                parallel_branch_runtime._release_projection_repair_id(canonical)
+            )
+            conn.execute(
+                """
+                UPDATE parallel_branch_integration_epoch_release_projection_repairs
+                SET repair_id = ?, audit_json = ?
+                WHERE project_id = ? AND batch_id = ? AND queue_item_id = ?
+                """,
+                (
+                    canonical["repair_id"],
+                    json.dumps(canonical, sort_keys=True, separators=(",", ":")),
+                    PID,
+                    _EXPLICIT_EPOCH_RELEASE_BATCH,
+                    _EXPLICIT_EPOCH_RELEASE_ITEM,
+                ),
+            )
+    conn.commit()
+    before_dump = _explicit_epoch_release_database_dump(conn)
+    changes_before = conn.total_changes
+
+    status, result = route_handler(
+        _ctx(
+            {"project_id": PID, "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH},
+            method="POST",
+            body=renewed_body,
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == (
+        "integration_epoch_release_replay_identity_mismatch"
+    )
+    assert conn.total_changes == changes_before
+    assert _explicit_epoch_release_database_dump(conn) == before_dump
+    assert len(_explicit_epoch_release_events(conn)) == 1
+
+
+def test_release_projection_repair_allows_recorded_at_and_repeated_route_renewal(
+    conn,
+):
+    route_handler, renewed_body = (
+        _establish_live_missing_batch_runtime_reconstruction(
+            conn,
+            suffix="recorded-at-fresh-chain",
+        )
+    )
+    epoch = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+    incomplete = copy.deepcopy(epoch.incomplete_fanin)
+    incomplete["released_children"][0]["binding_audit"][
+        "batch_runtime_projection_repair"
+    ]["recorded_at"] = "2000-01-01T00:00:00Z"
+    upsert_integration_epoch(conn, replace(epoch, incomplete_fanin=incomplete))
+    conn.commit()
+    anchor_before = [
+        dict(row) for row in _explicit_epoch_release_projection_repair_rows(conn)
+    ]
+    changes_before = conn.total_changes
+    exact = route_handler(
+        _ctx(
+            {"project_id": PID, "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH},
+            method="POST",
+            body=renewed_body,
+        )
+    )
+    assert exact["writes_performed"] is False
+    assert conn.total_changes == changes_before
+
+    for renewal_index in (2, 3):
+        fresh_body = _explicit_epoch_release_named_route_proof(
+            conn,
+            observer_session_id=f"obs-repair-fresh-{renewal_index}",
+            route_token_ref=f"rtok-repair-fresh-{renewal_index}",
+            allowed_actions=[
+                "integration_epoch_release_unlandable_child",
+                "task_timeline_append",
+            ],
+        )
+        renewed = route_handler(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+                },
+                method="POST",
+                body=fresh_body,
+            )
+        )
+        assert renewed["replay_authority_renewed"] is True
+        assert len(_explicit_epoch_release_rollover_ledger_rows(conn)) == (
+            renewal_index
+        )
+        assert [
+            dict(row)
+            for row in _explicit_epoch_release_projection_repair_rows(conn)
+        ] == anchor_before
+        changes_before_exact = conn.total_changes
+        exact = route_handler(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+                },
+                method="POST",
+                body=fresh_body,
+            )
+        )
+        assert exact["writes_performed"] is False
+        assert conn.total_changes == changes_before_exact
+    assert len(_explicit_epoch_release_events(conn)) == 1
+
+
+def test_release_missing_parent_preserves_exact_safe_preview_authority(conn):
+    route_handler, renewed_body = (
+        _prepare_live_missing_batch_runtime_release_replay(
+            conn,
+            suffix="safe-preview-authority",
+        )
+    )
+    safe_head = "a" * 40
+    conn.execute(
+        """
+        UPDATE parallel_branch_merge_queue_items
+        SET target_head_before_merge = ?, target_head_after_merge = ?,
+            snapshot_id = 'snapshot-safe', projection_id = 'projection-safe',
+            merge_preview_id = 'preview-safe'
+        WHERE project_id = ? AND queue_item_id = ?
+        """,
+        (safe_head, safe_head, PID, _EXPLICIT_EPOCH_RELEASE_ITEM),
+    )
+    conn.execute(
+        """
+        UPDATE parallel_branch_runtime_contexts
+        SET snapshot_id = 'snapshot-safe', projection_id = 'projection-safe',
+            merge_preview_id = 'preview-safe'
+        WHERE project_id = ? AND task_id = ?
+        """,
+        (PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK),
+    )
+    conn.commit()
+    repaired = route_handler(
+        _ctx(
+            {"project_id": PID, "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH},
+            method="POST",
+            body=renewed_body,
+        )
+    )
+    assert repaired["batch_runtime_projection_repaired"] is True
+    batch_item = parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ).items[0]
+    assert batch_item.target_head_before_merge == safe_head
+    assert batch_item.target_head_after_merge == safe_head
+    assert batch_item.snapshot_id == "snapshot-safe"
+    assert batch_item.projection_id == "projection-safe"
+    assert batch_item.merge_preview_id == "preview-safe"
 
 
 def test_release_route_replay_refuses_unanchored_legacy_projection(conn):
