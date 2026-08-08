@@ -50667,6 +50667,52 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
             backlog_id="AC-RUNTIME-TOKEN-INITIAL-JOIN",
         ) == before_events
 
+    for field, bad_value in (
+        ("task_id", "wrong-initial-join-task"),
+        ("parent_task_id", "wrong-initial-join-parent"),
+        ("contract_execution_id", "wrong-initial-join-contract"),
+    ):
+        with pytest.raises(GovernanceError) as wrong_canonical_scope:
+            server.handle_graph_governance_runtime_context_session_token_initial_join(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": context.runtime_context_id,
+                    },
+                    "coordinator",
+                    method="POST",
+                    body={
+                        field: bad_value,
+                        "target_project_root": str(target_root),
+                        **route_identity,
+                        "actual_host_worker_id": governed_worker_id,
+                        "reason": "reject caller-selected initial join identity",
+                    },
+                )
+            )
+        assert wrong_canonical_scope.value.code == (
+            "runtime_context_initial_join_contract_identity_mismatch"
+        )
+        assert wrong_canonical_scope.value.details[
+            "identity_mismatch_fields"
+        ] == [field]
+        assert wrong_canonical_scope.value.details["mutation_performed"] is False
+        assert get_branch_context(
+            conn,
+            PID,
+            "worker-runtime-initial-join",
+        ) == before_context
+        assert get_latest_branch_contract_revision(
+            conn,
+            PID,
+            context.runtime_context_id,
+        ) == before_revision
+        assert task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id="AC-RUNTIME-TOKEN-INITIAL-JOIN",
+        ) == before_events
+
     result = server.handle_graph_governance_runtime_context_session_token_initial_join(
         _ctx_with_role(
             {"project_id": PID, "runtime_context_id": context.runtime_context_id},
@@ -50835,6 +50881,9 @@ def _setup_pre_lineage_rejoin_recovery_case(
     *,
     suffix: str,
     source_backed_contract_runtime: bool = False,
+    allocation_agent_id: str = "",
+    omit_initial_join_agent_id: bool = False,
+    batch_id: str = "",
 ):
     """Create one accepted initial join with no read/startup lineage."""
 
@@ -50867,6 +50916,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
         )
         assert successor["contract_execution_id"] == parent_task_id
         worker_id = dispatched_context.worker_id
+    durable_allocation_agent_id = allocation_agent_id or worker_id
     route_identity = {
         "route_id": f"route-pre-lineage-rejoin-{suffix}",
         "route_context_hash": f"sha256:route-pre-lineage-rejoin-{suffix}",
@@ -50888,14 +50938,15 @@ def _setup_pre_lineage_rejoin_recovery_case(
             target_files=("agent/governance/server.py",),
             owned_files=("agent/governance/server.py",),
             task_id=task_id,
+            batch_id=batch_id,
             parent_task_id=parent_task_id,
             root_task_id=parent_task_id,
             backlog_id=backlog_id,
             stage_task_id=task_id,
             worker_id=worker_id,
             worker_slot_id=worker_id,
-            agent_id=worker_id,
-            allocation_owner=worker_id,
+            agent_id=durable_allocation_agent_id,
+            allocation_owner=durable_allocation_agent_id,
             branch_ref=f"refs/heads/codex/{task_id}",
             base_commit="a" * 40,
             head_commit="a" * 40,
@@ -50941,7 +50992,6 @@ def _setup_pre_lineage_rejoin_recovery_case(
         "target_project_root": str(target_root),
         "worker_id": worker_id,
         "worker_slot_id": worker_id,
-        "agent_id": worker_id,
         "actual_host_worker_id": worker_id,
         "worker_session_id": worker_session_id,
         "host_startup_id": host_startup_id,
@@ -50951,6 +51001,8 @@ def _setup_pre_lineage_rejoin_recovery_case(
         "ttl_seconds": 3600,
         "now_iso": now_iso,
     }
+    if not omit_initial_join_agent_id:
+        initial_join_body["agent_id"] = worker_id
     initial_join = (
         server.handle_graph_governance_runtime_context_session_token_initial_join(
             _ctx_with_role(
@@ -50979,6 +51031,22 @@ def _setup_pre_lineage_rejoin_recovery_case(
         == "runtime_context_session_token_initial_join"
     ]
     assert len(initial_join_events) == 1
+    identity_anchor_events = [
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            event_kind="observer_command",
+        )
+        if (event.get("payload") or {}).get("action")
+        == (
+            "runtime_context_session_token_initial_join_"
+            "identity_binding_anchor"
+        )
+    ]
+    assert len(identity_anchor_events) == 1
     assert not task_timeline.list_events(
         conn,
         PID,
@@ -51008,6 +51076,9 @@ def _setup_pre_lineage_rejoin_recovery_case(
         "context": saved,
         "initial_join": initial_join,
         "initial_join_event": initial_join_events[0],
+        "identity_anchor_event": identity_anchor_events[0],
+        "durable_allocation_agent_id": durable_allocation_agent_id,
+        "batch_id": batch_id,
     }
 
 
@@ -51081,6 +51152,616 @@ def _assert_pre_lineage_rejoin_zero_write(
             before_context.runtime_context_id,
         ) == before_revision
     assert _pre_lineage_case_events(conn, case) == before_events
+
+
+def _convert_pre_lineage_case_to_legacy_initial_join_audit(
+    conn,
+    case: Mapping[str, Any],
+    *,
+    extra_payload_updates: Mapping[str, Any] | None = None,
+) -> None:
+    """Model the pre-fix single audit without rewriting runtime authority."""
+
+    payload = copy.deepcopy(case["initial_join_event"]["payload"])
+    payload.pop("canonical_identity_binding", None)
+    payload.pop("initial_join_identity_contract_version", None)
+    payload.pop("canonical_identity_binding_required", None)
+    payload["agent_id"] = case["durable_allocation_agent_id"]
+    payload.update(dict(extra_payload_updates or {}))
+    conn.execute(
+        "DELETE FROM task_timeline_events WHERE id = ?",
+        (case["identity_anchor_event"]["id"],),
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(payload, sort_keys=True), case["initial_join_event"]["id"]),
+    )
+    conn.commit()
+
+
+def test_runtime_context_initial_join_omitted_agent_uses_canonical_worker_and_fresh_anchor(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="omitted-agent-canonical",
+        allocation_agent_id="stale-allocation-agent-omitted",
+        omit_initial_join_agent_id=True,
+    )
+
+    result = case["initial_join"]
+    assert result["agent_id"] == case["worker_id"]
+    assert result["actual_host_worker_id"] == case["worker_id"]
+    assert result["host_envelope"]["agent_id"] == case["worker_id"]
+    assert result["host_envelope"]["actual_host_worker_id"] == case["worker_id"]
+    saved = get_branch_context(conn, PID, case["task_id"])
+    assert saved is not None
+    assert saved.agent_id == "stale-allocation-agent-omitted"
+    assert saved.allocation_owner == "stale-allocation-agent-omitted"
+    assert saved.actual_host_worker_id == case["worker_id"]
+
+    payload = case["initial_join_event"]["payload"]
+    assert payload["initial_join_identity_contract_version"] == (
+        "runtime_context.initial_join_identity.v2"
+    )
+    assert payload["canonical_identity_binding_required"] is True
+    binding = payload["canonical_identity_binding"]
+    assert binding["contract_execution_id"] == case["parent_task_id"]
+    assert binding["governed_worker_id"] == case["worker_id"]
+    assert binding["agent_id"] == case["worker_id"]
+    assert binding["actual_host_worker_id"] == case["worker_id"]
+    assert all(binding["route_identity"].values())
+    assert binding["raw_credentials_persisted"] is False
+    assert case["identity_anchor_event"]["payload"][
+        "canonical_binding_hash"
+    ] == binding["binding_hash"]
+
+    rejoin = _pre_lineage_rejoin(case)
+    authority = rejoin["pre_lineage_rejoin_authority"]
+    assert authority["eligible"] is True
+    assert authority["identity_contract_version"] == (
+        "runtime_context.initial_join_identity.v2"
+    )
+    assert authority["canonical_identity_binding_valid"] is True
+    assert authority["legacy_agent_id_normalized"] is False
+    serialized = json.dumps(_pre_lineage_case_events(conn, case), sort_keys=True)
+    assert result["session_token"] not in serialized
+    assert result["fence_token"] not in serialized
+
+
+def test_runtime_context_pre_lineage_fresh_marker_removal_is_not_legacy_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="fresh-marker-removed",
+        allocation_agent_id="stale-allocation-agent-fresh-marker",
+        omit_initial_join_agent_id=True,
+    )
+    payload = copy.deepcopy(case["initial_join_event"]["payload"])
+    payload.pop("canonical_identity_binding")
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(payload, sort_keys=True), case["initial_join_event"]["id"]),
+    )
+    conn.commit()
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_events = _pre_lineage_case_events(conn, case)
+
+    with pytest.raises(GovernanceError) as removed:
+        _pre_lineage_rejoin(case)
+
+    assert removed.value.code == (
+        "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid"
+    )
+    authority = removed.value.details["pre_lineage_rejoin_authority"]
+    assert "initial_join_audit_canonical_binding_missing" in authority["errors"]
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        removed.value,
+        before_context=before_context,
+        before_events=before_events,
+    )
+
+
+def test_runtime_context_pre_lineage_legacy_stale_allocation_agent_only_normalizes(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="legacy-stale-agent",
+        allocation_agent_id="legacy-stale-allocation-agent",
+        omit_initial_join_agent_id=True,
+    )
+    _convert_pre_lineage_case_to_legacy_initial_join_audit(conn, case)
+    case["initial_join_event"] = next(
+        event
+        for event in _pre_lineage_case_events(conn, case)
+        if (event.get("payload") or {}).get("action")
+        == "runtime_context_session_token_initial_join"
+    )
+
+    rejoin = _pre_lineage_rejoin(case)
+
+    authority = rejoin["pre_lineage_rejoin_authority"]
+    assert authority["eligible"] is True
+    assert authority["identity_contract_version"] == (
+        "runtime_context.initial_join_identity.legacy"
+    )
+    assert authority["legacy_agent_id_normalized"] is True
+    assert authority["legacy_agent_id_normalization_source"] == (
+        "durable_pre_fix_allocation_context_agent_id"
+    )
+    persisted = next(
+        event
+        for event in _pre_lineage_case_events(conn, case)
+        if (event.get("payload") or {}).get("action")
+        == "runtime_context_session_token_initial_join"
+    )
+    assert persisted["payload"]["agent_id"] == (
+        "legacy-stale-allocation-agent"
+    )
+
+
+def test_runtime_context_pre_lineage_legacy_agent_plus_route_drift_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="legacy-agent-route-drift",
+        allocation_agent_id="legacy-stale-allocation-agent-drift",
+        omit_initial_join_agent_id=True,
+    )
+    payload = copy.deepcopy(case["initial_join_event"]["payload"])
+    route = dict(payload["route_identity"])
+    route["route_id"] = "route-forged-with-legacy-agent"
+    _convert_pre_lineage_case_to_legacy_initial_join_audit(
+        conn,
+        case,
+        extra_payload_updates={"route_identity": route},
+    )
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_events = _pre_lineage_case_events(conn, case)
+
+    with pytest.raises(GovernanceError) as drift:
+        _pre_lineage_rejoin(case)
+
+    assert drift.value.code == (
+        "runtime_context_pre_lineage_rejoin_route_identity_mismatch"
+    )
+    authority = drift.value.details["pre_lineage_rejoin_authority"]
+    assert authority["legacy_agent_id_normalized"] is False
+    assert "initial_join_audit_route_route_id_mismatch" in authority["errors"]
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        drift.value,
+        before_context=before_context,
+        before_events=before_events,
+    )
+
+
+def test_runtime_context_initial_join_rejects_post_issue_identity_drift_and_rolls_back(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    original_initial_join = (
+        parallel_branch_runtime.initial_join_mf_subagent_runtime_session_token
+    )
+
+    def _drifted_initial_join(*args, **kwargs):
+        result = original_initial_join(*args, **kwargs)
+        result["agent_id"] = "stale-post-issue-allocation-agent"
+        result["host_envelope"]["agent_id"] = (
+            "stale-post-issue-allocation-agent"
+        )
+        return result
+
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "initial_join_mf_subagent_runtime_session_token",
+        _drifted_initial_join,
+    )
+    suffix = "post-issue-drift-rollback"
+    with pytest.raises(GovernanceError) as rejected:
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=suffix,
+            allocation_agent_id="stale-allocation-before-post-issue",
+            omit_initial_join_agent_id=True,
+        )
+
+    assert rejected.value.code == (
+        "runtime_context_initial_join_canonical_identity_mismatch"
+    )
+    assert rejected.value.details["identity_mismatch_fields"] == [
+        "result.agent_id",
+        "host_envelope.agent_id",
+    ]
+    assert rejected.value.details["mutation_performed"] is False
+    task_id = f"pre-lineage-rejoin-{suffix}-worker"
+    backlog_id = f"AC-PRE-LINEAGE-REJOIN-{suffix.upper()}"
+    saved = get_branch_context(conn, PID, task_id)
+    assert saved is not None
+    assert saved.actual_host_worker_id == ""
+    assert saved.host_session_id == ""
+    assert saved.lease_id == ""
+    assert saved.lease_expires_at == ""
+    assert saved.session_token_hash == ""
+    assert saved.last_recovery_action == ""
+    assert not [
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            task_id=task_id,
+            backlog_id=backlog_id,
+        )
+        if (event.get("payload") or {}).get("action")
+        in {
+            "runtime_context_session_token_initial_join",
+            (
+                "runtime_context_session_token_initial_join_"
+                "identity_binding_anchor"
+            ),
+        }
+    ]
+
+
+def test_runtime_context_initial_join_anchor_failure_rolls_back_context_and_audit(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    original_record_event = task_timeline.record_event
+
+    def _fail_anchor(*args, **kwargs):
+        payload = kwargs.get("payload") or {}
+        if payload.get("action") == (
+            "runtime_context_session_token_initial_join_"
+            "identity_binding_anchor"
+        ):
+            raise RuntimeError("forced identity anchor failure")
+        return original_record_event(*args, **kwargs)
+
+    monkeypatch.setattr(task_timeline, "record_event", _fail_anchor)
+    suffix = "anchor-failure-rollback"
+    with pytest.raises(RuntimeError, match="forced identity anchor failure"):
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=suffix,
+            allocation_agent_id="stale-allocation-anchor-failure",
+            omit_initial_join_agent_id=True,
+        )
+
+    task_id = f"pre-lineage-rejoin-{suffix}-worker"
+    backlog_id = f"AC-PRE-LINEAGE-REJOIN-{suffix.upper()}"
+    saved = get_branch_context(conn, PID, task_id)
+    assert saved is not None
+    assert saved.actual_host_worker_id == ""
+    assert saved.host_session_id == ""
+    assert saved.lease_id == ""
+    assert saved.session_token_hash == ""
+    assert saved.last_recovery_action == ""
+    assert not [
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            task_id=task_id,
+            backlog_id=backlog_id,
+        )
+        if (event.get("payload") or {}).get("action")
+        in {
+            "runtime_context_session_token_initial_join",
+            (
+                "runtime_context_session_token_initial_join_"
+                "identity_binding_anchor"
+            ),
+        }
+    ]
+
+
+def test_runtime_context_initial_join_lock_revalidation_rejects_route_drift_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    original_latest_route_identity = (
+        server._runtime_context_latest_route_identity
+    )
+    calls = 0
+
+    def _route_changes_after_preflight(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        identity = dict(original_latest_route_identity(*args, **kwargs))
+        if calls >= 2:
+            identity["route_context_hash"] = (
+                "sha256:route-drifted-after-preflight"
+            )
+        return identity
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_route_identity",
+        _route_changes_after_preflight,
+    )
+    suffix = "locked-route-drift"
+    with pytest.raises(GovernanceError) as rejected:
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=suffix,
+            allocation_agent_id="stale-allocation-locked-route",
+            omit_initial_join_agent_id=True,
+        )
+
+    assert rejected.value.code == (
+        "runtime_context_initial_join_route_authority_changed"
+    )
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["credential_rotated"] is False
+    task_id = f"pre-lineage-rejoin-{suffix}-worker"
+    backlog_id = f"AC-PRE-LINEAGE-REJOIN-{suffix.upper()}"
+    saved = get_branch_context(conn, PID, task_id)
+    assert saved is not None
+    assert saved.actual_host_worker_id == ""
+    assert saved.lease_id == ""
+    assert saved.session_token_hash == ""
+    assert saved.last_recovery_action == ""
+    assert not [
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            task_id=task_id,
+            backlog_id=backlog_id,
+        )
+        if (event.get("payload") or {}).get("action")
+        in {
+            "runtime_context_session_token_initial_join",
+            (
+                "runtime_context_session_token_initial_join_"
+                "identity_binding_anchor"
+            ),
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "tamper_kind",
+    ["marker_rehashed", "anchor_rehashed", "duplicate_anchor"],
+)
+def test_runtime_context_pre_lineage_fresh_binding_or_anchor_drift_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    tamper_kind,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"fresh-{tamper_kind.replace('_', '-')}",
+        allocation_agent_id=f"stale-allocation-{tamper_kind}",
+        omit_initial_join_agent_id=True,
+    )
+    if tamper_kind == "marker_rehashed":
+        payload = copy.deepcopy(case["initial_join_event"]["payload"])
+        binding = dict(payload["canonical_identity_binding"])
+        binding["agent_id"] = "forged-marker-agent"
+        binding_core = dict(binding)
+        binding_core.pop("binding_hash", None)
+        binding["binding_hash"] = server._stable_public_hash(binding_core)
+        payload["canonical_identity_binding"] = binding
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (
+                json.dumps(payload, sort_keys=True),
+                case["initial_join_event"]["id"],
+            ),
+        )
+    elif tamper_kind == "anchor_rehashed":
+        payload = copy.deepcopy(case["identity_anchor_event"]["payload"])
+        payload["canonical_binding_hash"] = "sha256:" + "f" * 64
+        anchor_core = dict(payload)
+        anchor_core.pop("anchor_hash", None)
+        anchor_core.pop("meta_contract_gate", None)
+        payload["anchor_hash"] = server._stable_public_hash(anchor_core)
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (
+                json.dumps(payload, sort_keys=True),
+                case["identity_anchor_event"]["id"],
+            ),
+        )
+    else:
+        anchor = case["identity_anchor_event"]
+        payload = copy.deepcopy(anchor["payload"])
+        payload.pop("meta_contract_gate", None)
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            task_id=case["task_id"],
+            backlog_id=case["backlog_id"],
+            event_type=anchor["event_type"],
+            event_kind=anchor["event_kind"],
+            phase=anchor["phase"],
+            status=anchor["status"],
+            actor=anchor["actor"],
+            payload=payload,
+        )
+    conn.commit()
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_events = _pre_lineage_case_events(conn, case)
+
+    with pytest.raises(GovernanceError) as rejected:
+        _pre_lineage_rejoin(case)
+
+    assert rejected.value.code == (
+        "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid"
+    )
+    authority = rejected.value.details["pre_lineage_rejoin_authority"]
+    assert authority["eligible"] is False
+    assert authority["legacy_agent_id_normalized"] is False
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        rejected.value,
+        before_context=before_context,
+        before_events=before_events,
+    )
+
+
+@pytest.mark.parametrize(
+    ("audit_agent_id", "context_column"),
+    [
+        ("", ""),
+        ("arbitrary-non-allocation-agent", ""),
+        ("legacy-stale-allocation-context-agent", "agent_id"),
+        ("legacy-stale-allocation-owner", "allocation_owner"),
+    ],
+)
+def test_runtime_context_pre_lineage_legacy_agent_requires_dual_durable_allocation_binding(
+    conn,
+    monkeypatch,
+    tmp_path,
+    audit_agent_id,
+    context_column,
+):
+    suffix = (
+        "legacy-agent-" + (context_column or audit_agent_id or "empty")
+    ).replace("_", "-")
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=suffix,
+        allocation_agent_id="legacy-stale-allocation-agent-guard",
+        omit_initial_join_agent_id=True,
+    )
+    _convert_pre_lineage_case_to_legacy_initial_join_audit(conn, case)
+    if context_column:
+        conn.execute(
+            f"UPDATE parallel_branch_runtime_contexts SET {context_column} = ? "
+            "WHERE project_id = ? AND task_id = ?",
+            (
+                "post-hoc-drifted-allocation-binding",
+                PID,
+                case["task_id"],
+            ),
+        )
+    else:
+        event = next(
+            event
+            for event in _pre_lineage_case_events(conn, case)
+            if (event.get("payload") or {}).get("action")
+            == "runtime_context_session_token_initial_join"
+        )
+        payload = copy.deepcopy(event["payload"])
+        payload["agent_id"] = audit_agent_id
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (json.dumps(payload, sort_keys=True), event["id"]),
+        )
+    conn.commit()
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    before_events = _pre_lineage_case_events(conn, case)
+
+    with pytest.raises(GovernanceError) as rejected:
+        _pre_lineage_rejoin(case)
+
+    assert rejected.value.code == (
+        "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid"
+    )
+    authority = rejected.value.details["pre_lineage_rejoin_authority"]
+    assert authority["legacy_agent_id_normalized"] is False
+    assert "initial_join_audit_agent_id_mismatch" in authority["errors"]
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        rejected.value,
+        before_context=before_context,
+        before_events=before_events,
+    )
+
+
+def test_runtime_context_initial_join_and_rejoin_preserve_same_batch_sibling(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    batch_id = "mf-batch-initial-join-canonical-identity"
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="batch-target",
+        allocation_agent_id="stale-batch-target-allocation-agent",
+        omit_initial_join_agent_id=True,
+        batch_id=batch_id,
+    )
+    sibling = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="initial-join-canonical-batch-sibling",
+            batch_id=batch_id,
+            backlog_id=case["backlog_id"],
+            parent_task_id=case["parent_task_id"],
+            root_task_id=case["parent_task_id"],
+            worker_id="batch-sibling-worker",
+            worker_slot_id="batch-sibling-worker",
+            agent_id="batch-sibling-worker",
+            allocation_owner="batch-sibling-worker",
+            branch_ref="refs/heads/codex/batch-sibling-worker",
+            status=STATE_WORKTREE_READY,
+            fence_token="batch-sibling-fence",
+            session_token_hash=mf_subagent_session_token_hash(
+                "batch-sibling-session"
+            ),
+        ),
+        now_iso="2099-08-02T01:00:00Z",
+    )
+    conn.commit()
+    target_binding = case["initial_join_event"]["payload"][
+        "canonical_identity_binding"
+    ]
+    assert target_binding["batch_id"] == batch_id
+    assert case["initial_join"]["batch_id"] == batch_id
+    assert case["initial_join"]["host_envelope"]["batch_id"] == batch_id
+
+    _pre_lineage_rejoin(case)
+
+    assert get_branch_context(
+        conn,
+        PID,
+        sibling.task_id,
+    ) == sibling
 
 
 def test_runtime_context_pre_lineage_rejoin_rotates_auth_once_without_state_or_evidence_transition(

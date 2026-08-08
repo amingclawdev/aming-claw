@@ -33710,6 +33710,323 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
         conn.close()
 
 
+def _runtime_context_initial_join_expected_canonical_identity_binding(
+    *,
+    project_id: str,
+    context: Any,
+    governed_worker_id: str,
+    contract_execution_id: str,
+    worker_session_id: str,
+    host_startup_id: str,
+    host_session_id: str,
+    route_identity: Mapping[str, Any],
+    missing_lineage: Sequence[str],
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Build the closed copy-safe identity marker from durable authority."""
+
+    from .parallel_branch_runtime import (
+        runtime_context_id_for_branch_context,
+        runtime_context_session_token_lease_view,
+        runtime_context_session_token_ref,
+    )
+
+    lease = runtime_context_session_token_lease_view(context, now_iso=now_iso)
+    binding_core = {
+        "schema_version": (
+            "runtime_context.initial_join_canonical_identity_binding.v1"
+        ),
+        "server_derived": True,
+        "initial_join_identity_contract_version": (
+            "runtime_context.initial_join_identity.v2"
+        ),
+        "project_id": str(project_id or "").strip(),
+        "runtime_context_id": runtime_context_id_for_branch_context(context),
+        "contract_execution_id": str(contract_execution_id or "").strip(),
+        "task_id": str(context.task_id or "").strip(),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "backlog_id": str(context.backlog_id or "").strip(),
+        "batch_id": str(context.batch_id or "").strip(),
+        "worker_id": str(context.worker_id or "").strip(),
+        "worker_slot_id": str(
+            context.worker_slot_id or context.worker_id or ""
+        ).strip(),
+        "governed_worker_id": str(governed_worker_id or "").strip(),
+        "agent_id": str(governed_worker_id or "").strip(),
+        "actual_host_worker_id": str(governed_worker_id or "").strip(),
+        "worker_session_id": str(worker_session_id or "").strip(),
+        "host_startup_id": str(host_startup_id or "").strip(),
+        "host_session_id": str(host_session_id or "").strip(),
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "target_project_root": (
+            _runtime_context_effective_target_project_root(context)
+        ),
+        "branch_ref": str(context.branch_ref or "").strip(),
+        "worktree_path": str(context.worktree_path or "").strip(),
+        "base_commit": str(context.base_commit or "").strip(),
+        "head_commit": str(context.head_commit or "").strip(),
+        "target_head_commit": str(
+            context.target_head_commit or ""
+        ).strip(),
+        "merge_queue_id": str(context.merge_queue_id or "").strip(),
+        "context_status": str(context.status or "").strip(),
+        "last_recovery_action": str(
+            context.last_recovery_action or ""
+        ).strip(),
+        "missing_lineage": list(missing_lineage),
+        "route_identity": {
+            field: str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        },
+        "session_token_lease": {
+            "schema_version": str(lease.get("schema_version") or ""),
+            "lease_id": str(lease.get("lease_id") or ""),
+            "lease_expires_at": str(lease.get("lease_expires_at") or ""),
+            "session_token_ref": str(lease.get("session_token_ref") or ""),
+            "status": str(lease.get("status") or ""),
+            "authorization_valid": lease.get("authorization_valid") is True,
+            "lease_record_valid": lease.get("lease_record_valid") is True,
+            "expired": lease.get("expired") is True,
+        },
+        "raw_credentials_persisted": False,
+    }
+    return {**binding_core, "binding_hash": _stable_public_hash(binding_core)}
+
+
+def _runtime_context_initial_join_canonical_identity_binding(
+    *,
+    project_id: str,
+    original_context: Any,
+    saved_context: Any,
+    result: Mapping[str, Any],
+    governed_worker_id: str,
+    contract_execution_id: str,
+    expected_worker_session_id: str,
+    expected_host_startup_id: str,
+    expected_host_session_id: str,
+    route_identity: Mapping[str, Any],
+    expected_missing_lineage: Sequence[str],
+    actual_missing_lineage: Sequence[str],
+    now_iso: str = "",
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate the issued initial-join envelope before its audit can commit."""
+
+    from .parallel_branch_runtime import (
+        mf_subagent_session_token_hash,
+        runtime_context_fence_token_verifier,
+    )
+
+    if saved_context is None:
+        return {}, ["saved_runtime_context"]
+
+    binding = _runtime_context_initial_join_expected_canonical_identity_binding(
+        project_id=project_id,
+        context=saved_context,
+        governed_worker_id=governed_worker_id,
+        contract_execution_id=contract_execution_id,
+        worker_session_id=expected_worker_session_id,
+        host_startup_id=expected_host_startup_id,
+        host_session_id=expected_host_session_id,
+        route_identity=route_identity,
+        missing_lineage=expected_missing_lineage,
+        now_iso=now_iso,
+    )
+    runtime_id = str(binding.get("runtime_context_id") or "")
+    task_id = str(binding.get("task_id") or "")
+    parent_task_id = str(binding.get("parent_task_id") or "")
+    worker_id = str(binding.get("worker_id") or "")
+    worker_slot_id = str(binding.get("worker_slot_id") or "")
+    session_token_ref = str(binding.get("session_token_ref") or "")
+    target_project_root = str(binding.get("target_project_root") or "")
+    safe_route_identity = dict(binding.get("route_identity") or {})
+    mismatches: list[str] = []
+
+    def _compare_text(
+        container: Mapping[str, Any],
+        expected: Mapping[str, str],
+        *,
+        prefix: str,
+    ) -> None:
+        for field, expected_value in expected.items():
+            if str(container.get(field) or "").strip() != expected_value:
+                mismatches.append(f"{prefix}.{field}")
+
+    expected_result = {
+        "project_id": str(project_id or "").strip(),
+        "runtime_context_id": runtime_id,
+        "contract_execution_id": str(contract_execution_id or "").strip(),
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": str(saved_context.backlog_id or "").strip(),
+        "batch_id": str(saved_context.batch_id or "").strip(),
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": governed_worker_id,
+        "actual_host_worker_id": governed_worker_id,
+        "worker_session_id": expected_worker_session_id,
+        "host_startup_id": expected_host_startup_id,
+        "host_session_id": expected_host_session_id,
+        "principal_id": governed_worker_id,
+        "session_token_ref": session_token_ref,
+        "fence_token_hash": runtime_context_fence_token_verifier(saved_context),
+        "expires_at": str(saved_context.lease_expires_at or "").strip(),
+    }
+    _compare_text(result, expected_result, prefix="result")
+    for field, expected_value in {
+        "session_token_persisted": False,
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted_to_timeline": False,
+    }.items():
+        if result.get(field) is not expected_value:
+            mismatches.append(f"result.{field}")
+    session_token = str(result.get("session_token") or "")
+    fence_token = str(result.get("fence_token") or "")
+    if (
+        not session_token
+        or mf_subagent_session_token_hash(session_token)
+        != str(saved_context.session_token_hash or "").strip()
+        or str(result.get("session_token_hash") or "").strip()
+        != str(saved_context.session_token_hash or "").strip()
+    ):
+        mismatches.append("result.session_token_binding")
+    if not fence_token or fence_token != str(saved_context.fence_token or ""):
+        mismatches.append("result.fence_token_binding")
+    result_lease = result.get("session_token_lease")
+    expected_lease_binding = dict(binding["session_token_lease"])
+    if not isinstance(result_lease, Mapping) or any(
+        result_lease.get(field) != expected
+        for field, expected in expected_lease_binding.items()
+    ):
+        mismatches.append("result.session_token_lease")
+    if dict(result.get("route_identity") or {}) != safe_route_identity:
+        mismatches.append("result.route_identity")
+
+    host_envelope = result.get("host_envelope")
+    if not isinstance(host_envelope, Mapping):
+        mismatches.append("result.host_envelope")
+        host_envelope = {}
+    expected_host_envelope = {
+        **expected_result,
+        "target_project_root": target_project_root,
+        "branch": str(saved_context.branch_ref or "").strip(),
+        "branch_ref": str(saved_context.branch_ref or "").strip(),
+        "worktree_path": str(saved_context.worktree_path or "").strip(),
+        "base_commit": str(saved_context.base_commit or "").strip(),
+        "target_head_commit": str(
+            saved_context.target_head_commit or ""
+        ).strip(),
+        "merge_queue_id": str(saved_context.merge_queue_id or "").strip(),
+    }
+    expected_host_envelope.pop("expires_at", None)
+    _compare_text(
+        host_envelope,
+        expected_host_envelope,
+        prefix="host_envelope",
+    )
+    if dict(host_envelope.get("route_identity") or {}) != safe_route_identity:
+        mismatches.append("host_envelope.route_identity")
+    host_env = host_envelope.get("env")
+    if not isinstance(host_env, Mapping) or (
+        str(host_env.get("AMING_WORKER_SESSION_TOKEN") or "")
+        != session_token
+        or str(host_env.get("AMING_WORKER_FENCE_TOKEN") or "")
+        != fence_token
+    ):
+        mismatches.append("host_envelope.env")
+
+    durable_fields = (
+        "project_id",
+        "governance_project_id",
+        "target_project_id",
+        "target_project_root",
+        "task_id",
+        "batch_id",
+        "parent_task_id",
+        "root_task_id",
+        "backlog_id",
+        "stage_task_id",
+        "worker_id",
+        "worker_slot_id",
+        "agent_id",
+        "allocation_owner",
+        "branch_ref",
+        "worktree_path",
+        "base_commit",
+        "head_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "status",
+        "fence_token",
+    )
+    for field in durable_fields:
+        if getattr(original_context, field, None) != getattr(
+            saved_context,
+            field,
+            None,
+        ):
+            mismatches.append(f"context.{field}")
+    if str(saved_context.actual_host_worker_id or "").strip() != governed_worker_id:
+        mismatches.append("context.actual_host_worker_id")
+    if str(saved_context.host_startup_id or "").strip() != expected_host_startup_id:
+        mismatches.append("context.host_startup_id")
+    if str(saved_context.host_session_id or "").strip() != expected_host_session_id:
+        mismatches.append("context.host_session_id")
+    if str(saved_context.last_recovery_action or "").strip() != (
+        "mf_subagent_initial_join_issued"
+    ):
+        mismatches.append("context.last_recovery_action")
+    if list(actual_missing_lineage) != list(expected_missing_lineage):
+        mismatches.append("timeline.missing_lineage")
+
+    return binding, list(dict.fromkeys(mismatches))
+
+
+def _runtime_context_initial_join_identity_binding_anchor(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    contract_execution_id: str,
+    task_id: str,
+    backlog_id: str,
+    initial_join_event_ref: str,
+    canonical_binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the independent append-only cutover anchor for a fresh join."""
+
+    route_identity = (
+        canonical_binding.get("route_identity")
+        if isinstance(canonical_binding.get("route_identity"), Mapping)
+        else {}
+    )
+    core = {
+        "schema_version": (
+            "runtime_context.initial_join_identity_binding_anchor.v1"
+        ),
+        "action": (
+            "runtime_context_session_token_initial_join_identity_binding_anchor"
+        ),
+        "server_derived": True,
+        "project_id": str(project_id or "").strip(),
+        "runtime_context_id": str(runtime_context_id or "").strip(),
+        "contract_execution_id": str(
+            contract_execution_id or ""
+        ).strip(),
+        "task_id": str(task_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "initial_join_event_ref": str(initial_join_event_ref or "").strip(),
+        "canonical_binding_hash": str(
+            canonical_binding.get("binding_hash") or ""
+        ).strip(),
+        "session_token_ref": str(
+            canonical_binding.get("session_token_ref") or ""
+        ).strip(),
+        "route_identity_hash": _stable_public_hash(dict(route_identity)),
+        "raw_credentials_persisted": False,
+    }
+    return {**core, "anchor_hash": _stable_public_hash(core)}
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/initial-join")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/session-token/initial-join")
 def handle_graph_governance_runtime_context_session_token_initial_join(ctx: RequestContext):
@@ -33760,10 +34077,54 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 404,
                 {"runtime_context_id": runtime_context_id},
             )
-        task_id = str(body.get("task_id") or context.task_id or "").strip()
-        parent_task_id = str(body.get("parent_task_id") or "").strip() or (
-            _runtime_context_mf_sub_parent_task_id(context)
+        canonical_task_id = str(context.task_id or "").strip()
+        canonical_parent_task_id = _runtime_context_mf_sub_parent_task_id(
+            context
         )
+        supplied_task_id = str(body.get("task_id") or "").strip()
+        supplied_parent_task_id = str(
+            body.get("parent_task_id") or ""
+        ).strip()
+        supplied_contract_execution_id = str(
+            body.get("contract_execution_id") or ""
+        ).strip()
+        identity_mismatch_fields = [
+            field
+            for field, supplied, canonical in (
+                ("task_id", supplied_task_id, canonical_task_id),
+                (
+                    "parent_task_id",
+                    supplied_parent_task_id,
+                    canonical_parent_task_id,
+                ),
+                (
+                    "contract_execution_id",
+                    supplied_contract_execution_id,
+                    canonical_parent_task_id,
+                ),
+            )
+            if supplied and supplied != canonical
+        ]
+        if identity_mismatch_fields:
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_contract_identity_mismatch",
+                "runtime-context initial join requires exact canonical task and parent contract identity",
+                403,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "identity_mismatch_fields": identity_mismatch_fields,
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                    "next_legal_action": (
+                        "submit_the_server_advertised_parent_contract_execution_id"
+                    ),
+                },
+            )
+        task_id = canonical_task_id
+        parent_task_id = canonical_parent_task_id
+        contract_execution_id = canonical_parent_task_id
         timeline_events = _runtime_context_service_timeline_events(
             conn,
             project_id=project_id,
@@ -33834,8 +34195,41 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                         "fail_closed": True,
                     },
                 )
+        selected_route_identity = (
+            resolved_route_identity
+            if resolved_route_identity
+            else expected_route_identity
+        )
+        safe_route_identity = {
+            field: str(selected_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+        missing_route_identity_fields = [
+            field
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            if not safe_route_identity.get(field)
+        ]
+        if missing_route_identity_fields:
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_route_identity_incomplete",
+                "runtime-context initial join requires the complete canonical route identity",
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "missing_route_identity_fields": (
+                        missing_route_identity_fields
+                    ),
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                    "next_legal_action": (
+                        "repair_complete_route_prompt_manifest_binding_before_initial_join"
+                    ),
+                },
+            )
         try:
-            validate_initial_join_mf_subagent_host_identity(
+            host_identity = validate_initial_join_mf_subagent_host_identity(
                 context,
                 agent_id=str(
                     body.get("agent_id") or body.get("host_agent_id") or ""
@@ -33901,6 +34295,131 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                     },
                 ) from exc
             raise
+        governed_worker_id = str(
+            host_identity.get("expected_worker_id") or ""
+        ).strip()
+        if not governed_worker_id:
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_canonical_identity_missing",
+                "runtime-context initial join could not derive the governed worker identity",
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                    "next_legal_action": (
+                        "repair_runtime_context_governed_worker_binding_before_initial_join"
+                    ),
+                },
+            )
+        requested_worker_session_id = str(
+            body.get("worker_session_id") or body.get("session_id") or ""
+        ).strip()
+        expected_host_session_id = str(
+            body.get("host_session_id")
+            or requested_worker_session_id
+            or governed_worker_id
+            or ""
+        ).strip()
+        expected_worker_session_id = str(
+            requested_worker_session_id
+            or expected_host_session_id
+            or governed_worker_id
+        ).strip()
+        expected_host_startup_id = str(
+            body.get("host_startup_id") or context.host_startup_id or ""
+        ).strip()
+        if conn.in_transaction:
+            # All work above is schema/read preflight.  The timeline schema
+            # guard uses executescript, so establish the write lock only after
+            # that preflight is complete.
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        locked_context = get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            runtime_context_id,
+        )
+        if locked_context != context:
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_authority_changed",
+                "runtime-context initial join authority changed before issuance",
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": canonical_task_id,
+                    "mutation_performed": False,
+                    "timeline_event_persisted": False,
+                    "credential_rotated": False,
+                    "fail_closed": True,
+                    "next_legal_action": (
+                        "refresh_initial_join_authority_and_retry"
+                    ),
+                },
+            )
+        context = locked_context
+        locked_session = _require_graph_governance_mf_subagent(
+            ctx,
+            conn,
+            "graph-governance.runtime-context.session-token-initial-join",
+        )
+        require_operator_capability(
+            locked_session,
+            "graph-governance.runtime-context.session-token-initial-join",
+        )
+        locked_expected_route_identity = (
+            _runtime_context_latest_route_identity(conn, context)
+        )
+        locked_resolved_route_identity, locked_route_lineage_payload = (
+            _runtime_context_initial_join_resolved_ref_route_identity(
+                body,
+                supplied_route_identity,
+                project_id=project_id,
+                runtime_context_id=runtime_context_id,
+                context=context,
+                expected_route_identity=locked_expected_route_identity,
+            )
+        )
+        locked_selected_route_identity = (
+            locked_resolved_route_identity
+            if locked_resolved_route_identity
+            else locked_expected_route_identity
+        )
+        locked_safe_route_identity = {
+            field: str(
+                locked_selected_route_identity.get(field) or ""
+            ).strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+        if (
+            dict(locked_expected_route_identity)
+            != dict(expected_route_identity)
+            or locked_safe_route_identity != safe_route_identity
+            or dict(locked_route_lineage_payload)
+            != dict(initial_join_route_lineage_payload)
+            or not conn.in_transaction
+        ):
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_route_authority_changed",
+                "runtime-context route authority changed before issuance",
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": canonical_task_id,
+                    "mutation_performed": False,
+                    "timeline_event_persisted": False,
+                    "credential_rotated": False,
+                    "fail_closed": True,
+                    "next_legal_action": (
+                        "refresh_active_route_and_session_authority_before_initial_join"
+                    ),
+                },
+            )
+        session = locked_session
         try:
             result = initial_join_mf_subagent_runtime_session_token(
                 conn,
@@ -33914,21 +34433,9 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                     or body.get("repo_root")
                     or ""
                 ).strip(),
-                agent_id=str(
-                    body.get("agent_id")
-                    or body.get("host_agent_id")
-                    or ""
-                ).strip(),
-                actual_host_worker_id=str(
-                    body.get("actual_host_worker_id")
-                    or body.get("host_worker_id")
-                    or ""
-                ).strip(),
-                worker_session_id=str(
-                    body.get("worker_session_id")
-                    or body.get("session_id")
-                    or ""
-                ).strip(),
+                agent_id=governed_worker_id,
+                actual_host_worker_id=governed_worker_id,
+                worker_session_id=requested_worker_session_id,
                 host_startup_id=str(body.get("host_startup_id") or "").strip(),
                 host_session_id=str(body.get("host_session_id") or "").strip(),
                 ttl_seconds=body.get("ttl_seconds"),
@@ -33949,14 +34456,6 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 },
             ) from exc
 
-        selected_route_identity = (
-            resolved_route_identity if resolved_route_identity else expected_route_identity
-        )
-        safe_route_identity = {
-            field: str(selected_route_identity.get(field) or "").strip()
-            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-            if str(selected_route_identity.get(field) or "").strip()
-        }
         renewed_contract_revision = None
         if resolved_route_identity and safe_route_identity:
             renewed_contract_revision = (
@@ -33972,6 +34471,8 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 )
             )
         if safe_route_identity:
+            result["contract_execution_id"] = contract_execution_id
+            result["batch_id"] = str(context.batch_id or "").strip()
             result["route_identity"] = dict(safe_route_identity)
             if initial_join_route_lineage_payload:
                 result["route_lineage"] = dict(initial_join_route_lineage_payload)
@@ -33985,6 +34486,12 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 )
             host_envelope = result.get("host_envelope")
             if isinstance(host_envelope, dict):
+                host_envelope["contract_execution_id"] = (
+                    contract_execution_id
+                )
+                host_envelope["batch_id"] = str(
+                    context.batch_id or ""
+                ).strip()
                 host_envelope["route_identity"] = dict(safe_route_identity)
                 if initial_join_route_lineage_payload:
                     host_envelope["route_lineage"] = dict(
@@ -34001,6 +34508,69 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                         "renewed_route_token_ref"
                     )
                 result["host_envelope"] = host_envelope
+        saved_context = get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            runtime_context_id,
+        )
+        post_join_event_ids = [
+            int(row["id"])
+            for row in conn.execute(
+                """
+                SELECT id FROM task_timeline_events
+                WHERE project_id = ? AND task_id = ? AND backlog_id = ?
+                ORDER BY id
+                """,
+                (project_id, context.task_id, context.backlog_id),
+            ).fetchall()
+        ]
+        pre_join_event_ids = [
+            int(event.get("id") or 0)
+            for event in timeline_events
+            if int(event.get("id") or 0) > 0
+        ]
+        post_join_missing_lineage = (
+            list(missing_lineage)
+            if post_join_event_ids == pre_join_event_ids
+            else ["timeline_changed_during_initial_join"]
+        )
+        canonical_binding, identity_mismatches = (
+            _runtime_context_initial_join_canonical_identity_binding(
+                project_id=project_id,
+                original_context=context,
+                saved_context=saved_context,
+                result=result,
+                governed_worker_id=governed_worker_id,
+                contract_execution_id=contract_execution_id,
+                expected_worker_session_id=expected_worker_session_id,
+                expected_host_startup_id=expected_host_startup_id,
+                expected_host_session_id=expected_host_session_id,
+                route_identity=safe_route_identity,
+                expected_missing_lineage=missing_lineage,
+                actual_missing_lineage=post_join_missing_lineage,
+                now_iso=str(body.get("now_iso") or ""),
+            )
+        )
+        if identity_mismatches:
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_canonical_identity_mismatch",
+                "runtime-context initial join returned an identity that canonical audit would reject",
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "identity_mismatch_fields": identity_mismatches,
+                    "mutation_performed": False,
+                    "timeline_event_persisted": False,
+                    "credential_rotated": False,
+                    "fail_closed": True,
+                    "next_legal_action": (
+                        "repair_initial_join_identity_binding_and_retry_same_runtime_context"
+                    ),
+                },
+            )
+        result["canonical_identity_binding"] = canonical_binding
         audit_payload = {
             key: value
             for key, value in result.items()
@@ -34015,6 +34585,10 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
         audit_payload.update(
             {
                 "action": "runtime_context_session_token_initial_join",
+                "initial_join_identity_contract_version": (
+                    "runtime_context.initial_join_identity.v2"
+                ),
+                "canonical_identity_binding_required": True,
                 "caller_role": "observer",
                 "raw_session_token_persisted": False,
                 "raw_fence_token_persisted_to_timeline": False,
@@ -34027,9 +34601,7 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 "operator_session_role": session_role(session),
                 "missing_lineage": missing_lineage,
                 "runtime_context_id": runtime_context_id_for_branch_context(context),
-                "contract_execution_id": str(
-                    body.get("contract_execution_id") or ""
-                ).strip(),
+                "contract_execution_id": contract_execution_id,
                 "agent_id": str(result.get("agent_id") or ""),
                 "actual_host_worker_id": str(
                     result.get("actual_host_worker_id") or ""
@@ -34039,21 +34611,61 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 "host_session_id": str(result.get("host_session_id") or ""),
             }
         )
-        audit_event = task_timeline.record_event(
-            conn,
-            project_id=project_id,
-            task_id=context.task_id,
-            backlog_id=context.backlog_id,
-            event_type="observer.runtime_context_session_token_initial_join",
-            event_kind="observer_command",
-            phase="runtime_context_initial_join",
-            status="accepted",
-            actor=str(session.get("principal_id") or "observer"),
-            payload=audit_payload,
-        )
+        try:
+            audit_event = task_timeline.record_event(
+                conn,
+                project_id=project_id,
+                task_id=context.task_id,
+                backlog_id=context.backlog_id,
+                event_type=(
+                    "observer.runtime_context_session_token_initial_join"
+                ),
+                event_kind="observer_command",
+                phase="runtime_context_initial_join",
+                status="accepted",
+                actor=str(session.get("principal_id") or "observer"),
+                payload=audit_payload,
+            )
+            initial_join_event_ref = (
+                f"timeline:{audit_event.get('id', '')}"
+            )
+            anchor_payload = (
+                _runtime_context_initial_join_identity_binding_anchor(
+                    project_id=project_id,
+                    runtime_context_id=runtime_context_id,
+                    contract_execution_id=contract_execution_id,
+                    task_id=context.task_id,
+                    backlog_id=context.backlog_id,
+                    initial_join_event_ref=initial_join_event_ref,
+                    canonical_binding=canonical_binding,
+                )
+            )
+            anchor_event = task_timeline.record_event(
+                conn,
+                project_id=project_id,
+                task_id=context.task_id,
+                backlog_id=context.backlog_id,
+                event_type=(
+                    "observer.runtime_context_session_token_initial_join_identity_binding"
+                ),
+                event_kind="observer_command",
+                phase="runtime_context_initial_join_identity_binding",
+                status="accepted",
+                actor=str(session.get("principal_id") or "observer"),
+                payload=anchor_payload,
+            )
+        except Exception:
+            conn.rollback()
+            raise
         conn.commit()
-        result["audit_event_ref"] = f"timeline:{audit_event.get('id', '')}"
+        result["audit_event_ref"] = initial_join_event_ref
         result["audit_event_id"] = audit_event.get("id", "")
+        result["canonical_identity_binding_anchor_ref"] = (
+            f"timeline:{anchor_event.get('id', '')}"
+        )
+        result["canonical_identity_binding_anchor_hash"] = (
+            anchor_payload["anchor_hash"]
+        )
         result["raw_tokens_persisted_to_timeline"] = False
         return result
     finally:
@@ -38256,6 +38868,68 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
         if isinstance(initial_join_audit.get("payload"), Mapping)
         else {}
     )
+    candidate_identity_anchors: list[Mapping[str, Any]] = []
+    for event in timeline_events:
+        if not isinstance(event, Mapping):
+            continue
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        if not (
+            str(event.get("event_type") or "").strip()
+            == (
+                "observer.runtime_context_session_token_"
+                "initial_join_identity_binding"
+            )
+            and str(event.get("event_kind") or "").strip()
+            == "observer_command"
+            and str(event.get("phase") or "").strip()
+            == "runtime_context_initial_join_identity_binding"
+            and str(event.get("status") or "").strip().lower()
+            == "accepted"
+            and str(payload.get("action") or "").strip()
+            == (
+                "runtime_context_session_token_initial_join_"
+                "identity_binding_anchor"
+            )
+            and str(
+                event.get("task_id") or payload.get("task_id") or ""
+            ).strip()
+            == task_id
+            and str(
+                event.get("backlog_id")
+                or payload.get("backlog_id")
+                or ""
+            ).strip()
+            == backlog_id
+        ):
+            continue
+        candidate_identity_anchors.append(event)
+    identity_anchor = (
+        candidate_identity_anchors[0]
+        if len(candidate_identity_anchors) == 1
+        else {}
+    )
+    identity_anchor_payload = (
+        identity_anchor.get("payload")
+        if isinstance(identity_anchor.get("payload"), Mapping)
+        else {}
+    )
+    discriminator_present = any(
+        field in initial_join_payload
+        for field in (
+            "initial_join_identity_contract_version",
+            "canonical_identity_binding_required",
+        )
+    )
+    canonical_binding_present = "canonical_identity_binding" in initial_join_payload
+    fresh_identity_cutover = bool(
+        discriminator_present
+        or canonical_binding_present
+        or candidate_identity_anchors
+    )
     worker_session_id = str(
         initial_join_payload.get("worker_session_id") or ""
     ).strip()
@@ -38296,8 +38970,26 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
         "host_session_id": host_session_id,
         "session_token_ref": active_session_token_ref,
     }
+    legacy_agent_id_normalization_candidate = False
+    durable_allocation_agent_id = str(
+        getattr(context, "agent_id", "") or ""
+    ).strip()
+    durable_allocation_owner = str(
+        getattr(context, "allocation_owner", "") or ""
+    ).strip()
     for field, expected in expected_audit_identity.items():
-        if not expected or str(initial_join_payload.get(field) or "").strip() != expected:
+        actual = str(initial_join_payload.get(field) or "").strip()
+        if field == "agent_id" and expected and actual != expected:
+            if (
+                not fresh_identity_cutover
+                and actual
+                and actual == durable_allocation_agent_id
+                and actual == durable_allocation_owner
+                and durable_allocation_agent_id != expected
+            ):
+                legacy_agent_id_normalization_candidate = True
+                continue
+        if not expected or actual != expected:
             errors.append(f"initial_join_audit_{field}_mismatch")
     request_host_startup_id = str(
         body.get("host_startup_id") or ""
@@ -38350,6 +39042,124 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
             errors.append(f"request_route_{field}_mismatch_or_missing")
         if str(audited_route_identity.get(field) or "").strip() != expected:
             errors.append(f"initial_join_audit_route_{field}_mismatch")
+
+    expected_canonical_binding: dict[str, Any] = {}
+    expected_identity_anchor: dict[str, Any] = {}
+    if fresh_identity_cutover:
+        if (
+            initial_join_payload.get("initial_join_identity_contract_version")
+            != "runtime_context.initial_join_identity.v2"
+            or initial_join_payload.get(
+                "canonical_identity_binding_required"
+            )
+            is not True
+        ):
+            errors.append("initial_join_audit_identity_discriminator_invalid")
+        canonical_binding = initial_join_payload.get(
+            "canonical_identity_binding"
+        )
+        if not isinstance(canonical_binding, Mapping):
+            errors.append("initial_join_audit_canonical_binding_missing")
+            canonical_binding = {}
+        expected_missing_lineage = [
+            item
+            for item, present in (
+                ("mf_subagent_read_receipt", effective_read_receipt_ref),
+                ("mf_subagent_startup", effective_startup_ref),
+            )
+            if not present
+        ]
+        expected_canonical_binding = (
+            _runtime_context_initial_join_expected_canonical_identity_binding(
+                project_id=project_id,
+                context=context,
+                governed_worker_id=actual_host_worker_id,
+                contract_execution_id=contract_execution_id,
+                worker_session_id=worker_session_id,
+                host_startup_id=host_startup_id,
+                host_session_id=host_session_id,
+                route_identity=canonical_route_identity,
+                missing_lineage=expected_missing_lineage,
+                now_iso=now_iso,
+            )
+        )
+        if dict(canonical_binding) != expected_canonical_binding:
+            errors.append("initial_join_audit_canonical_binding_mismatch")
+        if len(candidate_identity_anchors) != 1:
+            errors.append(
+                "initial_join_audit_identity_anchor_cardinality_invalid"
+            )
+        if initial_join_audit:
+            expected_identity_anchor = (
+                _runtime_context_initial_join_identity_binding_anchor(
+                    project_id=project_id,
+                    runtime_context_id=runtime_id,
+                    contract_execution_id=contract_execution_id,
+                    task_id=task_id,
+                    backlog_id=backlog_id,
+                    initial_join_event_ref=(
+                        f"timeline:{initial_join_audit.get('id', '')}"
+                    ),
+                    canonical_binding=expected_canonical_binding,
+                )
+            )
+        persisted_identity_anchor = dict(identity_anchor_payload)
+        persisted_meta_contract_gate = persisted_identity_anchor.pop(
+            "meta_contract_gate",
+            None,
+        )
+        expected_meta_contract_gate: Mapping[str, Any] | None = None
+        if expected_identity_anchor and identity_anchor:
+            try:
+                from .mf_subagent_contract import (
+                    validate_meta_contract_timeline_event,
+                )
+
+                expected_meta_contract_gate = (
+                    validate_meta_contract_timeline_event(
+                        {
+                            "event_type": identity_anchor.get(
+                                "event_type",
+                                "",
+                            ),
+                            "phase": identity_anchor.get("phase", ""),
+                            "event_kind": identity_anchor.get(
+                                "event_kind",
+                                "",
+                            ),
+                            "actor": identity_anchor.get("actor", ""),
+                            "status": identity_anchor.get("status", ""),
+                            "decision": identity_anchor.get(
+                                "decision",
+                                "",
+                            ),
+                            "payload": expected_identity_anchor,
+                            "verification": identity_anchor.get(
+                                "verification",
+                                {},
+                            ),
+                            "artifact_refs": identity_anchor.get(
+                                "artifact_refs",
+                                {},
+                            ),
+                            "backlog_id": backlog_id,
+                            "task_id": task_id,
+                        }
+                    )
+                )
+            except Exception:
+                errors.append(
+                    "initial_join_audit_identity_anchor_gate_invalid"
+                )
+        if (
+            not expected_identity_anchor
+            or persisted_identity_anchor != expected_identity_anchor
+            or not isinstance(persisted_meta_contract_gate, Mapping)
+            or expected_meta_contract_gate is None
+            or dict(persisted_meta_contract_gate)
+            != dict(expected_meta_contract_gate)
+        ):
+            errors.append("initial_join_audit_identity_anchor_mismatch")
 
     errors = list(dict.fromkeys(errors))
     audit_errors = [
@@ -38460,6 +39270,34 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
         ),
         "audit_cardinality": len(candidate_initial_join_audits),
         "audit_valid": bool(not audit_errors),
+        "identity_contract_version": (
+            "runtime_context.initial_join_identity.v2"
+            if fresh_identity_cutover
+            else "runtime_context.initial_join_identity.legacy"
+        ),
+        "canonical_identity_binding_required": fresh_identity_cutover,
+        "canonical_identity_binding_valid": bool(
+            fresh_identity_cutover
+            and expected_canonical_binding
+            and not any(
+                error.startswith("initial_join_audit_canonical_binding_")
+                or error.startswith("initial_join_audit_identity_")
+                for error in errors
+            )
+        ),
+        "canonical_identity_binding_anchor_ref": (
+            f"timeline:{identity_anchor.get('id', '')}"
+            if identity_anchor
+            else ""
+        ),
+        "legacy_agent_id_normalized": bool(
+            legacy_agent_id_normalization_candidate and not errors
+        ),
+        "legacy_agent_id_normalization_source": (
+            "durable_pre_fix_allocation_context_agent_id"
+            if legacy_agent_id_normalization_candidate and not errors
+            else ""
+        ),
         "route_identity": canonical_route_identity,
         "lease": {
             "lease_id": str(lease.get("lease_id") or ""),
