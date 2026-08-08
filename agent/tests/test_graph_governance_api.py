@@ -23391,6 +23391,12 @@ def test_worker_results_deadlock_invalid_guide_and_stored_bypass_remain_terminal
     assert terminal_current["contract_runtime_current_state"][
         "readiness_state"
     ] == "completed_with_exception"
+    assert terminal_current["contract_runtime_current_state"][
+        "row_status"
+    ] == "WAIVED"
+    assert terminal_current["contract_runtime_current_state"][
+        "disposition"
+    ] == "completed_with_exception"
     assert terminal_current["runtime_context"]["status"] == (
         "released_unlandable"
     )
@@ -23515,6 +23521,17 @@ def test_worker_results_deadlock_invalid_guide_and_stored_bypass_remain_terminal
             "bypass_audit_valid"
         ] is False, path
         assert blocked_terminal_guide["readiness_state"] == (
+            "blocked_terminal_context_audit_identity"
+        )
+        blocked_current_state = server._runtime_current_state_from_record(
+            blocked_terminal
+        )
+        assert blocked_current_state["row_status"] == "BLOCKED"
+        assert blocked_current_state["source_row_status"] == "BLOCKED"
+        assert blocked_current_state["disposition"] == (
+            "blocked_terminal_context_audit_identity"
+        )
+        assert blocked_current_state["readiness_state"] == (
             "blocked_terminal_context_audit_identity"
         )
         assert raw_sentinel not in json.dumps(

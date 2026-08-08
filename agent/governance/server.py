@@ -80412,9 +80412,16 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
         )
         current_state.update(
             {
-                "row_status": "WAIVED",
-                "source_row_status": "WAIVED",
-                "disposition": "completed_with_exception",
+                "row_status": str(
+                    terminal.get("row_status") or "WAIVED"
+                ).strip(),
+                "source_row_status": str(
+                    terminal.get("source_row_status") or "WAIVED"
+                ).strip(),
+                "disposition": str(
+                    terminal.get("disposition")
+                    or "completed_with_exception"
+                ).strip(),
                 "terminal": True,
                 "scheduler_eligible": False,
                 "schedulable": False,
