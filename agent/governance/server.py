@@ -15378,6 +15378,25 @@ def _parallel_branch_allocate_normalized_target_ref(value: Any) -> str:
     return f"refs/heads/{target_ref}"
 
 
+def _parallel_branch_allocate_declares_failed_qa_rework(
+    body: Mapping[str, Any],
+) -> bool:
+    """Detect recovery intent before ordinary allocation can accept it."""
+
+    return bool(
+        str(body.get("stage_type") or "").strip() == "failed_qa_rework"
+        or str(body.get("failed_qa_source_ref") or "").strip()
+        or any(
+            key in body
+            for key in (
+                "failed_qa_rework_authority",
+                "failed_qa_rework_dispatch_revision",
+                "failed_qa_rework_dispatch_revision_authority",
+            )
+        )
+    )
+
+
 def _parallel_branch_allocate_verified_batch_target_authority(
     conn,
     *,
@@ -15507,6 +15526,17 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
     if not all((source_task_id, fresh_task_id, fresh_worker_id, fresh_worker_slot_id)):
         return {}
 
+    if conn.execute(
+        """
+        SELECT 1
+        FROM parallel_branch_runtime_contexts
+        WHERE project_id = ? AND task_id = ?
+        LIMIT 1
+        """,
+        (project_id, fresh_task_id),
+    ).fetchone() is not None:
+        return {}
+
     from .parallel_branch_runtime import get_branch_context
 
     source_context = get_branch_context(conn, project_id, source_task_id)
@@ -15532,11 +15562,55 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
         != str(verified_batch_child.get("child_backlog_id") or "").strip()
         or str(getattr(source_context, "merge_queue_id", "") or "").strip()
         != str(verified_batch_child.get("merge_queue_id") or "").strip()
+        or str(getattr(source_context, "batch_id", "") or "").strip()
+        != str(verified_batch_child.get("batch_id") or "").strip()
         or not source_runtime_context_id
         or not source_parent_task_id
+        or source_parent_task_id != contract_execution_id
         or fresh_task_id == source_task_id
         or fresh_worker_id in source_worker_ids
         or fresh_worker_slot_id in source_worker_ids
+    ):
+        return {}
+
+    requested_worker_identities = {
+        value
+        for value in (
+            fresh_worker_id,
+            fresh_worker_slot_id,
+        )
+        if value
+    }
+    family_rows = conn.execute(
+        """
+        SELECT agent_id, worker_id, allocation_owner, worker_slot_id,
+               actual_host_worker_id
+        FROM parallel_branch_runtime_contexts
+        WHERE project_id = ? AND backlog_id = ? AND parent_task_id = ?
+          AND batch_id = ? AND merge_queue_id = ?
+        """,
+        (
+            project_id,
+            str(verified_batch_child.get("child_backlog_id") or "").strip(),
+            source_parent_task_id,
+            str(verified_batch_child.get("batch_id") or "").strip(),
+            str(verified_batch_child.get("merge_queue_id") or "").strip(),
+        ),
+    ).fetchall()
+    if any(
+        requested_worker_identities
+        & {
+            str(_row_get(row, field, "") or "").strip()
+            for field in (
+                "agent_id",
+                "worker_id",
+                "allocation_owner",
+                "worker_slot_id",
+                "actual_host_worker_id",
+            )
+            if str(_row_get(row, field, "") or "").strip()
+        }
+        for row in family_rows
     ):
         return {}
 
@@ -16390,6 +16464,11 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             )
         )
         if rev8_allocation_record:
+            failed_qa_rework_intent = (
+                _parallel_branch_allocate_declares_failed_qa_rework(
+                    ctx.body or {}
+                )
+            )
             cardinality_policy = (
                 _contract_runtime_mf_parallel_worker_cardinality_policy(
                     conn,
@@ -16402,6 +16481,26 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     rev8_allocation_record
                 )
             )
+            if failed_qa_rework_intent and not declared_batch_child:
+                raise GovernanceError(
+                    "parallel_branch_allocate_failed_qa_rework_authority_required",
+                    (
+                        "failed-QA rework allocation requires exact verified "
+                        "merged batch-child recovery authority"
+                    ),
+                    422,
+                    {
+                        "contract_execution_id": str(
+                            rev8_allocation_record.get(
+                                "contract_execution_id"
+                            )
+                            or ""
+                        ),
+                        "declared_batch_child": False,
+                        "failed_qa_rework_intent": True,
+                        "writes_performed": False,
+                    },
+                )
             if declared_batch_child:
                 if not str(ctx.body.get("route_token_ref") or "").strip():
                     raise GovernanceError(
@@ -16462,6 +16561,32 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                             "expected_source": (
                                 "parallel_branch_merge_queue_items.status"
                             ),
+                            "writes_performed": False,
+                        },
+                    )
+                if failed_qa_rework_intent and not isinstance(
+                    batch_target_authority.get("failed_qa_rework_authority"),
+                    Mapping,
+                ):
+                    raise GovernanceError(
+                        (
+                            "parallel_branch_allocate_failed_qa_rework_"
+                            "authority_required"
+                        ),
+                        (
+                            "failed-QA rework allocation requires exact "
+                            "verified merged batch-child recovery authority"
+                        ),
+                        422,
+                        {
+                            "contract_execution_id": str(
+                                rev8_allocation_record.get(
+                                    "contract_execution_id"
+                                )
+                                or ""
+                            ),
+                            "declared_batch_child": True,
+                            "failed_qa_rework_intent": True,
                             "writes_performed": False,
                         },
                     )
@@ -16787,6 +16912,59 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             )
         worktree_result: dict[str, Any] | None = None
         with sqlite_write_lock():
+            if isinstance(
+                batch_target_authority.get("failed_qa_rework_authority"),
+                Mapping,
+            ):
+                conn.execute("BEGIN IMMEDIATE")
+                current_rework_record = (
+                    _parallel_branch_allocate_mf_parallel_rev8_record(
+                        conn,
+                        project_id=project_id,
+                        backlog_id=str(ctx.body.get("backlog_id") or ""),
+                        body=effective_body,
+                    )
+                )
+                current_verified_batch_child = (
+                    _parallel_branch_allocate_verified_batch_child_lineage_authority(
+                        conn,
+                        project_id=project_id,
+                        record=current_rework_record,
+                    )
+                    if current_rework_record
+                    else {}
+                )
+                current_rework_authority = (
+                    _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
+                        conn,
+                        project_id=project_id,
+                        record=current_rework_record,
+                        verified_batch_child=current_verified_batch_child,
+                        body=effective_body,
+                    )
+                    if current_verified_batch_child
+                    else {}
+                )
+                if not current_rework_authority:
+                    raise GovernanceError(
+                        (
+                            "parallel_branch_allocate_failed_qa_rework_"
+                            "authority_changed"
+                        ),
+                        (
+                            "failed-QA rework authority changed before the "
+                            "fresh RuntimeContext write"
+                        ),
+                        409,
+                        {
+                            "contract_execution_id": str(
+                                ctx.body.get("contract_execution_id") or ""
+                            ),
+                            "fresh_task_id": task_id,
+                            "writes_performed": False,
+                            "retry_requires_fresh_identity": True,
+                        },
+                    )
             if not create_worktree:
                 existing = get_branch_context(conn, project_id, task_id)
                 if is_materialized_branch_context(existing):

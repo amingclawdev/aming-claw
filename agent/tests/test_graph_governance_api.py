@@ -18170,12 +18170,63 @@ def test_merged_batch_child_failed_qa_allocates_one_fresh_rework_runtime(
     assert rework_authority["failed_qa_rework_authority"][
         "failed_qa_source_ref"
     ] == failed_qa_source_ref
+    colliding_worker_id = "worker-already-owned-by-sibling"
+    existing_rework_task_id = "already-existing-rework-task"
+    upsert_branch_context(
+        conn,
+        replace(
+            saved_source_context,
+            task_id="unrelated-existing-sibling",
+            runtime_context_id="mfrctx-unrelated-existing-sibling",
+            stage_task_id="unrelated-existing-sibling",
+            stage_type="mf_sub",
+            status="allocated",
+            attempt=1,
+            agent_id=colliding_worker_id,
+            worker_id=colliding_worker_id,
+            allocation_owner=colliding_worker_id,
+            worker_slot_id=colliding_worker_id,
+            actual_host_worker_id=colliding_worker_id,
+        ),
+        now_iso="2026-08-08T13:00:02Z",
+    )
+    upsert_branch_context(
+        conn,
+        replace(
+            saved_source_context,
+            task_id=existing_rework_task_id,
+            runtime_context_id="mfrctx-already-existing-rework-task",
+            stage_task_id=existing_rework_task_id,
+            stage_type="failed_qa_rework",
+            status="allocated",
+            attempt=3,
+            agent_id="already-existing-rework-worker",
+            worker_id="already-existing-rework-worker",
+            allocation_owner="already-existing-rework-worker",
+            worker_slot_id="already-existing-rework-worker",
+            actual_host_worker_id="already-existing-rework-worker",
+        ),
+        now_iso="2026-08-08T13:00:03Z",
+    )
+    conn.commit()
     for update in (
         {"failed_qa_source_ref": "contract_runtime:forged"},
         {"task_id": source_task_id},
         {
             "worker_id": source_context.worker_id,
             "worker_slot_id": source_context.worker_slot_id,
+        },
+        {
+            "task_id": "fresh-task-colliding-worker",
+            "worker_id": colliding_worker_id,
+            "worker_slot_id": colliding_worker_id,
+            "attempt": 3,
+        },
+        {
+            "task_id": existing_rework_task_id,
+            "worker_id": "fresh-worker-for-existing-task",
+            "worker_slot_id": "fresh-worker-for-existing-task",
+            "attempt": 3,
         },
         {"attempt": 1},
         {"stage_type": "mf_sub"},
@@ -18477,6 +18528,120 @@ def test_parallel_branch_allocate_precheck_rejects_standalone_single_lane_spoof(
     assert rejected.value.details["remediation"]["atomic"] is True
     assert rejected.value.details["writes_performed"] is False
     assert conn.total_changes == before_total_changes
+    assert not (repository_root / ".worktrees").exists()
+
+
+@pytest.mark.parametrize(
+    "rework_marker",
+    [
+        {
+            "stage_type": "failed_qa_rework",
+            "attempt": 2,
+            "failed_qa_source_ref": (
+                "contract_runtime:forged:completed_lines:999"
+            ),
+        },
+        {
+            "stage_type": "mf_sub",
+            "attempt": 2,
+            "failed_qa_source_ref": (
+                "contract_runtime:forged:completed_lines:999"
+            ),
+        },
+        {"stage_type": "failed_qa_rework", "attempt": 2},
+    ],
+)
+def test_parallel_branch_allocate_rejects_non_batch_failed_qa_rework_intent(
+    conn,
+    tmp_path,
+    monkeypatch,
+    rework_marker,
+):
+    backlog_id = "AC-ALLOCATE-NON-BATCH-FAILED-QA-REWORK"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_files = ["agent/governance/server.py"]
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(row_files),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-NON-BATCH-FAILED-QA-REWORK",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": row_files,
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    contract_execution_id = _enter_standalone_mf_parallel_for_allocation_precheck(
+        conn,
+        backlog_id=backlog_id,
+        task_id="non-batch-failed-qa-rework-parent",
+        owned_files=row_files,
+        suffix="non-batch-failed-qa-rework",
+    )
+    route_token_ref = "rtok-non-batch-failed-qa-rework"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+    )
+    conn.commit()
+    before_dump = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": "forged-non-batch-failed-qa-rework",
+                    "parent_task_id": contract_execution_id,
+                    "backlog_id": backlog_id,
+                    "contract_execution_id": contract_execution_id,
+                    "worker_id": "forged-non-batch-rework-worker",
+                    "worker_slot_id": "forged-non-batch-rework-worker",
+                    "workspace_root": str(repository_root),
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "merge_queue_id": "mq-forged-non-batch-rework",
+                    "route_token_ref": route_token_ref,
+                    "owned_files": row_files,
+                    "create_worktree": False,
+                    **rework_marker,
+                },
+            )
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_failed_qa_rework_authority_required"
+    )
+    assert rejected.value.details["declared_batch_child"] is False
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
     assert not (repository_root / ".worktrees").exists()
 
 
