@@ -1569,6 +1569,8 @@ class SafeRefPrestartupReissueAuthority:
     lease_expires_at: str
     read_receipt_ref: str
     initial_join_event_ref: str
+    session_authority_event_ref: str
+    session_authority_kind: str
     route_identity_hash: str
     authorized_at: str
     authority_hash: str
@@ -11456,6 +11458,8 @@ def build_safe_ref_prestartup_reissue_authority(
     read_receipt_ref: str,
     initial_join_event_ref: str,
     route_identity_hash: str,
+    session_authority_event_ref: str = "",
+    session_authority_kind: str = "initial_join",
     now_iso: str = "",
 ) -> SafeRefPrestartupReissueAuthority:
     """Bind server-verified pre-startup lineage to the active opaque ref."""
@@ -11466,6 +11470,10 @@ def build_safe_ref_prestartup_reissue_authority(
     execution_id = str(contract_execution_id or "").strip()
     read_ref = str(read_receipt_ref or "").strip()
     join_ref = str(initial_join_event_ref or "").strip()
+    session_authority_ref = str(
+        session_authority_event_ref or initial_join_event_ref or ""
+    ).strip()
+    session_authority_type = str(session_authority_kind or "").strip()
     route_hash = str(route_identity_hash or "").strip()
     worker_id = str(context.worker_id or "").strip()
     worker_slot_id = str(context.worker_slot_id or worker_id).strip()
@@ -11491,6 +11499,8 @@ def build_safe_ref_prestartup_reissue_authority(
                 context.lease_expires_at,
                 read_ref,
                 join_ref,
+                session_authority_ref,
+                session_authority_type,
                 route_hash,
                 authorized_at,
             )
@@ -11499,6 +11509,9 @@ def build_safe_ref_prestartup_reissue_authority(
             f"contract_runtime:{execution_id}:completed_lines:"
         )
         or not join_ref.startswith("timeline:")
+        or not session_authority_ref.startswith("timeline:")
+        or session_authority_type
+        not in {"initial_join", "bounded_replacement_rejoin"}
         or not route_hash.startswith("sha256:")
         or str(lease.get("status") or "") != "active"
         or lease.get("authorization_valid") is not True
@@ -11533,6 +11546,8 @@ def build_safe_ref_prestartup_reissue_authority(
         lease_expires_at=str(context.lease_expires_at or "").strip(),
         read_receipt_ref=read_ref,
         initial_join_event_ref=join_ref,
+        session_authority_event_ref=session_authority_ref,
+        session_authority_kind=session_authority_type,
         route_identity_hash=route_hash,
         authorized_at=authorized_at,
         authority_hash="",
@@ -11653,6 +11668,11 @@ def reissue_mf_subagent_runtime_session_token(
                 f"contract_runtime:{authority.contract_execution_id}:completed_lines:"
             )
             or not authority.initial_join_event_ref.startswith("timeline:")
+            or not authority.session_authority_event_ref.startswith(
+                "timeline:"
+            )
+            or authority.session_authority_kind
+            not in {"initial_join", "bounded_replacement_rejoin"}
             or not authority.route_identity_hash.startswith("sha256:")
             or not authority.authorized_at
             or authority_hash != _stable_authority_hash(authority_payload)
@@ -18215,6 +18235,59 @@ def _startup_string_list(value: Any) -> tuple[str, ...]:
     if isinstance(value, str) and value.strip():
         return (value.strip(),)
     return ()
+
+
+_STARTUP_COPY_SAFE_IDENTITY_FIELDS = (
+    "host_startup_id",
+    "host_session_id",
+    "worker_session_id",
+    "session_id",
+    "worker_transcript_ref",
+    "transcript_ref",
+)
+
+
+def runtime_context_startup_identity_preflight(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reject template or transcript-shaped identity values before writes."""
+
+    invalid_fields: list[dict[str, str]] = []
+    for field in _STARTUP_COPY_SAFE_IDENTITY_FIELDS:
+        if field not in payload or payload.get(field) is None:
+            continue
+        raw = payload.get(field)
+        if not isinstance(raw, str):
+            invalid_fields.append(
+                {"field": field, "reason": "identity_must_be_string"}
+            )
+            continue
+        value = raw.strip()
+        if not value:
+            continue
+        reason = ""
+        if len(value) > 512:
+            reason = "identity_too_long"
+        elif any(marker in value for marker in ("<", ">", "{{", "}}", "${")):
+            reason = "template_marker_forbidden"
+        elif any(ord(char) < 32 or ord(char) == 127 for char in value):
+            reason = "control_or_multiline_identity_forbidden"
+        elif (
+            (value.startswith("{") and value.endswith("}"))
+            or (value.startswith("[") and value.endswith("]"))
+        ):
+            reason = "raw_transcript_shape_forbidden"
+        if reason:
+            invalid_fields.append({"field": field, "reason": reason})
+    return {
+        "schema_version": "runtime_context.startup_identity_preflight.v1",
+        "accepted": not invalid_fields,
+        "invalid_fields": invalid_fields,
+        "placeholder_submission_forbidden": True,
+        "raw_transcript_submission_forbidden": True,
+        "submitted_values_echoed": False,
+        "secret_safe": True,
+    }
 
 
 def _startup_path_text(value: str) -> str:

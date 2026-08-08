@@ -33602,31 +33602,69 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         backlog_id=str(context.backlog_id or "").strip(),
     )
     matching_initial_joins = []
+    matching_session_authorities: list[tuple[Mapping[str, Any], str]] = []
     for event in timeline_events:
         payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
-        if (
+        common_identity_matches = (
             str(event.get("status") or "").strip().lower()
-            not in {"accepted", "ok", "pass", "passed", "success", "succeeded"}
-            or str(payload.get("action") or "").strip()
-            != "runtime_context_session_token_initial_join"
-            or str(payload.get("runtime_context_id") or "").strip()
-            != expected_runtime_id
-            or str(payload.get("task_id") or event.get("task_id") or "").strip()
-            != expected_task_id
-            or str(payload.get("session_token_ref") or "").strip()
-            != presented_session_ref
-            or str(payload.get("actual_host_worker_id") or "").strip()
-            != expected_actual_host_worker_id
-            or str(payload.get("worker_session_id") or "").strip()
-            != expected_host_session_id
-        ):
+            in {"accepted", "ok", "pass", "passed", "success", "succeeded"}
+            and str(payload.get("runtime_context_id") or "").strip()
+            == expected_runtime_id
+            and str(
+                payload.get("task_id") or event.get("task_id") or ""
+            ).strip()
+            == expected_task_id
+        )
+        if not common_identity_matches:
             continue
         event_execution_id = str(payload.get("contract_execution_id") or "").strip()
         if event_execution_id and event_execution_id != presented_contract_execution_id:
             continue
-        matching_initial_joins.append(event)
+        action = str(payload.get("action") or "").strip()
+        event_session_ref = str(payload.get("session_token_ref") or "").strip()
+        if (
+            action == "runtime_context_session_token_initial_join"
+            and str(payload.get("actual_host_worker_id") or "").strip()
+            == expected_actual_host_worker_id
+            and str(payload.get("worker_session_id") or "").strip()
+            == expected_host_session_id
+        ):
+            matching_initial_joins.append(event)
+            if event_session_ref == presented_session_ref:
+                matching_session_authorities.append((event, "initial_join"))
+        elif (
+            action == "runtime_context_session_token_rejoin"
+            and str(payload.get("bounded_rejoin_kind") or "").strip()
+            == "bounded_replacement_rejoin"
+            and payload.get("bounded_replacement_rejoin") is True
+            and event_session_ref == presented_session_ref
+            and str(payload.get("worker_id") or "").strip()
+            == expected_worker_id
+            and str(
+                payload.get("worker_slot_id") or expected_worker_slot_id
+            ).strip()
+            == expected_worker_slot_id
+            and str(
+                payload.get("actual_host_worker_id")
+                or expected_actual_host_worker_id
+            ).strip()
+            == expected_actual_host_worker_id
+            and str(
+                payload.get("worker_session_id")
+                or expected_host_session_id
+            ).strip()
+            == expected_host_session_id
+        ):
+            matching_session_authorities.append(
+                (event, "bounded_replacement_rejoin")
+            )
     if len(matching_initial_joins) != 1:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    if len(matching_session_authorities) != 1:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    session_authority_event, session_authority_kind = (
+        matching_session_authorities[0]
+    )
 
     supplied_route_identity = _runtime_context_request_route_identity_shapes(ctx)[
         "supplied"
@@ -33682,6 +33720,10 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         contract_execution_id=presented_contract_execution_id,
         read_receipt_ref=str(sequence["read_receipt_ref"]),
         initial_join_event_ref=f"timeline:{matching_initial_joins[0].get('id', '')}",
+        session_authority_event_ref=(
+            f"timeline:{session_authority_event.get('id', '')}"
+        ),
+        session_authority_kind=session_authority_kind,
         route_identity_hash=route_identity_hash,
         now_iso=str(body.get("now_iso") or ""),
     )
@@ -33702,8 +33744,13 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
     if not runtime_context_id:
         raise ValidationError("runtime_context_id is required")
     body = dict(ctx.body or {})
+    from .db import sqlite_write_lock
+
     conn = get_connection(project_id)
+    write_lock = sqlite_write_lock()
+    write_lock.acquire()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         from .parallel_branch_runtime import (
             BranchRuntimeFenceError,
             reissue_mf_subagent_runtime_session_token,
@@ -33769,6 +33816,12 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
                     "read_receipt_ref": safe_ref_authority.read_receipt_ref,
                     "initial_join_event_ref": (
                         safe_ref_authority.initial_join_event_ref
+                    ),
+                    "session_authority_event_ref": (
+                        safe_ref_authority.session_authority_event_ref
+                    ),
+                    "session_authority_kind": (
+                        safe_ref_authority.session_authority_kind
                     ),
                     "route_identity_hash": safe_ref_authority.route_identity_hash,
                     "server_derived": True,
@@ -33849,7 +33902,14 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
         result["audit_event_id"] = audit_event.get("id", "")
         return result
     finally:
-        conn.close()
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+        finally:
+            try:
+                conn.close()
+            finally:
+                write_lock.release()
 
 
 def _runtime_context_initial_join_expected_canonical_identity_binding(
@@ -40483,26 +40543,36 @@ def _runtime_context_bounded_replacement_rejoin_authority(
     runtime_context_id = str(
         getattr(context, "runtime_context_id", "") or ""
     ).strip()
-    audit_events = []
+    ordinary_audit_events = []
+    special_bootstrap_audit_events = []
     for event in timeline_events:
         payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
         bounded_rejoin_kind = str(
             payload.get("bounded_rejoin_kind") or ""
         ).strip()
-        accepted_initial_rejoin = bounded_rejoin_kind == (
-            "ordinary_initial_rejoin"
-        ) or (
-            bounded_rejoin_kind == "special_authority_rejoin"
-            and payload.get("pre_lineage_auth_only_rejoin") is True
-        )
         if (
-            str(payload.get("action") or "").strip()
+            str(event.get("status") or "").strip().lower()
+            in {"accepted", "ok", "pass", "passed", "success", "succeeded"}
+            and str(payload.get("action") or "").strip()
             == "runtime_context_session_token_rejoin"
-            and accepted_initial_rejoin
             and _timeline_first_deep_text(event, "runtime_context_id")
             in {"", runtime_context_id}
         ):
-            audit_events.append(event)
+            if bounded_rejoin_kind == "ordinary_initial_rejoin":
+                ordinary_audit_events.append(event)
+            elif (
+                bounded_rejoin_kind == "special_authority_rejoin"
+                and payload.get("pre_lineage_auth_only_rejoin") is True
+            ):
+                special_bootstrap_audit_events.append(event)
+    # An ordinary current rejoin supersedes the earlier pre-lineage bootstrap
+    # audit as replacement authority.  When no ordinary rejoin exists yet, the
+    # sole special bootstrap rejoin retains the legacy one-retry behavior.
+    audit_events = (
+        ordinary_audit_events
+        if ordinary_audit_events
+        else special_bootstrap_audit_events
+    )
     projection["mode"] = "bounded_post_lineage_replacement_auth_only"
     if len(audit_events) != 1:
         projection["errors"].append(
@@ -43262,12 +43332,34 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
     return response
 
 
+def _require_runtime_context_startup_identity_preflight(
+    body: Mapping[str, Any],
+) -> None:
+    from .parallel_branch_runtime import (
+        runtime_context_startup_identity_preflight,
+    )
+
+    decision = runtime_context_startup_identity_preflight(body)
+    if decision.get("accepted") is True:
+        return
+    raise GovernanceError(
+        "runtime_context_startup_identity_invalid",
+        (
+            "runtime-context startup identity fields must be copy-safe, "
+            "concrete host identifiers"
+        ),
+        422,
+        dict(decision),
+    )
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/startup")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/startup")
 def handle_graph_governance_runtime_context_startup(ctx: RequestContext):
     """Record real mf_sub startup evidence through the runtime-context facade."""
     project_id = ctx.get_project_id()
     body = dict(ctx.body or {})
+    _require_runtime_context_startup_identity_preflight(body)
     conn = get_connection(project_id)
     try:
         context, runtime_context_id, _session = _runtime_context_mf_sub_write_context(
@@ -54029,6 +54121,7 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
     task_id = str(ctx.body.get("task_id") or "").strip()
     if not task_id:
         raise ValidationError("task_id is required")
+    _require_runtime_context_startup_identity_preflight(ctx.body or {})
 
     conn = get_connection(project_id)
     try:
