@@ -51872,6 +51872,16 @@ def test_runtime_context_initial_join_accepts_canonical_passed_dispatch_line(
     assert case["initial_join_event"]["payload"][
         "canonical_identity_binding_required"
     ] is True
+    anchor = next(
+        event
+        for event in _pre_lineage_case_events(conn, case)
+        if (event.get("payload") or {}).get("action")
+        == (
+            "runtime_context_session_token_initial_join_"
+            "identity_binding_anchor"
+        )
+    )
+    assert anchor["payload"]["caller_role"] == "observer"
 
 
 def test_runtime_context_pre_lineage_legacy_agent_plus_route_drift_is_zero_write(

@@ -34157,6 +34157,7 @@ def _runtime_context_initial_join_identity_binding_anchor(
         "action": (
             "runtime_context_session_token_initial_join_identity_binding_anchor"
         ),
+        "caller_role": "observer",
         "server_derived": True,
         "project_id": str(project_id or "").strip(),
         "runtime_context_id": str(runtime_context_id or "").strip(),
