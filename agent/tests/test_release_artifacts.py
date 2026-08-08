@@ -98,3 +98,36 @@ def test_release_docs_name_replay_and_chain_trailer_boundaries():
     assert "event_kind=independent_verification" in runbook
     assert "runtime_loaded_version" in runbook
     assert "WIP=1" in runbook
+    assert "direct_fix_enter" in readme
+    assert "retired compatibility names" in readme
+    assert "work_type=operator_supervised_direct_main" in readme
+    assert "work_type=operator_supervised_direct_main or direct_fix" not in readme
+    assert "`v0.2.0`" in runbook
+    assert "`v2.0.0`" not in runbook
+
+
+def test_docker_release_identity_is_exact_and_health_checked():
+    dockerfile = (ROOT / "Dockerfile.governance").read_text(encoding="utf-8")
+    compose = (ROOT / "docker-compose.governance.yml").read_text(encoding="utf-8")
+    assert "ARG AMING_CLAW_BUILD_COMMIT" in dockerfile
+    assert "AMING_CLAW_BUILD_COMMIT must be an exact full Git commit" in dockerfile
+    assert 'pip install --no-cache-dir ".[redis]"' in dockerfile
+    assert "runtime_loaded_version" in dockerfile
+    assert "worktree_head_version" in dockerfile
+    assert "${GOVERNANCE_PORT:-40001}:40000" in compose
+    assert "AMING_CLAW_BUILD_COMMIT:" in compose
+
+
+def test_server_prefers_only_an_exact_immutable_build_commit(monkeypatch):
+    from agent.governance import chain_trailer, server
+
+    full_commit = "a" * 40
+    monkeypatch.setenv(server.BUILD_COMMIT_ENV, full_commit)
+    assert server._immutable_build_commit() == full_commit
+    assert server.get_server_version() == full_commit
+
+    monkeypatch.setattr(chain_trailer, "get_runtime_version", lambda: "unknown")
+    assert server.get_governance_runtime_version() == full_commit
+
+    monkeypatch.setenv(server.BUILD_COMMIT_ENV, "abc1234")
+    assert server._immutable_build_commit() == ""

@@ -120,13 +120,15 @@ the canonical dogfood projects.
 The compose service is opt-in so it cannot silently replace host governance:
 
 ```bash
+export AMING_CLAW_BUILD_COMMIT="$(git rev-parse HEAD)"
+export GOVERNANCE_PORT="${GOVERNANCE_PORT:-40001}"
 docker compose -f docker-compose.governance.yml \
   --profile governance-demo config
 docker compose -f docker-compose.governance.yml \
   --profile governance-demo build governance
 docker compose -f docker-compose.governance.yml \
   --profile governance-demo up -d redis governance
-curl --fail http://127.0.0.1:40000/api/health
+curl --fail "http://127.0.0.1:${GOVERNANCE_PORT}/api/health"
 docker compose -f docker-compose.governance.yml \
   --profile governance-demo down -v
 ```
@@ -154,7 +156,7 @@ removes only the profile's disposable container state.
    zero.
 7. Rerun the happy-path smoke after deploy.
 8. Append postdeploy verification and close-ready, close release rows, then tag
-   `v2.0.0` only if the tag target equals the deployed/full-graph commit.
+   `v0.2.0` only if the tag target equals the deployed/full-graph commit.
 9. Refresh the local Codex plugin cache with the plugin-creator cachebuster
    helper, validate the manifest, reinstall from the configured local
    marketplace, and test from a new Codex task.

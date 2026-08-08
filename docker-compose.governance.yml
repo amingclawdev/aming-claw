@@ -7,8 +7,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.governance
+      args:
+        AMING_CLAW_BUILD_COMMIT: ${AMING_CLAW_BUILD_COMMIT:?Set AMING_CLAW_BUILD_COMMIT to the exact full Git HEAD}
     ports:
-      - "${GOVERNANCE_PORT:-40000}:40000"
+      - "${GOVERNANCE_PORT:-40001}:40000"
     volumes:
       - governance-demo-data:/app/shared-volume
     environment:
@@ -19,7 +21,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:40000/api/health',timeout=2)); raise SystemExit(0 if d.get('status') == 'ok' and not d.get('runtime_stale', False) else 1)"]
+      test: ["CMD", "python", "-c", "import json,os,re,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:40000/api/health',timeout=2)); c=os.environ.get('AMING_CLAW_BUILD_COMMIT',''); ok=bool(re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}',c)) and d.get('status')=='ok' and d.get('runtime_loaded_version')==c and d.get('worktree_head_version')==c and not d.get('runtime_stale',False); raise SystemExit(0 if ok else 1)"]
       interval: 5s
       timeout: 3s
       start_period: 10s

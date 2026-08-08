@@ -145,12 +145,22 @@ AI_PROVIDER_REQUIREMENTS = {
     },
 }
 
-# --- Server Version (dynamic with 30s cache) ---
+# --- Server Version (dynamic with 30s cache, or immutable image provenance) ---
 _version_cache = {"value": "unknown", "ts": 0}
+BUILD_COMMIT_ENV = "AMING_CLAW_BUILD_COMMIT"
+
+
+def _immutable_build_commit() -> str:
+    """Return an exact image build commit, never a caller-controlled alias."""
+    value = str(os.environ.get(BUILD_COMMIT_ENV) or "").strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value) else ""
 
 
 def get_server_version():
-    """Return current git HEAD hash, cached for 30 seconds."""
+    """Return immutable image commit or current Git HEAD, cached for 30 seconds."""
+    build_commit = _immutable_build_commit()
+    if build_commit:
+        return build_commit
     if time.time() - _version_cache["ts"] < 30:
         return _version_cache["value"]
     try:
@@ -172,7 +182,9 @@ def get_governance_runtime_version(default: str = "unknown") -> str:
         from .chain_trailer import get_runtime_version
 
         runtime_version = get_runtime_version()
-        return runtime_version or default
+        if runtime_version and runtime_version != "unknown":
+            return runtime_version
+        return _immutable_build_commit() or default
     except Exception:
         return default
 
@@ -223,6 +235,11 @@ LOADED_RUNTIME_IDENTITY: dict[str, Any] = {
     "loaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "loaded_pid": SERVER_PID,
     "loaded_source": _source_file_fingerprint(_loaded_module_source_path()),
+    "commit_source": (
+        "immutable_build_environment"
+        if _immutable_build_commit()
+        else "git_head_at_import"
+    ),
 }
 
 # Re-hash the module source only when stat() says it changed; this file is large
@@ -286,6 +303,7 @@ def governance_loaded_runtime_identity(worktree_version: str = "") -> dict[str, 
         "runtime_stale": bool(reasons),
         "runtime_stale_reasons": reasons,
         "identity_source": "frozen_at_import",
+        "commit_source": LOADED_RUNTIME_IDENTITY["commit_source"],
         "worktree_head_version_source": "live_git_head_at_request_time",
         "meaning": (
             "loaded_* describe the code this process is running; worktree_* "

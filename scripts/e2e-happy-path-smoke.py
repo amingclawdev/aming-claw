@@ -110,13 +110,29 @@ def offline_preflight(repo_root: Path) -> dict[str, Any]:
         "docker_port": "EXPOSE 40000" in dockerfile
         and "GOVERNANCE_PORT=40000" in dockerfile,
         "docker_healthcheck": "HEALTHCHECK" in dockerfile
-        and "/api/health" in dockerfile,
+        and "/api/health" in dockerfile
+        and "runtime_loaded_version" in dockerfile
+        and "AMING_CLAW_BUILD_COMMIT" in dockerfile,
+        "docker_exact_build_identity": all(
+            marker in dockerfile
+            for marker in (
+                "ARG AMING_CLAW_BUILD_COMMIT",
+                "org.opencontainers.image.revision",
+                "AMING_CLAW_BUILD_COMMIT=${AMING_CLAW_BUILD_COMMIT}",
+            )
+        ),
+        "docker_redis_extra_installed": 'pip install --no-cache-dir ".[redis]"'
+        in dockerfile,
         "docker_context_excludes_local_state": all(
             marker in dockerignore
             for marker in (".git", ".env", "shared-volume", ".venv")
         ),
         "compose_governance_profile": 'profiles: ["governance-demo"]' in compose,
         "compose_healthcheck": "/api/health" in compose,
+        "compose_exact_build_identity": "AMING_CLAW_BUILD_COMMIT:" in compose
+        and "runtime_loaded_version" in compose,
+        "compose_non_conflicting_default_port": "${GOVERNANCE_PORT:-40001}:40000"
+        in compose,
         "compose_isolated_volume": "governance-demo-data:/app/shared-volume"
         in compose,
         "world_count": len(REFERENCE_WORLDS) == 2,

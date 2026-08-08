@@ -164,6 +164,8 @@ The normal development model remains host-side governance. To run the optional
 self-contained image without replacing an already-running host service:
 
 ```bash
+export AMING_CLAW_BUILD_COMMIT="$(git rev-parse HEAD)"
+export GOVERNANCE_PORT="${GOVERNANCE_PORT:-40001}"
 docker compose -f docker-compose.governance.yml \
   --profile governance-demo up --build -d governance redis
 docker compose -f docker-compose.governance.yml \
@@ -171,8 +173,10 @@ docker compose -f docker-compose.governance.yml \
 python scripts/e2e-happy-path-smoke.py --preflight
 ```
 
-The container serves governance on `40000` and its healthcheck calls
-`/api/health`. Its governance state uses the isolated
+The container serves governance on host port `40001` by default, leaving the
+normal host service on `40000`; override `GOVERNANCE_PORT` if needed. The build
+requires the exact full Git HEAD and the healthcheck rejects an unknown or
+mismatched loaded commit. Its governance state uses the isolated
 `governance-demo-data` named volume rather than the host `shared-volume` tree.
 Stop it with the same compose file and profile when the demo is complete.
 
@@ -214,7 +218,8 @@ onboard_route_guide(project_id="<project>", role="<role>", work_type="<work type
 The guide confirms:
 
 - role: observer, worker, mf_sub, or QA
-- work type: direct fix, parallel worker, multi-backlog parallel, QA, system
+- work type: operator-supervised direct main, parallel worker,
+  multi-backlog parallel, QA, system
   operation, capability query, or continue contract chain
 - required identity: session id, route token refs, QA token refs, or worker
   fence/session refs
@@ -224,27 +229,22 @@ The guide confirms:
 Archived skills live under `Archive/skills/` for provenance only. They are not
 active instructions.
 
-## Direct Fix
+## Operator-supervised direct main
 
-Use direct fix when the runtime says the current path is blocked, or when the
-operator explicitly approves a tiny parentless repair.
+`direct_fix` and `direct_fix_enter` are retired compatibility names. Never
+enter, resume, or retry them. For a bounded parentless repair, use
+`operator_supervised_direct_main` only when the current onboard guide returns
+that route. For a blocked parent, follow the guide's explicit successor
+contract instead of inventing a direct-fix child.
 
-There are two different cases:
-
-1. **Parentless direct repair**: a small operator-approved fix, usually docs or
-   a tightly scoped runtime unblock. Record `observer_direct_mutation_exception`
-   evidence before editing.
-2. **Blocked-parent successor**: a parent contract is blocked, so
-   `direct_fix_enter` creates a child fix contract. Finish the child, run
-   independent QA, then return to the parent.
-
-Minimal operator-supervised direct-fix flow:
+Minimal operator-supervised flow:
 
 ```text
 1. File or select the backlog row.
-2. Call onboard_route_guide with role=observer and work_type=operator_supervised_direct_main or direct_fix.
+2. Call `onboard_route_guide` with `role=observer` and
+   `work_type=operator_supervised_direct_main`.
 3. Register/renew observer session and route token ref.
-4. Record pre-mutation direct-fix exception evidence.
+4. Record pre-mutation `observer_direct_mutation_exception` evidence.
 5. Create a branch and edit only the approved target files.
 6. Record implementation evidence with changed files and verification commands.
 7. Run independent QA or verification for the same evidence packet.
