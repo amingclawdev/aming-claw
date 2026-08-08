@@ -5463,6 +5463,19 @@ def worker_implementation_test_results_validation(
             "replace count-shaped passed with JSON true or false",
             received_type=type(value.get("passed")).__name__,
         )
+    bounded_legacy_candidate_base = (
+        _worker_implementation_legacy_results_finish_compatible(value)
+    )
+    if not status and bounded_legacy_candidate_base:
+        return {
+            "schema_version": schema_version,
+            "accepted": True,
+            "canonical_test_results": canonical,
+            "field": "",
+            "reason": "accepted",
+            "remediation": "",
+            "result_kind": "bounded_legacy_candidate_base",
+        }
     if not status:
         if value.get("passed") is True:
             return {
@@ -5498,7 +5511,7 @@ def worker_implementation_test_results_validation(
     elif status in _WORKER_IMPLEMENTATION_FINISH_PASS_STATUSES:
         accepted = value.get("passed") is not False
         result_kind = "owned_lane_pass"
-    elif _worker_implementation_legacy_results_finish_compatible(value):
+    elif bounded_legacy_candidate_base:
         accepted = True
         result_kind = "bounded_legacy_candidate_base"
 

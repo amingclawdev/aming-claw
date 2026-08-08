@@ -22363,6 +22363,52 @@ def test_worker_implementation_test_results_validator_preserves_boolean_true_com
     ) is False
 
 
+def test_worker_implementation_test_results_validator_preserves_bounded_legacy_inherited_projection():
+    legacy_results = {
+        "schema_version": "runtime_context.worker_test_results.v1",
+        "candidate_new_failures": 0,
+        "focused_candidate": {
+            "status": "passed",
+            "failed": 0,
+            "passed": 6,
+        },
+        "expanded_candidate": {
+            "status": "passed",
+            "failed": 0,
+            "passed": 23,
+        },
+        "immutable_base": {
+            "status": "expected_red",
+            "failed": 2,
+            "passed": 1,
+            "selector": (
+                "rev8_postmerge_qa_graph_binding or "
+                "pre_rev8_qa_graph_binding"
+            ),
+        },
+        "qa_claim": False,
+        "release_claim": False,
+        "old_world_reuse": False,
+    }
+
+    validation = worker_implementation_test_results_validation(legacy_results)
+
+    assert validation["accepted"] is True
+    assert validation["canonical_test_results"] == legacy_results
+    assert validation["result_kind"] == "bounded_legacy_candidate_base"
+    assert _worker_implementation_test_results_finish_compatible(
+        legacy_results
+    ) is True
+    generic_missing_status = worker_implementation_test_results_validation(
+        {"failed": 0}
+    )
+    assert generic_missing_status["accepted"] is False
+    assert generic_missing_status["reason"] == "top_level_status_required"
+    assert worker_implementation_test_results_validation({"passed": 1})[
+        "reason"
+    ] == "passed_must_be_json_boolean"
+
+
 def test_worker_implementation_test_results_legacy_repair_classifier_is_narrow():
     exact = worker_implementation_legacy_accept_commit_divergence(
         {
