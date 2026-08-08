@@ -15383,6 +15383,7 @@ def _parallel_branch_allocate_verified_batch_target_authority(
     *,
     project_id: str,
     record: Mapping[str, Any],
+    body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve one allocation-eligible batch merge target from frozen lineage."""
 
@@ -15409,8 +15410,21 @@ def _parallel_branch_allocate_verified_batch_target_authority(
         ),
     ).fetchone()
     queue_item_status = str(_row_get(queue_row, "status", "") or "").strip()
+    failed_qa_rework_authority: dict[str, Any] = {}
     if queue_item_status != "planned":
-        return {}
+        if queue_item_status != "merged" or not isinstance(body, Mapping):
+            return {}
+        failed_qa_rework_authority = (
+            _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
+                conn,
+                project_id=project_id,
+                record=record,
+                verified_batch_child=verified,
+                body=body,
+            )
+        )
+        if not failed_qa_rework_authority:
+            return {}
     target_ref = _parallel_branch_allocate_normalized_target_ref(
         _row_get(queue_row, "target_ref", "")
     )
@@ -15432,6 +15446,139 @@ def _parallel_branch_allocate_verified_batch_target_authority(
         "server_derived": True,
         "db_verified": True,
         "allocation_eligible": True,
+        "allocation_eligibility_mode": (
+            "failed_qa_rework_from_merged_batch_child"
+            if failed_qa_rework_authority
+            else "initial_planned_batch_child"
+        ),
+        **failed_qa_rework_authority,
+    }
+
+
+def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    verified_batch_child: Mapping[str, Any],
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Admit one fresh rework worker from an exact merged batch child.
+
+    The original batch queue row stays terminal and immutable.  It supplies
+    only the frozen target-ref/row lineage for a new RuntimeContext.  The
+    active failed-QA ContractRuntime line supplies the recovery authority.
+    """
+
+    if (
+        str(body.get("stage_type") or "").strip() != "failed_qa_rework"
+        or _query_int(body, "attempt", 0) < 2
+    ):
+        return {}
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    completed_lines = list(record.get("completed_lines") or [])
+    failed_qa_index = _active_failed_qa_line_index(
+        completed_lines,
+        source_record=record,
+    )
+    if failed_qa_index < 0:
+        return {}
+    expected_failed_qa_source_ref = (
+        f"contract_runtime:{contract_execution_id}:completed_lines:"
+        f"{failed_qa_index}"
+    )
+    if str(body.get("failed_qa_source_ref") or "").strip() != (
+        expected_failed_qa_source_ref
+    ):
+        return {}
+
+    source_task_id = str(
+        verified_batch_child.get("child_task_id") or ""
+    ).strip()
+    fresh_task_id = str(body.get("task_id") or "").strip()
+    fresh_worker_id = str(
+        body.get("worker_id") or body.get("worker_slot_id") or ""
+    ).strip()
+    fresh_worker_slot_id = str(
+        body.get("worker_slot_id") or body.get("worker_id") or ""
+    ).strip()
+    if not all((source_task_id, fresh_task_id, fresh_worker_id, fresh_worker_slot_id)):
+        return {}
+
+    from .parallel_branch_runtime import get_branch_context
+
+    source_context = get_branch_context(conn, project_id, source_task_id)
+    if source_context is None:
+        return {}
+    source_runtime_context_id, resolved_source_task_id, source_parent_task_id = (
+        _contract_runtime_context_identity(source_context)
+    )
+    source_worker_ids = {
+        str(value or "").strip()
+        for value in (
+            getattr(source_context, "worker_id", ""),
+            getattr(source_context, "worker_slot_id", ""),
+            getattr(source_context, "agent_id", ""),
+            getattr(source_context, "allocation_owner", ""),
+        )
+        if str(value or "").strip()
+    }
+    if (
+        str(getattr(source_context, "status", "") or "").strip() != "merged"
+        or resolved_source_task_id != source_task_id
+        or str(getattr(source_context, "backlog_id", "") or "").strip()
+        != str(verified_batch_child.get("child_backlog_id") or "").strip()
+        or str(getattr(source_context, "merge_queue_id", "") or "").strip()
+        != str(verified_batch_child.get("merge_queue_id") or "").strip()
+        or not source_runtime_context_id
+        or not source_parent_task_id
+        or fresh_task_id == source_task_id
+        or fresh_worker_id in source_worker_ids
+        or fresh_worker_slot_id in source_worker_ids
+    ):
+        return {}
+
+    failed_qa_line = completed_lines[failed_qa_index]
+    if not isinstance(failed_qa_line, Mapping):
+        return {}
+    dispatch_match = _contract_runtime_dispatch_line_match(
+        record,
+        source_context,
+    )
+    if not dispatch_match or not _runtime_context_failed_qa_line_matches_context(
+        failed_qa_line,
+        context=source_context,
+        server_identity=dispatch_match,
+    ):
+        return {}
+
+    return {
+        "failed_qa_rework_authority": {
+            "schema_version": (
+                "parallel_branch_allocate."
+                "merged_batch_failed_qa_rework_authority.v1"
+            ),
+            "source": (
+                "frozen_batch_child+merged_runtime_context+"
+                "active_contract_runtime_failed_qa"
+            ),
+            "server_derived": True,
+            "db_verified": True,
+            "contract_execution_id": contract_execution_id,
+            "failed_qa_source_ref": expected_failed_qa_source_ref,
+            "source_runtime_context_id": source_runtime_context_id,
+            "source_task_id": source_task_id,
+            "fresh_task_id": fresh_task_id,
+            "fresh_worker_id": fresh_worker_id,
+            "fresh_worker_slot_id": fresh_worker_slot_id,
+            "source_queue_item_status": "merged",
+            "source_queue_item_remains_terminal": True,
+            "fresh_runtime_context_required": True,
+            "minimum_attempt": 2,
+            "normal_terminal_queue_allocation_unchanged": True,
+        }
     }
 
 
@@ -16288,6 +16435,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                         conn,
                         project_id=project_id,
                         record=rev8_allocation_record,
+                        body=effective_body,
                     )
                 )
                 if not batch_target_authority:

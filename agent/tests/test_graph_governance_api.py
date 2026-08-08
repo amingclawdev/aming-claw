@@ -17932,6 +17932,312 @@ def test_batch_child_allocation_rejects_terminal_merge_queue_item_before_write(
     ).fetchone()[0] == before_contexts
 
 
+def test_merged_batch_child_failed_qa_allocates_one_fresh_rework_runtime(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-ALLOCATE-MERGED-BATCH-FAILED-QA-REWORK"
+    repository_root = tmp_path / "merged-batch-failed-qa-rework"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    contract_execution_id, route_token_ref, row_files = (
+        _enter_verified_batch_child_for_allocation_precheck(
+            conn,
+            batch_backlog_id="AC-ALLOCATE-MERGED-BATCH-REWORK-PARENT",
+            child_backlog_id=backlog_id,
+            sibling_backlog_id="AC-ALLOCATE-MERGED-BATCH-REWORK-SIBLING",
+            child_files=["agent/governance/server.py"],
+            sibling_files=["agent/tests/test_graph_governance_api.py"],
+            suffix="merged-failed-qa-rework",
+        )
+    )
+    record = server._contract_runtime(conn).store.get(contract_execution_id)
+    planned_authority = (
+        server._parallel_branch_allocate_verified_batch_target_authority(
+            conn,
+            project_id=PID,
+            record=record,
+        )
+    )
+    source_task_id = planned_authority["task_id"]
+    common = {
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "parent_task_id": contract_execution_id,
+        "root_task_id": contract_execution_id,
+        "workspace_root": str(repository_root),
+        "target_project_root": str(repository_root),
+        "base_commit": candidate_commit,
+        "target_head_commit": candidate_commit,
+        "batch_id": planned_authority["batch_id"],
+        "merge_queue_id": planned_authority["merge_queue_id"],
+        "ref_name": planned_authority["ref_name"],
+        "route_token_ref": route_token_ref,
+        "owned_files": row_files,
+        "target_files": row_files,
+        "profile_requirements": {
+            "profile_id": "codex-mf-sub",
+            "harness": "codex",
+        },
+        "retry_policy": {"attempt": 1, "max_attempts": 2},
+        "create_worktree": False,
+    }
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                **common,
+                "task_id": source_task_id,
+                "worker_id": f"{source_task_id}-worker",
+                "worker_slot_id": f"{source_task_id}-worker",
+                "stage_type": "mf_sub",
+                "attempt": 1,
+            },
+        )
+    )
+    assert status == 201, allocated
+    source_context = get_branch_context(conn, PID, source_task_id)
+    assert source_context is not None
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+            },
+        )
+    )
+    assert prefill["ok"] is True
+    source_worker_id = source_context.worker_slot_id or source_context.worker_id
+    route_identity = allocated["branch_runtime_evidence"]["route_identity"]
+    dispatch = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "runtime_context_id": source_context.runtime_context_id,
+                "task_id": source_context.task_id,
+                "parent_task_id": source_context.parent_task_id,
+                "worker_role": "mf_sub",
+                "worker_id": source_worker_id,
+                "worker_slot_id": source_worker_id,
+                "observer_command_id": contract_execution_id,
+                "payload": {
+                    "schema_version": "mf_parallel.dispatch_bounded_worker.v1",
+                    "runtime_context_id": source_context.runtime_context_id,
+                    "task_id": source_context.task_id,
+                    "parent_task_id": source_context.parent_task_id,
+                    "worker_role": "mf_sub",
+                    "worker_id": source_worker_id,
+                    "worker_slot_id": source_worker_id,
+                    "observer_command_id": contract_execution_id,
+                    "target_project_root": source_context.target_project_root,
+                    "worktree_path": source_context.worktree_path,
+                    "branch_ref": source_context.branch_ref,
+                    "base_commit": source_context.base_commit,
+                    "target_head_commit": source_context.target_head_commit,
+                    "merge_queue_id": source_context.merge_queue_id,
+                    "owned_files": list(source_context.owned_files),
+                    "route_identity": route_identity,
+                    "profile_requirements": common["profile_requirements"],
+                    "retry_policy": common["retry_policy"],
+                },
+            },
+        )
+    )
+    assert dispatch["ok"] is True
+    runtime = server._contract_runtime(conn)
+    failed_record = runtime.store.get(contract_execution_id)
+    failed_record = copy.deepcopy(failed_record)
+    failed_record["completed_lines"].append(
+        {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "actor_role": "qa",
+            "evidence_kind": "independent_verification",
+            "status": "failed",
+            "runtime_context_id": source_context.runtime_context_id,
+            "task_id": source_context.task_id,
+            "parent_task_id": source_context.parent_task_id,
+            "worker_role": "mf_sub",
+            "payload": {
+                "status": "failed",
+                "verdict": "FAIL",
+                "runtime_context_id": source_context.runtime_context_id,
+                "task_id": source_context.task_id,
+                "parent_task_id": source_context.parent_task_id,
+            },
+            "verification": {
+                "result": "failed",
+                "verdict": "FAIL",
+                "acceptance_failed": ["merged_batch_rework_required"],
+            },
+        }
+    )
+    failed_record["execution_state_revision"] = (
+        int(failed_record["execution_state_revision"]) + 1
+    )
+    failed_record["runtime_guide"] = {
+        **dict(failed_record.get("runtime_guide") or {}),
+        "completed_lines": copy.deepcopy(failed_record["completed_lines"]),
+    }
+    runtime.store.update(contract_execution_id, failed_record)
+    conn.commit()
+    failed_record = runtime.store.get(contract_execution_id)
+    failed_index = server._active_failed_qa_line_index(
+        failed_record["completed_lines"],
+        source_record=failed_record,
+    )
+    failed_qa_source_ref = (
+        f"contract_runtime:{contract_execution_id}:completed_lines:"
+        f"{failed_index}"
+    )
+    assert failed_index >= 0
+    upsert_branch_context(
+        conn,
+        replace(source_context, status=STATE_MERGED),
+        now_iso="2026-08-08T13:00:01Z",
+    )
+    conn.execute(
+        """
+        UPDATE parallel_branch_merge_queue_items
+           SET status = 'merged'
+         WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (
+            PID,
+            planned_authority["merge_queue_id"],
+            planned_authority["queue_item_id"],
+        ),
+    )
+    conn.commit()
+
+    fresh_task_id = f"{source_task_id}-failed-qa-attempt-2"
+    fresh_worker_id = f"{fresh_task_id}-worker"
+    rework_body = {
+        **common,
+        "task_id": fresh_task_id,
+        "worker_id": fresh_worker_id,
+        "worker_slot_id": fresh_worker_id,
+        "stage_type": "failed_qa_rework",
+        "attempt": 2,
+        "failed_qa_source_ref": failed_qa_source_ref,
+    }
+    saved_source_context = get_branch_context(conn, PID, source_task_id)
+    assert saved_source_context is not None
+    assert saved_source_context.status == STATE_MERGED
+    dispatch_match = server._contract_runtime_dispatch_line_match(
+        failed_record,
+        saved_source_context,
+    )
+    assert dispatch_match, failed_record["completed_lines"]
+    assert server._runtime_context_failed_qa_line_matches_context(
+        failed_record["completed_lines"][failed_index],
+        context=saved_source_context,
+        server_identity=dispatch_match,
+    )
+    rework_authority = (
+        server._parallel_branch_allocate_verified_batch_target_authority(
+            conn,
+            project_id=PID,
+            record=failed_record,
+            body=rework_body,
+        )
+    )
+    assert rework_authority["queue_item_status"] == "merged"
+    assert rework_authority["allocation_eligibility_mode"] == (
+        "failed_qa_rework_from_merged_batch_child"
+    )
+    assert rework_authority["failed_qa_rework_authority"][
+        "failed_qa_source_ref"
+    ] == failed_qa_source_ref
+    for update in (
+        {"failed_qa_source_ref": "contract_runtime:forged"},
+        {"task_id": source_task_id},
+        {
+            "worker_id": source_context.worker_id,
+            "worker_slot_id": source_context.worker_slot_id,
+        },
+        {"attempt": 1},
+        {"stage_type": "mf_sub"},
+    ):
+        rejected_body = {**rework_body, **update}
+        before_rejected_dump = "\n".join(conn.iterdump())
+        before_rejected_changes = conn.total_changes
+        with pytest.raises(GovernanceError) as rejected:
+            server.handle_graph_governance_parallel_branch_allocate(
+                _ctx(
+                    {"project_id": PID},
+                    method="POST",
+                    body=rejected_body,
+                )
+            )
+        assert rejected.value.code == (
+            "parallel_branch_allocate_batch_target_authority_missing"
+        )
+        assert rejected.value.details["writes_performed"] is False
+        assert conn.total_changes == before_rejected_changes
+        assert "\n".join(conn.iterdump()) == before_rejected_dump
+    before_queue_row = dict(
+        conn.execute(
+            """
+            SELECT * FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+            """,
+            (
+                PID,
+                planned_authority["merge_queue_id"],
+                planned_authority["queue_item_id"],
+            ),
+        ).fetchone()
+    )
+    status, rework = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=rework_body,
+        )
+    )
+    assert status == 201, rework
+    fresh_context = get_branch_context(conn, PID, fresh_task_id)
+    assert fresh_context is not None
+    assert fresh_context.runtime_context_id != source_context.runtime_context_id
+    assert fresh_context.stage_type == "failed_qa_rework"
+    assert fresh_context.attempt == 2
+    assert rework["contract_runtime_dispatch_revision"]["status"] == "revised"
+    assert dict(
+        conn.execute(
+            """
+            SELECT * FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+            """,
+            (
+                PID,
+                planned_authority["merge_queue_id"],
+                planned_authority["queue_item_id"],
+            ),
+        ).fetchone()
+    ) == before_queue_row
+
 def test_legacy_revised_batch_child_two_worker_allocation_fails_closed(
     conn,
     tmp_path,
