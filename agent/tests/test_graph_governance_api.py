@@ -126414,6 +126414,47 @@ def test_incomplete_fanin_runtime_resume_without_validated_full_head_blocks(
     ] is True
 
 
+def test_reconciled_transient_resume_keeps_idempotent_current_full_tool_outward(
+    conn,
+):
+    epoch = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+        epoch_status=parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILED,
+    )
+    epoch = upsert_integration_epoch(
+        conn,
+        replace(
+            epoch,
+            reconcile_state="reconciled",
+            remaining_queue_item_ids=(),
+            active_queue_item_id="",
+            active_task_id="",
+            active_backlog_id="",
+        ),
+    )
+
+    direct = parallel_branch_runtime.integration_epoch_resume_payload(conn, epoch)
+    outward = server._server_integration_epoch_resume_payload(conn, epoch)
+    contract_projection = contract_state_runtime.integration_epoch_resume_projection(
+        parallel_branch_runtime.integration_epoch_to_dict(epoch)
+    )["next_legal_action"]
+
+    for resume in (direct, outward):
+        assert resume["id"] == "finalize_reconciled_batch_epoch"
+        assert resume["required_tool"] == "graph_current_full_reconcile"
+        assert resume["action_input"] == {}
+        assert resume["action_input_copy_safe"] is False
+        assert resume["idempotent_replay_required"] is True
+        assert resume["target_ref_frozen"] is True
+        assert resume["blocked"] is False
+    assert contract_projection["required_tool"] == (
+        "graph_current_full_reconcile"
+    )
+    assert contract_projection["idempotent_replay_required"] is True
+
+
 @pytest.mark.parametrize(
     "failure_mode",
     [

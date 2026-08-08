@@ -14872,11 +14872,11 @@ def integration_epoch_resume_payload(
         "executable_action_available": bool(action_input),
         "required_tool": (
             "graph_current_full_reconcile"
-            if action_input and epoch.status
-            in {
-                INTEGRATION_EPOCH_RECONCILE_PENDING,
-                INTEGRATION_EPOCH_RECONCILED,
-            }
+            if epoch.status == INTEGRATION_EPOCH_RECONCILED
+            or (
+                epoch.status == INTEGRATION_EPOCH_RECONCILE_PENDING
+                and bool(action_input)
+            )
             else ""
         ),
         "action_input": action_input,
