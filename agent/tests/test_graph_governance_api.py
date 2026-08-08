@@ -18320,6 +18320,66 @@ def test_merged_batch_child_failed_qa_allocates_one_fresh_rework_runtime(
         ),
     )
     conn.commit()
+    route_drift_state: dict[str, Any] = {}
+
+    def revoke_route_after_preflight(*args, **kwargs):
+        result = original_target_authority(*args, **kwargs)
+        call_count = int(route_drift_state.get("call_count") or 0) + 1
+        route_drift_state["call_count"] = call_count
+        if call_count == 1:
+            conn.execute(
+                """
+                UPDATE observer_route_token_refs
+                   SET status = 'revoked'
+                 WHERE project_id = ? AND route_token_ref = ?
+                """,
+                (PID, route_token_ref),
+            )
+            conn.commit()
+            route_drift_state["dump"] = "\n".join(conn.iterdump())
+            route_drift_state["total_changes"] = conn.total_changes
+        return result
+
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_allocate_verified_batch_target_authority",
+        revoke_route_after_preflight,
+    )
+    route_drift_task_id = f"{fresh_task_id}-route-drift"
+    with pytest.raises(GovernanceError) as route_drift_rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    **rework_body,
+                    "task_id": route_drift_task_id,
+                    "worker_id": f"{route_drift_task_id}-worker",
+                    "worker_slot_id": f"{route_drift_task_id}-worker",
+                },
+            )
+        )
+    assert route_drift_rejected.value.code == (
+        "parallel_branch_allocate_route_action_scope_invalid"
+    )
+    assert route_drift_rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == route_drift_state["total_changes"]
+    assert "\n".join(conn.iterdump()) == route_drift_state["dump"]
+    assert get_branch_context(conn, PID, route_drift_task_id) is None
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_allocate_verified_batch_target_authority",
+        original_target_authority,
+    )
+    conn.execute(
+        """
+        UPDATE observer_route_token_refs
+           SET status = 'active'
+         WHERE project_id = ? AND route_token_ref = ?
+        """,
+        (PID, route_token_ref),
+    )
+    conn.commit()
     before_queue_row = dict(
         conn.execute(
             """

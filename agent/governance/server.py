@@ -16917,6 +16917,36 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 Mapping,
             ):
                 conn.execute("BEGIN IMMEDIATE")
+                current_effective_body = (
+                    _parallel_branch_allocate_effective_route_body(
+                        conn,
+                        project_id=project_id,
+                        body=effective_body,
+                    )
+                )
+                if (
+                    dict(current_effective_body.get("route_identity") or {})
+                    != dict(effective_body.get("route_identity") or {})
+                ):
+                    raise GovernanceError(
+                        (
+                            "parallel_branch_allocate_failed_qa_rework_"
+                            "route_authority_changed"
+                        ),
+                        (
+                            "failed-QA rework route authority changed before "
+                            "the fresh RuntimeContext write"
+                        ),
+                        409,
+                        {
+                            "contract_execution_id": str(
+                                ctx.body.get("contract_execution_id") or ""
+                            ),
+                            "fresh_task_id": task_id,
+                            "writes_performed": False,
+                        },
+                    )
+                effective_body = current_effective_body
                 current_rework_record = (
                     _parallel_branch_allocate_mf_parallel_rev8_record(
                         conn,
