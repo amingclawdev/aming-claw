@@ -39,6 +39,7 @@ def test_codex_manifest_default_prompts_satisfy_doctor_contract():
     assert all(isinstance(prompt, str) and len(prompt) <= 128 for prompt in prompts)
     assert any("aming-claw-onboard" in prompt for prompt in prompts)
     assert any("onboard route guide" in prompt for prompt in prompts)
+    assert any("onboard_route_guide" in prompt for prompt in prompts)
 
 
 def test_happy_path_smoke_declares_two_zero_bypass_reference_worlds():
@@ -125,8 +126,13 @@ def test_release_docs_name_replay_and_chain_trailer_boundaries():
         "The retired direct-fix route names are audit history only and must never be"
     ]
     assert "`v0.2.1`" in runbook
-    assert "move the audit-archived `v0.2.0` tag" in runbook
+    assert "audit-archived `v0.2.0`" in runbook
+    assert "tag is immutable and must never move" in runbook
     assert "`v2.0.0`" not in runbook
+    publish_index = runbook.index("create annotated tag `v0.2.1`")
+    doctor_index = runbook.index("require plugin doctor to pass")
+    close_index = runbook.index("Append postdeploy verification and close-ready")
+    assert publish_index < doctor_index < close_index
 
 
 def test_docker_release_identity_is_exact_and_health_checked():

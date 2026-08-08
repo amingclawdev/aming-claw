@@ -155,12 +155,15 @@ removes only the profile's disposable container state.
 6. Activate the exact current-full graph and require pending scope reconcile
    zero.
 7. Rerun the happy-path smoke after deploy.
-8. Append postdeploy verification and close-ready, close release rows, then tag
-   `v0.2.1` only if the tag target equals the deployed/full-graph commit. Never
-   move the audit-archived `v0.2.0` tag.
-9. Refresh the local Codex plugin cache with the plugin-creator cachebuster
-   helper, validate the manifest, reinstall from the configured local
-   marketplace, and test from a new Codex task.
+8. Push the exact deployed commit and create annotated tag `v0.2.1` only if its
+   target equals the deployed/full-graph commit. The audit-archived `v0.2.0`
+   tag is immutable and must never move.
+9. Refresh the local Codex plugin cache from the exact tag with the
+   plugin-creator cachebuster workflow, validate the manifest, reinstall from
+   the configured local marketplace, require plugin doctor to pass, and test
+   from a new Codex task.
+10. Append postdeploy verification and close-ready, then close release rows
+    normally only after the publish, install, and doctor evidence is durable.
 
 ## Troubleshooting and known baselines
 

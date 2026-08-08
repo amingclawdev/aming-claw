@@ -30,7 +30,7 @@
       "MCP"
     ],
     "defaultPrompt": [
-      "Use the active aming-claw-onboard skill and MCP onboard route guide before governed mutations.",
+      "Use the active aming-claw-onboard skill; call MCP onboard_route_guide (onboard route guide) before governed mutations.",
       "If governance is offline, ask the user to run aming-claw start; do not treat archived skills as active.",
       "Before implementation, run runtime_status, graph_status, graph_operations_queue, and backlog checks."
     ],
