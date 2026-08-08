@@ -16925,27 +16925,17 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                         body=effective_body,
                     )
                 )
-                current_verified_batch_child = (
-                    _parallel_branch_allocate_verified_batch_child_lineage_authority(
+                current_batch_target_authority = (
+                    _parallel_branch_allocate_verified_batch_target_authority(
                         conn,
                         project_id=project_id,
                         record=current_rework_record,
+                        body=effective_body,
                     )
                     if current_rework_record
                     else {}
                 )
-                current_rework_authority = (
-                    _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
-                        conn,
-                        project_id=project_id,
-                        record=current_rework_record,
-                        verified_batch_child=current_verified_batch_child,
-                        body=effective_body,
-                    )
-                    if current_verified_batch_child
-                    else {}
-                )
-                if not current_rework_authority:
+                if current_batch_target_authority != batch_target_authority:
                     raise GovernanceError(
                         (
                             "parallel_branch_allocate_failed_qa_rework_"
@@ -16961,6 +16951,18 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                                 ctx.body.get("contract_execution_id") or ""
                             ),
                             "fresh_task_id": task_id,
+                            "preflight_queue_item_status": str(
+                                batch_target_authority.get(
+                                    "queue_item_status"
+                                )
+                                or ""
+                            ),
+                            "current_queue_item_status": str(
+                                current_batch_target_authority.get(
+                                    "queue_item_status"
+                                )
+                                or "missing"
+                            ),
                             "writes_performed": False,
                             "retry_requires_fresh_identity": True,
                         },

@@ -18248,6 +18248,78 @@ def test_merged_batch_child_failed_qa_allocates_one_fresh_rework_runtime(
         assert rejected.value.details["writes_performed"] is False
         assert conn.total_changes == before_rejected_changes
         assert "\n".join(conn.iterdump()) == before_rejected_dump
+    original_target_authority = (
+        server._parallel_branch_allocate_verified_batch_target_authority
+    )
+    drifted_state: dict[str, Any] = {}
+
+    def drift_queue_after_preflight(*args, **kwargs):
+        result = original_target_authority(*args, **kwargs)
+        call_count = int(drifted_state.get("call_count") or 0) + 1
+        drifted_state["call_count"] = call_count
+        if call_count == 1:
+            conn.execute(
+                """
+                UPDATE parallel_branch_merge_queue_items
+                   SET status = 'failed'
+                 WHERE project_id = ? AND merge_queue_id = ?
+                   AND queue_item_id = ?
+                """,
+                (
+                    PID,
+                    planned_authority["merge_queue_id"],
+                    planned_authority["queue_item_id"],
+                ),
+            )
+            conn.commit()
+            drifted_state["dump"] = "\n".join(conn.iterdump())
+            drifted_state["total_changes"] = conn.total_changes
+        return result
+
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_allocate_verified_batch_target_authority",
+        drift_queue_after_preflight,
+    )
+    toctou_task_id = f"{fresh_task_id}-mq-drift"
+    with pytest.raises(GovernanceError) as toctou_rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    **rework_body,
+                    "task_id": toctou_task_id,
+                    "worker_id": f"{toctou_task_id}-worker",
+                    "worker_slot_id": f"{toctou_task_id}-worker",
+                },
+            )
+        )
+    assert toctou_rejected.value.code == (
+        "parallel_branch_allocate_failed_qa_rework_authority_changed"
+    )
+    assert toctou_rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == drifted_state["total_changes"]
+    assert "\n".join(conn.iterdump()) == drifted_state["dump"]
+    assert get_branch_context(conn, PID, toctou_task_id) is None
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_allocate_verified_batch_target_authority",
+        original_target_authority,
+    )
+    conn.execute(
+        """
+        UPDATE parallel_branch_merge_queue_items
+           SET status = 'merged'
+         WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (
+            PID,
+            planned_authority["merge_queue_id"],
+            planned_authority["queue_item_id"],
+        ),
+    )
+    conn.commit()
     before_queue_row = dict(
         conn.execute(
             """
