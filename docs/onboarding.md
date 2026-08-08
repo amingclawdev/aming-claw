@@ -79,7 +79,8 @@ can answer HTTP. They do not prove the AI host loaded `.mcp.json`, exposed the
 Aming Claw MCP server, or has route/current-context visibility.
 
 Every source-controlled mutation must be contract-bound before it happens. This
-applies to parallel MF, direct fix, legacy/operator recovery, Docker dogfood,
+applies to parallel MF, operator-supervised direct main, legacy/operator
+recovery, Docker dogfood,
 fixture, docs, dashboard, runtime, config, and test changes alike: update or
 create the backlog row, bind the route/contract identity, record timeline
 evidence for the intended action, then mutate only the allowed files. A legacy
@@ -90,7 +91,7 @@ Observer-owned protected writes have a fixed identity order. First call
 `observer_session_register`. Keep that session alive with
 `observer_session_heartbeat` every 300 seconds. Then call
 `observer_route_context_issue` or `observer_route_context_renew` before
-`direct_fix_enter`, `mf_parallel_enter`, backlog close, graph reconcile, or any
+`mf_parallel_enter`, backlog close, graph reconcile, or any
 other protected write. The `observer_session_id` and its session token prove
 observer liveness; `observer_route_token_ref` / `route_token_ref` proves scoped
 route authority. They are not interchangeable. If `observer_session_id` is
@@ -326,16 +327,18 @@ Default onboard guidance does not expose `observer_hotfix` / `hotfix_enter` as
 ordinary observer paths. Those interfaces are legacy/operator recovery only and
 should appear through the live guide's explicit `legacy_operator_recovery`
 surface or a concrete operator recovery instruction. Ordinary repairs use the
-current ContractRuntime `next_legal_action`, `direct_fix_enter`,
-`mf_parallel_enter`, or `mf_batch_parallel_enter`.
+current ContractRuntime `next_legal_action`, the exact successor contract
+returned by the live guide, `mf_parallel_enter`, or `mf_batch_parallel_enter`.
+The retired direct-fix route names are audit history only and must never be
+entered, resumed, or retried.
 
-Classify direct-fix topology before action:
+Classify repair topology before action:
 
 1. Parentless single-branch direct merge: only for explicit operator-approved,
    tiny direct-main repairs with pre-mutation exception evidence.
-2. Blocked-parent successor: use `direct_fix_enter`, repair in the child
-   contract, run independent QA, and record return-to-parent evidence before
-   parent close authority resumes.
+2. Blocked-parent successor: use only the exact successor contract returned by
+   the live guide, repair in that child, run independent QA, and record
+   return-to-parent evidence before parent close authority resumes.
 3. Multi/parallel merge queue: use `mf_parallel_enter` or
    `mf_batch_parallel_enter`; row-scoped workers finish into the merge queue
    rather than direct parent mutation.

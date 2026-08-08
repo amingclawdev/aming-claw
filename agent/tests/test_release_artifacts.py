@@ -87,6 +87,7 @@ def test_smoke_preflight_is_offline_and_machine_readable():
 
 def test_release_docs_name_replay_and_chain_trailer_boundaries():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    onboarding = (ROOT / "docs" / "onboarding.md").read_text(encoding="utf-8")
     runbook = (ROOT / "docs" / "dev" / "happy-path-runbook.md").read_text(
         encoding="utf-8"
     )
@@ -102,6 +103,10 @@ def test_release_docs_name_replay_and_chain_trailer_boundaries():
     assert "retired compatibility names" in readme
     assert "work_type=operator_supervised_direct_main" in readme
     assert "work_type=operator_supervised_direct_main or direct_fix" not in readme
+    assert "direct_fix_enter" not in onboarding
+    assert "work_type=direct_fix" not in onboarding
+    assert "exact successor contract" in onboarding
+    assert "returned by the live guide" in onboarding
     assert "`v0.2.0`" in runbook
     assert "`v2.0.0`" not in runbook
 
