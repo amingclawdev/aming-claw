@@ -18244,6 +18244,19 @@ _STARTUP_COPY_SAFE_IDENTITY_FIELDS = (
     "session_id",
     "worker_transcript_ref",
     "transcript_ref",
+    "worker_transcript_path",
+    "transcript_path",
+)
+_STARTUP_REQUIRED_CONCRETE_IDENTITY_FIELDS = (
+    "host_startup_id",
+    "host_session_id",
+    "worker_session_id",
+)
+_STARTUP_TRANSCRIPT_IDENTITY_FIELDS = (
+    "worker_transcript_ref",
+    "transcript_ref",
+    "worker_transcript_path",
+    "transcript_path",
 )
 
 
@@ -18253,8 +18266,24 @@ def runtime_context_startup_identity_preflight(
     """Reject template or transcript-shaped identity values before writes."""
 
     invalid_fields: list[dict[str, str]] = []
+    for field in _STARTUP_REQUIRED_CONCRETE_IDENTITY_FIELDS:
+        if field not in payload:
+            invalid_fields.append(
+                {"field": field, "reason": "required_identity_missing"}
+            )
+    if not any(field in payload for field in _STARTUP_TRANSCRIPT_IDENTITY_FIELDS):
+        invalid_fields.append(
+            {
+                "field": "worker_transcript_ref_or_path",
+                "reason": "required_identity_missing",
+            }
+        )
     for field in _STARTUP_COPY_SAFE_IDENTITY_FIELDS:
         if field not in payload or payload.get(field) is None:
+            if field in payload:
+                invalid_fields.append(
+                    {"field": field, "reason": "identity_required_nonempty"}
+                )
             continue
         raw = payload.get(field)
         if not isinstance(raw, str):
@@ -18264,6 +18293,9 @@ def runtime_context_startup_identity_preflight(
             continue
         value = raw.strip()
         if not value:
+            invalid_fields.append(
+                {"field": field, "reason": "identity_required_nonempty"}
+            )
             continue
         reason = ""
         if len(value) > 512:
@@ -18279,6 +18311,25 @@ def runtime_context_startup_identity_preflight(
             reason = "raw_transcript_shape_forbidden"
         if reason:
             invalid_fields.append({"field": field, "reason": reason})
+    for aliases, field_label in (
+        (
+            ("worker_transcript_ref", "transcript_ref"),
+            "worker_transcript_ref/transcript_ref",
+        ),
+        (
+            ("worker_transcript_path", "transcript_path"),
+            "worker_transcript_path/transcript_path",
+        ),
+    ):
+        values = {
+            str(payload.get(field) or "").strip()
+            for field in aliases
+            if field in payload and str(payload.get(field) or "").strip()
+        }
+        if len(values) > 1:
+            invalid_fields.append(
+                {"field": field_label, "reason": "identity_alias_conflict"}
+            )
     return {
         "schema_version": "runtime_context.startup_identity_preflight.v1",
         "accepted": not invalid_fields,

@@ -115,6 +115,7 @@ from agent.governance.parallel_branch_runtime import (
     runtime_context_fence_token_verifier,
     runtime_context_secret_hash,
     runtime_context_session_token_ref,
+    runtime_context_startup_identity_preflight,
     upsert_batch_merge_runtime,
     upsert_branch_context,
     upsert_merge_queue_item,
@@ -20789,6 +20790,10 @@ def test_parallel_branch_allocate_issues_same_owner_scoped_session_token(conn, t
                 "worker_id": "same-owner-worker",
                 "worker_slot_id": "same-owner-worker",
                 "agent_id": "same-owner-agent",
+                "host_startup_id": "codex-thread:same-owner-token-task",
+                "host_session_id": "codex-session:same-owner-token-task",
+                "worker_session_id": "codex-session:same-owner-token-task",
+                "worker_transcript_ref": "codex:same-owner-token-task",
                 "session_token": raw_token,
                 "runtime_context_id": context["runtime_context_id"],
                 "fence_token": "fence-same-owner-token",
@@ -27658,6 +27663,8 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
             "observer_command_id": "cmd-facade",
             "read_receipt_hash": "sha256:read-facade",
             "worker_session_id": "worker-session-facade",
+            "host_startup_id": "codex-thread:runtime-facade",
+            "host_session_id": "worker-session-facade",
             "harness_type": "codex",
             "graph_trace_ids": [graph_trace_id],
         }
@@ -35565,6 +35572,8 @@ def test_parallel_branch_startup_records_timeline_and_running_context(conn, tmp_
                 "worker_id": "startup-worker",
                 "agent_id": "startup-agent",
                 "actual_host_worker_id": "/root/alloc_root_qa",
+                "host_startup_id": "codex-thread:startup-mf-sub-task",
+                "host_session_id": "/root/alloc_root_qa",
                 "worker_session_id": "/root/alloc_root_qa",
                 "worker_transcript_ref": (
                     "multi_agent:/root/alloc_root_qa"
@@ -35685,6 +35694,10 @@ def test_parallel_branch_startup_blocks_missing_command_read_receipt_lineage(
                 "worker_role": "mf_sub",
                 "worker_id": "startup-lineage-worker",
                 "agent_id": "startup-lineage-agent",
+                "host_startup_id": "codex-thread:startup-missing-lineage-task",
+                "host_session_id": "codex-session:startup-missing-lineage-task",
+                "worker_session_id": "codex-session:startup-missing-lineage-task",
+                "worker_transcript_ref": "codex:startup-missing-lineage-task",
                 "runtime_context_id": runtime_context_id_for_branch_context(
                     runtime_context
                 ),
@@ -35824,6 +35837,14 @@ def test_parallel_branch_startup_accepts_host_worker_surrogate_for_observer_allo
                 "host_startup_id": (
                     "multi_agent_v1.spawn_agent:"
                     "019e95fd-cec4-7c12-8abe-8acc849cd9c4"
+                ),
+                "host_session_id": (
+                    "multi_agent_v1.spawn_agent:"
+                    "019e95fd-cec4-7c12-8abe-8acc849cd9c4"
+                ),
+                "worker_session_id": "019e95fd-cec4-7c12-8abe-8acc849cd9c4",
+                "worker_transcript_ref": (
+                    "multi_agent:019e95fd-cec4-7c12-8abe-8acc849cd9c4"
                 ),
                 "session_token_surrogate": (
                     "codex_desktop_multi_agent_v1:"
@@ -36049,6 +36070,7 @@ def test_parallel_branch_startup_host_adapter_server_verified_ref_is_close_satis
                 ),
                 "session_token_surrogate": session_surrogate,
                 "host_startup_id": host_startup_id,
+                "host_session_id": host_startup_id,
                 "startup_source": "codex_desktop_multi_agent_v1.spawn_agent",
                 "fence_token": "fence-host-server-ref-mf-sub",
                 "actual_cwd": str(worktree),
@@ -36162,6 +36184,16 @@ def test_parallel_branch_startup_accepts_codex_cli_host_startup_id_for_observer_
                 "host_startup_id": (
                     "codex-cli-thread:"
                     "019e995e-d14d-79f2-8fcb-5af3ec083251"
+                ),
+                "host_session_id": (
+                    "codex-cli-thread:"
+                    "019e995e-d14d-79f2-8fcb-5af3ec083251"
+                ),
+                "worker_session_id": (
+                    "codex-cli-mfsub-doc-bootstrap-progress-20260605-a2"
+                ),
+                "worker_transcript_ref": (
+                    "codex:codex-cli-mfsub-doc-bootstrap-progress-20260605-a2"
                 ),
                 "startup_source": "codex_cli_exec",
                 "fence_token": "fence-codex-cli-startup-mf-sub",
@@ -36293,6 +36325,8 @@ def test_parallel_branch_startup_accepts_service_dispatch_bound_multi_agent_id(
                 "worker_slot_id": "service-dispatch-worker-slot",
                 "agent_id": "019ee-service-dispatch-worker",
                 "actual_host_worker_id": "019ee-service-dispatch-worker",
+                "host_startup_id": "service-dispatch:019ee-service-dispatch-worker",
+                "host_session_id": "019ee-service-dispatch-worker",
                 "worker_session_id": "019ee-service-dispatch-worker",
                 "filer_principal": "019ee-service-dispatch-worker",
                 "worker_transcript_ref": (
@@ -36425,6 +36459,10 @@ def test_parallel_branch_startup_rejects_service_dispatch_missing_route_identity
                 "actual_host_worker_id": (
                     "019ee-service-dispatch-missing-route-worker"
                 ),
+                "host_startup_id": (
+                    "service-dispatch:019ee-service-dispatch-missing-route-worker"
+                ),
+                "host_session_id": "019ee-service-dispatch-missing-route-worker",
                 "worker_session_id": "019ee-service-dispatch-missing-route-worker",
                 "worker_transcript_ref": (
                     "multi_agent:019ee-service-dispatch-missing-route-worker"
@@ -36542,6 +36580,10 @@ def test_runtime_context_startup_facade_projects_agent_id_zero_write_correction(
                 "actual_host_worker_id": (
                     "/root/daily_planner_desktop_worker"
                 ),
+                "host_startup_id": (
+                    "codex-thread:startup-agent-id-zero-write-task"
+                ),
+                "host_session_id": "/root/daily_planner_desktop_worker",
                 "worker_session_id": "/root/daily_planner_desktop_worker",
                 "worker_transcript_ref": (
                     "codex:/root/daily_planner_desktop_worker"
@@ -36639,6 +36681,10 @@ def test_parallel_branch_startup_rejects_host_worker_mismatch_without_surrogate(
                 "worker_role": "mf_sub",
                 "worker_id": "host-startup-worker-slot",
                 "agent_id": "019e95fd-cec4-7c12-8abe-8acc849cd9c4",
+                "host_startup_id": "codex-thread:host-startup-mismatch-task",
+                "host_session_id": "codex-session:host-startup-mismatch-task",
+                "worker_session_id": "codex-session:host-startup-mismatch-task",
+                "worker_transcript_ref": "codex:host-startup-mismatch-task",
                 "runtime_context_id": runtime_context_id_for_branch_context(
                     runtime_context
                 ),
@@ -36679,6 +36725,10 @@ def test_parallel_branch_startup_rejects_host_worker_mismatch_without_surrogate(
                 "worker_role": "mf_sub",
                 "worker_id": "host-startup-worker-slot",
                 "agent_id": "019e95fd-cec4-7c12-8abe-8acc849cd9c4",
+                "host_startup_id": "codex-thread:host-startup-mismatch-task",
+                "host_session_id": "codex-session:host-startup-mismatch-task",
+                "worker_session_id": "codex-session:host-startup-mismatch-task",
+                "worker_transcript_ref": "codex:host-startup-mismatch-task",
                 "runtime_context_id": runtime_context_id_for_branch_context(
                     runtime_context
                 ),
@@ -36720,6 +36770,9 @@ def test_parallel_branch_startup_rejects_host_worker_mismatch_without_surrogate(
                     "worker_role": "mf_sub",
                     "worker_id": "host-startup-worker-slot",
                     "agent_id": "019e95fd-cec4-7c12-8abe-8acc849cd9c4",
+                    "host_session_id": "codex-session:host-startup-mismatch-task",
+                    "worker_session_id": "codex-session:host-startup-mismatch-task",
+                    "worker_transcript_ref": "codex:host-startup-mismatch-task",
                     "runtime_context_id": runtime_context_id_for_branch_context(
                         runtime_context
                     ),
@@ -36767,6 +36820,9 @@ def test_parallel_branch_startup_rejects_host_worker_mismatch_without_surrogate(
                 "worker_role": "mf_sub",
                 "worker_id": "host-startup-worker-slot",
                 "agent_id": "019e95fd-cec4-7c12-8abe-8acc849cd9c4",
+                "host_session_id": "codex-session:host-startup-mismatch-task",
+                "worker_session_id": "codex-session:host-startup-mismatch-task",
+                "worker_transcript_ref": "codex:host-startup-mismatch-task",
                 "runtime_context_id": runtime_context_id_for_branch_context(
                     runtime_context
                 ),
@@ -36837,6 +36893,9 @@ def test_parallel_branch_startup_rejects_event_4178_multi_agent_prefix_replay(
                 runtime_context
             ),
             "host_startup_id": host_startup_id,
+            "host_session_id": host_startup_id,
+            "worker_session_id": "codex-session:event-4178-startup-task",
+            "worker_transcript_ref": "codex:event-4178-startup-task",
             "fence_token": "fence-event-4178-startup",
             "actual_cwd": str(worktree),
             "actual_git_root": str(worktree),
@@ -36950,6 +37009,10 @@ def test_parallel_branch_startup_returns_blocker_without_actual_startup(conn, tm
             method="POST",
             body={
                 "task_id": "startup-blocked-task",
+                "host_startup_id": "codex-thread:startup-blocked-task",
+                "host_session_id": "codex-session:startup-blocked-task",
+                "worker_session_id": "codex-session:startup-blocked-task",
+                "worker_transcript_ref": "codex:startup-blocked-task",
                 "branch_runtime_evidence": {"registered": True},
                 "startup_intent_event": {"event_kind": "mf_subagent_startup_intent"},
             },
@@ -50136,6 +50199,8 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         "target_project_root": str(target_root),
         "agent_id": allocated.worker_id,
         "actual_host_worker_id": allocated.worker_id,
+        "host_startup_id": "codex-thread:safe-ref-prestartup-worker",
+        "host_session_id": desktop_session_id,
         "worker_session_id": desktop_session_id,
         "worker_transcript_ref": "codex:safe-ref-prestartup-worker",
         "harness_type": "codex",
@@ -50271,6 +50336,12 @@ def test_runtime_context_startup_rejects_template_and_raw_transcript_ids_before_
     invalid_value,
     expected_reason,
 ):
+    valid_identity = {
+        "host_startup_id": "codex-thread:startup-placeholder-preflight",
+        "host_session_id": "codex-session:startup-placeholder-preflight",
+        "worker_session_id": "codex-session:startup-placeholder-preflight",
+        "worker_transcript_ref": "codex:startup-placeholder-preflight",
+    }
     monkeypatch.setattr(
         server,
         "get_connection",
@@ -50288,14 +50359,14 @@ def test_runtime_context_startup_rejects_template_and_raw_transcript_ids_before_
                 },
                 "mf_sub",
                 method="POST",
-                body={field: invalid_value},
+                body={**valid_identity, field: invalid_value},
             )
         )
 
     assert rejected.value.code == "runtime_context_startup_identity_invalid"
-    assert rejected.value.details["invalid_fields"] == [
-        {"field": field, "reason": expected_reason}
-    ]
+    assert {"field": field, "reason": expected_reason} in (
+        rejected.value.details["invalid_fields"]
+    )
     assert rejected.value.details["submitted_values_echoed"] is False
     assert invalid_value not in json.dumps(rejected.value.details, sort_keys=True)
     with pytest.raises(GovernanceError) as legacy_rejected:
@@ -50304,7 +50375,11 @@ def test_runtime_context_startup_rejects_template_and_raw_transcript_ids_before_
                 {"project_id": PID},
                 "mf_sub",
                 method="POST",
-                body={"task_id": "startup-placeholder", field: invalid_value},
+                body={
+                    "task_id": "startup-placeholder",
+                    **valid_identity,
+                    field: invalid_value,
+                },
             )
         )
     assert legacy_rejected.value.code == (
@@ -50314,6 +50389,163 @@ def test_runtime_context_startup_rejects_template_and_raw_transcript_ids_before_
         legacy_rejected.value.details,
         sort_keys=True,
     )
+
+
+def _startup_identity_preflight_valid_body() -> dict[str, str]:
+    return {
+        "host_startup_id": "codex-thread:startup-identity-preflight",
+        "host_session_id": "codex-session:startup-identity-preflight",
+        "worker_session_id": "codex-session:startup-identity-preflight",
+        "worker_transcript_ref": "codex:startup-identity-preflight",
+    }
+
+
+def test_runtime_context_startup_identity_preflight_accepts_concrete_ref_or_path():
+    body = _startup_identity_preflight_valid_body()
+    decision = runtime_context_startup_identity_preflight(body)
+    assert decision["accepted"] is True
+    assert decision["invalid_fields"] == []
+
+    path_body = {
+        **body,
+        "worker_transcript_path": "/tmp/codex-startup-transcript.jsonl",
+    }
+    path_body.pop("worker_transcript_ref")
+    path_decision = runtime_context_startup_identity_preflight(path_body)
+    assert path_decision["accepted"] is True
+    assert path_decision["invalid_fields"] == []
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_field", "expected_reason"),
+    [
+        ("empty_host_startup", "host_startup_id", "identity_required_nonempty"),
+        ("empty_host_session", "host_session_id", "identity_required_nonempty"),
+        ("empty_worker_session", "worker_session_id", "identity_required_nonempty"),
+        (
+            "empty_transcript_ref",
+            "worker_transcript_ref",
+            "identity_required_nonempty",
+        ),
+        ("missing_host_startup", "host_startup_id", "required_identity_missing"),
+        ("missing_host_session", "host_session_id", "required_identity_missing"),
+        ("missing_worker_session", "worker_session_id", "required_identity_missing"),
+        (
+            "missing_transcript_identity",
+            "worker_transcript_ref_or_path",
+            "required_identity_missing",
+        ),
+        (
+            "conflicting_transcript_alias",
+            "worker_transcript_ref/transcript_ref",
+            "identity_alias_conflict",
+        ),
+    ],
+)
+def test_runtime_context_startup_identity_preflight_rejects_empty_missing_or_conflict(
+    case,
+    expected_field,
+    expected_reason,
+):
+    body = _startup_identity_preflight_valid_body()
+    if case.startswith("empty_"):
+        field = {
+            "empty_host_startup": "host_startup_id",
+            "empty_host_session": "host_session_id",
+            "empty_worker_session": "worker_session_id",
+            "empty_transcript_ref": "worker_transcript_ref",
+        }[case]
+        body[field] = ""
+    elif case.startswith("missing_"):
+        field = {
+            "missing_host_startup": "host_startup_id",
+            "missing_host_session": "host_session_id",
+            "missing_worker_session": "worker_session_id",
+            "missing_transcript_identity": "worker_transcript_ref",
+        }[case]
+        body.pop(field)
+    else:
+        body["transcript_ref"] = "codex:different-transcript"
+
+    decision = runtime_context_startup_identity_preflight(body)
+    assert decision["accepted"] is False
+    assert {"field": expected_field, "reason": expected_reason} in decision[
+        "invalid_fields"
+    ]
+    assert decision["submitted_values_echoed"] is False
+    serialized = json.dumps(decision, sort_keys=True)
+    assert "codex:different-transcript" not in serialized
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "empty_host_startup",
+        "empty_host_session",
+        "empty_worker_session",
+        "empty_transcript_ref",
+        "missing_host_startup",
+        "missing_host_session",
+        "missing_worker_session",
+        "missing_transcript_identity",
+        "conflicting_transcript_alias",
+    ],
+)
+def test_startup_facades_reject_empty_missing_or_conflicting_identity_zero_write(
+    conn,
+    monkeypatch,
+    case,
+):
+    body = _startup_identity_preflight_valid_body()
+    if case.startswith("empty_"):
+        field = {
+            "empty_host_startup": "host_startup_id",
+            "empty_host_session": "host_session_id",
+            "empty_worker_session": "worker_session_id",
+            "empty_transcript_ref": "worker_transcript_ref",
+        }[case]
+        body[field] = ""
+    elif case.startswith("missing_"):
+        field = {
+            "missing_host_startup": "host_startup_id",
+            "missing_host_session": "host_session_id",
+            "missing_worker_session": "worker_session_id",
+            "missing_transcript_identity": "worker_transcript_ref",
+        }[case]
+        body.pop(field)
+    else:
+        body["transcript_ref"] = "RAW-TRANSCRIPT-CONFLICT-SENTINEL"
+
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(conn),
+    )
+    before_changes = conn.total_changes
+    before_events = task_timeline.list_events(conn, PID)
+    requests = (
+        server.handle_graph_governance_runtime_context_startup,
+        server.handle_graph_governance_parallel_branch_startup,
+    )
+    for handler in requests:
+        path_params = {"project_id": PID}
+        request_body = {**body, "task_id": "startup-identity-preflight"}
+        if handler is server.handle_graph_governance_runtime_context_startup:
+            path_params["runtime_context_id"] = "mfrctx-startup-identity-preflight"
+        with pytest.raises(GovernanceError) as rejected:
+            handler(
+                _ctx_with_role(
+                    path_params,
+                    "mf_sub",
+                    method="POST",
+                    body=request_body,
+                )
+            )
+        assert rejected.value.code == "runtime_context_startup_identity_invalid"
+        serialized_error = json.dumps(rejected.value.details, sort_keys=True)
+        assert "RAW-TRANSCRIPT-CONFLICT-SENTINEL" not in serialized_error
+        assert conn.total_changes == before_changes
+        assert task_timeline.list_events(conn, PID) == before_events
 
 
 def test_runtime_context_safe_ref_reissue_wrong_scope_and_replay_are_zero_write(
@@ -53429,6 +53661,9 @@ def test_runtime_context_pre_lineage_rejoin_resolves_renewal_descendant_and_rebi
                 "agent_id": case["worker_id"],
                 "host_startup_id": case["host_startup_id"],
                 "host_session_id": case["worker_session_id"],
+                "worker_transcript_ref": (
+                    f"codex:{case['worker_session_id']}"
+                ),
                 "read_receipt_event_id": read_receipt["timeline_event"]["id"],
                 "read_receipt_hash": "sha256:renewal-descendant-read",
                 "harness_type": "codex",
@@ -62618,6 +62853,8 @@ def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(
                     **strict_body,
                     "actual_cwd": str(worktree),
                     "actual_git_root": str(worktree),
+                    "host_startup_id": "codex-thread:worktree-alias",
+                    "host_session_id": "worker-session-worktree-alias",
                     "worker_session_id": "worker-session-worktree-alias",
                     "harness_type": "codex",
                     "filer_principal": "worker-session-worktree-alias",
@@ -88073,6 +88310,8 @@ def test_rejected_worker_startup_does_not_advance_contract_runtime_projection(
                 "worker_slot_id": worker_identity,
                 "agent_id": "host-mf-sub-rejected-startup",
                 "actual_host_worker_id": "host-mf-sub-rejected-startup",
+                "host_startup_id": "codex-thread:mf-sub-rejected-startup",
+                "host_session_id": "host-mf-sub-rejected-startup",
                 "worker_session_id": "host-mf-sub-rejected-startup",
                 "worker_transcript_ref": "codex:host-mf-sub-rejected-startup",
                 "harness_type": "codex",
@@ -104836,6 +105075,8 @@ def test_fresh_failed_qa_context_read_receipt_persists_and_startup_discovers_it(
                 "fence_token": fresh_fence,
                 "agent_id": fresh_context.actual_host_worker_id,
                 "actual_host_worker_id": fresh_context.actual_host_worker_id,
+                "host_startup_id": "codex-thread:context-local-rework-fresh",
+                "host_session_id": "session-context-local-rework-fresh",
                 "worker_session_id": "session-context-local-rework-fresh",
                 "worker_transcript_ref": (
                     "codex:session-context-local-rework-fresh"
@@ -105535,6 +105776,8 @@ def test_failed_qa_fresh_allocate_appends_dispatch_then_initial_join_receipt_sta
                 "fence_token": fresh_fence,
                 "agent_id": fresh_context.worker_id,
                 "actual_host_worker_id": fresh_context.worker_id,
+                "host_startup_id": "codex-thread:failed-qa-fresh-dispatch",
+                "host_session_id": "session-failed-qa-fresh-dispatch",
                 "worker_session_id": "session-failed-qa-fresh-dispatch",
                 "worker_transcript_ref": (
                     "codex:session-failed-qa-fresh-dispatch"
@@ -108197,6 +108440,8 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
                 "fence_token": "fence-contract-canonical-worker",
                 "agent_id": actual_worker_id,
                 "actual_host_worker_id": actual_worker_id,
+                "host_startup_id": "codex-thread:contract-canonical-worker",
+                "host_session_id": native_worker_session_id,
                 "worker_session_id": native_worker_session_id,
                 "worker_transcript_ref": f"codex:{native_worker_session_id}",
                 "harness_type": "codex",
@@ -129375,6 +129620,8 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
                 "fence_token": inactive_fence,
                 "agent_id": worker_identity,
                 "actual_host_worker_id": worker_identity,
+                "host_startup_id": f"codex-thread:{inactive_context.task_id}",
+                "host_session_id": worker_session_id,
                 "worker_session_id": worker_session_id,
                 "worker_transcript_ref": f"codex:{worker_session_id}",
                 "harness_type": "codex",
