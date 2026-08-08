@@ -50924,6 +50924,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
     initial_join_context_factory=None,
     initial_join_omit_identity_field: str = "",
     pre_initial_join_dispatch_drift_field: str = "",
+    dispatch_status: str = "",
 ):
     """Create one accepted initial join with no read/startup lineage."""
 
@@ -51014,6 +51015,8 @@ def _setup_pre_lineage_rejoin_recovery_case(
             for line in lines
             if line.get("line_id") == "observer_dispatch_bounded_workers"
         )
+        if dispatch_status:
+            dispatch["status"] = dispatch_status
         dispatch_payload = dict(dispatch.get("payload") or {})
         dispatch["route_identity"] = dict(route_identity)
         dispatch_payload["route_identity"] = dict(route_identity)
@@ -51045,6 +51048,8 @@ def _setup_pre_lineage_rejoin_recovery_case(
             if line.get("line_id") == "observer_dispatch_bounded_workers"
             and line.get("runtime_context_id") == context.runtime_context_id
         )
+        if dispatch_status:
+            guide_dispatch["status"] = dispatch_status
         guide_payload = dict(guide_dispatch.get("payload") or {})
         guide_dispatch["route_identity"] = dict(route_identity)
         guide_payload["route_identity"] = dict(route_identity)
@@ -51834,6 +51839,39 @@ def test_runtime_context_pre_lineage_legacy_stale_allocation_agent_only_normaliz
     assert persisted["payload"]["agent_id"] == (
         "legacy-stale-allocation-agent"
     )
+
+
+def test_runtime_context_initial_join_accepts_canonical_passed_dispatch_line(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="canonical-passed-dispatch",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+    )
+
+    initial_join = next(
+        event
+        for event in _pre_lineage_case_events(conn, case)
+        if (event.get("payload") or {}).get("action")
+        == "runtime_context_session_token_initial_join"
+    )
+    assert initial_join["status"] == "accepted"
+    record = server._contract_runtime(conn).store.get(case["parent_task_id"])
+    dispatch = next(
+        line
+        for line in record["completed_lines"]
+        if line.get("line_id") == "observer_dispatch_bounded_workers"
+    )
+    assert dispatch["status"] == "passed"
+    assert case["initial_join_event"]["payload"][
+        "canonical_identity_binding_required"
+    ] is True
 
 
 def test_runtime_context_pre_lineage_legacy_agent_plus_route_drift_is_zero_write(

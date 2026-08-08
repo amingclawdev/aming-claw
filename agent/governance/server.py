@@ -39248,7 +39248,7 @@ def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
         != "dispatch_bounded_worker"
         or str(dispatch_line.get("actor_role") or "").strip() != "observer"
         or str(dispatch_line.get("status") or "").strip().lower()
-        not in {"", "accepted"}
+        not in {"", "accepted", "passed"}
         or not dispatch_schema_version
     ):
         return {}
