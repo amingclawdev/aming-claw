@@ -13,6 +13,7 @@ from agent.plugin_installer import (
     AI_CLI_REQUIREMENTS,
     CODEX_PLUGIN_ID,
     CODEX_WORKER_MCP_ENV_VARS,
+    DEFAULT_PLUGIN_VERSION,
     PluginInstallError,
     _check_ai_cli,
     _check_claude_manifest,
@@ -59,7 +60,7 @@ def _write_plugin_fixture(root: Path) -> None:
         },
         ".claude-plugin/plugin.json": {
             "name": "aming-claw",
-            "version": "0.1.1",
+            "version": DEFAULT_PLUGIN_VERSION,
             "description": "Test plugin.",
             "mcpServers": {
                 "aming-claw": {
@@ -73,7 +74,11 @@ def _write_plugin_fixture(root: Path) -> None:
             "metadata": {"description": "Test marketplace."},
             "owner": {"name": "Aming Claw"},
             "plugins": [
-                {"name": "aming-claw", "source": "./", "version": "0.1.1"}
+                {
+                    "name": "aming-claw",
+                    "source": "./",
+                    "version": DEFAULT_PLUGIN_VERSION,
+                }
             ],
         },
         ".mcp.json": {
@@ -289,7 +294,7 @@ def test_write_plugin_update_state_records_current_install(tmp_path):
 
     assert result["ok"] is True
     assert result["status"] == "pass"
-    assert result["state"]["installed_version"] == "0.1.1"
+    assert result["state"]["installed_version"] == DEFAULT_PLUGIN_VERSION
     assert result["state"]["plugin_root"] == str(tmp_path.resolve())
     assert result["self_graph_bundle"]["status"] == "pass"
 
@@ -597,7 +602,14 @@ def test_install_codex_plugin_cache_uses_versioned_codex_loader_layout(tmp_path)
 
     target = install_codex_plugin_cache(tmp_path, codex_home=codex_home, python_executable="python3.12")
 
-    assert target == codex_home / "plugins" / "cache" / "aming-claw-local" / "aming-claw" / "0.1.1"
+    assert target == (
+        codex_home
+        / "plugins"
+        / "cache"
+        / "aming-claw-local"
+        / "aming-claw"
+        / DEFAULT_PLUGIN_VERSION
+    )
     assert (target / ".codex-plugin" / "plugin.json").is_file()
     assert (target / "skills" / "aming-claw-onboard" / "SKILL.md").is_file()
     assert not (target / "skills" / "aming-claw" / "SKILL.md").exists()

@@ -105,7 +105,7 @@ const FEATURE_SMOKE_NAMES = [
   "live_observer_route",
 ];
 
-const DEFAULT_PLUGIN_VERSION = "0.1.1";
+const DEFAULT_PLUGIN_VERSION = "0.2.0";
 
 function sha256(text) {
   return crypto.createHash("sha256").update(String(text)).digest("hex");

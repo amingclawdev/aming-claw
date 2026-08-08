@@ -1,4 +1,31 @@
 services:
+  # Optional self-contained governance demo. The default local development
+  # model remains host-side; opt in with `--profile governance-demo` so an
+  # already-running host service is never replaced accidentally.
+  governance:
+    profiles: ["governance-demo"]
+    build:
+      context: .
+      dockerfile: Dockerfile.governance
+    ports:
+      - "${GOVERNANCE_PORT:-40000}:40000"
+    volumes:
+      - governance-demo-data:/app/shared-volume
+    environment:
+      - GOVERNANCE_PORT=40000
+      - SHARED_VOLUME_PATH=/app/shared-volume
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:40000/api/health',timeout=2)); raise SystemExit(0 if d.get('status') == 'ok' and not d.get('runtime_stale', False) else 1)"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 12
+    restart: unless-stopped
+
   # Governance is host-side only. This compose file now provides supporting
   # dependencies that the host governance process may still use.
 
@@ -12,7 +39,8 @@ services:
     volumes:
       - ./shared-volume/codex-tasks:/app/shared-volume/codex-tasks
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       - GOVERNANCE_URL=http://host.docker.internal:40000
       - REDIS_URL=redis://redis:6379/0
@@ -64,6 +92,8 @@ services:
     restart: unless-stopped
 
 volumes:
+  governance-demo-data:
+    driver: local
   redis-data:
     driver: local
   memory-data:

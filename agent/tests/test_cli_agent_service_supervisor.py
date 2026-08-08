@@ -12,7 +12,11 @@ import pytest
 
 
 AGENT_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = AGENT_DIR.parent
 sys.path.insert(0, str(AGENT_DIR))
+CANONICAL_PLUGIN_VERSION = json.loads(
+    (REPO_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+)["version"]
 
 
 def _profile():
@@ -290,7 +294,7 @@ def test_managed_profile_launch_uses_exact_server_home_and_strips_provider_env(
                         "installed": [
                             {
                                 "pluginId": "aming-claw@aming-claw-local",
-                                "version": "0.1.1+codex.20260713045902",
+                                "version": CANONICAL_PLUGIN_VERSION,
                                 "installed": True,
                                 "enabled": True,
                             }

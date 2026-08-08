@@ -65,6 +65,9 @@ instructions.
 - Do not treat archived skill files as active instructions.
 - Do not mutate governed files until a backlog row and route/contract evidence
   exist.
+- For manual fixes, follow [`references/mf-sop.md`](references/mf-sop.md)
+  after the live onboard guide selects an operator-supervised path. This SOP is
+  a reference under this single entrypoint, not a second active skill.
 - The release-operator head queue is deliberately bounded to 32 OPEN backlog
   rows. Only an authenticated observer/coordinator may insert, reorder, or
   record an ordinary skip through

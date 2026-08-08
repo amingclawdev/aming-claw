@@ -1,6 +1,6 @@
 {
   "name": "aming-claw",
-  "version": "0.1.1+codex.20260802053756",
+  "version": "0.2.0+codex.20260808142420",
   "description": "Codex plugin packaging for Aming Claw governance with one onboard-first skill entrypoint and the onboard_route_guide MCP tool.",
   "license": "FSL-1.1-MIT",
   "keywords": [
@@ -12,18 +12,12 @@
   ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
-  "hooks": {
-    "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python agent/hooks/onboarding_guard.py"
-          }
-        ]
-      }
-    ]
+  "author": {
+    "name": "Aming Claw",
+    "url": "https://github.com/amingclawdev"
   },
+  "homepage": "https://github.com/amingclawdev/aming-claw",
+  "repository": "https://github.com/amingclawdev/aming-claw",
   "interface": {
     "displayName": "Aming Claw",
     "shortDescription": "Graph-first governance workflow guard",
@@ -36,7 +30,7 @@
       "MCP"
     ],
     "defaultPrompt": [
-      "Start with active aming-claw-onboard skill plus MCP onboard_route_guide before governed mutations.",
+      "Start with the active aming-claw-onboard skill, then call the MCP onboard route guide (`onboard_route_guide`) before governed mutations.",
       "If governance is offline, ask the user to run aming-claw start; do not treat archived skills as active.",
       "Before implementation, run runtime_status, graph_status, graph_operations_queue, and backlog checks."
     ],

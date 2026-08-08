@@ -6,4 +6,4 @@ Three-layer architecture:
   Layer 3: Event Log       (event stream, JSONL append-only)
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"

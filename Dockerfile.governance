@@ -2,21 +2,30 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Copy requirements first for layer caching
-COPY agent/requirements.txt agent/requirements.txt
-RUN pip install --no-cache-dir -r agent/requirements.txt
+# Git is part of the governance runtime contract: bootstrap, version checks,
+# graph snapshots, and merge previews all resolve immutable Git objects.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y git \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy agent source
+# Install the same package metadata exposed by the host-side installer.
+COPY pyproject.toml README.md LICENSE start_governance.py aming_claw.py ./
 COPY agent/ agent/
+RUN pip install --no-cache-dir .
 
-# Copy VERSION file for version gate
+# Preserve the chain-seal file for diagnostics. Release commits update chain
+# authority through Git trailers; the image never edits this file at runtime.
 COPY VERSION VERSION
 
-# Create shared-volume directory structure
 RUN mkdir -p /app/shared-volume/codex-tasks/state/governance
 
-EXPOSE 40006
+EXPOSE 40000
 
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    GOVERNANCE_PORT=40000 \
+    SHARED_VOLUME_PATH=/app/shared-volume
 
-CMD ["python", "-m", "agent.governance.server"]
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=12 \
+  CMD python -c "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:40000/api/health',timeout=2)); raise SystemExit(0 if d.get('status') == 'ok' and not d.get('runtime_stale', False) else 1)"
+
+CMD ["aming-governance"]

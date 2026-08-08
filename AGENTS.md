@@ -44,7 +44,8 @@ build is needed when `agent/governance/dashboard_dist/index.html` or
    `graph_operations_queue` before implementation work.
 3. File or update a backlog row before mutating code, docs, config, dashboard
    assets, or runtime state.
-4. For manual fixes, follow `skills/aming-claw/references/mf-sop.md`.
+4. For manual fixes, follow
+   `skills/aming-claw-onboard/references/mf-sop.md`.
 5. For dashboard or graph behavior, evaluate E2E impact and run or file the
    relevant E2E evidence.
 

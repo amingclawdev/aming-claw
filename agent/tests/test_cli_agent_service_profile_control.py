@@ -12,6 +12,9 @@ import pytest
 AGENT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = AGENT_DIR.parent
 sys.path.insert(0, str(AGENT_DIR))
+CANONICAL_PLUGIN_VERSION = json.loads(
+    (REPO_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+)["version"]
 
 
 def _fake_codex(tmp_path):
@@ -37,7 +40,7 @@ def _control(tmp_path, *, ready=True, plugin_source_root=REPO_ROOT):
                         "installed": [
                             {
                                 "pluginId": "aming-claw@aming-claw-local",
-                                "version": "0.1.1+codex.20260713045902",
+                                "version": CANONICAL_PLUGIN_VERSION,
                                 "installed": True,
                                 "enabled": True,
                             }
@@ -258,7 +261,7 @@ def test_same_version_source_payload_change_reinstalls_and_updates_marker(tmp_pa
         / "cache"
         / "aming-claw-local"
         / "aming-claw"
-        / "0.1.1+codex.20260713045902"
+        / CANONICAL_PLUGIN_VERSION
         / "skills"
         / "aming-claw-onboard"
         / "SKILL.md"
@@ -298,7 +301,7 @@ def test_same_version_source_payload_change_reinstalls_and_updates_marker(tmp_pa
             encoding="utf-8"
         )
     )
-    assert manifest["version"] == "0.1.1+codex.20260713045902"
+    assert manifest["version"] == CANONICAL_PLUGIN_VERSION
 
 
 def test_invalid_source_payload_fails_before_installer_or_ready_marker(
@@ -404,7 +407,7 @@ def test_repo_source_tooling_bootstrap_is_idempotent_visible_and_preserves_auth(
         / "cache"
         / "aming-claw-local"
         / "aming-claw"
-        / "0.1.1+codex.20260713045902"
+        / CANONICAL_PLUGIN_VERSION
         / ".codex-plugin"
         / "plugin.json",
     )

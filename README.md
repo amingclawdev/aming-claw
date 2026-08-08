@@ -15,10 +15,11 @@ They should not be the control loop for an agent that is already drifting.
 
 ## Status
 
-Aming Claw is a V1 MVP and active dogfood system. The guided-runtime direction
-is mid-migration: more work is moving from agent-pulled context into
-runtime-pushed contracts, gates, and evidence. The current evidence is
-observational, not a validated benchmark claim.
+Aming Claw v2 is the current release line and active dogfood system. Its
+guided-runtime contracts now cover the normal `mf_parallel` and
+`mf_batch_parallel` paths from bounded worker evidence through independent QA,
+ordered merge, current-full graph reconcile, and protected backlog close.
+The evidence below is product evidence, not a general benchmark claim.
 
 Today it is useful for local AI development governance:
 
@@ -30,6 +31,45 @@ Today it is useful for local AI development governance:
 - Onboard service that selects the role, work type, token refs, and next
   contract path.
 - Direct-fix and parallel-work paths for governed implementation.
+
+### v2 release evidence
+
+The two canonical zero-bypass happy-path worlds are retained as API-readable
+release fixtures:
+
+| Lane | Project | Close commit | Durable result |
+| --- | --- | --- | --- |
+| `mf_parallel` | `daily-planner-parallel-2184372f-20260806t203120z` | `d56d1074a9b89b1f5cdf6b8abdb6f9cebe16fd9f` | one row `FIXED`, active graph `full-d56d107-ea07`, no formal bypass/waive event |
+| `mf_batch_parallel` | `daily-planner-batch-45824720-20260807t032549z` | `4ec1e18e538218fe481fc87a9a92dcd09c2a9d21` | models, planner, and coordinator rows `FIXED`, active graph `full-4ec1e18-0e1c`, no formal bypass/waive event |
+
+Replay the durable API evidence and the isolated route-level merge/reconcile/
+close regressions with:
+
+```bash
+python scripts/e2e-happy-path-smoke.py --run-regressions
+```
+
+The HTTP portion is deliberately read-only and accepts no credentials. The
+route regression portion creates temporary governance worlds and is bounded to
+60 seconds. For image/build checks that must not use the network:
+
+```bash
+python scripts/e2e-happy-path-smoke.py --preflight
+```
+
+Known release limitations are explicit:
+
+- The historical graph API file is large, so release QA uses focused suites
+  plus a strictly bounded full-file run and records the exact inherited
+  baseline instead of claiming an unbounded full-suite pass.
+- `CHAIN_VERSION` is trailer-derived. Do not edit `VERSION` by hand; the release
+  commit must carry `Chain-Source-Stage:` and runtime verification must compare
+  `runtime_loaded_version`, `runtime_stale`, and the exact Git HEAD.
+- Archived `AC-CONTRACT-LINE-BYPASS-*` rows are diagnostic history. They do not
+  count as v2 happy-path PASS evidence and are audited/waived separately.
+
+See the [v2 happy-path runbook](docs/dev/happy-path-runbook.md) for the exact
+gate order, Docker demo, copy-safe identity rules, and troubleshooting.
 
 ## Install
 
@@ -84,6 +124,21 @@ aming-claw start
 aming-claw open
 ```
 
+`aming-claw start` is a long-running service command. Keep it in a dedicated
+background terminal; run `aming-claw open` separately after health is ready.
+For a detached local runtime, use the platform-appropriate launcher:
+
+```bash
+nohup python3 -m agent.cli start > /tmp/aming-claw-governance.log 2>&1 &
+```
+
+```powershell
+Start-Process powershell -ArgumentList '-NoExit', '-Command', 'python -m agent.cli start'
+```
+
+After installing or refreshing the plugin, open a new Codex session so its
+skills and MCP tools load from the new cache version.
+
 ### Verify
 
 ```bash
@@ -102,6 +157,24 @@ The root path `/` is not the dashboard and may return `404`. If governance
 health is OK but `/dashboard` is unavailable, dashboard static assets are
 missing; see [Codex bootstrap details](docs/install/codex-bootstrap.md) and the
 [legacy README archive](docs/archive/README-legacy-20260701.md).
+
+### Docker governance demo
+
+The normal development model remains host-side governance. To run the optional
+self-contained image without replacing an already-running host service:
+
+```bash
+docker compose -f docker-compose.governance.yml \
+  --profile governance-demo up --build -d governance redis
+docker compose -f docker-compose.governance.yml \
+  --profile governance-demo ps
+python scripts/e2e-happy-path-smoke.py --preflight
+```
+
+The container serves governance on `40000` and its healthcheck calls
+`/api/health`. Its governance state uses the isolated
+`governance-demo-data` named volume rather than the host `shared-volume` tree.
+Stop it with the same compose file and profile when the demo is complete.
 
 ## How It Works
 
