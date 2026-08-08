@@ -51884,6 +51884,42 @@ def test_runtime_context_initial_join_accepts_canonical_passed_dispatch_line(
     assert anchor["payload"]["caller_role"] == "observer"
 
 
+def test_pre_lineage_rejoin_guide_advertises_one_bounded_replacement(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="bounded-replacement-before-lineage",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+    )
+
+    first = _pre_lineage_rejoin(case)
+    assert first["bounded_rejoin_kind"] == "special_authority_rejoin"
+    assert first["pre_lineage_auth_only_rejoin"] is True
+    context = get_branch_context(conn, PID, case["task_id"])
+    assert context is not None
+    eligibility = server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=context,
+    )
+    assert eligibility["eligible"] is True
+    assert eligibility["mode"] == (
+        "bounded_post_lineage_replacement_auth_only"
+    )
+    assert eligibility["authority"]["actual_worker_write_baseline"][
+        "timeline_worker_write_count"
+    ] == 0
+    assert eligibility["authority"]["current_session_token_ref"] == (
+        runtime_context_session_token_ref(context)
+    )
+
+
 def test_runtime_context_pre_lineage_legacy_agent_plus_route_drift_is_zero_write(
     conn,
     monkeypatch,

@@ -40446,6 +40446,7 @@ def _runtime_context_bounded_replacement_rejoin_authority(
         "caller_claims_trusted": False,
         "applicable": last_action
         in {
+            "mf_subagent_pre_lineage_session_token_rejoin_issued",
             _RUNTIME_CONTEXT_REJOIN_FIRST_RECOVERY_ACTION,
             _RUNTIME_CONTEXT_REJOIN_REPLACEMENT_RECOVERY_ACTION,
         },
@@ -40485,11 +40486,19 @@ def _runtime_context_bounded_replacement_rejoin_authority(
     audit_events = []
     for event in timeline_events:
         payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        bounded_rejoin_kind = str(
+            payload.get("bounded_rejoin_kind") or ""
+        ).strip()
+        accepted_initial_rejoin = bounded_rejoin_kind == (
+            "ordinary_initial_rejoin"
+        ) or (
+            bounded_rejoin_kind == "special_authority_rejoin"
+            and payload.get("pre_lineage_auth_only_rejoin") is True
+        )
         if (
             str(payload.get("action") or "").strip()
             == "runtime_context_session_token_rejoin"
-            and str(payload.get("bounded_rejoin_kind") or "").strip()
-            == "ordinary_initial_rejoin"
+            and accepted_initial_rejoin
             and _timeline_first_deep_text(event, "runtime_context_id")
             in {"", runtime_context_id}
         ):
@@ -40714,26 +40723,6 @@ def _runtime_context_session_rejoin_guidance_eligibility(
                 ),
             }
         return projection
-    if missing_lineage:
-        projection["blockers"] = [
-            "runtime_context_rejoin_requires_existing_worker_lineage",
-            *missing_lineage,
-        ]
-        return projection
-    if _runtime_context_failed_qa_revision_rejoin_allowed(
-        conn=conn,
-        context=context,
-        runtime_context_id=str(
-            getattr(context, "runtime_context_id", "") or ""
-        ).strip(),
-        timeline_events=timeline_events,
-    ) or _runtime_context_failed_qa_revision_contract_runtime_evidence(
-        conn,
-        project_id=project_id,
-        context=context,
-    ):
-        projection.update({"eligible": True, "mode": "failed_qa_revision"})
-        return projection
     if status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
         replacement_authority = (
             _runtime_context_bounded_replacement_rejoin_authority(
@@ -40764,6 +40753,27 @@ def _runtime_context_session_rejoin_guidance_eligibility(
                 }
             )
             return projection
+    if missing_lineage:
+        projection["blockers"] = [
+            "runtime_context_rejoin_requires_existing_worker_lineage",
+            *missing_lineage,
+        ]
+        return projection
+    if _runtime_context_failed_qa_revision_rejoin_allowed(
+        conn=conn,
+        context=context,
+        runtime_context_id=str(
+            getattr(context, "runtime_context_id", "") or ""
+        ).strip(),
+        timeline_events=timeline_events,
+    ) or _runtime_context_failed_qa_revision_contract_runtime_evidence(
+        conn,
+        project_id=project_id,
+        context=context,
+    ):
+        projection.update({"eligible": True, "mode": "failed_qa_revision"})
+        return projection
+    if status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
         projection.update({"eligible": True, "mode": "active_context_auth_only"})
         return projection
     if status != "validated":
@@ -41173,6 +41183,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 }
             )
         pre_lineage_bootstrap_rejoin_authority: dict[str, Any] = {}
+        pre_lineage_bounded_replacement_authority: dict[str, Any] = {}
         if missing_lineage:
             pre_lineage_bootstrap_rejoin_authority = (
                 _runtime_context_pre_lineage_bootstrap_rejoin_authority(
@@ -41190,6 +41201,41 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 )
             )
             if pre_lineage_bootstrap_rejoin_authority.get("eligible") is not True:
+                pre_lineage_bounded_replacement_authority = (
+                    _runtime_context_bounded_replacement_rejoin_authority(
+                        conn,
+                        project_id=project_id,
+                        context=context,
+                        timeline_events=timeline_events,
+                        body=body,
+                    )
+                )
+            if (
+                pre_lineage_bootstrap_rejoin_authority.get("eligible")
+                is not True
+                and (
+                    pre_lineage_bounded_replacement_authority.get(
+                        "applicable"
+                    )
+                    is not True
+                    or (
+                        pre_lineage_bounded_replacement_authority.get(
+                            "eligible"
+                        )
+                        is not True
+                        and str(
+                            (
+                                pre_lineage_bounded_replacement_authority.get(
+                                    "identity_mismatches"
+                                )
+                                or [{}]
+                            )[0].get("field")
+                            or ""
+                        )
+                        == "session_token_ref"
+                    )
+                )
+            ):
                 failure_code = str(
                     pre_lineage_bootstrap_rejoin_authority.get(
                         "failure_code"
@@ -41370,7 +41416,9 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     timeline_refs=timeline_refs,
                 )
             )
-        bounded_replacement_rejoin_authority: dict[str, Any] = {}
+        bounded_replacement_rejoin_authority: dict[str, Any] = dict(
+            pre_lineage_bounded_replacement_authority
+        )
         bounded_replacement_rejoin = False
         if (
             not failed_qa_reopen_for_revision
@@ -41381,15 +41429,16 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             and pre_lineage_bootstrap_rejoin_authority.get("eligible")
             is not True
         ):
-            bounded_replacement_rejoin_authority = (
-                _runtime_context_bounded_replacement_rejoin_authority(
-                    conn,
-                    project_id=project_id,
-                    context=context,
-                    timeline_events=timeline_events,
-                    body=body,
+            if not bounded_replacement_rejoin_authority:
+                bounded_replacement_rejoin_authority = (
+                    _runtime_context_bounded_replacement_rejoin_authority(
+                        conn,
+                        project_id=project_id,
+                        context=context,
+                        timeline_events=timeline_events,
+                        body=body,
+                    )
                 )
-            )
             if bounded_replacement_rejoin_authority.get("applicable") is True:
                 if (
                     bounded_replacement_rejoin_authority.get("eligible")
