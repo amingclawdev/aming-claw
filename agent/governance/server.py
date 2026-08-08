@@ -21599,6 +21599,31 @@ def _runtime_context_contract_runtime_worker_projection(
                     ),
                 }
     except ContractRuntimeError:
+        execution_row = conn.execute(
+            """
+            SELECT 1
+            FROM contract_runtime_executions
+            WHERE contract_execution_id = ?
+            LIMIT 1
+            """,
+            (execution_id,),
+        ).fetchone()
+        correction_row = conn.execute(
+            """
+            SELECT 1
+            FROM worker_implementation_test_results_corrections
+            WHERE contract_execution_id = ?
+              AND runtime_context_id = ? AND task_id = ?
+            LIMIT 1
+            """,
+            (
+                execution_id,
+                runtime_context_id,
+                task_id,
+            ),
+        ).fetchone()
+        if execution_row is None and correction_row is None:
+            return {}
         return {
             "schema_version": (
                 "runtime_context.contract_runtime_worker_projection.v1"
@@ -30692,6 +30717,44 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
     return resolved_identity, lineage_payload
 
 
+def _runtime_context_initial_join_expected_route_identity(
+    conn,
+    context,
+    dispatch_identity_anchor: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    revision_identity = _runtime_context_latest_route_identity(conn, context)
+    dispatch_identity = (
+        dispatch_identity_anchor.get("route_identity")
+        if isinstance(dispatch_identity_anchor.get("route_identity"), Mapping)
+        else {}
+    )
+    if revision_identity and dispatch_identity:
+        mismatches = _runtime_context_route_identity_mismatch_fields(
+            dispatch_identity,
+            revision_identity,
+        )
+        if mismatches:
+            raise GovernanceError(
+                "runtime_context_initial_join_route_authority_conflict",
+                "runtime-context route contract revision conflicts with the accepted ContractRuntime dispatch",
+                409,
+                {
+                    "runtime_context_id": str(
+                        getattr(context, "runtime_context_id", "") or ""
+                    ),
+                    "task_id": str(getattr(context, "task_id", "") or ""),
+                    "route_identity_mismatch_fields": mismatches,
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                },
+            )
+    if revision_identity:
+        return dict(revision_identity), "branch_contract_revision"
+    if dispatch_identity:
+        return dict(dispatch_identity), "contract_runtime_dispatch"
+    return {}, ""
+
+
 def _runtime_context_initial_join_resolved_ref_route_identity(
     body: Mapping[str, Any],
     supplied_route_identity: Mapping[str, Any],
@@ -30709,9 +30772,20 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
         or ""
     ).strip()
     expected_ref = str(expected_route_identity.get("route_token_ref") or "").strip()
-    if not route_token_ref or not expected_ref or route_token_ref == expected_ref:
+    if not expected_ref:
         return {}, {}
-
+    if not route_token_ref:
+        raise GovernanceError(
+            "runtime_context_initial_join_route_identity_mismatch",
+            "runtime-context initial join requires the active server-registered route token ref",
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": getattr(context, "task_id", ""),
+                "mutation_performed": False,
+                "fail_closed": True,
+            },
+        )
     resolution_body = dict(body)
     for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
         supplied = str(supplied_route_identity.get(field) or "").strip()
@@ -30760,6 +30834,92 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
                 "fail_closed": True,
             },
         )
+
+    expected_backlog_id = str(getattr(context, "backlog_id", "") or "")
+    expected_task_scope_candidates = _runtime_context_service_dedupe(
+        [
+            str(getattr(context, "task_id", "") or ""),
+            str(body.get("contract_execution_id") or ""),
+            str(body.get("parent_task_id") or ""),
+            str(getattr(context, "root_task_id", "") or ""),
+            expected_backlog_id,
+        ]
+    )
+    resolved_scope = (
+        resolved.get("scope")
+        if isinstance(resolved.get("scope"), Mapping)
+        else {}
+    )
+    resolved_scope_errors: list[str] = []
+    for field, expected in (
+        ("project_id", project_id),
+        ("backlog_id", expected_backlog_id),
+    ):
+        if str(resolved_scope.get(field) or "").strip() != expected:
+            resolved_scope_errors.append(f"scope_{field}_mismatch")
+    if str(resolved_scope.get("task_id") or "").strip() not in (
+        expected_task_scope_candidates
+    ):
+        resolved_scope_errors.append("scope_task_id_mismatch")
+    resolved_allowed_actions = {
+        _normalized_contract_runtime_action(item)
+        for item in (resolved.get("allowed_actions") or [])
+    }
+    if "task_timeline_append" not in resolved_allowed_actions:
+        resolved_scope_errors.append("required_action_not_allowed")
+    if resolved_scope_errors:
+        raise GovernanceError(
+            "runtime_context_initial_join_route_token_ref_scope_invalid",
+            "runtime-context initial join route token ref is not active for the exact runtime route scope and action",
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": getattr(context, "task_id", ""),
+                "route_token_ref": route_token_ref,
+                "route_scope_errors": resolved_scope_errors,
+                "required_action": "task_timeline_append",
+                "mutation_performed": False,
+                "fail_closed": True,
+            },
+        )
+
+    resolved_identity, current_lineage_payload = (
+        _runtime_context_implementation_resolved_ref_route_identity(
+            resolved,
+            route_token_ref=route_token_ref,
+            runtime_context_id=runtime_context_id,
+            context=context,
+            parent_route_identity=expected_route_identity,
+        )
+    )
+    if route_token_ref == expected_ref:
+        current_route_mismatches = _runtime_context_route_identity_mismatch_fields(
+            expected_route_identity,
+            resolved_identity,
+        )
+        if current_route_mismatches:
+            raise GovernanceError(
+                "runtime_context_initial_join_route_identity_mismatch",
+                "runtime-context initial join active route registry identity does not match the canonical dispatch route",
+                403,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": getattr(context, "task_id", ""),
+                    "route_identity_mismatch_fields": current_route_mismatches,
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                },
+            )
+        return {}, {
+            "_runtime_context_initial_join_current_route_ref_registry_verified": True,
+            "route_token_ref": route_token_ref,
+            "resolved_route_scope": dict(
+                current_lineage_payload.get("resolved_route_scope") or {}
+            ),
+            "required_allowed_action": "task_timeline_append",
+            "registry_verified": True,
+            "raw_route_token_exposed": False,
+        }
 
     route_lineage = (
         resolved.get("route_lineage") if isinstance(resolved.get("route_lineage"), Mapping)
@@ -30833,15 +30993,6 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
             proof_errors.append("same_scope_reissue_proof_invalid")
     if str(renewal_proof.get("route_token_ref") or "").strip() != route_token_ref:
         proof_errors.append("route_token_ref_mismatch")
-    expected_backlog_id = str(getattr(context, "backlog_id", "") or "")
-    expected_task_scope_candidates = _runtime_context_service_dedupe(
-        [
-            str(getattr(context, "task_id", "") or ""),
-            str(body.get("parent_task_id") or ""),
-            str(getattr(context, "root_task_id", "") or ""),
-            expected_backlog_id,
-        ]
-    )
     if not expected_task_scope_candidates:
         expected_task_scope_candidates = [""]
     expected_scope = {
@@ -30945,15 +31096,8 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
             },
         )
 
-    resolved_identity, lineage_payload = (
-        _runtime_context_implementation_resolved_ref_route_identity(
-            resolved,
-            route_token_ref=route_token_ref,
-            runtime_context_id=runtime_context_id,
-            context=context,
-            parent_route_identity=expected_route_identity,
-        )
-    )
+    resolved_identity = dict(resolved_identity)
+    lineage_payload = dict(current_lineage_payload)
     if route_lineage:
         lineage_payload = dict(lineage_payload)
         lineage_payload.setdefault("route_lineage", dict(route_lineage))
@@ -34247,7 +34391,53 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                     "fail_closed": True,
                 },
             )
-        expected_route_identity = _runtime_context_latest_route_identity(conn, context)
+        contract_dispatch_anchor_required = (
+            _runtime_context_contract_dispatch_anchor_required(
+                conn,
+                context=context,
+                contract_execution_id=contract_execution_id,
+            )
+        )
+        contract_dispatch_identity_anchor = (
+            _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
+                conn,
+                project_id=project_id,
+                context=context,
+                runtime_context_id=runtime_context_id,
+                contract_execution_id=contract_execution_id,
+            )
+        )
+        if (
+            contract_dispatch_anchor_required
+            and not contract_dispatch_identity_anchor
+        ):
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_dispatch_identity_mismatch",
+                "runtime-context identity does not match the accepted ContractRuntime dispatch",
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": canonical_task_id,
+                    "mutation_performed": False,
+                    "timeline_event_persisted": False,
+                    "credential_rotated": False,
+                    "fail_closed": True,
+                    "next_legal_action": (
+                        "repair_runtime_context_from_accepted_dispatch_before_initial_join"
+                    ),
+                },
+            )
+        (
+            expected_route_identity,
+            expected_route_identity_source,
+        ) = (
+            _runtime_context_initial_join_expected_route_identity(
+                conn,
+                context,
+                contract_dispatch_identity_anchor,
+            )
+        )
         supplied_route_identity = dict(
             _runtime_context_request_route_identity_shapes(ctx).get("supplied") or {}
         )
@@ -34494,8 +34684,51 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                     ),
                 },
             )
-        locked_expected_route_identity = (
-            _runtime_context_latest_route_identity(conn, context)
+        locked_contract_dispatch_anchor_required = (
+            _runtime_context_contract_dispatch_anchor_required(
+                conn,
+                context=context,
+                contract_execution_id=contract_execution_id,
+            )
+        )
+        locked_contract_dispatch_identity_anchor = (
+            _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
+                conn,
+                project_id=project_id,
+                context=context,
+                runtime_context_id=runtime_context_id,
+                contract_execution_id=contract_execution_id,
+            )
+        )
+        if (
+            locked_contract_dispatch_anchor_required
+            != contract_dispatch_anchor_required
+            or locked_contract_dispatch_identity_anchor
+            != contract_dispatch_identity_anchor
+        ):
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_dispatch_authority_changed",
+                "runtime-context ContractRuntime dispatch authority changed before issuance",
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": canonical_task_id,
+                    "mutation_performed": False,
+                    "timeline_event_persisted": False,
+                    "credential_rotated": False,
+                    "fail_closed": True,
+                },
+            )
+        (
+            locked_expected_route_identity,
+            locked_expected_route_identity_source,
+        ) = (
+            _runtime_context_initial_join_expected_route_identity(
+                conn,
+                context,
+                locked_contract_dispatch_identity_anchor,
+            )
         )
         locked_resolved_route_identity, locked_route_lineage_payload = (
             _runtime_context_initial_join_resolved_ref_route_identity(
@@ -34521,6 +34754,8 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
         if (
             dict(locked_expected_route_identity)
             != dict(expected_route_identity)
+            or locked_expected_route_identity_source
+            != expected_route_identity_source
             or locked_safe_route_identity != safe_route_identity
             or dict(locked_route_lineage_payload)
             != dict(initial_join_route_lineage_payload)
@@ -34544,43 +34779,6 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 },
             )
         session = locked_session
-        contract_dispatch_anchor_required = (
-            _runtime_context_contract_dispatch_anchor_required(
-                conn,
-                context=context,
-                contract_execution_id=contract_execution_id,
-            )
-        )
-        contract_dispatch_identity_anchor = (
-            _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
-                conn,
-                project_id=project_id,
-                context=context,
-                runtime_context_id=runtime_context_id,
-                contract_execution_id=contract_execution_id,
-            )
-        )
-        if (
-            contract_dispatch_anchor_required
-            and not contract_dispatch_identity_anchor
-        ):
-            conn.rollback()
-            raise GovernanceError(
-                "runtime_context_initial_join_dispatch_identity_mismatch",
-                "runtime-context identity does not match the accepted ContractRuntime dispatch",
-                409,
-                {
-                    "runtime_context_id": runtime_context_id,
-                    "task_id": canonical_task_id,
-                    "mutation_performed": False,
-                    "timeline_event_persisted": False,
-                    "credential_rotated": False,
-                    "fail_closed": True,
-                    "next_legal_action": (
-                        "repair_runtime_context_from_accepted_dispatch_before_initial_join"
-                    ),
-                },
-            )
         try:
             result = initial_join_mf_subagent_runtime_session_token(
                 conn,
@@ -39086,6 +39284,27 @@ def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
     ]
     if not exact_runtime_dispatch_candidates:
         return {}
+    dispatch_route_identities: list[dict[str, str]] = []
+    for candidate in exact_runtime_dispatch_candidates:
+        route_identity = (
+            candidate.get("route_identity")
+            if isinstance(candidate.get("route_identity"), Mapping)
+            else {}
+        )
+        if not route_identity:
+            continue
+        canonical_route_identity = {
+            field: str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+        if any(not canonical_route_identity[field] for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS):
+            return {}
+        dispatch_route_identities.append(canonical_route_identity)
+    if not dispatch_route_identities or any(
+        candidate != dispatch_route_identities[0]
+        for candidate in dispatch_route_identities[1:]
+    ):
+        return {}
     for candidate in exact_runtime_dispatch_candidates:
         for field, expected in (
             ("task_id", task_id),
@@ -39155,6 +39374,7 @@ def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
             dispatch_line.get("status") or "accepted"
         ).strip().lower(),
         **identity,
+        "route_identity": dict(dispatch_route_identities[0]),
         "owned_files": expected_owned_files,
         "agent_id": dispatch_agent_id,
         "raw_credentials_persisted": False,

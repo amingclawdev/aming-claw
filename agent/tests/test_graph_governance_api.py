@@ -50600,6 +50600,12 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
         route_identity=route_identity,
         payload={"route_identity": route_identity},
     )
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=context.backlog_id,
+        task_id=context.root_task_id,
+        **route_identity,
+    )
     conn.commit()
     canonical_join_scope = {
         "task_id": context.task_id,
@@ -51009,6 +51015,8 @@ def _setup_pre_lineage_rejoin_recovery_case(
             if line.get("line_id") == "observer_dispatch_bounded_workers"
         )
         dispatch_payload = dict(dispatch.get("payload") or {})
+        dispatch["route_identity"] = dict(route_identity)
+        dispatch_payload["route_identity"] = dict(route_identity)
         dispatch_payload["bounded_workers"] = [
             {
                 **dispatch_payload,
@@ -51038,6 +51046,8 @@ def _setup_pre_lineage_rejoin_recovery_case(
             and line.get("runtime_context_id") == context.runtime_context_id
         )
         guide_payload = dict(guide_dispatch.get("payload") or {})
+        guide_dispatch["route_identity"] = dict(route_identity)
+        guide_payload["route_identity"] = dict(route_identity)
         guide_payload["bounded_workers"] = copy.deepcopy(
             dispatch_payload["bounded_workers"]
         )
@@ -133719,3 +133729,175 @@ def test_incomplete_fanin_server_ancestry_rejection_is_zero_write(
     assert get_integration_epoch(
         conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
     ) == before
+
+
+def test_initial_join_dispatch_route_ref_revoked_after_preflight_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-INITIAL-JOIN-DISPATCH-ROUTE-TOCTOU"
+    worker_task_id = "initial-join-dispatch-route-toctou-worker"
+    target_root = tmp_path / worker_task_id
+    head_commit = _init_test_git_repo(target_root)
+    successor, allocated = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="initial-join-dispatch-route-toctou-parent",
+        worker_task_id=worker_task_id,
+        fence_token="fence-initial-join-dispatch-route-toctou",
+        token="",
+        worktree_path=str(target_root),
+        target_project_root=str(target_root),
+        base_commit=head_commit,
+        parent_task_is_contract_execution=True,
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
+    body = {
+        "runtime_context_id": allocated.runtime_context_id,
+        "contract_execution_id": contract_execution_id,
+        "task_id": allocated.task_id,
+        "parent_task_id": contract_execution_id,
+        "worker_id": allocated.worker_id,
+        "worker_slot_id": allocated.worker_slot_id,
+        "target_project_root": str(target_root),
+        "agent_id": allocated.worker_id,
+        "actual_host_worker_id": allocated.worker_id,
+        "worker_session_id": "/root/initial_join_dispatch_route_toctou",
+        "host_session_id": "/root/initial_join_dispatch_route_toctou",
+        "reason": "prove the route registry is re-read under the write lock",
+        "ttl_seconds": 3600,
+        "now_iso": "2099-08-08T12:00:00Z",
+        **route_identity,
+    }
+    before_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+    )
+    original = server._runtime_context_initial_join_resolved_ref_route_identity
+    calls = 0
+    injected: dict[str, Any] = {}
+
+    def revoke_after_preflight(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        result = original(*args, **kwargs)
+        if calls == 1:
+            conn.execute(
+                """
+                UPDATE observer_route_token_refs
+                   SET status = 'revoked'
+                 WHERE project_id = ? AND route_token_ref = ?
+                """,
+                (PID, route_identity["route_token_ref"]),
+            )
+            conn.commit()
+            injected["dump"] = "\n".join(conn.iterdump())
+            injected["total_changes"] = conn.total_changes
+        return result
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_initial_join_resolved_ref_route_identity",
+        revoke_after_preflight,
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": allocated.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body=body,
+            )
+        )
+
+    assert calls == 2
+    assert rejected.value.code == (
+        "runtime_context_initial_join_route_token_ref_invalid"
+    )
+    assert conn.total_changes == injected["total_changes"]
+    assert "\n".join(conn.iterdump()) == injected["dump"]
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+    ) == before_events
+
+
+def test_contract_runtime_worker_projection_distinguishes_absent_from_invalid_correction(
+    conn,
+):
+    execution_id = "cex-missing-worker-projection"
+    runtime_context_id = "mfrctx-missing-worker-projection"
+    task_id = "missing-worker-projection-task"
+    context = SimpleNamespace(project_id=PID)
+
+    assert server._runtime_context_contract_runtime_worker_projection(
+        conn,
+        contract_execution_id=execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        context=context,
+    ) == {}
+
+    conn.execute(
+        """
+        INSERT INTO worker_implementation_test_results_corrections (
+            correction_id, project_id, backlog_id, contract_execution_id,
+            runtime_context_id, task_id, source_completed_line_index,
+            source_line_instance_id, source_implementation_lineage_ref,
+            source_line_sha256, source_execution_state_revision,
+            source_test_results_sha256, corrected_test_results_sha256,
+            source_authority_sha256, source_worker_id,
+            source_worker_slot_id, source_session_token_ref,
+            source_fence_token_hash, correction_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "witr-correction-missing-worker-projection",
+            PID,
+            "AC-MISSING-WORKER-PROJECTION",
+            execution_id,
+            runtime_context_id,
+            task_id,
+            0,
+            "runtime_context:mfrctx-missing-worker-projection",
+            "contract_runtime:missing:worker_implementation:0",
+            _fake_sha("missing-worker-projection-source-line"),
+            1,
+            _fake_sha("missing-worker-projection-source-results"),
+            _fake_sha("missing-worker-projection-corrected-results"),
+            _fake_sha("missing-worker-projection-authority"),
+            "worker-missing-worker-projection",
+            "slot-missing-worker-projection",
+            "session-token-ref:missing-worker-projection",
+            _fake_sha("missing-worker-projection-fence"),
+            "{}",
+            "2026-08-08T12:00:00Z",
+        ),
+    )
+    conn.commit()
+
+    projection = server._runtime_context_contract_runtime_worker_projection(
+        conn,
+        contract_execution_id=execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        context=context,
+    )
+    assert projection["contract_runtime_next_legal_action"]["action"] == (
+        "blocked_worker_implementation_test_results"
+    )
+    assert projection["worker_implementation_evidence"]["fail_closed"] is True
