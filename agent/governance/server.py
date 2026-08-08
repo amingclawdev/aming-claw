@@ -16614,7 +16614,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 "requested_target_head_commit": target_head_commit,
                 "partial_epoch_head": active_epoch.current_head,
                 "integration_epoch": integration_epoch_to_dict(active_epoch),
-                "next_legal_action": integration_epoch_resume_payload(
+                "next_legal_action": _server_integration_epoch_resume_payload(
                     conn, active_epoch
                 ),
             }
@@ -53610,7 +53610,7 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                     "unrelated materialize/dispatch cannot use its partial HEAD"
                 ),
                 "integration_epoch": integration_epoch_to_dict(active_epoch),
-                "next_legal_action": integration_epoch_resume_payload(
+                "next_legal_action": _server_integration_epoch_resume_payload(
                     conn, active_epoch
                 ),
             }
@@ -55592,6 +55592,116 @@ def _git_commit_is_ancestor(
     except Exception:
         return False
     return result.returncode == 0
+
+
+def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
+    """Project incomplete-fanin reconcile input from canonical Git HEAD."""
+
+    from .parallel_branch_runtime import integration_epoch_resume_payload
+
+    current_target_head = ""
+    if getattr(epoch, "incomplete_fanin", None):
+        try:
+            current_target_head = _git_head_commit(
+                _graph_governance_project_root(epoch.project_id, {})
+            )
+        except Exception:
+            current_target_head = ""
+    return integration_epoch_resume_payload(
+        conn,
+        epoch,
+        current_target_head=current_target_head,
+    )
+
+
+def _verify_incomplete_fanin_reconcile_target(
+    conn,
+    *,
+    project_id: str,
+    merge_queue_id: str,
+    project_root: Path,
+    target_commit: str,
+    head_commit: str,
+) -> bool:
+    """Authorize only a clean current-HEAD descendant of merge credit."""
+
+    from .parallel_branch_runtime import (
+        get_active_integration_epoch,
+        list_active_integration_epochs,
+    )
+
+    if merge_queue_id:
+        epoch = get_active_integration_epoch(
+            conn,
+            project_id,
+            merge_queue_id=merge_queue_id,
+        )
+    else:
+        incomplete_epochs = [
+            candidate
+            for candidate in list_active_integration_epochs(conn, project_id)
+            if candidate.incomplete_fanin
+        ]
+        if len(incomplete_epochs) > 1:
+            raise GovernanceError(
+                "integration_epoch_incomplete_fanin_queue_scope_required",
+                "multiple incomplete-fanin epochs require explicit merge_queue_id",
+                409,
+                {
+                    "merge_queue_ids": [
+                        candidate.merge_queue_id for candidate in incomplete_epochs
+                    ],
+                    "zero_write_rejection": True,
+                },
+            )
+        epoch = incomplete_epochs[0] if incomplete_epochs else None
+    if epoch is None or not epoch.incomplete_fanin:
+        return False
+    canonical_target = _parallel_branch_resolve_canonical_commit(
+        project_root,
+        target_commit,
+        field="target_commit_sha",
+    )
+    canonical_head = _parallel_branch_resolve_canonical_commit(
+        project_root,
+        head_commit,
+        field="current_head",
+    )
+    if canonical_target != canonical_head:
+        raise GovernanceError(
+            "integration_epoch_incomplete_fanin_target_not_current_head",
+            "incomplete-fanin reconcile must target the canonical current HEAD",
+            409,
+            {
+                "target_commit_sha": canonical_target,
+                "current_head": canonical_head,
+                "zero_write_rejection": True,
+            },
+        )
+    canonical_credit = _parallel_branch_resolve_canonical_commit(
+        project_root,
+        epoch.current_head,
+        field="integration_epoch.current_head",
+    )
+    try:
+        _parallel_branch_require_commit_ancestor(
+            project_root,
+            canonical_credit,
+            canonical_target,
+            relationship="integration_epoch_credit_to_reconcile_target",
+        )
+    except GovernanceError as exc:
+        raise GovernanceError(
+            "integration_epoch_incomplete_fanin_target_diverged",
+            "current HEAD is not a descendant of the credited integration epoch head",
+            409,
+            {
+                "credited_head": canonical_credit,
+                "target_commit_sha": canonical_target,
+                "zero_write_rejection": True,
+            },
+        ) from exc
+    return canonical_credit != canonical_target
 
 
 def _git_output(project_root: Path, args: list[str], *, timeout: int = 5) -> str:
@@ -62740,6 +62850,16 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             or body.get("merge_queue_id")
             or ""
         ).strip()
+        incomplete_fanin_descendant_verified = (
+            _verify_incomplete_fanin_reconcile_target(
+                conn,
+                project_id=project_id,
+                merge_queue_id=merge_queue_id,
+                project_root=root,
+                target_commit=target_commit,
+                head_commit=head_commit,
+            )
+        )
         queue_item_id = str(body.get("queue_item_id") or "").strip()
         run_id = str(body.get("run_id") or "").strip() or (
             f"current-full-{target_commit[:7]}"
@@ -62820,6 +62940,9 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                         ),
                         merge_queue_id=merge_queue_id,
                         queue_item_id=queue_item_id,
+                        incomplete_fanin_descendant_verified=(
+                            incomplete_fanin_descendant_verified
+                        ),
                         now_iso=_utc_now(),
                     )
                 )
@@ -63105,6 +63228,9 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     merge_queue_id=merge_queue_id,
                     queue_item_id=queue_item_id,
                     activation_completed=False,
+                    incomplete_fanin_descendant_verified=(
+                        incomplete_fanin_descendant_verified
+                    ),
                     now_iso=_utc_now(),
                 )
             else:
@@ -63447,6 +63573,9 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             projection_id=graph_epoch_projection_id,
             merge_queue_id=merge_queue_id,
             queue_item_id=queue_item_id,
+            incomplete_fanin_descendant_verified=(
+                incomplete_fanin_descendant_verified
+            ),
             now_iso=_utc_now(),
         )
         conn.commit()
@@ -98607,7 +98736,7 @@ def _release_operator_head_queue_integration_epoch_guard(
     epoch_guards: list[dict[str, Any]] = []
     member_guards: dict[str, dict[str, Any]] = {}
     for epoch in epochs:
-        resume = integration_epoch_resume_payload(conn, epoch)
+        resume = _server_integration_epoch_resume_payload(conn, epoch)
         epoch_members = tuple(
             dict.fromkeys(
                 backlog_id
@@ -105993,7 +106122,7 @@ def _onboard_guide_capsule_current_projection(
     active_epoch = get_active_integration_epoch(conn, project_id)
     if active_epoch is None:
         return current
-    resume = integration_epoch_resume_payload(conn, active_epoch)
+    resume = _server_integration_epoch_resume_payload(conn, active_epoch)
     canonical_backlog_id = str(
         resume.get("backlog_id")
         or active_epoch.coordination_backlog_id
@@ -107002,7 +107131,7 @@ def _onboard_route_guide_service_response(
 
     active_epoch = get_active_integration_epoch(conn, project_id)
     if active_epoch is not None:
-        resume = integration_epoch_resume_payload(conn, active_epoch)
+        resume = _server_integration_epoch_resume_payload(conn, active_epoch)
         canonical_backlog_id = str(
             resume.get("backlog_id")
             or active_epoch.coordination_backlog_id
@@ -138592,7 +138721,7 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                     "durable batch integration epoch"
                 ),
                 "integration_epoch": integration_epoch_to_dict(active_epoch),
-                "next_legal_action": integration_epoch_resume_payload(
+                "next_legal_action": _server_integration_epoch_resume_payload(
                     conn, active_epoch
                 ),
             }
@@ -140267,7 +140396,7 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                     "active integration epoch"
                 ),
                 "integration_epoch": integration_epoch_to_dict(active_epoch),
-                "next_legal_action": integration_epoch_resume_payload(
+                "next_legal_action": _server_integration_epoch_resume_payload(
                     conn, active_epoch
                 ),
             }
@@ -141016,6 +141145,9 @@ def handle_integration_epoch_release_unlandable_child(ctx: RequestContext):
         except IntegrationEpochUnlandableChildReleaseError as exc:
             conn.rollback()
             return 409, {"ok": False, **exc.details}
+        except Exception:
+            conn.rollback()
+            raise
         conn.commit()
         return {
             **result,
@@ -141048,7 +141180,7 @@ def handle_integration_epoch_release_unlandable_child(ctx: RequestContext):
                     "{batch_id}/release-unlandable-child"
                 ),
             },
-            "writes_performed": not bool(result.get("replayed")),
+            "writes_performed": bool(result.get("writes_performed", True)),
         }
     finally:
         conn.close()
@@ -142582,7 +142714,9 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
         )
         if active_epoch is not None:
             active_epoch_payload = integration_epoch_to_dict(active_epoch)
-            active_epoch_resume = integration_epoch_resume_payload(conn, active_epoch)
+            active_epoch_resume = _server_integration_epoch_resume_payload(
+                conn, active_epoch
+            )
         conn.commit()
     response = _contract_runtime_response(
         record,

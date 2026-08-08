@@ -237,6 +237,7 @@ CREATE TABLE IF NOT EXISTS parallel_branch_integration_epochs (
     last_merge_commit TEXT NOT NULL DEFAULT '',
     snapshot_id       TEXT NOT NULL DEFAULT '',
     projection_id     TEXT NOT NULL DEFAULT '',
+    reconciled_target_head TEXT NOT NULL DEFAULT '',
     failure_reason    TEXT NOT NULL DEFAULT '',
     incomplete_fanin_json TEXT NOT NULL DEFAULT '{}',
     created_at        TEXT NOT NULL,
@@ -311,6 +312,7 @@ MATERIALIZED_RUNTIME_CONTEXT_STATES = {
     STATE_MERGING,
     STATE_MERGED,
     STATE_MERGE_FAILED,
+    STATE_RELEASED_UNLANDABLE,
     STATE_ROLLBACK_REQUIRED,
 }
 
@@ -2374,6 +2376,7 @@ class IntegrationEpoch:
     last_merge_commit: str = ""
     snapshot_id: str = ""
     projection_id: str = ""
+    reconciled_target_head: str = ""
     failure_reason: str = ""
     incomplete_fanin: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
@@ -2592,6 +2595,11 @@ def _ensure_integration_epoch_columns(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE parallel_branch_integration_epochs "
             "ADD COLUMN incomplete_fanin_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    if "reconciled_target_head" not in columns:
+        conn.execute(
+            "ALTER TABLE parallel_branch_integration_epochs "
+            "ADD COLUMN reconciled_target_head TEXT NOT NULL DEFAULT ''"
         )
 
 
@@ -11207,6 +11215,27 @@ def upsert_branch_context(
     now_iso: str = "",
 ) -> BranchTaskRuntimeContext:
     ensure_branch_runtime_schema(conn)
+    previous_status_row = conn.execute(
+        """
+        SELECT status FROM parallel_branch_runtime_contexts
+        WHERE project_id = ? AND task_id = ?
+        """,
+        (context.project_id, context.task_id),
+    ).fetchone()
+    if (
+        previous_status_row is not None
+        and str(previous_status_row["status"] or "")
+        == STATE_RELEASED_UNLANDABLE
+        and context.status != STATE_RELEASED_UNLANDABLE
+    ):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "released_unlandable_context_cannot_be_resurrected",
+            "released unlandable branch context is permanently terminal",
+            project_id=context.project_id,
+            task_id=context.task_id,
+            requested_status=context.status,
+            recovery="file a new backlog row and allocate a new child lane",
+        )
     now = now_iso or utc_now()
     runtime_context_id = runtime_context_id_for_branch_context(context)
     target_project_root = _runtime_context_text(
@@ -13323,7 +13352,7 @@ def _read_model_batch_planned_item_context_bindings(
     contexts: Sequence[BranchTaskRuntimeContext],
     batch_runtime: BatchMergeRuntime | None,
 ) -> dict[str, BranchTaskRuntimeContext]:
-    """Bind unmaterialized Batch rows to live workers for read projection only.
+    """Bind planned or released Batch rows to their allocated worker context.
 
     Batch planning owns queue identity and ordering, while worker allocation may
     assign a different task id.  Before durable materialization, project the
@@ -13373,7 +13402,8 @@ def _read_model_batch_planned_item_context_bindings(
                 == normalized_active_target_ref
             )
         if (
-            _normalize_merge_queue_status(item.status) != "planned"
+            _normalize_merge_queue_status(item.status)
+            not in {"planned", STATE_RELEASED_UNLANDABLE}
             or item.merge_queue_id != merge_queue_id
             or not durable_batch_plan_identity
             or not item.backlog_id
@@ -13495,7 +13525,11 @@ def _recover_read_model_merge_queue_items(
                 enriched,
                 task_id=bound_context.task_id,
                 branch_ref=bound_context.branch_ref,
-                status=bound_context.status or enriched.status,
+                status=(
+                    STATE_RELEASED_UNLANDABLE
+                    if enriched.status == STATE_RELEASED_UNLANDABLE
+                    else bound_context.status or enriched.status
+                ),
                 base_commit=bound_context.base_commit or enriched.base_commit,
                 branch_head=bound_context.head_commit or enriched.branch_head,
                 current_target_head=(
@@ -13835,6 +13869,7 @@ def record_merge_queue_graph_epoch_after_reconcile(
     merge_queue_id: str = "",
     queue_item_id: str = "",
     activation_completed: bool = True,
+    incomplete_fanin_descendant_verified: bool = False,
     now_iso: str = "",
 ) -> dict[str, Any]:
     """Fill missing graph epoch refs on merged queue rows after current-full reconcile."""
@@ -13982,6 +14017,9 @@ def record_merge_queue_graph_epoch_after_reconcile(
             snapshot_id=snapshot,
             projection_id=projection,
             merge_queue_id=queue_id,
+            incomplete_fanin_descendant_verified=(
+                incomplete_fanin_descendant_verified
+            ),
             now_iso=now,
         )
         if epoch is not None and epoch.status == INTEGRATION_EPOCH_RECONCILED:
@@ -14201,6 +14239,28 @@ def upsert_batch_merge_runtime(
     now_iso: str = "",
 ) -> BatchMergeRuntime:
     ensure_branch_runtime_schema(conn)
+    persisted_released_rows = conn.execute(
+        """
+        SELECT task_id FROM parallel_branch_batch_items
+        WHERE project_id = ? AND batch_id = ? AND status = ?
+        ORDER BY task_id
+        """,
+        (runtime.project_id, runtime.batch_id, STATE_RELEASED_UNLANDABLE),
+    ).fetchall()
+    incoming_by_task = {item.task_id: item for item in runtime.items}
+    for row in persisted_released_rows:
+        task_id = str(row["task_id"] or "")
+        incoming = incoming_by_task.get(task_id)
+        if incoming is None or incoming.status != STATE_RELEASED_UNLANDABLE:
+            raise IntegrationEpochUnlandableChildReleaseError(
+                "released_unlandable_batch_item_cannot_be_resurrected",
+                "released unlandable batch item cannot be changed or removed",
+                project_id=runtime.project_id,
+                batch_id=runtime.batch_id,
+                task_id=task_id,
+                requested_status=(incoming.status if incoming is not None else "removed"),
+                recovery="file a new backlog row and allocate a new child lane",
+            )
     now = now_iso or utc_now()
     conn.execute(
         """
@@ -14387,6 +14447,7 @@ def _integration_epoch_from_row(row: sqlite3.Row) -> IntegrationEpoch:
         last_merge_commit=str(row["last_merge_commit"] or ""),
         snapshot_id=str(row["snapshot_id"] or ""),
         projection_id=str(row["projection_id"] or ""),
+        reconciled_target_head=str(row["reconciled_target_head"] or ""),
         failure_reason=str(row["failure_reason"] or ""),
         incomplete_fanin=_parse_json_object(row["incomplete_fanin_json"]),
         created_at=str(row["created_at"] or ""),
@@ -14415,10 +14476,11 @@ def upsert_integration_epoch(
             remaining_queue_item_ids_json, reconcile_state, status,
             active_queue_item_id, active_task_id, active_backlog_id,
             active_checkpoint_id, expected_head_before, expected_branch_head,
-            last_merge_commit, snapshot_id, projection_id, failure_reason,
+            last_merge_commit, snapshot_id, projection_id,
+            reconciled_target_head, failure_reason,
             incomplete_fanin_json, created_at, updated_at, closed_at
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(project_id, batch_id) DO UPDATE SET
             epoch_id = excluded.epoch_id,
@@ -14441,6 +14503,7 @@ def upsert_integration_epoch(
             last_merge_commit = excluded.last_merge_commit,
             snapshot_id = excluded.snapshot_id,
             projection_id = excluded.projection_id,
+            reconciled_target_head = excluded.reconciled_target_head,
             failure_reason = excluded.failure_reason,
             incomplete_fanin_json = excluded.incomplete_fanin_json,
             updated_at = excluded.updated_at,
@@ -14469,6 +14532,7 @@ def upsert_integration_epoch(
             epoch.last_merge_commit,
             epoch.snapshot_id,
             epoch.projection_id,
+            epoch.reconciled_target_head,
             epoch.failure_reason,
             _json_object(epoch.incomplete_fanin),
             created,
@@ -14626,7 +14690,10 @@ def validate_integration_epoch_backlog_close(
     if (
         epoch.status != INTEGRATION_EPOCH_RECONCILED
         or epoch.remaining_queue_item_ids
-        or not _commit_ref_unambiguously_matches(epoch.current_head, target)
+        or not _commit_ref_unambiguously_matches(
+            epoch.reconciled_target_head or epoch.current_head,
+            target,
+        )
     ):
         raise IntegrationEpochFrozenError(
             "backlog close remains frozen until the final batch reconcile barrier",
@@ -14658,6 +14725,8 @@ def validate_integration_epoch_backlog_close(
 def integration_epoch_resume_payload(
     conn: sqlite3.Connection,
     epoch: IntegrationEpoch,
+    *,
+    current_target_head: str = "",
 ) -> dict[str, Any]:
     """Build the copy-safe canonical restart/onboard instruction."""
 
@@ -14679,11 +14748,17 @@ def integration_epoch_resume_payload(
         action_id = "final_batch_reconcile"
         action_backlog_id = epoch.coordination_backlog_id
         action_task_id = epoch.batch_id
+        reconcile_target = (
+            str(current_target_head or "").strip()
+            if epoch.incomplete_fanin
+            else ""
+        ) or epoch.current_head
         action_input = {
             "project_id": epoch.project_id,
             "backlog_id": epoch.coordination_backlog_id,
             "task_id": epoch.batch_id,
-            "target_commit_sha": epoch.current_head,
+            "target_commit_sha": reconcile_target,
+            "merge_queue_id": epoch.merge_queue_id,
             "activate": True,
             "require_clean": True,
             "semantic_use_ai": False,
@@ -15212,6 +15287,166 @@ def _merge_queue_item_possible_landed_evidence(
     }
 
 
+def _resolve_unlandable_release_projection_binding(
+    conn: sqlite3.Connection,
+    *,
+    epoch: IntegrationEpoch,
+    item: MergeQueueItem,
+) -> tuple[BranchTaskRuntimeContext, BatchMergeRuntime, BatchMergeItem, dict[str, Any]]:
+    binding = resolve_batch_plan_row_task_binding(
+        conn,
+        epoch.project_id,
+        task_id=item.task_id,
+        merge_queue_id=epoch.merge_queue_id,
+    )
+    if not binding.get("is_batch_plan_row_task_id"):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_plan_row_binding_required",
+            "release target must retain its server-authored Batch plan row identity",
+            queue_item_id=item.queue_item_id,
+            task_id=item.task_id,
+        )
+    contract_execution_id = str(
+        binding.get("contract_execution_id") or ""
+    ).strip()
+    if not contract_execution_id:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            (
+                "integration_epoch_release_plan_row_binding_ambiguous"
+                if binding.get("contract_execution_ids_ambiguous")
+                else "integration_epoch_release_plan_row_binding_missing"
+            ),
+            "release requires one uniquely bound BranchTaskRuntimeContext",
+            queue_item_id=item.queue_item_id,
+            contract_execution_id_candidates=list(
+                binding.get("contract_execution_id_candidates") or []
+            ),
+        )
+    context = get_branch_context(
+        conn,
+        epoch.project_id,
+        contract_execution_id,
+    )
+    if context is None:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_bound_context_missing",
+            "resolved release binding has no durable BranchTaskRuntimeContext",
+            contract_execution_id=contract_execution_id,
+        )
+    batch_runtime = get_batch_merge_runtime(conn, epoch.project_id, epoch.batch_id)
+    if batch_runtime is None:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_batch_runtime_missing",
+            "release requires the durable BatchMergeRuntime projection",
+            batch_id=epoch.batch_id,
+        )
+    batch_items = [
+        candidate
+        for candidate in batch_runtime.items
+        if candidate.task_id == item.task_id
+    ]
+    if len(batch_items) != 1:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_batch_item_binding_invalid",
+            "release requires one BatchMergeItem for the planned row",
+            batch_id=epoch.batch_id,
+            task_id=item.task_id,
+            candidate_count=len(batch_items),
+        )
+    batch_item = batch_items[0]
+    audit = {
+        "schema_version": "mf_batch_parallel.release_projection_binding.v1",
+        "plan_row_task_id": item.task_id,
+        "contract_execution_id": context.task_id,
+        "runtime_context_id": runtime_context_id_for_branch_context(context),
+        "batch_item_task_id": batch_item.task_id,
+        "merge_queue_id": epoch.merge_queue_id,
+        "queue_item_id": item.queue_item_id,
+        "copy_safe": True,
+    }
+    return context, batch_runtime, batch_item, audit
+
+
+def _terminalize_unlandable_release_projections(
+    conn: sqlite3.Connection,
+    *,
+    item: MergeQueueItem,
+    context: BranchTaskRuntimeContext,
+    batch_runtime: BatchMergeRuntime,
+    batch_item: BatchMergeItem,
+    reason: str,
+    now_iso: str,
+) -> tuple[MergeQueueItem, BranchTaskRuntimeContext, BatchMergeRuntime, bool]:
+    writes_performed = False
+    saved_item = item
+    if item.status != STATE_RELEASED_UNLANDABLE:
+        saved_item = upsert_merge_queue_item(
+            conn,
+            replace(
+                item,
+                status=STATE_RELEASED_UNLANDABLE,
+                completed_at=now_iso,
+                failure_reason=reason,
+            ),
+            now_iso=now_iso,
+        )
+        writes_performed = True
+    saved_context = context
+    if context.status != STATE_RELEASED_UNLANDABLE:
+        saved_context = upsert_branch_context(
+            conn,
+            replace(
+                context,
+                status=STATE_RELEASED_UNLANDABLE,
+                last_recovery_action="released_unlandable",
+            ),
+            now_iso=now_iso,
+        )
+        writes_performed = True
+    saved_batch_runtime = batch_runtime
+    if batch_item.status != STATE_RELEASED_UNLANDABLE:
+        saved_batch_runtime = upsert_batch_merge_runtime(
+            conn,
+            replace(
+                batch_runtime,
+                items=tuple(
+                    replace(candidate, status=STATE_RELEASED_UNLANDABLE)
+                    if candidate.task_id == batch_item.task_id
+                    else candidate
+                    for candidate in batch_runtime.items
+                ),
+            ),
+            now_iso=now_iso,
+        )
+        writes_performed = True
+    return saved_item, saved_context, saved_batch_runtime, writes_performed
+
+
+def _with_release_binding_audit(
+    epoch: IntegrationEpoch,
+    *,
+    queue_item_id: str,
+    binding_audit: Mapping[str, Any],
+) -> tuple[IntegrationEpoch, bool]:
+    incomplete = dict(epoch.incomplete_fanin)
+    records = list(incomplete.get("released_children") or [])
+    changed = False
+    next_records: list[Any] = []
+    for record in records:
+        if not isinstance(record, Mapping) or str(record.get("queue_item_id") or "") != queue_item_id:
+            next_records.append(record)
+            continue
+        next_record = dict(record)
+        if next_record.get("binding_audit") != dict(binding_audit):
+            next_record["binding_audit"] = dict(binding_audit)
+            changed = True
+        next_records.append(next_record)
+    if changed:
+        incomplete["released_children"] = next_records
+        return replace(epoch, incomplete_fanin=incomplete), True
+    return epoch, False
+
+
 def release_integration_epoch_unlandable_child(
     conn: sqlite3.Connection,
     *,
@@ -15306,16 +15541,56 @@ def release_integration_epoch_unlandable_child(
             str(existing_event["merge_queue_id"] or ""),
             item_id,
         )
+        if replay_epoch is None or replay_item is None:
+            raise IntegrationEpochUnlandableChildReleaseError(
+                "integration_epoch_release_replay_projection_missing",
+                "release replay cannot repair without its durable epoch and queue item",
+                event_id=int(existing_event["id"] or 0),
+                queue_item_id=item_id,
+            )
+        replay_context, replay_batch, replay_batch_item, binding_audit = (
+            _resolve_unlandable_release_projection_binding(
+                conn,
+                epoch=replay_epoch,
+                item=replay_item,
+            )
+        )
+        now = now_iso or utc_now()
+        replay_item, _, _, projection_repaired = (
+            _terminalize_unlandable_release_projections(
+                conn,
+                item=replay_item,
+                context=replay_context,
+                batch_runtime=replay_batch,
+                batch_item=replay_batch_item,
+                reason=bounded_reason,
+                now_iso=now,
+            )
+        )
+        replay_epoch_with_audit, audit_repaired = _with_release_binding_audit(
+            replay_epoch,
+            queue_item_id=item_id,
+            binding_audit=binding_audit,
+        )
+        if audit_repaired:
+            replay_epoch = upsert_integration_epoch(
+                conn,
+                replay_epoch_with_audit,
+                now_iso=now,
+            )
+        projection_repaired = bool(projection_repaired or audit_repaired)
         return {
             "schema_version": "mf_batch_parallel.explicit_unlandable_release.v1",
             "ok": True,
             "replayed": True,
+            "projection_repaired": projection_repaired,
+            "writes_performed": projection_repaired,
             "release_event_id": int(existing_event["id"] or 0),
             "integration_epoch": (
-                integration_epoch_to_dict(replay_epoch) if replay_epoch else {}
+                integration_epoch_to_dict(replay_epoch)
             ),
             "queue_item": (
-                merge_queue_item_to_dict(replay_item) if replay_item else {}
+                merge_queue_item_to_dict(replay_item)
             ),
             "merge_credit_granted": False,
             "target_head_mutated": False,
@@ -15430,6 +15705,13 @@ def release_integration_epoch_unlandable_child(
             recoverable_child_refused=True,
         )
 
+    context, batch_runtime, batch_item, binding_audit = (
+        _resolve_unlandable_release_projection_binding(
+            conn,
+            epoch=epoch,
+            item=item,
+        )
+    )
     now = now_iso or utc_now()
     remaining = tuple(
         candidate
@@ -15451,6 +15733,7 @@ def release_integration_epoch_unlandable_child(
         "approval_ref": approval,
         "reason": bounded_reason,
         "evidence_refs": list(refs),
+        "binding_audit": binding_audit,
         "released_at": now,
         "pre_release_queue_status": item.status,
         "merge_credit_granted": False,
@@ -15472,14 +15755,13 @@ def release_integration_epoch_unlandable_child(
             item_id,
         ],
     }
-    saved_item = upsert_merge_queue_item(
+    saved_item, _, _, _ = _terminalize_unlandable_release_projections(
         conn,
-        replace(
-            item,
-            status=STATE_RELEASED_UNLANDABLE,
-            completed_at=now,
-            failure_reason=bounded_reason,
-        ),
+        item=item,
+        context=context,
+        batch_runtime=batch_runtime,
+        batch_item=batch_item,
+        reason=bounded_reason,
         now_iso=now,
     )
     saved_epoch = upsert_integration_epoch(
@@ -15529,6 +15811,9 @@ def release_integration_epoch_unlandable_child(
     return {
         "schema_version": "mf_batch_parallel.explicit_unlandable_release.v1",
         "ok": True,
+        "replayed": False,
+        "projection_repaired": False,
+        "writes_performed": True,
         "release_event_id": release_event_id,
         "integration_epoch": integration_epoch_to_dict(saved_epoch),
         "queue_item": merge_queue_item_to_dict(saved_item),
@@ -15547,6 +15832,7 @@ def mark_integration_epoch_reconciled(
     snapshot_id: str,
     projection_id: str,
     merge_queue_id: str = "",
+    incomplete_fanin_descendant_verified: bool = False,
     now_iso: str = "",
 ) -> IntegrationEpoch | None:
     queue_id = str(merge_queue_id or "").strip()
@@ -15590,10 +15876,30 @@ def mark_integration_epoch_reconciled(
         return None
     if epoch.status != INTEGRATION_EPOCH_RECONCILE_PENDING:
         return epoch
-    if (
-        epoch.remaining_queue_item_ids
-        or not _commit_ref_unambiguously_matches(epoch.current_head, target)
-    ):
+    head_matches_credit = _commit_ref_unambiguously_matches(
+        epoch.current_head,
+        target,
+    )
+    descendant_reconcile = bool(
+        epoch.incomplete_fanin
+        and not head_matches_credit
+        and incomplete_fanin_descendant_verified
+    )
+    if epoch.remaining_queue_item_ids:
+        if epoch.incomplete_fanin:
+            return epoch
+        return upsert_integration_epoch(
+            conn,
+            replace(
+                epoch,
+                reconcile_state="failed",
+                failure_reason="reconcile target head does not match frozen epoch head",
+            ),
+            now_iso=now_iso,
+        )
+    if not head_matches_credit and not descendant_reconcile:
+        if epoch.incomplete_fanin:
+            return epoch
         return upsert_integration_epoch(
             conn,
             replace(
@@ -15611,6 +15917,7 @@ def mark_integration_epoch_reconciled(
             reconcile_state="reconciled",
             snapshot_id=snapshot_id,
             projection_id=projection_id,
+            reconciled_target_head=target,
             failure_reason="",
         ),
         now_iso=now_iso,
@@ -15637,7 +15944,7 @@ def close_integration_epoch(
     if (
         epoch.remaining_queue_item_ids
         or not _commit_ref_unambiguously_matches(
-            epoch.current_head,
+            epoch.reconciled_target_head or epoch.current_head,
             target_head_commit,
         )
     ):
@@ -19067,6 +19374,15 @@ def record_branch_finish_gate(
     context = get_branch_context(conn, project_id, task_id)
     if context is None:
         raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
+    if context.status == STATE_RELEASED_UNLANDABLE:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "released_unlandable_context_cannot_be_resurrected",
+            "released unlandable branch context cannot re-enter the finish gate",
+            project_id=project_id,
+            task_id=task_id,
+            requested_status=STATE_VALIDATED,
+            recovery="file a new backlog row and allocate a new child lane",
+        )
     _require_current_fence(context, fence_token)
     now = now_iso or utc_now()
     next_head = str(head_commit or context.head_commit or "").strip()
@@ -23636,15 +23952,6 @@ def build_parallel_branch_read_model_from_db(
 ) -> ParallelBranchReadModel:
     """Build PB-010 read model from durable branch, queue, and batch rows."""
     contexts = list_branch_contexts(conn, project_id, batch_id=batch_id)
-    recovery_plan = (
-        decide_restart_recovery(
-            runtime_tasks_from_contexts(contexts, now_iso=now_iso),
-            scenario_id=scenario_id,
-        )
-        if contexts
-        else None
-    )
-
     batch_runtime: BatchMergeRuntime | None = None
     integration_epoch: IntegrationEpoch | None = None
     if batch_id:
@@ -23676,6 +23983,18 @@ def build_parallel_branch_read_model_from_db(
             contexts=contexts,
             batch_runtime=batch_runtime,
         )
+        released_context_task_ids = {
+            item.task_id
+            for item in queue_items
+            if item.status == STATE_RELEASED_UNLANDABLE
+        }
+        if released_context_task_ids:
+            contexts = [
+                replace(context, status=STATE_RELEASED_UNLANDABLE)
+                if context.task_id in released_context_task_ids
+                else context
+                for context in contexts
+            ]
         latest_target = str(current_target_head or "").strip()
         if latest_target:
             queue_items = [
@@ -23691,6 +24010,15 @@ def build_parallel_branch_read_model_from_db(
                 project_id,
                 merge_queue_id=queue_id,
             )
+
+    recovery_plan = (
+        decide_restart_recovery(
+            runtime_tasks_from_contexts(contexts, now_iso=now_iso),
+            scenario_id=scenario_id,
+        )
+        if contexts
+        else None
+    )
 
     batch_plan: BatchRollbackPlan | None = None
     if batch_runtime is not None:

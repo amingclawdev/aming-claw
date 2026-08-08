@@ -125129,6 +125129,8 @@ _EXPLICIT_EPOCH_RELEASE_CHILD = "AC-EXPLICIT-EPOCH-UNLANDABLE-CHILD"
 _EXPLICIT_EPOCH_RELEASE_BLOCKER = "AC-EXPLICIT-EPOCH-BLOCKING-DEFECT"
 _EXPLICIT_EPOCH_RELEASE_COORD = "AC-EXPLICIT-EPOCH-COORDINATION"
 _EXPLICIT_EPOCH_RELEASE_ITEM = "mqitem-explicit-epoch-release-row3"
+_EXPLICIT_EPOCH_RELEASE_PLAN_TASK = f"{_EXPLICIT_EPOCH_RELEASE_BATCH}:row:3"
+_EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK = "cex-explicit-epoch-release-row3"
 _EXPLICIT_EPOCH_RELEASE_HEAD = "c" * 40
 _EXPLICIT_EPOCH_RELEASE_GOVERNING_BACKLOG = (
     "AC-INTEGRATION-EPOCH-EXPLICIT-RELEASE-RECOVERY-P2-20260807"
@@ -125188,7 +125190,7 @@ def _explicit_epoch_release_fixture(
             project_id=PID,
             merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
             queue_item_id=_EXPLICIT_EPOCH_RELEASE_ITEM,
-            task_id="cex-explicit-epoch-release-row3",
+            task_id=_EXPLICIT_EPOCH_RELEASE_PLAN_TASK,
             backlog_id=_EXPLICIT_EPOCH_RELEASE_CHILD,
             branch_ref="refs/heads/codex/explicit-epoch-release-row3",
             queue_index=3,
@@ -125198,6 +125200,41 @@ def _explicit_epoch_release_fixture(
         ),
     )
     upsert_merge_queue_items(conn, items)
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=_EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK,
+            runtime_context_id="rtctx-explicit-epoch-release-row3",
+            batch_id=_EXPLICIT_EPOCH_RELEASE_BATCH,
+            backlog_id=_EXPLICIT_EPOCH_RELEASE_CHILD,
+            branch_ref="refs/heads/codex/explicit-epoch-release-row3",
+            ref_name="refs/heads/main",
+            merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+            status="running",
+        ),
+    )
+    upsert_batch_merge_runtime(
+        conn,
+        BatchMergeRuntime(
+            project_id=PID,
+            batch_id=_EXPLICIT_EPOCH_RELEASE_BATCH,
+            target_ref="refs/heads/main",
+            batch_base_commit="a" * 40,
+            current_target_head=_EXPLICIT_EPOCH_RELEASE_HEAD,
+            items=(
+                BatchMergeItem(
+                    task_id=_EXPLICIT_EPOCH_RELEASE_PLAN_TASK,
+                    branch_ref="refs/heads/codex/explicit-epoch-release-row3",
+                    worktree_path="/tmp/explicit-epoch-release-row3",
+                    queue_index=3,
+                    status=queue_status,
+                    branch_head="",
+                    merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+                ),
+            ),
+        ),
+    )
     epoch = upsert_integration_epoch(
         conn,
         IntegrationEpoch(
@@ -125952,3 +125989,527 @@ def test_explicit_unlandable_child_release_refuses_middle_child_and_preserves_su
         successor.queue_item_id,
     ).status == "planned"
     assert _explicit_epoch_release_events(conn) == []
+
+
+def _call_explicit_epoch_release_as_operator(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {
+            "role": "observer",
+            "principal_id": "release-operator",
+        },
+    )
+    return server.handle_integration_epoch_release_unlandable_child(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            "observer",
+            method="POST",
+            body=_explicit_epoch_release_body(),
+        )
+    )
+
+
+@pytest.mark.parametrize("binding_failure", ["missing", "ambiguous"])
+def test_explicit_release_binding_failure_is_zero_write(
+    conn,
+    monkeypatch,
+    binding_failure,
+):
+    before_epoch = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    if binding_failure == "missing":
+        conn.execute(
+            "DELETE FROM parallel_branch_runtime_contexts "
+            "WHERE project_id = ? AND task_id = ?",
+            (PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK),
+        )
+    else:
+        upsert_branch_context(
+            conn,
+            BranchTaskRuntimeContext(
+                project_id=PID,
+                task_id="cex-explicit-epoch-release-row3-duplicate",
+                runtime_context_id="rtctx-explicit-epoch-release-row3-duplicate",
+                batch_id=_EXPLICIT_EPOCH_RELEASE_BATCH,
+                backlog_id=_EXPLICIT_EPOCH_RELEASE_CHILD,
+                branch_ref="refs/heads/codex/explicit-release-duplicate",
+                ref_name="refs/heads/main",
+                merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+                status="running",
+            ),
+        )
+    conn.commit()
+
+    status, result = _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+
+    assert status == 409
+    assert result["error"] == (
+        f"integration_epoch_release_plan_row_binding_{binding_failure}"
+    )
+    assert get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_epoch
+    assert get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    ).status == "planned"
+    assert parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ).items[0].status == "planned"
+    assert _explicit_epoch_release_events(conn) == []
+
+
+def test_explicit_release_partial_projection_failure_rolls_back_every_write(
+    conn,
+    monkeypatch,
+):
+    before_epoch = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+
+    def fail_batch_projection(*_args, **_kwargs):
+        raise parallel_branch_runtime.IntegrationEpochUnlandableChildReleaseError(
+            "simulated_release_projection_failure",
+            "simulated failure after queue/context writes",
+        )
+
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "upsert_batch_merge_runtime",
+        fail_batch_projection,
+    )
+    status, result = _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+
+    assert status == 409
+    assert result["error"] == "simulated_release_projection_failure"
+    assert get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_epoch
+    assert get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    ).status == "planned"
+    assert get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    ).status == "running"
+    assert parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ).items[0].status == "planned"
+    assert _explicit_epoch_release_events(conn) == []
+
+
+def test_exact_release_replay_repairs_projection_once_and_read_model_deduplicates(
+    conn,
+    monkeypatch,
+):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    first = _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+    assert first["writes_performed"] is True
+    event_count = len(_explicit_epoch_release_events(conn))
+
+    # Reproduce the deployed pre-repair shape: immutable release event and MQ
+    # terminal row exist, while the bound context/batch projections are live.
+    conn.execute(
+        "UPDATE parallel_branch_runtime_contexts SET status = 'running' "
+        "WHERE project_id = ? AND task_id = ?",
+        (PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK),
+    )
+    conn.execute(
+        "UPDATE parallel_branch_batch_items SET status = 'running' "
+        "WHERE project_id = ? AND batch_id = ? AND task_id = ?",
+        (
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_BATCH,
+            _EXPLICIT_EPOCH_RELEASE_PLAN_TASK,
+        ),
+    )
+    epoch = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+    incomplete = dict(epoch.incomplete_fanin)
+    incomplete["released_children"] = [
+        {
+            key: value
+            for key, value in record.items()
+            if key != "binding_audit"
+        }
+        for record in incomplete["released_children"]
+    ]
+    upsert_integration_epoch(conn, replace(epoch, incomplete_fanin=incomplete))
+    conn.commit()
+
+    repaired = _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+
+    assert repaired["replayed"] is True
+    assert repaired["projection_repaired"] is True
+    assert repaired["writes_performed"] is True
+    assert len(_explicit_epoch_release_events(conn)) == event_count
+    assert get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    ).status == parallel_branch_runtime.STATE_RELEASED_UNLANDABLE
+    batch_runtime = parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    assert batch_runtime.items[0].status == (
+        parallel_branch_runtime.STATE_RELEASED_UNLANDABLE
+    )
+    repaired_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    assert repaired_epoch.incomplete_fanin["released_children"][0][
+        "binding_audit"
+    ]["contract_execution_id"] == _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+
+    read_model = parallel_branch_runtime.build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PID,
+        batch_id=_EXPLICIT_EPOCH_RELEASE_BATCH,
+        merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+        target_ref="refs/heads/main",
+    )
+    child_rows = [
+        row
+        for row in read_model.merge_queue["rows"]
+        if row["backlog_id"] == _EXPLICIT_EPOCH_RELEASE_CHILD
+    ]
+    assert len(child_rows) == 1
+    assert child_rows[0]["status"] == (
+        parallel_branch_runtime.STATE_RELEASED_UNLANDABLE
+    )
+    assert read_model.summary["status_counts"].get("running", 0) == 0
+
+    replay = _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+    assert replay["replayed"] is True
+    assert replay["projection_repaired"] is False
+    assert replay["writes_performed"] is False
+    assert len(_explicit_epoch_release_events(conn)) == event_count
+
+
+def test_released_projection_upserts_cannot_resurrect_or_remove_child(
+    conn,
+    monkeypatch,
+):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+    item = get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    )
+    context = get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    )
+    batch_runtime = parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+
+    with pytest.raises(
+        parallel_branch_runtime.IntegrationEpochUnlandableChildReleaseError
+    ):
+        upsert_merge_queue_item(conn, replace(item, status="running"))
+    with pytest.raises(
+        parallel_branch_runtime.IntegrationEpochUnlandableChildReleaseError
+    ):
+        upsert_branch_context(conn, replace(context, status="running"))
+    with pytest.raises(
+        parallel_branch_runtime.IntegrationEpochUnlandableChildReleaseError
+    ):
+        parallel_branch_runtime.record_branch_finish_gate(
+            conn,
+            project_id=PID,
+            task_id=context.task_id,
+            checkpoint_id="checkpoint-must-not-resurrect",
+            fence_token="",
+        )
+    with pytest.raises(
+        parallel_branch_runtime.IntegrationEpochUnlandableChildReleaseError
+    ):
+        upsert_batch_merge_runtime(
+            conn,
+            replace(
+                batch_runtime,
+                items=(replace(batch_runtime.items[0], status="running"),),
+            ),
+        )
+    with pytest.raises(
+        parallel_branch_runtime.IntegrationEpochUnlandableChildReleaseError
+    ):
+        upsert_batch_merge_runtime(conn, replace(batch_runtime, items=()))
+
+
+def test_incomplete_fanin_descendant_reconcile_preserves_merge_credit_and_closes(
+    conn,
+    monkeypatch,
+):
+    credited = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+    descendant = "d" * 40
+
+    reconciled = parallel_branch_runtime.mark_integration_epoch_reconciled(
+        conn,
+        project_id=PID,
+        target_head_commit=descendant,
+        snapshot_id="full-descendant",
+        projection_id="projection-descendant",
+        merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+        incomplete_fanin_descendant_verified=True,
+    )
+
+    assert reconciled.status == parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILED
+    assert reconciled.current_head == credited.current_head
+    assert reconciled.last_merge_commit == credited.last_merge_commit
+    assert reconciled.merge_cursor == credited.merge_cursor
+    assert reconciled.merged_prefix == credited.merged_prefix
+    assert reconciled.incomplete_fanin["status"] == "incomplete"
+    assert reconciled.reconciled_target_head == descendant
+    closed = parallel_branch_runtime.close_integration_epoch(
+        conn,
+        project_id=PID,
+        batch_id=_EXPLICIT_EPOCH_RELEASE_BATCH,
+        target_head_commit=descendant,
+    )
+    assert closed.status == parallel_branch_runtime.INTEGRATION_EPOCH_CLOSED
+    assert closed.current_head == credited.current_head
+    assert closed.reconciled_target_head == descendant
+
+
+def test_incomplete_fanin_divergent_reconcile_is_zero_write_and_stays_frozen(
+    conn,
+    monkeypatch,
+):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+    before = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+
+    result = parallel_branch_runtime.mark_integration_epoch_reconciled(
+        conn,
+        project_id=PID,
+        target_head_commit="e" * 40,
+        snapshot_id="full-divergent",
+        projection_id="projection-divergent",
+        merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+        incomplete_fanin_descendant_verified=False,
+    )
+
+    assert result == before
+    assert get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before
+    assert result.status == parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILE_PENDING
+
+
+def test_incomplete_fanin_resume_uses_server_current_full_head(conn, monkeypatch):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {
+            "role": "observer",
+            "principal_id": "release-operator",
+        },
+    )
+    _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+    epoch = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+    current_full_head = "f" * 40
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: current_full_head)
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda *_args, **_kwargs: Path("/tmp"),
+    )
+
+    resume = server._server_integration_epoch_resume_payload(conn, epoch)
+
+    assert resume["id"] == "final_batch_reconcile"
+    assert resume["action_input"]["target_commit_sha"] == current_full_head
+    assert resume["action_input"]["merge_queue_id"] == (
+        _EXPLICIT_EPOCH_RELEASE_QUEUE
+    )
+    assert len(resume["action_input"]["target_commit_sha"]) == 40
+
+
+def test_normal_full_fanin_reconcile_keeps_exact_credit_head_behavior(conn):
+    queue_id = "mq-normal-full-fanin-reconcile"
+    head = "1" * 40
+    epoch = upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id="batch-normal-full-fanin-reconcile",
+            epoch_id="epoch-normal-full-fanin-reconcile",
+            coordination_backlog_id="AC-NORMAL-FULL-FANIN-RECONCILE",
+            target_ref="refs/heads/normal-full-fanin",
+            base_head="0" * 40,
+            current_head=head,
+            merge_queue_id=queue_id,
+            status=parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILE_PENDING,
+            reconcile_state="pending",
+            last_merge_commit=head,
+        ),
+    )
+
+    reconciled = parallel_branch_runtime.mark_integration_epoch_reconciled(
+        conn,
+        project_id=PID,
+        target_head_commit=head,
+        snapshot_id="full-normal-fanin",
+        projection_id="projection-normal-fanin",
+        merge_queue_id=queue_id,
+    )
+
+    assert reconciled.status == parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILED
+    assert reconciled.current_head == epoch.current_head
+    assert reconciled.reconciled_target_head == head
+
+
+def test_current_full_reconcile_executes_incomplete_fanin_descendant_target(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    credited = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+
+    def resolve_commit(_root, ref, *, field):
+        del field
+        normalized = str(ref)
+        if normalized.startswith(credited.current_head):
+            return credited.current_head
+        if normalized.startswith(head):
+            return head
+        raise AssertionError(f"unexpected commit ref: {ref}")
+
+    ancestry_checks: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_resolve_canonical_commit",
+        resolve_commit,
+    )
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_require_commit_ancestor",
+        lambda _root, ancestor, descendant, *, relationship: ancestry_checks.append(
+            (ancestor, descendant, relationship)
+        ),
+    )
+    ctx = _ctx(
+        {"project_id": PID},
+        method="POST",
+        body={
+            "target_commit_sha": head,
+            "activate": True,
+            "semantic_enrich": False,
+            "merge_queue_id": _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        },
+    )
+    ctx.token = "operator-token"
+
+    status, result = server.handle_graph_governance_current_full_reconcile(ctx)
+
+    assert status == 201
+    assert calls[0]["commit_sha"] == head
+    assert ancestry_checks == [
+        (
+            credited.current_head,
+            head,
+            "integration_epoch_credit_to_reconcile_target",
+        )
+    ]
+    closed = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+    assert closed.status == parallel_branch_runtime.INTEGRATION_EPOCH_CLOSED
+    assert closed.current_head == credited.current_head
+    assert closed.reconciled_target_head == head
+    assert result["merge_queue_graph_epoch_auto_record"][
+        "integration_epoch_barrier"
+    ] == "satisfied_and_closed"
+
+
+def test_incomplete_fanin_server_ancestry_rejection_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    _call_explicit_epoch_release_as_operator(conn, monkeypatch)
+    before = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_resolve_canonical_commit",
+        lambda _root, ref, *, field: str(ref).ljust(40, "0")[:40],
+    )
+
+    def reject_ancestry(*_args, **_kwargs):
+        raise GovernanceError(
+            "parallel_merge_commit_non_ancestor",
+            "not an ancestor",
+            409,
+            {},
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_require_commit_ancestor",
+        reject_ancestry,
+    )
+
+    with pytest.raises(GovernanceError) as exc:
+        server._verify_incomplete_fanin_reconcile_target(
+            conn,
+            project_id=PID,
+            merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+            project_root=tmp_path,
+            target_commit="d" * 40,
+            head_commit="d" * 40,
+        )
+
+    assert exc.value.code == "integration_epoch_incomplete_fanin_target_diverged"
+    assert exc.value.details["zero_write_rejection"] is True
+    assert get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before
