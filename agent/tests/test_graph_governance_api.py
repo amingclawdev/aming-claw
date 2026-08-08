@@ -125476,6 +125476,162 @@ def _establish_explicit_epoch_release_authority_rollover(
     return route_handler, renewed_body
 
 
+def _prepare_live_missing_batch_runtime_release_replay(
+    conn,
+    *,
+    suffix: str,
+):
+    from agent.governance.contracts.runtime import SQLiteContractExecutionStore
+
+    # The compact API fixture intentionally omits ContractRuntime tables.  The
+    # live repair path requires those independent durable authorities, so
+    # initialize their product schemas before constructing the live-shaped
+    # projection hole.
+    SQLiteContractExecutionStore(conn)
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    route_handler = _explicit_epoch_release_route_handler()
+    old_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id=f"obs-live-missing-batch-old-{suffix}",
+        route_token_ref=f"rtok-live-missing-batch-old-{suffix}",
+    )
+    first = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=old_body,
+        )
+    )
+    assert first["ok"] is True
+
+    conn.execute(
+        "UPDATE parallel_branch_runtime_contexts "
+        "SET status = 'running', worktree_path = ?, base_commit = ?, "
+        "head_commit = ? WHERE project_id = ? AND task_id = ?",
+        (
+            "/tmp/live-missing-batch-runtime-row3",
+            "a" * 40,
+            "a" * 40,
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK,
+        ),
+    )
+    conn.execute(
+        "UPDATE parallel_branch_merge_queue_items SET base_commit = ? "
+        "WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?",
+        (
+            "a" * 40,
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_QUEUE,
+            _EXPLICIT_EPOCH_RELEASE_ITEM,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO contract_runtime_executions (
+            contract_execution_id, project_id, backlog_id, contract_id,
+            version, revision, parent_contract_execution_id,
+            root_contract_execution_id, contract_chain_id,
+            execution_state_revision, record_json, created_at, updated_at
+        ) VALUES (?, ?, ?, 'mf_parallel.v2', 'v2', 'rev8', '', '', ?, 8,
+                  '{}', ?, ?)
+        """,
+        (
+            _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK,
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_CHILD,
+            f"chain-{suffix}",
+            "2026-08-08T00:00:00Z",
+            "2026-08-08T00:00:00Z",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO backlog_contract_chain_current (
+            project_id, backlog_id, contract_chain_id,
+            root_contract_execution_id, current_contract_execution_id,
+            current_contract_id, parent_to_resume_contract_execution_id,
+            active_child_contract_execution_id, readiness_state, generation,
+            projection_watermark, projection_hash, active_chain_json,
+            next_legal_action_json, degraded_flags_json, source_refs_json,
+            updated_at
+        ) VALUES (?, ?, ?, '', ?, 'mf_parallel.v2', '', ?,
+                  'contract_active', 8, 1, ?, '{}', '{}', '{}', '[]', ?)
+        """,
+        (
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_CHILD,
+            f"chain-{suffix}",
+            _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK,
+            _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK,
+            "sha256:"
+            + hashlib.sha256(f"compact-{suffix}".encode()).hexdigest(),
+            "2026-08-08T00:00:00Z",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO parallel_branch_runtime_contract_revisions (
+            project_id, runtime_context_id, revision_id, task_id,
+            parent_task_id, backlog_id, contract_version, payload_json,
+            route_identity_json, route_gate_json, route_evidence_type, actor,
+            created_at
+        ) VALUES (?, ?, ?, ?, '', ?, 'mf_parallel.v2', '{}', '{}', '{}',
+                  'server_registered', 'fixture', ?)
+        """,
+        (
+            PID,
+            "rtctx-explicit-epoch-release-row3",
+            f"revision-{suffix}",
+            _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK,
+            _EXPLICIT_EPOCH_RELEASE_CHILD,
+            "2026-08-08T00:00:00Z",
+        ),
+    )
+    conn.execute(
+        "DELETE FROM parallel_branch_batch_items "
+        "WHERE project_id = ? AND batch_id = ?",
+        (PID, _EXPLICIT_EPOCH_RELEASE_BATCH),
+    )
+    conn.execute(
+        "DELETE FROM parallel_branch_batch_runtimes "
+        "WHERE project_id = ? AND batch_id = ?",
+        (PID, _EXPLICIT_EPOCH_RELEASE_BATCH),
+    )
+    epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    incomplete_fanin = copy.deepcopy(epoch.incomplete_fanin)
+    incomplete_fanin["released_children"][0].pop("binding_audit", None)
+    upsert_integration_epoch(
+        conn,
+        replace(epoch, incomplete_fanin=incomplete_fanin),
+    )
+    conn.commit()
+    assert parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) is None
+    assert _explicit_epoch_release_rollover_ledger_rows(conn) == []
+
+    renewed_body = _explicit_epoch_release_named_route_proof(
+        conn,
+        observer_session_id=f"obs-live-missing-batch-new-{suffix}",
+        route_token_ref=f"rtok-live-missing-batch-new-{suffix}",
+        allowed_actions=[
+            "integration_epoch_release_unlandable_child",
+            "task_timeline_append",
+        ],
+    )
+    return route_handler, renewed_body
+
+
 @pytest.mark.parametrize(
     ("route_backlog_id", "route_task_id"),
     [
@@ -126608,6 +126764,409 @@ def test_release_route_replay_appends_fresh2_fresh3_canonical_chain(conn):
             immutable_event
         ]
     assert previous_audit["sequence"] == 3
+
+
+def test_release_route_replay_reconstructs_wholly_missing_batch_runtime_once(
+    conn,
+):
+    route_handler, renewed_body = (
+        _prepare_live_missing_batch_runtime_release_replay(
+            conn,
+            suffix="positive",
+        )
+    )
+    before_event = dict(_explicit_epoch_release_events(conn)[0])
+    before_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    credited_facts = (
+        before_epoch.current_head,
+        before_epoch.last_merge_commit,
+        before_epoch.merge_cursor,
+        before_epoch.merged_prefix,
+        before_epoch.remaining_queue_item_ids,
+        before_epoch.status,
+    )
+
+    repaired = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=renewed_body,
+        )
+    )
+
+    assert repaired["replayed"] is True
+    assert repaired["replay_authority_renewed"] is True
+    assert repaired["batch_runtime_projection_repaired"] is True
+    assert repaired["projection_repaired"] is True
+    assert repaired["writes_performed"] is True
+    assert repaired["merge_credit_granted"] is False
+    runtime = parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    assert runtime is not None
+    assert runtime.target_ref == "refs/heads/main"
+    assert runtime.batch_base_commit == "a" * 40
+    assert runtime.current_target_head == _EXPLICIT_EPOCH_RELEASE_HEAD
+    assert runtime.batch_status == parallel_branch_runtime.BATCH_STATE_OPEN
+    assert len(runtime.items) == 1
+    batch_item = runtime.items[0]
+    assert batch_item.task_id == _EXPLICIT_EPOCH_RELEASE_PLAN_TASK
+    assert batch_item.status == parallel_branch_runtime.STATE_RELEASED_UNLANDABLE
+    assert batch_item.merge_queue_id == _EXPLICIT_EPOCH_RELEASE_QUEUE
+    assert batch_item.queue_index == 3
+    assert batch_item.worktree_path == "/tmp/live-missing-batch-runtime-row3"
+    assert get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    ).status == parallel_branch_runtime.STATE_RELEASED_UNLANDABLE
+    repaired_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    assert (
+        repaired_epoch.current_head,
+        repaired_epoch.last_merge_commit,
+        repaired_epoch.merge_cursor,
+        repaired_epoch.merged_prefix,
+        repaired_epoch.remaining_queue_item_ids,
+        repaired_epoch.status,
+    ) == credited_facts
+    binding_audit = repaired_epoch.incomplete_fanin["released_children"][0][
+        "binding_audit"
+    ]
+    projection_repair = binding_audit["batch_runtime_projection_repair"]
+    assert projection_repair["source"] == (
+        "server_derived_epoch_queue_context_binding"
+    )
+    assert projection_repair["credited_current_head"] == (
+        _EXPLICIT_EPOCH_RELEASE_HEAD
+    )
+    assert projection_repair["item_count"] == 1
+    assert projection_repair["merge_credit_granted"] is False
+    assert projection_repair["copy_safe"] is True
+    assert len(binding_audit["replay_authority_rollovers"]) == 1
+    assert len(_explicit_epoch_release_rollover_ledger_rows(conn)) == 1
+    assert [dict(row) for row in _explicit_epoch_release_events(conn)] == [
+        before_event
+    ]
+    read_model = parallel_branch_runtime.build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PID,
+        batch_id=_EXPLICIT_EPOCH_RELEASE_BATCH,
+        merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+        target_ref="refs/heads/main",
+    )
+    child_rows = [
+        row
+        for row in read_model.merge_queue["rows"]
+        if row["backlog_id"] == _EXPLICIT_EPOCH_RELEASE_CHILD
+    ]
+    assert len(child_rows) == 1
+    assert child_rows[0]["status"] == (
+        parallel_branch_runtime.STATE_RELEASED_UNLANDABLE
+    )
+    assert read_model.summary["status_counts"].get("running", 0) == 0
+
+    changes_before = conn.total_changes
+    replay = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=renewed_body,
+        )
+    )
+    assert replay["replayed"] is True
+    assert replay["replay_authority_renewed"] is False
+    assert replay["batch_runtime_projection_repaired"] is False
+    assert replay["projection_repaired"] is False
+    assert replay["writes_performed"] is False
+    assert conn.total_changes == changes_before
+    assert len(_explicit_epoch_release_events(conn)) == 1
+    assert len(_explicit_epoch_release_rollover_ledger_rows(conn)) == 1
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "missing_context_authority",
+        "missing_contract_authority",
+        "missing_compact_authority",
+        "missing_runtime_revision_authority",
+        "ambiguous_context_binding",
+        "orphan_batch_item",
+        "existing_parent_missing_item",
+        "existing_parent_tampered",
+    ],
+)
+def test_release_route_replay_missing_batch_runtime_binding_rejects_zero_write(
+    conn,
+    failure_mode,
+):
+    route_handler, renewed_body = (
+        _prepare_live_missing_batch_runtime_release_replay(
+            conn,
+            suffix=f"negative-{failure_mode}",
+        )
+    )
+    if failure_mode == "missing_context_authority":
+        conn.execute(
+            "UPDATE parallel_branch_runtime_contexts SET worktree_path = '' "
+            "WHERE project_id = ? AND task_id = ?",
+            (PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK),
+        )
+    elif failure_mode == "missing_contract_authority":
+        conn.execute(
+            "DELETE FROM contract_runtime_executions "
+            "WHERE project_id = ? AND contract_execution_id = ?",
+            (PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK),
+        )
+    elif failure_mode == "missing_compact_authority":
+        conn.execute(
+            "DELETE FROM backlog_contract_chain_current "
+            "WHERE project_id = ? AND backlog_id = ?",
+            (PID, _EXPLICIT_EPOCH_RELEASE_CHILD),
+        )
+    elif failure_mode == "missing_runtime_revision_authority":
+        conn.execute(
+            "DELETE FROM parallel_branch_runtime_contract_revisions "
+            "WHERE project_id = ? AND runtime_context_id = ?",
+            (PID, "rtctx-explicit-epoch-release-row3"),
+        )
+    elif failure_mode == "ambiguous_context_binding":
+        context = get_branch_context(
+            conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+        )
+        upsert_branch_context(
+            conn,
+            replace(
+                context,
+                task_id="cex-explicit-epoch-release-row3-ambiguous",
+                runtime_context_id="rtctx-explicit-row3-ambiguous",
+                branch_ref="refs/heads/codex/explicit-row3-ambiguous",
+                worktree_path="/tmp/explicit-row3-ambiguous",
+            ),
+        )
+    elif failure_mode == "orphan_batch_item":
+        conn.execute(
+            """
+            INSERT INTO parallel_branch_batch_items (
+                project_id, batch_id, task_id, branch_ref, worktree_path,
+                queue_index, status, branch_head, base_commit, checkpoint_id,
+                merge_commit, target_head_before_merge,
+                target_head_after_merge, snapshot_id, projection_id,
+                merge_queue_id, merge_preview_id, depends_on_json, retained,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, '', '', 3, ?, '', ?, '', '', '', '', '', '',
+                      ?, '', '[]', 1, ?, ?)
+            """,
+            (
+                PID,
+                _EXPLICIT_EPOCH_RELEASE_BATCH,
+                _EXPLICIT_EPOCH_RELEASE_PLAN_TASK,
+                parallel_branch_runtime.STATE_RELEASED_UNLANDABLE,
+                "a" * 40,
+                _EXPLICIT_EPOCH_RELEASE_QUEUE,
+                "2026-08-08T00:00:00Z",
+                "2026-08-08T00:00:00Z",
+            ),
+        )
+    elif failure_mode == "existing_parent_missing_item":
+        conn.execute(
+            """
+            INSERT INTO parallel_branch_batch_runtimes (
+                project_id, batch_id, target_ref, batch_base_commit,
+                current_target_head, batch_status, rollback_epoch,
+                replay_epoch, rollback_target_commit, rollback_snapshot_id,
+                rollback_projection_id, failure_reason, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, '', '', '', '', '', '', ?, ?)
+            """,
+            (
+                PID,
+                _EXPLICIT_EPOCH_RELEASE_BATCH,
+                "refs/heads/main",
+                "a" * 40,
+                _EXPLICIT_EPOCH_RELEASE_HEAD,
+                parallel_branch_runtime.BATCH_STATE_OPEN,
+                "2026-08-08T00:00:00Z",
+                "2026-08-08T00:00:00Z",
+            ),
+        )
+    else:
+        context = get_branch_context(
+            conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+        )
+        upsert_batch_merge_runtime(
+            conn,
+            BatchMergeRuntime(
+                project_id=PID,
+                batch_id=_EXPLICIT_EPOCH_RELEASE_BATCH,
+                target_ref="refs/heads/main",
+                batch_base_commit="a" * 40,
+                current_target_head="d" * 40,
+                items=(
+                    BatchMergeItem(
+                        task_id=_EXPLICIT_EPOCH_RELEASE_PLAN_TASK,
+                        branch_ref=context.branch_ref,
+                        worktree_path=context.worktree_path,
+                        queue_index=3,
+                        status=(
+                            parallel_branch_runtime.STATE_RELEASED_UNLANDABLE
+                        ),
+                        branch_head=context.head_commit,
+                        base_commit="a" * 40,
+                        merge_queue_id=_EXPLICIT_EPOCH_RELEASE_QUEUE,
+                    ),
+                ),
+            ),
+        )
+    conn.commit()
+    before_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_item = get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    )
+    before_contexts = parallel_branch_runtime.list_branch_contexts(
+        conn, PID, batch_id=_EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_runtime = parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_batch_items = parallel_branch_runtime.list_batch_merge_items(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_events = [
+        dict(row) for row in _explicit_epoch_release_events(conn)
+    ]
+    changes_before = conn.total_changes
+
+    status, result = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=renewed_body,
+        )
+    )
+
+    assert status == 409
+    assert result["error"] in {
+        "integration_epoch_release_plan_row_binding_ambiguous",
+        "integration_epoch_release_batch_runtime_projection_partial",
+        "integration_epoch_release_batch_runtime_reconstruction_authority_insufficient",
+        "integration_epoch_release_batch_item_binding_invalid",
+        "integration_epoch_release_batch_runtime_binding_invalid",
+    }
+    assert result["zero_write_rejection"] is True
+    assert conn.total_changes == changes_before
+    assert get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_epoch
+    assert get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    ) == before_item
+    assert parallel_branch_runtime.list_branch_contexts(
+        conn, PID, batch_id=_EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_contexts
+    assert parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_runtime
+    assert parallel_branch_runtime.list_batch_merge_items(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_batch_items
+    assert _explicit_epoch_release_rollover_ledger_rows(conn) == []
+    assert [dict(row) for row in _explicit_epoch_release_events(conn)] == (
+        before_events
+    )
+
+
+def test_release_route_replay_missing_batch_runtime_failure_rolls_back_all(
+    conn,
+    monkeypatch,
+):
+    route_handler, renewed_body = (
+        _prepare_live_missing_batch_runtime_release_replay(
+            conn,
+            suffix="rollback",
+        )
+    )
+    before_epoch = get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    before_item = get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    )
+    before_context = get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    )
+    before_events = [
+        dict(row) for row in _explicit_epoch_release_events(conn)
+    ]
+    original_upsert = parallel_branch_runtime.upsert_integration_epoch
+
+    def _write_epoch_then_fail(*args, **kwargs):
+        original_upsert(*args, **kwargs)
+        raise RuntimeError("forced missing batch runtime repair failure")
+
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "upsert_integration_epoch",
+        _write_epoch_then_fail,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="forced missing batch runtime repair failure",
+    ):
+        route_handler(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+                },
+                method="POST",
+                body=renewed_body,
+            )
+        )
+
+    assert get_integration_epoch(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == before_epoch
+    assert get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    ) == before_item
+    assert get_branch_context(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_CONTRACT_TASK
+    ) == before_context
+    assert parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) is None
+    assert parallel_branch_runtime.list_batch_merge_items(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    ) == []
+    assert _explicit_epoch_release_rollover_ledger_rows(conn) == []
+    assert [dict(row) for row in _explicit_epoch_release_events(conn)] == (
+        before_events
+    )
 
 
 def test_release_route_replay_refuses_unanchored_legacy_projection(conn):

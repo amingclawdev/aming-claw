@@ -15348,12 +15348,283 @@ def _merge_queue_item_possible_landed_evidence(
     }
 
 
+def _derive_missing_release_batch_runtime_projection(
+    conn: sqlite3.Connection,
+    *,
+    epoch: IntegrationEpoch,
+    item: MergeQueueItem,
+    context: BranchTaskRuntimeContext,
+    binding: Mapping[str, Any],
+) -> tuple[BatchMergeRuntime, BatchMergeItem, dict[str, Any]]:
+    """Derive one absent Batch projection from independent durable lineage.
+
+    This repair is deliberately narrower than ordinary Batch materialization:
+    it is available only after an immutable release event exists, only when
+    the whole parent projection is absent, and only for the uniquely bound
+    planned row.  No caller input participates in the reconstructed values.
+    """
+
+    orphan_items = list_batch_merge_items(
+        conn,
+        epoch.project_id,
+        epoch.batch_id,
+    )
+    if orphan_items:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_batch_runtime_projection_partial",
+            (
+                "missing BatchMergeRuntime cannot be reconstructed while "
+                "orphan BatchMergeItem rows exist"
+            ),
+            batch_id=epoch.batch_id,
+            orphan_task_ids=[candidate.task_id for candidate in orphan_items],
+        )
+
+    try:
+        contract_row = conn.execute(
+            """
+            SELECT contract_execution_id, backlog_id, contract_id,
+                   execution_state_revision
+            FROM contract_runtime_executions
+            WHERE project_id = ? AND contract_execution_id = ?
+            """,
+            (epoch.project_id, context.task_id),
+        ).fetchone()
+        compact_row = conn.execute(
+            """
+            SELECT current_contract_execution_id, current_contract_id,
+                   active_child_contract_execution_id, generation,
+                   projection_hash
+            FROM backlog_contract_chain_current
+            WHERE project_id = ? AND backlog_id = ?
+            """,
+            (epoch.project_id, item.backlog_id),
+        ).fetchone()
+        revision_row = conn.execute(
+            """
+            SELECT runtime_context_id, revision_id, task_id, backlog_id,
+                   contract_version
+            FROM parallel_branch_runtime_contract_revisions
+            WHERE project_id = ? AND runtime_context_id = ?
+            ORDER BY created_at DESC, revision_id DESC
+            LIMIT 1
+            """,
+            (
+                epoch.project_id,
+                runtime_context_id_for_branch_context(context),
+            ),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        contract_row = None
+        compact_row = None
+        revision_row = None
+    contract = dict(contract_row) if contract_row is not None else {}
+    compact = dict(compact_row) if compact_row is not None else {}
+    revision = dict(revision_row) if revision_row is not None else {}
+
+    required_values = {
+        "epoch_target_ref": epoch.target_ref,
+        "epoch_base_head": epoch.base_head,
+        "epoch_current_head": epoch.current_head,
+        "queue_item_backlog_id": item.backlog_id,
+        "queue_item_target_ref": item.target_ref,
+        "queue_item_base_commit": item.base_commit,
+        "context_runtime_context_id": runtime_context_id_for_branch_context(
+            context
+        ),
+        "context_branch_ref": context.branch_ref,
+        "context_worktree_path": context.worktree_path,
+        "context_base_commit": context.base_commit,
+        "context_head_commit": context.head_commit,
+        "contract_runtime_revision": contract.get(
+            "execution_state_revision"
+        ),
+        "compact_chain_generation": compact.get("generation"),
+        "compact_projection_hash": compact.get("projection_hash"),
+        "runtime_contract_revision_id": revision.get("revision_id"),
+    }
+    missing = [key for key, value in required_values.items() if not value]
+    missing.extend(
+        key
+        for key, value in (
+            ("contract_runtime_execution", contract),
+            ("backlog_contract_chain_current", compact),
+            ("runtime_contract_revision", revision),
+        )
+        if not value
+    )
+    mismatches = {
+        key: {"expected": expected, "actual": actual}
+        for key, expected, actual in (
+            ("binding_batch_id", epoch.batch_id, binding.get("batch_id")),
+            (
+                "binding_queue_item_id",
+                item.queue_item_id,
+                binding.get("planned_queue_item_id"),
+            ),
+            (
+                "binding_queue_index",
+                item.queue_index,
+                binding.get("planned_queue_index"),
+            ),
+            (
+                "binding_backlog_id",
+                item.backlog_id,
+                binding.get("backlog_id"),
+            ),
+            ("context_batch_id", epoch.batch_id, context.batch_id),
+            ("context_backlog_id", item.backlog_id, context.backlog_id),
+            (
+                "context_merge_queue_id",
+                epoch.merge_queue_id,
+                context.merge_queue_id,
+            ),
+            ("queue_project_id", epoch.project_id, item.project_id),
+            (
+                "queue_merge_queue_id",
+                epoch.merge_queue_id,
+                item.merge_queue_id,
+            ),
+            ("queue_target_ref", epoch.target_ref, item.target_ref),
+            ("queue_base_commit", epoch.base_head, item.base_commit),
+            ("context_base_commit", epoch.base_head, context.base_commit),
+        )
+        if expected != actual
+    }
+    compact_execution_ids = sorted({
+        str(value or "").strip()
+        for value in (
+            compact.get("current_contract_execution_id"),
+            compact.get("active_child_contract_execution_id"),
+        )
+        if str(value or "").strip()
+    })
+    contract_mismatches = {
+        key: {"expected": expected, "actual": actual}
+        for key, expected, actual in (
+            (
+                "contract_execution_id",
+                context.task_id,
+                contract.get("contract_execution_id"),
+            ),
+            ("contract_backlog_id", item.backlog_id, contract.get("backlog_id")),
+            ("contract_id", "mf_parallel.v2", contract.get("contract_id")),
+            (
+                "compact_execution_ids",
+                [context.task_id],
+                compact_execution_ids,
+            ),
+            (
+                "compact_contract_id",
+                "mf_parallel.v2",
+                compact.get("current_contract_id"),
+            ),
+            (
+                "revision_runtime_context_id",
+                runtime_context_id_for_branch_context(context),
+                revision.get("runtime_context_id"),
+            ),
+            ("revision_task_id", context.task_id, revision.get("task_id")),
+            ("revision_backlog_id", item.backlog_id, revision.get("backlog_id")),
+            (
+                "revision_contract_version",
+                "mf_parallel.v2",
+                revision.get("contract_version"),
+            ),
+        )
+        if expected != actual
+    }
+    mismatches.update(contract_mismatches)
+    if missing or mismatches or item.queue_index <= 0:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_batch_runtime_reconstruction_authority_insufficient",
+            (
+                "missing BatchMergeRuntime requires complete exact epoch, "
+                "planned-row, queue, and runtime-context authority"
+            ),
+            batch_id=epoch.batch_id,
+            queue_item_id=item.queue_item_id,
+            missing_fields=missing,
+            identity_mismatches=mismatches,
+            queue_index=item.queue_index,
+        )
+
+    batch_item = BatchMergeItem(
+        task_id=item.task_id,
+        branch_ref=item.branch_ref or context.branch_ref,
+        worktree_path=context.worktree_path,
+        queue_index=item.queue_index,
+        status=item.status,
+        branch_head=item.branch_head or context.head_commit,
+        base_commit=item.base_commit,
+        checkpoint_id=context.checkpoint_id,
+        merge_commit=item.merge_commit,
+        target_head_before_merge=item.target_head_before_merge,
+        target_head_after_merge=item.target_head_after_merge,
+        snapshot_id=item.snapshot_id or context.snapshot_id,
+        projection_id=item.projection_id or context.projection_id,
+        merge_queue_id=epoch.merge_queue_id,
+        merge_preview_id=item.merge_preview_id or context.merge_preview_id,
+        depends_on=item.depends_on,
+        retained=True,
+    )
+    runtime = BatchMergeRuntime(
+        project_id=epoch.project_id,
+        batch_id=epoch.batch_id,
+        target_ref=epoch.target_ref,
+        batch_base_commit=epoch.base_head,
+        current_target_head=epoch.current_head,
+        items=(batch_item,),
+        batch_status=BATCH_STATE_OPEN,
+    )
+    repair_audit = {
+        "schema_version": (
+            "mf_batch_parallel.release_batch_runtime_projection_repair.v1"
+        ),
+        "source": "server_derived_epoch_queue_context_binding",
+        "batch_id": epoch.batch_id,
+        "plan_row_task_id": item.task_id,
+        "contract_execution_id": context.task_id,
+        "runtime_context_id": runtime_context_id_for_branch_context(context),
+        "merge_queue_id": epoch.merge_queue_id,
+        "queue_item_id": item.queue_item_id,
+        "target_ref": epoch.target_ref,
+        "batch_base_commit": epoch.base_head,
+        "credited_current_head": epoch.current_head,
+        "batch_status": BATCH_STATE_OPEN,
+        "item_count": 1,
+        "item_terminal_status": STATE_RELEASED_UNLANDABLE,
+        "contract_runtime_execution_id": context.task_id,
+        "contract_runtime_revision": int(
+            contract.get("execution_state_revision") or 0
+        ),
+        "compact_chain_generation": int(compact.get("generation") or 0),
+        "compact_projection_hash": str(
+            compact.get("projection_hash") or ""
+        ),
+        "runtime_contract_revision_id": str(
+            revision.get("revision_id") or ""
+        ),
+        "merge_credit_granted": False,
+        "full_batch_completion_claimed": False,
+        "copy_safe": True,
+    }
+    return runtime, batch_item, repair_audit
+
+
 def _resolve_unlandable_release_projection_binding(
     conn: sqlite3.Connection,
     *,
     epoch: IntegrationEpoch,
     item: MergeQueueItem,
-) -> tuple[BranchTaskRuntimeContext, BatchMergeRuntime, BatchMergeItem, dict[str, Any]]:
+    allow_missing_batch_runtime_reconstruction: bool = False,
+) -> tuple[
+    BranchTaskRuntimeContext,
+    BatchMergeRuntime,
+    BatchMergeItem,
+    dict[str, Any],
+    bool,
+]:
     binding = resolve_batch_plan_row_task_binding(
         conn,
         epoch.project_id,
@@ -15396,16 +15667,31 @@ def _resolve_unlandable_release_projection_binding(
         )
     batch_runtime = get_batch_merge_runtime(conn, epoch.project_id, epoch.batch_id)
     if batch_runtime is None:
-        raise IntegrationEpochUnlandableChildReleaseError(
-            "integration_epoch_release_batch_runtime_missing",
-            "release requires the durable BatchMergeRuntime projection",
-            batch_id=epoch.batch_id,
+        if not allow_missing_batch_runtime_reconstruction:
+            raise IntegrationEpochUnlandableChildReleaseError(
+                "integration_epoch_release_batch_runtime_missing",
+                "release requires the durable BatchMergeRuntime projection",
+                batch_id=epoch.batch_id,
+            )
+        batch_runtime, batch_item, repair_audit = (
+            _derive_missing_release_batch_runtime_projection(
+                conn,
+                epoch=epoch,
+                item=item,
+                context=context,
+                binding=binding,
+            )
         )
-    batch_items = [
-        candidate
-        for candidate in batch_runtime.items
-        if candidate.task_id == item.task_id
-    ]
+        batch_items = [batch_item]
+        batch_runtime_projection_missing = True
+    else:
+        repair_audit = {}
+        batch_items = [
+            candidate
+            for candidate in batch_runtime.items
+            if candidate.task_id == item.task_id
+        ]
+        batch_runtime_projection_missing = False
     if len(batch_items) != 1:
         raise IntegrationEpochUnlandableChildReleaseError(
             "integration_epoch_release_batch_item_binding_invalid",
@@ -15415,6 +15701,41 @@ def _resolve_unlandable_release_projection_binding(
             candidate_count=len(batch_items),
         )
     batch_item = batch_items[0]
+    batch_projection_mismatches = {
+        key: {"expected": expected, "actual": actual}
+        for key, expected, actual in (
+            ("target_ref", epoch.target_ref, batch_runtime.target_ref),
+            (
+                "batch_base_commit",
+                epoch.base_head,
+                batch_runtime.batch_base_commit,
+            ),
+            (
+                "current_target_head",
+                epoch.current_head,
+                batch_runtime.current_target_head,
+            ),
+            ("batch_status", BATCH_STATE_OPEN, batch_runtime.batch_status),
+            ("item_queue_index", item.queue_index, batch_item.queue_index),
+            (
+                "item_merge_queue_id",
+                epoch.merge_queue_id,
+                batch_item.merge_queue_id,
+            ),
+        )
+        if expected != actual
+    }
+    if batch_projection_mismatches:
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_batch_runtime_binding_invalid",
+            (
+                "BatchMergeRuntime projection does not match the durable "
+                "integration epoch and planned queue row"
+            ),
+            batch_id=epoch.batch_id,
+            task_id=item.task_id,
+            identity_mismatches=batch_projection_mismatches,
+        )
     audit = {
         "schema_version": "mf_batch_parallel.release_projection_binding.v1",
         "plan_row_task_id": item.task_id,
@@ -15425,7 +15746,15 @@ def _resolve_unlandable_release_projection_binding(
         "queue_item_id": item.queue_item_id,
         "copy_safe": True,
     }
-    return context, batch_runtime, batch_item, audit
+    if repair_audit:
+        audit["batch_runtime_projection_repair"] = repair_audit
+    return (
+        context,
+        batch_runtime,
+        batch_item,
+        audit,
+        batch_runtime_projection_missing,
+    )
 
 
 def _terminalize_unlandable_release_projections(
@@ -15435,6 +15764,7 @@ def _terminalize_unlandable_release_projections(
     context: BranchTaskRuntimeContext,
     batch_runtime: BatchMergeRuntime,
     batch_item: BatchMergeItem,
+    batch_runtime_projection_missing: bool = False,
     reason: str,
     now_iso: str,
 ) -> tuple[MergeQueueItem, BranchTaskRuntimeContext, BatchMergeRuntime, bool]:
@@ -15465,7 +15795,10 @@ def _terminalize_unlandable_release_projections(
         )
         writes_performed = True
     saved_batch_runtime = batch_runtime
-    if batch_item.status != STATE_RELEASED_UNLANDABLE:
+    if (
+        batch_runtime_projection_missing
+        or batch_item.status != STATE_RELEASED_UNLANDABLE
+    ):
         saved_batch_runtime = upsert_batch_merge_runtime(
             conn,
             replace(
@@ -15507,6 +15840,13 @@ def _with_release_binding_audit(
             else {}
         )
         next_binding_audit = dict(binding_audit)
+        if (
+            "batch_runtime_projection_repair" in existing_binding_audit
+            and "batch_runtime_projection_repair" not in next_binding_audit
+        ):
+            next_binding_audit["batch_runtime_projection_repair"] = (
+                existing_binding_audit["batch_runtime_projection_repair"]
+            )
         if canonical_rollover_audits is None:
             if "replay_authority_rollovers" in existing_binding_audit:
                 next_binding_audit["replay_authority_rollovers"] = (
@@ -15621,9 +15961,11 @@ def _release_rollover_projection_audits(
             actual_count=len(records),
         )
     binding_audit = records[0].get("binding_audit")
+    if binding_audit is None:
+        return []
     if not isinstance(binding_audit, Mapping):
         _reject_release_rollover_audit(
-            "released_child_binding_audit_missing",
+            "released_child_binding_audit_malformed",
             queue_item_id=queue_item_id,
         )
     value = binding_audit.get("replay_authority_rollovers")
@@ -16352,12 +16694,17 @@ def release_integration_epoch_unlandable_child(
                 event_id=int(existing_event["id"] or 0),
                 queue_item_id=item_id,
             )
-        replay_context, replay_batch, replay_batch_item, binding_audit = (
-            _resolve_unlandable_release_projection_binding(
-                conn,
-                epoch=replay_epoch,
-                item=replay_item,
-            )
+        (
+            replay_context,
+            replay_batch,
+            replay_batch_item,
+            binding_audit,
+            batch_runtime_projection_missing,
+        ) = _resolve_unlandable_release_projection_binding(
+            conn,
+            epoch=replay_epoch,
+            item=replay_item,
+            allow_missing_batch_runtime_reconstruction=True,
         )
         canonical_rollover_audits: list[dict[str, Any]] | None = None
         replay_authority_renewed = False
@@ -16418,6 +16765,9 @@ def release_integration_epoch_unlandable_child(
                 context=replay_context,
                 batch_runtime=replay_batch,
                 batch_item=replay_batch_item,
+                batch_runtime_projection_missing=(
+                    batch_runtime_projection_missing
+                ),
                 reason=bounded_reason,
                 now_iso=now,
             )
@@ -16435,6 +16785,9 @@ def release_integration_epoch_unlandable_child(
             "replayed": True,
             "replay_authority_renewed": replay_authority_renewed,
             "legacy_rollover_migrated": legacy_rollover_migrated,
+            "batch_runtime_projection_repaired": (
+                batch_runtime_projection_missing
+            ),
             "projection_repaired": projection_repaired,
             "writes_performed": projection_repaired,
             "release_event_id": int(existing_event["id"] or 0),
@@ -16557,7 +16910,7 @@ def release_integration_epoch_unlandable_child(
             recoverable_child_refused=True,
         )
 
-    context, batch_runtime, batch_item, binding_audit = (
+    context, batch_runtime, batch_item, binding_audit, _ = (
         _resolve_unlandable_release_projection_binding(
             conn,
             epoch=epoch,
