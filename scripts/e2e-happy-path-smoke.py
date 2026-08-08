@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-RELEASE_VERSION = "0.2.0"
+RELEASE_VERSION = "0.2.1"
 SCHEMA_VERSION = "aming_claw.happy_path_smoke.v2"
 
 

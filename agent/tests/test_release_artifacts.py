@@ -30,6 +30,17 @@ def test_v2_release_versions_are_synchronized():
     assert preflight["checks"]["docker_context_excludes_local_state"] is True
 
 
+def test_codex_manifest_default_prompts_satisfy_doctor_contract():
+    manifest = json.loads(
+        (ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    prompts = manifest["interface"]["defaultPrompt"]
+    assert 1 <= len(prompts) <= 3
+    assert all(isinstance(prompt, str) and len(prompt) <= 128 for prompt in prompts)
+    assert any("aming-claw-onboard" in prompt for prompt in prompts)
+    assert any("onboard route guide" in prompt for prompt in prompts)
+
+
 def test_happy_path_smoke_declares_two_zero_bypass_reference_worlds():
     smoke = _load_smoke_module()
     assert [world.lane for world in smoke.REFERENCE_WORLDS] == [
@@ -113,7 +124,8 @@ def test_release_docs_name_replay_and_chain_trailer_boundaries():
     assert direct_fix_lines == [
         "The retired direct-fix route names are audit history only and must never be"
     ]
-    assert "`v0.2.0`" in runbook
+    assert "`v0.2.1`" in runbook
+    assert "move the audit-archived `v0.2.0` tag" in runbook
     assert "`v2.0.0`" not in runbook
 
 

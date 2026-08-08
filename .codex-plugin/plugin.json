@@ -1,6 +1,6 @@
 {
   "name": "aming-claw",
-  "version": "0.2.0+codex.20260808150148",
+  "version": "0.2.1+codex.20260808153702",
   "description": "Codex plugin packaging for Aming Claw governance with one onboard-first skill entrypoint and the onboard_route_guide MCP tool.",
   "license": "FSL-1.1-MIT",
   "keywords": [
@@ -30,7 +30,7 @@
       "MCP"
     ],
     "defaultPrompt": [
-      "Start with the active aming-claw-onboard skill, then call the MCP onboard route guide (`onboard_route_guide`) before governed mutations.",
+      "Use the active aming-claw-onboard skill and MCP onboard route guide before governed mutations.",
       "If governance is offline, ask the user to run aming-claw start; do not treat archived skills as active.",
       "Before implementation, run runtime_status, graph_status, graph_operations_queue, and backlog checks."
     ],

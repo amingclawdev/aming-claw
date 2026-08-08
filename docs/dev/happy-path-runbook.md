@@ -156,7 +156,8 @@ removes only the profile's disposable container state.
    zero.
 7. Rerun the happy-path smoke after deploy.
 8. Append postdeploy verification and close-ready, close release rows, then tag
-   `v0.2.0` only if the tag target equals the deployed/full-graph commit.
+   `v0.2.1` only if the tag target equals the deployed/full-graph commit. Never
+   move the audit-archived `v0.2.0` tag.
 9. Refresh the local Codex plugin cache with the plugin-creator cachebuster
    helper, validate the manifest, reinstall from the configured local
    marketplace, and test from a new Codex task.
