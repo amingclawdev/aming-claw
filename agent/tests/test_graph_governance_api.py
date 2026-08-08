@@ -51919,6 +51919,27 @@ def test_pre_lineage_rejoin_guide_advertises_one_bounded_replacement(
         runtime_context_session_token_ref(context)
     )
 
+    replacement = _pre_lineage_rejoin(
+        case,
+        body_updates={
+            "session_token_ref": runtime_context_session_token_ref(context),
+            "reason": (
+                "the first rejoin envelope was lost before any worker write"
+            ),
+        },
+    )
+    assert replacement["bounded_rejoin_kind"] == "bounded_replacement_rejoin"
+    assert replacement["bounded_replacement_rejoin"] is True
+    replaced = get_branch_context(conn, PID, case["task_id"])
+    assert replaced is not None
+    exhausted = server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=replaced,
+    )
+    assert exhausted["eligible"] is False
+    assert exhausted["mode"] == "replacement_exhausted"
+
 
 def test_runtime_context_pre_lineage_legacy_agent_plus_route_drift_is_zero_write(
     conn,

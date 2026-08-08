@@ -12057,7 +12057,10 @@ def rejoin_mf_subagent_runtime_session_token(
         revision_rejoin
         or reopen_for_revision
         or context.last_recovery_action
-        != "mf_subagent_session_token_rejoin_issued"
+        not in {
+            "mf_subagent_session_token_rejoin_issued",
+            "mf_subagent_pre_lineage_session_token_rejoin_issued",
+        }
     ):
         raise BranchRuntimeFenceError("bounded_replacement_rejoin_invalid")
     if (
