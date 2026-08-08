@@ -83119,6 +83119,7 @@ def _contract_runtime_apply_mf_parallel_context_projection(
             guide["same_lane_worker_commit_recovery_projection"] = True
             projected["runtime_guide"] = guide
     projected = _contract_runtime_apply_terminal_context_audit_only_projection(
+        conn,
         projected,
         projection=projection,
     )
@@ -84138,7 +84139,128 @@ def _contract_runtime_projection_context_summary(
     }
 
 
+def _contract_runtime_terminal_bypass_timeline_matches(
+    conn,
+    *,
+    record: Mapping[str, Any],
+    line: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    continuation_authority: Mapping[str, Any],
+) -> bool:
+    if conn is None:
+        return False
+    bypass_identity = str(payload.get("bypass_identity") or "").strip()
+    if not bypass_identity:
+        return False
+    correlation_id = f"contract-line-bypass:{bypass_identity}"
+    try:
+        rows = conn.execute(
+            """
+            SELECT backlog_id, task_id, event_type, event_kind, actor,
+                   status, correlation_id, commit_sha, payload_json,
+                   phase, decision, schema_version
+            FROM task_timeline_events
+            WHERE project_id = ?
+              AND correlation_id = ?
+              AND event_type = 'contract_line_bypass'
+            ORDER BY id
+            """,
+            (
+                str(record.get("project_id") or "").strip(),
+                correlation_id,
+            ),
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    if len(rows) != 1:
+        return False
+    row = rows[0]
+    event_payload = backlog_runtime.parse_json_object(
+        _row_get(row, "payload_json", "{}")
+    )
+    try:
+        bypass_revision = int(payload.get("execution_state_revision") or 0)
+        event_schema_version = int(
+            _row_get(row, "schema_version", 0) or 0
+        )
+    except (TypeError, ValueError):
+        return False
+    exact_event_fields = {
+        "bypass_identity": bypass_identity,
+        "classification": str(payload.get("classification") or "").strip(),
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "source_backlog_id": str(record.get("backlog_id") or "").strip(),
+        "diagnostic_backlog_id": str(
+            payload.get("diagnostic_backlog_id") or ""
+        ).strip(),
+        "reason": str(payload.get("reason") or "").strip(),
+        "execution_state_revision": bypass_revision,
+        "line_id": "worker_commit",
+        "no_pass_claim": True,
+        "disposition": "proceeded_with_exception",
+        "diagnostic_created": True,
+        "reason_code": str(payload.get("classification") or "").strip(),
+        "root_bypass_identity": bypass_identity,
+        "root_diagnostic_backlog_id": str(
+            payload.get("diagnostic_backlog_id") or ""
+        ).strip(),
+        "root_line_id": "worker_commit",
+        "no_pass_generation_id": str(
+            (
+                payload.get("no_pass_generation")
+                if isinstance(payload.get("no_pass_generation"), Mapping)
+                else {}
+            ).get("generation_id")
+            or ""
+        ).strip(),
+        "no_pass_generation_role": "root",
+    }
+    event_has_request_anchor = (
+        "request_hash" in event_payload or "evidence_refs" in event_payload
+    )
+    request_anchor_matches = bool(
+        (
+            event_payload.get("request_hash")
+            == str(payload.get("request_hash") or "").strip()
+            and event_payload.get("evidence_refs")
+            == payload.get("evidence_refs")
+        )
+        if event_has_request_anchor
+        else payload.get("evidence_refs") == []
+    )
+    return bool(
+        str(_row_get(row, "backlog_id", "") or "").strip()
+        == exact_event_fields["source_backlog_id"]
+        and str(_row_get(row, "task_id", "") or "").strip()
+        == exact_event_fields["contract_execution_id"]
+        and str(_row_get(row, "event_kind", "") or "").strip()
+        == "record_blocker"
+        and str(_row_get(row, "phase", "") or "").strip()
+        == "contract_runtime_bypass"
+        and str(_row_get(row, "decision", "") or "").strip()
+        == "linked_open_diagnostic_no_pass"
+        and event_schema_version == 2
+        and str(_row_get(row, "actor", "") or "").strip()
+        == str(line.get("actor_role") or "").strip()
+        and str(_row_get(row, "status", "") or "").strip()
+        == "proceeded_with_exception"
+        and str(_row_get(row, "correlation_id", "") or "").strip()
+        == correlation_id
+        and str(_row_get(row, "commit_sha", "") or "").strip()
+        == str(continuation_authority.get("commit_sha") or "").strip()
+        and all(
+            event_payload.get(field) == expected
+            for field, expected in exact_event_fields.items()
+        )
+        and event_payload.get("authoritative_pass_synthesized") is False
+        and request_anchor_matches
+    )
+
+
 def _contract_runtime_apply_terminal_context_audit_only_projection(
+    conn,
     record: Mapping[str, Any],
     *,
     projection: Mapping[str, Any],
@@ -84171,6 +84293,7 @@ def _contract_runtime_apply_terminal_context_audit_only_projection(
         return dict(record)
 
     matching_bypasses: list[tuple[int, Mapping[str, Any]]] = []
+    bypass_validation_errors: list[str] = []
     for index, line in enumerate(record.get("completed_lines") or []):
         if not isinstance(line, Mapping):
             continue
@@ -84185,52 +84308,356 @@ def _contract_runtime_apply_terminal_context_audit_only_projection(
             or payload.get("line_instance_id")
             or ""
         ).strip()
-        runtime_context_matches = bool(
-            ("runtime_context_id", runtime_context_id) in context_keys
-            or line_instance_id == f"runtime_context:{runtime_context_id}"
-        )
+        runtime_context_keys = {
+            value
+            for kind, value in context_keys
+            if kind == "runtime_context_id"
+        }
+        runtime_context_matches = runtime_context_keys == {runtime_context_id}
         task_context_keys = {
             value for kind, value in context_keys if kind == "task_id"
         }
-        task_matches = bool(
-            task_context_keys == {task_id}
-            or (
-                not task_context_keys
-                and line_instance_id == f"runtime_context:{runtime_context_id}"
-            )
-        )
+        task_matches = task_context_keys == {task_id}
         try:
             bypass_revision = int(
                 payload.get("execution_state_revision") or 0
             )
         except (TypeError, ValueError):
             bypass_revision = 0
-        if (
-            str(line.get("line_id") or "").strip() == "worker_commit"
-            and str(line.get("actor_role") or "").strip()
-            in {"observer", "qa"}
-            and str(line.get("evidence_kind") or "").strip()
-            == "contract_line_bypass"
-            and str(line.get("status") or "").strip().lower() == "waived"
-            and str(line.get("disposition") or "").strip()
-            == "proceeded_with_exception"
-            and line.get("no_pass_claim") is True
-            and str(payload.get("schema_version") or "").strip()
-            == "contract_line_bypass.v1"
-            and str(payload.get("disposition") or "").strip()
-            == "proceeded_with_exception"
-            and payload.get("no_pass_claim") is True
-            and str(payload.get("source_backlog_id") or "").strip()
-            == str(record.get("backlog_id") or "").strip()
-            and str(payload.get("bypass_identity") or "").strip()
-            and str(payload.get("diagnostic_backlog_id") or "").strip()
-            and str(payload.get("classification") or "").strip()
-            and str(payload.get("decision") or "").strip()
-            and bypass_revision > 0
-            and runtime_context_matches
-            and task_matches
-        ):
+        continuation_authority = (
+            payload.get("continuation_authority")
+            if isinstance(payload.get("continuation_authority"), Mapping)
+            else {}
+        )
+        no_pass_generation = (
+            payload.get("no_pass_generation")
+            if isinstance(payload.get("no_pass_generation"), Mapping)
+            else {}
+        )
+        request_fields = {
+            "bypass_identity": str(
+                payload.get("bypass_identity") or ""
+            ).strip(),
+            "line_id": "worker_commit",
+            "stage_id": str(line.get("stage_id") or "").strip(),
+            "execution_state_revision": bypass_revision,
+            "diagnostic_backlog_id": str(
+                payload.get("diagnostic_backlog_id") or ""
+            ).strip(),
+            "classification": str(
+                payload.get("classification") or ""
+            ).strip(),
+            "reason": str(payload.get("reason") or "").strip(),
+            "decision": str(payload.get("decision") or "").strip(),
+            "actor_role": str(line.get("actor_role") or "").strip(),
+            "evidence_refs": payload.get("evidence_refs") or [],
+            "continuation_authority": dict(continuation_authority),
+        }
+        continuation_keys = {
+            "schema_version",
+            "source",
+            "server_derived",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "commit_sha",
+            "worker_commit_sha",
+            "canonical_historical_commit_sha",
+            "commit_parent_sha",
+            "diff_base_commit",
+            "changed_files",
+            "owned_files",
+            "commit_diff_files",
+            "out_of_scope_files",
+            "clean_worktree",
+            "historical_lineage_stale",
+            "db_verified",
+            "no_pass_claim",
+        }
+        implementation_commits = {
+            str(item.get("commit_sha") or "").strip()
+            for item in record.get("completed_lines") or []
+            if isinstance(item, Mapping)
+            and str(item.get("line_id") or "").strip()
+            == "worker_implementation"
+            and (
+                "runtime_context_id",
+                runtime_context_id,
+            )
+            in _contract_runtime_line_context_keys(item)
+            and str(item.get("commit_sha") or "").strip()
+        }
+        continuation_commit = str(
+            continuation_authority.get("commit_sha") or ""
+        ).strip()
+        from .parallel_branch_runtime import (
+            get_branch_context_by_runtime_context_id,
+        )
+
+        durable_context = get_branch_context_by_runtime_context_id(
+            conn,
+            str(record.get("project_id") or "").strip(),
+            runtime_context_id,
+        )
+        durable_owned_files = (
+            list(getattr(durable_context, "owned_files", ()) or ())
+            if durable_context is not None
+            else []
+        )
+        durable_base_commit = str(
+            getattr(durable_context, "base_commit", "") or ""
+        ).strip()
+        continuation_exact = bool(
+            set(continuation_authority) == continuation_keys
+            and str(continuation_authority.get("schema_version") or "")
+            == "contract_runtime.worker_commit_bypass_continuation.v1"
+            and str(continuation_authority.get("source") or "")
+            == "canonical_worker_implementation+runtime_context_git"
+            and continuation_authority.get("server_derived") is True
+            and continuation_authority.get("db_verified") is True
+            and continuation_authority.get("no_pass_claim") is True
+            and continuation_authority.get("clean_worktree") is True
+            and continuation_authority.get("historical_lineage_stale") is False
+            and continuation_authority.get("out_of_scope_files") == []
+            and durable_context is not None
+            and str(getattr(durable_context, "task_id", "") or "").strip()
+            == task_id
+            and str(
+                getattr(durable_context, "parent_task_id", "") or ""
+            ).strip()
+            == str(terminal_context.get("parent_task_id") or "").strip()
+            and str(continuation_authority.get("runtime_context_id") or "")
+            == runtime_context_id
+            and str(continuation_authority.get("task_id") or "") == task_id
+            and str(continuation_authority.get("parent_task_id") or "")
+            == str(terminal_context.get("parent_task_id") or "").strip()
+            and len(implementation_commits) == 1
+            and continuation_commit in implementation_commits
+            and continuation_commit
+            == str(continuation_authority.get("worker_commit_sha") or "")
+            == str(
+                continuation_authority.get("canonical_historical_commit_sha")
+                or ""
+            )
+            == str(line.get("commit_sha") or "").strip()
+            and str(continuation_authority.get("commit_parent_sha") or "")
+            == str(continuation_authority.get("diff_base_commit") or "")
+            == durable_base_commit
+            and continuation_authority.get("changed_files")
+            == continuation_authority.get("owned_files")
+            == continuation_authority.get("commit_diff_files")
+            == durable_owned_files
+        )
+        try:
+            root_execution_state_revision = int(
+                no_pass_generation.get("root_execution_state_revision") or 0
+            )
+        except (TypeError, ValueError):
+            root_execution_state_revision = 0
+        generation_keys = {
+            "schema_version",
+            "generation_id",
+            "role",
+            "root_bypass_identity",
+            "root_diagnostic_backlog_id",
+            "root_stage_id",
+            "root_line_id",
+            "root_line_instance_id",
+            "root_classification",
+            "root_execution_state_revision",
+            "gate_reason_code",
+            "gate_reason",
+            "original_gate_evidence_status",
+            "diagnostic_created",
+            "no_pass_claim",
+            "authoritative_pass_synthesized",
+        }
+        expected_generation_id = (
+            "bypassgen-"
+            + stable_sha256(
+                {
+                    "project_id": str(record.get("project_id") or ""),
+                    "source_backlog_id": str(record.get("backlog_id") or ""),
+                    "contract_execution_id": str(
+                        record.get("contract_execution_id") or ""
+                    ),
+                    "root_bypass_identity": request_fields[
+                        "bypass_identity"
+                    ],
+                    "root_line_instance_id": line_instance_id,
+                }
+            )[7:27]
+        )
+        generation_checks = {
+            "closed_schema": set(no_pass_generation) == generation_keys,
+            "schema_version": str(
+                no_pass_generation.get("schema_version") or ""
+            )
+            == "contract_line_bypass_generation_link.v1",
+            "role": str(no_pass_generation.get("role") or "") == "root",
+            "generation_id": str(
+                no_pass_generation.get("generation_id") or ""
+            )
+            == expected_generation_id,
+            "no_pass_claim": no_pass_generation.get("no_pass_claim") is True,
+            "authoritative_pass_synthesized": no_pass_generation.get(
+                "authoritative_pass_synthesized"
+            )
+            is False,
+            "root_bypass_identity": str(
+                no_pass_generation.get("root_bypass_identity") or ""
+            )
+            == request_fields["bypass_identity"],
+            "root_diagnostic_backlog_id": str(
+                no_pass_generation.get("root_diagnostic_backlog_id") or ""
+            )
+            == request_fields["diagnostic_backlog_id"],
+            "root_stage_id": str(
+                no_pass_generation.get("root_stage_id") or ""
+            )
+            == request_fields["stage_id"],
+            "root_line_id": str(
+                no_pass_generation.get("root_line_id") or ""
+            )
+            == "worker_commit",
+            "root_line_instance_id": str(
+                no_pass_generation.get("root_line_instance_id") or ""
+            )
+            == line_instance_id,
+            "root_classification": str(
+                no_pass_generation.get("root_classification") or ""
+            )
+            == request_fields["classification"],
+            "root_execution_state_revision": (
+                root_execution_state_revision == bypass_revision
+            ),
+            "gate_reason_code": str(
+                no_pass_generation.get("gate_reason_code") or ""
+            )
+            == request_fields["classification"],
+            "gate_reason": str(
+                no_pass_generation.get("gate_reason") or ""
+            )
+            == request_fields["reason"],
+            "original_gate_evidence_status": str(
+                no_pass_generation.get("original_gate_evidence_status") or ""
+            )
+            == "blocked_at_root",
+            "diagnostic_created": no_pass_generation.get(
+                "diagnostic_created"
+            )
+            is True,
+        }
+        generation_exact = all(generation_checks.values())
+        payload_keys = {
+            "schema_version",
+            "bypass_identity",
+            "request_hash",
+            "source_backlog_id",
+            "diagnostic_backlog_id",
+            "classification",
+            "reason",
+            "decision",
+            "blocked_owner_role",
+            "blocked_evidence_kind",
+            "execution_state_revision",
+            "disposition",
+            "no_pass_claim",
+            "evidence_refs",
+            "no_pass_generation",
+            "continuation_authority",
+        }
+        line_keys = {
+            "stage_id",
+            "line_id",
+            "actor_role",
+            "evidence_kind",
+            "status",
+            "disposition",
+            "no_pass_claim",
+            "payload",
+            "commit_sha",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+        }
+        if line_instance_id:
+            line_keys.add("line_instance_id")
+        validation_checks = {
+            "line_closed_schema": set(line) == line_keys,
+            "stage_id": str(line.get("stage_id") or "").strip()
+            == "worker_commit",
+            "line_id": str(line.get("line_id") or "").strip()
+            == "worker_commit",
+            "actor_role": str(line.get("actor_role") or "").strip()
+            == "observer",
+            "evidence_kind": str(line.get("evidence_kind") or "").strip()
+            == "contract_line_bypass",
+            "status": str(line.get("status") or "").strip().lower()
+            == "waived",
+            "line_disposition": str(line.get("disposition") or "").strip()
+            == "proceeded_with_exception",
+            "line_no_pass_claim": line.get("no_pass_claim") is True,
+            "payload_schema": str(payload.get("schema_version") or "").strip()
+            == "contract_line_bypass.v1",
+            "payload_closed_schema": set(payload) == payload_keys,
+            "payload_disposition": str(
+                payload.get("disposition") or ""
+            ).strip()
+            == "proceeded_with_exception",
+            "payload_no_pass_claim": payload.get("no_pass_claim") is True,
+            "blocked_owner_role": str(
+                payload.get("blocked_owner_role") or ""
+            ).strip()
+            == "mf_sub",
+            "blocked_evidence_kind": str(
+                payload.get("blocked_evidence_kind") or ""
+            ).strip()
+            == "worker_commit",
+            "source_backlog_id": str(
+                payload.get("source_backlog_id") or ""
+            ).strip()
+            == str(record.get("backlog_id") or "").strip(),
+            "bypass_identity": bool(
+                str(payload.get("bypass_identity") or "").strip()
+            ),
+            "diagnostic_backlog_id": bool(
+                str(payload.get("diagnostic_backlog_id") or "").strip()
+            ),
+            "reason": bool(str(payload.get("reason") or "").strip()),
+            "classification": str(
+                payload.get("classification") or ""
+            ).strip()
+            == "structural_deadlock_recorded_exception",
+            "decision": str(payload.get("decision") or "").strip()
+            == "no_pass",
+            "execution_state_revision": bypass_revision > 0,
+            "evidence_refs": isinstance(payload.get("evidence_refs"), list),
+            "request_hash": str(payload.get("request_hash") or "").strip()
+            == stable_sha256(request_fields),
+            "continuation_authority": continuation_exact,
+            "no_pass_generation": generation_exact,
+            "runtime_context_identity": runtime_context_matches,
+            "task_identity": task_matches,
+            "timeline_anchor": _contract_runtime_terminal_bypass_timeline_matches(
+                conn,
+                record=record,
+                line=line,
+                payload=payload,
+                continuation_authority=continuation_authority,
+            ),
+        }
+        if all(validation_checks.values()):
             matching_bypasses.append((index, line))
+        elif validation_checks["line_id"] and validation_checks["evidence_kind"]:
+            bypass_validation_errors.extend(
+                key for key, accepted in validation_checks.items() if not accepted
+            )
+            bypass_validation_errors.extend(
+                f"no_pass_generation.{key}"
+                for key, accepted in generation_checks.items()
+                if not accepted
+            )
 
     bypass_valid = len(matching_bypasses) == 1
     bypass_index = matching_bypasses[0][0] if bypass_valid else -1
@@ -84267,6 +84694,9 @@ def _contract_runtime_apply_terminal_context_audit_only_projection(
         ).strip(),
         "bypass_completed_line_index": bypass_index,
         "bypass_audit_valid": bypass_valid,
+        "bypass_audit_validation_errors": sorted(
+            set(bypass_validation_errors)
+        ),
         "no_pass_claim": True,
         "authoritative_pass_synthesized": False,
         "historical_source_rewrite_allowed": False,
@@ -145764,6 +146194,12 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
                     ),
                 )
             event_payload = {**link, "diagnostic_backlog_id": diagnostic_id}
+            event_payload["request_hash"] = str(
+                written_payload.get("request_hash") or ""
+            ).strip()
+            event_payload["evidence_refs"] = list(
+                written_payload.get("evidence_refs") or []
+            )
             common = {
                 "project_id": project_id,
                 "task_id": str(body.get("task_id") or execution_id),

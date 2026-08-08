@@ -23165,6 +23165,19 @@ def test_worker_results_deadlock_invalid_guide_and_stored_bypass_remain_terminal
     observer_view = case.runtime.current_record(
         case.successor["contract_execution_id"], actor_role="observer"
     )
+    bypass_record, bypass_projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=case.runtime.store.get(
+                case.successor["contract_execution_id"]
+            ),
+            actor_role="observer",
+        )
+    )
+    assert bypass_record["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "worker_commit"
+    )
     bypass_result = case.runtime.bypass_current_line(
         case.successor["contract_execution_id"],
         {
@@ -23176,20 +23189,45 @@ def test_worker_results_deadlock_invalid_guide_and_stored_bypass_remain_terminal
                 "runtime_guide_hash"
             ],
             "diagnostic_backlog_id": "AC-WORKER-RESULTS-AUDIT-ONLY",
-            "classification": "historical_deadlock_already_waived",
+            "classification": "structural_deadlock_recorded_exception",
             "reason": "preserve terminal no-PASS audit without resurrection",
-            "decision": "continue_with_audited_exception",
+            "decision": "no_pass",
             "evidence_refs": ["timeline:historical-worker-commit-waiver"],
             "continuation_authority": {
+                "schema_version": (
+                    "contract_runtime.worker_commit_bypass_continuation.v1"
+                ),
+                "source": "canonical_worker_implementation+runtime_context_git",
+                "server_derived": True,
                 "runtime_context_id": (
                     case.runtime_context.runtime_context_id
                 ),
                 "task_id": case.runtime_context.task_id,
-                "parent_task_id": case.backlog_id,
+                "parent_task_id": case.runtime_context.parent_task_id,
                 "commit_sha": case.implementation_commit,
+                "worker_commit_sha": case.implementation_commit,
+                "canonical_historical_commit_sha": (
+                    case.implementation_commit
+                ),
+                "commit_parent_sha": case.base_commit,
+                "diff_base_commit": case.base_commit,
+                "changed_files": [case.owned_file],
+                "owned_files": [case.owned_file],
+                "commit_diff_files": [case.owned_file],
+                "out_of_scope_files": [],
+                "clean_worktree": True,
+                "historical_lineage_stale": False,
+                "db_verified": True,
+                "no_pass_claim": True,
             },
         },
         actor_role="observer",
+        projected_completed_lines=(
+            server._contract_runtime_projection_completed_lines(
+                bypass_projection
+            )
+        ),
+        projection=bypass_projection,
     )
     assert bypass_result["ok"] is True
     bypassed_record = case.runtime.store.get(
@@ -23197,6 +23235,86 @@ def test_worker_results_deadlock_invalid_guide_and_stored_bypass_remain_terminal
     )
     assert bypassed_record["completed_lines"][-1]["line_id"] == "worker_commit"
     assert bypassed_record["completed_lines"][-1]["status"] == "waived"
+    bypass_line = bypassed_record["completed_lines"][-1]
+    bypass_payload = bypass_line["payload"]
+    expected_request_fields = {
+        "bypass_identity": bypass_payload["bypass_identity"],
+        "line_id": "worker_commit",
+        "stage_id": bypass_line["stage_id"],
+        "execution_state_revision": bypass_payload[
+            "execution_state_revision"
+        ],
+        "diagnostic_backlog_id": bypass_payload[
+            "diagnostic_backlog_id"
+        ],
+        "classification": bypass_payload["classification"],
+        "reason": bypass_payload["reason"],
+        "decision": bypass_payload["decision"],
+        "actor_role": bypass_line["actor_role"],
+        "evidence_refs": bypass_payload["evidence_refs"],
+        "continuation_authority": bypass_payload[
+            "continuation_authority"
+        ],
+    }
+    assert bypass_payload["request_hash"] == server.stable_sha256(
+        expected_request_fields
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=case.backlog_id,
+        task_id=case.successor["contract_execution_id"],
+        event_type="contract_line_bypass",
+        event_kind="record_blocker",
+        phase="contract_runtime_bypass",
+        actor="observer",
+        status="proceeded_with_exception",
+        decision="linked_open_diagnostic_no_pass",
+        correlation_id=(
+            f"contract-line-bypass:{bypass_payload['bypass_identity']}"
+        ),
+        commit_sha=case.implementation_commit,
+        payload={
+            "authoritative_pass_synthesized": False,
+            "bypass_identity": bypass_payload["bypass_identity"],
+            "classification": bypass_payload["classification"],
+            "contract_execution_id": case.successor[
+                "contract_execution_id"
+            ],
+            "source_backlog_id": case.backlog_id,
+            "diagnostic_backlog_id": bypass_payload[
+                "diagnostic_backlog_id"
+            ],
+            "reason": bypass_payload["reason"],
+            "execution_state_revision": bypass_payload[
+                "execution_state_revision"
+            ],
+            "line_id": "worker_commit",
+            "no_pass_claim": True,
+            "disposition": "proceeded_with_exception",
+            "diagnostic_created": True,
+            "reason_code": bypass_payload["classification"],
+            "root_bypass_identity": bypass_payload["bypass_identity"],
+            "root_diagnostic_backlog_id": bypass_payload[
+                "diagnostic_backlog_id"
+            ],
+            "root_line_id": "worker_commit",
+            "no_pass_generation_id": bypass_payload[
+                "no_pass_generation"
+            ]["generation_id"],
+            "no_pass_generation_role": "root",
+            "request_hash": bypass_payload["request_hash"],
+            "evidence_refs": bypass_payload["evidence_refs"],
+        },
+    )
+    conn.commit()
+    assert server._contract_runtime_terminal_bypass_timeline_matches(
+        conn,
+        record=bypassed_record,
+        line=bypass_line,
+        payload=bypass_payload,
+        continuation_authority=bypass_payload["continuation_authority"],
+    ) is True
     bypassed_projection = server._runtime_context_contract_runtime_worker_projection(
         conn,
         contract_execution_id=case.successor["contract_execution_id"],
@@ -23260,7 +23378,16 @@ def test_worker_results_deadlock_invalid_guide_and_stored_bypass_remain_terminal
     assert terminal_current["contract_runtime_current_state"]["terminal"] is True
     assert terminal_current["contract_runtime_current_state"][
         "terminal_disposition"
-    ]["bypass_audit_valid"] is True
+    ]["bypass_audit_valid"] is True, {
+        "validation_errors": terminal_current[
+            "contract_runtime_current_state"
+        ]["terminal_disposition"].get("bypass_audit_validation_errors"),
+        "line": bypass_line,
+        "continuation_keys": sorted(
+            (bypass_payload.get("continuation_authority") or {})
+        ),
+        "generation": bypass_payload.get("no_pass_generation"),
+    }
     assert terminal_current["contract_runtime_current_state"][
         "readiness_state"
     ] == "completed_with_exception"
@@ -23273,24 +23400,130 @@ def test_worker_results_deadlock_invalid_guide_and_stored_bypass_remain_terminal
         record=immutable_terminal_source,
         actor_role="observer",
     )
-    tampered_bypass_record = copy.deepcopy(immutable_terminal_source)
-    tampered_bypass_record["completed_lines"][-1]["payload"][
-        "source_backlog_id"
-    ] = "AC-UNRELATED-BACKLOG"
-    blocked_terminal = (
-        server._contract_runtime_apply_terminal_context_audit_only_projection(
-            tampered_bypass_record,
-            projection=terminal_projection,
+
+    def set_nested(target, path, value):
+        cursor = target
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = value
+
+    def recompute_bypass_hash(target):
+        target_line = target["completed_lines"][-1]
+        target_payload = target_line["payload"]
+        target_payload["request_hash"] = server.stable_sha256(
+            {
+                "bypass_identity": target_payload["bypass_identity"],
+                "line_id": "worker_commit",
+                "stage_id": target_line["stage_id"],
+                "execution_state_revision": target_payload[
+                    "execution_state_revision"
+                ],
+                "diagnostic_backlog_id": target_payload[
+                    "diagnostic_backlog_id"
+                ],
+                "classification": target_payload["classification"],
+                "reason": target_payload["reason"],
+                "decision": target_payload["decision"],
+                "actor_role": target_line["actor_role"],
+                "evidence_refs": target_payload["evidence_refs"],
+                "continuation_authority": target_payload[
+                    "continuation_authority"
+                ],
+            }
         )
-    )
-    blocked_terminal_guide = blocked_terminal["runtime_guide"]
-    assert blocked_terminal_guide["next_legal_action"] is None
-    assert blocked_terminal_guide["terminal_disposition"][
-        "bypass_audit_valid"
-    ] is False
-    assert blocked_terminal_guide["readiness_state"] == (
-        "blocked_terminal_context_audit_identity"
-    )
+
+    raw_sentinel = "RAW-TERMINAL-BYPASS-SECRET-SENTINEL"
+    tamper_cases = [
+        (("payload", "source_backlog_id"), "AC-UNRELATED-BACKLOG", False),
+        (("payload", "bypass_identity"), raw_sentinel, False),
+        (("payload", "diagnostic_backlog_id"), "AC-TAMPERED", False),
+        (("payload", "blocked_owner_role"), "observer", False),
+        (("payload", "blocked_evidence_kind"), "qa_verdict", False),
+        (("payload", "classification"), "tampered_classification", False),
+        (("payload", "decision"), "tampered_decision", False),
+        (("stage_id",), "observer_close", False),
+        (("qa_claimed",), False, False),
+        (("payload", "request_hash"), "sha256:" + "0" * 64, False),
+        (
+            ("payload", "continuation_authority", "runtime_context_id"),
+            "mfrctx-tampered",
+            False,
+        ),
+        (
+            ("payload", "continuation_authority", "task_id"),
+            "task-tampered",
+            False,
+        ),
+        (
+            ("payload", "continuation_authority", "parent_task_id"),
+            "parent-tampered",
+            False,
+        ),
+        (
+            ("payload", "continuation_authority", "commit_sha"),
+            "f" * 40,
+            False,
+        ),
+        (
+            ("payload", "continuation_authority", "changed_files"),
+            ["agent/governance/TAMPERED.py"],
+            False,
+        ),
+        (("payload", "evidence_refs"), ["timeline:tampered"], False),
+        (("payload", "evidence_refs"), ["timeline:tampered"], True),
+        (("payload", "reason"), "tampered reason", True),
+        (
+            ("payload", "no_pass_generation", "generation_id"),
+            "bypassgen-" + "0" * 20,
+            False,
+        ),
+        (
+            ("payload", "no_pass_generation", "root_bypass_identity"),
+            "bypass:tampered-root",
+            False,
+        ),
+        (("runtime_context_id",), "mfrctx-extra-identity", False),
+        (("payload", "worker_task_id"), "task-extra-identity", False),
+        (("payload", "classification"), "tampered_classification", True),
+        (
+            ("payload", "continuation_authority", "runtime_context_id"),
+            "mfrctx-recomputed-tamper",
+            True,
+        ),
+    ]
+    for path, value, recompute_hash in tamper_cases:
+        tampered_bypass_record = copy.deepcopy(immutable_terminal_source)
+        set_nested(
+            tampered_bypass_record["completed_lines"][-1],
+            path,
+            value,
+        )
+        if recompute_hash:
+            recompute_bypass_hash(tampered_bypass_record)
+        changes_before = conn.total_changes
+        blocked_terminal = (
+            server._contract_runtime_apply_terminal_context_audit_only_projection(
+                conn,
+                tampered_bypass_record,
+                projection=terminal_projection,
+            )
+        )
+        assert conn.total_changes == changes_before
+        blocked_terminal_guide = blocked_terminal["runtime_guide"]
+        assert blocked_terminal_guide["next_legal_action"] is None
+        assert blocked_terminal_guide["terminal_disposition"][
+            "bypass_audit_valid"
+        ] is False, path
+        assert blocked_terminal_guide["readiness_state"] == (
+            "blocked_terminal_context_audit_identity"
+        )
+        assert raw_sentinel not in json.dumps(
+            blocked_terminal_guide,
+            sort_keys=True,
+        )
+        assert case.runtime.store.get(
+            case.successor["contract_execution_id"]
+        ) == immutable_terminal_source
     terminal_guide = (
         server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
             _ctx_with_role(
@@ -23398,6 +23631,7 @@ def test_terminal_runtime_context_projection_does_not_terminalize_sibling_execut
     }
 
     projected = server._contract_runtime_apply_terminal_context_audit_only_projection(
+        None,
         record,
         projection=projection,
     )
@@ -90431,7 +90665,7 @@ def test_contract_runtime_line_bypass_atomically_links_open_diagnostic(conn):
     assert link["source_backlog_id"] == backlog_id
     assert link["line_id"] == "hotfix_pre_reason"
     events = conn.execute(
-        "SELECT backlog_id, event_type FROM task_timeline_events "
+        "SELECT backlog_id, event_type, payload_json FROM task_timeline_events "
         "WHERE correlation_id = ? ORDER BY id",
         (f"contract-line-bypass:{body['bypass_identity']}",),
     ).fetchall()
@@ -90439,6 +90673,12 @@ def test_contract_runtime_line_bypass_atomically_links_open_diagnostic(conn):
         (backlog_id, "contract_line_bypass"),
         (diagnostic_id, "contract_line_bypass_diagnostic_linked"),
     ]
+    for row in events:
+        event_payload = json.loads(row["payload_json"])
+        assert event_payload["request_hash"] == accepted["written_line"][
+            "payload"
+        ]["request_hash"]
+        assert event_payload["evidence_refs"] == body["evidence_refs"]
     with server._ONBOARD_GUIDE_CAPSULE_LOCK:
         assert not any(
             entry["guide_capsule_ref"] == stale_capsule["guide_capsule_ref"]
