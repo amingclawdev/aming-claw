@@ -140587,6 +140587,312 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
     }
 
 
+def _integration_epoch_release_auth_error(
+    proof_error: str,
+    *,
+    status: int = 403,
+    field: str = "authorization",
+    expected: Any = "authenticated_operator_or_complete_observer_route_proof",
+    actual: Any = "missing_or_invalid",
+    **details: Any,
+) -> GovernanceError:
+    """Build a public-safe, prewrite rejection for the release escape hatch."""
+
+    source = (
+        "server._require_integration_epoch_release_authority."
+        "prewrite_gate.v1"
+    )
+    return GovernanceError(
+        "integration_epoch_release_authorization_required",
+        "integration epoch release authority was not proven",
+        status,
+        {
+            "proof_error": proof_error,
+            "field": field,
+            "expected": expected,
+            "actual": actual,
+            "field_mismatches": [
+                {"field": field, "expected": expected, "actual": actual}
+            ],
+            "guide": {
+                "action": "retry_with_exactly_one_authority_mode",
+                "legacy_mode": "non_anonymous_role_service_X_Gov_Token",
+                "route_mode": (
+                    "active_observer_session_plus_server_registered_route_token_ref"
+                ),
+                "raw_route_token_allowed": False,
+            },
+            "source": source,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "retry_same_world_allowed": True,
+            "public_safe": True,
+            "secret_safe": True,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+            "raw_route_token_persisted": False,
+            **details,
+        },
+    )
+
+
+_INTEGRATION_EPOCH_RELEASE_ROUTE_ACTION = (
+    "integration_epoch_release_unlandable_child"
+)
+_INTEGRATION_EPOCH_RELEASE_ROUTE_PROOF_FIELDS = (
+    "observer_session_id",
+    "observer_route_token_ref",
+    "route_token_ref",
+    "backlog_id",
+    "task_id",
+)
+_INTEGRATION_EPOCH_RELEASE_RAW_CREDENTIAL_FIELDS = (
+    "route_token",
+    "route_waiver",
+    "route_token_waiver",
+    "observer_session_token",
+    "session_token",
+    "gov_token",
+    "x_gov_token",
+)
+
+
+def _require_integration_epoch_release_authority(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+) -> dict[str, Any]:
+    """Select one release authority mode before any release-ledger write."""
+
+    supplied_raw_fields = sorted(
+        field
+        for field in _INTEGRATION_EPOCH_RELEASE_RAW_CREDENTIAL_FIELDS
+        if _contract_runtime_ref_value(ctx, field)
+    )
+    if supplied_raw_fields:
+        raise _integration_epoch_release_auth_error(
+            "raw_route_credential_forbidden",
+            status=422,
+            field="raw_credentials",
+            expected="opaque_server_registered_route_token_ref_only",
+            actual="forbidden_credential_field_supplied",
+            forbidden_fields=supplied_raw_fields,
+        )
+
+    route_proof_requested = any(
+        _contract_runtime_ref_value(ctx, field)
+        for field in _INTEGRATION_EPOCH_RELEASE_ROUTE_PROOF_FIELDS
+    )
+    cached_session = ctx._session if isinstance(ctx._session, Mapping) else {}
+    cached_session_id = str(cached_session.get("session_id") or "").strip()
+    has_role_session = bool(cached_session_id and cached_session_id != "anonymous")
+
+    if route_proof_requested:
+        if str(ctx.token or "").strip() or has_role_session:
+            raise _integration_epoch_release_auth_error(
+                "authority_mode_conflict",
+                status=422,
+                field="authority_mode",
+                expected="exactly_one_of_legacy_X_Gov_or_observer_route_proof",
+                actual="mixed_legacy_and_route_authority",
+            )
+
+        alias_values: dict[str, list[str]] = {}
+        for alias, value in _contract_runtime_ref_values(
+            ctx,
+            "observer_route_token_ref",
+            "route_token_ref",
+        ):
+            alias_values.setdefault(alias, [])
+            if value not in alias_values[alias]:
+                alias_values[alias].append(value)
+        if len(alias_values) != 1 or any(
+            len(values) != 1 for values in alias_values.values()
+        ):
+            raise _integration_epoch_release_auth_error(
+                "route_token_ref_alias_conflict",
+                status=422,
+                field="route_token_ref",
+                expected="exactly_one_non_conflicting_route_token_ref_alias",
+                actual=sorted(alias_values),
+                accepted_aliases=[
+                    "observer_route_token_ref",
+                    "route_token_ref",
+                ],
+            )
+        route_token_ref = next(iter(alias_values.values()))[0]
+        body = ctx.body if isinstance(ctx.body, Mapping) else {}
+        body_project_id = str(body.get("project_id") or "").strip()
+        if body_project_id:
+            body_project_id = project_service._normalize_project_id(body_project_id)
+            if body_project_id != project_id:
+                raise _integration_epoch_release_auth_error(
+                    "route_token_ref_scope_mismatch",
+                    field="project_id",
+                    expected=project_id,
+                    actual=body_project_id,
+                )
+        observer_session_id = str(body.get("observer_session_id") or "").strip()
+        backlog_id = str(body.get("backlog_id") or "").strip()
+        task_id = str(body.get("task_id") or "").strip()
+        missing = [
+            field
+            for field, value in (
+                ("observer_session_id", observer_session_id),
+                ("backlog_id", backlog_id),
+                ("task_id", task_id),
+            )
+            if not value
+        ]
+        if missing:
+            raise _integration_epoch_release_auth_error(
+                "missing_route_proof_fields",
+                status=422,
+                field=missing[0],
+                expected="non_empty_explicit_body_field",
+                actual="missing_or_empty",
+                missing_fields=missing,
+            )
+        expected_scope = {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        }
+
+        session = observer_session.get_session(
+            conn,
+            project_id=project_id,
+            session_id=observer_session_id,
+        )
+        if not session or str(session.get("computed_status") or "") != "active":
+            raise _integration_epoch_release_auth_error(
+                "observer_session_not_active",
+                field="observer_session_id",
+                expected="active_registered_observer_session",
+                actual=str(
+                    (session or {}).get("computed_status") or "inactive_or_unknown"
+                ),
+            )
+
+        from . import observer_route_context
+
+        try:
+            resolved = observer_route_context.resolve_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=route_token_ref,
+                backlog_id=backlog_id,
+                task_id=task_id,
+            )
+        except observer_route_context.RouteTokenRefError as exc:
+            raise _integration_epoch_release_auth_error(
+                "route_token_ref_invalid",
+                field="route_token_ref",
+                expected="active_server_registered_ref_matching_exact_release_scope",
+                actual=str(getattr(exc, "code", "invalid") or "invalid"),
+            ) from exc
+        if not resolved:
+            raise _integration_epoch_release_auth_error(
+                "route_token_ref_unknown",
+                field="route_token_ref",
+                expected="known_server_registered_route_token_ref",
+                actual="unknown",
+            )
+        if str(resolved.get("caller_role") or "") != "observer":
+            raise _integration_epoch_release_auth_error(
+                "route_token_ref_not_observer",
+                field="caller_role",
+                expected="observer",
+                actual=str(resolved.get("caller_role") or "missing_or_empty"),
+            )
+        resolved_scope = (
+            dict(resolved.get("scope") or {})
+            if isinstance(resolved.get("scope"), Mapping)
+            else {}
+        )
+        public_scope = {
+            field: str(resolved_scope.get(field) or "").strip()
+            for field in expected_scope
+        }
+        if public_scope != expected_scope:
+            mismatched_field = next(
+                field
+                for field in expected_scope
+                if expected_scope[field] != public_scope[field]
+            )
+            raise _integration_epoch_release_auth_error(
+                "route_token_ref_scope_mismatch",
+                field=mismatched_field,
+                expected=expected_scope[mismatched_field],
+                actual=public_scope[mismatched_field],
+                required_scope=expected_scope,
+            )
+        allowed_actions = sorted(
+            {
+                _normalized_contract_runtime_action(value)
+                for value in resolved.get("allowed_actions") or []
+                if str(value or "").strip()
+            }
+        )
+        if _INTEGRATION_EPOCH_RELEASE_ROUTE_ACTION not in allowed_actions:
+            raise _integration_epoch_release_auth_error(
+                "route_token_ref_action_not_allowed",
+                field="allowed_actions",
+                expected=[_INTEGRATION_EPOCH_RELEASE_ROUTE_ACTION],
+                actual=allowed_actions,
+            )
+        return {
+            "role": "observer",
+            "principal_id": f"observer-session:{observer_session_id}",
+            "role_source": "observer_session_route_token_ref",
+            "observer_session_id": observer_session_id,
+            "route_token_ref": route_token_ref,
+            "route_scope": expected_scope,
+            "allowed_actions": allowed_actions,
+        }
+
+    if not str(ctx.token or "").strip() and not has_role_session:
+        raise _integration_epoch_release_auth_error(
+            "legacy_operator_session_required",
+            field="X-Gov-Token",
+            expected="non_anonymous_role_service_operator_session",
+            actual="missing",
+        )
+    try:
+        operator = _require_graph_governance_operator(
+            ctx,
+            conn,
+            "parallel-branches.integration-epoch.release-unlandable-child",
+        )
+    except GovernanceError as exc:
+        raise _integration_epoch_release_auth_error(
+            "legacy_operator_session_invalid",
+            status=exc.status,
+            field="X-Gov-Token",
+            expected="active_role_service_observer_or_coordinator_token",
+            actual=exc.code,
+        ) from exc
+    operator_session_id = str(
+        operator.get("session_id")
+        or (
+            ctx._session.get("session_id")
+            if isinstance(ctx._session, Mapping)
+            else ""
+        )
+        or ""
+    ).strip()
+    if not operator_session_id or operator_session_id == "anonymous":
+        raise _integration_epoch_release_auth_error(
+            "anonymous_coordinator_forbidden",
+            field="session_id",
+            expected="non_anonymous_role_service_operator_session",
+            actual=operator_session_id or "missing",
+        )
+    return {**operator, "role_source": "graph_governance_operator_session"}
+
+
 @route(
     "POST",
     "/api/projects/{project_id}/integration-epochs/{batch_id}/release-unlandable-child",
@@ -140655,11 +140961,17 @@ def handle_integration_epoch_release_unlandable_child(ctx: RequestContext):
 
     conn = get_connection(project_id)
     try:
-        operator = _require_graph_governance_operator(
-            ctx,
-            conn,
-            "parallel-branches.integration-epoch.release-unlandable-child",
-        )
+        try:
+            operator = _require_integration_epoch_release_authority(
+                ctx,
+                conn,
+                project_id=project_id,
+            )
+        except GovernanceError as exc:
+            return exc.status, {
+                "ok": False,
+                **_public_zero_write_error_response(exc),
+            }
         ensure_branch_runtime_schema(conn)
         operator_principal = str(
             operator.get("principal_id") or operator.get("role") or "operator"
@@ -140671,6 +140983,18 @@ def handle_integration_epoch_release_unlandable_child(ctx: RequestContext):
                     f"backlog:{child_backlog_id}",
                     f"backlog:{blocking_backlog_id}",
                     f"operator-approval:{approval_ref}",
+                    *(
+                        [
+                            f"observer-session:{operator['observer_session_id']}",
+                            f"observer-route-token-ref:{operator['route_token_ref']}",
+                            f"governing-backlog:{operator['route_scope']['backlog_id']}",
+                            f"governing-task:{operator['route_scope']['task_id']}",
+                            f"authorized-action:{_INTEGRATION_EPOCH_RELEASE_ROUTE_ACTION}",
+                        ]
+                        if operator.get("role_source")
+                        == "observer_session_route_token_ref"
+                        else []
+                    ),
                 ]
             )
         )
@@ -140699,11 +141023,23 @@ def handle_integration_epoch_release_unlandable_child(ctx: RequestContext):
             "project_id": project_id,
             "batch_id": batch_id,
             "authorization": {
-                "mode": "graph_governance_operator_session",
+                "mode": operator.get("role_source"),
                 "operator_principal": operator_principal,
                 "operator_approved": True,
                 "approval_ref": approval_ref,
+                **(
+                    {
+                        "observer_session_id": operator["observer_session_id"],
+                        "route_token_ref": operator["route_token_ref"],
+                        "scope": operator["route_scope"],
+                        "allowed_actions": operator["allowed_actions"],
+                    }
+                    if operator.get("role_source")
+                    == "observer_session_route_token_ref"
+                    else {}
+                ),
                 "raw_credentials_exposed": False,
+                "raw_route_token_persisted": False,
             },
             "runtime_entrypoint": {
                 "method": "POST",

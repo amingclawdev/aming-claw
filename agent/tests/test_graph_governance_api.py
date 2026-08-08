@@ -125130,6 +125130,10 @@ _EXPLICIT_EPOCH_RELEASE_BLOCKER = "AC-EXPLICIT-EPOCH-BLOCKING-DEFECT"
 _EXPLICIT_EPOCH_RELEASE_COORD = "AC-EXPLICIT-EPOCH-COORDINATION"
 _EXPLICIT_EPOCH_RELEASE_ITEM = "mqitem-explicit-epoch-release-row3"
 _EXPLICIT_EPOCH_RELEASE_HEAD = "c" * 40
+_EXPLICIT_EPOCH_RELEASE_GOVERNING_BACKLOG = (
+    "AC-INTEGRATION-EPOCH-EXPLICIT-RELEASE-RECOVERY-P2-20260807"
+)
+_EXPLICIT_EPOCH_RELEASE_GOVERNING_TASK = "repair-d8a5052f5ebd4545"
 
 
 def _explicit_epoch_release_fixture(
@@ -125247,6 +125251,298 @@ def _explicit_epoch_release_events(conn) -> list[sqlite3.Row]:
         """,
         (PID, _EXPLICIT_EPOCH_RELEASE_BATCH),
     ).fetchall()
+
+
+def _explicit_epoch_release_route_proof(
+    conn,
+    *,
+    route_project_id: str = PID,
+    route_backlog_id: str = _EXPLICIT_EPOCH_RELEASE_GOVERNING_BACKLOG,
+    route_task_id: str = _EXPLICIT_EPOCH_RELEASE_GOVERNING_TASK,
+    allowed_actions: list[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    registered = observer_session.register_session(
+        conn,
+        project_id=PID,
+        session_id="obs-explicit-epoch-release",
+    )
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=route_project_id,
+        backlog_id=route_backlog_id,
+        task_id=route_task_id,
+        target_files=[
+            "agent/governance/server.py",
+            "agent/governance/parallel_branch_runtime.py",
+        ],
+        allowed_actions=(
+            allowed_actions
+            if allowed_actions is not None
+            else ["integration_epoch_release_unlandable_child"]
+        ),
+        evidence_refs=["timeline:21916"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=route_project_id,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    conn.commit()
+    body = _explicit_epoch_release_body()
+    body.update(
+        {
+            "observer_session_id": registered["observer_session_id"],
+            "observer_route_token_ref": issued["route_token_ref"],
+            "backlog_id": route_backlog_id,
+            "task_id": route_task_id,
+        }
+    )
+    return registered, issued, body
+
+
+@pytest.mark.parametrize(
+    ("route_backlog_id", "route_task_id"),
+    [
+        (
+            _EXPLICIT_EPOCH_RELEASE_GOVERNING_BACKLOG,
+            _EXPLICIT_EPOCH_RELEASE_GOVERNING_TASK,
+        ),
+        ("AC-ANOTHER-EXPLICIT-EPOCH-RECOVERY", "repair-another-epoch"),
+    ],
+)
+def test_explicit_unlandable_child_release_route_dispatch_accepts_canonical_route_ref(
+    conn,
+    route_backlog_id,
+    route_task_id,
+):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    registered, issued, body = _explicit_epoch_release_route_proof(
+        conn,
+        route_backlog_id=route_backlog_id,
+        route_task_id=route_task_id,
+    )
+    route_handlers = [
+        handler
+        for method, path, handler in server.ROUTES
+        if method == "POST"
+        and path
+        == (
+            "/api/projects/{project_id}/integration-epochs/{batch_id}/"
+            "release-unlandable-child"
+        )
+    ]
+    assert route_handlers == [
+        server.handle_integration_epoch_release_unlandable_child
+    ]
+    route_handler = route_handlers[0]
+    assert route_handler is server.handle_integration_epoch_release_unlandable_child
+
+    result = route_handler(
+        _ctx(
+            {
+                "project_id": PID,
+                "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+            },
+            method="POST",
+            body=body,
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["authorization"] == {
+        "mode": "observer_session_route_token_ref",
+        "operator_principal": (
+            f"observer-session:{registered['observer_session_id']}"
+        ),
+        "operator_approved": True,
+        "approval_ref": body["approval_ref"],
+        "observer_session_id": registered["observer_session_id"],
+        "route_token_ref": issued["route_token_ref"],
+        "scope": {
+            "project_id": PID,
+            "backlog_id": route_backlog_id,
+            "task_id": route_task_id,
+        },
+        "allowed_actions": ["integration_epoch_release_unlandable_child"],
+        "raw_credentials_exposed": False,
+        "raw_route_token_persisted": False,
+    }
+    events = _explicit_epoch_release_events(conn)
+    assert len(events) == 1
+    audit_refs = json.loads(events[0]["evidence_refs_json"])
+    assert f"observer-session:{registered['observer_session_id']}" in audit_refs
+    assert f"observer-route-token-ref:{issued['route_token_ref']}" in audit_refs
+    assert registered["session_token"] not in json.dumps(result, sort_keys=True)
+    assert registered["session_token"] not in events[0]["evidence_refs_json"]
+
+
+def test_explicit_unlandable_child_release_legacy_role_session_still_works(conn):
+    _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    registered = server.role_service.register(
+        conn,
+        principal_id="explicit-release-legacy-observer",
+        project_id=PID,
+        role="observer",
+    )
+    conn.commit()
+    ctx = _ctx(
+        {
+            "project_id": PID,
+            "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+        },
+        method="POST",
+        body=_explicit_epoch_release_body(),
+    )
+    ctx.token = registered["token"]
+    result = server.handle_integration_epoch_release_unlandable_child(ctx)
+    assert result["ok"] is True
+    assert result["authorization"]["mode"] == (
+        "graph_governance_operator_session"
+    )
+    assert result["authorization"]["operator_principal"] == (
+        "explicit-release-legacy-observer"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "no_authority",
+        "partial_proof",
+        "wrong_action",
+        "wrong_project",
+        "body_project_conflict",
+        "wrong_backlog",
+        "wrong_task",
+        "expired_ref",
+        "revoked_ref",
+        "inactive_session",
+        "alias_conflict",
+        "raw_route_token",
+        "x_gov_route_conflict",
+        "valid_role_route_conflict",
+        "invalid_legacy_token",
+    ],
+)
+def test_explicit_unlandable_child_release_route_authority_rejections_are_zero_write(
+    conn,
+    failure_mode,
+):
+    before_epoch = _explicit_epoch_release_fixture(
+        conn,
+        child_status="WAIVED",
+        queue_status="planned",
+    )
+    before_item = get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    )
+    assert before_item is not None
+    ctx = _ctx(
+        {
+            "project_id": PID,
+            "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH,
+        },
+        method="POST",
+        body=_explicit_epoch_release_body(),
+    )
+    raw_secret = ""
+    if failure_mode == "partial_proof":
+        ctx.body["backlog_id"] = _EXPLICIT_EPOCH_RELEASE_GOVERNING_BACKLOG
+    elif failure_mode == "invalid_legacy_token":
+        ctx.token = "invalid-legacy-role-token"
+    elif failure_mode != "no_authority":
+        route_project = "other-project" if failure_mode == "wrong_project" else PID
+        actions = ["graph_query"] if failure_mode == "wrong_action" else None
+        registered, issued, body = _explicit_epoch_release_route_proof(
+            conn,
+            route_project_id=route_project,
+            allowed_actions=actions,
+        )
+        ctx.body = body
+        raw_secret = registered["session_token"]
+        if failure_mode == "wrong_backlog":
+            ctx.body["backlog_id"] = "AC-WRONG-RELEASE-BACKLOG"
+        elif failure_mode == "body_project_conflict":
+            ctx.body["project_id"] = "other-project"
+        elif failure_mode == "wrong_task":
+            ctx.body["task_id"] = "wrong-release-task"
+        elif failure_mode == "expired_ref":
+            conn.execute(
+                "UPDATE observer_route_token_refs SET expires_at = ? "
+                "WHERE project_id = ? AND route_token_ref = ?",
+                ("2020-01-01T00:00:00Z", route_project, issued["route_token_ref"]),
+            )
+            conn.commit()
+        elif failure_mode == "revoked_ref":
+            conn.execute(
+                "UPDATE observer_route_token_refs SET status = 'revoked' "
+                "WHERE project_id = ? AND route_token_ref = ?",
+                (route_project, issued["route_token_ref"]),
+            )
+            conn.commit()
+        elif failure_mode == "inactive_session":
+            conn.execute(
+                "UPDATE observer_sessions SET status = 'revoked', revoked_at = ? "
+                "WHERE project_id = ? AND session_id = ?",
+                (
+                    "2026-08-08T00:00:00Z",
+                    PID,
+                    registered["observer_session_id"],
+                ),
+            )
+            conn.commit()
+        elif failure_mode == "alias_conflict":
+            ctx.body["route_token_ref"] = issued["route_token_ref"]
+        elif failure_mode == "raw_route_token":
+            ctx.body["route_token"] = issued["route_token"]
+        elif failure_mode == "x_gov_route_conflict":
+            ctx.token = "invalid-observer-one-time-token"
+        elif failure_mode == "valid_role_route_conflict":
+            role_session = server.role_service.register(
+                conn,
+                principal_id="valid-route-conflict-observer",
+                project_id=PID,
+                role="observer",
+            )
+            conn.commit()
+            ctx.token = role_session["token"]
+
+    status, result = (
+        server.handle_integration_epoch_release_unlandable_child(ctx)
+    )
+
+    assert status in {401, 403, 422}
+    assert result["error"] == "integration_epoch_release_authorization_required"
+    assert result["zero_write_rejection"] is True
+    assert result["writes_performed"] is False
+    assert result["mutation_performed"] is False
+    assert result["raw_route_token_exposed"] is False
+    assert result["details"]["raw_route_token_persisted"] is False
+    if raw_secret:
+        assert raw_secret not in json.dumps(result, sort_keys=True)
+    assert get_integration_epoch(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_BATCH,
+    ) == before_epoch
+    assert get_merge_queue_item(
+        conn,
+        PID,
+        _EXPLICIT_EPOCH_RELEASE_QUEUE,
+        _EXPLICIT_EPOCH_RELEASE_ITEM,
+    ) == before_item
+    assert _explicit_epoch_release_events(conn) == []
 
 
 @pytest.mark.parametrize(
