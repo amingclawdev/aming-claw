@@ -15454,6 +15454,23 @@ def _release_projection_repair_id(audit: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
+def _is_canonical_copy_safe_audit_timestamp(value: Any) -> bool:
+    """Accept only the bounded UTC wire format emitted by ``utc_now``.
+
+    Audit timestamps are intentionally excluded from stable audit identities so
+    a mirror may retain its original write time.  That exception must not turn
+    the field into an unbounded or credential-shaped persistence channel.
+    """
+
+    if not isinstance(value, str) or len(value) != 20:
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ") == value
+
+
 def _release_batch_runtime_projection_authority(
     conn: sqlite3.Connection,
     *,
@@ -15691,19 +15708,6 @@ def _release_batch_runtime_projection_authority(
             item,
             batch_item,
         )
-        missing_permitted_fields = {
-            "item_branch_ref",
-            "item_worktree_path",
-            "item_base_commit",
-            "item_branch_head",
-            "item_checkpoint_id",
-            "item_merge_commit",
-            "item_target_head_before_merge",
-            "item_target_head_after_merge",
-            "item_snapshot_id",
-            "item_projection_id",
-            "item_merge_preview_id",
-        }
         batch_projection_mismatches = {
             key: {"expected": expected, "actual": actual}
             for key, expected, actual in (
@@ -15785,10 +15789,6 @@ def _release_batch_runtime_projection_authority(
                 ("item_retained", True, batch_item.retained),
             )
             if expected != actual
-            and not (
-                key in missing_permitted_fields
-                and not str(actual or "").strip()
-            )
         }
         mismatches.update(batch_projection_mismatches)
     context_possible_landed = context.status in {STATE_MERGED, STATE_MERGING}
@@ -16315,6 +16315,15 @@ def _validate_release_projection_repair_audit(
             missing_fields=sorted(set(expected_dict) - set(actual)),
             extra_fields=sorted(set(actual) - set(expected_dict)),
         )
+    if not _is_canonical_copy_safe_audit_timestamp(
+        actual.get("recorded_at")
+    ) or not _is_canonical_copy_safe_audit_timestamp(
+        expected_dict.get("recorded_at")
+    ):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "release Batch projection repair audit timestamp is invalid",
+        )
     actual_id = str(actual.get("repair_id") or "")
     if (
         not actual_id
@@ -16430,6 +16439,14 @@ def _prepare_release_projection_repair_anchor(
         expected=expected,
         allow_recorded_at_variance=True,
     )
+    if (
+        not _is_canonical_copy_safe_audit_timestamp(row["created_at"])
+        or row["created_at"] != canonical["recorded_at"]
+    ):
+        raise IntegrationEpochUnlandableChildReleaseError(
+            "integration_epoch_release_replay_identity_mismatch",
+            "release Batch projection repair row timestamp is invalid",
+        )
     if str(row["repair_id"] or "") != canonical["repair_id"]:
         raise IntegrationEpochUnlandableChildReleaseError(
             "integration_epoch_release_replay_identity_mismatch",
@@ -16693,6 +16710,11 @@ def _build_release_rollover_ledger_audit(
     queue_item_id: str,
     recorded_at: str,
 ) -> dict[str, Any]:
+    if not _is_canonical_copy_safe_audit_timestamp(recorded_at):
+        _reject_release_rollover_audit(
+            "rollover_recorded_at_invalid",
+            queue_item_id=queue_item_id,
+        )
     old_session_anchor, old_route_anchor = _release_rollover_registry_anchors(
         conn,
         project_id=project_id,
@@ -16808,6 +16830,7 @@ def _validated_release_rollover_ledger(
         audit = dict(parsed)
         sequence = index + 1
         expected_previous_id = str(previous.get("rollover_id") or "")
+        audit_recorded_at = audit.get("recorded_at")
         if (
             int(row_data.get("release_event_id") or 0) != event_id
             or int(row_data.get("sequence") or 0) != sequence
@@ -16815,13 +16838,17 @@ def _validated_release_rollover_ledger(
             != expected_previous_id
             or str(row_data.get("rollover_id") or "")
             != str(audit.get("rollover_id") or "")
-            or str(row_data.get("created_at") or "")
-            != str(audit.get("recorded_at") or "")
+            or not _is_canonical_copy_safe_audit_timestamp(
+                row_data.get("created_at")
+            )
+            or not _is_canonical_copy_safe_audit_timestamp(
+                audit_recorded_at
+            )
+            or row_data.get("created_at") != audit_recorded_at
             or set(audit) != _RELEASE_ROLLOVER_AUDIT_FIELDS
             or int(audit.get("sequence") or 0) != sequence
             or str(audit.get("previous_rollover_id") or "")
             != expected_previous_id
-            or not str(audit.get("recorded_at") or "").strip()
         ):
             _reject_release_rollover_audit(
                 "canonical_rollover_ledger_row_mismatch",
@@ -16862,7 +16889,7 @@ def _validated_release_rollover_ledger(
                 authority.get("authorized_action_ref") or ""
             ),
             queue_item_id=queue_item_id,
-            recorded_at=str(audit.get("recorded_at") or ""),
+            recorded_at=audit_recorded_at,
         )
         if audit != expected:
             _reject_release_rollover_audit(

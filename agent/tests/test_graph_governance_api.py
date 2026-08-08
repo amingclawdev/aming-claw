@@ -126038,6 +126038,28 @@ def test_explicit_unlandable_child_release_records_incomplete_fanin_without_merg
             projection_id="projection-explicit-epoch-release-preflight",
         ),
     )
+    batch_runtime = parallel_branch_runtime.get_batch_merge_runtime(
+        conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH
+    )
+    batch_item = batch_runtime.items[0]
+    upsert_batch_merge_runtime(
+        conn,
+        replace(
+            batch_runtime,
+            items=(
+                replace(
+                    batch_item,
+                    target_head_before_merge=_EXPLICIT_EPOCH_RELEASE_HEAD,
+                    target_head_after_merge=target_head_after_merge,
+                    merge_preview_id="preview-explicit-epoch-release",
+                    snapshot_id="snapshot-explicit-epoch-release",
+                    projection_id=(
+                        "projection-explicit-epoch-release-preflight"
+                    ),
+                ),
+            ),
+        ),
+    )
     conn.commit()
     monkeypatch.setattr(
         server,
@@ -127306,9 +127328,13 @@ def test_release_route_replay_missing_batch_runtime_failure_rolls_back_all(
     "tamper_mode",
     [
         "branch_ref",
+        "empty_branch_ref",
         "worktree_path",
+        "empty_worktree_path",
         "base_commit",
+        "empty_base_commit",
         "branch_head",
+        "empty_branch_head",
         "merge_commit",
         "before_head",
         "after_head",
@@ -127410,9 +127436,13 @@ def test_release_route_replay_rejects_existing_batch_projection_tamper_full_db_z
     else:
         column, value = {
             "branch_ref": ("branch_ref", "refs/heads/codex/cross-lane"),
+            "empty_branch_ref": ("branch_ref", ""),
             "worktree_path": ("worktree_path", "/tmp/cross-lane"),
+            "empty_worktree_path": ("worktree_path", ""),
             "base_commit": ("base_commit", "e" * 40),
+            "empty_base_commit": ("base_commit", ""),
             "branch_head": ("branch_head", "f" * 40),
+            "empty_branch_head": ("branch_head", ""),
             "merge_commit": ("merge_commit", "d" * 40),
             "after_head": ("target_head_after_merge", "d" * 40),
             "snapshot_id": ("snapshot_id", "snapshot-tampered"),
@@ -127713,6 +127743,164 @@ def test_release_projection_repair_allows_recorded_at_and_repeated_route_renewal
         )
         assert exact["writes_performed"] is False
         assert conn.total_changes == changes_before_exact
+    assert len(_explicit_epoch_release_events(conn)) == 1
+
+
+@pytest.mark.parametrize(
+    ("tamper_target", "invalid_kind"),
+    [
+        ("projection", "credential_shaped"),
+        ("projection", "object"),
+        ("projection", "oversize"),
+        ("canonical_audit", "credential_shaped"),
+        ("canonical_audit", "object"),
+        ("canonical_audit", "oversize"),
+        ("canonical_row", "credential_shaped"),
+    ],
+)
+def test_release_route_replay_rejects_invalid_projection_repair_timestamp_no_leak(
+    conn,
+    tamper_target,
+    invalid_kind,
+):
+    route_handler, renewed_body = (
+        _establish_live_missing_batch_runtime_reconstruction(
+            conn,
+            suffix=f"repair-time-{tamper_target}-{invalid_kind}",
+        )
+    )
+    sentinel = "RAW-SECRET-DO-NOT-EXPOSE"
+    invalid_value = {
+        "credential_shaped": sentinel,
+        "object": {"credential": sentinel},
+        "oversize": sentinel * 256,
+    }[invalid_kind]
+    epoch = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+    if tamper_target == "projection":
+        incomplete = copy.deepcopy(epoch.incomplete_fanin)
+        incomplete["released_children"][0]["binding_audit"][
+            "batch_runtime_projection_repair"
+        ]["recorded_at"] = invalid_value
+        upsert_integration_epoch(
+            conn,
+            replace(epoch, incomplete_fanin=incomplete),
+        )
+    elif tamper_target == "canonical_audit":
+        row = _explicit_epoch_release_projection_repair_rows(conn)[0]
+        canonical = json.loads(row["audit_json"])
+        canonical["recorded_at"] = invalid_value
+        conn.execute(
+            "UPDATE parallel_branch_integration_epoch_release_projection_repairs "
+            "SET audit_json = ? WHERE project_id = ? AND batch_id = ? "
+            "AND queue_item_id = ?",
+            (
+                json.dumps(canonical, sort_keys=True, separators=(",", ":")),
+                PID,
+                _EXPLICIT_EPOCH_RELEASE_BATCH,
+                _EXPLICIT_EPOCH_RELEASE_ITEM,
+            ),
+        )
+    else:
+        conn.execute(
+            "UPDATE parallel_branch_integration_epoch_release_projection_repairs "
+            "SET created_at = ? WHERE project_id = ? AND batch_id = ? "
+            "AND queue_item_id = ?",
+            (
+                invalid_value,
+                PID,
+                _EXPLICIT_EPOCH_RELEASE_BATCH,
+                _EXPLICIT_EPOCH_RELEASE_ITEM,
+            ),
+        )
+    conn.commit()
+    before_dump = _explicit_epoch_release_database_dump(conn)
+    changes_before = conn.total_changes
+
+    status, result = route_handler(
+        _ctx(
+            {"project_id": PID, "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH},
+            method="POST",
+            body=renewed_body,
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == (
+        "integration_epoch_release_replay_identity_mismatch"
+    )
+    assert sentinel not in json.dumps(result, sort_keys=True)
+    assert conn.total_changes == changes_before
+    assert _explicit_epoch_release_database_dump(conn) == before_dump
+    assert len(_explicit_epoch_release_events(conn)) == 1
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        "RAW-SECRET-DO-NOT-EXPOSE",
+        {"credential": "RAW-SECRET-DO-NOT-EXPOSE"},
+        "RAW-SECRET-DO-NOT-EXPOSE" * 256,
+    ],
+    ids=["credential-shaped", "object", "oversize"],
+)
+def test_release_route_replay_rejects_invalid_rollover_timestamp_no_leak(
+    conn,
+    invalid_value,
+):
+    route_handler, renewed_body = (
+        _establish_explicit_epoch_release_authority_rollover(
+            conn,
+            suffix=f"rollover-time-{type(invalid_value).__name__}",
+        )
+    )
+    epoch = get_integration_epoch(conn, PID, _EXPLICIT_EPOCH_RELEASE_BATCH)
+    incomplete = copy.deepcopy(epoch.incomplete_fanin)
+    projection_audit = incomplete["released_children"][0]["binding_audit"][
+        "replay_authority_rollovers"
+    ][0]
+    projection_audit["recorded_at"] = invalid_value
+    upsert_integration_epoch(conn, replace(epoch, incomplete_fanin=incomplete))
+    ledger_row = _explicit_epoch_release_rollover_ledger_rows(conn)[0]
+    ledger_audit = json.loads(ledger_row["audit_json"])
+    ledger_audit["recorded_at"] = invalid_value
+    persisted_timestamp = (
+        invalid_value
+        if isinstance(invalid_value, str)
+        else json.dumps(invalid_value, sort_keys=True)
+    )
+    conn.execute(
+        "UPDATE parallel_branch_integration_epoch_release_rollovers "
+        "SET audit_json = ?, created_at = ? WHERE project_id = ? "
+        "AND batch_id = ? AND queue_item_id = ?",
+        (
+            json.dumps(ledger_audit, sort_keys=True, separators=(",", ":")),
+            persisted_timestamp,
+            PID,
+            _EXPLICIT_EPOCH_RELEASE_BATCH,
+            _EXPLICIT_EPOCH_RELEASE_ITEM,
+        ),
+    )
+    conn.commit()
+    before_dump = _explicit_epoch_release_database_dump(conn)
+    changes_before = conn.total_changes
+
+    status, result = route_handler(
+        _ctx(
+            {"project_id": PID, "batch_id": _EXPLICIT_EPOCH_RELEASE_BATCH},
+            method="POST",
+            body=renewed_body,
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == (
+        "integration_epoch_release_replay_identity_mismatch"
+    )
+    assert "RAW-SECRET-DO-NOT-EXPOSE" not in json.dumps(
+        result, sort_keys=True
+    )
+    assert conn.total_changes == changes_before
+    assert _explicit_epoch_release_database_dump(conn) == before_dump
     assert len(_explicit_epoch_release_events(conn)) == 1
 
 
