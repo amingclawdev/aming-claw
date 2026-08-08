@@ -92453,6 +92453,21 @@ def test_contract_runtime_qa_bridge_preserves_precheck_submit_and_failure_fields
         }
         if qa_status is not None:
             incomplete_body["status"] = qa_status
+        incomplete_precheck = (
+            server.handle_project_contract_runtime_line_write_precheck(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "contract_execution_id": incomplete_hotfix[
+                            "contract_execution_id"
+                        ],
+                    },
+                    "qa",
+                    method="POST",
+                    body=incomplete_body,
+                )
+            )
+        )
         record_before = runtime.store.get(
             incomplete_hotfix["contract_execution_id"]
         )
@@ -92490,6 +92505,23 @@ def test_contract_runtime_qa_bridge_preserves_precheck_submit_and_failure_fields
                 "is derived from the top-level status alone and would "
                 "normalize this passing verification into a failing one"
             ], label
+            for rejection in (incomplete_precheck, incomplete_qa):
+                assert rejection["missing_proof_fields"] == ["status"], label
+                assert rejection["nested_passing_verdict_field"] == (
+                    "verdict"
+                ), label
+                assert rejection["nested_passing_verdict_value"] == "pass", label
+                assert rejection[
+                    "silent_failing_normalization_prevented"
+                ] is True, label
+                assert rejection["completed_line_mutated"] is False, label
+                assert rejection["zero_contract_runtime_write"] is True, label
+                assert rejection["remediation"] == (
+                    'resubmit the same evidence with top-level status: "passed"'
+                ), label
+                assert rejection["next_legal_action"] == (
+                    "resubmit_qa_independent_verification_with_top_level_status"
+                ), label
             # Zero write: no completed line appended, no revision bump, and no
             # failed-QA world entered behind the author's back.
             assert len(incomplete_record["completed_lines"]) == completed_before

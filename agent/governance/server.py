@@ -101014,6 +101014,41 @@ def _contract_runtime_qa_missing_status_rejection(
     return rejected
 
 
+_CONTRACT_RUNTIME_QA_REJECTION_RESPONSE_FIELDS = (
+    "missing_proof_fields",
+    "nested_passing_verdict_field",
+    "nested_passing_verdict_value",
+    "silent_failing_normalization_prevented",
+    "completed_line_mutated",
+    "zero_contract_runtime_write",
+    "remediation",
+    "next_legal_action",
+)
+
+
+def _contract_runtime_qa_rejection_response_fields(
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the bounded machine-readable QA rejection without collisions.
+
+    ContractRuntime responses also carry a current runtime guide whose own
+    ``missing_proof_fields`` and ``next_legal_action`` describe the unchanged
+    record.  When the attempted QA write was rejected, those projections must
+    not replace the rejection's exact field/remediation/action contract.
+    """
+
+    if not (
+        result.get("zero_contract_runtime_write") is True
+        and result.get("silent_failing_normalization_prevented") is True
+    ):
+        return {}
+    return {
+        field: result[field]
+        for field in _CONTRACT_RUNTIME_QA_REJECTION_RESPONSE_FIELDS
+        if field in result
+    }
+
+
 def _contract_runtime_observer_reconcile_idempotency(
     *,
     record: Mapping[str, Any],
@@ -118617,6 +118652,9 @@ def _contract_runtime_close_gate(
             actor_role=actor_role,
         )
         if qa_missing_status:
+            rejection_fields = _contract_runtime_qa_rejection_response_fields(
+                qa_missing_status
+            )
             raise GovernanceError(
                 "contract_runtime_close_evidence_rejected",
                 (
@@ -118632,14 +118670,8 @@ def _contract_runtime_close_gate(
                     "contract_execution_id": contract_execution_id,
                     "actor_role": actor_role,
                     "line_id": "qa_independent_verification",
-                    "missing_proof_fields": ["status"],
-                    "nested_passing_verdict_field": qa_missing_status.get(
-                        "nested_passing_verdict_field"
-                    ),
-                    "silent_failing_normalization_prevented": True,
-                    "zero_contract_runtime_write": True,
+                    **rejection_fields,
                     "zero_timeline_write": True,
-                    "remediation": qa_missing_status.get("remediation"),
                 },
             )
         write = _contract_runtime_bind_authenticated_qa_provenance(
@@ -146289,6 +146321,7 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
         response["close_authority_precheck"] = result[
             "close_authority_precheck"
         ]
+    response.update(_contract_runtime_qa_rejection_response_fields(result))
     return response
 
 
@@ -146901,6 +146934,7 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
         response["close_authority_precheck"] = result[
             "close_authority_precheck"
         ]
+    response.update(_contract_runtime_qa_rejection_response_fields(result))
     return response
 
 
