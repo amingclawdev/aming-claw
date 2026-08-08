@@ -77,6 +77,13 @@ from .contracts.runtime import (
     rebuild_backlog_contract_chain_projection,
     SQLiteContractExecutionStore,
     StalePinnedContractExecutionError,
+    worker_implementation_source_execution_state_revision,
+    worker_implementation_source_line_sha256,
+    worker_implementation_copy_safe_test_command,
+    worker_implementation_legacy_accept_commit_divergence,
+    worker_implementation_test_results_correction_id,
+    worker_implementation_test_results_correction_validation,
+    worker_implementation_test_results_validation,
     upsert_contract_chain_root_current_binding,
     upsert_contract_chain_successor_binding,
 )
@@ -20336,6 +20343,7 @@ def _runtime_context_contract_runtime_worker_implementation_projection(
     *,
     runtime_context_id: str,
     task_id: str,
+    corrections: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Project exact copy-safe results from the canonical implementation line."""
     from .parallel_branch_runtime import public_contract_revision_payload
@@ -20369,9 +20377,31 @@ def _runtime_context_contract_runtime_worker_implementation_projection(
         else {}
     )
     source = "ContractRuntime.completed_lines.worker_implementation"
+    test_results_validation = worker_implementation_test_results_validation(
+        selected,
+        evidence_envelope=True,
+    )
+    correction_validation: dict[str, Any] = {}
+    selected_correction: dict[str, Any] = {}
+    if len(corrections) == 1 and test_results_validation.get("accepted") is not True:
+        selected_correction = dict(corrections[0])
+        correction_validation = (
+            worker_implementation_test_results_correction_validation(
+                record,
+                selected,
+                selected_correction,
+            )
+        )
+        if correction_validation.get("accepted") is True:
+            test_results_validation = dict(correction_validation)
+            source = (
+                "worker_implementation_test_results_corrections"
+            )
     test_results = public_contract_revision_payload(
-        payload.get("test_results")
-        if isinstance(payload.get("test_results"), Mapping)
+        test_results_validation.get("canonical_test_results")
+        if isinstance(
+            test_results_validation.get("canonical_test_results"), Mapping
+        )
         else {}
     )
     resolved_identity = {
@@ -20405,14 +20435,35 @@ def _runtime_context_contract_runtime_worker_implementation_projection(
     lineage_ref = str(lineage.get("implementation_lineage_ref") or "").strip()
     if not lineage_ref:
         errors.append("worker_implementation lineage ref is missing")
-    if not test_results:
-        errors.append("worker_implementation test_results are missing")
-    elif not (
-        _runtime_context_finish_attestation_test_results_accepted(test_results)
-        or _runtime_context_finish_attestation_project_test_results(test_results)
+    if test_results_validation.get("accepted") is not True:
+        errors.append(
+            "worker_implementation test_results are not finish-compatible: "
+            + str(test_results_validation.get("reason") or "invalid")
+        )
+    if len(corrections) > 1:
+        errors.append(
+            "worker_implementation test-results correction is ambiguous"
+        )
+    if len(corrections) == 1 and not correction_validation and (
+        test_results_validation.get("accepted") is True
     ):
-        errors.append("worker_implementation test_results are not finish-compatible")
+        errors.append(
+            "finish-compatible worker_implementation must not have a correction"
+        )
     accepted = not errors
+    immutable_source_graph_trace_ids = list(lineage.get("graph_trace_ids") or [])
+    effective_graph_trace_ids = list(immutable_source_graph_trace_ids)
+    if accepted and selected_correction:
+        correction_authority = (
+            selected_correction.get("source_authority")
+            if isinstance(
+                selected_correction.get("source_authority"), Mapping
+            )
+            else {}
+        )
+        effective_graph_trace_ids = list(
+            correction_authority.get("graph_trace_ids") or []
+        )
     return {
         "schema_version": (
             "runtime_context.contract_runtime_worker_implementation_projection.v1"
@@ -20436,10 +20487,469 @@ def _runtime_context_contract_runtime_worker_implementation_projection(
         "line_instance_id": str(selected.get("line_instance_id") or "").strip(),
         "matching_source_count": len(matching_sources),
         "changed_files": list(lineage.get("changed_files") or []),
-        "graph_trace_ids": list(lineage.get("graph_trace_ids") or []),
+        "graph_trace_ids": effective_graph_trace_ids,
+        "immutable_source_graph_trace_ids": immutable_source_graph_trace_ids,
         "test_results": dict(test_results) if accepted else {},
+        "test_results_validation": dict(test_results_validation),
+        "test_results_correction": (
+            dict(selected_correction) if accepted else {}
+        ),
+        "test_results_correction_count": len(corrections),
         "errors": errors,
     }
+
+
+def _runtime_context_worker_implementation_correction_rows(
+    runtime: Any,
+    record: Mapping[str, Any],
+    implementation: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Find corrections by immutable source identity, never mutable scope."""
+
+    matching_indexes = [
+        index
+        for index, line in enumerate(record.get("completed_lines") or [])
+        if isinstance(line, Mapping) and dict(line) == dict(implementation)
+    ]
+    if len(matching_indexes) != 1:
+        raise ContractRuntimeError(
+            "test-results correction immutable source is ambiguous"
+        )
+    source_lineage = _worker_implementation_lineage(record, implementation)
+    return runtime.store.worker_implementation_test_results_corrections(
+        project_id=str(record.get("project_id") or "").strip(),
+        contract_execution_id=str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        runtime_context_id=_worker_commit_text(
+            implementation, "runtime_context_id"
+        ),
+        task_id=_worker_commit_text(implementation, "task_id"),
+        source_line_sha256=worker_implementation_source_line_sha256(
+            implementation
+        ),
+        source_line_instance_id=str(
+            implementation.get("line_instance_id") or ""
+        ).strip(),
+        source_implementation_lineage_ref=str(
+            source_lineage.get("implementation_lineage_ref") or ""
+        ).strip(),
+        source_completed_line_index=matching_indexes[0],
+    )
+
+
+def _runtime_context_worker_implementation_session_authority_event_ref(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    worker_id: str,
+    worker_slot_id: str,
+    session_token_ref: str,
+    fence_token_hash: str,
+    required_event_ref: str = "",
+) -> str:
+    """Resolve one server-authored session registry event for a safe ref."""
+
+    from . import task_timeline
+
+    allowed_types = {
+        "observer.runtime_context_session_token_initial_join",
+        "observer.runtime_context_session_token_rejoin",
+    }
+    matches: list[str] = []
+    for event in task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        limit=1000,
+    ):
+        event_ref = f"timeline:{event.get('id', '')}"
+        payload = event.get("payload") if isinstance(
+            event.get("payload"), Mapping
+        ) else {}
+        if (
+            str(event.get("event_type") or "").strip() not in allowed_types
+            or str(event.get("status") or "").strip().lower() != "accepted"
+            or (required_event_ref and event_ref != required_event_ref)
+            or str(payload.get("runtime_context_id") or "").strip()
+            != runtime_context_id
+            or str(payload.get("task_id") or task_id).strip() != task_id
+            or str(payload.get("backlog_id") or backlog_id).strip()
+            != backlog_id
+            or str(payload.get("worker_id") or worker_id).strip() != worker_id
+            or str(
+                payload.get("worker_slot_id")
+                or payload.get("worker_id")
+                or worker_slot_id
+            ).strip()
+            != worker_slot_id
+            or str(payload.get("session_token_ref") or "").strip()
+            != session_token_ref
+            or str(payload.get("fence_token_hash") or "").strip()
+            != fence_token_hash
+            or payload.get("raw_session_token_persisted") is not False
+            or payload.get("raw_fence_token_persisted_to_timeline") is not False
+        ):
+            continue
+        matches.append(event_ref)
+    return matches[0] if len(matches) == 1 else ""
+
+
+def _runtime_context_worker_implementation_correction_authority_validation(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    implementation: Mapping[str, Any],
+    correction: Mapping[str, Any],
+    context: Any,
+) -> dict[str, Any]:
+    """Revalidate correction auth against independent durable registries."""
+
+    validation = worker_implementation_test_results_correction_validation(
+        record,
+        implementation,
+        correction,
+    )
+    if validation.get("accepted") is not True:
+        return {
+            "accepted": False,
+            "reason": str(validation.get("reason") or "invalid_correction"),
+        }
+    source_authority = correction.get("source_authority")
+    source_authority = (
+        source_authority if isinstance(source_authority, Mapping) else {}
+    )
+    expected_scope = {
+        "project_id": project_id,
+        "backlog_id": str(record.get("backlog_id") or "").strip(),
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": _worker_commit_text(
+            implementation, "runtime_context_id"
+        ),
+        "task_id": _worker_commit_text(implementation, "task_id"),
+        "worker_id": _worker_commit_text(implementation, "worker_id"),
+        "worker_slot_id": _worker_commit_text(
+            implementation, "worker_slot_id", "lane_id"
+        ),
+    }
+    if (
+        str(getattr(context, "project_id", "") or "").strip()
+        != expected_scope["project_id"]
+        or str(getattr(context, "backlog_id", "") or "").strip()
+        != expected_scope["backlog_id"]
+        or str(getattr(context, "runtime_context_id", "") or "").strip()
+        != expected_scope["runtime_context_id"]
+        or str(getattr(context, "task_id", "") or "").strip()
+        != expected_scope["task_id"]
+        or str(getattr(context, "worker_id", "") or "").strip()
+        != expected_scope["worker_id"]
+        or str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ).strip()
+        != expected_scope["worker_slot_id"]
+    ):
+        return {"accepted": False, "reason": "correction_context_scope_mismatch"}
+    authority_event_ref = (
+        _runtime_context_worker_implementation_session_authority_event_ref(
+            conn,
+            project_id=project_id,
+            backlog_id=expected_scope["backlog_id"],
+            runtime_context_id=expected_scope["runtime_context_id"],
+            task_id=expected_scope["task_id"],
+            worker_id=expected_scope["worker_id"],
+            worker_slot_id=expected_scope["worker_slot_id"],
+            session_token_ref=str(
+                source_authority.get("session_token_ref") or ""
+            ).strip(),
+            fence_token_hash=str(
+                source_authority.get("fence_token_hash") or ""
+            ).strip(),
+            required_event_ref=str(
+                source_authority.get("session_authority_event_ref") or ""
+            ).strip(),
+        )
+    )
+    if not authority_event_ref:
+        return {
+            "accepted": False,
+            "reason": "correction_session_authority_registry_mismatch",
+        }
+    trace_ids = source_authority.get("graph_trace_ids")
+    if (
+        not isinstance(trace_ids, list)
+        or not trace_ids
+        or any(not isinstance(item, str) or not item.strip() for item in trace_ids)
+        or len(set(trace_ids)) != len(trace_ids)
+    ):
+        return {"accepted": False, "reason": "correction_graph_authority_invalid"}
+    placeholders = ",".join("?" for _ in trace_ids)
+    rows = conn.execute(
+        f"""
+        SELECT trace_id, project_id, runtime_context_id, task_id,
+               parent_task_id, worker_role, query_source, query_purpose,
+               fence_token, status
+        FROM graph_query_traces
+        WHERE trace_id IN ({placeholders})
+        """,
+        tuple(trace_ids),
+    ).fetchall()
+    rows_by_id = {str(row["trace_id"] or "").strip(): row for row in rows}
+    from .parallel_branch_runtime import runtime_context_secret_hash
+
+    for trace_id in trace_ids:
+        row = rows_by_id.get(trace_id)
+        if row is None or any(
+            str(row[field] or "").strip() != expected
+            for field, expected in (
+                ("project_id", expected_scope["project_id"]),
+                ("runtime_context_id", expected_scope["runtime_context_id"]),
+                ("task_id", expected_scope["task_id"]),
+                (
+                    "parent_task_id",
+                    _runtime_context_mf_sub_parent_task_id(context),
+                ),
+                ("worker_role", "mf_sub"),
+                ("query_source", "mf_subagent"),
+                ("query_purpose", "subagent_context_build"),
+                ("status", "complete"),
+            )
+        ) or runtime_context_secret_hash(
+            str(row["fence_token"] or "")
+        ) != str(source_authority.get("fence_token_hash") or "").strip():
+            return {
+                "accepted": False,
+                "reason": "correction_graph_authority_registry_mismatch",
+            }
+    return {
+        "accepted": True,
+        "reason": "accepted",
+        "session_authority_event_ref": authority_event_ref,
+        "graph_trace_ids": list(trace_ids),
+    }
+
+
+def _runtime_context_worker_implementation_test_results_repair_action(
+    record: Mapping[str, Any],
+    implementation: Mapping[str, Any] | None,
+    source_projection: Mapping[str, Any],
+    canonical_next_action: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    current_authority: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Expose the sole authenticated recovery for a historical accept mismatch."""
+
+    next_action = (
+        dict(canonical_next_action)
+        if isinstance(canonical_next_action, Mapping)
+        else {}
+    )
+    if (
+        source_projection.get("accepted") is True
+        or int(source_projection.get("test_results_correction_count") or 0) != 0
+        or str(next_action.get("line_id") or "").strip() != "worker_commit"
+        or not isinstance(implementation, Mapping)
+    ):
+        return {}
+    completed_lines = list(record.get("completed_lines") or [])
+    matching_worker_commits = [
+        line
+        for line in completed_lines
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "worker_commit"
+        and _runtime_context_contract_line_matches_worker(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        )
+    ]
+    # A bypass/waive is still a worker_commit line.  Its immutable audit closes
+    # this recovery just like an ordinary completed commit.
+    if matching_worker_commits:
+        return {}
+    matching_implementations = [
+        (index, line)
+        for index, line in enumerate(completed_lines)
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "worker_implementation"
+        and _runtime_context_contract_line_matches_worker(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        )
+    ]
+    if len(matching_implementations) != 1:
+        return {}
+    source_index, source_line = matching_implementations[0]
+    if dict(source_line) != dict(implementation):
+        return {}
+    legacy_divergence = worker_implementation_legacy_accept_commit_divergence(
+        source_line,
+        evidence_envelope=True,
+    )
+    if legacy_divergence.get("authorized") is not True:
+        return {}
+    source_lineage = _worker_implementation_lineage(record, source_line)
+    source_line_ref = str(
+        source_lineage.get("implementation_lineage_ref") or ""
+    ).strip()
+    source_line_hash = worker_implementation_source_line_sha256(source_line)
+    source_execution_revision = (
+        worker_implementation_source_execution_state_revision(source_line)
+    )
+    source_commit = _worker_commit_text(
+        source_line,
+        "commit_sha",
+        "head_commit",
+        "immutable_head_commit",
+    )
+    if (
+        not source_line_ref
+        or source_execution_revision <= 0
+        or not source_lineage.get("changed_files")
+        or not source_lineage.get("graph_trace_ids")
+        or not re.fullmatch(r"[0-9a-f]{40,64}", source_commit)
+    ):
+        return {}
+    correction_intent = {
+        "schema_version": (
+            "runtime_context.worker_implementation_test_results_correction_intent.v1"
+        ),
+        "action": "repair_worker_implementation_test_results",
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "source_completed_line_index": source_index,
+        "source_line_instance_id": str(
+            source_line.get("line_instance_id") or ""
+        ).strip(),
+        "source_implementation_lineage_ref": source_line_ref,
+        "source_line_sha256": source_line_hash,
+        "source_execution_state_revision": source_execution_revision,
+    }
+    writer_copy_container = next_action.get("writer_role_safe_copy_payload")
+    writer_copy = dict(
+        writer_copy_container.get("copy_payload")
+        if isinstance(writer_copy_container, Mapping)
+        and isinstance(writer_copy_container.get("copy_payload"), Mapping)
+        else {}
+    )
+    active_authority = (
+        current_authority
+        if isinstance(current_authority, Mapping)
+        else {}
+    )
+    for field in ("session_token_ref", "fence_token_hash"):
+        value = str(active_authority.get(field) or "").strip()
+        if value:
+            writer_copy[field] = value
+    writer_copy.update(
+        {
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "evidence_kind": "implementation",
+            "line_instance_id": f"runtime_context:{runtime_context_id}",
+        }
+    )
+    if any(value in (None, "") for value in writer_copy.values()):
+        return {}
+    next_action.update(
+        {
+            "schema_version": "contract_runtime_next_legal_action.v1",
+            "id": "worker_implementation_test_results_repair",
+            "action": "repair_worker_implementation_test_results",
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "owner_role": "mf_sub",
+            "allowed_writer_roles": ["mf_sub"],
+            "evidence_kind": "implementation",
+            "required": True,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "source": (
+                "ContractRuntime.completed_lines.worker_implementation"
+            ),
+            "source_of_authority": (
+                "ContractRuntime.completed_lines.worker_implementation"
+            ),
+            "authority_decision_source": (
+                "worker_implementation_test_results_structured_validator"
+            ),
+            "submit_via": "runtime_context_implementation_evidence",
+            "historical_source_mutation_allowed": False,
+            "worker_commit_bypass_allowed": False,
+            "action_input": {
+                **dict(writer_copy),
+                "contract_execution_id": correction_intent[
+                    "contract_execution_id"
+                ],
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "precommit_implementation_correction_intent": (
+                    correction_intent
+                ),
+                "test_results": {
+                    "status": "<exact terminal owned-lane status>",
+                    "passed": "<JSON boolean, never a count>",
+                },
+                "correction_reason": (
+                    "legacy_worker_implementation_test_results_shape_incompatible"
+                ),
+                "evidence_refs": [
+                    f"graph-query-trace:{trace_id}"
+                    for trace_id in source_lineage.get("graph_trace_ids") or []
+                ],
+                "tests": [
+                    {
+                        "command": "<exact owned-lane test command>",
+                        "status": "passed",
+                    }
+                ],
+                "ephemeral_authorization_fields_to_refresh": [
+                    "session_token",
+                    "fence_token",
+                    "session_token_ref",
+                    "fence_token_hash",
+                    "graph_trace_ids",
+                ],
+                "stable_business_evidence_fields": [
+                    "correction_reason",
+                    "evidence_refs",
+                    "tests",
+                    "test_results",
+                    "precommit_implementation_correction_intent",
+                ],
+            },
+            "blocker": {
+                "code": "worker_implementation_test_results_incompatible",
+                "field": str(
+                    (source_projection.get("test_results_validation") or {}).get(
+                        "field"
+                    )
+                    or "test_results"
+                ),
+                "remediation": str(
+                    (source_projection.get("test_results_validation") or {}).get(
+                        "remediation"
+                    )
+                    or "submit one canonical correction"
+                ),
+            },
+        }
+    )
+    return next_action
 
 
 def _runtime_context_finish_hint_from_source_backed_implementation(
@@ -20465,6 +20975,13 @@ def _runtime_context_finish_hint_from_source_backed_implementation(
         else {}
     )
     errors = list(source_projection.get("errors") or [])
+    correction = (
+        source_projection.get("test_results_correction")
+        if isinstance(
+            source_projection.get("test_results_correction"), Mapping
+        )
+        else {}
+    )
     if source_projection.get("accepted") is not True or not source_results:
         errors.append("source-backed implementation is not actionable")
     alias_present = bool(
@@ -20499,7 +21016,19 @@ def _runtime_context_finish_hint_from_source_backed_implementation(
             alias_results = _runtime_context_test_results_from_tests(
                 alias.get("tests")
             )
-        if alias_results and alias_results != source_results:
+        correction_source_alias = bool(
+            correction
+            and alias_results
+            and stable_sha256(alias_results)
+            == str(
+                correction.get("source_test_results_sha256") or ""
+            ).strip()
+        )
+        if (
+            alias_results
+            and alias_results != source_results
+            and not correction_source_alias
+        ):
             errors.append("timeline alias test_results conflict with source")
         for label, keys, source_key in (
             ("changed_files", ("changed_files", "worker_changed_files"), "changed_files"),
@@ -20513,6 +21042,15 @@ def _runtime_context_finish_hint_from_source_backed_implementation(
                 set(_runtime_context_service_query_values(alias, *keys))
             )
             source_values = sorted(set(source_projection.get(source_key) or []))
+            if correction and label == "graph_trace_ids":
+                source_values = sorted(
+                    set(
+                        source_projection.get(
+                            "immutable_source_graph_trace_ids"
+                        )
+                        or []
+                    )
+                )
             if alias_values and alias_values != source_values:
                 errors.append(f"timeline alias {label} conflict with source")
     resolution = {
@@ -20535,6 +21073,9 @@ def _runtime_context_finish_hint_from_source_backed_implementation(
         ),
         "timeline_projection_authoritative": False,
         "timeline_alias_status": "present" if alias_present else "absent",
+        "timeline_alias_matches_immutable_correction_source": bool(
+            alias_present and correction and not errors
+        ),
         "errors": list(dict.fromkeys(str(item) for item in errors if item)),
     }
     hint["source_backed_worker_implementation"] = dict(source_projection)
@@ -20592,6 +21133,15 @@ def _runtime_context_contract_runtime_worker_projection(
             if canonical_implementation is not None
             else {}
         )
+        worker_implementation_test_results_corrections = (
+            _runtime_context_worker_implementation_correction_rows(
+                runtime,
+                canonical_record,
+                canonical_implementation,
+            )
+            if isinstance(canonical_implementation, Mapping)
+            else []
+        )
         worker_implementation_projection = (
             _runtime_context_contract_runtime_worker_implementation_projection(
                 canonical_record,
@@ -20599,10 +21149,91 @@ def _runtime_context_contract_runtime_worker_projection(
                 worker_implementation_lineage,
                 runtime_context_id=runtime_context_id,
                 task_id=task_id,
+                corrections=worker_implementation_test_results_corrections,
             )
         )
+        selected_correction = (
+            worker_implementation_projection.get("test_results_correction")
+            if isinstance(
+                worker_implementation_projection.get(
+                    "test_results_correction"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        if selected_correction:
+            authority_validation = (
+                _runtime_context_worker_implementation_correction_authority_validation(
+                    conn,
+                    project_id=str(
+                        source_record.get("project_id") or ""
+                    ).strip(),
+                    record=canonical_record,
+                    implementation=canonical_implementation,
+                    correction=selected_correction,
+                    context=context,
+                )
+                if context is not None
+                else {
+                    "accepted": False,
+                    "reason": "correction_runtime_context_unavailable",
+                }
+            )
+            if authority_validation.get("accepted") is not True:
+                worker_implementation_projection = {
+                    **worker_implementation_projection,
+                    "status": "blocked_invalid_source_evidence",
+                    "accepted": False,
+                    "fail_closed": True,
+                    "test_results": {},
+                    "errors": [
+                        *list(
+                            worker_implementation_projection.get("errors") or []
+                        ),
+                        "worker_implementation correction durable authority "
+                        "is invalid: "
+                        + str(
+                            authority_validation.get("reason")
+                            or "identity_mismatch"
+                        ),
+                    ],
+                    "correction_authority_validation": dict(
+                        authority_validation
+                    ),
+                }
     except ContractRuntimeError:
-        return {}
+        return {
+            "schema_version": (
+                "runtime_context.contract_runtime_worker_projection.v1"
+            ),
+            "contract_runtime_next_legal_action": {
+                "schema_version": "contract_runtime_next_legal_action.v1",
+                "id": "worker_implementation_test_results_blocked",
+                "action": "blocked_worker_implementation_test_results",
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "owner_role": "mf_sub",
+                "allowed_writer_roles": ["mf_sub"],
+                "required": True,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "fail_closed": True,
+                "action_input": {},
+                "blocker": {
+                    "code": "worker_implementation_test_results_identity_mismatch",
+                    "worker_commit_write_allowed": False,
+                    "historical_source_rewrite_allowed": False,
+                },
+            },
+            "worker_implementation_evidence": {
+                "accepted": False,
+                "fail_closed": True,
+                "errors": [
+                    "worker_implementation correction durable identity is invalid"
+                ],
+            },
+        }
     guide = (
         canonical_record.get("runtime_guide")
         if isinstance(canonical_record.get("runtime_guide"), Mapping)
@@ -20680,6 +21311,68 @@ def _runtime_context_contract_runtime_worker_projection(
                 next_action["runtime_context_id"] = runtime_context_id
             if not str(next_action.get("task_id") or "").strip():
                 next_action["task_id"] = task_id
+        current_state["next_legal_action"] = dict(next_action)
+    current_repair_authority: dict[str, str] = {}
+    if context is not None:
+        from .parallel_branch_runtime import (
+            runtime_context_fence_token_verifier,
+            runtime_context_session_token_ref,
+        )
+
+        current_repair_authority = {
+            "session_token_ref": runtime_context_session_token_ref(context),
+            "fence_token_hash": runtime_context_fence_token_verifier(context),
+        }
+    repair_action = (
+        _runtime_context_worker_implementation_test_results_repair_action(
+            canonical_record,
+            canonical_implementation,
+            worker_implementation_projection,
+            next_action,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            current_authority=current_repair_authority,
+        )
+    )
+    if repair_action:
+        current_state["canonical_next_legal_action_before_test_results_repair"] = (
+            dict(next_action)
+        )
+        next_action = repair_action
+        current_state["next_legal_action"] = dict(next_action)
+    elif (
+        worker_implementation_projection
+        and worker_implementation_projection.get("accepted") is not True
+        and str(next_action.get("line_id") or "").strip() == "worker_commit"
+    ):
+        current_state["canonical_next_legal_action_before_invalid_results_block"] = (
+            dict(next_action)
+        )
+        next_action = {
+            "schema_version": "contract_runtime_next_legal_action.v1",
+            "id": "worker_implementation_test_results_blocked",
+            "action": "blocked_worker_implementation_test_results",
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "owner_role": "mf_sub",
+            "allowed_writer_roles": ["mf_sub"],
+            "required": True,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "fail_closed": True,
+            "action_input": {},
+            "blocker": {
+                "code": "worker_implementation_test_results_invalid",
+                "errors": list(
+                    worker_implementation_projection.get("errors") or []
+                ),
+                "worker_commit_write_allowed": False,
+                "historical_source_rewrite_allowed": False,
+                "remediation": (
+                    "stop and audit the immutable implementation evidence"
+                ),
+            },
+        }
         current_state["next_legal_action"] = dict(next_action)
     if worker_implementation_lineage:
         current_state["worker_implementation_lineage"] = dict(
@@ -46951,8 +47644,52 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
                 worker_implementation_lineage,
                 runtime_context_id=runtime_context_id,
                 task_id=context.task_id,
+                corrections=(
+                    _runtime_context_worker_implementation_correction_rows(
+                        runtime,
+                        stored_record,
+                        implementation_line,
+                    )
+                ),
             )
         )
+        implementation_correction = (
+            implementation_source_validation.get("test_results_correction")
+            if isinstance(
+                implementation_source_validation.get(
+                    "test_results_correction"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        if implementation_correction:
+            correction_authority_validation = (
+                _runtime_context_worker_implementation_correction_authority_validation(
+                    conn,
+                    project_id=project_id,
+                    record=stored_record,
+                    implementation=implementation_line,
+                    correction=implementation_correction,
+                    context=context,
+                )
+            )
+            if correction_authority_validation.get("accepted") is not True:
+                implementation_source_validation = {
+                    **implementation_source_validation,
+                    "accepted": False,
+                    "fail_closed": True,
+                    "errors": [
+                        *list(
+                            implementation_source_validation.get("errors") or []
+                        ),
+                        "worker_implementation correction durable authority "
+                        "is invalid",
+                    ],
+                    "correction_authority_validation": dict(
+                        correction_authority_validation
+                    ),
+                }
         if implementation_source_validation.get("accepted") is not True:
             raise GovernanceError(
                 "worker_commit_invalid_implementation_test_results",
@@ -47031,7 +47768,17 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             worker_implementation_lineage.get("changed_files") or []
         )
         implementation_trace_ids = list(
-            worker_implementation_lineage.get("graph_trace_ids") or []
+            implementation_source_validation.get("graph_trace_ids") or []
+        )
+        implementation_correction = (
+            implementation_source_validation.get("test_results_correction")
+            if isinstance(
+                implementation_source_validation.get(
+                    "test_results_correction"
+                ),
+                Mapping,
+            )
+            else {}
         )
         supplied_trace_ids = _runtime_context_service_dedupe(
             _runtime_context_service_query_values(
@@ -47041,8 +47788,9 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
                 "trace_ids",
             )
         )
-        if not supplied_trace_ids or set(supplied_trace_ids) != set(
-            implementation_trace_ids
+        if not supplied_trace_ids or (
+            not implementation_correction
+            and set(supplied_trace_ids) != set(implementation_trace_ids)
         ):
             raise ValidationError(
                 "worker_commit graph_trace_ids must exactly match worker_implementation"
@@ -47273,6 +48021,20 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             "raw_session_token_persisted": False,
             "raw_fence_token_persisted": False,
         }
+        canonical_test_results_correction = (
+            implementation_source_validation.get("test_results_correction")
+            if isinstance(
+                implementation_source_validation.get(
+                    "test_results_correction"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        if canonical_test_results_correction:
+            payload[
+                "worker_implementation_test_results_correction"
+            ] = dict(canonical_test_results_correction)
         if not post_qa_target_baseline_recovery:
             payload["normal_pre_qa_target_head_revision"] = dict(
                 revision_diff.get("normal_pre_qa_target_head_revision") or {}
@@ -48376,14 +49138,21 @@ def _runtime_context_require_worker_implementation_test_results(
         else None
     )
     supplied = dict(supplied_value) if isinstance(supplied_value, Mapping) else {}
-    projected = _runtime_context_finish_attestation_project_test_results(supplied)
-    if supplied_present and isinstance(supplied_value, Mapping) and projected:
+    validation = worker_implementation_test_results_validation(
+        body,
+        evidence_envelope=True,
+    )
+    projected = validation.get("canonical_test_results")
+    if validation.get("accepted") is True and isinstance(projected, Mapping):
         return dict(projected)
 
     actual = {
         "present": supplied_present,
         "received_type": (
-            type(supplied_value).__name__ if supplied_present else "missing"
+            str(validation.get("received_type") or "").strip()
+            or type(supplied_value).__name__
+            if supplied_present
+            else "missing"
         ),
         "received_status": str(supplied.get("status") or "").strip(),
     }
@@ -48403,6 +49172,9 @@ def _runtime_context_require_worker_implementation_test_results(
             "actual": actual,
             "received_status": actual["received_status"],
             "received_type": actual["received_type"],
+            "validation": dict(validation),
+            "invalid_field": str(validation.get("field") or "test_results"),
+            "remediation": str(validation.get("remediation") or ""),
             "zero_db_access": bool(zero_db_access),
             "zero_contract_runtime_write": True,
             "zero_timeline_write": True,
@@ -48449,6 +49221,544 @@ def _runtime_context_require_worker_implementation_test_results(
             "historical_backfill_allowed": False,
         },
     )
+
+
+def _runtime_context_repair_worker_implementation_test_results(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    runtime_context_id: str,
+    contract_execution_id: str,
+    body: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    verified_graph_trace_ids: Sequence[str],
+    session_token_ref: str,
+    fence_token_hash: str,
+) -> dict[str, Any]:
+    """Persist one independent correction without mutating ContractRuntime."""
+
+    fresh_graph_evidence = _runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=str(getattr(context, "task_id", "") or "").strip(),
+        parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
+        backlog_id=str(getattr(context, "backlog_id", "") or "").strip(),
+        fence_token=str(body.get("fence_token") or ""),
+        explicit_trace_ids=list(verified_graph_trace_ids),
+        strict_explicit_trace_ids=True,
+    )
+    if fresh_graph_evidence.get("db_verified") is not True or sorted(
+        set(fresh_graph_evidence.get("verified_trace_ids") or [])
+    ) != sorted(set(verified_graph_trace_ids)):
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_graph_authority_changed",
+            "correction graph authority changed before the locked write",
+            409,
+            {
+                "runtime_context_id": runtime_context_id,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+
+    intent = payload.get("precommit_implementation_correction_intent")
+    if not (
+        isinstance(intent, Mapping)
+        and str(intent.get("action") or "").strip()
+        == "repair_worker_implementation_test_results"
+    ):
+        return {}
+    runtime = _contract_runtime(conn)
+    record = runtime.store.get(contract_execution_id)
+    lines = list(record.get("completed_lines") or [])
+    matching_implementations = [
+        (index, line)
+        for index, line in enumerate(lines)
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "worker_implementation"
+        and _runtime_context_contract_line_matches_worker(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=str(getattr(context, "task_id", "") or "").strip(),
+        )
+    ]
+    matching_worker_commits = [
+        line
+        for line in lines
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "worker_commit"
+        and _runtime_context_contract_line_matches_worker(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=str(getattr(context, "task_id", "") or "").strip(),
+        )
+    ]
+    guide = record.get("runtime_guide") if isinstance(
+        record.get("runtime_guide"), Mapping
+    ) else {}
+    next_line = guide.get("next_legal_action") if isinstance(
+        guide.get("next_legal_action"), Mapping
+    ) else {}
+    if len(matching_implementations) != 1:
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_source_ambiguous",
+            "test-results correction requires one immutable implementation source",
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": str(getattr(context, "task_id", "") or ""),
+                "matching_source_count": len(matching_implementations),
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+    if matching_worker_commits or str(next_line.get("line_id") or "").strip() != (
+        "worker_commit"
+    ):
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_closed",
+            "test-results correction is closed after worker_commit or bypass",
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": str(getattr(context, "task_id", "") or ""),
+                "worker_commit_line_count": len(matching_worker_commits),
+                "original_completed_lines_immutable": True,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+    source_index, source_line = matching_implementations[0]
+    source_validation = worker_implementation_test_results_validation(
+        source_line,
+        evidence_envelope=True,
+    )
+    if source_validation.get("accepted") is True:
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_not_required",
+            "the immutable implementation source is already finish-compatible",
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": str(getattr(context, "task_id", "") or ""),
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+    legacy_divergence = worker_implementation_legacy_accept_commit_divergence(
+        source_line,
+        evidence_envelope=True,
+    )
+    if legacy_divergence.get("authorized") is not True:
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_source_not_authorized",
+            "source is not the bounded legacy accept/commit divergence",
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "classification": legacy_divergence.get("classification"),
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+    source_lineage = _worker_implementation_lineage(record, source_line)
+    source_line_sha256 = worker_implementation_source_line_sha256(source_line)
+    try:
+        corrections = _runtime_context_worker_implementation_correction_rows(
+            runtime,
+            record,
+            source_line,
+        )
+    except ContractRuntimeError as exc:
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_identity_mismatch",
+            "durable correction identity is invalid",
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        ) from exc
+    if len(corrections) > 1:
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_ambiguous",
+            "multiple canonical corrections exist for one immutable source",
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "correction_count": len(corrections),
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+    source_revision = worker_implementation_source_execution_state_revision(
+        source_line
+    )
+    expected_intent = {
+        "schema_version": (
+            "runtime_context.worker_implementation_test_results_correction_intent.v1"
+        ),
+        "action": "repair_worker_implementation_test_results",
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": str(getattr(context, "task_id", "") or "").strip(),
+        "source_completed_line_index": source_index,
+        "source_line_instance_id": str(
+            source_line.get("line_instance_id") or ""
+        ).strip(),
+        "source_implementation_lineage_ref": str(
+            source_lineage.get("implementation_lineage_ref") or ""
+        ).strip(),
+        "source_line_sha256": source_line_sha256,
+        "source_execution_state_revision": source_revision,
+    }
+    if set(intent) != set(expected_intent) or any(
+        intent.get(key) != expected for key, expected in expected_intent.items()
+    ):
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_intent_mismatch",
+            "test-results correction intent does not match server-derived source",
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": str(getattr(context, "task_id", "") or ""),
+                "required_intent": expected_intent,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+                "caller_authority_fields_trusted": False,
+            },
+        )
+    corrected_validation = worker_implementation_test_results_validation(
+        payload,
+        evidence_envelope=True,
+    )
+    if corrected_validation.get("accepted") is not True:
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_invalid",
+            "corrected test_results are not finish-compatible",
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "validation": corrected_validation,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+    corrected_results = dict(
+        corrected_validation.get("canonical_test_results") or {}
+    )
+    correction_reason = str(body.get("correction_reason") or "").strip()
+    submitted_evidence_refs = body.get("evidence_refs")
+    submitted_tests = body.get("tests")
+    expected_evidence_refs = [
+        f"graph-query-trace:{trace_id}"
+        for trace_id in source_lineage.get("graph_trace_ids") or []
+    ]
+    if (
+        correction_reason
+        != "legacy_worker_implementation_test_results_shape_incompatible"
+        or not isinstance(submitted_evidence_refs, list)
+        or submitted_evidence_refs != expected_evidence_refs
+        or set(corrected_results) != {"status", "passed", "commands"}
+        or not isinstance(submitted_tests, list)
+        or not submitted_tests
+        or any(
+            not isinstance(item, Mapping)
+            or set(item) != {"command", "status"}
+            or not worker_implementation_copy_safe_test_command(
+                item.get("command")
+            )
+            or not str(item.get("status") or "").strip()
+            or len(str(item.get("status") or "").strip()) > 32
+            or str(item.get("status") or "").strip().lower()
+            not in {"pass", "passed", "ok", "succeeded", "success", "clean"}
+            for item in submitted_tests
+        )
+    ):
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_evidence_invalid",
+            "correction requires the exact reason and ordered evidence",
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "required_reason": (
+                    "legacy_worker_implementation_test_results_shape_incompatible"
+                ),
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+    from .parallel_branch_runtime import public_contract_revision_payload
+
+    ordered_tests = [
+        public_contract_revision_payload(item) for item in submitted_tests
+    ]
+    if corrected_results.get("commands") != ordered_tests:
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_evidence_mismatch",
+            "corrected test_results commands must equal ordered tests",
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+    source_payload = source_line.get("payload") if isinstance(
+        source_line.get("payload"), Mapping
+    ) else {}
+    source_results = (
+        source_payload.get("test_results")
+        if "test_results" in source_payload
+        else source_line.get("test_results")
+    )
+    source_files = sorted(
+        set(_runtime_context_service_query_values(source_line, "changed_files"))
+    )
+    submitted_files = sorted(
+        set(_runtime_context_service_query_values(body, "changed_files"))
+    )
+    if submitted_files != source_files or not verified_graph_trace_ids:
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_evidence_mismatch",
+            "correction files and graph traces must match the immutable source",
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+    from . import batch_jobs
+
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    actual_head = batch_jobs.git_commit(worktree_path)
+    source_commit = _worker_commit_text(
+        source_line,
+        "commit_sha",
+        "head_commit",
+        "immutable_head_commit",
+    )
+    supplied_commit = str(
+        body.get("commit_sha") or body.get("head_commit") or source_commit
+    ).strip()
+    dirty_files = _runtime_context_git_dirty_files(worktree_path)
+    if (
+        not re.fullmatch(r"[0-9a-f]{40,64}", actual_head)
+        or actual_head != source_commit
+        or supplied_commit != source_commit
+        or dirty_files
+    ):
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_git_mismatch",
+            "correction requires the exact clean immutable implementation HEAD",
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "expected_head_commit": source_commit,
+                "actual_head_commit": actual_head,
+                "dirty_files": dirty_files,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+    session_authority_event_ref = (
+        _runtime_context_worker_implementation_session_authority_event_ref(
+            conn,
+            project_id=project_id,
+            backlog_id=str(getattr(context, "backlog_id", "") or "").strip(),
+            runtime_context_id=runtime_context_id,
+            task_id=str(getattr(context, "task_id", "") or "").strip(),
+            worker_id=str(getattr(context, "worker_id", "") or "").strip(),
+            worker_slot_id=str(
+                getattr(context, "worker_slot_id", "")
+                or getattr(context, "worker_id", "")
+                or ""
+            ).strip(),
+            session_token_ref=str(session_token_ref or "").strip(),
+            fence_token_hash=str(fence_token_hash or "").strip(),
+        )
+    )
+    if not session_authority_event_ref:
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_session_authority_missing",
+            "correction requires one server-owned session authority event",
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+                "next_legal_action": "rejoin_runtime_context_and_retry_correction",
+            },
+        )
+    business = {
+        "schema_version": (
+            "contract_runtime.worker_implementation_test_results_correction.v1"
+        ),
+        "project_id": project_id,
+        "backlog_id": str(getattr(context, "backlog_id", "") or "").strip(),
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": str(getattr(context, "task_id", "") or "").strip(),
+        "source_completed_line_index": source_index,
+        "source_line_instance_id": expected_intent["source_line_instance_id"],
+        "source_implementation_lineage_ref": expected_intent[
+            "source_implementation_lineage_ref"
+        ],
+        "source_line_sha256": source_line_sha256,
+        "source_execution_state_revision": source_revision,
+        "source_test_results_sha256": stable_sha256(source_results),
+        "corrected_test_results": corrected_results,
+        "corrected_test_results_sha256": stable_sha256(corrected_results),
+        "correction_reason": correction_reason,
+        "correction_reason_sha256": stable_sha256(correction_reason),
+        "ordered_evidence_refs": list(submitted_evidence_refs),
+        "ordered_evidence_refs_sha256": stable_sha256(
+            submitted_evidence_refs
+        ),
+        "ordered_tests": ordered_tests,
+        "ordered_tests_sha256": stable_sha256(ordered_tests),
+        "append_only": True,
+        "original_completed_line_immutable": True,
+        "copy_safe": True,
+        "raw_credentials_persisted": False,
+    }
+    if corrections:
+        existing = dict(corrections[0])
+        existing_validation = (
+            worker_implementation_test_results_correction_validation(
+                record,
+                source_line,
+                existing,
+            )
+        )
+        existing_authority_validation = (
+            _runtime_context_worker_implementation_correction_authority_validation(
+                conn,
+                project_id=project_id,
+                record=record,
+                implementation=source_line,
+                correction=existing,
+                context=context,
+            )
+        )
+        stable_fields = set(business)
+        if (
+            existing_validation.get("accepted") is not True
+            or existing_authority_validation.get("accepted") is not True
+            or any(
+                existing.get(field) != business[field]
+                for field in stable_fields
+            )
+        ):
+            raise GovernanceError(
+                "worker_implementation_test_results_correction_identity_mismatch",
+                "existing correction conflicts with the immutable source or replay",
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "runtime_context_id": runtime_context_id,
+                    "zero_contract_runtime_write": True,
+                    "zero_timeline_write": True,
+                },
+            )
+        return {
+            "schema_version": (
+                "runtime_context.worker_implementation_test_results_correction_result.v1"
+            ),
+            "ok": True,
+            "status": "already_completed",
+            "writes_performed": False,
+            "correction": existing,
+            "original_completed_line_count": len(lines),
+            "original_execution_state_revision": int(
+                record.get("execution_state_revision") or 0
+            ),
+            "timeline_write_performed": False,
+        }
+    source_authority = {
+        "schema_version": (
+            "runtime_context.worker_implementation_test_results_correction_authority.v1"
+        ),
+        "source": "authenticated_runtime_context_implementation_evidence",
+        "server_derived": True,
+        "worker_role": "mf_sub",
+        "worker_id": str(getattr(context, "worker_id", "") or "").strip(),
+        "worker_slot_id": str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ).strip(),
+        "session_token_ref": str(session_token_ref or "").strip(),
+        "fence_token_hash": str(fence_token_hash or "").strip(),
+        "session_authority_event_ref": session_authority_event_ref,
+        "graph_trace_ids": list(verified_graph_trace_ids),
+        "db_verified_graph_traces": True,
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        "raw_route_token_persisted": False,
+    }
+    correction = {
+        **business,
+        "source_authority": source_authority,
+        "source_authority_sha256": stable_sha256(source_authority),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    correction["correction_id"] = (
+        worker_implementation_test_results_correction_id(correction)
+    )
+    validation = worker_implementation_test_results_correction_validation(
+        record,
+        source_line,
+        correction,
+    )
+    if validation.get("accepted") is not True:
+        raise GovernanceError(
+            "worker_implementation_test_results_correction_internal_invalid",
+            "server-derived correction failed closed validation: "
+            + str(validation.get("reason") or "invalid"),
+            500,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "reason": validation.get("reason"),
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+    runtime.store.append_worker_implementation_test_results_correction(
+        correction
+    )
+    return {
+        "schema_version": (
+            "runtime_context.worker_implementation_test_results_correction_result.v1"
+        ),
+        "ok": True,
+        "status": "corrected",
+        "writes_performed": True,
+        "correction": correction,
+        "original_completed_line_count": len(lines),
+        "original_execution_state_revision": int(
+            record.get("execution_state_revision") or 0
+        ),
+        "timeline_write_performed": False,
+    }
 
 
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/implementation-evidence")
@@ -48794,6 +50104,181 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         payload["precommit_implementation_correction_intent"] = body.get(
             "precommit_implementation_correction_intent"
         )
+    correction_intent = payload.get(
+        "precommit_implementation_correction_intent"
+    )
+    if (
+        isinstance(correction_intent, Mapping)
+        and str(correction_intent.get("action") or "").strip()
+        == "repair_worker_implementation_test_results"
+    ):
+        correction_conn = get_connection(project_id)
+        try:
+            correction_conn.execute("BEGIN IMMEDIATE")
+            (
+                locked_context,
+                locked_runtime_context_id,
+                _locked_session,
+            ) = _runtime_context_mf_sub_write_context(
+                ctx,
+                correction_conn,
+                action=(
+                    "graph-governance.runtime-context.implementation-evidence"
+                ),
+                allow_validated=True,
+            )
+            if locked_runtime_context_id != runtime_context_id:
+                raise GovernanceError(
+                    "worker_implementation_test_results_correction_context_changed",
+                    "runtime context changed before the locked correction",
+                    409,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "zero_contract_runtime_write": True,
+                        "zero_timeline_write": True,
+                    },
+                )
+            from .parallel_branch_runtime import (
+                mf_subagent_session_token_hash,
+                runtime_context_fence_token_matches,
+                runtime_context_fence_token_verifier,
+                runtime_context_session_token_ref,
+            )
+
+            locked_session_token_ref = runtime_context_session_token_ref(
+                locked_context
+            )
+            locked_fence_token_hash = runtime_context_fence_token_verifier(
+                locked_context
+            )
+            presented_session_token = _runtime_context_request_value(
+                ctx,
+                "session_token",
+            )
+            presented_fence_token = _runtime_context_request_value(
+                ctx,
+                "fence_token",
+            )
+            presented_session_token_ref = runtime_context_session_token_ref(
+                locked_context,
+                session_token_hash=mf_subagent_session_token_hash(
+                    presented_session_token
+                ),
+            )
+            locked_identity = (
+                str(getattr(locked_context, "task_id", "") or "").strip(),
+                str(getattr(locked_context, "backlog_id", "") or "").strip(),
+                str(getattr(locked_context, "worker_id", "") or "").strip(),
+                str(
+                    getattr(locked_context, "worker_slot_id", "")
+                    or getattr(locked_context, "worker_id", "")
+                    or ""
+                ).strip(),
+                str(getattr(locked_context, "worktree_path", "") or "").strip(),
+            )
+            preflight_identity = (
+                str(getattr(context, "task_id", "") or "").strip(),
+                str(getattr(context, "backlog_id", "") or "").strip(),
+                str(getattr(context, "worker_id", "") or "").strip(),
+                str(
+                    getattr(context, "worker_slot_id", "")
+                    or getattr(context, "worker_id", "")
+                    or ""
+                ).strip(),
+                str(getattr(context, "worktree_path", "") or "").strip(),
+            )
+            locked_contract_execution_identity = (
+                _runtime_context_contract_execution_identity(
+                    _runtime_context_latest_contract_revision_payload(
+                        correction_conn,
+                        locked_context,
+                    )
+                )
+            )
+            (
+                locked_contract_execution_identity,
+                _locked_contract_execution_resolution,
+            ) = _runtime_context_resolve_contract_execution_identity(
+                correction_conn,
+                project_id=project_id,
+                context=locked_context,
+                runtime_context_id=locked_runtime_context_id,
+                task_id=str(
+                    getattr(locked_context, "task_id", "") or ""
+                ).strip(),
+                contract_identity=locked_contract_execution_identity,
+            )
+            locked_contract_execution_id = str(
+                locked_contract_execution_identity.get(
+                    "contract_execution_id"
+                )
+                or ""
+            ).strip()
+            preflight_contract_execution_id = str(
+                contract_execution_identity.get("contract_execution_id")
+                or ""
+            ).strip()
+            if (
+                locked_identity != preflight_identity
+                or not locked_session_token_ref
+                or not locked_fence_token_hash
+                or locked_session_token_ref != session_token_ref
+                or locked_fence_token_hash != fence_token_hash
+                or presented_session_token_ref
+                != locked_session_token_ref
+                or not runtime_context_fence_token_matches(
+                    locked_context,
+                    presented_fence_token,
+                )
+                or not locked_contract_execution_id
+                or locked_contract_execution_id
+                != preflight_contract_execution_id
+            ):
+                raise GovernanceError(
+                    "worker_implementation_test_results_correction_authority_changed",
+                    "runtime-context authority changed before the locked correction",
+                    409,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "zero_contract_runtime_write": True,
+                        "zero_timeline_write": True,
+                    },
+                )
+            correction_result = (
+                _runtime_context_repair_worker_implementation_test_results(
+                    correction_conn,
+                    project_id=project_id,
+                    context=locked_context,
+                    runtime_context_id=runtime_context_id,
+                    contract_execution_id=locked_contract_execution_id,
+                    body=body,
+                    payload=payload,
+                    verified_graph_trace_ids=verified_graph_trace_ids,
+                    session_token_ref=locked_session_token_ref,
+                    fence_token_hash=locked_fence_token_hash,
+                )
+            )
+            correction_conn.commit()
+        except Exception:
+            correction_conn.rollback()
+            raise
+        finally:
+            correction_conn.close()
+        return {
+            **correction_result,
+            "action": "repair_worker_implementation_test_results",
+            "project_id": project_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": str(context.task_id or "").strip(),
+            "contract_execution_id": str(
+                contract_execution_identity.get("contract_execution_id") or ""
+            ).strip(),
+            "source_of_authority": (
+                "worker_implementation_test_results_corrections"
+            ),
+            "original_worker_implementation_mutated": False,
+            "contract_runtime_revision_mutated": False,
+        }
     if isinstance(body.get("route_token_gate"), Mapping):
         payload["route_token_gate"] = body.get("route_token_gate")
 
@@ -143321,6 +144806,14 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
     if not contract_execution_id:
         raise ValidationError("contract_execution_id is required")
     body = dict(ctx.body or {})
+    if str(body.get("line_id") or "").strip() == "worker_implementation":
+        _runtime_context_require_worker_implementation_test_results(
+            body,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=str(body.get("runtime_context_id") or "").strip(),
+            task_id=str(body.get("task_id") or "").strip(),
+            zero_db_access=True,
+        )
     with DBContext(project_id) as conn:
         runtime = _contract_runtime(conn)
         record = runtime.store.get(contract_execution_id)
@@ -143931,6 +145424,14 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
     if not contract_execution_id:
         raise ValidationError("contract_execution_id is required")
     body = dict(ctx.body or {})
+    if str(body.get("line_id") or "").strip() == "worker_implementation":
+        _runtime_context_require_worker_implementation_test_results(
+            body,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=str(body.get("runtime_context_id") or "").strip(),
+            task_id=str(body.get("task_id") or "").strip(),
+            zero_db_access=True,
+        )
     with DBContext(project_id) as conn:
         runtime = _contract_runtime(conn)
         record = runtime.store.get(contract_execution_id)

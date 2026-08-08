@@ -361,6 +361,50 @@ CREATE INDEX IF NOT EXISTS idx_contract_runtime_backlog
     ON contract_runtime_executions(project_id, backlog_id, contract_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_contract_runtime_chain
     ON contract_runtime_executions(contract_chain_id, parent_contract_execution_id);
+CREATE TABLE IF NOT EXISTS worker_implementation_test_results_corrections (
+    correction_id              TEXT PRIMARY KEY,
+    project_id                 TEXT NOT NULL,
+    backlog_id                 TEXT NOT NULL,
+    contract_execution_id      TEXT NOT NULL,
+    runtime_context_id         TEXT NOT NULL,
+    task_id                    TEXT NOT NULL,
+    source_completed_line_index INTEGER NOT NULL,
+    source_line_instance_id    TEXT NOT NULL,
+    source_implementation_lineage_ref TEXT NOT NULL,
+    source_line_sha256         TEXT NOT NULL,
+    source_execution_state_revision INTEGER NOT NULL,
+    source_test_results_sha256 TEXT NOT NULL,
+    corrected_test_results_sha256 TEXT NOT NULL,
+    source_authority_sha256   TEXT NOT NULL,
+    source_worker_id          TEXT NOT NULL,
+    source_worker_slot_id     TEXT NOT NULL,
+    source_session_token_ref  TEXT NOT NULL,
+    source_fence_token_hash   TEXT NOT NULL,
+    correction_json            TEXT NOT NULL,
+    created_at                 TEXT NOT NULL,
+    UNIQUE (
+        project_id,
+        contract_execution_id,
+        runtime_context_id,
+        task_id,
+        source_completed_line_index,
+        source_line_sha256
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_source
+    ON worker_implementation_test_results_corrections(
+        project_id,
+        contract_execution_id,
+        runtime_context_id,
+        task_id
+    );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_line
+    ON worker_implementation_test_results_corrections(
+        source_line_sha256,
+        source_line_instance_id,
+        source_implementation_lineage_ref,
+        source_completed_line_index
+    );
 """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
@@ -371,7 +415,10 @@ CREATE INDEX IF NOT EXISTS idx_contract_runtime_chain
         _ensure_sqlite_schema_without_implicit_commit(
             self.conn,
             self.SCHEMA_SQL,
-            required_tables=("contract_runtime_executions",),
+            required_tables=(
+                "contract_runtime_executions",
+                "worker_implementation_test_results_corrections",
+            ),
         )
         ensure_contract_chain_mapping_schema(self.conn)
 
@@ -516,6 +563,292 @@ CREATE INDEX IF NOT EXISTS idx_contract_runtime_chain
             raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[0]
             records.append(_decode_record(raw))
         return records
+
+    def worker_implementation_test_results_corrections(
+        self,
+        *,
+        project_id: str,
+        contract_execution_id: str,
+        runtime_context_id: str,
+        task_id: str,
+        source_line_sha256: str = "",
+        source_line_instance_id: str = "",
+        source_implementation_lineage_ref: str = "",
+        source_completed_line_index: int | None = None,
+    ) -> list[dict[str, Any]]:
+        source_lookup = bool(
+            source_line_sha256
+            or source_line_instance_id
+            or source_implementation_lineage_ref
+            or source_completed_line_index is not None
+        )
+        if source_lookup and not (
+            source_line_sha256
+            and source_line_instance_id
+            and source_implementation_lineage_ref
+            and isinstance(source_completed_line_index, int)
+            and not isinstance(source_completed_line_index, bool)
+            and source_completed_line_index >= 0
+        ):
+            raise ContractRuntimeError(
+                "test-results correction source lookup is incomplete"
+            )
+        where = (
+            "((project_id = ? AND contract_execution_id = ? "
+            "AND runtime_context_id = ? AND task_id = ?) "
+            "OR source_line_sha256 = ? "
+            "OR source_implementation_lineage_ref = ? "
+            "OR (source_line_instance_id = ? "
+            "AND source_completed_line_index = ?))"
+            if source_lookup
+            else (
+                "project_id = ? AND contract_execution_id = ? "
+                "AND runtime_context_id = ? AND task_id = ?"
+            )
+        )
+        params = (
+            (
+                project_id,
+                contract_execution_id,
+                runtime_context_id,
+                task_id,
+                source_line_sha256,
+                source_implementation_lineage_ref,
+                source_line_instance_id,
+                source_completed_line_index,
+            )
+            if source_lookup
+            else (
+                project_id,
+                contract_execution_id,
+                runtime_context_id,
+                task_id,
+            )
+        )
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                correction_id,
+                project_id,
+                backlog_id,
+                contract_execution_id,
+                runtime_context_id,
+                task_id,
+                source_completed_line_index,
+                source_line_instance_id,
+                source_implementation_lineage_ref,
+                source_line_sha256,
+                source_execution_state_revision,
+                source_test_results_sha256,
+                corrected_test_results_sha256,
+                source_authority_sha256,
+                source_worker_id,
+                source_worker_slot_id,
+                source_session_token_ref,
+                source_fence_token_hash,
+                created_at,
+                correction_json
+            FROM worker_implementation_test_results_corrections
+            WHERE {where}
+            ORDER BY created_at, correction_id
+            """,
+            params,
+        ).fetchall()
+        records: list[dict[str, Any]] = []
+        columns = (
+            "correction_id",
+            "project_id",
+            "backlog_id",
+            "contract_execution_id",
+            "runtime_context_id",
+            "task_id",
+            "source_completed_line_index",
+            "source_line_instance_id",
+            "source_implementation_lineage_ref",
+            "source_line_sha256",
+            "source_execution_state_revision",
+            "source_test_results_sha256",
+            "corrected_test_results_sha256",
+            "source_authority_sha256",
+            "source_worker_id",
+            "source_worker_slot_id",
+            "source_session_token_ref",
+            "source_fence_token_hash",
+            "created_at",
+            "correction_json",
+        )
+        for raw_row in rows:
+            row = (
+                dict(raw_row)
+                if isinstance(raw_row, sqlite3.Row)
+                else dict(zip(columns, raw_row, strict=True))
+            )
+            try:
+                decoded = _decode_record(row["correction_json"])
+            except (ContractRuntimeError, TypeError, ValueError) as exc:
+                raise ContractRuntimeError(
+                    "test-results correction durable row is invalid"
+                ) from exc
+            authority = (
+                decoded.get("source_authority")
+                if isinstance(decoded.get("source_authority"), Mapping)
+                else {}
+            )
+            duplicated = {
+                key: row[key]
+                for key in (
+                    "correction_id",
+                    "project_id",
+                    "backlog_id",
+                    "contract_execution_id",
+                    "runtime_context_id",
+                    "task_id",
+                    "source_completed_line_index",
+                    "source_line_instance_id",
+                    "source_implementation_lineage_ref",
+                    "source_line_sha256",
+                    "source_execution_state_revision",
+                    "source_test_results_sha256",
+                    "corrected_test_results_sha256",
+                    "source_authority_sha256",
+                    "created_at",
+                )
+            }
+            authority_duplicates = {
+                "source_worker_id": authority.get("worker_id"),
+                "source_worker_slot_id": authority.get("worker_slot_id"),
+                "source_session_token_ref": authority.get("session_token_ref"),
+                "source_fence_token_hash": authority.get("fence_token_hash"),
+            }
+            mismatch = any(
+                type(decoded.get(key)) is not type(expected)
+                or decoded.get(key) != expected
+                for key, expected in duplicated.items()
+            ) or any(
+                not isinstance(actual, str) or actual != row[key]
+                for key, actual in authority_duplicates.items()
+            )
+            if mismatch:
+                raise ContractRuntimeError(
+                    "test-results correction durable row identity mismatch"
+                )
+            records.append(decoded)
+        return records
+
+    def append_worker_implementation_test_results_correction(
+        self,
+        correction: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        stored = deepcopy(dict(correction))
+        required_text = (
+            "correction_id",
+            "project_id",
+            "backlog_id",
+            "contract_execution_id",
+            "runtime_context_id",
+            "task_id",
+            "source_line_instance_id",
+            "source_implementation_lineage_ref",
+            "source_line_sha256",
+            "source_test_results_sha256",
+            "corrected_test_results_sha256",
+            "source_authority_sha256",
+        )
+        if any(not str(stored.get(field) or "").strip() for field in required_text):
+            raise ContractRuntimeError(
+                "test-results correction requires complete immutable identity"
+            )
+        source_index = stored.get("source_completed_line_index")
+        source_revision = stored.get("source_execution_state_revision")
+        if (
+            not isinstance(source_index, int)
+            or isinstance(source_index, bool)
+            or source_index < 0
+            or not isinstance(source_revision, int)
+            or isinstance(source_revision, bool)
+            or source_revision <= 0
+        ):
+            raise ContractRuntimeError(
+                "test-results correction source index/revision is invalid"
+            )
+        created_at = str(
+            stored.get("created_at")
+            or datetime.now(timezone.utc).isoformat()
+        ).strip()
+        if not _worker_implementation_canonical_utc_timestamp(created_at):
+            raise ContractRuntimeError(
+                "test-results correction created_at is invalid"
+            )
+        stored["created_at"] = created_at
+        source_authority = (
+            stored.get("source_authority")
+            if isinstance(stored.get("source_authority"), Mapping)
+            else {}
+        )
+        source_authority_columns = tuple(
+            str(source_authority.get(field) or "").strip()
+            for field in (
+                "worker_id",
+                "worker_slot_id",
+                "session_token_ref",
+                "fence_token_hash",
+            )
+        )
+        if any(not value for value in source_authority_columns):
+            raise ContractRuntimeError(
+                "test-results correction source authority is incomplete"
+            )
+        try:
+            self.conn.execute(
+                """
+                INSERT INTO worker_implementation_test_results_corrections (
+                    correction_id,
+                    project_id,
+                    backlog_id,
+                    contract_execution_id,
+                    runtime_context_id,
+                    task_id,
+                    source_completed_line_index,
+                    source_line_instance_id,
+                    source_implementation_lineage_ref,
+                    source_line_sha256,
+                    source_execution_state_revision,
+                    source_test_results_sha256,
+                    corrected_test_results_sha256,
+                    source_authority_sha256,
+                    source_worker_id,
+                    source_worker_slot_id,
+                    source_session_token_ref,
+                    source_fence_token_hash,
+                    correction_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    stored["correction_id"],
+                    stored["project_id"],
+                    stored["backlog_id"],
+                    stored["contract_execution_id"],
+                    stored["runtime_context_id"],
+                    stored["task_id"],
+                    source_index,
+                    stored["source_line_instance_id"],
+                    stored["source_implementation_lineage_ref"],
+                    stored["source_line_sha256"],
+                    source_revision,
+                    stored["source_test_results_sha256"],
+                    stored["corrected_test_results_sha256"],
+                    stored["source_authority_sha256"],
+                    *source_authority_columns,
+                    _record_json(stored),
+                    created_at,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ContractRuntimeError(
+                "test-results correction immutable source already exists"
+            ) from exc
+        return deepcopy(stored)
 
 
 CONTRACT_CHAIN_MAPPING_SCHEMA_SQL = """
@@ -4453,6 +4786,405 @@ _WORKER_IMPLEMENTATION_NO_PASS_COUNT_FIELDS = (
 _WORKER_IMPLEMENTATION_HISTORICAL_BASE_SELECTORS = frozenset(
     {"rev8_postmerge_qa_graph_binding or pre_rev8_qa_graph_binding"}
 )
+_WORKER_IMPLEMENTATION_TEST_RESULTS_CORRECTION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "correction_id",
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+        "source_completed_line_index",
+        "source_line_instance_id",
+        "source_implementation_lineage_ref",
+        "source_line_sha256",
+        "source_execution_state_revision",
+        "source_test_results_sha256",
+        "corrected_test_results",
+        "corrected_test_results_sha256",
+        "source_authority",
+        "source_authority_sha256",
+        "correction_reason",
+        "correction_reason_sha256",
+        "ordered_evidence_refs",
+        "ordered_evidence_refs_sha256",
+        "ordered_tests",
+        "ordered_tests_sha256",
+        "append_only",
+        "original_completed_line_immutable",
+        "copy_safe",
+        "raw_credentials_persisted",
+        "created_at",
+    }
+)
+_WORKER_IMPLEMENTATION_TEST_RESULTS_CORRECTION_AUTHORITY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source",
+        "server_derived",
+        "worker_role",
+        "worker_id",
+        "worker_slot_id",
+        "session_token_ref",
+        "fence_token_hash",
+        "session_authority_event_ref",
+        "graph_trace_ids",
+        "db_verified_graph_traces",
+        "raw_session_token_persisted",
+        "raw_fence_token_persisted",
+        "raw_route_token_persisted",
+    }
+)
+
+
+def worker_implementation_source_line_sha256(
+    implementation: Mapping[str, Any],
+) -> str:
+    """Hash the immutable ContractRuntime source line without precedence."""
+
+    return stable_sha256(deepcopy(dict(implementation)))
+
+
+def worker_implementation_source_execution_state_revision(
+    implementation: Mapping[str, Any],
+) -> int:
+    """Resolve the immutable revision recorded on the source line itself."""
+
+    payload = (
+        implementation.get("payload")
+        if isinstance(implementation.get("payload"), Mapping)
+        else {}
+    )
+    candidates = [
+        candidate
+        for candidate in (
+            implementation.get("execution_state_revision"),
+            payload.get("execution_state_revision"),
+        )
+        if candidate is not None
+    ]
+    if (
+        not candidates
+        or any(
+            not isinstance(candidate, int)
+            or isinstance(candidate, bool)
+            or candidate <= 0
+            for candidate in candidates
+        )
+        or len(set(candidates)) != 1
+    ):
+        return 0
+    return int(candidates[0])
+
+
+def worker_implementation_test_results_correction_id(
+    correction: Mapping[str, Any],
+) -> str:
+    id_core = {
+        key: correction[key]
+        for key in sorted(
+            _WORKER_IMPLEMENTATION_TEST_RESULTS_CORRECTION_FIELDS
+            - {"correction_id", "created_at", "source_authority"}
+        )
+        if key in correction
+    }
+    return "witr-correction:" + stable_sha256(id_core)
+
+
+def _worker_implementation_test_results_contains_raw_credential_field(
+    value: Any,
+) -> bool:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            normalized = re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower())
+            if (
+                normalized
+                in {
+                    "token",
+                    "raw_token",
+                    "session_token",
+                    "route_token",
+                    "fence_token",
+                    "access_token",
+                    "refresh_token",
+                    "bearer_token",
+                    "api_key",
+                    "apikey",
+                    "password",
+                    "secret",
+                    "secret_value",
+                    "credential",
+                    "credentials",
+                    "credential_value",
+                    "authorization",
+                }
+                or (
+                    normalized.startswith("raw_")
+                    and normalized.endswith("_token")
+                )
+            ):
+                return True
+            if _worker_implementation_test_results_contains_raw_credential_field(
+                nested
+            ):
+                return True
+    elif isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return any(
+            _worker_implementation_test_results_contains_raw_credential_field(item)
+            for item in value
+        )
+    return False
+
+
+def worker_implementation_copy_safe_test_command(value: Any) -> bool:
+    command = value if isinstance(value, str) else ""
+    stripped = command.strip()
+    placeholder_vocabulary = {
+        "placeholder",
+        "replace-me",
+        "replace_me",
+        "tbd",
+        "todo",
+    }
+    return bool(
+        1 <= len(stripped) <= 512
+        and command == stripped
+        and not any(ord(character) < 32 for character in command)
+        and stripped.lower() not in placeholder_vocabulary
+        and not re.search(r"<[^<>\r\n]{1,128}>", command)
+        and not re.search(r"\{\{[^{}\r\n]{1,128}\}\}", command)
+        and not re.search(
+            r"(?i)(?:\$\{|__)(?:todo|tbd|placeholder|replace[_-]?me)(?:\}|__)",
+            command,
+        )
+        and not re.search(
+            r"(?i)(?:token|password|secret|api[_-]?key|authorization)\s*(?:=|:)",
+            command,
+        )
+        and not re.search(
+            r"(?i)(?:^|\s)--(?:session-|route-|fence-)?"
+            r"(?:token|password|secret|api-key)(?:\s|=)",
+            command,
+        )
+        and not re.search(r"(?i)\bbearer\s+[a-z0-9._~-]+", command)
+    )
+
+
+def _worker_implementation_canonical_utc_timestamp(value: Any) -> bool:
+    if not isinstance(value, str) or not (20 <= len(value) <= 32):
+        return False
+    if not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?\+00:00",
+        value,
+    ):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return bool(parsed.tzinfo is not None and parsed.utcoffset().total_seconds() == 0)
+
+
+def worker_implementation_test_results_correction_validation(
+    record: Mapping[str, Any],
+    implementation: Mapping[str, Any],
+    correction: Any,
+) -> dict[str, Any]:
+    """Validate one independent correction ledger row against its source."""
+
+    schema_version = (
+        "contract_runtime.worker_implementation_test_results_correction_validation.v1"
+    )
+
+    def _reject(reason: str) -> dict[str, Any]:
+        return {
+            "schema_version": schema_version,
+            "accepted": False,
+            "reason": reason,
+            "canonical_test_results": {},
+        }
+
+    if not isinstance(correction, Mapping):
+        return _reject("correction_must_be_mapping")
+    candidate = deepcopy(dict(correction))
+    if set(candidate) != _WORKER_IMPLEMENTATION_TEST_RESULTS_CORRECTION_FIELDS:
+        return _reject("correction_closed_schema_mismatch")
+    if (
+        str(candidate.get("schema_version") or "").strip()
+        != "contract_runtime.worker_implementation_test_results_correction.v1"
+        or candidate.get("append_only") is not True
+        or candidate.get("original_completed_line_immutable") is not True
+        or candidate.get("copy_safe") is not True
+        or candidate.get("raw_credentials_persisted") is not False
+        or not _worker_implementation_canonical_utc_timestamp(
+            candidate.get("created_at")
+        )
+    ):
+        return _reject("correction_contract_flags_invalid")
+    source_authority = candidate.get("source_authority")
+    if (
+        not isinstance(source_authority, Mapping)
+        or set(source_authority)
+        != _WORKER_IMPLEMENTATION_TEST_RESULTS_CORRECTION_AUTHORITY_FIELDS
+        or str(source_authority.get("schema_version") or "").strip()
+        != "runtime_context.worker_implementation_test_results_correction_authority.v1"
+        or str(source_authority.get("source") or "").strip()
+        != "authenticated_runtime_context_implementation_evidence"
+        or source_authority.get("server_derived") is not True
+        or str(source_authority.get("worker_role") or "").strip() != "mf_sub"
+        or source_authority.get("db_verified_graph_traces") is not True
+        or not str(
+            source_authority.get("session_authority_event_ref") or ""
+        ).startswith("timeline:")
+        or not list(source_authority.get("graph_trace_ids") or [])
+        or source_authority.get("raw_session_token_persisted") is not False
+        or source_authority.get("raw_fence_token_persisted") is not False
+        or source_authority.get("raw_route_token_persisted") is not False
+    ):
+        return _reject("correction_source_authority_invalid")
+    if stable_sha256(source_authority) != str(
+        candidate.get("source_authority_sha256") or ""
+    ).strip():
+        return _reject("correction_source_authority_hash_mismatch")
+    source_index = candidate.get("source_completed_line_index")
+    source_revision = candidate.get("source_execution_state_revision")
+    lines = list(record.get("completed_lines") or [])
+    if (
+        not isinstance(source_index, int)
+        or isinstance(source_index, bool)
+        or source_index < 0
+        or source_index >= len(lines)
+    ):
+        return _reject("correction_source_index_or_revision_invalid")
+    source_line = lines[source_index]
+    expected_source_revision = (
+        worker_implementation_source_execution_state_revision(source_line)
+        if isinstance(source_line, Mapping)
+        else 0
+    )
+    if (
+        not isinstance(source_revision, int)
+        or isinstance(source_revision, bool)
+        or source_revision <= 0
+        or source_revision != expected_source_revision
+    ):
+        return _reject("correction_source_index_or_revision_invalid")
+    if (
+        not isinstance(source_line, Mapping)
+        or dict(source_line) != dict(implementation)
+        or str(source_line.get("line_id") or "").strip()
+        != "worker_implementation"
+    ):
+        return _reject("correction_source_line_mismatch")
+    source_lineage = _worker_implementation_lineage(record, source_line)
+    source_validation = worker_implementation_test_results_validation(
+        source_line,
+        evidence_envelope=True,
+    )
+    if source_validation.get("accepted") is True:
+        return _reject("correction_source_already_finish_compatible")
+    source_test_results = (
+        source_line.get("payload", {}).get("test_results")
+        if isinstance(source_line.get("payload"), Mapping)
+        else source_line.get("test_results")
+    )
+    corrected_validation = worker_implementation_test_results_validation(
+        candidate.get("corrected_test_results")
+    )
+    if corrected_validation.get("accepted") is not True:
+        return _reject("correction_results_not_finish_compatible")
+    correction_reason = candidate.get("correction_reason")
+    ordered_evidence_refs = candidate.get("ordered_evidence_refs")
+    ordered_tests = candidate.get("ordered_tests")
+    if (
+        not isinstance(correction_reason, str)
+        or not (1 <= len(correction_reason.strip()) <= 512)
+        or not isinstance(ordered_evidence_refs, list)
+        or not ordered_evidence_refs
+        or any(
+            not isinstance(ref, str)
+            or not ref.strip()
+            or len(ref) > 256
+            for ref in ordered_evidence_refs
+        )
+        or set(candidate.get("corrected_test_results") or {})
+        != {"status", "passed", "commands"}
+        or not isinstance(ordered_tests, list)
+        or not ordered_tests
+        or any(
+            not isinstance(item, Mapping)
+            or set(item) != {"command", "status"}
+            or not worker_implementation_copy_safe_test_command(
+                item.get("command")
+            )
+            or not str(item.get("status") or "").strip()
+            or len(str(item.get("status") or "").strip()) > 32
+            or str(item.get("status") or "").strip().lower()
+            not in _WORKER_IMPLEMENTATION_FINISH_PASS_STATUSES
+            for item in ordered_tests
+        )
+        or candidate.get("corrected_test_results", {}).get("commands")
+        != ordered_tests
+        or stable_sha256(correction_reason.strip())
+        != str(candidate.get("correction_reason_sha256") or "").strip()
+        or stable_sha256(ordered_evidence_refs)
+        != str(candidate.get("ordered_evidence_refs_sha256") or "").strip()
+        or stable_sha256(ordered_tests)
+        != str(candidate.get("ordered_tests_sha256") or "").strip()
+    ):
+        return _reject("correction_reason_or_ordered_evidence_invalid")
+    expected_identity = {
+        "project_id": str(record.get("project_id") or "").strip(),
+        "backlog_id": str(record.get("backlog_id") or "").strip(),
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": _worker_commit_text(
+            source_line, "runtime_context_id"
+        ),
+        "task_id": _worker_commit_text(source_line, "task_id"),
+        "source_line_instance_id": str(
+            source_line.get("line_instance_id") or ""
+        ).strip(),
+        "source_implementation_lineage_ref": str(
+            source_lineage.get("implementation_lineage_ref") or ""
+        ).strip(),
+        "source_line_sha256": worker_implementation_source_line_sha256(
+            source_line
+        ),
+        "source_test_results_sha256": stable_sha256(source_test_results),
+        "corrected_test_results_sha256": stable_sha256(
+            corrected_validation.get("canonical_test_results") or {}
+        ),
+    }
+    if any(
+        str(candidate.get(field) or "").strip() != expected
+        for field, expected in expected_identity.items()
+    ):
+        return _reject("correction_identity_mismatch")
+    if str(source_authority.get("worker_id") or "").strip() != _worker_commit_text(
+        source_line, "worker_id"
+    ) or str(source_authority.get("worker_slot_id") or "").strip() != (
+        _worker_commit_text(source_line, "worker_slot_id", "lane_id")
+    ):
+        return _reject("correction_worker_authority_mismatch")
+    expected_correction_id = worker_implementation_test_results_correction_id(
+        candidate
+    )
+    if str(candidate.get("correction_id") or "").strip() != expected_correction_id:
+        return _reject("correction_id_mismatch")
+    return {
+        "schema_version": schema_version,
+        "accepted": True,
+        "reason": "accepted",
+        "canonical_test_results": dict(
+            corrected_validation.get("canonical_test_results") or {}
+        ),
+        "correction_id": expected_correction_id,
+    }
 
 
 def _worker_implementation_legacy_results_finish_compatible(value: Any) -> bool:
@@ -4626,19 +5358,249 @@ def _worker_implementation_legacy_results_finish_compatible(value: Any) -> bool:
     )
 
 
-def _worker_implementation_test_results_finish_compatible(value: Any) -> bool:
-    """Validate the exact result shapes that can drive the finish contract.
+def worker_implementation_test_results_validation(
+    value: Any,
+    *,
+    evidence_envelope: bool = False,
+) -> dict[str, Any]:
+    """Return one structured verdict for implementation accept and commit.
 
-    The runtime deliberately does not reinterpret an intermediate lane state as
-    a test verdict.  In particular, a sibling that has not merged yet belongs
-    in implementation risk/summary evidence, not in ``test_results``.
+    ``passed`` is a verdict, never a count.  Python's ``bool`` is a subclass of
+    ``int``, so an ordinary truthiness check would otherwise accept the live
+    deadlock shape ``{"passed": 1}`` at implementation time and reject it at
+    worker-commit time.  When an evidence envelope is supplied, top-level and
+    payload projections are aliases of the same evidence and therefore must be
+    exactly equal rather than resolved by precedence.
+
+    The returned mapping is intentionally copy-safe and field-specific so the
+    server can use the same decision at both write boundaries without
+    reinterpreting it.
     """
 
+    schema_version = "contract_runtime.worker_implementation_test_results_validation.v1"
+    if evidence_envelope:
+        if not isinstance(value, Mapping):
+            return {
+                "schema_version": schema_version,
+                "accepted": False,
+                "canonical_test_results": {},
+                "field": "worker_implementation",
+                "reason": "evidence_envelope_must_be_mapping",
+                "remediation": "submit a worker_implementation object",
+            }
+        payload = value.get("payload") if isinstance(value.get("payload"), Mapping) else {}
+        top_present = "test_results" in value
+        nested_present = "test_results" in payload
+        if not top_present and not nested_present:
+            return {
+                "schema_version": schema_version,
+                "accepted": False,
+                "canonical_test_results": {},
+                "field": "test_results",
+                "reason": "test_results_missing",
+                "remediation": (
+                    "submit explicit top-level status and a JSON boolean verdict"
+                ),
+            }
+        top_value = value.get("test_results") if top_present else None
+        nested_value = payload.get("test_results") if nested_present else None
+        if top_present and nested_present and (
+            not isinstance(top_value, Mapping)
+            or not isinstance(nested_value, Mapping)
+            or dict(top_value) != dict(nested_value)
+        ):
+            return {
+                "schema_version": schema_version,
+                "accepted": False,
+                "canonical_test_results": {},
+                "field": "test_results",
+                "reason": "top_level_payload_test_results_conflict",
+                "remediation": (
+                    "submit one test_results object or make both aliases exactly equal"
+                ),
+            }
+        value = top_value if top_present else nested_value
+
+    def _reject(
+        field: str,
+        reason: str,
+        remediation: str,
+        *,
+        received_type: str = "",
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": schema_version,
+            "accepted": False,
+            "canonical_test_results": {},
+            "field": field,
+            "reason": reason,
+            "remediation": remediation,
+            "received_type": received_type,
+        }
+
     if not isinstance(value, Mapping) or not value:
-        return False
+        return _reject(
+            "test_results",
+            "test_results_must_be_nonempty_mapping",
+            "submit explicit structured test_results",
+            received_type=(
+                type(value).__name__ if value is not None else "missing"
+            ),
+        )
+    if _worker_implementation_test_results_contains_raw_credential_field(value):
+        return _reject(
+            "test_results",
+            "raw_credential_shaped_field_forbidden",
+            "remove raw session, route, fence, token, secret, or credential fields",
+            received_type=type(value).__name__,
+        )
+    canonical = deepcopy(dict(value))
     status = str(value.get("status") or "").strip().lower()
+    if "passed" in value and not isinstance(value.get("passed"), bool):
+        return _reject(
+            "test_results.passed",
+            "passed_must_be_json_boolean",
+            "replace count-shaped passed with JSON true or false",
+            received_type=type(value.get("passed")).__name__,
+        )
+    if not status:
+        if value.get("passed") is True:
+            return {
+                "schema_version": schema_version,
+                "accepted": True,
+                "canonical_test_results": canonical,
+                "field": "",
+                "reason": "accepted",
+                "remediation": "",
+                "result_kind": "legacy_owned_lane_boolean_pass",
+            }
+        return _reject(
+            "test_results.status",
+            "top_level_status_required",
+            "set status to the exact owned-lane outcome",
+            received_type="missing",
+        )
+
+    accepted = False
+    result_kind = ""
     if status == _WORKER_IMPLEMENTATION_UNRELATED_BLOCK_STATUS:
-        if (
+        accepted = _worker_implementation_unrelated_block_finish_compatible(value)
+        result_kind = "owned_lane_pass_with_unrelated_block"
+    elif status == _WORKER_IMPLEMENTATION_NO_PASS_STATUS:
+        accepted = _worker_implementation_known_baseline_finish_compatible(value)
+        result_kind = "known_baseline_no_pass"
+    elif status in _WORKER_IMPLEMENTATION_FINISH_AMBIGUOUS_STATUSES:
+        return _reject(
+            "test_results.status",
+            "ambiguous_or_nonterminal_status",
+            "record the exact terminal owned-lane outcome",
+        )
+    elif status in _WORKER_IMPLEMENTATION_FINISH_PASS_STATUSES:
+        accepted = value.get("passed") is not False
+        result_kind = "owned_lane_pass"
+    elif _worker_implementation_legacy_results_finish_compatible(value):
+        accepted = True
+        result_kind = "bounded_legacy_candidate_base"
+
+    if not accepted:
+        return _reject(
+            "test_results",
+            "test_results_not_finish_compatible",
+            "use the copy-safe worker implementation test-results guide",
+        )
+    return {
+        "schema_version": schema_version,
+        "accepted": True,
+        "canonical_test_results": canonical,
+        "field": "",
+        "reason": "accepted",
+        "remediation": "",
+        "result_kind": result_kind,
+    }
+
+
+def worker_implementation_legacy_accept_commit_divergence(
+    value: Any,
+    *,
+    evidence_envelope: bool = False,
+) -> dict[str, Any]:
+    """Classify only the historical truthiness/identity deadlock shape.
+
+    The old facade treated ``passed`` by truthiness while worker_commit used
+    ``is True``.  This recovery is deliberately limited to the audited count
+    verdicts ``{"passed": 1}`` and ``{"passed": 1, "failed": 0}`` accepted by
+    that mismatch.  It is not a generic path for failed, partial, ambiguous,
+    secret-bearing, or missing evidence.
+    """
+
+    schema_version = (
+        "contract_runtime.worker_implementation_legacy_accept_commit_divergence.v1"
+    )
+    candidate = value
+    if evidence_envelope:
+        if not isinstance(value, Mapping):
+            candidate = None
+        else:
+            payload = (
+                value.get("payload")
+                if isinstance(value.get("payload"), Mapping)
+                else {}
+            )
+            top_present = "test_results" in value
+            nested_present = "test_results" in payload
+            top_value = value.get("test_results") if top_present else None
+            nested_value = payload.get("test_results") if nested_present else None
+            if (
+                not (top_present or nested_present)
+                or (
+                    top_present
+                    and nested_present
+                    and (
+                        not isinstance(top_value, Mapping)
+                        or not isinstance(nested_value, Mapping)
+                        or dict(top_value) != dict(nested_value)
+                    )
+                )
+            ):
+                candidate = None
+            else:
+                candidate = top_value if top_present else nested_value
+    authorized = bool(
+        isinstance(candidate, Mapping)
+        and set(candidate) in ({"passed"}, {"passed", "failed"})
+        and type(candidate.get("passed")) is int
+        and candidate.get("passed") == 1
+        and (
+            "failed" not in candidate
+            or (
+                type(candidate.get("failed")) is int
+                and candidate.get("failed") == 0
+            )
+        )
+        and not _worker_implementation_test_results_contains_raw_credential_field(
+            candidate
+        )
+    )
+    return {
+        "schema_version": schema_version,
+        "authorized": authorized,
+        "classification": (
+            "legacy_accept_commit_divergence_passed_int_one"
+            if authorized
+            else "not_legacy_accept_commit_divergence"
+        ),
+        "field": "test_results.passed" if authorized else "test_results",
+        "copy_safe": True,
+        "generic_invalid_source_repair_allowed": False,
+    }
+
+
+def _worker_implementation_unrelated_block_finish_compatible(
+    value: Mapping[str, Any],
+) -> bool:
+    """Validate an owned-lane pass with separately recorded unrelated blocks."""
+
+    if (
             ("no_pass" in value and value.get("no_pass") is not True)
             or ("passed" in value and value.get("passed") is not False)
             or (
@@ -4649,12 +5611,12 @@ def _worker_implementation_test_results_finish_compatible(value: Any) -> bool:
                 "overall_release_pass_claimed" in value
                 and value.get("overall_release_pass_claimed") is not False
             )
-        ):
-            return False
-        required_passed = value.get("required_passed")
-        unrelated_blocks = value.get("unrelated_system_blocks")
-        tests = value.get("tests")
-        if (
+    ):
+        return False
+    required_passed = value.get("required_passed")
+    unrelated_blocks = value.get("unrelated_system_blocks")
+    tests = value.get("tests")
+    if (
             not isinstance(required_passed, int)
             or isinstance(required_passed, bool)
             or required_passed <= 0
@@ -4663,33 +5625,40 @@ def _worker_implementation_test_results_finish_compatible(value: Any) -> bool:
             or unrelated_blocks <= 0
             or not isinstance(tests, list)
             or not tests
-        ):
-            return False
-        passed_count = 0
-        blocked_count = 0
-        for test in tests:
-            if (
+    ):
+        return False
+    passed_count = 0
+    blocked_count = 0
+    for test in tests:
+        if (
                 not isinstance(test, Mapping)
                 or not str(test.get("name") or "").strip()
                 or not str(test.get("command") or "").strip()
-            ):
-                return False
-            test_status = str(test.get("status") or "").strip().lower()
-            if test_status in _WORKER_IMPLEMENTATION_FINISH_PASS_STATUSES:
-                passed_count += 1
-            elif test_status == "blocked_unrelated" and str(
-                test.get("detail") or ""
-            ).strip():
-                blocked_count += 1
-            else:
-                return False
-        return bool(
-            passed_count == required_passed
-            and blocked_count == unrelated_blocks
-            and len(tests) == passed_count + blocked_count
-        )
-    if status == _WORKER_IMPLEMENTATION_NO_PASS_STATUS or value.get("no_pass") is True:
-        if (
+        ):
+            return False
+        test_status = str(test.get("status") or "").strip().lower()
+        if test_status in _WORKER_IMPLEMENTATION_FINISH_PASS_STATUSES:
+            passed_count += 1
+        elif test_status == "blocked_unrelated" and str(
+            test.get("detail") or ""
+        ).strip():
+            blocked_count += 1
+        else:
+            return False
+    return bool(
+        passed_count == required_passed
+        and blocked_count == unrelated_blocks
+        and len(tests) == passed_count + blocked_count
+    )
+
+
+def _worker_implementation_known_baseline_finish_compatible(
+    value: Mapping[str, Any],
+) -> bool:
+    """Validate the bounded no-pass shape for immutable baseline failures."""
+
+    status = str(value.get("status") or "").strip().lower()
+    if (
             status != _WORKER_IMPLEMENTATION_NO_PASS_STATUS
             or value.get("no_pass") is not True
             or ("passed" in value and value.get("passed") is not False)
@@ -4701,50 +5670,52 @@ def _worker_implementation_test_results_finish_compatible(value: Any) -> bool:
                 "overall_release_pass_claimed" in value
                 and value.get("overall_release_pass_claimed") is not False
             )
-        ):
-            return False
-        counts: dict[str, int] = {}
-        for field in _WORKER_IMPLEMENTATION_NO_PASS_COUNT_FIELDS:
-            count = value.get(field)
-            if not isinstance(count, int) or isinstance(count, bool):
-                return False
-            counts[field] = count
-        return bool(
-            counts["candidate_new_failures"] == 0
-            and counts["full_failed"] > 0
-            and counts["full_failed"]
-            == counts["inherited_failed"]
-            == counts["baseline_failed"]
-            and counts["focused_passed"] > 0
-            and counts["full_passed"] >= counts["baseline_passed"] >= 0
-        )
-    if status in _WORKER_IMPLEMENTATION_FINISH_AMBIGUOUS_STATUSES:
+    ):
         return False
-    if status in _WORKER_IMPLEMENTATION_FINISH_PASS_STATUSES:
-        return value.get("passed") is not False
-    return value.get("passed") is True
+    counts: dict[str, int] = {}
+    for field in _WORKER_IMPLEMENTATION_NO_PASS_COUNT_FIELDS:
+        count = value.get(field)
+        if not isinstance(count, int) or isinstance(count, bool):
+            return False
+        counts[field] = count
+    return bool(
+        counts["candidate_new_failures"] == 0
+        and counts["full_failed"] > 0
+        and counts["full_failed"]
+        == counts["inherited_failed"]
+        == counts["baseline_failed"]
+        and counts["focused_passed"] > 0
+        and counts["full_passed"] >= counts["baseline_passed"] >= 0
+    )
+
+
+def _worker_implementation_test_results_finish_compatible(value: Any) -> bool:
+    """Compatibility wrapper over the canonical structured validator."""
+
+    return bool(worker_implementation_test_results_validation(value)["accepted"])
 
 
 def _worker_commit_has_finish_compatible_implementation_results(
     implementation: Mapping[str, Any],
+    *,
+    record: Mapping[str, Any] | None = None,
+    correction: Mapping[str, Any] | None = None,
 ) -> bool:
-    payload = (
-        implementation.get("payload")
-        if isinstance(implementation.get("payload"), Mapping)
-        else {}
+    direct = worker_implementation_test_results_validation(
+        implementation,
+        evidence_envelope=True,
     )
-    test_results = (
-        payload.get("test_results")
-        if isinstance(payload.get("test_results"), Mapping)
-        else (
-            implementation.get("test_results")
-            if isinstance(implementation.get("test_results"), Mapping)
-            else {}
-        )
-    )
-    if _worker_implementation_test_results_finish_compatible(test_results):
+    if direct["accepted"]:
         return True
-    return _worker_implementation_legacy_results_finish_compatible(test_results)
+    if not isinstance(record, Mapping) or not isinstance(correction, Mapping):
+        return False
+    return bool(
+        worker_implementation_test_results_correction_validation(
+            record,
+            implementation,
+            correction,
+        )["accepted"]
+    )
 
 
 def _mf_parallel_worker_commit_errors(
@@ -4915,8 +5886,41 @@ def _mf_parallel_worker_commit_errors(
             record,
             implementation,
         )
+        write_payload = (
+            write.get("payload")
+            if isinstance(write.get("payload"), Mapping)
+            else {}
+        )
+        correction_projection = (
+            write.get("worker_implementation_test_results_correction")
+            if isinstance(
+                write.get("worker_implementation_test_results_correction"),
+                Mapping,
+            )
+            else write_payload.get(
+                "worker_implementation_test_results_correction"
+            )
+            if isinstance(
+                write_payload.get(
+                    "worker_implementation_test_results_correction"
+                ),
+                Mapping,
+            )
+            else None
+        )
+        correction_validation = (
+            worker_implementation_test_results_correction_validation(
+                record,
+                implementation,
+                correction_projection,
+            )
+            if isinstance(correction_projection, Mapping)
+            else {}
+        )
         if not _worker_commit_has_finish_compatible_implementation_results(
-            implementation
+            implementation,
+            record=record,
+            correction=correction_projection,
         ):
             errors.append(
                 "worker_commit requires canonical worker_implementation "
@@ -4948,6 +5952,22 @@ def _mf_parallel_worker_commit_errors(
                 "verified_trace_ids",
             )
         )
+        if correction_validation.get("accepted") is True:
+            direct_write_graph_trace_ids = write.get("graph_trace_ids")
+            if not isinstance(direct_write_graph_trace_ids, list):
+                direct_write_graph_trace_ids = write_payload.get(
+                    "graph_trace_ids"
+                )
+            graph_trace_ids = {
+                str(item or "").strip()
+                for item in (
+                    direct_write_graph_trace_ids
+                    if isinstance(direct_write_graph_trace_ids, list)
+                    else []
+                )
+                if str(item or "").strip()
+            }
+            implementation_graph_trace_ids = set(graph_trace_ids)
         if implementation_graph_trace_ids != graph_trace_ids:
             errors.append("worker_commit graph traces do not match worker_implementation lineage")
         for field in ("worker_id", "worker_slot_id"):

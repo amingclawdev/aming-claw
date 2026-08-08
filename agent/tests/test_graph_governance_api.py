@@ -16,7 +16,7 @@ import time
 from threading import Event
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 
@@ -48,6 +48,7 @@ from agent.governance.contracts.instructions import resolve_instruction_bundle
 from agent.governance.contracts import write_gate as contract_write_gate
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
+    SQLiteContractExecutionStore,
     _active_failed_qa_line,
     _contract_completion_satisfying_lines,
     _line_status_allows_contract_completion,
@@ -55,6 +56,10 @@ from agent.governance.contracts.runtime import (
     _next_action_from_record,
     _worker_fence_containment,
     _worker_implementation_lineage,
+    _worker_implementation_test_results_finish_compatible,
+    worker_implementation_legacy_accept_commit_divergence,
+    worker_implementation_test_results_correction_id,
+    worker_implementation_test_results_validation,
 )
 from agent.governance.contract_runtime_visualization import (
     build_contract_runtime_visualization,
@@ -22238,6 +22243,1571 @@ def test_runtime_context_implementation_evidence_rejects_invalid_test_results_be
     assert invalid_results.value.details["copy_safe_test_results_guide"][
         "parallel_sibling_dependency"
     ]["partial_sibling_blocked_is_finish_compatible"] is False
+
+
+@pytest.mark.parametrize(
+    ("test_results", "invalid_field", "reason", "received_type"),
+    [
+        (
+            {"passed": 1},
+            "test_results.passed",
+            "passed_must_be_json_boolean",
+            "int",
+        ),
+        (
+            {"status": "passed", "passed": 1},
+            "test_results.passed",
+            "passed_must_be_json_boolean",
+            "int",
+        ),
+        (
+            {"status": "passed", "passed": 1.0},
+            "test_results.passed",
+            "passed_must_be_json_boolean",
+            "float",
+        ),
+        (
+            {"status": "passed", "passed": "true"},
+            "test_results.passed",
+            "passed_must_be_json_boolean",
+            "str",
+        ),
+    ],
+)
+def test_runtime_context_implementation_evidence_rejects_count_shaped_passed_before_db(
+    monkeypatch,
+    test_results,
+    invalid_field,
+    reason,
+    received_type,
+):
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: (_ for _ in ()).throw(
+            AssertionError("count-shaped verdict must be zero-DB")
+        ),
+    )
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": "mfrctx-count-shaped-results",
+                },
+                method="POST",
+                body={
+                    "task_id": "worker-count-shaped-results",
+                    "test_results": test_results,
+                },
+            )
+        )
+
+    assert rejected.value.code == (
+        "worker_implementation_test_results_not_finish_compatible"
+    )
+    assert rejected.value.details["invalid_field"] == invalid_field
+    assert rejected.value.details["validation"]["reason"] == reason
+    assert rejected.value.details["received_type"] == received_type
+    assert rejected.value.details["validation"]["received_type"] == received_type
+    assert rejected.value.details["zero_db_access"] is True
+
+
+def test_runtime_context_implementation_evidence_rejects_conflicting_test_result_aliases_before_db(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: (_ for _ in ()).throw(
+            AssertionError("conflicting aliases must be zero-DB")
+        ),
+    )
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": "mfrctx-conflicting-results",
+                },
+                method="POST",
+                body={
+                    "task_id": "worker-conflicting-results",
+                    "test_results": {"status": "passed", "passed": True},
+                    "payload": {
+                        "test_results": {"status": "passed", "passed": False}
+                    },
+                },
+            )
+        )
+
+    assert rejected.value.details["validation"]["reason"] == (
+        "top_level_payload_test_results_conflict"
+    )
+    assert rejected.value.details["zero_db_access"] is True
+
+
+def test_worker_implementation_test_results_validator_preserves_boolean_true_compatibility():
+    validation = worker_implementation_test_results_validation({"passed": True})
+
+    assert validation["accepted"] is True
+    assert validation["canonical_test_results"] == {"passed": True}
+    assert validation["result_kind"] == "legacy_owned_lane_boolean_pass"
+    assert _worker_implementation_test_results_finish_compatible(
+        {"passed": True}
+    ) is True
+    assert _worker_implementation_test_results_finish_compatible(
+        {"passed": 1}
+    ) is False
+
+
+def test_worker_implementation_test_results_legacy_repair_classifier_is_narrow():
+    exact = worker_implementation_legacy_accept_commit_divergence(
+        {
+            "test_results": {"passed": 1, "failed": 0},
+            "payload": {"test_results": {"passed": 1, "failed": 0}},
+        },
+        evidence_envelope=True,
+    )
+    assert exact["authorized"] is True
+    assert worker_implementation_legacy_accept_commit_divergence(
+        {"passed": 1}
+    )["authorized"] is True
+    for value in (
+        {"passed": 2},
+        {"passed": -1},
+        {"passed": True},
+        {"passed": 1, "failed": 1},
+        {"passed": 1, "failed": "0"},
+        {"passed": 1, "failed": 0, "extra": True},
+        {"status": "failed", "passed": False},
+        {"status": "partial_sibling_blocked"},
+        {"passed": 1, "route_token": "RAW-SECRET"},
+        {},
+    ):
+        assert worker_implementation_legacy_accept_commit_divergence(value)[
+            "authorized"
+        ] is False
+
+
+def test_worker_implementation_test_results_allows_benign_security_metadata():
+    validation = worker_implementation_test_results_validation(
+        {
+            "status": "passed",
+            "passed": True,
+            "secret_scan": {"status": "passed"},
+            "credential_leak_check": {"status": "passed"},
+            "session_token_ref": "wstok-copy-safe",
+            "fence_token_hash": "sha256:" + "a" * 64,
+        }
+    )
+
+    assert validation["accepted"] is True
+
+
+def test_worker_implementation_test_results_correction_schema_migrates_table_absent_idempotently():
+    migration_conn = sqlite3.connect(":memory:")
+    migration_conn.row_factory = sqlite3.Row
+    try:
+        migration_conn.execute(
+            """
+            CREATE TABLE contract_runtime_executions (
+                contract_execution_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                backlog_id TEXT NOT NULL,
+                contract_id TEXT NOT NULL,
+                version TEXT NOT NULL,
+                revision TEXT NOT NULL,
+                parent_contract_execution_id TEXT NOT NULL DEFAULT '',
+                root_contract_execution_id TEXT NOT NULL DEFAULT '',
+                contract_chain_id TEXT NOT NULL DEFAULT '',
+                execution_state_revision INTEGER NOT NULL,
+                record_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        assert migration_conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'worker_implementation_test_results_corrections'
+            """
+        ).fetchone() is None
+
+        store = SQLiteContractExecutionStore(migration_conn)
+        store.ensure_schema()
+        columns = {
+            str(row["name"])
+            for row in migration_conn.execute(
+                "PRAGMA table_info(worker_implementation_test_results_corrections)"
+            ).fetchall()
+        }
+        assert {
+            "correction_json",
+            "source_authority_sha256",
+            "source_session_token_ref",
+            "source_fence_token_hash",
+        }.issubset(columns)
+        migration_conn.execute(
+            "DROP INDEX idx_worker_implementation_results_correction_line"
+        )
+        store.ensure_schema()
+        assert migration_conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'index'
+              AND name = 'idx_worker_implementation_results_correction_line'
+            """
+        ).fetchone() is not None
+    finally:
+        migration_conn.close()
+
+
+def test_worker_implementation_test_results_rejects_nested_raw_credential_key_without_echo(
+    monkeypatch,
+):
+    sentinel = "RAW-SECRET-DO-NOT-ECHO"
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: (_ for _ in ()).throw(
+            AssertionError("raw credential-shaped results must be zero-DB")
+        ),
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": "mfrctx-raw-results",
+                },
+                method="POST",
+                body={
+                    "task_id": "worker-raw-results",
+                    "test_results": {
+                        "status": "passed",
+                        "passed": True,
+                        "details": {"route_token": sentinel},
+                    },
+                },
+            )
+        )
+
+    assert rejected.value.details["validation"]["reason"] == (
+        "raw_credential_shaped_field_forbidden"
+    )
+    assert sentinel not in str(rejected.value)
+    assert sentinel not in json.dumps(rejected.value.details, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        server.handle_project_contract_runtime_line_write,
+        server.handle_project_contract_runtime_line_write_precheck,
+    ],
+)
+def test_generic_worker_implementation_count_shaped_results_reject_before_db(
+    monkeypatch,
+    handler,
+):
+    monkeypatch.setattr(
+        server,
+        "DBContext",
+        lambda _project_id: (_ for _ in ()).throw(
+            AssertionError("generic count-shaped verdict must be zero-DB")
+        ),
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        handler(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": "cex-count-shaped-zero-db",
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "stage_id": "worker_implementation",
+                    "line_id": "worker_implementation",
+                    "evidence_kind": "implementation",
+                    "runtime_context_id": "mfrctx-count-shaped-zero-db",
+                    "task_id": "worker-count-shaped-zero-db",
+                    "test_results": {"status": "passed", "passed": 1},
+                },
+            )
+        )
+
+    assert rejected.value.details["invalid_field"] == "test_results.passed"
+    assert rejected.value.details["received_type"] == "int"
+    assert rejected.value.details["zero_db_access"] is True
+
+
+def _setup_worker_implementation_results_deadlock_case(
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    suffix: str,
+):
+    backlog_id = f"AC-WORKER-RESULTS-DEADLOCK-{suffix.upper()}"
+    worker_task_id = f"worker-results-deadlock-{suffix}"
+    parent_task_id = f"worker-results-deadlock-parent-{suffix}"
+    fence_token = f"fence-worker-results-deadlock-{suffix}"
+    session_token = f"session-worker-results-deadlock-{suffix}"
+    graph_trace_id = f"gqt-worker-results-deadlock-{suffix}"
+    snapshot_id = f"scope-worker-results-deadlock-{suffix}"
+    owned_file = "agent/governance/server.py"
+    worktree = tmp_path / worker_task_id
+    _init_test_git_repo(worktree)
+    owned_path = worktree / owned_file
+    owned_path.parent.mkdir(parents=True, exist_ok=True)
+    owned_path.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", owned_file], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "worker results base"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    base_commit = batch_jobs.git_commit(worktree)
+    owned_path.write_text("implementation\n", encoding="utf-8")
+    subprocess.run(["git", "add", owned_file], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "worker implementation"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    implementation_commit = batch_jobs.git_commit(worktree)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: worktree,
+    )
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id=parent_task_id,
+        worker_task_id=worker_task_id,
+        fence_token=fence_token,
+        token=session_token,
+        worktree_path=str(worktree),
+        target_project_root=str(worktree),
+        base_commit=base_commit,
+        owned_files=(owned_file,),
+    )
+    _activate_basic_graph(conn, snapshot_id, commit_sha=base_commit)
+    evidence = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token=fence_token,
+        graph_trace_id=graph_trace_id,
+        head_commit=implementation_commit,
+        include_finish_evidence=False,
+        changed_files=[owned_file],
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=implementation_commit,
+        implementation_event_ref=f"timeline:{evidence['implementation']}",
+        include_worker_commit=False,
+        changed_files=[owned_file],
+        owned_files=[owned_file],
+    )
+    runtime = server._contract_runtime(conn)
+    historical_record = runtime.store.get(successor["contract_execution_id"])
+    source_index = next(
+        index
+        for index, line in enumerate(historical_record["completed_lines"])
+        if line.get("line_id") == "worker_implementation"
+        and line.get("runtime_context_id") == runtime_context.runtime_context_id
+    )
+    historical_count_results = {"passed": 1, "failed": 0}
+    historical_source_revision = source_index + 1
+    historical_record["completed_lines"][source_index][
+        "execution_state_revision"
+    ] = historical_source_revision
+    historical_record["completed_lines"][source_index]["payload"][
+        "execution_state_revision"
+    ] = historical_source_revision
+    historical_record["completed_lines"][source_index]["test_results"] = dict(
+        historical_count_results
+    )
+    historical_record["completed_lines"][source_index]["payload"][
+        "test_results"
+    ] = dict(historical_count_results)
+    implementation_timeline_row = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (evidence["implementation"],),
+    ).fetchone()
+    implementation_timeline_payload = json.loads(
+        implementation_timeline_row["payload_json"]
+    )
+
+    def historical_count_shape(value):
+        if isinstance(value, dict):
+            return {
+                key: (
+                    dict(historical_count_results)
+                    if key == "test_results"
+                    else historical_count_shape(nested)
+                )
+                for key, nested in value.items()
+            }
+        if isinstance(value, list):
+            return [historical_count_shape(item) for item in value]
+        return value
+
+    immutable_implementation_timeline_json = json.dumps(
+        historical_count_shape(implementation_timeline_payload),
+        sort_keys=True,
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (immutable_implementation_timeline_json, evidence["implementation"]),
+    )
+    conn.execute(
+        """
+        UPDATE contract_runtime_executions
+        SET record_json = ?
+        WHERE contract_execution_id = ?
+        """,
+        (
+            json.dumps(historical_record, sort_keys=True),
+            successor["contract_execution_id"],
+        ),
+    )
+    conn.commit()
+    immutable_before = runtime.store.get(successor["contract_execution_id"])
+    projection = server._runtime_context_contract_runtime_worker_projection(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        context=runtime_context,
+    )
+    action = projection["contract_runtime_next_legal_action"]
+    assert action["action"] == "repair_worker_implementation_test_results", (
+        action,
+        immutable_before["completed_lines"][source_index],
+    )
+    return SimpleNamespace(
+        suffix=suffix,
+        backlog_id=backlog_id,
+        worker_task_id=worker_task_id,
+        parent_task_id=parent_task_id,
+        old_fence_token=fence_token,
+        old_session_token=session_token,
+        graph_trace_id=graph_trace_id,
+        snapshot_id=snapshot_id,
+        owned_file=owned_file,
+        worktree=worktree,
+        base_commit=base_commit,
+        implementation_commit=implementation_commit,
+        successor=successor,
+        runtime_context=runtime_context,
+        evidence=evidence,
+        runtime=runtime,
+        source_index=source_index,
+        immutable_before=immutable_before,
+        immutable_implementation_timeline_json=(
+            immutable_implementation_timeline_json
+        ),
+        projection=projection,
+        action=action,
+        intent=action["action_input"][
+            "precommit_implementation_correction_intent"
+        ],
+    )
+
+
+def _rejoin_worker_implementation_results_deadlock_case(
+    conn,
+    case,
+    *,
+    authority_suffix: str,
+    prior_session_token_ref: str = "",
+):
+    body = {
+        "task_id": case.runtime_context.task_id,
+        "parent_task_id": case.backlog_id,
+        "target_project_root": str(case.worktree),
+        "reason": f"refresh historical correction authority {authority_suffix}",
+    }
+    if prior_session_token_ref:
+        body["session_token_ref"] = prior_session_token_ref
+    else:
+        body["now_iso"] = "2999-01-01T00:00:00Z"
+    auth = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case.runtime_context.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body=body,
+        )
+    )
+    active_context = get_branch_context(
+        conn,
+        PID,
+        case.runtime_context.task_id,
+    )
+    assert active_context is not None
+    assert parallel_branch_runtime.runtime_context_session_token_ref(
+        active_context
+    ) == auth["session_token_ref"]
+    assert parallel_branch_runtime.runtime_context_fence_token_verifier(
+        active_context
+    ) == auth["fence_token_hash"]
+    graph_trace_id = f"{case.graph_trace_id}-{authority_suffix}"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        parent_task_id=case.backlog_id,
+        snapshot_id=case.snapshot_id,
+        runtime_context_id=case.runtime_context.runtime_context_id,
+        task_id=case.runtime_context.task_id,
+        worker_role="mf_sub",
+        fence_token=auth["fence_token"],
+        run_id=_mf_sub_run_id(
+            case.runtime_context.task_id,
+            auth["fence_token"],
+        ),
+        created_at=(
+            "2026-08-08T13:00:00Z"
+            if prior_session_token_ref
+            else "2026-08-08T12:00:00Z"
+        ),
+    )
+    conn.commit()
+    return SimpleNamespace(
+        auth=auth,
+        active_context=active_context,
+        graph_trace_id=graph_trace_id,
+    )
+
+
+def _worker_implementation_results_correction_body(case, authority):
+    projection = server._runtime_context_contract_runtime_worker_projection(
+        case.runtime.store.conn,
+        contract_execution_id=case.successor["contract_execution_id"],
+        runtime_context_id=case.runtime_context.runtime_context_id,
+        task_id=case.runtime_context.task_id,
+        context=authority.active_context,
+    )
+    action = projection["contract_runtime_next_legal_action"]
+    action_input = (
+        action["action_input"]
+        if action.get("action")
+        == "repair_worker_implementation_test_results"
+        else case.action["action_input"]
+    )
+    ordered_tests = [
+        {"command": "python -m pytest -q focused", "status": "passed"},
+        {"command": "python -m pytest -q adjacent", "status": "passed"},
+    ]
+    return {
+        **action_input,
+        "parent_task_id": case.backlog_id,
+        "fence_token": authority.auth["fence_token"],
+        "session_token": authority.auth["session_token"],
+        "session_token_ref": authority.auth["session_token_ref"],
+        "fence_token_hash": authority.auth["fence_token_hash"],
+        "target_project_root": str(case.worktree),
+        "commit_sha": case.implementation_commit,
+        "changed_files": [case.owned_file],
+        "graph_trace_ids": [authority.graph_trace_id],
+        "evidence_refs": [f"graph-query-trace:{case.graph_trace_id}"],
+        "tests": ordered_tests,
+        "test_results": {
+            "status": "passed",
+            "passed": True,
+            "commands": ordered_tests,
+        },
+        "precommit_implementation_correction_intent": case.intent,
+    }
+
+
+def _submit_worker_implementation_results_correction(case, body):
+    return server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case.runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=body,
+        )
+    )
+
+
+def _worker_implementation_results_correction_rows(case):
+    return case.runtime.store.worker_implementation_test_results_corrections(
+        project_id=PID,
+        contract_execution_id=case.successor["contract_execution_id"],
+        runtime_context_id=case.runtime_context.runtime_context_id,
+        task_id=case.runtime_context.task_id,
+    )
+
+
+def _worker_implementation_results_correction_raw_rows(conn, case):
+    return [
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT *
+            FROM worker_implementation_test_results_corrections
+            ORDER BY correction_id
+            """,
+        ).fetchall()
+    ]
+
+
+def _replace_worker_implementation_results_correction_row(
+    conn,
+    *,
+    original_correction_id: str,
+    correction: Mapping[str, Any],
+):
+    authority = correction["source_authority"]
+    conn.execute(
+        """
+        UPDATE worker_implementation_test_results_corrections
+        SET correction_id = ?,
+            project_id = ?,
+            backlog_id = ?,
+            contract_execution_id = ?,
+            runtime_context_id = ?,
+            task_id = ?,
+            source_completed_line_index = ?,
+            source_line_instance_id = ?,
+            source_implementation_lineage_ref = ?,
+            source_line_sha256 = ?,
+            source_execution_state_revision = ?,
+            source_test_results_sha256 = ?,
+            corrected_test_results_sha256 = ?,
+            source_authority_sha256 = ?,
+            source_worker_id = ?,
+            source_worker_slot_id = ?,
+            source_session_token_ref = ?,
+            source_fence_token_hash = ?,
+            correction_json = ?,
+            created_at = ?
+        WHERE correction_id = ?
+        """,
+        (
+            correction["correction_id"],
+            correction["project_id"],
+            correction["backlog_id"],
+            correction["contract_execution_id"],
+            correction["runtime_context_id"],
+            correction["task_id"],
+            correction["source_completed_line_index"],
+            correction["source_line_instance_id"],
+            correction["source_implementation_lineage_ref"],
+            correction["source_line_sha256"],
+            correction["source_execution_state_revision"],
+            correction["source_test_results_sha256"],
+            correction["corrected_test_results_sha256"],
+            correction["source_authority_sha256"],
+            authority["worker_id"],
+            authority["worker_slot_id"],
+            authority["session_token_ref"],
+            authority["fence_token_hash"],
+            json.dumps(correction, sort_keys=True),
+            correction["created_at"],
+            original_correction_id,
+        ),
+    )
+    conn.commit()
+
+
+def _worker_implementation_results_commit_body(case, authority):
+    lineage = _worker_implementation_lineage(
+        case.immutable_before,
+        case.immutable_before["completed_lines"][case.source_index],
+    )
+    return {
+        "contract_execution_id": case.successor["contract_execution_id"],
+        "runtime_context_id": case.runtime_context.runtime_context_id,
+        "task_id": case.runtime_context.task_id,
+        "parent_task_id": case.backlog_id,
+        "fence_token": authority.auth["fence_token"],
+        "session_token": authority.auth["session_token"],
+        "target_project_root": str(case.worktree),
+        "worker_commit_sha": case.implementation_commit,
+        "worker_session_id": case.runtime_context.worker_slot_id,
+        "filer_principal": case.runtime_context.worker_slot_id,
+        "implementation_lineage_ref": lineage["implementation_lineage_ref"],
+        "owned_files": [case.owned_file],
+        "changed_files": [case.owned_file],
+        "graph_trace_ids": [authority.graph_trace_id],
+    }
+
+
+def _assert_worker_results_correction_rejected_without_write(
+    conn,
+    case,
+    body,
+    *,
+    expected_code: str = "",
+    forbidden_text: str = "",
+):
+    before = conn.total_changes
+    before_record = case.runtime.store.get(
+        case.successor["contract_execution_id"]
+    )
+    before_rows = _worker_implementation_results_correction_raw_rows(conn, case)
+    with pytest.raises(GovernanceError) as rejected:
+        _submit_worker_implementation_results_correction(case, body)
+    assert conn.total_changes == before
+    assert case.runtime.store.get(
+        case.successor["contract_execution_id"]
+    ) == before_record
+    assert _worker_implementation_results_correction_raw_rows(
+        conn, case
+    ) == before_rows
+    if expected_code:
+        assert rejected.value.code == expected_code
+    if forbidden_text:
+        assert forbidden_text not in str(rejected.value)
+        assert forbidden_text not in json.dumps(
+            rejected.value.details,
+            sort_keys=True,
+        )
+    return rejected.value
+
+
+def test_worker_results_deadlock_invalid_guide_and_stored_bypass_remain_terminal(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_worker_implementation_results_deadlock_case(
+        conn, monkeypatch, tmp_path, suffix="guide"
+    )
+    source_projection = case.projection["worker_implementation_evidence"]
+    canonical_next = case.projection["contract_runtime_current_state"][
+        "canonical_next_legal_action_before_test_results_repair"
+    ]
+    for generic_invalid_results in (
+        {"status": "failed", "passed": False},
+        {"status": "partial_sibling_blocked"},
+        {"passed": 1, "failed": 0, "route_token": "RAW-SECRET"},
+    ):
+        invalid_record = copy.deepcopy(case.immutable_before)
+        invalid_line = invalid_record["completed_lines"][case.source_index]
+        invalid_line["test_results"] = generic_invalid_results
+        invalid_line["payload"]["test_results"] = generic_invalid_results
+        assert server._runtime_context_worker_implementation_test_results_repair_action(
+            invalid_record,
+            invalid_line,
+            {**source_projection, "accepted": False},
+            canonical_next,
+            runtime_context_id=case.runtime_context.runtime_context_id,
+            task_id=case.runtime_context.task_id,
+        ) == {}
+
+    stored_invalid_record = copy.deepcopy(case.immutable_before)
+    stored_invalid_line = stored_invalid_record["completed_lines"][case.source_index]
+    stored_invalid_line["test_results"] = {"status": "partial_sibling_blocked"}
+    stored_invalid_line["payload"]["test_results"] = {
+        "status": "partial_sibling_blocked"
+    }
+    conn.execute(
+        """
+        UPDATE contract_runtime_executions SET record_json = ?
+        WHERE contract_execution_id = ?
+        """,
+        (
+            json.dumps(stored_invalid_record, sort_keys=True),
+            case.successor["contract_execution_id"],
+        ),
+    )
+    conn.commit()
+    blocked_projection = server._runtime_context_contract_runtime_worker_projection(
+        conn,
+        contract_execution_id=case.successor["contract_execution_id"],
+        runtime_context_id=case.runtime_context.runtime_context_id,
+        task_id=case.runtime_context.task_id,
+        context=case.runtime_context,
+    )
+    assert blocked_projection["contract_runtime_next_legal_action"]["action"] == (
+        "blocked_worker_implementation_test_results"
+    )
+    assert blocked_projection["contract_runtime_next_legal_action"][
+        "action_input"
+    ] == {}
+    conn.execute(
+        """
+        UPDATE contract_runtime_executions SET record_json = ?
+        WHERE contract_execution_id = ?
+        """,
+        (
+            json.dumps(case.immutable_before, sort_keys=True),
+            case.successor["contract_execution_id"],
+        ),
+    )
+    conn.commit()
+
+    authority = _rejoin_worker_implementation_results_deadlock_case(
+        conn, case, authority_suffix="guide-auth"
+    )
+    exact_guide_body = {
+        **case.action["action_input"],
+        "parent_task_id": case.backlog_id,
+        "fence_token": authority.auth["fence_token"],
+        "session_token": authority.auth["session_token"],
+        "session_token_ref": authority.auth["session_token_ref"],
+        "fence_token_hash": authority.auth["fence_token_hash"],
+        "target_project_root": str(case.worktree),
+        "commit_sha": case.implementation_commit,
+        "changed_files": [case.owned_file],
+        "graph_trace_ids": [authority.graph_trace_id],
+    }
+    timeline_before = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=case.backlog_id,
+        task_id=case.runtime_context.task_id,
+        limit=1000,
+    )
+    _assert_worker_results_correction_rejected_without_write(
+        conn, case, exact_guide_body
+    )
+    placeholder_command_body = _worker_implementation_results_correction_body(
+        case, authority
+    )
+    placeholder_tests = case.action["action_input"]["tests"]
+    placeholder_command_body["tests"] = placeholder_tests
+    placeholder_command_body["test_results"] = {
+        "status": "passed",
+        "passed": True,
+        "commands": placeholder_tests,
+    }
+    _assert_worker_results_correction_rejected_without_write(
+        conn,
+        case,
+        placeholder_command_body,
+        expected_code=(
+            "worker_implementation_test_results_correction_evidence_invalid"
+        ),
+    )
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=case.backlog_id,
+        task_id=case.runtime_context.task_id,
+        limit=1000,
+    ) == timeline_before
+
+    observer_view = case.runtime.current_record(
+        case.successor["contract_execution_id"], actor_role="observer"
+    )
+    bypass_result = case.runtime.bypass_current_line(
+        case.successor["contract_execution_id"],
+        {
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+            "bypass_identity": "bypass:historical-results-deadlock:worker_commit",
+            "execution_state_revision": observer_view["execution_state_revision"],
+            "runtime_guide_hash": observer_view["runtime_guide"][
+                "runtime_guide_hash"
+            ],
+            "diagnostic_backlog_id": "AC-WORKER-RESULTS-AUDIT-ONLY",
+            "classification": "historical_deadlock_already_waived",
+            "reason": "preserve terminal no-PASS audit without resurrection",
+            "decision": "continue_with_audited_exception",
+            "evidence_refs": ["timeline:historical-worker-commit-waiver"],
+        },
+        actor_role="observer",
+    )
+    assert bypass_result["ok"] is True
+    bypassed_record = case.runtime.store.get(
+        case.successor["contract_execution_id"]
+    )
+    assert bypassed_record["completed_lines"][-1]["line_id"] == "worker_commit"
+    assert bypassed_record["completed_lines"][-1]["status"] == "waived"
+    bypassed_projection = server._runtime_context_contract_runtime_worker_projection(
+        conn,
+        contract_execution_id=case.successor["contract_execution_id"],
+        runtime_context_id=case.runtime_context.runtime_context_id,
+        task_id=case.runtime_context.task_id,
+        context=authority.active_context,
+    )
+    assert bypassed_projection["contract_runtime_next_legal_action"].get(
+        "action"
+    ) != "repair_worker_implementation_test_results"
+    assert bypassed_projection["contract_runtime_next_legal_action"].get(
+        "line_id"
+    ) != "worker_commit"
+
+
+def test_worker_results_deadlock_first_correction_auth_rotation_and_rollback(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_worker_implementation_results_deadlock_case(
+        conn, monkeypatch, tmp_path, suffix="first"
+    )
+    authority = _rejoin_worker_implementation_results_deadlock_case(
+        conn, case, authority_suffix="first-auth"
+    )
+    correction_body = _worker_implementation_results_correction_body(
+        case, authority
+    )
+    timeline_before = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=case.backlog_id,
+        task_id=case.runtime_context.task_id,
+        limit=1000,
+    )
+    _assert_worker_results_correction_rejected_without_write(
+        conn,
+        case,
+        {**correction_body, "session_token": case.old_session_token},
+    )
+
+    original_write_context = server._runtime_context_mf_sub_write_context
+    write_context_calls = 0
+
+    def rotate_authority_before_locked_write(*args, **kwargs):
+        nonlocal write_context_calls
+        write_context_calls += 1
+        resolved = original_write_context(*args, **kwargs)
+        if write_context_calls == 2:
+            locked_context, locked_runtime_context_id, locked_session = resolved
+            return (
+                replace(
+                    locked_context,
+                    session_token_hash=(
+                        parallel_branch_runtime.mf_subagent_session_token_hash(
+                            "rotated-between-preflight-and-begin"
+                        )
+                    ),
+                ),
+                locked_runtime_context_id,
+                locked_session,
+            )
+        return resolved
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_mf_sub_write_context",
+        rotate_authority_before_locked_write,
+    )
+    _assert_worker_results_correction_rejected_without_write(
+        conn,
+        case,
+        correction_body,
+        expected_code=(
+            "worker_implementation_test_results_correction_authority_changed"
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_mf_sub_write_context",
+        original_write_context,
+    )
+
+    store_type = type(case.runtime.store)
+    original_append = store_type.append_worker_implementation_test_results_correction
+
+    def fail_after_ledger_insert(store, correction):
+        original_append(store, correction)
+        raise RuntimeError("forced correction transaction rollback")
+
+    monkeypatch.setattr(
+        store_type,
+        "append_worker_implementation_test_results_correction",
+        fail_after_ledger_insert,
+    )
+    with pytest.raises(RuntimeError, match="forced correction transaction rollback"):
+        _submit_worker_implementation_results_correction(case, correction_body)
+    monkeypatch.setattr(
+        store_type,
+        "append_worker_implementation_test_results_correction",
+        original_append,
+    )
+    assert _worker_implementation_results_correction_rows(case) == []
+    assert case.runtime.store.get(
+        case.successor["contract_execution_id"]
+    ) == case.immutable_before
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=case.backlog_id,
+        task_id=case.runtime_context.task_id,
+        limit=1000,
+    ) == timeline_before
+
+    corrected = _submit_worker_implementation_results_correction(
+        case, correction_body
+    )
+    assert corrected["status"] == "corrected"
+    assert corrected["writes_performed"] is True
+    assert corrected["timeline_write_performed"] is False
+    rows = _worker_implementation_results_correction_rows(case)
+    assert len(rows) == 1
+    assert rows[0]["source_completed_line_index"] == case.source_index
+    assert rows[0]["source_execution_state_revision"] == (
+        case.source_index + 1
+    )
+    assert rows[0]["raw_credentials_persisted"] is False
+    assert case.runtime.store.get(
+        case.successor["contract_execution_id"]
+    ) == case.immutable_before
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=case.backlog_id,
+        task_id=case.runtime_context.task_id,
+        limit=1000,
+    ) == timeline_before
+
+
+def test_worker_results_deadlock_fresh_rejoin_replay_commit_and_finish(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_worker_implementation_results_deadlock_case(
+        conn, monkeypatch, tmp_path, suffix="finish"
+    )
+    first = _rejoin_worker_implementation_results_deadlock_case(
+        conn, case, authority_suffix="first-auth"
+    )
+    first_body = _worker_implementation_results_correction_body(case, first)
+    corrected = _submit_worker_implementation_results_correction(case, first_body)
+    assert corrected["status"] == "corrected"
+    ledger_rows = _worker_implementation_results_correction_rows(case)
+
+    fresh2 = _rejoin_worker_implementation_results_deadlock_case(
+        conn,
+        case,
+        authority_suffix="fresh2",
+        prior_session_token_ref=first.auth["session_token_ref"],
+    )
+    fresh2_body = {
+        **first_body,
+        "fence_token": fresh2.auth["fence_token"],
+        "session_token": fresh2.auth["session_token"],
+        "session_token_ref": fresh2.auth["session_token_ref"],
+        "fence_token_hash": fresh2.auth["fence_token_hash"],
+        "graph_trace_ids": [fresh2.graph_trace_id],
+    }
+    before_replay = conn.total_changes
+    replay = _submit_worker_implementation_results_correction(case, fresh2_body)
+    assert replay["status"] == "already_completed"
+    assert replay["writes_performed"] is False
+    assert conn.total_changes == before_replay
+    assert _worker_implementation_results_correction_rows(case) == ledger_rows
+
+    worker_commit = server.handle_graph_governance_runtime_context_worker_commit(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case.runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=_worker_implementation_results_commit_body(case, fresh2),
+        )
+    )
+    assert worker_commit["ok"] is True
+    assert worker_commit["contract_runtime_close_evidence_gate"]["accepted"] is True
+    finish_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": case.runtime_context.runtime_context_id,
+                },
+                query={
+                    "parent_task_id": case.backlog_id,
+                    "fence_token": fresh2.auth["fence_token"],
+                    "session_token": fresh2.auth["session_token"],
+                    "session_token_ref": fresh2.auth["session_token_ref"],
+                    "target_project_root": str(case.worktree),
+                },
+            )
+        )
+    )
+    assert finish_guide["next_legal_action"] == (
+        "record_finish_time_worker_attestation"
+    )
+    assert finish_guide["finish_hint_source_backed_resolution"]["accepted"] is True
+    assert finish_guide["finish_hint_source_backed_resolution"][
+        "timeline_alias_matches_immutable_correction_source"
+    ] is True
+    finish = server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case.runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "contract_execution_id": case.successor["contract_execution_id"],
+                "runtime_context_id": case.runtime_context.runtime_context_id,
+                "task_id": case.runtime_context.task_id,
+                "parent_task_id": case.backlog_id,
+                "fence_token": fresh2.auth["fence_token"],
+                "session_token": fresh2.auth["session_token"],
+                "session_token_ref": fresh2.auth["session_token_ref"],
+                "target_project_root": str(case.worktree),
+                "head_commit": case.implementation_commit,
+                "worker_session_id": case.runtime_context.worker_slot_id,
+                "filer_principal": case.runtime_context.worker_slot_id,
+                "worker_transcript_ref": (
+                    f"multi_agent:{case.runtime_context.worker_slot_id}"
+                ),
+                "harness_type": "codex",
+                "graph_trace_ids": [fresh2.graph_trace_id],
+                "read_receipt_hash": "sha256:mf-parallel-runtime-projection-read",
+                "read_receipt_event_id": case.evidence["read_receipt"],
+                "changed_files": [case.owned_file],
+                "owned_files": [case.owned_file],
+                "test_results": fresh2_body["test_results"],
+            },
+        )
+    )
+    assert finish["ok"] is True
+    immutable_alias_after = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (case.evidence["implementation"],),
+    ).fetchone()
+    assert immutable_alias_after["payload_json"] == (
+        case.immutable_implementation_timeline_json
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE id = ?",
+        (case.evidence["implementation"],),
+    ).fetchone()[0] == 1
+
+
+def test_worker_results_deadlock_replay_drift_and_ledger_tamper_fail_closed(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_worker_implementation_results_deadlock_case(
+        conn, monkeypatch, tmp_path, suffix="tamper"
+    )
+    authority = _rejoin_worker_implementation_results_deadlock_case(
+        conn, case, authority_suffix="tamper-auth"
+    )
+    correction_body = _worker_implementation_results_correction_body(
+        case, authority
+    )
+    _submit_worker_implementation_results_correction(case, correction_body)
+    ledger_rows = _worker_implementation_results_correction_rows(case)
+    assert len(ledger_rows) == 1
+
+    for drift_body in (
+        {**correction_body, "tests": list(reversed(correction_body["tests"]))},
+        {**correction_body, "correction_reason": "different-reason"},
+        {
+            **correction_body,
+            "tests": [
+                {"command": "python -m pytest -q focused", "status": "failed"}
+            ],
+            "test_results": {
+                "status": "passed",
+                "passed": True,
+                "commands": [
+                    {
+                        "command": "python -m pytest -q focused",
+                        "status": "failed",
+                    }
+                ],
+            },
+        },
+        {
+            **correction_body,
+            "precommit_implementation_correction_intent": {
+                **case.intent,
+                "caller_authority": True,
+            },
+        },
+    ):
+        _assert_worker_results_correction_rejected_without_write(
+            conn, case, drift_body
+        )
+
+    raw_command_sentinel = "RAW-SECRET-DO-NOT-ECHO"
+    raw_command_body = {
+        **correction_body,
+        "tests": [
+            {
+                "command": f"pytest --token={raw_command_sentinel}",
+                "status": "passed",
+            }
+        ],
+        "test_results": {
+            "status": "passed",
+            "passed": True,
+            "commands": [
+                {
+                    "command": f"pytest --token={raw_command_sentinel}",
+                    "status": "passed",
+                }
+            ],
+        },
+    }
+    _assert_worker_results_correction_rejected_without_write(
+        conn,
+        case,
+        raw_command_body,
+        forbidden_text=raw_command_sentinel,
+    )
+
+    tampered = copy.deepcopy(ledger_rows[0])
+    tampered["source_authority"]["session_token_ref"] = "wstok-" + "f" * 40
+    tampered["source_authority_sha256"] = server.stable_sha256(
+        tampered["source_authority"]
+    )
+    tampered["correction_id"] = worker_implementation_test_results_correction_id(
+        tampered
+    )
+    conn.execute(
+        """
+        UPDATE worker_implementation_test_results_corrections
+        SET correction_json = ? WHERE correction_id = ?
+        """,
+        (json.dumps(tampered, sort_keys=True), ledger_rows[0]["correction_id"]),
+    )
+    conn.commit()
+    _assert_worker_results_correction_rejected_without_write(
+        conn,
+        case,
+        correction_body,
+        expected_code=(
+            "worker_implementation_test_results_correction_identity_mismatch"
+        ),
+    )
+    tampered_projection = (
+        server._runtime_context_contract_runtime_worker_projection(
+            conn,
+            contract_execution_id=case.successor["contract_execution_id"],
+            runtime_context_id=case.runtime_context.runtime_context_id,
+            task_id=case.runtime_context.task_id,
+            context=authority.active_context,
+        )
+    )
+    assert tampered_projection["contract_runtime_next_legal_action"][
+        "action"
+    ] == "blocked_worker_implementation_test_results"
+    conn.execute(
+        """
+        UPDATE worker_implementation_test_results_corrections
+        SET correction_json = ? WHERE correction_id = ?
+        """,
+        (
+            json.dumps(ledger_rows[0], sort_keys=True),
+            ledger_rows[0]["correction_id"],
+        ),
+    )
+    conn.commit()
+
+    recomputed_authority_drift = copy.deepcopy(ledger_rows[0])
+    recomputed_authority_drift["source_authority"].update(
+        {
+            "session_token_ref": "wstok-" + "e" * 40,
+            "fence_token_hash": "sha256:" + "e" * 64,
+            "session_authority_event_ref": "timeline:999999999",
+            "graph_trace_ids": ["gqt-recomputed-authority-drift"],
+        }
+    )
+    recomputed_authority_drift["source_authority_sha256"] = (
+        server.stable_sha256(recomputed_authority_drift["source_authority"])
+    )
+    recomputed_authority_drift["correction_id"] = (
+        worker_implementation_test_results_correction_id(
+            recomputed_authority_drift
+        )
+    )
+    _replace_worker_implementation_results_correction_row(
+        conn,
+        original_correction_id=ledger_rows[0]["correction_id"],
+        correction=recomputed_authority_drift,
+    )
+    _assert_worker_results_correction_rejected_without_write(
+        conn,
+        case,
+        correction_body,
+        expected_code=(
+            "worker_implementation_test_results_correction_identity_mismatch"
+        ),
+    )
+    authority_drift_projection = (
+        server._runtime_context_contract_runtime_worker_projection(
+            conn,
+            contract_execution_id=case.successor["contract_execution_id"],
+            runtime_context_id=case.runtime_context.runtime_context_id,
+            task_id=case.runtime_context.task_id,
+            context=authority.active_context,
+        )
+    )
+    assert authority_drift_projection["contract_runtime_next_legal_action"][
+        "action"
+    ] == "blocked_worker_implementation_test_results"
+    before_authority_drift_commit = conn.total_changes
+    with pytest.raises(GovernanceError):
+        server.handle_graph_governance_runtime_context_worker_commit(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": case.runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=_worker_implementation_results_commit_body(case, authority),
+            )
+        )
+    assert conn.total_changes == before_authority_drift_commit
+    _replace_worker_implementation_results_correction_row(
+        conn,
+        original_correction_id=recomputed_authority_drift["correction_id"],
+        correction=ledger_rows[0],
+    )
+
+    revision_drift = copy.deepcopy(ledger_rows[0])
+    revision_drift["source_execution_state_revision"] += 1
+    revision_drift["correction_id"] = (
+        worker_implementation_test_results_correction_id(revision_drift)
+    )
+    _replace_worker_implementation_results_correction_row(
+        conn,
+        original_correction_id=ledger_rows[0]["correction_id"],
+        correction=revision_drift,
+    )
+    _assert_worker_results_correction_rejected_without_write(
+        conn,
+        case,
+        correction_body,
+        expected_code=(
+            "worker_implementation_test_results_correction_identity_mismatch"
+        ),
+    )
+    _replace_worker_implementation_results_correction_row(
+        conn,
+        original_correction_id=revision_drift["correction_id"],
+        correction=ledger_rows[0],
+    )
+
+    scope_drift = copy.deepcopy(ledger_rows[0])
+    scope_drift.update(
+        {
+            "project_id": "drifted-project",
+            "backlog_id": "drifted-backlog",
+            "contract_execution_id": "drifted-contract",
+            "runtime_context_id": "mfrctx-drifted-scope",
+            "task_id": "worker-drifted-scope",
+        }
+    )
+    scope_drift["correction_id"] = (
+        worker_implementation_test_results_correction_id(scope_drift)
+    )
+    _replace_worker_implementation_results_correction_row(
+        conn,
+        original_correction_id=ledger_rows[0]["correction_id"],
+        correction=scope_drift,
+    )
+    _assert_worker_results_correction_rejected_without_write(
+        conn,
+        case,
+        correction_body,
+        expected_code=(
+            "worker_implementation_test_results_correction_identity_mismatch"
+        ),
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM worker_implementation_test_results_corrections"
+    ).fetchone()[0] == 1
+    _replace_worker_implementation_results_correction_row(
+        conn,
+        original_correction_id=scope_drift["correction_id"],
+        correction=ledger_rows[0],
+    )
+
+    for source_field, drift_value in (
+        ("source_line_sha256", "sha256:" + "b" * 64),
+        ("source_line_instance_id", "runtime_context:mfrctx-drifted-source"),
+        (
+            "source_implementation_lineage_ref",
+            "contract-runtime:worker-implementation:sha256:" + "c" * 64,
+        ),
+        ("source_completed_line_index", case.source_index + 1),
+    ):
+        source_drift = copy.deepcopy(ledger_rows[0])
+        source_drift[source_field] = drift_value
+        source_drift["correction_id"] = (
+            worker_implementation_test_results_correction_id(source_drift)
+        )
+        _replace_worker_implementation_results_correction_row(
+            conn,
+            original_correction_id=ledger_rows[0]["correction_id"],
+            correction=source_drift,
+        )
+        _assert_worker_results_correction_rejected_without_write(
+            conn,
+            case,
+            correction_body,
+            expected_code=(
+                "worker_implementation_test_results_correction_identity_mismatch"
+            ),
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM worker_implementation_test_results_corrections"
+        ).fetchone()[0] == 1
+        _replace_worker_implementation_results_correction_row(
+            conn,
+            original_correction_id=source_drift["correction_id"],
+            correction=ledger_rows[0],
+        )
+
+    sentinel = "RAW-SECRET-DO-NOT-EXPOSE"
+    conn.execute(
+        """
+        UPDATE worker_implementation_test_results_corrections
+        SET created_at = ? WHERE correction_id = ?
+        """,
+        (sentinel, ledger_rows[0]["correction_id"]),
+    )
+    conn.commit()
+    _assert_worker_results_correction_rejected_without_write(
+        conn, case, correction_body, forbidden_text=sentinel
+    )
+    conn.execute(
+        """
+        UPDATE worker_implementation_test_results_corrections
+        SET created_at = ? WHERE correction_id = ?
+        """,
+        (ledger_rows[0]["created_at"], ledger_rows[0]["correction_id"]),
+    )
+    conn.commit()
+
+    conn.execute(
+        """
+        UPDATE worker_implementation_test_results_corrections
+        SET correction_json = ? WHERE correction_id = ?
+        """,
+        ("{malformed", ledger_rows[0]["correction_id"]),
+    )
+    conn.commit()
+    _assert_worker_results_correction_rejected_without_write(
+        conn, case, correction_body, forbidden_text="malformed"
+    )
+    conn.execute(
+        """
+        UPDATE worker_implementation_test_results_corrections
+        SET correction_json = ? WHERE correction_id = ?
+        """,
+        (
+            json.dumps(ledger_rows[0], sort_keys=True),
+            ledger_rows[0]["correction_id"],
+        ),
+    )
+    conn.commit()
+
+    extra = copy.deepcopy(ledger_rows[0])
+    extra["source_completed_line_index"] = case.source_index + 1
+    extra["source_line_sha256"] = "sha256:" + "d" * 64
+    extra["correction_id"] = worker_implementation_test_results_correction_id(
+        extra
+    )
+    case.runtime.store.append_worker_implementation_test_results_correction(extra)
+    conn.commit()
+    _assert_worker_results_correction_rejected_without_write(
+        conn,
+        case,
+        correction_body,
+        expected_code="worker_implementation_test_results_correction_ambiguous",
+    )
+    extra_projection = server._runtime_context_contract_runtime_worker_projection(
+        conn,
+        contract_execution_id=case.successor["contract_execution_id"],
+        runtime_context_id=case.runtime_context.runtime_context_id,
+        task_id=case.runtime_context.task_id,
+        context=authority.active_context,
+    )
+    assert extra_projection["contract_runtime_next_legal_action"]["action"] == (
+        "blocked_worker_implementation_test_results"
+    )
+    before_commit = conn.total_changes
+    with pytest.raises(GovernanceError):
+        server.handle_graph_governance_runtime_context_worker_commit(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": case.runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=_worker_implementation_results_commit_body(case, authority),
+            )
+        )
+    assert conn.total_changes == before_commit
+
+
+def test_worker_results_deadlock_correction_ledger_isolates_real_sibling_source(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    first = _setup_worker_implementation_results_deadlock_case(
+        conn, monkeypatch, tmp_path, suffix="sibling-a"
+    )
+    first_authority = _rejoin_worker_implementation_results_deadlock_case(
+        conn, first, authority_suffix="auth"
+    )
+    _submit_worker_implementation_results_correction(
+        first,
+        _worker_implementation_results_correction_body(first, first_authority),
+    )
+    first_rows = _worker_implementation_results_correction_rows(first)
+
+    second = _setup_worker_implementation_results_deadlock_case(
+        conn, monkeypatch, tmp_path, suffix="sibling-b"
+    )
+    second_authority = _rejoin_worker_implementation_results_deadlock_case(
+        conn, second, authority_suffix="auth"
+    )
+    _submit_worker_implementation_results_correction(
+        second,
+        _worker_implementation_results_correction_body(second, second_authority),
+    )
+    second_rows = _worker_implementation_results_correction_rows(second)
+
+    assert len(first_rows) == len(second_rows) == 1
+    assert first_rows[0]["correction_id"] != second_rows[0]["correction_id"]
+    assert first_rows[0]["contract_execution_id"] != (
+        second_rows[0]["contract_execution_id"]
+    )
+    assert first_rows[0]["source_line_sha256"] != (
+        second_rows[0]["source_line_sha256"]
+    )
+    assert _worker_implementation_results_correction_rows(first) == first_rows
+    assert _worker_implementation_results_correction_rows(second) == second_rows
 
 
 def test_runtime_context_implementation_evidence_rejects_tests_only_before_db(
