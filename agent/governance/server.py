@@ -23791,6 +23791,28 @@ def _runtime_context_materialized_finish_gate_submission(
     ).strip()
     if not attestation_event_ref:
         return {}
+    read_receipt_event_ref = str(
+        hint.get("read_receipt_event_ref") or ""
+    ).strip()
+    read_receipt_event_id = str(
+        hint.get("read_receipt_event_id") or ""
+    ).strip()
+    ref_event_id = _runtime_context_timeline_event_id(read_receipt_event_ref)
+    if (
+        not read_receipt_event_id
+        or not ref_event_id
+        or read_receipt_event_id != ref_event_id
+    ):
+        return {}
+    read_receipt_hash = str(hint.get("read_receipt_hash") or "").strip()
+    if not _runtime_context_non_placeholder_text(read_receipt_hash):
+        return {}
+    receipt_refs = hint.get("read_receipt_event_refs")
+    if receipt_refs is not None and (
+        not isinstance(receipt_refs, list)
+        or receipt_refs != [read_receipt_event_ref]
+    ):
+        return {}
     result = deepcopy(dict(template))
     body = result.get("copy_safe_body")
     body = dict(body) if isinstance(body, Mapping) else {}
@@ -23803,6 +23825,8 @@ def _runtime_context_materialized_finish_gate_submission(
     durable_fields = {
         "checkpoint_id": f"ckpt-finish-{checkpoint_seed[:24] or 'worker'}",
         "finish_time_worker_self_attestation": dict(attestation),
+        "read_receipt_event_id": read_receipt_event_id,
+        "read_receipt_hash": read_receipt_hash,
     }
     body.update(durable_fields)
     result.update(durable_fields)
@@ -23811,6 +23835,28 @@ def _runtime_context_materialized_finish_gate_submission(
     result["copy_safe_body"] = dict(body)
     result["post_body"] = dict(body)
     result["body_source"] = "copy_safe_body"
+    result["required_fields"] = list(
+        dict.fromkeys(
+            [
+                *list(result.get("required_fields") or []),
+                "read_receipt_event_id",
+                "read_receipt_hash",
+            ]
+        )
+    )
+    result["field_pointers"] = {
+        **dict(result.get("field_pointers") or {}),
+        "read_receipt_event_id": "copy_safe_body.read_receipt_event_id",
+        "read_receipt_hash": "copy_safe_body.read_receipt_hash",
+    }
+    result["read_receipt_authority"] = {
+        "schema_version": "runtime_context.finish_gate_read_receipt_authority.v1",
+        "source": "accepted_task_timeline_read_receipt",
+        "event_ref": read_receipt_event_ref,
+        "event_id": read_receipt_event_id,
+        "read_receipt_hash": read_receipt_hash,
+        "server_derived": True,
+    }
     return result
 
 

@@ -109197,6 +109197,41 @@ def test_eabf_current_worker_guide_projects_executable_finish_alias_chain(
     assert gate_skeleton["action_input"]["head_commit"] == attestation[
         "finish_gate_submission"
     ]["body"]["head_commit"]
+    for field in ("read_receipt_event_id", "read_receipt_hash"):
+        assert gate_skeleton["action_input"][field] == attestation[
+            "finish_gate_submission"
+        ]["body"][field]
+        assert field in gate_skeleton["required_fields"]
+        assert gate_skeleton["field_pointers"][field] == (
+            f"copy_safe_body.{field}"
+        )
+    receipt_authority = gate_skeleton["read_receipt_authority"]
+    assert receipt_authority["server_derived"] is True
+    assert receipt_authority["event_id"] == gate_skeleton["action_input"][
+        "read_receipt_event_id"
+    ]
+    assert receipt_authority["read_receipt_hash"] == gate_skeleton[
+        "action_input"
+    ]["read_receipt_hash"]
+    invalid_hint = {
+        "finish_time_worker_self_attestation": attestation[
+            "finish_time_worker_self_attestation"
+        ],
+        "finish_time_attestation_event_ref": "timeline:finish-test",
+        "read_receipt_event_ref": "timeline:18",
+        "read_receipt_event_id": "19",
+        "read_receipt_hash": gate_skeleton["action_input"][
+            "read_receipt_hash"
+        ],
+    }
+    assert candidate_server._runtime_context_materialized_finish_gate_submission(
+        gate_skeleton,
+        finish_attestation_hint=invalid_hint,
+    ) == {}
+    assert candidate_server._runtime_context_materialized_finish_gate_submission(
+        gate_skeleton,
+        finish_attestation_hint={**invalid_hint, "read_receipt_event_id": "18", "read_receipt_hash": ""},
+    ) == {}
     gate_body = copy.deepcopy(gate_skeleton["action_input"])
     gate_body.update({"session_token": worker_token, "fence_token": worker_fence})
     finished = candidate_server.handle_graph_governance_runtime_context_finish_gate(
