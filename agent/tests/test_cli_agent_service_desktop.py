@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from threading import Barrier
@@ -11,11 +12,16 @@ from agent.cli_agent_service.adapters.codex_desktop import (
     DesktopHostAdapterError,
     _stable_hash,
 )
+from agent.cli_agent_service.guided_runtime import (
+    GuidedRuntimeDispatchError,
+    orchestrate_runtime_context_host_startup,
+)
 from agent.cli_agent_service.service import (
     CliAgentService,
     ServiceError,
     ServicePaths,
     ServiceUnavailableError,
+    unwrap_mcp_application_response,
 )
 from agent.governance.contract_state_runtime import build_cli_agent_execution_ticket
 
@@ -479,3 +485,333 @@ def test_ack_and_join_races_remain_atomic_and_idempotent() -> None:
     with ThreadPoolExecutor(max_workers=2) as pool:
         join_results = list(pool.map(join, ("host-worker-1", "host-worker-2")))
     assert len([result for result in join_results if isinstance(result, dict)]) == 1
+
+
+def _runtime_context_host_guide() -> dict[str, object]:
+    route = {
+        "route_id": "route-host",
+        "route_context_hash": "sha256:" + "1" * 64,
+        "prompt_contract_id": "prompt-host",
+        "prompt_contract_hash": "sha256:" + "2" * 64,
+        "route_token_ref": "rtok-host",
+        "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+    }
+    receipt = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-host",
+        "task_id": "host-worker",
+        "parent_task_id": "cex-host",
+        "contract_execution_id": "cex-host",
+        "contract_hash": "sha256:" + "4" * 64,
+        "context_hash": "sha256:" + "5" * 64,
+        "worker_role": "mf_sub",
+        "worker_id": "governed-worker",
+        "worker_slot_id": "governed-slot",
+        "target_project_root": "/tmp/host-worker",
+        "session_token": "<read from worker env>",
+        "session_token_ref": "wstok-allocation-old",
+        "fence_token": "<read from worker env>",
+        "session_token_env": "AMING_WORKER_SESSION_TOKEN",
+        "fence_token_env": "AMING_WORKER_FENCE_TOKEN",
+        "event_type": "mf_subagent_read_receipt",
+        "event_kind": "contract_context_read_receipt",
+        "status": "accepted",
+        "read_receipt_hash": "<worker-computed-read-receipt-hash>",
+        "launch_text_hash": "<launch-text-sha256-if-known>",
+        "contract_context_read_receipt": {
+            "project_id": "aming-claw",
+            "actor_role": "mf_sub",
+            "actor_session_principal": "<server-verified worker session principal>",
+            "contract_execution_id": "cex-host",
+            "runtime_context_id": "mfrctx-host",
+            "task_id": "host-worker",
+            "parent_task_id": "cex-host",
+            "worker_slot_id": "governed-slot",
+            "route_token_ref": "rtok-host",
+            "context_hash": "sha256:" + "5" * 64,
+            "contract_hash": "sha256:" + "4" * 64,
+            "acknowledged_at": "<worker-generated ISO-8601 timestamp>",
+            "receipt_hash": "<worker-computed-read-receipt-hash>",
+            "read_receipt_hash": "<worker-computed-read-receipt-hash>",
+            **route,
+        },
+        "payload": {
+            "runtime_context_id": "mfrctx-host",
+            "read_receipt_hash": "<worker-computed-read-receipt-hash>",
+            "launch_text_hash": "<launch-text-sha256-if-known>",
+            "contract_context_read_receipt": {
+                "acknowledged_at": "<worker-generated ISO-8601 timestamp>",
+                "receipt_hash": "<worker-computed-read-receipt-hash>",
+                "read_receipt_hash": "<worker-computed-read-receipt-hash>",
+            },
+        },
+        **route,
+    }
+    application = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-host",
+        "task_id": "host-worker",
+        "actionable_payloads": {
+            "session_token_initial_join_submission": {
+                "mcp_tool": "runtime_context_session_token_initial_join",
+                "copy_safe_body": {
+                    # The real guide omitted this MCP-adapter-required field.
+                    "runtime_context_id": "mfrctx-host",
+                    "task_id": "host-worker",
+                    "parent_task_id": "cex-host",
+                    "contract_execution_id": "cex-host",
+                    "target_project_root": "/tmp/host-worker",
+                    "worker_id": "governed-worker",
+                    "worker_slot_id": "governed-slot",
+                    "agent_id": "governed-worker",
+                    "allocation_owner": "observer-allocation",
+                    "actual_host_worker_id": "governed-worker",
+                    "worker_session_id": "<actual Desktop/Codex worker session id>",
+                    "session_token_ref": "wstok-allocation-old",
+                    **route,
+                    "reason": "<operator reason>",
+                    "ttl_seconds": 3600,
+                },
+            },
+            "read_receipt_facade_payload_skeleton": {
+                "mcp_tool": "runtime_context_read_receipt",
+                "copy_safe_body": receipt,
+            },
+            "startup_facade_payload_skeleton": {
+                "legacy_tool": "parallel_branch_startup",
+                "copy_safe_body": {
+                    # The real startup guide likewise relies on adapter injection.
+                    "runtime_context_id": "mfrctx-host",
+                    "task_id": "host-worker",
+                    "parent_task_id": "cex-host",
+                    "worker_role": "mf_sub",
+                    "worker_id": "governed-worker",
+                    "worker_slot_id": "governed-slot",
+                    "agent_id": "governed-worker",
+                    "allocation_owner": "observer-allocation",
+                    "observer_allocation_owner": "observer-allocation",
+                    "branch": "refs/heads/host-worker",
+                    "branch_ref": "refs/heads/host-worker",
+                    "base_commit": "a" * 40,
+                    "target_head_commit": "a" * 40,
+                    "merge_queue_id": "mq-host",
+                    "target_project_root": "/tmp/host-worker",
+                    "session_token": "<read from worker env>",
+                    "session_token_ref": "wstok-allocation-old",
+                    "fence_token": "<read from worker env>",
+                    "worker_session_id": "<actual worker-owned session id>",
+                    "worker_transcript_ref": "<host transcript ref>",
+                    "worker_transcript_path": "<local transcript path if available>",
+                    "harness_type": "codex",
+                    "filer_principal": "<actual worker principal filing startup>",
+                    "actual_host_worker_id": "governed-worker",
+                    "host_startup_id": "<host startup event/thread id>",
+                    "host_session_id": "<host session id>",
+                    "actual_cwd": "/tmp/host-worker",
+                    "actual_git_root": "/tmp/host-worker",
+                    "head_commit": "<worker worktree HEAD after launch>",
+                    "read_receipt_hash": "<accepted-read-receipt-hash>",
+                    "read_receipt_event_id": "<accepted-read-receipt-event-id>",
+                    "worker_session_lifecycle_policy": {
+                        "not_an_mcp_field": "<must be filtered before validation>"
+                    },
+                    **route,
+                },
+            },
+        },
+    }
+    return {
+        "content": [{"type": "text", "text": json.dumps(application)}]
+    }
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"ok": True, "status": "direct"},
+        {"structuredContent": {"ok": True, "status": "structured"}},
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps({"ok": True, "status": "text"}),
+                }
+            ]
+        },
+    ],
+)
+def test_mcp_application_response_unwraps_real_host_shapes(response) -> None:
+    application = unwrap_mcp_application_response(response)
+
+    assert application["ok"] is True
+    assert application["status"] in {"direct", "structured", "text"}
+
+
+def test_mcp_application_response_rejects_non_json_text_content() -> None:
+    with pytest.raises(ServiceError, match="JSON object"):
+        unwrap_mcp_application_response(
+            {"content": [{"type": "text", "text": "not-json"}]}
+        )
+
+
+def test_runtime_context_host_orchestration_is_uninterrupted_and_private() -> None:
+    session_token = "raw-session-host-orchestration"
+    fence_token = "raw-fence-host-orchestration"
+    call_names: list[str] = []
+    live_bodies: list[dict[str, object]] = []
+    call_summaries: list[dict[str, object]] = []
+
+    def call_tool(name, body):
+        call_names.append(name)
+        live_bodies.append(body)
+        assert "<" not in json.dumps(body, sort_keys=True)
+        if name == "runtime_context_session_token_initial_join":
+            assert body["project_id"] == "aming-claw"
+            assert body["agent_id"] == "governed-worker"
+            assert body["actual_host_worker_id"] == "governed-worker"
+            assert body["worker_session_id"] == "codex-thread-42"
+            assert body["host_session_id"] == "codex-thread-42"
+            assert body["host_startup_id"] == "startup-thread-42"
+            assert "allocation_owner" not in body
+            return {
+                "structuredContent": {
+                    "ok": True,
+                    "status": "session_token_initial_join_issued",
+                    "session_token_ref": "wstok-joined-authoritative",
+                    "worker_session_token_ref": "wstok-joined-authoritative",
+                    "host_envelope": {
+                        "session_token_ref": "wstok-joined-authoritative",
+                        "env": {
+                            "AMING_WORKER_SESSION_TOKEN": session_token,
+                            "AMING_WORKER_FENCE_TOKEN": fence_token,
+                        },
+                    },
+                }
+            }
+        if name == "runtime_context_read_receipt":
+            call_summaries.append(deepcopy(body))
+            assert body["session_token"] == session_token
+            assert body["fence_token"] == fence_token
+            assert body["session_token_ref"] == "wstok-joined-authoritative"
+            assert body["contract_context_read_receipt"]["receipt_hash"] == (
+                body["read_receipt_hash"]
+            )
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "ok": True,
+                                "status": "accepted",
+                                "read_receipt_hash": body["read_receipt_hash"],
+                                "read_receipt_event_id": "timeline:90210",
+                            }
+                        ),
+                    }
+                ]
+            }
+        call_summaries.append(deepcopy(body))
+        assert name == "parallel_branch_startup"
+        assert body["project_id"] == "aming-claw"
+        assert body["session_token"] == session_token
+        assert body["fence_token"] == fence_token
+        assert body["session_token_ref"] == "wstok-joined-authoritative"
+        assert body["agent_id"] == "governed-worker"
+        assert body["actual_host_worker_id"] == "governed-worker"
+        assert body["worker_session_id"] == "codex-thread-42"
+        assert body["host_session_id"] == "codex-thread-42"
+        assert body["host_startup_id"] == "startup-thread-42"
+        assert body["read_receipt_event_id"] == "timeline:90210"
+        assert "worker_transcript_path" not in body
+        assert body["worker_transcript_ref"] == "codex:codex-thread-42"
+        assert "worker_session_lifecycle_policy" not in body
+        assert "worker_slot_id" not in body
+        return {"ok": True, "status": "passed", "startup_event_ref": "timeline:90211"}
+
+    result = orchestrate_runtime_context_host_startup(
+        worker_guide=_runtime_context_host_guide(),
+        tool_caller=call_tool,
+        host_identity={
+            "worker_session_id": "codex-thread-42",
+            "agent_id": "codex-thread-42",
+            "actual_host_worker_id": "codex-thread-42",
+            "host_startup_id": "startup-thread-42",
+            "head_commit": "b" * 40,
+        },
+        reason="same-invocation host startup",
+        now_iso="2026-08-09T14:00:00Z",
+    )
+
+    assert result["ok"] is True
+    assert result["sequence"] == call_names
+    assert result["session_token_ref"] == "wstok-joined-authoritative"
+    assert result["uninterrupted_same_invocation"] is True
+    serialized = json.dumps(result, sort_keys=True)
+    assert session_token not in serialized
+    assert fence_token not in serialized
+    assert "host_envelope_incomplete" not in serialized
+    assert "tool_error" not in serialized
+    # The exact mutable request objects and tool results were scrubbed after
+    # the sequence; deep copies made inside the fake prove what was invoked.
+    assert all(session_token not in json.dumps(body) for body in live_bodies)
+    assert all(fence_token not in json.dumps(body) for body in live_bodies)
+    assert call_summaries[0]["session_token_ref"] == "wstok-joined-authoritative"
+    assert call_summaries[1]["session_token_ref"] == "wstok-joined-authoritative"
+
+
+def test_runtime_context_host_orchestration_rejects_placeholders_before_call() -> None:
+    guide = _runtime_context_host_guide()
+    application = json.loads(guide["content"][0]["text"])
+    application["actionable_payloads"]["session_token_initial_join_submission"][
+        "copy_safe_body"
+    ]["ttl_seconds"] = "<unrealized ttl>"
+    guide["content"][0]["text"] = json.dumps(application)
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError, match="unresolved ttl_seconds"):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "codex-thread-42",
+                "head_commit": "b" * 40,
+            },
+        )
+
+    assert calls == []
+
+
+def test_runtime_context_host_orchestration_preserves_server_error_object() -> None:
+    server_error = {
+        "ok": False,
+        "status": "rejected_before_server",
+        "code": -32603,
+        "message": "missing required property project_id",
+        "error": {
+            "code": "mcp_schema_validation_failed",
+            "field": "project_id",
+        },
+        "error_alias": "schema_validation",
+    }
+
+    result = orchestrate_runtime_context_host_startup(
+        worker_guide=_runtime_context_host_guide(),
+        tool_caller=lambda _name, _body: {
+            "isError": True,
+            "content": [{"type": "text", "text": json.dumps(server_error)}],
+        },
+        host_identity={
+            "worker_session_id": "codex-thread-42",
+            "head_commit": "b" * 40,
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == -32603
+    assert result["error"] == server_error["error"]
+    assert result["error_alias"] == "schema_validation"
+    assert result["server_response"]["message"] == server_error["message"]
+    serialized = json.dumps(result, sort_keys=True)
+    assert "tool_error" not in serialized
+    assert "host_envelope_incomplete" not in serialized

@@ -162,6 +162,111 @@ class ServiceUnavailableError(ServiceError):
     pass
 
 
+def _json_compatible_copy(value: Any) -> Any:
+    """Copy one host/MCP value without relying on host-only clone APIs."""
+
+    try:
+        return json.loads(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ServiceError("MCP tool response is not JSON compatible") from exc
+
+
+def unwrap_mcp_application_response(value: Any) -> dict[str, Any]:
+    """Return the application object from the MCP result shapes hosts emit.
+
+    The JSON round trip supports direct results, ``structuredContent``, and
+    JSON text blocks without relying on host-only ``structuredClone``.
+    """
+
+    copied = _json_compatible_copy(value)
+    if not isinstance(copied, dict):
+        raise ServiceError("MCP tool response must be a JSON object")
+
+    wrapper_is_error = copied.get("isError") is True
+    application_keys = {
+        "ok", "status", "error", "code", "host_envelope",
+        "worker_host_envelope", "read_receipt",
+    }
+    if application_keys.intersection(copied) and "structuredContent" not in copied:
+        return copied
+    structured = copied.get("structuredContent")
+    if isinstance(structured, str):
+        try:
+            structured = json.loads(structured)
+        except json.JSONDecodeError as exc:
+            raise ServiceError("MCP structuredContent must contain a JSON object") from exc
+    if isinstance(structured, dict):
+        application = _json_compatible_copy(structured)
+        if wrapper_is_error and "isError" not in application:
+            application["isError"] = True
+        return application
+
+    content = copied.get("content")
+    if isinstance(content, list):
+        saw_text_block = False
+        for block in content:
+            if not isinstance(block, Mapping) or block.get("type") != "text":
+                continue
+            saw_text_block = True
+            text = block.get("text")
+            if not isinstance(text, str):
+                continue
+            try:
+                application = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(application, dict):
+                application = _json_compatible_copy(application)
+                if wrapper_is_error and "isError" not in application:
+                    application["isError"] = True
+                return application
+        if saw_text_block:
+            raise ServiceError("MCP text content must contain a JSON object")
+
+    # Preserve direct server error objects and alias fields verbatim.
+    return copied
+
+
+def scrub_host_secret_values(
+    value: Any,
+    *,
+    raw_values: Sequence[str] = (),
+) -> None:
+    """Recursively remove raw worker auth fields and embedded secret values."""
+
+    secrets = tuple(str(raw) for raw in raw_values if raw)
+    scrub_host_envelope_payload(value)
+
+    def _scrub(nested: Any) -> None:
+        if isinstance(nested, dict):
+            for key in tuple(nested):
+                child = nested.get(key)
+                if str(key) in {
+                    "session_token",
+                    "fence_token",
+                    "AMING_WORKER_SESSION_TOKEN",
+                    "AMING_WORKER_FENCE_TOKEN",
+                }:
+                    nested.pop(key, None)
+                    continue
+                if isinstance(child, str) and secrets:
+                    for secret in secrets:
+                        child = child.replace(secret, "<redacted-worker-auth>")
+                    nested[key] = child
+                else:
+                    _scrub(child)
+        elif isinstance(nested, list):
+            for index, child in enumerate(nested):
+                if isinstance(child, str) and secrets:
+                    for secret in secrets:
+                        child = child.replace(secret, "<redacted-worker-auth>")
+                    nested[index] = child
+                else:
+                    _scrub(child)
+
+    _scrub(value)
+
+
 def default_state_dir() -> Path:
     configured = os.environ.get("AMING_CLAW_CLI_AGENT_STATE_DIR", "").strip()
     if configured:

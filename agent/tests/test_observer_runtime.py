@@ -7,6 +7,9 @@ from pathlib import Path
 import pytest
 
 from agent.ai_invocation import RoutePromptContract
+from agent.cli_agent_service.guided_runtime import (
+    orchestrate_runtime_context_host_startup,
+)
 from agent.governance.parallel_branch_runtime import (
     BranchTaskRuntimeContext,
     STATE_WORKTREE_READY,
@@ -1558,3 +1561,96 @@ def test_build_observer_poll_loop_metadata_is_bounded_and_dependency_free():
     assert metadata["service_manager_required"] is False
     assert metadata["executor_worker_required"] is False
     assert metadata["uses_task_create"] is False
+
+
+def test_host_orchestration_scrubs_raw_auth_from_post_join_server_error() -> None:
+    session_token = "raw-session-post-join-error"
+    fence_token = "raw-fence-post-join-error"
+    guide = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-observer-host",
+        "task_id": "observer-host-worker",
+        "session_token_initial_join_submission": {
+            "mcp_tool": "runtime_context_session_token_initial_join",
+            "copy_safe_body": {
+                "runtime_context_id": "mfrctx-observer-host",
+                "task_id": "observer-host-worker",
+                "parent_task_id": "cex-observer-host",
+                "worker_id": "governed-observer-worker",
+                "agent_id": "governed-observer-worker",
+                "actual_host_worker_id": "governed-observer-worker",
+                "worker_session_id": "<actual worker session id>",
+                "reason": "<operator reason>",
+            },
+        },
+        "read_receipt_facade_payload_skeleton": {
+            "mcp_tool": "runtime_context_read_receipt",
+            "copy_safe_body": {
+                "project_id": "aming-claw",
+                "runtime_context_id": "mfrctx-observer-host",
+                "task_id": "observer-host-worker",
+                "parent_task_id": "cex-observer-host",
+                "session_token": "<worker session token>",
+                "session_token_ref": "wstok-before-join",
+                "fence_token": "<worker fence token>",
+                "read_receipt_hash": "<worker receipt hash>",
+            },
+        },
+        "startup_facade_payload_skeleton": {
+            "legacy_tool": "parallel_branch_startup",
+            "copy_safe_body": {},
+        },
+    }
+    calls = []
+
+    def call_tool(name, _body):
+        calls.append(name)
+        if len(calls) == 1:
+            return {
+                "ok": True,
+                "status": "session_token_initial_join_issued",
+                "worker_session_token_ref": "wstok-after-join",
+                "worker_host_envelope": {
+                    "worker_session_token_ref": "wstok-after-join",
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": session_token,
+                        "AMING_WORKER_FENCE_TOKEN": fence_token,
+                    },
+                },
+            }
+        return {
+            "structuredContent": {
+                "ok": False,
+                "status": "read_receipt_rejected",
+                "error": {
+                    "code": "receipt_schema_mismatch",
+                    "detail": "{} / {}".format(session_token, fence_token),
+                },
+                "error_alias": "receipt_error",
+            }
+        }
+
+    result = orchestrate_runtime_context_host_startup(
+        worker_guide=guide,
+        tool_caller=call_tool,
+        host_identity={
+            "worker_session_id": "codex-observer-thread",
+            "host_startup_id": "startup-observer-thread",
+            "head_commit": "a" * 40,
+        },
+    )
+
+    assert calls == [
+        "runtime_context_session_token_initial_join",
+        "runtime_context_read_receipt",
+    ]
+    assert result["ok"] is False
+    assert result["status"] == "read_receipt_rejected"
+    assert result["error"]["code"] == "receipt_schema_mismatch"
+    assert result["error_alias"] == "receipt_error"
+    serialized = json.dumps(result, sort_keys=True)
+    assert session_token not in serialized
+    assert fence_token not in serialized
+    assert "<redacted-worker-auth>" in serialized
+    assert "tool_error" not in serialized
+    assert "host_envelope_incomplete" not in serialized
