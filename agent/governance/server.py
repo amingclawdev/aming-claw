@@ -17790,6 +17790,7 @@ def _runtime_context_service_timeline_refs(
     finish_attestation_events: list[dict[str, Any]] = []
     verification_events: list[dict[str, Any]] = []
     route_action_precheck_events: list[dict[str, Any]] = []
+    passing_read_receipt_events: list[dict[str, Any]] = []
     for event in events:
         event_task_id = str(event.get("task_id") or "").strip()
         if task_id and event_task_id and event_task_id != task_id:
@@ -17895,13 +17896,20 @@ def _runtime_context_service_timeline_refs(
         ):
             refs["startup_event_ref"] = ref
             startup_event = dict(event)
-        if not refs.get("read_receipt_event_ref") and is_read_receipt:
-            refs["read_receipt_event_ref"] = ref
-            read_receipt_hash = _runtime_context_non_placeholder_text(
-                _timeline_first_deep_text(payload, "read_receipt_hash")
-            )
-            if read_receipt_hash:
-                refs["read_receipt_hash"] = read_receipt_hash
+        is_canonical_read_receipt = is_read_receipt and (
+            event_kind_normalized
+            in {"mf_subagent_read_receipt", "runtime_context_read_receipt"}
+            or event_type_normalized
+            in {
+                "mf_subagent.read_receipt",
+                "mf_subagent_read_receipt",
+                "runtime_context.read_receipt",
+            }
+            or action_normalized
+            in {"record_read_receipt", "submit_mf_subagent_read_receipt"}
+        )
+        if is_canonical_read_receipt and startup_status_allows_projection:
+            passing_read_receipt_events.append(dict(event))
         is_finish_gate = event_kind_normalized in {
             "finish_gate",
             "mf_subagent_finish_gate",
@@ -18010,6 +18018,78 @@ def _runtime_context_service_timeline_refs(
     refs["rejected_startup_event_refs"] = _runtime_context_service_dedupe(
         refs["rejected_startup_event_refs"]
     )
+    startup_authority_payload = (
+        startup_event.get("payload")
+        if isinstance(startup_event.get("payload"), Mapping)
+        else {}
+    )
+    expected_receipt_identity = {
+        field: _runtime_context_non_placeholder_text(
+            _timeline_first_deep_text(startup_authority_payload, field)
+        )
+        for field in ("runtime_context_id", "task_id", "parent_task_id")
+    }
+    read_receipt_identity_mismatches: list[str] = []
+    for event in passing_read_receipt_events:
+        candidate_payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        for field, expected in expected_receipt_identity.items():
+            actual = _runtime_context_non_placeholder_text(
+                _timeline_first_deep_text(candidate_payload, field)
+            )
+            if not expected or not actual or actual != expected:
+                read_receipt_identity_mismatches.append(
+                    f"{_runtime_context_event_ref(event)}:{field}"
+                )
+    passing_read_receipt_refs = _runtime_context_service_dedupe(
+        [_runtime_context_event_ref(event) for event in passing_read_receipt_events]
+    )
+    refs["read_receipt_event_refs"] = passing_read_receipt_refs
+    refs["read_receipt_authority"] = {
+        "schema_version": "runtime_context.read_receipt_authority.v1",
+        "status": (
+            "unique_passing"
+            if len(passing_read_receipt_events) == 1
+            and not read_receipt_identity_mismatches
+            else "missing_or_ambiguous"
+        ),
+        "candidate_event_refs": list(passing_read_receipt_refs),
+        "candidate_count": len(passing_read_receipt_events),
+        "identity_mismatch_fields": list(read_receipt_identity_mismatches),
+        "server_derived": True,
+    }
+    if len(passing_read_receipt_events) == 1 and not read_receipt_identity_mismatches:
+        selected_read_receipt = passing_read_receipt_events[0]
+        selected_read_receipt_ref = _runtime_context_event_ref(
+            selected_read_receipt
+        )
+        selected_read_receipt_payload = (
+            selected_read_receipt.get("payload")
+            if isinstance(selected_read_receipt.get("payload"), Mapping)
+            else {}
+        )
+        selected_read_receipt_hash = _runtime_context_non_placeholder_text(
+            _timeline_first_deep_text(
+                selected_read_receipt_payload,
+                "read_receipt_hash",
+            )
+        )
+        if selected_read_receipt_ref and selected_read_receipt_hash:
+            refs["read_receipt_event_ref"] = selected_read_receipt_ref
+            refs["read_receipt_hash"] = selected_read_receipt_hash
+            refs["read_receipt_authority"]["event_ref"] = (
+                selected_read_receipt_ref
+            )
+            refs["read_receipt_authority"]["read_receipt_hash"] = (
+                selected_read_receipt_hash
+            )
+        else:
+            refs["read_receipt_authority"]["status"] = (
+                "unique_passing_missing_hash"
+            )
     worker_lineage = _runtime_context_service_event_lineage_identity(
         {
             "commit_sha": refs.get("worker_commit_sha"),
@@ -18211,6 +18291,12 @@ def _runtime_context_service_timeline_refs(
             finish_attestation.get("worker_self_attestation") or {}
         ),
         "read_receipt_event_ref": str(refs.get("read_receipt_event_ref") or ""),
+        "read_receipt_event_refs": list(
+            refs.get("read_receipt_event_refs") or []
+        ),
+        "read_receipt_authority": dict(
+            refs.get("read_receipt_authority") or {}
+        ),
         "observer_command_id": str(refs.get("observer_command_id") or ""),
         "read_receipt_hash": str(refs.get("read_receipt_hash") or ""),
         "test_results": dict(refs.get("test_results") or {}),
@@ -23808,9 +23894,21 @@ def _runtime_context_materialized_finish_gate_submission(
     if not _runtime_context_non_placeholder_text(read_receipt_hash):
         return {}
     receipt_refs = hint.get("read_receipt_event_refs")
-    if receipt_refs is not None and (
+    if (
         not isinstance(receipt_refs, list)
         or receipt_refs != [read_receipt_event_ref]
+    ):
+        return {}
+    receipt_authority = hint.get("read_receipt_authority")
+    if not isinstance(receipt_authority, Mapping) or (
+        str(receipt_authority.get("status") or "") != "unique_passing"
+        or receipt_authority.get("candidate_count") != 1
+        or receipt_authority.get("candidate_event_refs")
+        != [read_receipt_event_ref]
+        or str(receipt_authority.get("event_ref") or "")
+        != read_receipt_event_ref
+        or str(receipt_authority.get("read_receipt_hash") or "")
+        != read_receipt_hash
     ):
         return {}
     result = deepcopy(dict(template))

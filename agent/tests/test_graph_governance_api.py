@@ -109182,6 +109182,62 @@ def test_eabf_current_worker_guide_projects_executable_finish_alias_chain(
     )
     assert attestation["ok"] is True
 
+    canonical_receipts = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=worker_task_id,
+        event_kind="mf_subagent_read_receipt",
+    )
+    assert len(canonical_receipts) == 1
+    canonical_receipt = canonical_receipts[0]
+    failed_receipt = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=worker_task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent.read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        phase="read_receipt",
+        status="failed",
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": worker_task_id,
+            "parent_task_id": contract_execution_id,
+            "read_receipt_hash": _fake_sha("failed-read-receipt"),
+        },
+    )
+    conn.commit()
+    gate_guide = worker_guide()
+    gate_skeleton = gate_guide["finish_gate_facade_payload_skeleton"]
+    assert gate_skeleton
+    conn.execute(
+        "UPDATE task_timeline_events SET status = 'failed' WHERE id = ?",
+        (canonical_receipt["id"],),
+    )
+    conn.commit()
+    assert worker_guide()["finish_gate_facade_payload_skeleton"] == {}
+    conn.execute(
+        "UPDATE task_timeline_events SET status = 'accepted' WHERE id = ?",
+        (canonical_receipt["id"],),
+    )
+    second_passing_receipt = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=worker_task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent.read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        phase="read_receipt",
+        status="accepted",
+        payload=dict(canonical_receipt["payload"]),
+    )
+    conn.commit()
+    assert worker_guide()["finish_gate_facade_payload_skeleton"] == {}
+    conn.execute(
+        "UPDATE task_timeline_events SET status = 'failed' WHERE id IN (?, ?)",
+        (failed_receipt["id"], second_passing_receipt["id"]),
+    )
+    conn.commit()
     gate_guide = worker_guide()
     gate_skeleton = gate_guide["finish_gate_facade_payload_skeleton"]
     assert gate_skeleton
