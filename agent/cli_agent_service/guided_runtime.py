@@ -63,6 +63,35 @@ _HOST_PRIVACY_FLAGS = {
     "raw_session_token_persisted": False,
     "raw_fence_token_persisted": False,
 }
+_HOST_REPLACEMENT_FIELDS_BY_SOURCE = {
+    "host_identity": frozenset(
+        """project_id worker_session_id host_session_id host_startup_id now_iso
+        read_receipt_hash worker_transcript_ref worker_transcript_path filer_principal
+        actor_session_principal launch_text_hash head_commit actual_cwd actual_git_root
+        harness_type agent_id actual_host_worker_id worker_id worker_slot_id""".split()
+    ),
+    "worker_guide": frozenset(
+        """contract_execution_id contract_hash context_hash agent_id
+        actual_host_worker_id worker_id worker_slot_id parent_task_id
+        target_project_root branch branch_ref base_commit target_head_commit
+        merge_queue_id observer_command_id route_id route_context_hash
+        prompt_contract_id prompt_contract_hash route_token_ref
+        visible_injection_manifest_hash""".split()
+    ),
+    "host_computed": frozenset(
+        """project_id reason worker_session_id host_session_id host_startup_id
+        worker_transcript_ref worker_transcript_path filer_principal
+        actor_session_principal acknowledged_at now_iso read_receipt_hash receipt_hash
+        launch_text_hash head_commit actual_cwd actual_git_root harness_type""".split()
+    ),
+    "initial_join": frozenset("session_token fence_token session_token_ref".split()),
+    "read_receipt": frozenset(
+        "read_receipt_hash receipt_hash read_receipt_event_id".split()
+    ),
+}
+_HOST_REPLACEMENT_FIELDS = frozenset().union(
+    *_HOST_REPLACEMENT_FIELDS_BY_SOURCE.values()
+)
 _INITIAL_FORCE_FIELDS = frozenset(
     "project_id reason worker_session_id host_session_id host_startup_id now_iso".split()
 )
@@ -261,7 +290,12 @@ def _host_runtime_values(
     now_iso: str,
     read_receipt_hash: str,
 ) -> dict[str, Any]:
-    supplied = _json_round_trip(host_identity, "host_identity")
+    host_input = {
+        str(key): value
+        for key, value in host_identity.items()
+        if str(key) in _HOST_REPLACEMENT_FIELDS_BY_SOURCE["host_identity"]
+    }
+    supplied = _json_round_trip(host_input, "host_identity")
     worker_session = _text(
         supplied.get("worker_session_id") or supplied.get("host_session_id")
     )
@@ -328,13 +362,7 @@ def _host_runtime_values(
         or _first_deep_text(guide, "target_project_root"),
         "harness_type": _text(supplied.get("harness_type")) or "codex",
     }
-    guide_fields = """contract_execution_id contract_hash context_hash agent_id
-        actual_host_worker_id worker_id worker_slot_id parent_task_id
-        target_project_root branch branch_ref base_commit target_head_commit
-        merge_queue_id observer_command_id route_id route_context_hash
-        prompt_contract_id prompt_contract_hash route_token_ref
-        visible_injection_manifest_hash""".split()
-    for field_name in guide_fields:
+    for field_name in _HOST_REPLACEMENT_FIELDS_BY_SOURCE["worker_guide"]:
         guide_value = _first_deep_text(guide, field_name)
         if field_name in {"agent_id", "actual_host_worker_id", "worker_id", "worker_slot_id"}:
             # Allocation identity is authoritative; host identity belongs in
@@ -343,6 +371,46 @@ def _host_runtime_values(
         else:
             values[field_name] = values.get(field_name) or guide_value
     return values
+
+
+def _validate_placeholder_contract(
+    templates: tuple[tuple[str, Mapping[str, Any], frozenset[str]], ...],
+) -> None:
+    undocumented: list[str] = []
+
+    def walk(value: Any, path: str, field_name: str = "") -> None:
+        if isinstance(value, Mapping):
+            for key, nested in value.items():
+                name = str(key)
+                walk(nested, "{}.{}".format(path, name), name)
+        elif isinstance(value, list):
+            for index, nested in enumerate(value):
+                walk(nested, "{}[{}]".format(path, index), field_name)
+        elif (
+            isinstance(value, str)
+            and _PLACEHOLDER.search(value)
+            and field_name not in _HOST_REPLACEMENT_FIELDS
+        ):
+            undocumented.append(path)
+
+    for tool_name, template, allowed_fields in templates:
+        walk(
+            {
+                str(key): value
+                for key, value in template.items()
+                if str(key) in allowed_fields
+            },
+            tool_name,
+        )
+    if undocumented:
+        field_names = sorted({path.rsplit(".", 1)[-1] for path in undocumented})
+        raise GuidedRuntimeDispatchError(
+            "runtime context host tool body is incomplete: unresolved {}; "
+            "undocumented replacement source(s): {}".format(
+                ", ".join(field_names), ", ".join(sorted(undocumented))
+            ),
+            status="invalid_host_orchestration",
+        )
 
 
 def _validated_tool_body(
@@ -528,6 +596,13 @@ def orchestrate_runtime_context_host_startup(
     )
     startup_submission, startup_template = _submission_body(
         guide, "startup_facade_payload_skeleton"
+    )
+    _validate_placeholder_contract(
+        (
+            ("initial_join", initial_template, _INITIAL_JOIN_TOOL_FIELDS),
+            ("read_receipt", receipt_template, _READ_RECEIPT_TOOL_FIELDS),
+            ("startup", startup_template, _STARTUP_TOOL_FIELDS),
+        )
     )
     values = _host_runtime_values(
         guide,

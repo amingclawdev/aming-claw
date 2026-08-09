@@ -677,7 +677,6 @@ def test_runtime_context_host_orchestration_is_uninterrupted_and_private() -> No
                 "structuredContent": {
                     "ok": True,
                     "status": "session_token_initial_join_issued",
-                    "session_token_ref": "wstok-joined-authoritative",
                     "worker_session_token_ref": "wstok-joined-authoritative",
                     "host_envelope": {
                         "session_token_ref": "wstok-joined-authoritative",
@@ -695,6 +694,12 @@ def test_runtime_context_host_orchestration_is_uninterrupted_and_private() -> No
             assert body["session_token_ref"] == "wstok-joined-authoritative"
             assert body["contract_context_read_receipt"]["receipt_hash"] == (
                 body["read_receipt_hash"]
+            )
+            assert body["contract_context_read_receipt"][
+                "actor_session_principal"
+            ] == "codex-thread-42"
+            assert body["contract_context_read_receipt"]["acknowledged_at"] == (
+                "2026-08-09T14:00:00Z"
             )
             return {
                 "content": [
@@ -780,6 +785,33 @@ def test_runtime_context_host_orchestration_rejects_placeholders_before_call() -
         )
 
     assert calls == []
+
+
+def test_runtime_context_host_orchestration_rejects_unknown_host_guess_zero_call() -> None:
+    guide = _runtime_context_host_guide()
+    application = json.loads(guide["content"][0]["text"])
+    application["actionable_payloads"]["read_receipt_facade_payload_skeleton"][
+        "copy_safe_body"
+    ]["payload"]["undocumented_host_guess"] = "<must-not-be-host-realized>"
+    guide["content"][0]["text"] = json.dumps(application)
+    private_guess = "host-injected-undocumented-value"
+    calls = []
+
+    with pytest.raises(
+        GuidedRuntimeDispatchError, match="undocumented_host_guess"
+    ) as raised:
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "codex-thread-42",
+                "head_commit": "b" * 40,
+                "undocumented_host_guess": private_guess,
+            },
+        )
+
+    assert calls == []
+    assert private_guess not in str(raised.value)
 
 
 def test_runtime_context_host_orchestration_preserves_server_error_object() -> None:
