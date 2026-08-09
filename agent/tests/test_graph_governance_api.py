@@ -130357,6 +130357,149 @@ def test_rev8_atomic_dispatch_accepts_exactly_two_distinct_disjoint_lanes(conn):
     ) == 2
 
 
+def test_compact_worker_read_bridges_outer_atomic_ticket_to_exact_lane_zero_write(
+    conn,
+    monkeypatch,
+):
+    server_file = "agent/governance/server.py"
+    test_file = "agent/tests/test_graph_governance_api.py"
+    record, write = _rev8_atomic_dispatch_binding_fixture(
+        conn,
+        suffix="outer-ticket-worker-read",
+        lane_files=((server_file,), (test_file,)),
+    )
+    effective, errors = server._contract_runtime_bind_mf_parallel_dispatch_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        write=write,
+    )
+    assert errors == []
+    effective["actor_role"] = "observer"
+    workers = effective["payload"]["bounded_workers"]
+    selected_worker = workers[1]
+    other_worker = workers[0]
+    next_line = {
+        "stage_id": "worker_read",
+        "line_id": "worker_read_runtime_guide",
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "evidence_kind": "read_receipt",
+        "runtime_context_id": selected_worker["runtime_context_id"],
+        "task_id": selected_worker["task_id"],
+        "parent_task_id": selected_worker["parent_task_id"],
+        "worker_id": selected_worker["worker_id"],
+        "worker_slot_id": selected_worker["worker_slot_id"],
+    }
+    record.update(
+        {
+            "completed_lines": [effective],
+            "contract_chain_id": "cchain-outer-ticket-worker-read",
+            "execution_state_revision": 3,
+            "runtime_guide": {
+                "execution": {
+                    "contract_execution_id": record["contract_execution_id"],
+                    "execution_state_revision": 3,
+                },
+                "next_legal_action": next_line,
+            },
+        }
+    )
+
+    class StaticStore:
+        current = record
+
+        def get(self, execution_id):
+            assert execution_id == record["contract_execution_id"]
+            return self.current
+
+    store = StaticStore()
+    monkeypatch.setattr(server, "_contract_runtime_store", lambda _conn: store)
+    current_projection = {
+        "current_contract_execution_id": record["contract_execution_id"],
+        "next_legal_action": next_line,
+    }
+    runtime_resume = {
+        "current_contract_execution_id": record["contract_execution_id"],
+        "next_legal_action": next_line,
+    }
+    conn.commit()
+    before_changes = conn.total_changes
+    before_db = "\n".join(conn.iterdump())
+
+    projected = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=record["backlog_id"],
+        next_action=server._runtime_next_action_from_guide(record["runtime_guide"]),
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+    )
+
+    assert projected["actionable"] is True
+    assert projected["worker_read_runtime_facade_projection"]["status"] == "ready"
+    assert projected["runtime_context_id"] == selected_worker["runtime_context_id"]
+    assert projected["copy_safe_body"]["task_id"] == selected_worker["task_id"]
+    assert projected["copy_safe_body"]["route_token_ref"] == selected_worker[
+        "route_token_ref"
+    ]
+    assert other_worker["runtime_context_id"] not in json.dumps(
+        projected,
+        sort_keys=True,
+    )
+    assert "token-rev8-outer-ticket-worker-read" not in json.dumps(
+        projected,
+        sort_keys=True,
+    )
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_db
+
+    invalid_records = []
+    missing_marker = copy.deepcopy(record)
+    missing_marker["completed_lines"][0]["payload"][
+        "dispatch_ticket_authority"
+    ].pop("server_resolved_child_route_identity")
+    invalid_records.append((missing_marker, "accepted_dispatch_authority"))
+    false_marker = copy.deepcopy(record)
+    false_marker["completed_lines"][0]["payload"][
+        "dispatch_ticket_authority"
+    ]["server_resolved_child_route_identity"] = False
+    invalid_records.append((false_marker, "accepted_dispatch_authority"))
+    worker_drift = copy.deepcopy(record)
+    worker_drift["completed_lines"][0]["payload"]["bounded_workers"][1][
+        "worker_id"
+    ] = "forged-worker"
+    invalid_records.append((worker_drift, "worker_id"))
+    route_drift = copy.deepcopy(record)
+    selected_drift = route_drift["completed_lines"][0]["payload"][
+        "bounded_workers"
+    ][1]
+    selected_drift["route_identity"]["route_id"] = "route-forged-drift"
+    invalid_records.append((route_drift, "accepted_dispatch_authority"))
+
+    for invalid_record, expected_invalid_field in invalid_records:
+        store.current = invalid_record
+        rejected = server._onboard_worker_read_runtime_facade_projection(
+            conn,
+            project_id=PID,
+            backlog_id=record["backlog_id"],
+            next_action=server._runtime_next_action_from_guide(
+                invalid_record["runtime_guide"]
+            ),
+            current_projection=current_projection,
+            runtime_resume=runtime_resume,
+        )
+        assert rejected["actionable"] is False
+        blocker = rejected["worker_read_runtime_facade_projection"]
+        assert blocker["status"] == "blocked"
+        assert expected_invalid_field in blocker["missing_or_mismatched_fields"]
+        assert blocker["zero_write_rejection"] is True
+        assert blocker["writes_performed"] is False
+        assert rejected.get("copy_safe_body") in (None, {})
+        assert conn.total_changes == before_changes
+        assert "\n".join(conn.iterdump()) == before_db
+
+
 def test_rev8_atomic_dispatch_rejects_overlapping_lane_fences_before_dispatch(conn):
     shared_file = "agent/governance/server.py"
     record, write = _rev8_atomic_dispatch_binding_fixture(

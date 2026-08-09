@@ -141726,6 +141726,11 @@ def _contract_runtime_dispatch_ticket_authority(
     dispatch_index = int(selected["completed_line_index"])
     line = selected["line"]
     payload = selected["payload"]
+    aggregate_dispatch_ticket_authority = (
+        dict(payload.get("dispatch_ticket_authority"))
+        if isinstance(payload.get("dispatch_ticket_authority"), Mapping)
+        else {}
+    )
     actual_next = (
         current_state.get("next_legal_action")
         if isinstance(current_state.get("next_legal_action"), Mapping)
@@ -141928,14 +141933,33 @@ def _contract_runtime_dispatch_ticket_authority(
             ]
         )
         missing = [field for field in required_fields if not action.get(field)]
-        dispatch_ticket_authority = (
-            payload.get("dispatch_ticket_authority")
-            if isinstance(payload.get("dispatch_ticket_authority"), Mapping)
-            else {}
+        dispatch_ticket_authority = aggregate_dispatch_ticket_authority
+        ticket_schema = str(
+            dispatch_ticket_authority.get("schema_version") or ""
+        ).strip()
+        ticket_invalid = bool(
+            ticket_schema
+            not in {
+                "mf_parallel.dispatch_ticket_authority.v1",
+                "mf_parallel.atomic_dispatch_ticket_authority.v1",
+            }
+            or str(dispatch_ticket_authority.get("source") or "").strip()
+            != "observer_route_token_refs"
+            or dispatch_ticket_authority.get(
+                "server_resolved_child_route_identity"
+            )
+            is not True
+            or dispatch_ticket_authority.get("runtime_context_bound") is not True
+            or (
+                ticket_schema
+                == "mf_parallel.atomic_dispatch_ticket_authority.v1"
+                and (
+                    dispatch_ticket_authority.get("all_workers_bound") is not True
+                    or dispatch_ticket_authority.get("atomic_dispatch") is not True
+                )
+            )
         )
-        if dispatch_ticket_authority.get(
-            "server_resolved_child_route_identity"
-        ) is not True:
+        if ticket_invalid:
             missing.append("server_resolved_child_route_identity")
         if missing:
             return {
