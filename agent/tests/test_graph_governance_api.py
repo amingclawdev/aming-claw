@@ -101924,6 +101924,7 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     base_commit: str = "",
     owned_files: tuple[str, ...] = ("agent/governance/server.py",),
     parent_task_is_contract_execution: bool = False,
+    required_worker_count: int | None = None,
 ) -> tuple[dict[str, Any], BranchTaskRuntimeContext]:
     _insert_simple_mf_close_backlog(conn, backlog_id)
     started = server.handle_project_onboard_contract_start(
@@ -101994,6 +101995,15 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
                     "owned_files": list(owned_files),
                 },
                 "owned_files": list(owned_files),
+                **(
+                    {
+                        "metadata": {
+                            "required_worker_count": required_worker_count,
+                        }
+                    }
+                    if required_worker_count is not None
+                    else {}
+                ),
             },
         )
     )
@@ -102090,6 +102100,187 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     )
     assert dispatch["ok"] is True
     return successor, runtime_context
+
+
+def _compact_worker_read_guide(
+    conn,
+    *,
+    backlog_id: str,
+    contract_execution_id: str,
+) -> dict[str, Any]:
+    current = server._contract_chain_current_projection(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        rebuild_if_missing=True,
+    )
+    current = server._contract_chain_current_with_runtime_authority_overlay(
+        current
+    )
+    resume = server._onboard_runtime_resume_from_current_projection(current)
+    projected_action = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        next_action=current["next_legal_action"],
+        current_projection=current,
+        runtime_resume=resume,
+    )
+    record = server._contract_runtime_store(conn).get(contract_execution_id)
+    return server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="mf_sub",
+        work_type="parallel_worker",
+        record=record,
+        next_action=projected_action,
+        current_projection=current,
+        runtime_resume=resume,
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+    )
+
+
+def test_compact_worker_read_projects_current_runtime_context_receipt_facade(conn):
+    backlog_id = "AC-GUIDE-WORKER-READ-RUNTIME-FACADE"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="guide-worker-read-parent",
+        worker_task_id="guide-worker-read-worker",
+        fence_token="fence-guide-worker-read",
+        token="session-guide-worker-read",
+        pinned_revision="",
+        required_worker_count=1,
+    )
+    guide = _compact_worker_read_guide(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=successor["contract_execution_id"],
+    )
+
+    assert guide["ok"] is True, guide
+    projection = guide["worker_read_runtime_facade_projection"]
+    assert guide["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
+    assert projection["status"] == "ready"
+    assert projection["fresh_worker_identity_complete"] is True
+    assert projection["runtime_context_id"] == runtime_context.runtime_context_id
+    assert projection["task_id"] == runtime_context.task_id
+    assert projection["session_token_ref"] == runtime_context_session_token_ref(
+        runtime_context
+    )
+    action = guide["canonical_executable_action"]
+    assert action["action"] == "record_runtime_context_read_receipt"
+    assert action["facade"] == "runtime_context.read_receipts"
+    assert action["mcp_tool"] == "runtime_context_read_receipt"
+    assert action["path"].endswith(
+        f"/{runtime_context.runtime_context_id}/read-receipts"
+    )
+    body = action["copy_safe_body"]
+    assert body == guide["copy_safe_body"] == guide["action_input"]
+    assert body["project_id"] == PID
+    assert body["runtime_context_id"] == runtime_context.runtime_context_id
+    assert body["task_id"] == runtime_context.task_id
+    assert body["parent_task_id"] == runtime_context.parent_task_id
+    assert body["worker_id"] == runtime_context.worker_id
+    assert body["worker_slot_id"] == runtime_context.worker_slot_id
+    assert body["contract_execution_id"] == successor["contract_execution_id"]
+    assert body["session_token_ref"] == runtime_context_session_token_ref(
+        runtime_context
+    )
+    assert "payload" not in body
+    assert "contract_context_read_receipt" not in body
+    assert body["session_token"].startswith("<read from env:")
+    assert body["fence_token"].startswith("<read from env:")
+    assert action["host_realization"]["required_replacement_paths"]
+    assert "session-guide-worker-read" not in json.dumps(guide, sort_keys=True)
+    assert guide["actionable"] is True
+
+    realized = dict(body)
+    realized["read_receipt_hash"] = _fake_sha("guide-worker-read-receipt")
+    realized["launch_text_hash"] = _fake_sha("guide-worker-read-launch")
+    realized["session_token"] = "session-guide-worker-read"
+    realized["fence_token"] = "fence-guide-worker-read"
+    receipt = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=realized,
+        )
+    )
+    assert receipt["ok"] is True
+    assert receipt["read_receipt_hash"] == realized["read_receipt_hash"]
+    assert receipt["contract_runtime_canonical_line"]["line_id"] == (
+        "worker_read_runtime_guide"
+    )
+
+
+def test_compact_worker_read_fails_closed_without_active_session_safe_ref(conn):
+    backlog_id = "AC-GUIDE-WORKER-READ-MISSING-SAFE-REF"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="guide-worker-read-missing-ref-parent",
+        worker_task_id="guide-worker-read-missing-ref-worker",
+        fence_token="fence-guide-worker-read-missing-ref",
+        token="",
+        pinned_revision="",
+        required_worker_count=1,
+    )
+    conn.commit()
+    before_record = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    before_context = dict(
+        conn.execute(
+            "SELECT * FROM parallel_branch_runtime_contexts "
+            "WHERE project_id = ? AND runtime_context_id = ?",
+            (PID, runtime_context.runtime_context_id),
+        ).fetchone()
+    )
+    before_events = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+
+    guide = _compact_worker_read_guide(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=successor["contract_execution_id"],
+    )
+
+    assert server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    ) == before_record
+    assert dict(
+        conn.execute(
+            "SELECT * FROM parallel_branch_runtime_contexts "
+            "WHERE project_id = ? AND runtime_context_id = ?",
+            (PID, runtime_context.runtime_context_id),
+        ).fetchone()
+    ) == before_context
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == before_events
+    projection = guide["worker_read_runtime_facade_projection"]
+    assert guide["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
+    assert projection["status"] == "blocked"
+    assert projection["blocker_id"] == (
+        "worker_read_runtime_guide_projection_incomplete"
+    )
+    assert "active_session_token_ref" in projection[
+        "missing_or_mismatched_fields"
+    ]
+    assert projection["zero_write_rejection"] is True
+    assert projection["writes_performed"] is False
+    assert guide["canonical_executable_action"] == {}
+    assert guide["copy_safe_body"] == {}
+    assert guide["facade"] == ""
+    assert guide["mcp_tool"] == ""
+    assert guide["actionable"] is False
 
 
 def test_recent_timeline_projects_runtime_newer_current_stream(conn):

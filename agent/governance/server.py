@@ -115446,6 +115446,252 @@ def _onboard_work_type_storage_projection(
     }
 
 
+def _onboard_worker_read_runtime_facade_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    next_action: Mapping[str, Any],
+    current_projection: Mapping[str, Any],
+    runtime_resume: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Join worker_read to one current RuntimeContext receipt facade."""
+
+    projected = dict(next_action)
+    if str(projected.get("line_id") or "").strip() != (
+        "worker_read_runtime_guide"
+    ):
+        return projected
+
+    def blocked(reason: str, fields: Sequence[str] = ()) -> dict[str, Any]:
+        projection = {
+            "schema_version": (
+                "onboard_route_guide.worker_read_runtime_facade_projection.v1"
+            ),
+            "status": "blocked",
+            "blocker_id": "worker_read_runtime_guide_projection_incomplete",
+            "reason": reason,
+            "missing_or_mismatched_fields": list(fields),
+            "selected_contract_line": "worker_read_runtime_guide",
+            "required_facade": "runtime_context_read_receipt",
+            "fail_closed": True,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        }
+        return {
+            **projected,
+            "actionable": False,
+            "worker_read_runtime_facade_projection": projection,
+        }
+
+    if conn is None:
+        return blocked("runtime_context_connection_unavailable")
+    execution_id = _onboard_route_guide_target_contract_execution_id(
+        next_action=projected,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+    )
+    if not execution_id:
+        return blocked("contract_execution_identity_unavailable", ["contract_execution_id"])
+    try:
+        record = _contract_runtime_store(conn).get(execution_id)
+    except ContractRuntimeError:
+        return blocked("contract_execution_not_found", ["contract_execution_id"])
+    if (
+        str(record.get("project_id") or "") != project_id
+        or str(record.get("backlog_id") or "") != backlog_id
+    ):
+        return blocked(
+            "contract_execution_scope_mismatch",
+            ["project_id", "backlog_id"],
+        )
+    dispatch = _contract_runtime_dispatch_ticket_authority(
+        record,
+        _runtime_current_state_from_record(record),
+    )
+    if dispatch.get("status") != "projected":
+        return blocked(
+            str(dispatch.get("error") or "dispatch_authority_unavailable"),
+            ["accepted_dispatch_authority"],
+        )
+    dispatch_action = (
+        dispatch.get("next_legal_action")
+        if isinstance(dispatch.get("next_legal_action"), Mapping)
+        else {}
+    )
+    runtime_context_id = str(
+        dispatch_action.get("runtime_context_id") or ""
+    ).strip()
+    if not runtime_context_id:
+        return blocked("dispatch_runtime_context_missing", ["runtime_context_id"])
+
+    from .parallel_branch_runtime import (
+        get_branch_context_by_runtime_context_id,
+        runtime_context_secret_hash,
+        runtime_context_session_token_ref,
+    )
+
+    context = get_branch_context_by_runtime_context_id(
+        conn,
+        project_id,
+        runtime_context_id,
+    )
+    if context is None:
+        return blocked("runtime_context_not_found", ["runtime_context_id"])
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    target_project_root = _runtime_context_effective_target_project_root(context)
+    session_token_ref = runtime_context_session_token_ref(context)
+    route_identity = {
+        field: str(dispatch_action.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    identity_mismatches = [
+        field
+        for field, expected, actual in (
+            ("project_id", project_id, str(getattr(context, "project_id", "") or "")),
+            ("backlog_id", backlog_id, str(getattr(context, "backlog_id", "") or "")),
+            ("runtime_context_id", runtime_context_id, str(getattr(context, "runtime_context_id", "") or "")),
+            ("task_id", task_id, str(dispatch_action.get("task_id") or "")),
+            ("parent_task_id", parent_task_id, str(dispatch_action.get("parent_task_id") or "")),
+            ("worker_id", worker_id, str(dispatch_action.get("worker_id") or "")),
+            ("worker_slot_id", worker_slot_id, str(dispatch_action.get("worker_slot_id") or "")),
+        )
+        if not expected or expected != actual
+    ]
+    missing = [
+        field
+        for field, value in {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "target_project_root": target_project_root,
+            "session_token_ref": session_token_ref,
+            **route_identity,
+        }.items()
+        if not _runtime_context_non_placeholder_text(value)
+    ]
+    if not str(getattr(context, "session_token_hash", "") or "").strip():
+        missing.append("active_session_token_ref")
+    if identity_mismatches or missing:
+        return blocked(
+            "runtime_context_or_fresh_worker_identity_incomplete",
+            list(dict.fromkeys([*identity_mismatches, *missing])),
+        )
+
+    actionable = _runtime_context_worker_recovery_payloads(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        target_project_root=target_project_root,
+        backlog_id=backlog_id,
+        agent_id=str(getattr(context, "agent_id", "") or ""),
+        allocation_owner=str(getattr(context, "allocation_owner", "") or ""),
+        actual_host_worker_id=str(
+            getattr(context, "actual_host_worker_id", "") or ""
+        ),
+        worker_session_id=str(getattr(context, "host_session_id", "") or ""),
+        host_startup_id=str(getattr(context, "host_startup_id", "") or ""),
+        host_session_id=str(getattr(context, "host_session_id", "") or ""),
+        branch_ref=str(getattr(context, "branch_ref", "") or ""),
+        base_commit=str(getattr(context, "base_commit", "") or ""),
+        target_head_commit=str(getattr(context, "target_head_commit", "") or ""),
+        merge_queue_id=str(getattr(context, "merge_queue_id", "") or ""),
+        route_identity=route_identity,
+        fence_token_hash=runtime_context_secret_hash(
+            str(getattr(context, "fence_token", "") or "")
+        ),
+        session_token_ref=session_token_ref,
+        contract_execution_id=execution_id,
+        contract_chain_id=str(record.get("contract_chain_id") or ""),
+        parent_contract_execution_id=str(
+            record.get("parent_contract_execution_id") or ""
+        ),
+        successor_contract_execution_id=execution_id,
+    )
+    receipt = actionable.get("read_receipt_facade_payload_skeleton")
+    body = (
+        dict(receipt.get("copy_safe_body"))
+        if isinstance(receipt, Mapping)
+        and isinstance(receipt.get("copy_safe_body"), Mapping)
+        else {}
+    )
+    # The receipt facade derives its durable payload and canonical receipt from
+    # these top-level fields.  Do not repeat the recovery guide's nested
+    # templates or raw-env alternatives in the compact executable body.
+    for redundant_field in (
+        "payload",
+        "contract_context_read_receipt",
+        "session_token_env",
+        "fence_token_env",
+    ):
+        body.pop(redundant_field, None)
+    required_body = {
+        "project_id": project_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "session_token_ref": session_token_ref,
+        "contract_execution_id": execution_id,
+        **route_identity,
+    }
+    body_mismatches = [
+        field
+        for field, expected in required_body.items()
+        if str(body.get(field) or "").strip() != expected
+    ]
+    if body_mismatches:
+        return blocked("read_receipt_body_incomplete", body_mismatches)
+
+    facade_projection = {
+        "schema_version": (
+            "onboard_route_guide.worker_read_runtime_facade_projection.v1"
+        ),
+        "status": "ready",
+        "source": "accepted_dispatch+RuntimeContext.current_values",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "session_token_ref": session_token_ref,
+        "fresh_worker_identity_complete": True,
+        "zero_write_projection": True,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    return {
+        **projected,
+        "action": "record_runtime_context_read_receipt",
+        "interface": "runtime_context.read_receipts",
+        "mcp_tool": "runtime_context_read_receipt",
+        "method": "POST",
+        "path": str(receipt.get("path") or ""),
+        "body_source": "copy_safe_body",
+        "action_input": body,
+        "copy_safe_body": body,
+        "actionable": True,
+        "worker_read_runtime_facade_projection": facade_projection,
+    }
+
+
 def _onboard_route_guide_compact_service_response(
     *,
     project_id: str,
@@ -115524,16 +115770,39 @@ def _onboard_route_guide_compact_service_response(
         if isinstance(writer_safe_copy.get("copy_payload"), Mapping)
         else {}
     )
-    canonical_body = dict(writer_copy_body or action_input)
+    worker_read_projection = (
+        next_action.get("worker_read_runtime_facade_projection")
+        if isinstance(
+            next_action.get("worker_read_runtime_facade_projection"), Mapping
+        )
+        else {}
+    )
+    worker_read_selected = str(next_action.get("line_id") or "").strip() == (
+        "worker_read_runtime_guide"
+    )
+    worker_read_ready = (
+        worker_read_selected
+        and str(worker_read_projection.get("status") or "") == "ready"
+    )
+    canonical_body = (
+        dict(next_action.get("copy_safe_body") or {})
+        if worker_read_ready
+        else {}
+        if worker_read_selected
+        else dict(writer_copy_body or action_input)
+    )
+    if worker_read_ready:
+        action_input = dict(canonical_body)
+        action_input_path = "canonical_executable_action.copy_safe_body"
     canonical_mcp_tool = str(
         next_action.get("mcp_tool")
         or next_action.get("tool")
         or next_action.get("interface")
         or action
     ).strip()
-    if writer_copy_body or (
+    if not worker_read_ready and (writer_copy_body or (
         next_action.get("stage_id") and next_action.get("line_id")
-    ):
+    )):
         canonical_mcp_tool = "contract_runtime_submit_line"
     canonical_executable_action = (
         _guide_canonical_executable_action(
@@ -115711,6 +115980,9 @@ def _onboard_route_guide_compact_service_response(
             "required_sequence": list(
                 next_action.get("required_sequence") or []
             )[:16],
+            "worker_read_runtime_facade_projection": dict(
+                worker_read_projection
+            ),
             "explicit_cross_contract_transition": (
                 dict(next_action.get("explicit_cross_contract_transition"))
                 if isinstance(
@@ -115956,6 +116228,10 @@ def _onboard_route_guide_compact_service_response(
         ),
         "facade": str(canonical_executable_action.get("facade") or ""),
         "mcp_tool": str(canonical_executable_action.get("mcp_tool") or ""),
+        "actionable": bool(canonical_executable_action),
+        "worker_read_runtime_facade_projection": dict(
+            worker_read_projection
+        ),
         "allowed_action_summary": action_summary,
         "legitimate_evidence_bindings": legitimate_evidence_bindings,
         "evidence_shape_authority": {
@@ -116822,6 +117098,14 @@ def _onboard_route_guide_service_response(
         ):
             qa_runtime_record = candidate
     if response_view == "compact":
+        next_action = _onboard_worker_read_runtime_facade_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            next_action=next_action,
+            current_projection=current_projection,
+            runtime_resume=runtime_resume,
+        )
         return _onboard_route_guide_compact_service_response(
             project_id=project_id,
             backlog_id=backlog_id,
