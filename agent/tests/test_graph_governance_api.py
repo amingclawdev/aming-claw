@@ -49625,9 +49625,13 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
     assert qa_guide["qa_session"]["scope"] == [
         "backlog:AC-RUNTIME-LEASE-CURRENT",
         "task:worker-runtime-lease",
+        "contract_execution:parent-runtime-lease",
         "commit:<full-candidate-commit>",
         "qa_scope:<server-derived-canonical-binding-hash>",
     ]
+    assert qa_guide["qa_session"]["register_body"][
+        "contract_execution_id"
+    ] == "parent-runtime-lease"
     assert qa_guide["qa_session"]["raw_qa_session_token_persisted"] is False
     assert qa_guide["graph_query"]["backlog_id"] == (
         "AC-RUNTIME-LEASE-CURRENT"
@@ -100933,9 +100937,18 @@ def test_hotfix_enter_attempt_facade_rejects_stale_sibling_placeholder_and_widen
     placeholder = dict(base)
     placeholder["successor_attempt_id"] = "<new unique attempt id>"
     invalid_bodies.append((placeholder, "successor_attempt_id"))
-    widened = dict(base)
-    widened["owned_files"] = ["agent/governance/server.py"]
-    invalid_bodies.append((widened, "attempt_scope"))
+    for extra_field, extra_value in (
+        ("allowed_actions", ["observer_hotfix_enter"]),
+        ("parent_task_id", "cex-forged-parent"),
+        ("worker_id", "forged-worker"),
+        ("route_token", "super-secret-not-returned"),
+        ("qa_session_token", "super-secret-not-returned"),
+        ("fence_token", "super-secret-not-returned"),
+        ("owned_files", ["agent/governance/server.py"]),
+    ):
+        widened = dict(base)
+        widened[extra_field] = extra_value
+        invalid_bodies.append((widened, "attempt_request_schema"))
     predecessor_task = dict(base)
     predecessor_task["task_id"] = "hotfix-predecessor-invalid"
     invalid_bodies.append((predecessor_task, "task_id"))
@@ -100956,8 +100969,19 @@ def test_hotfix_enter_attempt_facade_rejects_stale_sibling_placeholder_and_widen
             "observer_hotfix_attempt_identity_invalid"
         )
         assert rejected.value.details["field"] == expected_field
+        if expected_field == "attempt_request_schema":
+            assert rejected.value.details["expected"] == sorted(
+                action["copy_safe_body"]
+            )
+            assert rejected.value.details["actual"] == sorted(
+                set(body) - set(action["copy_safe_body"])
+            )
         assert rejected.value.details["writes_performed"] is False
         assert rejected.value.details["mutation_performed"] is False
+        assert "super-secret-not-returned" not in json.dumps(
+            rejected.value.details,
+            sort_keys=True,
+        )
         assert conn.total_changes == before_changes
         assert "\n".join(conn.iterdump()) == before
 

@@ -49,6 +49,30 @@ def test_guide_facade_schemas_require_project_adapter_and_top_level_revise_count
         }
         assert "metadata" not in revise["required"]
 
+        hotfix = by_name["observer_hotfix_enter"]["inputSchema"]
+        attempt_fields = [
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "parent_contract_execution_id",
+            "predecessor_contract_execution_id",
+            "predecessor_execution_state_revision",
+            "predecessor_execution_state_hash",
+            "successor_attempt_id",
+            "actor",
+            "reason",
+            "route_token_ref",
+        ]
+        assert set(attempt_fields).issubset(hotfix["properties"])
+        attempt_schema = hotfix["allOf"][0]
+        assert attempt_schema["if"] == {
+            "required": ["successor_attempt_id"]
+        }
+        assert attempt_schema["then"]["required"] == attempt_fields
+        assert attempt_schema["then"]["propertyNames"]["enum"] == (
+            attempt_fields
+        )
+
     graph = next(item for item in TOOLS if item["name"] == "graph_query")
     graph_properties = graph["inputSchema"]["properties"]
     assert graph_properties["args"] == {"type": "object"}

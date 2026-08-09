@@ -1963,6 +1963,11 @@ TOOLS: list[dict] = [
                 "backlog_id": {"type": "string"},
                 "bug_id": {"type": "string"},
                 "task_id": {"type": "string"},
+                "parent_contract_execution_id": {"type": "string"},
+                "predecessor_contract_execution_id": {"type": "string"},
+                "predecessor_execution_state_revision": {"type": "integer"},
+                "predecessor_execution_state_hash": {"type": "string"},
+                "successor_attempt_id": {"type": "string"},
                 "reason": {"type": "string"},
                 "human_reason": {"type": "string"},
                 "hotfix_reason": {"type": "string"},
@@ -1989,6 +1994,41 @@ TOOLS: list[dict] = [
             "anyOf": [
                 {"required": ["backlog_id"]},
                 {"required": ["bug_id"]},
+            ],
+            "allOf": [
+                {
+                    "if": {"required": ["successor_attempt_id"]},
+                    "then": {
+                        "required": [
+                            "project_id",
+                            "backlog_id",
+                            "task_id",
+                            "parent_contract_execution_id",
+                            "predecessor_contract_execution_id",
+                            "predecessor_execution_state_revision",
+                            "predecessor_execution_state_hash",
+                            "successor_attempt_id",
+                            "actor",
+                            "reason",
+                            "route_token_ref",
+                        ],
+                        "propertyNames": {
+                            "enum": [
+                                "project_id",
+                                "backlog_id",
+                                "task_id",
+                                "parent_contract_execution_id",
+                                "predecessor_contract_execution_id",
+                                "predecessor_execution_state_revision",
+                                "predecessor_execution_state_hash",
+                                "successor_attempt_id",
+                                "actor",
+                                "reason",
+                                "route_token_ref",
+                            ]
+                        },
+                    },
+                }
             ],
         },
     },

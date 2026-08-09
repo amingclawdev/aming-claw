@@ -117935,16 +117935,20 @@ def _observer_hotfix_attempt_successor_execution_id(
     )
 
 
-_OBSERVER_HOTFIX_ATTEMPT_WIDENING_FIELDS = (
-    "changed_files",
-    "contract_chain_id",
-    "contract_execution_id",
-    "metadata",
-    "onboard_service_waiver",
-    "owned_files",
-    "root_contract_execution_id",
-    "successor_contract_execution_id",
-    "target_files",
+_OBSERVER_HOTFIX_ATTEMPT_ALLOWED_FIELDS = frozenset(
+    {
+        "actor",
+        "backlog_id",
+        "parent_contract_execution_id",
+        "predecessor_contract_execution_id",
+        "predecessor_execution_state_hash",
+        "predecessor_execution_state_revision",
+        "project_id",
+        "reason",
+        "route_token_ref",
+        "successor_attempt_id",
+        "task_id",
+    }
 )
 
 
@@ -118039,6 +118043,19 @@ def _observer_hotfix_attempt_identity_mismatches(
         else ""
     ).strip()
     invalid_fields: list[dict[str, Any]] = []
+    unknown_fields = sorted(
+        str(field)
+        for field in attempt_request
+        if str(field) not in _OBSERVER_HOTFIX_ATTEMPT_ALLOWED_FIELDS
+    )
+    if unknown_fields:
+        invalid_fields.append(
+            {
+                "field": "attempt_request_schema",
+                "expected": sorted(_OBSERVER_HOTFIX_ATTEMPT_ALLOWED_FIELDS),
+                "actual": unknown_fields,
+            }
+        )
     for field, expected, actual in (
         (
             "predecessor_contract_execution_id",
@@ -118090,19 +118107,6 @@ def _observer_hotfix_attempt_identity_mismatches(
                 "field": "reason",
                 "expected": "concrete human reason",
                 "actual": reason,
-            }
-        )
-    widened_fields = [
-        field
-        for field in _OBSERVER_HOTFIX_ATTEMPT_WIDENING_FIELDS
-        if attempt_request.get(field) not in (None, "", [], {})
-    ]
-    if widened_fields:
-        invalid_fields.append(
-            {
-                "field": "attempt_scope",
-                "expected": "guide-projected identity-only body",
-                "actual": sorted(widened_fields),
             }
         )
     return invalid_fields
