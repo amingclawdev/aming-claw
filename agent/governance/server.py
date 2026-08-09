@@ -14360,6 +14360,26 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
         lane_projections.sort(
             key=lambda lane: str(lane.get("task_id") or "")
         )
+        canonical_allocation_actions = [
+            _guide_canonical_executable_action(
+                project_id=project_id,
+                backlog_id=str(body.get("backlog_id") or backlog_id),
+                contract_execution_id=str(
+                    body.get("contract_execution_id") or contract_execution_id
+                ),
+                action="allocate_prechecked_parallel_branch",
+                facade="parallel_branch_allocate",
+                mcp_tool="parallel_branch_allocate",
+                method="POST",
+                path="/api/graph-governance/{project_id}/parallel-branches",
+                body=body,
+            )
+            for body in copy_safe_bodies
+        ]
+        for action in canonical_allocation_actions:
+            action["host_realization"]["target_ref_contract"] = dict(
+                allocation_precheck_policy.get("target_ref_contract") or {}
+            )
         return {
             "ok": True,
             "status": "ready",
@@ -14377,6 +14397,7 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             "submit_unchanged": True,
             "mcp_tool": "parallel_branch_allocate",
             "copy_safe_allocation_bodies": copy_safe_bodies,
+            "canonical_executable_actions": canonical_allocation_actions,
             "lane_projections": lane_projections,
             "acceptance_scope_closure": acceptance_scope_closure,
             "registered_repository_root": str(repository_root),
@@ -19709,6 +19730,7 @@ def _runtime_context_projection_response(
     target_project_root = _runtime_context_effective_target_project_root(context)
     worktree_path = getattr(context, "worktree_path", "") or target_project_root
     target_root_projection = _runtime_context_target_root_projection(
+        project_id=context_project_id,
         requested_target_project_root=_runtime_context_requested_target_project_root(ctx),
         canonical_target_project_root=target_project_root,
         worktree_path=worktree_path,
@@ -19884,6 +19906,7 @@ def _runtime_context_projection_response(
                     }
                 )
                 postmerge_root_projection = _runtime_context_target_root_projection(
+                    project_id=project_id,
                     requested_target_project_root=(
                         _runtime_context_requested_target_project_root(ctx)
                     ),
@@ -23086,6 +23109,12 @@ def _runtime_context_qa_verification_guide(
         )
         else {}
     )
+    qa_contract_execution_id = str(
+        runtime_state.get("contract_execution_id")
+        or projected_writer_copy_payload.get("contract_execution_id")
+        or parent_task_id
+        or ""
+    ).strip()
     parent_route_identity = dict(safe_route_identity)
     if project_id:
         parent_route_identity["selected_project"] = project_id
@@ -23167,6 +23196,19 @@ def _runtime_context_qa_verification_guide(
     }
     qa_session_body = {
         **base_append_body,
+        "qa_session_token": "<raw-qa-session-token-used-as-header-only>",
+    }
+    qa_contract_runtime_body = {
+        **qa_writer_copy_payload,
+        **base_append_body,
+        "project_id": project_id,
+        "backlog_id": backlog_id or parent_task_id,
+        "contract_execution_id": qa_contract_execution_id,
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "evidence_kind": "independent_verification",
+        "status": "accepted",
+        "verdict": "accepted",
         "qa_session_token": "<raw-qa-session-token-used-as-header-only>",
     }
     focused_pass_with_full_suite_caveat_body = {
@@ -23514,10 +23556,12 @@ def _runtime_context_qa_verification_guide(
                 "backlog_id": backlog_id or parent_task_id,
                 "task_id": task_id,
                 "commit_sha": "<full-candidate-commit>",
+                "contract_execution_id": qa_contract_execution_id,
             },
             "scope": [
                 f"backlog:{backlog_id or parent_task_id}",
                 f"task:{task_id}",
+                f"contract_execution:{qa_contract_execution_id}",
                 "commit:<full-candidate-commit>",
                 "qa_scope:<server-derived-canonical-binding-hash>",
             ],
@@ -23585,6 +23629,10 @@ def _runtime_context_qa_verification_guide(
         },
         "graph_query": {
             "tool": "graph_query",
+            "mcp_tool": "graph_query",
+            "method": "POST",
+            "path": "/api/graph-governance/{project_id}/query",
+            "body_source": "copy_safe_body",
             "query_source": "qa",
             "query_purpose": "independent_verification",
             "backlog_id": backlog_id or parent_task_id,
@@ -23667,6 +23715,35 @@ def _runtime_context_qa_verification_guide(
             ],
             "route_identity": dict(safe_route_identity),
             "target_project_root": target_project_root,
+            "copy_safe_body": {
+                "project_id": project_id,
+                "tool": "function_index",
+                "args": {"query": "<exact source symbol name>"},
+                "backlog_id": backlog_id or parent_task_id,
+                "task_id": task_id,
+                "commit_sha": "<full-candidate-commit>",
+                "query_source": "qa",
+                "query_purpose": "independent_verification",
+                "qa_session_token": (
+                    "<raw-qa-session-token-used-as-header-only>"
+                ),
+                "target_project_root": target_project_root,
+                "route_identity": dict(safe_route_identity),
+            },
+            "host_realization": {
+                "mode": "replace_declared_placeholders_then_spread_to_mcp",
+                "adapter_fields_included": ["project_id"],
+                "required_replacements": [
+                    "args.query",
+                    "commit_sha",
+                    "qa_session_token",
+                ],
+                "qa_scope": {
+                    "backlog_id": backlog_id or parent_task_id,
+                    "task_id": task_id,
+                    "contract_execution_id": qa_contract_execution_id,
+                },
+            },
         },
         "qa_graph_context": {
             "stage_id": "qa_graph_context",
@@ -23691,6 +23768,7 @@ def _runtime_context_qa_verification_guide(
                 "accepted_route_owned_source_event_lineage",
             ],
             "bounded_qa_session_body": qa_session_body,
+            "canonical_contract_runtime_body": qa_contract_runtime_body,
             "qa_child_route_token_ref_body": qa_child_route_ref_body,
             "route_token_ref_body": route_ref_body,
             "source_event_lineage_body": source_lineage_body,
@@ -23984,6 +24062,261 @@ def _runtime_context_materialized_finish_gate_submission(
         "server_derived": True,
     }
     return result
+
+
+_RUNTIME_CONTEXT_GUIDE_STAGE_FACADES = {
+    "join": "runtime_context_session_token_initial_join",
+    "receipt": "runtime_context_read_receipt",
+    "startup": "parallel_branch_startup",
+    "graph": "graph_query",
+    "implementation": "runtime_context_implementation_evidence",
+    "commit": "runtime_context_worker_commit",
+    "attestation": "runtime_context_finish_time_worker_attestation",
+    "finish": "runtime_context_finish_gate",
+    "qa": "contract_runtime_submit_line",
+    "observer_close": "contract_runtime_submit_line",
+    "coordinator_close": "contract_runtime_submit_line",
+}
+
+
+def _runtime_context_guide_executable_actions(
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    parent_contract_execution_id: str,
+    actionable_payloads: Mapping[str, Any],
+    graph_copy_safe_body: Mapping[str, Any],
+    qa_verification_guide: Mapping[str, Any],
+    contract_runtime_next_action: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Join every advertised worker/QA/close stage to exactly one facade."""
+
+    actions: dict[str, dict[str, Any]] = {}
+
+    def add(
+        stage: str,
+        source: Mapping[str, Any],
+        *,
+        default_action: str,
+        default_tool: str,
+        default_facade: str = "",
+        optional_omission_fields: Sequence[str] = (),
+    ) -> None:
+        body = source.get("copy_safe_body")
+        if not isinstance(body, Mapping) or not body:
+            return
+        contract = _guide_canonical_executable_action(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            parent_contract_execution_id=parent_contract_execution_id,
+            action=str(source.get("action") or default_action),
+            facade=str(
+                source.get("facade")
+                or source.get("endpoint")
+                or default_facade
+                or default_tool
+            ),
+            mcp_tool=str(source.get("mcp_tool") or default_tool),
+            method=str(source.get("method") or "POST"),
+            path=str(source.get("path") or ""),
+            stage_id=str(source.get("stage_id") or stage),
+            line_id=str(source.get("line_id") or ""),
+            body=body,
+            optional_omission_fields=optional_omission_fields,
+        )
+        actions[stage] = contract
+        if isinstance(source, dict):
+            source["canonical_executable_action"] = deepcopy(contract)
+            source["copy_safe_body"] = dict(contract["copy_safe_body"])
+            if isinstance(source.get("body"), Mapping):
+                source["body"] = dict(contract["copy_safe_body"])
+
+    renewal = (
+        actionable_payloads.get("session_renewal_hints")
+        if isinstance(actionable_payloads.get("session_renewal_hints"), Mapping)
+        else {}
+    )
+    initial_join = (
+        renewal.get("initial_join")
+        if isinstance(renewal.get("initial_join"), Mapping)
+        else actionable_payloads.get("session_token_initial_join_submission")
+    )
+    if isinstance(initial_join, Mapping):
+        add(
+            "join",
+            initial_join,
+            default_action="request_runtime_context_initial_join_host_envelope",
+            default_tool="runtime_context_session_token_initial_join",
+            optional_omission_fields=("host_startup_id", "host_session_id"),
+        )
+    rejoin = (
+        renewal.get("rejoin")
+        if isinstance(renewal.get("rejoin"), Mapping)
+        else actionable_payloads.get("session_token_rejoin_submission")
+    )
+    if isinstance(rejoin, Mapping):
+        add(
+            "rejoin",
+            rejoin,
+            default_action="request_runtime_context_rejoin_host_envelope",
+            default_tool="runtime_context_session_token_rejoin",
+            optional_omission_fields=("host_startup_id", "host_session_id"),
+        )
+
+    for stage, key, action, tool, facade in (
+        (
+            "receipt",
+            "read_receipt_facade_payload_skeleton",
+            "record_runtime_context_read_receipt",
+            "runtime_context_read_receipt",
+            "runtime_context.read_receipts",
+        ),
+        (
+            "startup",
+            "startup_facade_payload_skeleton",
+            "record_mf_subagent_startup",
+            "parallel_branch_startup",
+            "runtime_context.startup",
+        ),
+        (
+            "implementation",
+            "implementation_evidence_facade_payload_skeleton",
+            "record_implementation_evidence",
+            "runtime_context_implementation_evidence",
+            "runtime_context.implementation_evidence",
+        ),
+        (
+            "commit",
+            "worker_commit_facade_payload_skeleton",
+            "record_worker_commit",
+            "runtime_context_worker_commit",
+            "runtime_context.worker_commit",
+        ),
+        (
+            "attestation",
+            "finish_time_worker_attestation_submission",
+            "record_finish_time_worker_attestation",
+            "runtime_context_finish_time_worker_attestation",
+            "runtime_context.finish_time_worker_attestation",
+        ),
+        (
+            "finish",
+            "finish_gate_facade_payload_skeleton",
+            "record_finish_gate",
+            "runtime_context_finish_gate",
+            "runtime_context.finish_gate",
+        ),
+    ):
+        source = actionable_payloads.get(key)
+        if isinstance(source, Mapping):
+            add(
+                stage,
+                source,
+                default_action=action,
+                default_tool=tool,
+                default_facade=facade,
+            )
+
+    graph_source = {
+        "action": "run_graph_query",
+        "facade": "graph_query",
+        "mcp_tool": "graph_query",
+        "method": "POST",
+        "path": "/api/graph-governance/{project_id}/query",
+        "copy_safe_body": dict(graph_copy_safe_body),
+    }
+    add(
+        "graph",
+        graph_source,
+        default_action="run_graph_query",
+        default_tool="graph_query",
+    )
+
+    append_evidence = (
+        qa_verification_guide.get("append_evidence")
+        if isinstance(qa_verification_guide.get("append_evidence"), Mapping)
+        else {}
+    )
+    qa_body = append_evidence.get("canonical_contract_runtime_body")
+    if isinstance(qa_body, Mapping) and qa_body:
+        qa_source = {
+            "action": "record_qa_independent_verification",
+            "facade": "contract_runtime.submit_line",
+            "mcp_tool": "contract_runtime_submit_line",
+            "method": "POST",
+            "path": (
+                "/api/projects/{project_id}/contract-runtime/"
+                "{contract_execution_id}/lines"
+            ),
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "copy_safe_body": dict(qa_body),
+        }
+        add(
+            "qa",
+            qa_source,
+            default_action="record_qa_independent_verification",
+            default_tool="contract_runtime_submit_line",
+        )
+
+    writer = contract_runtime_next_action.get("writer_role_safe_copy_payload")
+    writer_body = (
+        writer.get("copy_payload")
+        if isinstance(writer, Mapping)
+        and isinstance(writer.get("copy_payload"), Mapping)
+        else {}
+    )
+    current_line_id = str(contract_runtime_next_action.get("line_id") or "")
+    current_stage_id = str(contract_runtime_next_action.get("stage_id") or "")
+    current_role = str(
+        contract_runtime_next_action.get("actor_role")
+        or contract_runtime_next_action.get("owner_role")
+        or ""
+    )
+    close_stage = (
+        "observer_close"
+        if current_line_id == "observer_close_ready" or current_role == "observer"
+        else "coordinator_close"
+        if "close" in current_line_id or "close" in current_stage_id
+        else ""
+    )
+    if close_stage and writer_body:
+        close_source = {
+            "action": str(
+                contract_runtime_next_action.get("action")
+                or current_line_id
+            ),
+            "facade": "contract_runtime.submit_line",
+            "mcp_tool": "contract_runtime_submit_line",
+            "method": "POST",
+            "path": (
+                "/api/projects/{project_id}/contract-runtime/"
+                "{contract_execution_id}/lines"
+            ),
+            "stage_id": current_stage_id,
+            "line_id": current_line_id,
+            "copy_safe_body": dict(writer_body),
+        }
+        add(
+            close_stage,
+            close_source,
+            default_action=current_line_id,
+            default_tool="contract_runtime_submit_line",
+        )
+
+    return {
+        "schema_version": "runtime_context.guide_to_facade_coverage.v1",
+        "stage_facade_catalog": dict(_RUNTIME_CONTEXT_GUIDE_STAGE_FACADES),
+        "literal_stage_coverage": list(_RUNTIME_CONTEXT_GUIDE_STAGE_FACADES),
+        "actions": actions,
+        "one_canonical_facade_per_advertised_stage": True,
+        "copy_safe_body_spreads_directly_to_mcp": True,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
 
 
 def _runtime_context_worker_guide_response(
@@ -24403,6 +24736,7 @@ def _runtime_context_worker_guide_response(
     )
     if not target_root_projection:
         target_root_projection = _runtime_context_target_root_projection(
+            project_id=project_id,
             canonical_target_project_root=target_project_root,
             worktree_path=worktree_path,
             runtime_context_id=runtime_context_id,
@@ -24995,6 +25329,7 @@ def _runtime_context_worker_guide_response(
         or ""
     ).strip()
     finish_attestation_body = {
+        "project_id": project_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
@@ -25245,6 +25580,7 @@ def _runtime_context_worker_guide_response(
         "method": "POST",
         "endpoint": "runtime_context.finish_gate",
         "path": finish_gate_path,
+        "project_id": project_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
@@ -25276,6 +25612,7 @@ def _runtime_context_worker_guide_response(
             "finish-time-worker-attestation>"
         ),
         "body": {
+            "project_id": project_id,
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
@@ -25994,6 +26331,44 @@ def _runtime_context_worker_guide_response(
                 "worker_mutations_allowed": False,
             },
         }
+    graph_copy_safe_body = {
+        "project_id": project_id,
+        "tool": "function_index",
+        "args": {"query": "<exact source symbol name>"},
+        **graph_payload_shape,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "target_project_root": target_project_root,
+        "worker_role": "mf_sub",
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "session_token_ref": str(worker_view.get("session_token_ref") or ""),
+        "fence_token": fence_token_placeholder,
+        "route_identity": dict(route_identity),
+    }
+    guide_to_facade_coverage = _runtime_context_guide_executable_actions(
+        project_id=project_id,
+        backlog_id=str(
+            task.get("backlog_id") or worker_view.get("backlog_id") or ""
+        ),
+        contract_execution_id=resolved_contract_execution_id,
+        parent_contract_execution_id=str(
+            contract_execution_identity.get("parent_contract_execution_id")
+            or ""
+        ),
+        actionable_payloads=actionable_payloads,
+        graph_copy_safe_body=graph_copy_safe_body,
+        qa_verification_guide=qa_verification_guide,
+        contract_runtime_next_action=contract_runtime_next_legal_action,
+    )
+    if not contract_runtime_resolution_blocked:
+        actionable_payloads["guide_to_facade_coverage"] = deepcopy(
+            guide_to_facade_coverage
+        )
+        actionable_payloads["canonical_executable_actions"] = deepcopy(
+            guide_to_facade_coverage.get("actions") or {}
+        )
     executable_contract = _runtime_context_executable_contract_envelope(
         current_state_response,
         actionable_payloads=actionable_payloads,
@@ -26055,6 +26430,11 @@ def _runtime_context_worker_guide_response(
             contract_runtime_next_action_took_precedence
         ),
         "executable_contract": executable_contract,
+        "guide_to_facade_coverage": guide_to_facade_coverage,
+        "canonical_executable_actions": guide_to_facade_coverage.get(
+            "actions",
+            {},
+        ),
         "actionable_payloads": actionable_payloads,
         "capacity_fallback_guidance": actionable_payloads.get(
             "capacity_fallback_guidance",
@@ -26175,6 +26555,11 @@ def _runtime_context_worker_guide_response(
             "historical_audit_reasons": historical_audit_reasons,
             "read_endpoints": read_endpoints,
             "write_guides": write_guides,
+            "guide_to_facade_coverage": guide_to_facade_coverage,
+            "canonical_executable_actions": guide_to_facade_coverage.get(
+                "actions",
+                {},
+            ),
             "actionable_payloads": actionable_payloads,
             "capacity_fallback_guidance": actionable_payloads.get(
                 "capacity_fallback_guidance",
@@ -26257,7 +26642,7 @@ def _runtime_context_worker_guide_response(
                 "required_route_identity_fields": list(
                     graph_identity.get("required_route_identity_fields") or []
                 ),
-                "payload_shape": graph_payload_shape,
+                "payload_shape": graph_copy_safe_body,
             },
             "route_identity": route_identity,
             "session_token_lease": session_token_lease,
@@ -26574,6 +26959,7 @@ def _runtime_context_requested_target_project_root(ctx: RequestContext) -> str:
 
 def _runtime_context_target_root_projection(
     *,
+    project_id: str = "",
     requested_target_project_root: str = "",
     canonical_target_project_root: str = "",
     worktree_path: str = "",
@@ -26645,6 +27031,9 @@ def _runtime_context_target_root_projection(
             "current_state_query": dict(identity_shape),
             "worker_guide_query": dict(identity_shape),
             "graph_query_body": {
+                "project_id": str(project_id or "").strip(),
+                "tool": "function_index",
+                "args": {"query": "<exact source symbol name>"},
                 **write_identity_shape,
                 "worker_role": "mf_sub",
                 "query_source": "mf_subagent",
@@ -27184,6 +27573,7 @@ def _runtime_context_worker_recovery_payloads(
         "path": initial_join_path,
         "body_source": "copy_safe_body",
         "body": {
+            "project_id": project_id,
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
@@ -27192,7 +27582,6 @@ def _runtime_context_worker_recovery_payloads(
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
             "agent_id": allocated_governed_worker_id,
-            "allocation_owner": normalized_allocation_owner,
             "actual_host_worker_id": allocated_governed_worker_id,
             "worker_session_id": normalized_worker_session_id,
             **safe_route_identity,
@@ -27200,6 +27589,7 @@ def _runtime_context_worker_recovery_payloads(
             "ttl_seconds": 3600,
         },
         "copy_safe_body": {
+            "project_id": project_id,
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
@@ -27208,7 +27598,6 @@ def _runtime_context_worker_recovery_payloads(
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
             "agent_id": allocated_governed_worker_id,
-            "allocation_owner": normalized_allocation_owner,
             "actual_host_worker_id": allocated_governed_worker_id,
             "worker_session_id": normalized_worker_session_id,
             **safe_route_identity,
@@ -27254,6 +27643,7 @@ def _runtime_context_worker_recovery_payloads(
         "path": rejoin_path,
         "body_source": "copy_safe_body",
         "body": {
+            "project_id": project_id,
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
@@ -27266,7 +27656,6 @@ def _runtime_context_worker_recovery_payloads(
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
             "agent_id": allocated_governed_worker_id,
-            "allocation_owner": normalized_allocation_owner,
             "actual_host_worker_id": allocated_governed_worker_id,
             "worker_session_id": normalized_worker_session_id,
             "host_startup_id": normalized_host_startup_id,
@@ -27277,6 +27666,7 @@ def _runtime_context_worker_recovery_payloads(
             "ttl_seconds": 3600,
         },
         "copy_safe_body": {
+            "project_id": project_id,
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
@@ -27289,7 +27679,6 @@ def _runtime_context_worker_recovery_payloads(
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
             "agent_id": allocated_governed_worker_id,
-            "allocation_owner": normalized_allocation_owner,
             "actual_host_worker_id": allocated_governed_worker_id,
             "worker_session_id": normalized_worker_session_id,
             "host_startup_id": normalized_host_startup_id,
@@ -27335,6 +27724,7 @@ def _runtime_context_worker_recovery_payloads(
         "eligibility": rejoin_eligibility,
     }
     session_token_reissue_body = {
+        "project_id": project_id,
         "runtime_context_id": runtime_context_id,
         **(
             {"contract_execution_id": contract_execution_id}
@@ -27347,7 +27737,6 @@ def _runtime_context_worker_recovery_payloads(
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
         "agent_id": allocated_governed_worker_id,
-        "allocation_owner": normalized_allocation_owner,
         "actual_host_worker_id": allocated_governed_worker_id,
         "worker_session_id": normalized_worker_session_id,
         "host_startup_id": normalized_host_startup_id,
@@ -27638,6 +28027,7 @@ def _runtime_context_worker_recovery_payloads(
         "read_receipt_event_id",
     ]
     startup_body = {
+        "project_id": project_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
@@ -27771,6 +28161,7 @@ def _runtime_context_worker_recovery_payloads(
         "commands": [dict(item) for item in implementation_evidence_tests],
     }
     implementation_evidence_body = {
+        "project_id": project_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
@@ -27854,6 +28245,7 @@ def _runtime_context_worker_recovery_payloads(
         or "<active ContractRuntime contract_execution_id>"
     )
     worker_commit_body = {
+        "project_id": project_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
@@ -29255,6 +29647,7 @@ def _runtime_context_worker_recovery_details(
             "fence_token_recorded": bool(getattr(context, "fence_token", "")),
         }
         target_root_projection = _runtime_context_target_root_projection(
+            project_id=project_id,
             requested_target_project_root=requested_target_root,
             canonical_target_project_root=expected_target_root,
             worktree_path=getattr(context, "worktree_path", ""),
@@ -83044,6 +83437,7 @@ def _mf_sub_worker_host_envelope_handoff(
     }
     session_token_ref = session_token_ref or "<copy-safe worker session_token_ref>"
     common_body = {
+        "project_id": project_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
@@ -83112,6 +83506,13 @@ def _mf_sub_worker_host_envelope_handoff(
             "path": f"{base_path}/initial-join",
             "body_source": "copy_safe_body",
             "copy_safe_body": initial_join_body,
+            "host_realization": {
+                "mode": "replace_declared_placeholders_then_spread_to_mcp",
+                "mcp_tool": "runtime_context_session_token_initial_join",
+                "adapter_fields_included": ["project_id"],
+                "required_replacements": ["worker_session_id", "reason"],
+                "optional_omission_fields": [],
+            },
             "valid_when_lineage_missing": [
                 "mf_subagent_read_receipt",
                 "mf_subagent_startup",
@@ -83130,6 +83531,16 @@ def _mf_sub_worker_host_envelope_handoff(
             "path": f"{base_path}/rejoin",
             "body_source": "copy_safe_body",
             "copy_safe_body": rejoin_body,
+            "host_realization": {
+                "mode": "replace_declared_placeholders_then_spread_to_mcp",
+                "mcp_tool": "runtime_context_session_token_rejoin",
+                "adapter_fields_included": ["project_id"],
+                "required_replacements": ["worker_session_id", "reason"],
+                "optional_omission_fields": [
+                    "host_startup_id",
+                    "host_session_id",
+                ],
+            },
             "required_existing_lineage": [
                 "mf_subagent_read_receipt",
                 "mf_subagent_startup",
@@ -105485,12 +105896,41 @@ def _contract_runtime_mf_parallel_worker_cardinality_policy(
         "latest_revision_id": str(latest_revision.get("revision_id") or ""),
         "revision_contract": {
             "interface": "mf_parallel_revise",
+            "facade": "mf_parallel_revise",
+            "mcp_tool": "mf_parallel_revise",
             "method": "POST",
             "path": (
                 "/api/projects/{project_id}/mf-parallel/"
                 "{contract_execution_id}/revise"
             ),
             "observer_only": True,
+            "body_source": "copy_safe_body",
+            "copy_safe_body": {
+                "project_id": project_id,
+                "backlog_id": str(record.get("backlog_id") or "").strip(),
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ).strip(),
+                "required_worker_count": (
+                    1
+                    if verified_batch_child
+                    else (1 if required_worker_count == 2 else 2)
+                ),
+                "reason": "<observer reason for cardinality revision>",
+                "observer_session_id": "<active observer session id>",
+                "observer_route_token_ref": "<current child route token ref>",
+            },
+            "host_realization": {
+                "mode": "replace_declared_placeholders_then_spread_to_mcp",
+                "adapter_fields_included": ["project_id"],
+                "required_replacements": [
+                    "reason",
+                    "observer_session_id",
+                    "observer_route_token_ref",
+                ],
+                "optional_omission_fields": ["route_token_ref"],
+                "required_worker_count_location": "top_level",
+            },
             "allowed_before": "first_runtime_context_allocation_or_dispatch",
             "ordinary_reenter_change_allowed": False,
             "accepted_revisions_append_only": True,
@@ -114024,6 +114464,185 @@ def _onboard_guide_capsule_find_action_input(
     return {}, ""
 
 
+_GUIDE_RAW_AUTH_BODY_FIELDS = {
+    "fence_token",
+    "qa_session_token",
+    "route_token",
+    "session_token",
+}
+
+
+def _guide_executable_action_safe_body(
+    value: Mapping[str, Any],
+    *,
+    path: str = "copy_safe_body",
+) -> tuple[dict[str, Any], list[str]]:
+    """Copy one advertised body while replacing any accidental raw auth.
+
+    Guide projections may advertise process-local auth *locations*, but must
+    never echo their values.  Placeholders remain executable after the host
+    realization step and every replacement path is declared explicitly.
+    """
+
+    replacements: list[str] = []
+
+    def project(item: Any, item_path: str, key: str = "") -> Any:
+        if key in _GUIDE_RAW_AUTH_BODY_FIELDS:
+            if isinstance(item, str) and (
+                item.startswith("<") or item.startswith("env:")
+            ):
+                replacements.append(item_path)
+                return item
+            replacements.append(item_path)
+            return f"<host-realized {key}>"
+        if isinstance(item, Mapping):
+            return {
+                str(child_key): project(
+                    child,
+                    f"{item_path}.{child_key}",
+                    str(child_key),
+                )
+                for child_key, child in item.items()
+            }
+        if isinstance(item, (list, tuple)):
+            return [
+                project(child, f"{item_path}[{index}]")
+                for index, child in enumerate(item)
+            ]
+        if isinstance(item, str) and item.startswith("<"):
+            replacements.append(item_path)
+        return deepcopy(item)
+
+    projected = project(value, path)
+    return dict(projected), list(dict.fromkeys(replacements))
+
+
+def _guide_canonical_executable_action(
+    *,
+    project_id: str,
+    action: str,
+    body: Mapping[str, Any],
+    facade: str = "",
+    mcp_tool: str = "",
+    method: str = "POST",
+    path: str = "",
+    stage_id: str = "",
+    line_id: str = "",
+    backlog_id: str = "",
+    contract_execution_id: str = "",
+    parent_contract_execution_id: str = "",
+    optional_omission_fields: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Return the single facade-executable contract for one advertised action."""
+
+    normalized_action = str(action or facade or mcp_tool or "").strip()
+    normalized_facade = str(facade or mcp_tool or normalized_action).strip()
+    normalized_tool = str(mcp_tool or normalized_facade).strip()
+    copy_safe_body, replacement_paths = _guide_executable_action_safe_body(body)
+    if project_id:
+        copy_safe_body.setdefault("project_id", project_id)
+
+    if normalized_tool == "graph_query":
+        copy_safe_body.setdefault("tool", "function_index")
+        args = (
+            dict(copy_safe_body.get("args"))
+            if isinstance(copy_safe_body.get("args"), Mapping)
+            else {}
+        )
+        args.setdefault("query", "<exact source symbol name>")
+        copy_safe_body["args"] = args
+        if str(args.get("query") or "").startswith("<"):
+            replacement_paths.append("copy_safe_body.args.query")
+        nested_route_identity = (
+            copy_safe_body.get("route_identity")
+            if isinstance(copy_safe_body.get("route_identity"), Mapping)
+            else {}
+        )
+        route_identity = {
+            field: nested_route_identity.get(field) or copy_safe_body.get(field)
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            if nested_route_identity.get(field) or copy_safe_body.get(field)
+        }
+        copy_safe_body["route_identity"] = route_identity
+
+    if normalized_tool == "mf_parallel_revise":
+        metadata = (
+            dict(copy_safe_body.get("metadata"))
+            if isinstance(copy_safe_body.get("metadata"), Mapping)
+            else {}
+        )
+        if "required_worker_count" not in copy_safe_body and (
+            "required_worker_count" in metadata
+        ):
+            copy_safe_body["required_worker_count"] = metadata.pop(
+                "required_worker_count"
+            )
+        if metadata:
+            copy_safe_body["metadata"] = metadata
+        else:
+            copy_safe_body.pop("metadata", None)
+
+    nested_route_identity = (
+        copy_safe_body.get("route_identity")
+        if isinstance(copy_safe_body.get("route_identity"), Mapping)
+        else {}
+    )
+    present_route_identity = {
+        field: nested_route_identity.get(field) or copy_safe_body.get(field)
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if nested_route_identity.get(field) or copy_safe_body.get(field)
+    }
+    lineage = {
+        key: value
+        for key, value in {
+            "project_id": project_id,
+            "backlog_id": backlog_id or copy_safe_body.get("backlog_id"),
+            "contract_execution_id": (
+                contract_execution_id
+                or copy_safe_body.get("contract_execution_id")
+            ),
+            "parent_contract_execution_id": parent_contract_execution_id,
+            "runtime_context_id": copy_safe_body.get("runtime_context_id"),
+            "task_id": copy_safe_body.get("task_id"),
+            "parent_task_id": copy_safe_body.get("parent_task_id"),
+        }.items()
+        if value not in (None, "")
+    }
+    return {
+        "schema_version": "guide.canonical_executable_action.v1",
+        "action": normalized_action,
+        "facade": normalized_facade,
+        "mcp_tool": normalized_tool,
+        "method": str(method or "POST").upper(),
+        "path": str(path or "").strip(),
+        "stage_id": str(stage_id or "").strip(),
+        "line_id": str(line_id or "").strip(),
+        "body_source": "copy_safe_body",
+        "copy_safe_body": copy_safe_body,
+        "host_realization": {
+            "mode": "replace_only_declared_placeholders_then_spread_to_mcp",
+            "mcp_invocation": f"{normalized_tool}(**copy_safe_body)",
+            "adapter_fields_included": ["project_id"],
+            "required_replacement_paths": list(dict.fromkeys(replacement_paths)),
+            "optional_omission_fields": list(optional_omission_fields),
+            "authority_inference_allowed": False,
+        },
+        "route_identity": present_route_identity,
+        "canonical_lineage": lineage,
+        "safe_ref_policy": {
+            "session_token_ref_rotation_is_authoritative": True,
+            "copy_latest_joined_ref": True,
+            "raw_auth_process_local_only": True,
+        },
+        "prewrite_failure_contract": {
+            "wrong_or_ambiguous_identity": "reject_zero_write",
+            "replayed_request": "reject_zero_write",
+            "unrealized_placeholder": "reject_zero_write",
+            "raw_secret_exposed": False,
+        },
+    }
+
+
 def _onboard_guide_capsule_blocker_ids(
     next_action: Mapping[str, Any],
 ) -> list[str]:
@@ -114893,6 +115512,57 @@ def _onboard_route_guide_compact_service_response(
         or next_action.get("line_id")
         or ""
     ).strip()
+    writer_safe_copy = (
+        next_action.get("writer_role_safe_copy_payload")
+        if isinstance(
+            next_action.get("writer_role_safe_copy_payload"), Mapping
+        )
+        else {}
+    )
+    writer_copy_body = (
+        writer_safe_copy.get("copy_payload")
+        if isinstance(writer_safe_copy.get("copy_payload"), Mapping)
+        else {}
+    )
+    canonical_body = dict(writer_copy_body or action_input)
+    canonical_mcp_tool = str(
+        next_action.get("mcp_tool")
+        or next_action.get("tool")
+        or next_action.get("interface")
+        or action
+    ).strip()
+    if writer_copy_body or (
+        next_action.get("stage_id") and next_action.get("line_id")
+    ):
+        canonical_mcp_tool = "contract_runtime_submit_line"
+    canonical_executable_action = (
+        _guide_canonical_executable_action(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=str(
+                identity.get("contract_execution_id") or ""
+            ),
+            parent_contract_execution_id=str(
+                next_action.get("parent_contract_execution_id") or ""
+            ),
+            action=action,
+            facade=str(next_action.get("interface") or canonical_mcp_tool),
+            mcp_tool=canonical_mcp_tool,
+            method=str(next_action.get("method") or "POST"),
+            path=str(next_action.get("path") or ""),
+            stage_id=str(next_action.get("stage_id") or ""),
+            line_id=str(next_action.get("line_id") or ""),
+            body=canonical_body,
+            optional_omission_fields=[
+                *list(next_action.get("omitted_fields") or []),
+                *list(
+                    next_action.get("omitted_server_authority_fields") or []
+                ),
+            ],
+        )
+        if canonical_body and action
+        else {}
+    )
     blocker_ids = _onboard_guide_capsule_blocker_ids(next_action)
     source_of_authority = str(
         next_action.get("source_of_authority")
@@ -115194,6 +115864,9 @@ def _onboard_route_guide_compact_service_response(
                     ),
                     "successor_body": successor_action_input,
                     "allowed_action_summary": action_summary,
+                    "canonical_executable_action": (
+                        canonical_executable_action
+                    ),
                 },
                 section_name="action_input",
             ),
@@ -115277,6 +115950,12 @@ def _onboard_route_guide_compact_service_response(
         "projection_hash": identity["projection_hash"],
         "action_input": action_input,
         "action_input_path": action_input_path,
+        "canonical_executable_action": canonical_executable_action,
+        "copy_safe_body": dict(
+            canonical_executable_action.get("copy_safe_body") or {}
+        ),
+        "facade": str(canonical_executable_action.get("facade") or ""),
+        "mcp_tool": str(canonical_executable_action.get("mcp_tool") or ""),
         "allowed_action_summary": action_summary,
         "legitimate_evidence_bindings": legitimate_evidence_bindings,
         "evidence_shape_authority": {
@@ -149785,9 +150464,11 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                     # authority, not copied from a caller waiver claim.
                     "onboard_service_waiver": True,
                     "metadata": {
-                        "required_worker_count": int(
-                            expected_metadata["required_worker_count"]
-                        )
+                        # A batch row is already one unit of parallelism.  Its
+                        # row-scoped child may not inherit the batch parent's
+                        # cardinality because nested worker fan-out has no
+                        # durable nested merge queue/fan-in contract.
+                        "required_worker_count": 1
                     },
                     "owned_files": list(
                         queue_items_by_backlog.get(row_id, {}).get("owned_files")

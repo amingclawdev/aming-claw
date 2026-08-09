@@ -21,6 +21,40 @@ def _tool_properties(name: str) -> dict:
     return tool["inputSchema"]["properties"]
 
 
+def test_guide_facade_schemas_require_project_adapter_and_top_level_revise_count():
+    guide_facades = {
+        "runtime_context_session_token_initial_join",
+        "runtime_context_session_token_rejoin",
+        "runtime_context_read_receipt",
+        "runtime_context_implementation_evidence",
+        "runtime_context_worker_commit",
+        "runtime_context_finish_time_worker_attestation",
+        "runtime_context_finish_gate",
+        "contract_runtime_submit_line",
+        "mf_parallel_revise",
+        "parallel_branch_allocate",
+    }
+    for registry in (governance_mcp_server.TOOLS, mcp_tools.TOOLS):
+        by_name = {item["name"]: item for item in registry}
+        for facade in guide_facades:
+            schema = by_name[facade]["inputSchema"]
+            assert "project_id" in schema["properties"]
+            assert "project_id" in schema["required"]
+
+        revise = by_name["mf_parallel_revise"]["inputSchema"]
+        assert "required_worker_count" in revise["required"]
+        assert revise["properties"]["required_worker_count"] == {
+            "type": "integer",
+            "enum": [1, 2],
+        }
+        assert "metadata" not in revise["required"]
+
+    graph = next(item for item in TOOLS if item["name"] == "graph_query")
+    graph_properties = graph["inputSchema"]["properties"]
+    assert graph_properties["args"] == {"type": "object"}
+    assert graph_properties["route_identity"]["type"] == "object"
+
+
 def test_runtime_context_worker_commit_tool_routes_to_canonical_facade():
     assert "runtime_context_worker_commit" in _tool_names()
     tool = next(

@@ -17428,6 +17428,12 @@ def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
         "cardinality_source": "verified_batch_child_lineage",
     }
     copy_safe_body = response["copy_safe_allocation_bodies"][0]
+    allocation_action = response["canonical_executable_actions"][0]
+    assert allocation_action["mcp_tool"] == "parallel_branch_allocate"
+    assert allocation_action["copy_safe_body"] == copy_safe_body
+    assert allocation_action["host_realization"]["target_ref_contract"] == (
+        response["effective_allocation_precheck_policy"]["target_ref_contract"]
+    )
     assert copy_safe_body["ref_name"] == "main"
     assert copy_safe_body["branch_ref"].startswith("refs/heads/codex/")
     assert copy_safe_body["branch_ref"] != "refs/heads/main"
@@ -64779,6 +64785,15 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     )
     worker_guide = guide["worker_guide"]
     assert worker_guide["session_token_ref"] == session_ref
+    assert guide["canonical_executable_actions"] == worker_guide[
+        "canonical_executable_actions"
+    ]
+    assert worker_guide["actionable_payloads"][
+        "canonical_executable_actions"
+    ] == worker_guide["canonical_executable_actions"]
+    assert guide["read_receipt_facade_payload_skeleton"] == worker_guide[
+        "read_receipt_facade_payload_skeleton"
+    ]
     lifecycle_policy = worker_guide["worker_session_lifecycle_policy"]
     assert lifecycle_policy[
         "startup_and_implementation_same_live_session_required"
@@ -64803,16 +64818,14 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
         "session_token_ref_alone_authorizes_writes"
     ] is False
     assert rejoin_submission["copy_safe_body"]["agent_id"] == "worker-session-ref"
-    assert rejoin_submission["copy_safe_body"]["allocation_owner"] == (
-        "agent-session-ref"
-    )
+    assert rejoin_submission["copy_safe_body"]["project_id"] == PID
+    assert "allocation_owner" not in rejoin_submission["copy_safe_body"]
     initial_join_submission = worker_guide["actionable_payloads"][
         "session_token_initial_join_submission"
     ]
     assert initial_join_submission["copy_safe_body"]["agent_id"] == "worker-session-ref"
-    assert initial_join_submission["copy_safe_body"]["allocation_owner"] == (
-        "agent-session-ref"
-    )
+    assert initial_join_submission["copy_safe_body"]["project_id"] == PID
+    assert "allocation_owner" not in initial_join_submission["copy_safe_body"]
     assert initial_join_submission["copy_safe_body"]["route_id"] == "route-session-ref"
     assert initial_join_submission[
         "required_when_desktop_identity_differs_from_allocation_owner"
@@ -65384,6 +65397,15 @@ def test_runtime_context_worker_guide_corrected_shapes_default_worker_identity(
     assert corrected["graph_query_body"]["worker_id"] == task_id
     assert corrected["graph_query_body"]["route_identity"] == route_identity
     worker_guide = guide["worker_guide"]
+    assert guide["canonical_executable_actions"] == worker_guide[
+        "canonical_executable_actions"
+    ]
+    assert worker_guide["actionable_payloads"][
+        "canonical_executable_actions"
+    ] == worker_guide["canonical_executable_actions"]
+    assert guide["read_receipt_facade_payload_skeleton"] == worker_guide[
+        "read_receipt_facade_payload_skeleton"
+    ]
     guide_corrected = worker_guide["corrected_request_shapes"]
     assert guide_corrected["write_facade_body"]["worker_id"] == task_id
     assert guide_corrected["write_facade_body"]["worker_slot_id"] == task_id
@@ -65392,6 +65414,12 @@ def test_runtime_context_worker_guide_corrected_shapes_default_worker_identity(
     ]
     assert receipt_body["worker_id"] == task_id
     assert receipt_body["worker_slot_id"] == task_id
+    graph_action = worker_guide["canonical_executable_actions"]["graph"]
+    assert graph_action["copy_safe_body"]["project_id"] == PID
+    assert graph_action["copy_safe_body"]["args"] == {
+        "query": "<exact source symbol name>"
+    }
+    assert graph_action["copy_safe_body"]["route_identity"] == route_identity
 
 
 def test_contract_runtime_worker_sequence_projects_ordered_read_and_startup_without_timeline_backfill(
@@ -125348,7 +125376,7 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     ]
     assert all(
         item["body"]["project_id"] == PID
-        and item["body"]["metadata"]["required_worker_count"] == 2
+        and item["body"]["metadata"]["required_worker_count"] == 1
         for item in result["per_row_successors"]
     )
     assert all(
@@ -138842,3 +138870,215 @@ def test_contract_runtime_worker_projection_distinguishes_absent_from_invalid_co
         "blocked_worker_implementation_test_results"
     )
     assert projection["worker_implementation_evidence"]["fail_closed"] is True
+
+
+def test_guide_canonical_executable_action_is_secret_safe_and_schema_shaped():
+    raw_session = "raw-session-must-not-escape"
+    action = server._guide_canonical_executable_action(
+        project_id=PID,
+        backlog_id="AC-GUIDE-CONFORMANCE",
+        contract_execution_id="cex-guide-conformance",
+        parent_contract_execution_id="cex-parent",
+        action="run_graph_query",
+        facade="graph_query",
+        mcp_tool="graph_query",
+        body={
+            "runtime_context_id": "mfrctx-guide-conformance",
+            "task_id": "guide-conformance-worker",
+            "parent_task_id": "cex-parent",
+            "session_token": raw_session,
+            "fence_token": "raw-fence-must-not-escape",
+            "route_id": "route-guide-conformance",
+            "route_context_hash": "sha256:route-context",
+            "route_token_ref": "rtok-guide-conformance",
+            "prompt_contract_id": "prompt-guide-conformance",
+            "prompt_contract_hash": "sha256:prompt-contract",
+            "visible_injection_manifest_hash": "sha256:visible-manifest",
+        },
+    )
+
+    body = action["copy_safe_body"]
+    assert body["project_id"] == PID
+    assert body["tool"] == "function_index"
+    assert body["args"] == {"query": "<exact source symbol name>"}
+    assert body["route_identity"] == {
+        "route_id": "route-guide-conformance",
+        "route_context_hash": "sha256:route-context",
+        "route_token_ref": "rtok-guide-conformance",
+        "prompt_contract_id": "prompt-guide-conformance",
+        "prompt_contract_hash": "sha256:prompt-contract",
+        "visible_injection_manifest_hash": "sha256:visible-manifest",
+    }
+    assert raw_session not in json.dumps(action)
+    assert action["host_realization"]["required_replacement_paths"] == [
+        "copy_safe_body.session_token",
+        "copy_safe_body.fence_token",
+        "copy_safe_body.args.query",
+    ]
+    assert action["prewrite_failure_contract"] == {
+        "wrong_or_ambiguous_identity": "reject_zero_write",
+        "replayed_request": "reject_zero_write",
+        "unrealized_placeholder": "reject_zero_write",
+        "raw_secret_exposed": False,
+    }
+
+
+def test_guide_literal_stage_facades_have_one_executable_copy_safe_body():
+    payloads = {
+        "session_renewal_hints": {
+            "initial_join": {
+                "copy_safe_body": {
+                    "runtime_context_id": "mfrctx-guide-stages",
+                    "task_id": "guide-stage-worker",
+                    "reason": "bounded join",
+                }
+            }
+        },
+        "read_receipt_facade_payload_skeleton": {
+            "copy_safe_body": {"runtime_context_id": "mfrctx-guide-stages"}
+        },
+        "startup_facade_payload_skeleton": {
+            "copy_safe_body": {"task_id": "guide-stage-worker"}
+        },
+        "implementation_evidence_facade_payload_skeleton": {
+            "copy_safe_body": {
+                "runtime_context_id": "mfrctx-guide-stages",
+                "stage_id": "implementation",
+            }
+        },
+        "worker_commit_facade_payload_skeleton": {
+            "copy_safe_body": {
+                "runtime_context_id": "mfrctx-guide-stages",
+                "contract_execution_id": "cex-guide-stages",
+            }
+        },
+        "finish_time_worker_attestation_submission": {
+            "copy_safe_body": {"runtime_context_id": "mfrctx-guide-stages"}
+        },
+        "finish_gate_facade_payload_skeleton": {
+            "copy_safe_body": {"runtime_context_id": "mfrctx-guide-stages"}
+        },
+    }
+    graph_body = {
+        "runtime_context_id": "mfrctx-guide-stages",
+        "task_id": "guide-stage-worker",
+        "parent_task_id": "cex-parent",
+        "tool": "function_index",
+        "args": {"query": "_runtime_context_worker_guide_response"},
+        "route_identity": {
+            "route_id": "route-guide-stages",
+            "route_context_hash": "sha256:route-context-stages",
+            "route_token_ref": "rtok-guide-stages",
+            "prompt_contract_id": "prompt-guide-stages",
+            "prompt_contract_hash": "sha256:prompt-contract-stages",
+            "visible_injection_manifest_hash": "sha256:visible-stages",
+        },
+    }
+    qa_guide = {
+        "append_evidence": {
+            "canonical_contract_runtime_body": {
+                "contract_execution_id": "cex-guide-stages",
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+            }
+        }
+    }
+
+    common = {
+        "project_id": PID,
+        "backlog_id": "AC-GUIDE-STAGES",
+        "contract_execution_id": "cex-guide-stages",
+        "parent_contract_execution_id": "cex-parent",
+        "actionable_payloads": payloads,
+        "graph_copy_safe_body": graph_body,
+        "qa_verification_guide": qa_guide,
+    }
+    observer = server._runtime_context_guide_executable_actions(
+        **common,
+        contract_runtime_next_action={
+            "action": "observer_close_ready",
+            "actor_role": "observer",
+            "stage_id": "close",
+            "line_id": "observer_close_ready",
+            "writer_role_safe_copy_payload": {
+                "copy_payload": {
+                    "contract_execution_id": "cex-guide-stages",
+                    "parent_contract_execution_id": "cex-parent",
+                    "payload": {
+                        "retained_contract_envelope": {
+                            "definition_hash": "sha256:retained"
+                        }
+                    },
+                }
+            },
+        },
+    )
+    coordinator = server._runtime_context_guide_executable_actions(
+        **common,
+        contract_runtime_next_action={
+            "action": "coordinator_close",
+            "actor_role": "coordinator",
+            "stage_id": "close",
+            "line_id": "coordinator_close",
+            "writer_role_safe_copy_payload": {
+                "copy_payload": {
+                    "contract_execution_id": "cex-guide-stages",
+                    "parent_contract_execution_id": "cex-parent",
+                }
+            },
+        },
+    )
+    actions = {**observer["actions"], **coordinator["actions"]}
+
+    assert set(actions) == set(server._RUNTIME_CONTEXT_GUIDE_STAGE_FACADES)
+    assert all(
+        action["mcp_tool"]
+        == server._RUNTIME_CONTEXT_GUIDE_STAGE_FACADES[stage]
+        and action["copy_safe_body"]["project_id"] == PID
+        and action["host_realization"]["mcp_invocation"].endswith(
+            "(**copy_safe_body)"
+        )
+        for stage, action in actions.items()
+    )
+    assert actions["graph"]["copy_safe_body"]["args"]["query"] == (
+        "_runtime_context_worker_guide_response"
+    )
+    assert actions["qa"]["canonical_lineage"]["contract_execution_id"] == (
+        "cex-guide-stages"
+    )
+    assert actions["observer_close"]["copy_safe_body"]["payload"][
+        "retained_contract_envelope"
+    ] == {"definition_hash": "sha256:retained"}
+    assert actions["observer_close"]["canonical_lineage"][
+        "parent_contract_execution_id"
+    ] == "cex-parent"
+
+
+def test_worker_host_handoff_and_revise_are_direct_mcp_bodies():
+    handoff = server._mf_sub_worker_host_envelope_handoff(
+        project_id=PID,
+        runtime_context_id="mfrctx-host-handoff",
+        task_id="host-handoff-worker",
+        parent_task_id="cex-host-handoff",
+    )
+    for stage in ("initial_join", "rejoin"):
+        projected = handoff[stage]
+        assert projected["copy_safe_body"]["project_id"] == PID
+        assert projected["body_source"] == "copy_safe_body"
+        assert projected["host_realization"]["adapter_fields_included"] == [
+            "project_id"
+        ]
+
+    revised = server._guide_canonical_executable_action(
+        project_id=PID,
+        action="revise_worker_count",
+        facade="mf_parallel_revise",
+        mcp_tool="mf_parallel_revise",
+        body={
+            "backlog_id": "AC-GUIDE-REVISE",
+            "contract_execution_id": "cex-guide-revise",
+            "metadata": {"required_worker_count": 2},
+        },
+    )["copy_safe_body"]
+    assert revised["required_worker_count"] == 2
+    assert "metadata" not in revised
