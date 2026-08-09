@@ -63570,6 +63570,48 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
     )
     assert "\n".join(conn.iterdump()) == before_forced_failure
     assert conn.total_changes == before_projection_failure_changes
+    normalized_projection_calls = 0
+
+    def fail_normalized_projection(*args, **kwargs):
+        nonlocal normalized_projection_calls
+        normalized_projection_calls += 1
+        if normalized_projection_calls == 2:
+            raise RuntimeError(
+                "forced-normalized-read-receipt-authority-failure"
+            )
+        return original_response_authority(*args, **kwargs)
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_read_receipt_response_authority",
+        fail_normalized_projection,
+    )
+    before_normalized_projection_failure_changes = conn.total_changes
+    with pytest.raises(
+        RuntimeError,
+        match="forced-normalized-read-receipt-authority-failure",
+    ):
+        server.handle_graph_governance_runtime_context_read_receipt(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                method="POST",
+                body=submitted_body,
+            )
+        )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_read_receipt_response_authority",
+        original_response_authority,
+    )
+    assert normalized_projection_calls == 2
+    assert "\n".join(conn.iterdump()) == before_forced_failure
+    assert (
+        conn.total_changes
+        == before_normalized_projection_failure_changes
+    )
 
     response = server.handle_graph_governance_runtime_context_read_receipt(
         _ctx(

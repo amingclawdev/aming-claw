@@ -45604,8 +45604,28 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
                 route_identity=route_identity,
             )
         )
+        setattr(
+            forwarded_request,
+            "_trusted_runtime_context_read_receipt_authority_preflight",
+            {
+                "prospective_event_id": prospective_event_id,
+                "context": context,
+                "parent_task_id": parent_task_id,
+                "expected_payload": payload,
+                "route_identity": route_identity,
+                "authority": read_receipt_authority,
+            },
+        )
         result = handle_task_timeline_append(forwarded_request)
-        persisted_read_receipt_authority = (
+        if getattr(
+            forwarded_request,
+            "_trusted_runtime_context_read_receipt_authority_validated",
+            {},
+        ) != read_receipt_authority:
+            # A replaced internal append primitive cannot bypass the closed
+            # authority contract.  The production append sets this seal before
+            # its first write, so the normal path performs no fallible
+            # projection after persistence.
             _runtime_context_read_receipt_response_authority(
                 result,
                 context=context,
@@ -45613,14 +45633,9 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
                 expected_payload=payload,
                 route_identity=route_identity,
             )
-        )
-        if persisted_read_receipt_authority != read_receipt_authority:
             raise GovernanceError(
                 "runtime_context_read_receipt_response_authority_changed",
-                (
-                    "persisted read receipt identity changed after its "
-                    "server-derived authority was validated"
-                ),
+                "timeline append did not consume the validated authority",
                 409,
                 {
                     "runtime_context_id": runtime_context_id,
@@ -133881,6 +133896,115 @@ def handle_task_timeline_append(ctx: RequestContext):
                 qa_replay["agent_facing_decision_source"] = "contract_gate_kernel"
                 qa_replay["meta_contract_gate_decision_source"] = False
                 return qa_replay
+        trusted_read_receipt_authority_preflight = getattr(
+            ctx,
+            "_trusted_runtime_context_read_receipt_authority_preflight",
+            {},
+        )
+        if isinstance(trusted_read_receipt_authority_preflight, Mapping) and (
+            trusted_read_receipt_authority_preflight
+        ):
+            prospective_event_id = int(
+                trusted_read_receipt_authority_preflight.get(
+                    "prospective_event_id",
+                    0,
+                )
+                or 0
+            )
+            sequence_row = conn.execute(
+                """SELECT seq
+                     FROM sqlite_sequence
+                    WHERE name = 'task_timeline_events'"""
+            ).fetchone()
+            next_event_id = (
+                int(sequence_row[0] or 0) + 1 if sequence_row else 1
+            )
+            preflight_context = trusted_read_receipt_authority_preflight.get(
+                "context"
+            )
+            normalized_authority = (
+                _runtime_context_read_receipt_response_authority(
+                    {
+                        "id": prospective_event_id,
+                        "project_id": project_id,
+                        "backlog_id": ctx.body.get("backlog_id", ""),
+                        "task_id": ctx.body.get("task_id", ""),
+                        "event_type": ctx.body.get("event_type", ""),
+                        "event_kind": norm_event_kind,
+                        "status": norm_status,
+                        "payload": norm_payload,
+                    },
+                    context=preflight_context,
+                    parent_task_id=str(
+                        trusted_read_receipt_authority_preflight.get(
+                            "parent_task_id",
+                            "",
+                        )
+                        or ""
+                    ),
+                    expected_payload=(
+                        trusted_read_receipt_authority_preflight.get(
+                            "expected_payload"
+                        )
+                        if isinstance(
+                            trusted_read_receipt_authority_preflight.get(
+                                "expected_payload"
+                            ),
+                            Mapping,
+                        )
+                        else {}
+                    ),
+                    route_identity=(
+                        trusted_read_receipt_authority_preflight.get(
+                            "route_identity"
+                        )
+                        if isinstance(
+                            trusted_read_receipt_authority_preflight.get(
+                                "route_identity"
+                            ),
+                            Mapping,
+                        )
+                        else {}
+                    ),
+                )
+            )
+            if (
+                prospective_event_id <= 0
+                or next_event_id != prospective_event_id
+                or normalized_authority
+                != trusted_read_receipt_authority_preflight.get("authority")
+            ):
+                raise GovernanceError(
+                    "runtime_context_read_receipt_response_authority_changed",
+                    (
+                        "normalized read receipt does not match its "
+                        "server-derived response authority"
+                    ),
+                    409,
+                    {
+                        "runtime_context_id": str(
+                            getattr(
+                                preflight_context,
+                                "runtime_context_id",
+                                "",
+                            )
+                            or ""
+                        ),
+                        "task_id": str(
+                            getattr(preflight_context, "task_id", "") or ""
+                        ),
+                        "mutation_performed": False,
+                        "fail_closed": True,
+                        "raw_session_token_exposed": False,
+                        "raw_fence_token_exposed": False,
+                        "raw_route_token_exposed": False,
+                    },
+                )
+            setattr(
+                ctx,
+                "_trusted_runtime_context_read_receipt_authority_validated",
+                normalized_authority,
+            )
         canonical_contract_line: dict[str, Any] = {}
         requested_contract_line = (
             ctx.body.get("contract_runtime_line")
