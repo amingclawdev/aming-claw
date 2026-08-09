@@ -61892,25 +61892,55 @@ def _rev8_postmerge_qa_binding_record() -> dict[str, Any]:
         "schema_version": (
             "contract_runtime.observer_reconcile_record_authority.v1"
         ),
+        "source": "contract_runtime.server_reconcile_record_projection",
+        "server_derived": True,
         "record_verified": True,
         "merge_projection_verified": True,
         "dispatch_lineage_verified": True,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
         "all_lane_merges_verified": True,
         "lane_merge_count": 2,
+        "lane_runtime_context_ids": [
+            worker["runtime_context_id"] for worker in workers
+        ],
+        "lane_merge_queue_ids": [
+            worker["merge_queue_id"] for worker in workers
+        ],
         "runtime_context_id": workers[1]["runtime_context_id"],
         "task_id": workers[1]["task_id"],
         "parent_task_id": execution_id,
         "merge_queue_id": workers[1]["merge_queue_id"],
         "merged_commit_sha": "2" * 40,
+        "merge_source_ref": "timeline:902",
+        "merge_event_id": 902,
+        "merge_event_created_at": "2026-08-01T15:00:02Z",
+        "contract_runtime_dispatch_source_ref": dispatch_ref,
         "reconcile_event_recorded": False,
+        "reconcile_source_ref": "",
         "reconcile_event_id": 0,
+        "reconcile_event_created_at": "",
+        "reconcile_task_id": "",
+        "reconcile_runtime_context_id": "",
+        "close_grade_authority_deferred": True,
+        "close_grade_required_checks": [
+            "durable_post_merge_reconcile_event",
+            "current_full_reconcile_provenance",
+            "contract_execution_scope",
+            "worker_task_scope",
+            "runtime_context_scope",
+            "parent_task_scope",
+            "merge_queue_scope",
+        ],
+        "current_full_reconcile_activation_verified": False,
     }
     reconcile_receipt["authority_hash"] = server.stable_sha256(
         reconcile_receipt
     )
     completed_lines.append(
         {
-            "stage_id": "reconcile",
+            "stage_id": "observer_integration",
             "line_id": "observer_reconcile",
             "actor_role": "observer",
             "evidence_kind": "reconcile",
@@ -62136,6 +62166,17 @@ def _rev8_postmerge_current_full_state() -> dict[str, Any]:
         "reconcile_snapshot_id": "full-rev8-final-combined",
         "reconcile_source_ref": "timeline:903",
         "reconcile_event_id": 903,
+        "reconcile_event_created_at": "2026-08-01T15:00:03Z",
+        "current_full_reconcile_marker": {
+            "run_id": "current-full-rev8-postmerge",
+            "request_id": "req-current-full-rev8-postmerge",
+        },
+        "current_full_reconcile_provenance": {
+            "provenance_id": "gcfp-rev8-postmerge",
+            "provenance_hash": "sha256:" + "8" * 64,
+            "run_id": "current-full-rev8-postmerge",
+            "request_id": "req-current-full-rev8-postmerge",
+        },
     }
     state["authority_hash"] = server.stable_sha256(state)
     return state
@@ -62190,6 +62231,59 @@ def _install_rev8_postmerge_qa_helper_boundaries(
         "current_full": _rev8_postmerge_current_full_state(),
         "target_project_root_override": "",
     }
+    current_receipt = copy.deepcopy(reconcile_receipt)
+    current_receipt.update(
+        {
+            "reconcile_event_recorded": True,
+            "reconcile_source_ref": "timeline:903",
+            "reconcile_event_id": 903,
+            "reconcile_event_created_at": "2026-08-01T15:00:03Z",
+            "reconcile_task_id": final_worker["task_id"],
+            "reconcile_runtime_context_id": final_worker[
+                "runtime_context_id"
+            ],
+            "current_full_reconcile_activation_verified": True,
+            "terminal_current_full_reconcile_authority": copy.deepcopy(
+                state["current_full"]
+            ),
+        }
+    )
+    current_receipt["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in current_receipt.items()
+            if key != "authority_hash"
+        }
+    )
+    source_line_index = len(record["completed_lines"]) - 1
+    correction_marker = (
+        server._contract_runtime_reconcile_receipt_correction_marker(
+            record=record,
+            source_line=reconcile_line,
+            source_line_index=source_line_index,
+            authority=current_receipt,
+        )
+    )
+    record["completed_lines"].append(
+        {
+            "stage_id": "observer_integration",
+            "line_id": "observer_reconcile",
+            "actor_role": "observer",
+            "evidence_kind": "reconcile",
+            "status": "accepted",
+            "commit_sha": final_commit,
+            "runtime_context_id": final_worker["runtime_context_id"],
+            "task_id": final_worker["task_id"],
+            "parent_task_id": record["contract_execution_id"],
+            "merge_queue_id": final_worker["merge_queue_id"],
+            "payload": {
+                "reconcile_authority": current_receipt,
+                "canonical_reconcile_receipt_correction": (
+                    correction_marker
+                ),
+            },
+        }
+    )
     monkeypatch.setattr(
         server,
         "_contract_runtime_completed_line_acceptance",
@@ -62207,7 +62301,7 @@ def _install_rev8_postmerge_qa_helper_boundaries(
     monkeypatch.setattr(
         server,
         "_contract_runtime_reconcile_record_authority",
-        lambda *_args, **_kwargs: dict(reconcile_receipt),
+        lambda *_args, **_kwargs: copy.deepcopy(current_receipt),
     )
     monkeypatch.setattr(
         server,
@@ -62285,12 +62379,15 @@ def test_rev8_postmerge_qa_authority_joins_progress_receipt_to_final_live_state(
     assert state["target_project_root_override"] == (
         "/tmp/rev8-final-integration-target"
     )
-    assert record["completed_lines"][-1]["payload"][
+    assert record["completed_lines"][-2]["payload"][
         "reconcile_authority"
     ]["reconcile_event_recorded"] is False
-    assert record["completed_lines"][-1]["payload"][
+    assert record["completed_lines"][-2]["payload"][
         "reconcile_authority"
     ]["reconcile_event_id"] == 0
+    assert record["completed_lines"][-1]["payload"][
+        "canonical_reconcile_receipt_correction"
+    ]["append_only_history_preserved"] is True
     assert authority["authority_hash"] == server.stable_sha256(
         {key: value for key, value in authority.items() if key != "authority_hash"}
     )
@@ -73197,6 +73294,316 @@ def test_close_ready_precheck_rejects_invalid_retained_envelope_zero_write_and_p
     assert '"session_token"' not in serialized, case
     assert '"fence_token"' not in serialized, case
     assert '"route_token"' not in serialized, case
+
+
+def _install_contract_runtime_handler_passthrough(monkeypatch, runtime) -> None:
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: runtime)
+    monkeypatch.setattr(
+        server, "_contract_runtime_effective_actor_role",
+        lambda *_args, **_kwargs: "observer",
+    )
+    for name in (
+        "_contract_runtime_mf_parallel_dispatch_copy_safe_projection",
+        "_contract_runtime_apply_mf_parallel_context_projection",
+    ):
+        monkeypatch.setattr(
+            server, name,
+            lambda *_args, **kwargs: (copy.deepcopy(kwargs["record"]), {}),
+        )
+    monkeypatch.setattr(
+        server, "_contract_runtime_mf_parallel_atomic_lane_write_record",
+        lambda _runtime, *, record, **_kwargs: record,
+    )
+    monkeypatch.setattr(
+        server, "_contract_runtime_line_write_body",
+        lambda _record, **kwargs: copy.deepcopy(kwargs["body"]),
+    )
+    monkeypatch.setattr(
+        server, "_contract_runtime_bind_server_line_authority",
+        lambda _ctx, *_args, **kwargs: kwargs["write"],
+    )
+    monkeypatch.setattr(
+        server, "_publish_accepted_contract_runtime_line_write",
+        lambda *_args, **_kwargs: None,
+    )
+
+
+def _standalone_close_ready_worker_set_fixture() -> tuple[dict[str, Any], dict[str, Any]]:
+    record = _rev8_postmerge_qa_binding_record()
+    dispatch = record["completed_lines"][0]
+    workers = dispatch["payload"]["bounded_workers"]
+    completed = [dispatch]
+    for worker in workers:
+        line_instance_id = f"runtime_context:{worker['runtime_context_id']}"
+        for line_id, evidence_kind, actor_role in (
+            ("worker_implementation", "implementation", "mf_sub"),
+            ("worker_commit", "worker_commit", "mf_sub"),
+            ("worker_finish_gate", "mf_subagent_finish_gate", "mf_sub"),
+            ("observer_merge", "merge", "observer"),
+        ):
+            completed.append(
+                {
+                    "stage_id": line_id,
+                    "line_id": line_id,
+                    "actor_role": actor_role,
+                    "evidence_kind": evidence_kind,
+                    "status": "passed",
+                    "runtime_context_id": worker["runtime_context_id"],
+                    "line_instance_id": line_instance_id,
+                    "commit_sha": "2" * 40,
+                    "payload": {
+                        **worker,
+                        "line_instance_id": line_instance_id,
+                    },
+                }
+            )
+    record.update(
+        {
+            "version": "v2",
+            "revision": "rev8",
+            "completed_lines": completed,
+            "runtime_guide": {
+                "completed_lines": copy.deepcopy(completed),
+                "next_legal_action": {
+                    "stage_id": "observer_close",
+                    "line_id": "observer_close_ready",
+                    "owner_role": "observer",
+                    "evidence_kind": "close_ready",
+                },
+            },
+        }
+    )
+    return record, {
+        "stage_id": "observer_close",
+        "line_id": "observer_close_ready",
+        "actor_role": "observer",
+        "evidence_kind": "close_ready",
+        "status": "passed",
+        "commit_sha": "2" * 40,
+        "task_id": record["contract_execution_id"],
+        "payload": {},
+    }
+
+
+def _accept_close_ready_worker_set_line(
+    _conn,
+    *,
+    record,
+    completed_line_index,
+    **_kwargs,
+):
+    execution_id = record["contract_execution_id"]
+    return {
+        "db_verified": True,
+        "completed_line_ref": (
+            f"contract_runtime:{execution_id}:completed_lines:"
+            f"{completed_line_index}"
+        ),
+        "acceptance_ref": (
+            f"contract_runtime:{execution_id}:revision:"
+            f"{completed_line_index + 2}"
+        ),
+        "execution_state_revision": completed_line_index + 2,
+    }
+
+
+@pytest.mark.parametrize(
+    ("case", "mutator"),
+    [
+        (
+            "single_lane",
+            lambda write: write.update(
+                {"runtime_context_id": "mfrctx-rev8-postmerge-server"}
+            ),
+        ),
+        (
+            "wrong_contract",
+            lambda write: write.update({"task_id": "cex-sibling"}),
+        ),
+        (
+            "tampered_envelope",
+            lambda write: write["payload"]["retained_contract_envelope"].update(
+                {"required_worker_count": 1}
+            ),
+        ),
+    ],
+)
+def test_standalone_close_ready_worker_set_drift_is_zero_write(
+    monkeypatch,
+    case,
+    mutator,
+):
+    record, write = _standalone_close_ready_worker_set_fixture()
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_line_acceptance",
+        _accept_close_ready_worker_set_line,
+    )
+    if case == "tampered_envelope":
+        write, errors = server._contract_runtime_bind_close_ready_worker_set(
+            object(), project_id=PID, record=record, write=write
+        )
+        assert errors == []
+    mutator(write)
+    before_record = server.stable_sha256(record)
+    before_write = server.stable_sha256(write)
+
+    _effective, errors = server._contract_runtime_bind_close_ready_worker_set(
+        object(), project_id=PID, record=record, write=write
+    )
+
+    assert errors, case
+    assert server.stable_sha256(record) == before_record, case
+    assert server.stable_sha256(write) == before_write, case
+
+
+@pytest.mark.parametrize("case", ["missing", "duplicate", "wrong_parent"])
+def test_standalone_close_ready_worker_set_requires_exact_lane_history(
+    monkeypatch,
+    case,
+):
+    record, write = _standalone_close_ready_worker_set_fixture()
+    if case == "missing":
+        record["completed_lines"].pop(3)
+    elif case == "duplicate":
+        record["completed_lines"].append(
+            copy.deepcopy(record["completed_lines"][4])
+        )
+    else:
+        for source in (
+            record["completed_lines"],
+            record["runtime_guide"]["completed_lines"],
+        ):
+            source[0]["payload"]["bounded_workers"][0]["parent_task_id"] = (
+                "cex-sibling"
+            )
+    monkeypatch.setattr(
+        server, "_contract_runtime_completed_line_acceptance",
+        _accept_close_ready_worker_set_line,
+    )
+    before = server.stable_sha256(record)
+
+    _effective, errors = server._contract_runtime_bind_close_ready_worker_set(
+        object(), project_id=PID, record=record, write=write
+    )
+
+    assert errors, case
+    assert server.stable_sha256(record) == before, case
+
+
+def test_standalone_close_ready_actual_facades_bind_worker_set_then_submit(
+    conn,
+    monkeypatch,
+):
+    record, body = _standalone_close_ready_worker_set_fixture()
+    execution_id = record["contract_execution_id"]
+
+    class Store:
+        current = copy.deepcopy(record)
+
+        def get(self, requested_execution_id):
+            assert requested_execution_id == execution_id
+            return copy.deepcopy(self.current)
+
+    store = Store()
+
+    class Runtime:
+        def __init__(self):
+            self.store = store
+
+        def current_record(self, requested_execution_id, *, actor_role):
+            assert requested_execution_id == execution_id
+            assert actor_role == "observer"
+            return store.get(requested_execution_id)
+
+        def precheck_line_write(self, requested_execution_id, write, **_kwargs):
+            assert requested_execution_id == execution_id
+            assert write["payload"]["retained_contract_envelope"][
+                "required_worker_count"
+            ] == 2
+            return {
+                "ok": True,
+                "decision": {"ok": True, "errors": []},
+                "record": store.get(requested_execution_id),
+                "completed_lines_count": len(store.current["completed_lines"]),
+                "execution_state_revision": 21,
+                "runtime_guide_hash": "sha256:" + "2" * 64,
+            }
+
+        def submit_line_write(self, requested_execution_id, write, **_kwargs):
+            assert requested_execution_id == execution_id
+            updated = store.get(requested_execution_id)
+            updated["completed_lines"].append(copy.deepcopy(write))
+            updated["execution_state_revision"] = 22
+            updated["runtime_guide"] = {
+                "completed_lines": copy.deepcopy(updated["completed_lines"]),
+                "next_legal_action": None,
+            }
+            store.current = updated
+            return {
+                "ok": True,
+                "decision": {"ok": True, "errors": []},
+                "record": copy.deepcopy(updated),
+            }
+
+    runtime = Runtime()
+    _install_contract_runtime_handler_passthrough(monkeypatch, runtime)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_line_acceptance",
+        _accept_close_ready_worker_set_line,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_bind_close_reconcile_authority",
+        lambda *_args, **_kwargs: store.get(execution_id),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_close_authority_gate",
+        lambda *_args, **_kwargs: {
+            "passed": True,
+            "missing_requirement_ids": [],
+        },
+    )
+    before = copy.deepcopy(store.current)
+    request = {
+        "project_id": PID,
+        "contract_execution_id": execution_id,
+    }
+    precheck = server.handle_project_contract_runtime_line_write_precheck(
+        _ctx_with_role(request, "observer", method="POST", body=body)
+    )
+    assert precheck["ok"] is True
+    assert store.current == before
+
+    submitted = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(request, "observer", method="POST", body=body)
+    )
+    assert submitted["ok"] is True
+    assert len(store.current["completed_lines"]) == len(
+        before["completed_lines"]
+    ) + 1
+    persisted = store.current["completed_lines"][-1]
+    assert persisted["line_id"] == "observer_close_ready"
+    envelope = persisted["payload"]["retained_contract_envelope"]
+    assert envelope["required_worker_count"] == 2
+    assert envelope["single_worker_identity_claimed"] is False
+    assert [worker["runtime_context_id"] for worker in envelope["workers"]] == [
+        "mfrctx-rev8-postmerge-server",
+        "mfrctx-rev8-postmerge-test",
+    ]
+    assert all(
+        [item["line_id"] for item in worker["completed_line_authorities"]]
+        == [
+            "worker_implementation",
+            "worker_commit",
+            "worker_finish_gate",
+            "observer_merge",
+        ]
+        for worker in envelope["workers"]
+    )
+    assert store.current["runtime_guide"]["next_legal_action"] is None
 
 
 def _insert_non_mf_backlog(conn, backlog_id: str) -> None:
@@ -114120,6 +114527,360 @@ def test_observer_reconcile_record_receipt_defers_close_gate_and_is_idempotent()
     assert "duplicate observer_reconcile merge_queue_id mismatch" in (
         rejected["decision"]["errors"]
     )
+
+
+def _postmerge_reconcile_receipt_correction_authority() -> dict[str, Any]:
+    terminal = _rev8_postmerge_current_full_state()
+    terminal.update(
+        {
+            "backlog_id": "AC-DAILY-PLANNER-BATCH-RECONCILE-ORDER",
+            "contract_execution_id": "cex-daily-planner-batch-child",
+            "runtime_context_id": "mfrctx-daily-planner-batch-child",
+            "task_id": "daily-planner-batch-child",
+            "parent_task_id": "cex-daily-planner-batch-child",
+            "merge_queue_id": "mq-daily-planner-batch-child",
+        }
+    )
+    terminal["current_full_reconcile_marker"] = {
+        "run_id": "current-full-daily-planner-batch",
+        "request_id": "req-daily-planner-current-full",
+    }
+    terminal["current_full_reconcile_provenance"] = {
+        "provenance_id": "gcfp-daily-planner-batch",
+        "provenance_hash": "sha256:" + "9" * 64,
+        "run_id": "current-full-daily-planner-batch",
+        "request_id": "req-daily-planner-current-full",
+    }
+    terminal["reconcile_event_created_at"] = "2026-08-09T03:10:00Z"
+    terminal["authority_hash"] = server.stable_sha256(
+        {key: value for key, value in terminal.items() if key != "authority_hash"}
+    )
+    authority = {
+        "schema_version": (
+            "contract_runtime.observer_reconcile_record_authority.v1"
+        ),
+        "source": "contract_runtime.server_reconcile_record_projection",
+        "server_derived": True,
+        "record_verified": True,
+        "merge_projection_verified": True,
+        "dispatch_lineage_verified": True,
+        "project_id": PID,
+        "backlog_id": "AC-DAILY-PLANNER-BATCH-RECONCILE-ORDER",
+        "contract_execution_id": "cex-daily-planner-batch-child",
+        "runtime_context_id": "mfrctx-daily-planner-batch-child",
+        "task_id": "daily-planner-batch-child",
+        "parent_task_id": "cex-daily-planner-batch-child",
+        "merge_queue_id": "mq-daily-planner-batch-child",
+        "merged_commit_sha": "2" * 40,
+        "merge_source_ref": "timeline:902",
+        "merge_event_id": 902,
+        "merge_event_created_at": "2026-08-09T03:00:00Z",
+        "contract_runtime_dispatch_source_ref": (
+            "contract_runtime:cex-daily-planner-batch-child:"
+            "completed_lines:0"
+        ),
+        "all_lane_merges_verified": True,
+        "lane_merge_count": 1,
+        "lane_runtime_context_ids": [
+            "mfrctx-daily-planner-batch-child"
+        ],
+        "lane_merge_queue_ids": ["mq-daily-planner-batch-child"],
+        "reconcile_event_recorded": True,
+        "reconcile_source_ref": "timeline:903",
+        "reconcile_event_id": 903,
+        "reconcile_event_created_at": "2026-08-09T03:10:00Z",
+        "reconcile_task_id": "daily-planner-batch-child",
+        "reconcile_runtime_context_id": (
+            "mfrctx-daily-planner-batch-child"
+        ),
+        "close_grade_authority_deferred": True,
+        "close_grade_required_checks": [
+            "durable_post_merge_reconcile_event",
+            "current_full_reconcile_provenance",
+            "contract_execution_scope",
+            "worker_task_scope",
+            "runtime_context_scope",
+            "parent_task_scope",
+            "merge_queue_scope",
+        ],
+        "current_full_reconcile_activation_verified": True,
+        "terminal_current_full_reconcile_authority": terminal,
+    }
+    authority["authority_hash"] = server.stable_sha256(authority)
+    return authority
+
+
+def test_legacy_observer_reconcile_receipt_correction_is_append_only_and_exact(
+    monkeypatch,
+):
+    authority = _postmerge_reconcile_receipt_correction_authority()
+    legacy = server._contract_runtime_legacy_reconcile_receipt_variants(
+        authority
+    )[0]
+    source_line = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_reconcile",
+        "actor_role": "observer",
+        "evidence_kind": "reconcile",
+        "status": "passed",
+        "commit_sha": authority["merged_commit_sha"],
+        "runtime_context_id": authority["runtime_context_id"],
+        "task_id": authority["task_id"],
+        "parent_task_id": authority["parent_task_id"],
+        "merge_queue_id": authority["merge_queue_id"],
+        "payload": {"reconcile_authority": legacy},
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": authority["backlog_id"],
+        "contract_execution_id": authority["contract_execution_id"],
+        "completed_lines": [source_line],
+        "execution_state_revision": 8,
+        "runtime_guide": {
+            "runtime_guide_hash": "sha256:" + "8" * 64,
+            "next_legal_action": {"line_id": "qa_graph_context"},
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_line_acceptance",
+        lambda *_args, **kwargs: {
+            "db_verified": True,
+            "completed_line_ref": (
+                f"contract_runtime:{authority['contract_execution_id']}:"
+                f"completed_lines:{kwargs['completed_line_index']}"
+            ),
+        },
+    )
+    write = {
+        **source_line,
+        "payload": {"reconcile_authority": authority},
+    }
+    precheck = server._contract_runtime_reconcile_receipt_correction(
+        object(),
+        runtime=object(),
+        project_id=PID,
+        record=record,
+        write=write,
+        actor_role="observer",
+        mutate=False,
+    )
+    assert precheck["legacy_reconcile_receipt_correction_required"] is True
+    assert precheck["append_only_history_preserved"] is True
+    correction_line = precheck["write"]
+    corrected_record = {
+        **record,
+        "completed_lines": [source_line, correction_line],
+        "execution_state_revision": 9,
+    }
+    resolution = server._contract_runtime_reconcile_receipt_resolution(
+        object(),
+        project_id=PID,
+        record=corrected_record,
+        authority=authority,
+    )
+    assert resolution["status"] == "corrected"
+    assert corrected_record["completed_lines"][0] == source_line
+    replay = server._contract_runtime_reconcile_receipt_correction(
+        object(),
+        runtime=object(),
+        project_id=PID,
+        record=corrected_record,
+        write=write,
+        actor_role="observer",
+        mutate=True,
+    )
+    assert replay["idempotent"] is True
+    assert replay["contract_runtime_line_mutated"] is False
+
+    for field, forged in (
+        ("active_snapshot_id", "full-sibling"),
+        ("reconcile_request_id", "req-sibling"),
+        ("reconcile_event_ref", "timeline:999"),
+        ("reconcile_timeline_event_hash", "sha256:" + "0" * 64),
+    ):
+        tampered = copy.deepcopy(corrected_record)
+        marker = tampered["completed_lines"][1]["payload"][
+            "canonical_reconcile_receipt_correction"
+        ]
+        marker[field] = forged
+        marker["correction_id"] = server.stable_sha256(
+            {key: value for key, value in marker.items() if key != "correction_id"}
+        )
+        rejected = server._contract_runtime_reconcile_receipt_resolution(
+            object(),
+            project_id=PID,
+            record=tampered,
+            authority=authority,
+        )
+        assert rejected["status"] == "invalid", field
+    for lines in (
+        [source_line, correction_line, copy.deepcopy(correction_line)],
+        [correction_line, source_line],
+    ):
+        divergent = {**corrected_record, "completed_lines": lines}
+        assert server._contract_runtime_reconcile_receipt_resolution(
+            object(), project_id=PID, record=divergent, authority=authority
+        )["status"] == "invalid"
+
+
+def test_observer_reconcile_rejects_before_current_full_without_mutation(
+    monkeypatch,
+):
+    record = {
+        "project_id": PID,
+        "contract_execution_id": "cex-reconcile-before-current-full",
+    }
+    write = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_reconcile",
+        "evidence_kind": "reconcile",
+        "payload": {},
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_reconcile_record_authority",
+        lambda *_args, **_kwargs: {
+            "record_verified": True,
+            "reconcile_event_recorded": True,
+            "current_full_reconcile_activation_verified": False,
+            "terminal_current_full_reconcile_authority": {},
+        },
+    )
+    before = (server.stable_sha256(record), server.stable_sha256(write))
+
+    with pytest.raises(GovernanceError) as blocked:
+        server._contract_runtime_bind_reconcile_authority(
+            object(),
+            project_id=PID,
+            record=record,
+            write=write,
+            policy={"authority_object_path": "payload.reconcile_authority"},
+        )
+
+    assert blocked.value.code == (
+        "contract_runtime_observer_reconcile_current_full_required"
+    )
+    assert blocked.value.details["writes_performed"] is False
+    assert before == (server.stable_sha256(record), server.stable_sha256(write))
+
+
+def test_legacy_observer_reconcile_actual_facade_appends_one_correction(
+    conn,
+    monkeypatch,
+):
+    authority = _postmerge_reconcile_receipt_correction_authority()
+    legacy = server._contract_runtime_legacy_reconcile_receipt_variants(
+        authority
+    )[0]
+    execution_id = authority["contract_execution_id"]
+    source_line = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_reconcile",
+        "actor_role": "observer",
+        "evidence_kind": "reconcile",
+        "status": "passed",
+        "commit_sha": authority["merged_commit_sha"],
+        "runtime_context_id": authority["runtime_context_id"],
+        "task_id": authority["task_id"],
+        "parent_task_id": authority["parent_task_id"],
+        "merge_queue_id": authority["merge_queue_id"],
+        "payload": {"reconcile_authority": legacy},
+    }
+    initial = {
+        "project_id": PID,
+        "backlog_id": authority["backlog_id"],
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev8",
+        "completed_lines": [source_line],
+        "execution_state_revision": 8,
+        "runtime_guide": {
+            "runtime_guide_hash": "sha256:" + "8" * 64,
+            "completed_lines": [source_line],
+            "next_legal_action": {
+                "stage_id": "qa_graph_context",
+                "line_id": "qa_graph_context",
+                "owner_role": "qa",
+                "evidence_kind": "graph_trace",
+            },
+        },
+    }
+
+    class Store:
+        current = copy.deepcopy(initial)
+
+        def get(self, requested_execution_id):
+            assert requested_execution_id == execution_id
+            return copy.deepcopy(self.current)
+
+        def update(self, requested_execution_id, updated, *, expected_revision):
+            assert requested_execution_id == execution_id
+            assert expected_revision == self.current["execution_state_revision"]
+            self.current = copy.deepcopy(updated)
+
+    store = Store()
+
+    class Runtime:
+        def __init__(self):
+            self.store = store
+
+        def current_record(self, requested_execution_id, *, actor_role):
+            assert actor_role == "observer"
+            return store.get(requested_execution_id)
+
+        def _record_view(self, candidate, *, actor_role, completed_lines):
+            assert actor_role == "observer"
+            viewed = copy.deepcopy(candidate)
+            viewed["completed_lines"] = copy.deepcopy(completed_lines)
+            viewed["runtime_guide"] = {
+                "runtime_guide_hash": "sha256:" + "9" * 64,
+                "completed_lines": copy.deepcopy(completed_lines),
+                "next_legal_action": copy.deepcopy(
+                    initial["runtime_guide"]["next_legal_action"]
+                ),
+            }
+            return viewed
+
+        def submit_line_write(self, *_args, **_kwargs):
+            raise AssertionError("correction must not replay observer_reconcile")
+
+    runtime = Runtime()
+    _install_contract_runtime_handler_passthrough(monkeypatch, runtime)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_line_acceptance",
+        lambda *_args, **kwargs: {
+            "db_verified": True,
+            "completed_line_ref": (
+                f"contract_runtime:{execution_id}:completed_lines:"
+                f"{kwargs['completed_line_index']}"
+            ),
+        },
+    )
+    body = {**source_line, "payload": {"reconcile_authority": authority}}
+    request = {"project_id": PID, "contract_execution_id": execution_id}
+
+    accepted = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(request, "observer", method="POST", body=body)
+    )
+    assert accepted["ok"] is True
+    assert store.current["completed_lines"][0] == source_line
+    assert len(store.current["completed_lines"]) == 2
+    marker = store.current["completed_lines"][1]["payload"][
+        "canonical_reconcile_receipt_correction"
+    ]
+    assert marker["append_only_history_preserved"] is True
+    assert marker["historical_line_rewritten"] is False
+    accepted_hash = server.stable_sha256(store.current)
+
+    replayed = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(request, "observer", method="POST", body=body)
+    )
+    assert replayed["ok"] is True
+    assert server.stable_sha256(store.current) == accepted_hash
+    assert len(store.current["completed_lines"]) == 2
 
 
 def test_reconcile_close_diagnostic_reports_exact_scope_and_authority_failures():

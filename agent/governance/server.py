@@ -97348,40 +97348,30 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         and not isinstance(dispatch_completed_line_index_value, bool)
         else -1
     )
-    reconcile_lines = [
-        (index, line)
-        for index, line in enumerate(record.get("completed_lines") or [])
-        if isinstance(line, Mapping)
-        and index > dispatch_completed_line_index
-        and str(line.get("line_id") or "").strip() == "observer_reconcile"
-        and str(line.get("actor_role") or "").strip() == "observer"
-        and str(line.get("evidence_kind") or "").strip() == "reconcile"
-    ]
     if (
         dispatch_completed_line_index < 0
         or merge_completed_line_index <= dispatch_completed_line_index
-        or len(reconcile_lines) != 1
     ):
         return blocked("observer_reconcile_line_not_unique")
-    reconcile_line_index, reconcile_line = reconcile_lines[0]
-    reconcile_acceptance = _contract_runtime_completed_line_acceptance(
-        conn,
-        project_id=project_id,
-        record=record,
-        completed_line_index=reconcile_line_index,
-        expected_line=reconcile_line,
-    )
-    persisted_reconcile_receipt = (
-        _contract_runtime_close_authority_payload_mapping(
-            reconcile_line,
-            "reconcile_authority",
-        )
-    )
     expected_reconcile_receipt = _contract_runtime_reconcile_record_authority(
         conn,
         project_id=project_id,
         record=record,
     )
+    receipt_resolution = _contract_runtime_reconcile_receipt_resolution(
+        conn,
+        project_id=project_id,
+        record=record,
+        authority=expected_reconcile_receipt,
+    )
+    if receipt_resolution.get("status") not in {"current", "corrected"}:
+        return blocked("observer_reconcile_receipt_unverified")
+    reconcile_line_index = _contract_runtime_close_authority_line_index(
+        receipt_resolution.get("line_index")
+    )
+    reconcile_line = receipt_resolution.get("line") or {}
+    reconcile_acceptance = receipt_resolution.get("acceptance") or {}
+    persisted_reconcile_receipt = receipt_resolution.get("authority") or {}
     if not (
         reconcile_line_index > merge_completed_line_index
         and reconcile_acceptance.get("db_verified") is True
@@ -103995,6 +103985,271 @@ def _contract_runtime_reconcile_record_authority(
     return authority
 
 
+_CONTRACT_RUNTIME_RECONCILE_RECEIPT_CORRECTION_SCHEMA = (
+    "contract_runtime.observer_reconcile_receipt_correction.v1"
+)
+
+
+def _contract_runtime_reconcile_receipt_line_hash(
+    line: Mapping[str, Any],
+) -> str:
+    """Hash the immutable stored line without transient read-model fields."""
+
+    return stable_sha256(
+        {
+            key: value
+            for key, value in line.items()
+            if not str(key).startswith("_")
+        }
+    )
+
+
+def _contract_runtime_legacy_reconcile_receipt_variants(
+    current: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Reconstruct the only pre-current-full receipts accepted for repair."""
+
+    if not _contract_runtime_current_full_reconcile_activation_verified(
+        current.get("terminal_current_full_reconcile_authority")
+        if isinstance(
+            current.get("terminal_current_full_reconcile_authority"),
+            Mapping,
+        )
+        else {}
+    ):
+        return []
+    variants: list[dict[str, Any]] = []
+    for preserve_event in (False, True):
+        candidate = {
+            key: deepcopy(value)
+            for key, value in current.items()
+            if key
+            not in {
+                "authority_hash",
+                "terminal_current_full_reconcile_authority",
+            }
+        }
+        candidate["current_full_reconcile_activation_verified"] = False
+        if not preserve_event:
+            candidate.update(
+                {
+                    "reconcile_event_recorded": False,
+                    "reconcile_source_ref": "",
+                    "reconcile_event_id": 0,
+                    "reconcile_event_created_at": "",
+                    "reconcile_task_id": "",
+                    "reconcile_runtime_context_id": "",
+                }
+            )
+        candidate["authority_hash"] = stable_sha256(candidate)
+        variants.append(candidate)
+    return variants
+
+
+def _contract_runtime_reconcile_receipt_correction_marker(
+    *,
+    record: Mapping[str, Any],
+    source_line: Mapping[str, Any],
+    source_line_index: int,
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the closed append-only transition from one legacy receipt."""
+
+    terminal = (
+        authority.get("terminal_current_full_reconcile_authority")
+        if isinstance(
+            authority.get("terminal_current_full_reconcile_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    provenance = (
+        terminal.get("current_full_reconcile_provenance")
+        if isinstance(
+            terminal.get("current_full_reconcile_provenance"), Mapping
+        )
+        else {}
+    )
+    activation = (
+        terminal.get("current_full_reconcile_marker")
+        if isinstance(
+            terminal.get("current_full_reconcile_marker"), Mapping
+        )
+        else {}
+    )
+    reconcile_event_id = int(terminal.get("reconcile_event_id") or 0)
+    reconcile_source_ref = str(
+        terminal.get("reconcile_source_ref") or ""
+    ).strip()
+    timeline_event_core = {
+        "event_id": reconcile_event_id,
+        "event_ref": reconcile_source_ref,
+        "created_at": str(
+            terminal.get("reconcile_event_created_at") or ""
+        ).strip(),
+        "runtime_context_id": str(
+            terminal.get("runtime_context_id") or ""
+        ).strip(),
+        "task_id": str(terminal.get("task_id") or "").strip(),
+        "parent_task_id": str(
+            terminal.get("parent_task_id") or ""
+        ).strip(),
+        "merge_queue_id": str(
+            terminal.get("merge_queue_id") or ""
+        ).strip(),
+        "target_commit_sha": str(
+            terminal.get("reconciled_commit_sha") or ""
+        ).strip().lower(),
+    }
+    marker = {
+        "schema_version": (
+            _CONTRACT_RUNTIME_RECONCILE_RECEIPT_CORRECTION_SCHEMA
+        ),
+        "source": (
+            "ContractRuntime.completed_lines+"
+            "graph_current_full_reconcile_provenance+task_timeline_events"
+        ),
+        "server_derived": True,
+        "append_only_history_preserved": True,
+        "historical_line_rewritten": False,
+        "project_id": str(record.get("project_id") or "").strip(),
+        "backlog_id": str(record.get("backlog_id") or "").strip(),
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": timeline_event_core["runtime_context_id"],
+        "task_id": timeline_event_core["task_id"],
+        "parent_task_id": timeline_event_core["parent_task_id"],
+        "merge_queue_id": timeline_event_core["merge_queue_id"],
+        "merged_commit_sha": str(
+            authority.get("merged_commit_sha") or ""
+        ).strip().lower(),
+        "source_completed_line_index": source_line_index,
+        "source_completed_line_ref": (
+            "contract_runtime:"
+            f"{str(record.get('contract_execution_id') or '').strip()}:"
+            f"completed_lines:{source_line_index}"
+        ),
+        "source_completed_line_hash": (
+            _contract_runtime_reconcile_receipt_line_hash(source_line)
+        ),
+        "source_reconcile_authority_hash": str(
+            _contract_runtime_close_authority_payload_mapping(
+                source_line,
+                "reconcile_authority",
+            ).get("authority_hash")
+            or ""
+        ).strip(),
+        "corrected_reconcile_authority_hash": str(
+            authority.get("authority_hash") or ""
+        ).strip(),
+        "active_snapshot_id": str(
+            terminal.get("active_snapshot_id") or ""
+        ).strip(),
+        "reconcile_snapshot_id": str(
+            terminal.get("reconcile_snapshot_id") or ""
+        ).strip(),
+        "reconcile_run_id": str(
+            activation.get("run_id") or provenance.get("run_id") or ""
+        ).strip(),
+        "reconcile_request_id": str(
+            activation.get("request_id")
+            or provenance.get("request_id")
+            or ""
+        ).strip(),
+        "reconcile_provenance_id": str(
+            provenance.get("provenance_id") or ""
+        ).strip(),
+        "reconcile_provenance_hash": str(
+            provenance.get("provenance_hash") or ""
+        ).strip(),
+        "reconcile_event_id": reconcile_event_id,
+        "reconcile_event_ref": reconcile_source_ref,
+        "reconcile_timeline_event_hash": stable_sha256(
+            timeline_event_core
+        ),
+    }
+    marker["correction_id"] = stable_sha256(marker)
+    return marker
+
+
+def _contract_runtime_reconcile_receipt_correction_valid(
+    *,
+    record: Mapping[str, Any],
+    source_line: Mapping[str, Any],
+    source_line_index: int,
+    correction_line: Mapping[str, Any],
+    authority: Mapping[str, Any],
+) -> bool:
+    payload = (
+        correction_line.get("payload")
+        if isinstance(correction_line.get("payload"), Mapping)
+        else {}
+    )
+    marker = (
+        payload.get("canonical_reconcile_receipt_correction")
+        if isinstance(
+            payload.get("canonical_reconcile_receipt_correction"), Mapping
+        )
+        else {}
+    )
+    corrected = (
+        payload.get("reconcile_authority")
+        if isinstance(payload.get("reconcile_authority"), Mapping)
+        else {}
+    )
+    expected_marker = _contract_runtime_reconcile_receipt_correction_marker(
+        record=record,
+        source_line=source_line,
+        source_line_index=source_line_index,
+        authority=authority,
+    )
+    required_text = (
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "merge_queue_id",
+        "merged_commit_sha",
+        "source_completed_line_ref",
+        "source_completed_line_hash",
+        "source_reconcile_authority_hash",
+        "corrected_reconcile_authority_hash",
+        "active_snapshot_id",
+        "reconcile_snapshot_id",
+        "reconcile_run_id",
+        "reconcile_request_id",
+        "reconcile_provenance_id",
+        "reconcile_provenance_hash",
+        "reconcile_event_ref",
+        "reconcile_timeline_event_hash",
+        "correction_id",
+    )
+    return bool(
+        all(str(expected_marker.get(field) or "").strip() for field in required_text)
+        and int(expected_marker.get("reconcile_event_id") or 0) > 0
+        and stable_sha256(marker) == stable_sha256(expected_marker)
+        and stable_sha256(corrected) == stable_sha256(authority)
+        and set(payload) == {
+            "canonical_reconcile_receipt_correction",
+            "reconcile_authority",
+        }
+        and str(correction_line.get("stage_id") or "").strip()
+        == str(source_line.get("stage_id") or "").strip()
+        and str(correction_line.get("stage_id") or "").strip()
+        in {"observer_integration", "observer_reconcile"}
+        and str(correction_line.get("line_id") or "").strip()
+        == "observer_reconcile"
+        and str(correction_line.get("actor_role") or "").strip()
+        == "observer"
+        and str(correction_line.get("evidence_kind") or "").strip()
+        == "reconcile"
+        and _contract_runtime_line_status_passes(correction_line)
+    )
+
+
 def _contract_runtime_bind_reconcile_authority(
     conn,
     *,
@@ -104008,6 +104263,81 @@ def _contract_runtime_bind_reconcile_authority(
         project_id=project_id,
         record=record,
     )
+    terminal = (
+        authority.get("terminal_current_full_reconcile_authority")
+        if isinstance(
+            authority.get("terminal_current_full_reconcile_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    if not (
+        authority.get("record_verified") is True
+        and authority.get("reconcile_event_recorded") is True
+        and authority.get("current_full_reconcile_activation_verified")
+        is True
+        and _contract_runtime_current_full_reconcile_activation_verified(
+            terminal
+        )
+    ):
+        raise GovernanceError(
+            "contract_runtime_observer_reconcile_current_full_required",
+            (
+                "observer_reconcile requires one unique exact durable "
+                "graph_current_full_reconcile receipt before the contract "
+                "line can be prechecked or submitted"
+            ),
+            409,
+            {
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "line_id": "observer_reconcile",
+                "required_action": "graph_current_full_reconcile",
+                "writes_performed": False,
+                "fail_closed": True,
+            },
+        )
+    for field in (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "merge_queue_id",
+    ):
+        supplied = _contract_runtime_mapping_value(write, field)
+        expected = str(authority.get(field) or "").strip()
+        if supplied and supplied != expected:
+            raise GovernanceError(
+                "contract_runtime_observer_reconcile_identity_mismatch",
+                f"observer_reconcile {field} does not match server authority",
+                409,
+                {
+                    "field": field,
+                    "contract_execution_id": str(
+                        record.get("contract_execution_id") or ""
+                    ),
+                    "writes_performed": False,
+                    "fail_closed": True,
+                },
+            )
+    supplied_commit = str(write.get("commit_sha") or "").strip().lower()
+    expected_commit = str(
+        authority.get("merged_commit_sha") or ""
+    ).strip().lower()
+    if supplied_commit and supplied_commit != expected_commit:
+        raise GovernanceError(
+            "contract_runtime_observer_reconcile_identity_mismatch",
+            "observer_reconcile commit_sha does not match server authority",
+            409,
+            {
+                "field": "commit_sha",
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "writes_performed": False,
+                "fail_closed": True,
+            },
+        )
     sanitized = _contract_runtime_strip_authority_claims(
         write,
         field_names=_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS,
@@ -105396,6 +105726,351 @@ _CONTRACT_RUNTIME_QA_REJECTION_RESPONSE_FIELDS = (
     "remediation",
     "next_legal_action",
 )
+
+
+def _contract_runtime_reconcile_receipt_resolution(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve one canonical receipt or one legacy+correction transition."""
+
+    lines = [
+        (index, line)
+        for index, line in enumerate(record.get("completed_lines") or [])
+        if isinstance(line, Mapping)
+        and str(line.get("stage_id") or "").strip()
+        in {"observer_integration", "observer_reconcile"}
+        and str(line.get("line_id") or "").strip()
+        == "observer_reconcile"
+        and str(line.get("evidence_kind") or "").strip() == "reconcile"
+        and str(line.get("actor_role") or "").strip() == "observer"
+    ]
+    sources: list[tuple[int, Mapping[str, Any]]] = []
+    corrections: list[tuple[int, Mapping[str, Any]]] = []
+    for index, line in lines:
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        if "canonical_reconcile_receipt_correction" in payload:
+            corrections.append((index, line))
+        else:
+            sources.append((index, line))
+    if len(sources) != 1 or len(corrections) > 1 or len(lines) not in {1, 2}:
+        return {"status": "invalid", "reason": "receipt_cardinality"}
+    source_index, source_line = sources[0]
+    source_acceptance = _contract_runtime_completed_line_acceptance(
+        conn,
+        project_id=project_id,
+        record=record,
+        completed_line_index=source_index,
+        expected_line=source_line,
+    )
+    source_receipt = _contract_runtime_close_authority_payload_mapping(
+        source_line,
+        "reconcile_authority",
+    )
+    if not (
+        source_acceptance.get("db_verified") is True
+        and _contract_runtime_close_authority_hash_matches(source_receipt)
+        and _contract_runtime_line_status_passes(source_line)
+    ):
+        return {"status": "invalid", "reason": "source_acceptance"}
+    if stable_sha256(source_receipt) == stable_sha256(authority):
+        if corrections:
+            return {"status": "invalid", "reason": "unexpected_correction"}
+        return {
+            "status": "current",
+            "line_index": source_index,
+            "line": source_line,
+            "acceptance": source_acceptance,
+            "authority": dict(authority),
+        }
+    legacy_variants = _contract_runtime_legacy_reconcile_receipt_variants(
+        authority
+    )
+    if not any(
+        stable_sha256(source_receipt) == stable_sha256(candidate)
+        for candidate in legacy_variants
+    ):
+        return {"status": "invalid", "reason": "source_identity"}
+    if not corrections:
+        return {
+            "status": "legacy_pending",
+            "source_line_index": source_index,
+            "source_line": source_line,
+            "source_acceptance": source_acceptance,
+            "authority": dict(authority),
+        }
+    correction_index, correction_line = corrections[0]
+    correction_acceptance = _contract_runtime_completed_line_acceptance(
+        conn,
+        project_id=project_id,
+        record=record,
+        completed_line_index=correction_index,
+        expected_line=correction_line,
+    )
+    if not (
+        correction_index == source_index + 1
+        and correction_acceptance.get("db_verified") is True
+        and _contract_runtime_reconcile_receipt_correction_valid(
+            record=record,
+            source_line=source_line,
+            source_line_index=source_index,
+            correction_line=correction_line,
+            authority=authority,
+        )
+    ):
+        return {"status": "invalid", "reason": "correction_identity"}
+    return {
+        "status": "corrected",
+        "source_line_index": source_index,
+        "source_line": source_line,
+        "line_index": correction_index,
+        "line": correction_line,
+        "acceptance": correction_acceptance,
+        "authority": dict(authority),
+    }
+
+
+def _contract_runtime_reconcile_receipt_correction(
+    conn,
+    *,
+    runtime: Any,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    actor_role: str,
+    mutate: bool,
+) -> dict[str, Any]:
+    """Append the sole canonical repair for a pre-current-full receipt."""
+
+    if not (
+        actor_role == "observer"
+        and str(write.get("stage_id") or "").strip()
+        in {"observer_integration", "observer_reconcile"}
+        and str(write.get("line_id") or "").strip()
+        == "observer_reconcile"
+        and str(write.get("evidence_kind") or "").strip() == "reconcile"
+    ):
+        return {}
+    authority = _contract_runtime_close_authority_payload_mapping(
+        write,
+        "reconcile_authority",
+    )
+    resolution = _contract_runtime_reconcile_receipt_resolution(
+        conn,
+        project_id=project_id,
+        record=record,
+        authority=authority,
+    )
+    if resolution.get("status") == "corrected":
+        guide = (
+            record.get("runtime_guide")
+            if isinstance(record.get("runtime_guide"), Mapping)
+            else {}
+        )
+        state = (
+            record.get("execution_state")
+            if isinstance(record.get("execution_state"), Mapping)
+            else {}
+        )
+        return {
+            "ok": True,
+            "record": dict(record),
+            "decision": {
+                "schema_version": "contract_write_gate_decision.v1",
+                "ok": True,
+                "errors": [],
+            },
+            "idempotent": True,
+            "completed_line_already_recorded": True,
+            "contract_runtime_line_mutated": False,
+            "append_only_history_preserved": True,
+            "legacy_reconcile_receipt_correction_replayed": True,
+            "completed_lines_count": len(record.get("completed_lines") or []),
+            "execution_state_revision": int(
+                record.get("execution_state_revision")
+                or state.get("execution_state_revision")
+                or 0
+            ),
+            "execution_state_hash": str(
+                state.get("execution_state_hash") or ""
+            ),
+            "runtime_guide_hash": str(
+                guide.get("runtime_guide_hash") or ""
+            ),
+        }
+    if resolution.get("status") == "invalid" and any(
+        isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip()
+        == "observer_reconcile"
+        for line in record.get("completed_lines") or []
+    ):
+        raise GovernanceError(
+            "contract_runtime_observer_reconcile_correction_identity_mismatch",
+            "persisted observer_reconcile receipt/correction is divergent",
+            409,
+            {
+                "reason": str(resolution.get("reason") or "invalid"),
+                "writes_performed": False,
+                "fail_closed": True,
+            },
+        )
+    if resolution.get("status") != "legacy_pending":
+        return {}
+    source_line = resolution["source_line"]
+    source_index = int(resolution["source_line_index"])
+    source_stage_id = str(source_line.get("stage_id") or "").strip()
+    if str(write.get("stage_id") or "").strip() != source_stage_id:
+        raise GovernanceError(
+            "contract_runtime_observer_reconcile_correction_identity_mismatch",
+            "observer_reconcile correction stage does not match the source line",
+            409,
+            {"writes_performed": False, "fail_closed": True},
+        )
+    marker = _contract_runtime_reconcile_receipt_correction_marker(
+        record=record,
+        source_line=source_line,
+        source_line_index=source_index,
+        authority=authority,
+    )
+    if not _contract_runtime_reconcile_receipt_correction_valid(
+        record=record,
+        source_line=source_line,
+        source_line_index=source_index,
+        correction_line={
+            "stage_id": source_stage_id,
+            "line_id": "observer_reconcile",
+            "actor_role": "observer",
+            "evidence_kind": "reconcile",
+            "status": "passed",
+            "payload": {
+                "reconcile_authority": dict(authority),
+                "canonical_reconcile_receipt_correction": marker,
+            },
+        },
+        authority=authority,
+    ):
+        raise GovernanceError(
+            "contract_runtime_observer_reconcile_correction_unverified",
+            "legacy observer_reconcile correction authority is incomplete",
+            409,
+            {
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "writes_performed": False,
+                "fail_closed": True,
+            },
+        )
+    correction_line = {
+        "stage_id": source_stage_id,
+        "line_id": "observer_reconcile",
+        "actor_role": "observer",
+        "evidence_kind": "reconcile",
+        "status": "passed",
+        "commit_sha": str(
+            authority.get("merged_commit_sha") or ""
+        ).strip().lower(),
+        "runtime_context_id": str(
+            authority.get("runtime_context_id") or ""
+        ).strip(),
+        "task_id": str(authority.get("task_id") or "").strip(),
+        "parent_task_id": str(
+            authority.get("parent_task_id") or ""
+        ).strip(),
+        "merge_queue_id": str(
+            authority.get("merge_queue_id") or ""
+        ).strip(),
+        "payload": {
+            "reconcile_authority": dict(authority),
+            "canonical_reconcile_receipt_correction": marker,
+        },
+        "artifact_refs": {
+            "source_reconcile_completed_line_ref": marker[
+                "source_completed_line_ref"
+            ],
+            "current_full_reconcile_event_ref": marker[
+                "reconcile_event_ref"
+            ],
+            "current_full_snapshot_ref": (
+                f"graph_snapshot:{marker['active_snapshot_id']}"
+            ),
+        },
+    }
+    next_line = (
+        record.get("runtime_guide", {}).get("next_legal_action", {})
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    expected_next_line_id = str(next_line.get("line_id") or "").strip()
+    if not expected_next_line_id:
+        raise GovernanceError(
+            "contract_runtime_observer_reconcile_correction_transition_invalid",
+            "legacy observer_reconcile correction has no durable next line",
+            409,
+            {"writes_performed": False, "fail_closed": True},
+        )
+    if not mutate:
+        return {
+            "ok": True,
+            "decision": {
+                "schema_version": "contract_write_gate_decision.v1",
+                "ok": True,
+                "errors": [],
+            },
+            "record": dict(record),
+            "write": correction_line,
+            "would_mutate_completed_lines": True,
+            "legacy_reconcile_receipt_correction_required": True,
+            "append_only_history_preserved": True,
+            "completed_lines_count": len(record.get("completed_lines") or []),
+        }
+    try:
+        persisted = _contract_runtime_append_completed_line_correction(
+            runtime,
+            record,
+            correction_line,
+            contract_execution_id=str(
+                record.get("contract_execution_id") or ""
+            ),
+            actor_role="observer",
+            expected_next_line_id=expected_next_line_id,
+        )
+    except ContractRuntimeError as exc:
+        raise GovernanceError(
+            "contract_runtime_observer_reconcile_correction_conflict",
+            str(exc),
+            409,
+            {"writes_performed": False, "fail_closed": True},
+        ) from exc
+    if not persisted:
+        raise GovernanceError(
+            "contract_runtime_observer_reconcile_correction_transition_invalid",
+            "legacy observer_reconcile correction changed the legal next line",
+            409,
+            {"writes_performed": False, "fail_closed": True},
+        )
+    return {
+        "ok": True,
+        "record": persisted,
+        "decision": {
+            "schema_version": "contract_write_gate_decision.v1",
+            "ok": True,
+            "errors": [],
+        },
+        "status": "corrected_observer_reconcile_receipt",
+        "contract_runtime_line_mutated": True,
+        "append_only_history_preserved": True,
+        "historical_line_rewritten": False,
+        "canonical_reconcile_receipt_correction": marker,
+        "completed_lines_count": len(persisted.get("completed_lines") or []),
+    }
 
 
 def _contract_runtime_qa_rejection_response_fields(
@@ -127128,6 +127803,54 @@ def _contract_runtime_bind_close_reconcile_authority(
         str(projected.get("contract_id") or "")
     ):
         return projected
+    expected_receipt = _contract_runtime_reconcile_record_authority(
+        conn,
+        project_id=project_id,
+        record=projected,
+    )
+    correction_present = any(
+        isinstance(line, Mapping)
+        and isinstance(line.get("payload"), Mapping)
+        and "canonical_reconcile_receipt_correction" in line["payload"]
+        for line in projected.get("completed_lines") or []
+    )
+    receipt_resolution = (
+        _contract_runtime_reconcile_receipt_resolution(
+            conn,
+            project_id=project_id,
+            record=projected,
+            authority=expected_receipt,
+        )
+        if correction_present
+        else {"status": "current"}
+    )
+    if receipt_resolution.get("status") == "corrected":
+        source_index = _contract_runtime_close_authority_line_index(
+            receipt_resolution.get("source_line_index")
+        )
+        correction_index = _contract_runtime_close_authority_line_index(
+            receipt_resolution.get("line_index")
+        )
+        completed = list(projected.get("completed_lines") or [])
+        if not (
+            0 <= source_index < correction_index < len(completed)
+        ):
+            return projected
+        effective_line = deepcopy(dict(receipt_resolution["line"]))
+        effective_payload = dict(effective_line.get("payload") or {})
+        effective_payload.pop(
+            "canonical_reconcile_receipt_correction",
+            None,
+        )
+        effective_line["payload"] = effective_payload
+        effective_line["artifact_refs"] = {
+            "reconcile_event_ref": str(
+                expected_receipt.get("reconcile_source_ref") or ""
+            ).strip(),
+        }
+        completed[source_index] = effective_line
+        completed.pop(correction_index)
+        projected["completed_lines"] = completed
     merge = _contract_runtime_close_grade_merge_projection(
         conn,
         project_id=project_id,
@@ -128843,6 +129566,278 @@ def _contract_runtime_mf_parallel_close_authority_gate(
     }
 
 
+_CONTRACT_RUNTIME_CLOSE_READY_WORKER_SET_SCHEMA = (
+    "contract_runtime.observer_close_ready_retained_worker_set.v1"
+)
+
+
+def _contract_runtime_close_ready_worker_set_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind contract-scoped close-ready to every current worker lane."""
+
+    if conn is None or not _is_mf_parallel_postmerge_revision(record):
+        return {}
+    required_count = _contract_runtime_mf_parallel_current_generation_worker_count(
+        record,
+        conn=conn,
+        project_id=project_id,
+    )
+    if required_count <= 1:
+        return {}
+    selection = _contract_runtime_current_dispatch_authority_line(record)
+    if selection.get("status") != "selected":
+        return {}
+    dispatch_index = _contract_runtime_close_authority_line_index(
+        selection.get("completed_line_index", -1)
+    )
+    completed = [
+        item
+        for item in record.get("completed_lines") or []
+        if isinstance(item, Mapping)
+    ]
+    if not (0 <= dispatch_index < len(completed)):
+        return {}
+    dispatch_line = completed[dispatch_index]
+    workers = _contract_runtime_mf_parallel_bounded_workers(
+        {"payload": selection.get("payload") or {}}
+    )
+    if len(workers) != required_count:
+        return {}
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    dispatch_acceptance = _contract_runtime_completed_line_acceptance(
+        conn,
+        project_id=project_id,
+        record=record,
+        completed_line_index=dispatch_index,
+        expected_line=dispatch_line,
+    )
+    if dispatch_acceptance.get("db_verified") is not True:
+        return {}
+
+    identities: list[dict[str, Any]] = []
+    seen: dict[str, set[str]] = {
+        field: set()
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "worker_id",
+            "worker_slot_id",
+            "merge_queue_id",
+        )
+    }
+    required_line_ids = (
+        "worker_implementation",
+        "worker_commit",
+        "worker_finish_gate",
+        "observer_merge",
+    )
+    for worker in sorted(
+        workers,
+        key=lambda item: str(item.get("runtime_context_id") or ""),
+    ):
+        identity = {
+            field: str(worker.get(field) or "").strip()
+            for field in (
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_id",
+                "worker_slot_id",
+                "merge_queue_id",
+            )
+        }
+        if not all(identity.values()):
+            return {}
+        if identity["parent_task_id"] != execution_id:
+            return {}
+        for field, values in seen.items():
+            value = identity[field]
+            if value in values:
+                return {}
+            values.add(value)
+        runtime_context_id = identity["runtime_context_id"]
+        line_instance_id = f"runtime_context:{runtime_context_id}"
+        line_authorities: list[dict[str, Any]] = []
+        for line_id in required_line_ids:
+            candidates: list[tuple[int, Mapping[str, Any]]] = []
+            for index, line in enumerate(completed):
+                if index <= dispatch_index or str(
+                    line.get("line_id") or ""
+                ).strip() != line_id:
+                    continue
+                payload = (
+                    line.get("payload")
+                    if isinstance(line.get("payload"), Mapping)
+                    else {}
+                )
+                actual_runtime_context_id = str(
+                    line.get("runtime_context_id")
+                    or payload.get("runtime_context_id")
+                    or ""
+                ).strip()
+                actual_instance = str(
+                    line.get("line_instance_id")
+                    or payload.get("line_instance_id")
+                    or ""
+                ).strip()
+                if (
+                    actual_runtime_context_id == runtime_context_id
+                    and actual_instance == line_instance_id
+                ):
+                    candidates.append((index, line))
+            if len(candidates) != 1:
+                return {}
+            index, line = candidates[0]
+            acceptance = _contract_runtime_completed_line_acceptance(
+                conn,
+                project_id=project_id,
+                record=record,
+                completed_line_index=index,
+                expected_line=line,
+                allow_missing_observer_merge_status=(
+                    line_id == "observer_merge"
+                ),
+            )
+            if acceptance.get("db_verified") is not True:
+                return {}
+            line_authorities.append(
+                {
+                    "line_id": line_id,
+                    "line_instance_id": line_instance_id,
+                    "completed_line_index": index,
+                    "completed_line_ref": str(
+                        acceptance.get("completed_line_ref") or ""
+                    ),
+                    "line_hash": stable_sha256(line),
+                    "acceptance_ref": str(
+                        acceptance.get("acceptance_ref") or ""
+                    ),
+                    "accepted_execution_state_revision": int(
+                        acceptance.get("execution_state_revision") or 0
+                    ),
+                }
+            )
+        identities.append(
+            {
+                **identity,
+                "line_instance_id": line_instance_id,
+                "dispatch_worker_hash": stable_sha256(worker),
+                "completed_line_authorities": line_authorities,
+            }
+        )
+    if len(identities) != required_count:
+        return {}
+    authority = {
+        "schema_version": _CONTRACT_RUNTIME_CLOSE_READY_WORKER_SET_SCHEMA,
+        "source": "contract_runtime.current_dispatch_and_line_acceptance",
+        "server_derived": True,
+        "db_verified": True,
+        "project_id": project_id,
+        "backlog_id": str(record.get("backlog_id") or "").strip(),
+        "contract_execution_id": execution_id,
+        "required_worker_count": required_count,
+        "dispatch_completed_line_index": dispatch_index,
+        "dispatch_completed_line_ref": str(
+            dispatch_acceptance.get("completed_line_ref") or ""
+        ),
+        "dispatch_line_hash": stable_sha256(dispatch_line),
+        "dispatch_acceptance_ref": str(
+            dispatch_acceptance.get("acceptance_ref") or ""
+        ),
+        "workers": identities,
+        "single_worker_identity_claimed": False,
+        "append_only_history_preserved": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _contract_runtime_bind_close_ready_worker_set(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Materialize the multi-lane retained envelope before precheck/submit."""
+
+    effective = dict(write)
+    if (
+        str(effective.get("line_id") or "").strip()
+        != "observer_close_ready"
+        or not _is_mf_parallel_postmerge_revision(record)
+        or _contract_runtime_mf_parallel_current_generation_worker_count(
+            record,
+            conn=conn,
+            project_id=project_id,
+        )
+        <= 1
+    ):
+        return effective, []
+    authority = _contract_runtime_close_ready_worker_set_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+    )
+    if not authority:
+        return effective, [
+            "contract_runtime.observer_close_ready_retained_contract_envelope"
+        ]
+    payload = (
+        dict(effective.get("payload"))
+        if isinstance(effective.get("payload"), Mapping)
+        else {}
+    )
+    supplied = (
+        payload.get("retained_contract_envelope")
+        if isinstance(payload.get("retained_contract_envelope"), Mapping)
+        else {}
+    )
+    if supplied and stable_sha256(supplied) != stable_sha256(authority):
+        return effective, [
+            "contract_runtime.observer_close_ready_retained_contract_envelope_mismatch"
+        ]
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    singular_claims = {
+        field: sorted(
+            {
+                str(source.get(field) or "").strip()
+                for source in (effective, payload)
+                if str(source.get(field) or "").strip()
+            }
+        )
+        for field in (
+            "runtime_context_id",
+            "worker_task_id",
+            "parent_task_id",
+            "merge_queue_id",
+            "line_instance_id",
+        )
+    }
+    if any(singular_claims.values()):
+        return effective, [
+            "contract_runtime.observer_close_ready_single_lane_identity_forbidden"
+        ]
+    task_claims = {
+        str(source.get("task_id") or "").strip()
+        for source in (effective, payload)
+        if str(source.get("task_id") or "").strip()
+    }
+    if task_claims and task_claims != {execution_id}:
+        return effective, [
+            "contract_runtime.observer_close_ready_contract_scope_mismatch"
+        ]
+    payload["contract_execution_id"] = execution_id
+    payload["retained_contract_envelope"] = authority
+    effective["task_id"] = execution_id
+    effective["payload"] = payload
+    return effective, []
+
+
 def _contract_runtime_mf_parallel_close_ready_precheck(
     record: Mapping[str, Any],
     write: Mapping[str, Any],
@@ -128900,9 +129895,51 @@ def _contract_runtime_mf_parallel_close_ready_precheck(
         project_id=project_id,
     )
     prospective_identity = _contract_runtime_server_line_identity(prospective)
-    if prospective_identity["identity_status"] != "ambiguous":
+    write_payload = (
+        write.get("payload")
+        if isinstance(write.get("payload"), Mapping)
+        else {}
+    )
+    retained_worker_set = (
+        write_payload.get("retained_contract_envelope")
+        if isinstance(
+            write_payload.get("retained_contract_envelope"), Mapping
+        )
+        else {}
+    )
+    expected_worker_set = (
+        _contract_runtime_close_ready_worker_set_authority(
+            conn,
+            project_id=(
+                project_id or str(record.get("project_id") or "").strip()
+            ),
+            record=authority_record,
+        )
+        if retained_worker_set
+        else {}
+    )
+    contract_scoped_worker_set_verified = bool(
+        retained_worker_set
+        and expected_worker_set
+        and stable_sha256(retained_worker_set)
+        == stable_sha256(expected_worker_set)
+    )
+    if (
+        prospective_identity["identity_status"] != "ambiguous"
+        or contract_scoped_worker_set_verified
+    ):
         if gate.get("passed") is True:
-            return gate
+            return {
+                **gate,
+                "identity_status": (
+                    "contract_scoped_worker_set"
+                    if contract_scoped_worker_set_verified
+                    else prospective_identity["identity_status"]
+                ),
+                "retained_contract_envelope_verified": (
+                    contract_scoped_worker_set_verified
+                ),
+            }
         return {
             **gate,
             "zero_write_rejection": True,
@@ -150673,6 +151710,14 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                         write=write,
                         body=body,
                     )
+                    write, close_ready_binding_errors = (
+                        _contract_runtime_bind_close_ready_worker_set(
+                            conn,
+                            project_id=project_id,
+                            record=record,
+                            write=write,
+                        )
+                    )
                     write, dispatch_errors = (
                         _contract_runtime_bind_mf_parallel_dispatch_authority(
                             conn,
@@ -150681,6 +151726,10 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                             write=write,
                         )
                     )
+                    dispatch_errors = [
+                        *close_ready_binding_errors,
+                        *dispatch_errors,
+                    ]
                     close_authority_precheck = (
                         _contract_runtime_mf_parallel_close_ready_precheck(
                             record,
@@ -150694,6 +151743,17 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                             record=record,
                             write=write,
                             actor_role=actor_role,
+                        )
+                    )
+                    reconcile_correction = (
+                        _contract_runtime_reconcile_receipt_correction(
+                            conn,
+                            runtime=runtime,
+                            project_id=project_id,
+                            record=record,
+                            write=write,
+                            actor_role=actor_role,
+                            mutate=True,
                         )
                     )
                     finish_attestation_facade_only = (
@@ -150710,7 +151770,9 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                             actor_role=actor_role,
                         )
                     )
-                    if reconcile_idempotency:
+                    if reconcile_correction:
+                        result = reconcile_correction
+                    elif reconcile_idempotency:
                         result = reconcile_idempotency
                     elif dispatch_errors:
                         result = _contract_runtime_unchanged_line_rejection(
@@ -151290,6 +152352,14 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                         write=write,
                         body=body,
                     )
+                    write, close_ready_binding_errors = (
+                        _contract_runtime_bind_close_ready_worker_set(
+                            conn,
+                            project_id=project_id,
+                            record=record,
+                            write=write,
+                        )
+                    )
                     write, dispatch_errors = (
                         _contract_runtime_bind_mf_parallel_dispatch_authority(
                             conn,
@@ -151298,6 +152368,10 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                             write=write,
                         )
                     )
+                    dispatch_errors = [
+                        *close_ready_binding_errors,
+                        *dispatch_errors,
+                    ]
                     close_authority_precheck = (
                         _contract_runtime_mf_parallel_close_ready_precheck(
                             record,
@@ -151311,6 +152385,17 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                             record=record,
                             write=write,
                             actor_role=actor_role,
+                        )
+                    )
+                    reconcile_correction = (
+                        _contract_runtime_reconcile_receipt_correction(
+                            conn,
+                            runtime=runtime,
+                            project_id=project_id,
+                            record=record,
+                            write=write,
+                            actor_role=actor_role,
+                            mutate=False,
                         )
                     )
                     finish_attestation_facade_only = (
@@ -151327,7 +152412,9 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                             actor_role=actor_role,
                         )
                     )
-                    if reconcile_idempotency:
+                    if reconcile_correction:
+                        result = reconcile_correction
+                    elif reconcile_idempotency:
                         result = reconcile_idempotency
                     elif dispatch_errors:
                         result = _contract_runtime_unchanged_line_rejection(
