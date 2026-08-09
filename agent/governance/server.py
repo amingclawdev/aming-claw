@@ -97402,6 +97402,116 @@ def _contract_runtime_rev8_postmerge_qa_authority(
     ):
         return blocked("observer_reconcile_receipt_unverified")
 
+    declared_batch_child = _parallel_branch_allocate_declares_batch_child(
+        record
+    )
+    verified_batch_child = (
+        _parallel_branch_allocate_verified_batch_child_lineage_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
+        if declared_batch_child
+        else {}
+    )
+    if declared_batch_child and not (
+        verified_batch_child.get("db_verified") is True
+        and verified_batch_child.get("server_derived") is True
+        and str(verified_batch_child.get("project_id") or "").strip()
+        == project_id
+        and str(
+            verified_batch_child.get("child_backlog_id") or ""
+        ).strip()
+        == str(record.get("backlog_id") or "").strip()
+        and str(verified_batch_child.get("child_task_id") or "").strip()
+        == task_id
+        and str(verified_batch_child.get("merge_queue_id") or "").strip()
+        == merge_queue_id
+        and str(verified_batch_child.get("queue_item_id") or "").strip()
+        == queue_item_id
+        and str(verified_batch_child.get("batch_id") or "").strip()
+        and str(verified_batch_child.get("authority_hash") or "")
+        == stable_sha256(
+            {
+                key: value
+                for key, value in verified_batch_child.items()
+                if key != "authority_hash"
+            }
+        )
+    ):
+        return blocked("batch_child_lineage_unverified")
+
+    terminal_current_full = (
+        expected_reconcile_receipt.get(
+            "terminal_current_full_reconcile_authority"
+        )
+        if isinstance(
+            expected_reconcile_receipt.get(
+                "terminal_current_full_reconcile_authority"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    terminal_commit = str(
+        terminal_current_full.get("reconciled_commit_sha") or ""
+    ).strip().lower()
+    batch_terminal_current_full_verified = bool(
+        verified_batch_child
+        and _contract_runtime_current_full_reconcile_activation_verified(
+            terminal_current_full
+        )
+        and re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}", terminal_commit
+        )
+        and str(terminal_current_full.get("project_id") or "").strip()
+        == project_id
+        and str(terminal_current_full.get("backlog_id") or "").strip()
+        == str(record.get("backlog_id") or "").strip()
+        and str(
+            terminal_current_full.get("contract_execution_id") or ""
+        ).strip()
+        == str(record.get("contract_execution_id") or "").strip()
+        and str(
+            terminal_current_full.get("runtime_context_id") or ""
+        ).strip()
+        == runtime_context_id
+        and str(terminal_current_full.get("task_id") or "").strip()
+        == task_id
+        and str(
+            terminal_current_full.get("parent_task_id") or ""
+        ).strip()
+        == parent_task_id
+        and str(
+            terminal_current_full.get("merge_queue_id") or ""
+        ).strip()
+        == merge_queue_id
+        and str(
+            terminal_current_full.get("merged_commit_sha") or ""
+        ).strip().lower()
+        == merged_commit
+        and str(
+            terminal_current_full.get("active_snapshot_commit") or ""
+        ).strip().lower()
+        == terminal_commit
+        and str(
+            terminal_current_full.get("canonical_head_commit")
+            or terminal_current_full.get("current_canonical_commit_sha")
+            or ""
+        ).strip().lower()
+        == terminal_commit
+        and str(
+            terminal_current_full.get("reconcile_source_ref") or ""
+        ).strip()
+        == str(
+            expected_reconcile_receipt.get("reconcile_source_ref") or ""
+        ).strip()
+        and int(terminal_current_full.get("reconcile_event_id") or 0)
+        == int(expected_reconcile_receipt.get("reconcile_event_id") or 0)
+        and str(
+            terminal_current_full.get("target_project_root") or ""
+        ).strip()
+    )
     matching_contexts: dict[str, Any] = {}
     for dispatch_line in record.get("completed_lines") or []:
         if not isinstance(dispatch_line, Mapping) or str(
@@ -97488,6 +97598,8 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         )
     ):
         return blocked("postmerge_reconcile_event_unverified")
+    if declared_batch_child and not batch_terminal_current_full_verified:
+        return blocked("batch_terminal_current_full_unverified")
 
     shared_batch_verified = (
         _contract_runtime_shared_batch_reconcile_activation_verified(
@@ -97510,7 +97622,11 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         .strip()
         .lower()
         if shared_batch_verified
-        else merged_commit
+        else (
+            terminal_commit
+            if batch_terminal_current_full_verified
+            else merged_commit
+        )
     )
     dispatch_source_ref = str(
         merge.get("contract_runtime_dispatch_source_ref") or ""
@@ -97573,13 +97689,17 @@ def _contract_runtime_rev8_postmerge_qa_authority(
     current_full = (
         dict(reconciled_merge)
         if shared_batch_verified
-        else _contract_runtime_current_full_reconcile_authority_from_merge(
-            conn,
-            project_id=project_id,
-            record=record,
-            merge=merge,
-            reconcile=reconciled_merge,
-            target_project_root_override=str(target_owner),
+        else (
+            dict(terminal_current_full)
+            if batch_terminal_current_full_verified
+            else _contract_runtime_current_full_reconcile_authority_from_merge(
+                conn,
+                project_id=project_id,
+                record=record,
+                merge=merge,
+                reconcile=reconciled_merge,
+                target_project_root_override=str(target_owner),
+            )
         )
     )
     if not (
@@ -97640,7 +97760,11 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         "qa_candidate_commit_source": (
             "shared_batch_final_reconcile"
             if shared_batch_verified
-            else "standalone_final_merge"
+            else (
+                "verified_batch_child_terminal_current_full"
+                if batch_terminal_current_full_verified
+                else "standalone_final_merge"
+            )
         ),
         "reconciled_commit_sha": str(
             current_full.get("reconciled_commit_sha") or ""
@@ -97681,6 +97805,41 @@ def _contract_runtime_rev8_postmerge_qa_authority(
     }
     if shared_batch_verified:
         authority["shared_batch_reconcile_authority"] = dict(shared_batch)
+    if batch_terminal_current_full_verified:
+        authority["batch_terminal_target_owner_authority"] = {
+            "schema_version": (
+                "contract_runtime.batch_terminal_target_owner_authority.v1"
+            ),
+            "source": (
+                "verified_batch_child_lineage+"
+                "observer_reconcile_receipt.terminal_current_full"
+            ),
+            "server_derived": True,
+            "db_verified": True,
+            "batch_id": str(
+                verified_batch_child.get("batch_id") or ""
+            ).strip(),
+            "queue_item_id": queue_item_id,
+            "child_merged_commit_sha": merged_commit,
+            "terminal_reconciled_commit_sha": qa_candidate_commit,
+            "active_snapshot_id": str(
+                current_full.get("active_snapshot_id") or ""
+            ).strip(),
+            "reconcile_source_ref": str(
+                current_full.get("reconcile_source_ref") or ""
+            ).strip(),
+            "batch_child_lineage_authority_hash": str(
+                verified_batch_child.get("authority_hash") or ""
+            ).strip(),
+            "terminal_current_full_authority_hash": str(
+                current_full.get("authority_hash") or ""
+            ).strip(),
+        }
+        authority["batch_terminal_target_owner_authority"][
+            "authority_hash"
+        ] = stable_sha256(
+            authority["batch_terminal_target_owner_authority"]
+        )
     authority["authority_hash"] = stable_sha256(authority)
     return authority
 

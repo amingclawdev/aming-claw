@@ -62122,8 +62122,12 @@ def test_rev8_merge_projection_accepts_one_observer_selected_batch_child_lane():
     assert projection["merged_commit_sha"] == "1" * 40
 
 
-def _rev8_postmerge_current_full_state() -> dict[str, Any]:
-    final_commit = "2" * 40
+def _rev8_postmerge_current_full_state(
+    *,
+    final_commit: str = "2" * 40,
+    merged_commit: str = "",
+) -> dict[str, Any]:
+    merged_commit = merged_commit or final_commit
     target_root = "/tmp/rev8-final-integration-target"
     state = {
         "schema_version": "graph_snapshot_store.current_full_reconcile_state.v1",
@@ -62155,7 +62159,7 @@ def _rev8_postmerge_current_full_state() -> dict[str, Any]:
         "task_id": "rev8-postmerge-test-worker",
         "parent_task_id": "cex-rev8-postmerge-qa-authority",
         "merge_queue_id": "mq-rev8-postmerge-test",
-        "merged_commit_sha": final_commit,
+        "merged_commit_sha": merged_commit,
         "reconciled_commit_sha": final_commit,
         "reconcile_provenance_target_commit": final_commit,
         "current_canonical_commit_sha": final_commit,
@@ -62185,8 +62189,12 @@ def _rev8_postmerge_current_full_state() -> dict[str, Any]:
 def _install_rev8_postmerge_qa_helper_boundaries(
     monkeypatch,
     record: dict[str, Any],
+    *,
+    terminal_commit: str = "2" * 40,
+    verified_batch_child: bool = False,
 ) -> dict[str, Any]:
-    final_commit = "2" * 40
+    merged_commit = "2" * 40
+    final_commit = terminal_commit
     final_worker = record["completed_lines"][0]["payload"][
         "bounded_workers"
     ][1]
@@ -62209,8 +62217,8 @@ def _install_rev8_postmerge_qa_helper_boundaries(
         status="merged",
         target_ref="refs/heads/integration",
         branch_head="b" * 40,
-        merge_commit=final_commit,
-        target_head_after_merge=final_commit,
+        merge_commit=merged_commit,
+        target_head_after_merge=merged_commit,
     )
     state = {
         "reconcile_acceptance_verified": True,
@@ -62228,7 +62236,10 @@ def _install_rev8_postmerge_qa_helper_boundaries(
             "reconcile_event_id": 903,
             "reconcile_source_ref": "timeline:903",
         },
-        "current_full": _rev8_postmerge_current_full_state(),
+        "current_full": _rev8_postmerge_current_full_state(
+            final_commit=final_commit,
+            merged_commit=merged_commit,
+        ),
         "target_project_root_override": "",
     }
     current_receipt = copy.deepcopy(reconcile_receipt)
@@ -62255,6 +62266,7 @@ def _install_rev8_postmerge_qa_helper_boundaries(
             if key != "authority_hash"
         }
     )
+    state["current_receipt"] = current_receipt
     source_line_index = len(record["completed_lines"]) - 1
     correction_marker = (
         server._contract_runtime_reconcile_receipt_correction_marker(
@@ -62348,6 +62360,43 @@ def _install_rev8_postmerge_qa_helper_boundaries(
         "_contract_runtime_current_full_reconcile_authority_from_merge",
         current_full,
     )
+    if verified_batch_child:
+        lineage = {
+            "schema_version": (
+                "contract_runtime."
+                "mf_batch_child_worker_cardinality_authority.v1"
+            ),
+            "source": (
+                "server_authored_mf_batch_enter+"
+                "durable_merge_queue_identity"
+            ),
+            "server_derived": True,
+            "db_verified": True,
+            "project_id": PID,
+            "child_backlog_id": record["backlog_id"],
+            "child_task_id": final_worker["task_id"],
+            "batch_id": "mf-batch-rev8-terminal-owner",
+            "coordination_backlog_id": "AC-BATCH-COORD-REV8-TERMINAL",
+            "merge_queue_id": final_worker["merge_queue_id"],
+            "queue_item_id": queue_item.queue_item_id,
+            "batch_enter_event_id": 801,
+            "required_worker_count": 1,
+            "worker_count_policy": "exactly",
+            "atomic_dispatch_required": False,
+            "standalone_mf_parallel_policy_unchanged": True,
+        }
+        lineage["authority_hash"] = server.stable_sha256(lineage)
+        state["verified_batch_child"] = lineage
+        monkeypatch.setattr(
+            server,
+            "_parallel_branch_allocate_declares_batch_child",
+            lambda *_args, **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            server,
+            "_parallel_branch_allocate_verified_batch_child_lineage_authority",
+            lambda *_args, **_kwargs: copy.deepcopy(lineage),
+        )
     return state
 
 
@@ -62376,6 +62425,8 @@ def test_rev8_postmerge_qa_authority_joins_progress_receipt_to_final_live_state(
     )
     assert authority["active_snapshot_id"] == "full-rev8-final-combined"
     assert authority["reconcile_event_id"] == 903
+    assert authority["qa_candidate_commit_source"] == "standalone_final_merge"
+    assert "batch_terminal_target_owner_authority" not in authority
     assert state["target_project_root_override"] == (
         "/tmp/rev8-final-integration-target"
     )
@@ -62391,6 +62442,178 @@ def test_rev8_postmerge_qa_authority_joins_progress_receipt_to_final_live_state(
     assert authority["authority_hash"] == server.stable_sha256(
         {key: value for key, value in authority.items() if key != "authority_hash"}
     )
+
+
+@pytest.mark.parametrize(
+    ("terminal_commit", "expected_child_commit"),
+    [
+        ("3" * 40, "2" * 40),
+        ("2" * 40, "2" * 40),
+    ],
+    ids=["models_child_then_terminal", "planner_terminal_child"],
+)
+def test_rev8_batch_child_postmerge_qa_uses_terminal_current_full_target_owner(
+    monkeypatch,
+    terminal_commit,
+    expected_child_commit,
+):
+    record = _rev8_postmerge_qa_binding_record()
+    state = _install_rev8_postmerge_qa_helper_boundaries(
+        monkeypatch,
+        record,
+        terminal_commit=terminal_commit,
+        verified_batch_child=True,
+    )
+
+    authority = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(),
+        project_id=PID,
+        record=record,
+    )
+
+    assert authority["verified"] is True
+    assert authority["candidate_commit_sha"] == terminal_commit
+    assert authority["merged_commit_sha"] == expected_child_commit
+    assert authority["comparison_lineage_merge_commit_sha"] == (
+        expected_child_commit
+    )
+    assert authority["qa_candidate_commit_source"] == (
+        "verified_batch_child_terminal_current_full"
+    )
+    terminal = authority["batch_terminal_target_owner_authority"]
+    assert terminal["child_merged_commit_sha"] == expected_child_commit
+    assert terminal["terminal_reconciled_commit_sha"] == terminal_commit
+    assert terminal["batch_child_lineage_authority_hash"] == state[
+        "verified_batch_child"
+    ]["authority_hash"]
+    assert terminal["terminal_current_full_authority_hash"] == state[
+        "current_full"
+    ]["authority_hash"]
+    assert terminal["authority_hash"] == server.stable_sha256(
+        {
+            key: value
+            for key, value in terminal.items()
+            if key != "authority_hash"
+        }
+    )
+    assert state["target_alignment"]["head_commit"] == terminal_commit
+    assert state["target_project_root_override"] == ""
+
+
+def _accept_rev8_test_current_receipt(monkeypatch, record, state):
+    receipt = state["current_receipt"]
+    receipt["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in receipt.items()
+            if key != "authority_hash"
+        }
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_reconcile_receipt_resolution",
+        lambda *_args, **_kwargs: {
+            "status": "corrected",
+            "line_index": len(record["completed_lines"]) - 1,
+            "line": record["completed_lines"][-1],
+            "acceptance": {
+                "db_verified": True,
+                "acceptance_ref": "contract_runtime:test:revision:20",
+                "completed_line_ref": "contract_runtime:test:completed_lines:3",
+            },
+            "authority": copy.deepcopy(receipt),
+        },
+    )
+
+
+def test_rev8_batch_terminal_target_owner_fails_closed_on_lineage_scope_and_dirty(
+    monkeypatch,
+):
+    record = _rev8_postmerge_qa_binding_record()
+    state = _install_rev8_postmerge_qa_helper_boundaries(
+        monkeypatch,
+        record,
+        terminal_commit="3" * 40,
+        verified_batch_child=True,
+    )
+
+    state["verified_batch_child"]["child_task_id"] = "sibling-task"
+    state["verified_batch_child"]["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in state["verified_batch_child"].items()
+            if key != "authority_hash"
+        }
+    )
+    lineage_blocked = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(), project_id=PID, record=record
+    )
+    assert lineage_blocked["blocker_codes"] == [
+        "batch_child_lineage_unverified"
+    ]
+
+    state["verified_batch_child"]["child_task_id"] = (
+        record["completed_lines"][0]["payload"]["bounded_workers"][1][
+            "task_id"
+        ]
+    )
+    state["verified_batch_child"]["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in state["verified_batch_child"].items()
+            if key != "authority_hash"
+        }
+    )
+    terminal = state["current_receipt"].pop(
+        "terminal_current_full_reconcile_authority"
+    )
+    _accept_rev8_test_current_receipt(monkeypatch, record, state)
+    missing_terminal_blocked = (
+        server._contract_runtime_rev8_postmerge_qa_authority(
+            object(), project_id=PID, record=record
+        )
+    )
+    assert missing_terminal_blocked["blocker_codes"] == [
+        "batch_terminal_current_full_unverified"
+    ]
+
+    state["current_receipt"][
+        "terminal_current_full_reconcile_authority"
+    ] = terminal
+    terminal["task_id"] = "sibling-task"
+    terminal["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in terminal.items()
+            if key != "authority_hash"
+        }
+    )
+    _accept_rev8_test_current_receipt(monkeypatch, record, state)
+    scope_blocked = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(), project_id=PID, record=record
+    )
+    assert scope_blocked["blocker_codes"] == [
+        "batch_terminal_current_full_unverified"
+    ]
+
+    terminal["task_id"] = record["completed_lines"][0]["payload"][
+        "bounded_workers"
+    ][1]["task_id"]
+    terminal["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in terminal.items()
+            if key != "authority_hash"
+        }
+    )
+    _accept_rev8_test_current_receipt(monkeypatch, record, state)
+    state["target_alignment"]["worktree_clean"] = False
+    dirty_blocked = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(), project_id=PID, record=record
+    )
+    assert dirty_blocked["blocker_codes"] == [
+        "target_ref_owner_not_clean_and_aligned"
+    ]
 
 
 def test_rev8_postmerge_qa_authority_fails_closed_at_each_live_boundary(
