@@ -45557,11 +45557,156 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
         "read_receipt_hash": str(payload.get("read_receipt_hash") or ""),
         "launch_text_hash": str(payload.get("launch_text_hash") or ""),
     }
+    read_receipt_authority = _runtime_context_read_receipt_response_authority(
+        result,
+        context=context,
+        parent_task_id=parent_task_id,
+        expected_payload=payload,
+        route_identity=route_identity,
+    )
+    response["read_receipt_event_id"] = read_receipt_authority["event_id"]
+    response["read_receipt_event_ref"] = read_receipt_authority["event_ref"]
+    response["read_receipt_hash"] = read_receipt_authority[
+        "read_receipt_hash"
+    ]
+    response["read_receipt_authority"] = read_receipt_authority
+    response["same_context_startup_resume"] = {
+        "schema_version": "runtime_context.read_receipt_startup_resume.v1",
+        "source": "read_receipt_authority",
+        "server_derived": True,
+        "runtime_context_id": runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": parent_task_id,
+        "read_receipt_event_id": read_receipt_authority["event_id"],
+        "read_receipt_event_ref": read_receipt_authority["event_ref"],
+        "read_receipt_hash": read_receipt_authority["read_receipt_hash"],
+        "next_legal_action": "record_mf_subagent_startup",
+        "same_runtime_context_only": True,
+        "caller_inferred_authority_allowed": False,
+    }
+    response["read_receipt"].update(
+        {
+            "read_receipt_event_id": read_receipt_authority["event_id"],
+            "read_receipt_event_ref": read_receipt_authority["event_ref"],
+            "authority": read_receipt_authority,
+        }
+    )
     if isinstance(result.get("contract_runtime_canonical_line"), Mapping):
         response["contract_runtime_canonical_line"] = result.get(
             "contract_runtime_canonical_line"
         )
     return response
+
+
+def _runtime_context_read_receipt_response_authority(
+    event: Mapping[str, Any],
+    *,
+    context: Any,
+    parent_task_id: str,
+    expected_payload: Mapping[str, Any],
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind the success response to the exact server-persisted receipt."""
+
+    persisted_payload = (
+        event.get("payload")
+        if isinstance(event.get("payload"), Mapping)
+        else {}
+    )
+    event_id = str(event.get("id") or "").strip()
+    read_receipt_hash = str(
+        persisted_payload.get("read_receipt_hash") or ""
+    ).strip()
+    expected_runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    expected_task_id = str(getattr(context, "task_id", "") or "").strip()
+    expected_worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    expected_worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or expected_worker_id
+    ).strip()
+    exact_fields = {
+        "runtime_context_id": expected_runtime_context_id,
+        "task_id": expected_task_id,
+        "parent_task_id": str(parent_task_id or "").strip(),
+        "worker_id": expected_worker_id,
+        "worker_slot_id": expected_worker_slot_id,
+        "read_receipt_hash": str(
+            expected_payload.get("read_receipt_hash") or ""
+        ).strip(),
+        **{
+            field: str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            if str(route_identity.get(field) or "").strip()
+        },
+    }
+    invalid_fields = [
+        field
+        for field, expected in exact_fields.items()
+        if not expected
+        or str(persisted_payload.get(field) or "").strip() != expected
+    ]
+    if (
+        not event_id.isdigit()
+        or int(event_id) <= 0
+        or str(event.get("task_id") or "").strip() != expected_task_id
+        or str(event.get("backlog_id") or "").strip()
+        != str(getattr(context, "backlog_id", "") or "").strip()
+        or str(event.get("event_type") or "").strip()
+        != "mf_subagent_read_receipt"
+        or str(event.get("event_kind") or "").strip()
+        not in {"mf_subagent_read_receipt", "contract_context_read_receipt"}
+        or str(event.get("status") or "").strip().lower()
+        not in {"accepted", "ok", "passed", "succeeded", "success"}
+        or not _runtime_context_non_placeholder_text(read_receipt_hash)
+        or invalid_fields
+    ):
+        raise GovernanceError(
+            "runtime_context_read_receipt_response_authority_invalid",
+            (
+                "persisted read receipt does not provide one exact "
+                "same-context startup authority"
+            ),
+            409,
+            {
+                "runtime_context_id": expected_runtime_context_id,
+                "task_id": expected_task_id,
+                "invalid_fields": invalid_fields,
+                "event_identity_valid": bool(
+                    event_id.isdigit() and int(event_id or "0") > 0
+                ),
+                "candidate_count": 1 if event_id else 0,
+                "mutation_performed": False,
+                "fail_closed": True,
+                "raw_session_token_exposed": False,
+                "raw_fence_token_exposed": False,
+                "raw_route_token_exposed": False,
+            },
+        )
+    return {
+        "schema_version": "runtime_context.read_receipt_authority.v1",
+        "source": "task_timeline.record_event_return",
+        "server_derived": True,
+        "status": "accepted",
+        "candidate_count": 1,
+        "event_id": event_id,
+        "event_ref": f"timeline:{event_id}",
+        "read_receipt_hash": read_receipt_hash,
+        "runtime_context_id": expected_runtime_context_id,
+        "task_id": expected_task_id,
+        "parent_task_id": str(parent_task_id or "").strip(),
+        "worker_id": expected_worker_id,
+        "worker_slot_id": expected_worker_slot_id,
+        "route_identity": {
+            field: str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        },
+        "next_legal_action": "record_mf_subagent_startup",
+        "same_runtime_context_only": True,
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        "raw_route_token_persisted": False,
+    }
 
 
 def _require_runtime_context_startup_identity_preflight(

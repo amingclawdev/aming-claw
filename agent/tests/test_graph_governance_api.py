@@ -63365,6 +63365,7 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
 
 def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
     conn,
+    monkeypatch,
     tmp_path,
 ):
     target_root = tmp_path / "copy-safe-worker-root"
@@ -63390,8 +63391,13 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
             stage_task_id="worker-copy-safe-receipt",
             worker_id="worker-copy-safe-receipt",
             worker_slot_id="slot-copy-safe-receipt",
+            agent_id="worker-copy-safe-receipt",
+            allocation_owner="worker-copy-safe-receipt",
             branch_ref="refs/heads/codex/worker-copy-safe-receipt",
             worktree_path=str(target_root),
+            base_commit="base-copy-safe-receipt",
+            target_head_commit="target-copy-safe-receipt",
+            merge_queue_id="mq-copy-safe-receipt",
             status=STATE_WORKTREE_READY,
             fence_token="fence-copy-safe-receipt",
             session_token_hash=mf_subagent_session_token_hash(
@@ -63507,6 +63513,32 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
         }:
             assert submitted_body[field] == value
 
+    before_forced_failure = "\n".join(conn.iterdump())
+    original_record_event = task_timeline.record_event
+    monkeypatch.setattr(
+        task_timeline,
+        "record_event",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("forced-read-receipt-append-failure")
+        ),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="forced-read-receipt-append-failure",
+    ):
+        server.handle_graph_governance_runtime_context_read_receipt(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                method="POST",
+                body=submitted_body,
+            )
+        )
+    monkeypatch.setattr(task_timeline, "record_event", original_record_event)
+    assert "\n".join(conn.iterdump()) == before_forced_failure
+
     response = server.handle_graph_governance_runtime_context_read_receipt(
         _ctx(
             {"project_id": PID, "runtime_context_id": context.runtime_context_id},
@@ -63541,6 +63573,68 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
     assert persisted_payload["fence_token_hash"] == _fake_sha(
         "fence-copy-safe-receipt"
     )
+    assert response["read_receipt_event_id"] == str(events[0]["id"])
+    assert response["read_receipt_event_ref"] == f"timeline:{events[0]['id']}"
+    assert response["read_receipt_hash"] == "sha256:copy-safe-receipt"
+    authority = response["read_receipt_authority"]
+    assert authority["candidate_count"] == 1
+    assert authority["runtime_context_id"] == context.runtime_context_id
+    assert authority["task_id"] == context.task_id
+    assert authority["parent_task_id"] == context.root_task_id
+    assert authority["route_identity"] == route_identity
+    assert response["same_context_startup_resume"][
+        "read_receipt_event_id"
+    ] == str(events[0]["id"])
+    assert response["same_context_startup_resume"]["read_receipt_hash"] == (
+        "sha256:copy-safe-receipt"
+    )
+    assert "copy-safe-session" not in json.dumps(authority, sort_keys=True)
+    assert "fence-copy-safe-receipt" not in json.dumps(
+        authority,
+        sort_keys=True,
+    )
+
+    before_authority_drift = "\n".join(conn.iterdump())
+    original_timeline_append = server.handle_task_timeline_append
+    for drifted_event in (
+        {**copy.deepcopy(events[0]), "id": ""},
+        {
+            **copy.deepcopy(events[0]),
+            "payload": {
+                **copy.deepcopy(events[0]["payload"]),
+                "worker_id": "sibling-worker",
+            },
+        },
+    ):
+        monkeypatch.setattr(
+            server,
+            "handle_task_timeline_append",
+            lambda *_args, _event=drifted_event, **_kwargs: _event,
+        )
+        with pytest.raises(GovernanceError) as authority_rejected:
+            server.handle_graph_governance_runtime_context_read_receipt(
+                _ctx(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": context.runtime_context_id,
+                    },
+                    method="POST",
+                    body=submitted_body,
+                )
+            )
+        assert authority_rejected.value.code == (
+            "runtime_context_read_receipt_response_authority_invalid"
+        )
+        assert "copy-safe-session" not in json.dumps(
+            authority_rejected.value.details,
+            sort_keys=True,
+        )
+        assert "\n".join(conn.iterdump()) == before_authority_drift
+    monkeypatch.setattr(
+        server,
+        "handle_task_timeline_append",
+        original_timeline_append,
+    )
     startup_guide = (
         server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
             _ctx(
@@ -63559,7 +63653,44 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
         )
     )
     assert startup_guide["next_legal_action"] == "record_mf_subagent_startup"
-    assert startup_guide["startup_facade_payload_skeleton"]["copy_safe_body"]
+    startup_body = copy.deepcopy(
+        startup_guide["startup_facade_payload_skeleton"]["copy_safe_body"]
+    )
+    for optional_identity in (
+        "session_id",
+        "transcript_ref",
+        "worker_transcript_path",
+        "transcript_path",
+    ):
+        startup_body.pop(optional_identity, None)
+    startup_body.update(
+        {
+            "session_token": "copy-safe-session",
+            "fence_token": "fence-copy-safe-receipt",
+            "agent_id": context.worker_id,
+            "actual_host_worker_id": context.worker_id,
+            "worker_session_id": "/root/copy_safe_receipt_worker",
+            "host_startup_id": "multi_agent:/root/copy_safe_receipt_worker",
+            "host_session_id": "/root/copy_safe_receipt_worker",
+            "worker_transcript_ref": "codex:/root/copy_safe_receipt_worker",
+            "harness_type": "codex",
+            "filer_principal": "/root/copy_safe_receipt_worker",
+            "actual_cwd": str(target_root),
+            "actual_git_root": str(target_root),
+            "branch": context.branch_ref,
+            "read_receipt_event_id": response["read_receipt_event_id"],
+            "read_receipt_hash": response["read_receipt_hash"],
+            **route_identity,
+        }
+    )
+    startup = server.handle_graph_governance_runtime_context_startup(
+        _ctx(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            method="POST",
+            body=startup_body,
+        )
+    )
+    assert startup["ok"] is True
 
 
 def test_scope_insufficiency_request_is_append_only_and_returns_disposition(
