@@ -44154,6 +44154,85 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             actor=str(session.get("principal_id") or "observer"),
             payload=audit_payload,
         )
+        # The raw host envelope and its next copy-safe worker facade must be
+        # consumable by the same host invocation.  Materialize only after this
+        # accepted rejoin audit is visible in the transaction, using the same
+        # durable guide path that a later ref-only read would use.
+        refreshed_context = get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            runtime_context_id,
+        )
+        try:
+            immediate_recovery = _runtime_context_worker_recovery_details(
+                ctx,
+                conn,
+                project_id=project_id,
+                runtime_context_id=runtime_context_id,
+                task_id=str(result.get("task_id") or context.task_id or ""),
+                parent_task_id=str(
+                    result.get("parent_task_id") or parent_task_id or ""
+                ),
+                fence_token=str(result.get("fence_token") or ""),
+                session_token=str(result.get("session_token") or ""),
+                session_token_ref=str(result.get("session_token_ref") or ""),
+                target_project_root=(
+                    _runtime_context_effective_target_project_root(
+                        refreshed_context or context
+                    )
+                ),
+                route_identity=safe_route_identity,
+                reason="post_rejoin_same_invocation_finish_projection",
+                context=refreshed_context or context,
+            )
+        except Exception:
+            # The envelope must not escape if its same-invocation projection
+            # could not be computed after the durable write.  Roll back the
+            # rotated context and accepted audit together.
+            conn.rollback()
+            legacy_template_repair_transaction = ""
+            raise
+        immediate_actionable_payloads = {
+            alias: deepcopy(immediate_recovery.get(alias) or {})
+            for alias in _RUNTIME_CONTEXT_FINISH_FACADE_ALIASES
+            if immediate_recovery.get(alias)
+        }
+        immediate_projection_diagnostics = (
+            (immediate_recovery.get("diagnostics") or {}).get(
+                "finish_facade_projection"
+            )
+            if isinstance(immediate_recovery.get("diagnostics"), Mapping)
+            else {}
+        )
+        result["immediate_finish_facade_projection"] = deepcopy(
+            immediate_projection_diagnostics or {}
+        )
+        if immediate_actionable_payloads:
+            immediate_worker_guide = {
+                "schema_version": (
+                    "runtime_context.rejoin_immediate_worker_guide.v1"
+                ),
+                "source": "post_rejoin_durable_runtime_context_worker_guide",
+                "server_derived": True,
+                "access_audit_recorded": False,
+                "actionable_payloads": deepcopy(
+                    immediate_actionable_payloads
+                ),
+                **_runtime_context_finish_facade_alias_projection(
+                    immediate_actionable_payloads
+                ),
+            }
+            result["actionable_payloads"] = deepcopy(
+                immediate_actionable_payloads
+            )
+            result["immediate_authenticated_worker_guide"] = (
+                immediate_worker_guide
+            )
+            result.update(
+                _runtime_context_finish_facade_alias_projection(
+                    immediate_actionable_payloads
+                )
+            )
         conn.commit()
         legacy_template_repair_transaction = ""
         result["audit_event_ref"] = f"timeline:{audit_event.get('id', '')}"

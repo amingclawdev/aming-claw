@@ -109324,6 +109324,213 @@ def test_eabf_current_worker_guide_projects_executable_finish_alias_chain(
     assert finished["context"]["status"] == "validated"
 
 
+def test_rejoin_same_response_projects_finish_gate_for_ordinary_and_bounded_loss(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    candidate_server, candidate_server_path = _preload_candidate_server_module()
+    assert Path(candidate_server.__file__).resolve() == candidate_server_path
+    monkeypatch.setattr(
+        candidate_server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(conn),
+    )
+    backlog_id = "AC-REJOIN-IMMEDIATE-FINISH-ALIAS"
+    worker_task_id = "rejoin-immediate-finish-worker"
+    worker_token = "rejoin-immediate-finish-token"
+    worker_fence = "rejoin-immediate-finish-fence"
+    graph_trace_id = "gqt-rejoin-immediate-finish"
+    owned_file = "agent/governance/server.py"
+    worker_root = tmp_path / worker_task_id
+    base_commit, worker_commit = _source_backed_worker_git_fixture(
+        worker_root,
+        owned_file,
+    )
+    test_results = {
+        "status": "passed",
+        "passed": True,
+        "commands": ["python -m pytest -q focused-rejoin-finish"],
+    }
+    (
+        contract_execution_id,
+        runtime_context,
+        _runtime,
+        worker_session_id,
+    ) = _record_source_backed_worker_authority(
+        candidate_server,
+        conn,
+        backlog_id=backlog_id,
+        worker_task_id=worker_task_id,
+        worker_token=worker_token,
+        worker_fence=worker_fence,
+        graph_trace_id=graph_trace_id,
+        owned_file=owned_file,
+        worker_root=worker_root,
+        base_commit=base_commit,
+        worker_commit=worker_commit,
+        test_results=test_results,
+    )
+    path = {
+        "project_id": PID,
+        "runtime_context_id": runtime_context.runtime_context_id,
+    }
+    query = {
+        "parent_task_id": contract_execution_id,
+        "fence_token": worker_fence,
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(runtime_context),
+        "target_project_root": str(worker_root),
+    }
+    guide = candidate_server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(path, "mf_sub", query=query)
+    )
+    attestation_body = copy.deepcopy(
+        guide["finish_time_worker_attestation_facade_payload_skeleton"][
+            "action_input"
+        ]
+    )
+    attestation_body.update(
+        {"session_token": worker_token, "fence_token": worker_fence}
+    )
+    attestation = candidate_server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+        _ctx_with_role(
+            path,
+            "mf_sub",
+            method="POST",
+            body=attestation_body,
+        )
+    )
+    assert attestation["ok"] is True
+
+    refreshed = get_branch_context(conn, PID, worker_task_id)
+    assert refreshed is not None
+    route_identity = candidate_server._runtime_context_latest_route_identity(
+        conn,
+        refreshed,
+    )
+    rejoin_body = {
+        "runtime_context_id": refreshed.runtime_context_id,
+        "contract_execution_id": contract_execution_id,
+        "task_id": worker_task_id,
+        "parent_task_id": contract_execution_id,
+        "target_project_root": str(worker_root),
+        "worker_id": refreshed.worker_id,
+        "worker_slot_id": refreshed.worker_slot_id,
+        "agent_id": refreshed.actual_host_worker_id,
+        "allocation_owner": refreshed.allocation_owner,
+        "actual_host_worker_id": refreshed.actual_host_worker_id,
+        "worker_session_id": refreshed.host_session_id,
+        "host_session_id": refreshed.host_session_id,
+        "session_token_ref": runtime_context_session_token_ref(refreshed),
+        "reason": "recover finish gate in the same ordinary host invocation",
+        **route_identity,
+    }
+    before_forced_failure = "\n".join(conn.iterdump())
+    original_recovery_details = (
+        candidate_server._runtime_context_worker_recovery_details
+    )
+    monkeypatch.setattr(
+        candidate_server,
+        "_runtime_context_worker_recovery_details",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("forced-immediate-finish-projection-failure")
+        ),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="forced-immediate-finish-projection-failure",
+    ):
+        candidate_server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                path,
+                "coordinator",
+                method="POST",
+                body=rejoin_body,
+            )
+        )
+    monkeypatch.setattr(
+        candidate_server,
+        "_runtime_context_worker_recovery_details",
+        original_recovery_details,
+    )
+    assert "\n".join(conn.iterdump()) == before_forced_failure
+    ordinary = candidate_server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(path, "coordinator", method="POST", body=rejoin_body)
+    )
+    assert ordinary["bounded_rejoin_kind"] == "ordinary_initial_rejoin"
+    assert "finish_gate_facade_payload_skeleton" in ordinary, ordinary.get(
+        "immediate_finish_facade_projection"
+    )
+    ordinary_gate = ordinary["finish_gate_facade_payload_skeleton"]
+    assert ordinary_gate
+    assert ordinary_gate == ordinary["actionable_payloads"][
+        "finish_gate_facade_payload_skeleton"
+    ]
+    assert ordinary_gate == ordinary[
+        "immediate_authenticated_worker_guide"
+    ]["finish_gate_facade_payload_skeleton"]
+    for raw_value in (ordinary["session_token"], ordinary["fence_token"]):
+        assert raw_value not in json.dumps(ordinary_gate, sort_keys=True)
+
+    replacement_body = {
+        **rejoin_body,
+        "session_token_ref": ordinary["session_token_ref"],
+        "reason": "replace the sole lost finish envelope at this checkpoint",
+    }
+    replacement = candidate_server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            path,
+            "coordinator",
+            method="POST",
+            body=replacement_body,
+        )
+    )
+    assert replacement["bounded_rejoin_kind"] == (
+        "bounded_replacement_rejoin"
+    )
+    replacement_gate = replacement["finish_gate_facade_payload_skeleton"]
+    for field in ("event_id", "event_ref", "read_receipt_hash"):
+        assert replacement_gate["read_receipt_authority"][field] == (
+            ordinary_gate["read_receipt_authority"][field]
+        )
+    assert replacement_gate["action_input"]["session_token_ref"] == (
+        replacement["session_token_ref"]
+    )
+    finish_body = copy.deepcopy(replacement_gate["action_input"])
+    finish_body.update(
+        {
+            "session_token": replacement["session_token"],
+            "fence_token": replacement["fence_token"],
+        }
+    )
+    finished = candidate_server.handle_graph_governance_runtime_context_finish_gate(
+        _ctx_with_role(path, "mf_sub", method="POST", body=finish_body)
+    )
+    assert finished["ok"] is True
+    assert finished["context"]["status"] == "validated"
+    serialized_events = json.dumps(
+        [
+            event
+            for event in task_timeline.list_events(
+                conn,
+                PID,
+                backlog_id=backlog_id,
+            )
+            if (event.get("payload") or {}).get("action")
+            == "runtime_context_session_token_rejoin"
+        ],
+        sort_keys=True,
+    )
+    for label, raw_value in {
+        "ordinary_session": ordinary["session_token"],
+        "ordinary_fence": ordinary["fence_token"],
+        "replacement_session": replacement["session_token"],
+        "replacement_fence": replacement["fence_token"],
+    }.items():
+        assert raw_value not in serialized_events, label
+
+
 def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage(
     conn,
     tmp_path,
