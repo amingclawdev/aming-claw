@@ -41016,9 +41016,20 @@ def _runtime_context_legacy_v1_rejoin_audit(
     else:
         if str(baseline.get("contract_execution_id") or "").strip() != parent_task_id:
             errors.append("baseline_contract_execution_id_mismatch")
-        relation = _runtime_context_rejoin_checkpoint_relation(
-            baseline,
-            current_baseline,
+        from . import task_timeline
+
+        relation = _runtime_context_legacy_rejoin_verified_relation(
+            conn,
+            project_id=project_id,
+            context=context,
+            timeline_events=task_timeline.list_events(
+                conn,
+                project_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+            ),
+            prior_baseline=baseline,
+            current_baseline=current_baseline,
         )
         if relation == "invalid":
             errors.append("checkpoint_relation_invalid")
@@ -41067,14 +41078,14 @@ def _runtime_context_legacy_v1_rejoin_audit(
     return projection
 
 
-def _runtime_context_rejoin_worker_write_baseline(
+def _runtime_context_rejoin_worker_write_evidence(
     conn,
     *,
     project_id: str,
     context: Any,
     timeline_events: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Hash worker/protected evidence without treating observer rejoin audit as work."""
+    """Return the canonical ordered inputs for one worker-write checkpoint."""
 
     runtime_context_id = str(
         getattr(context, "runtime_context_id", "") or ""
@@ -41150,8 +41161,16 @@ def _runtime_context_rejoin_worker_write_baseline(
             }
         )
 
+    timeline_ids = [int(item["id"]) for item in timeline_worker_writes]
+    timeline_source_valid = bool(
+        all(item > 0 for item in timeline_ids)
+        and timeline_ids == sorted(timeline_ids)
+        and len(timeline_ids) == len(set(timeline_ids))
+    )
+
     contract_execution_id = ""
     contract_lines: list[dict[str, Any]] = []
+    contract_source_valid = True
     try:
         contract_identity, _resolution = (
             _runtime_context_source_backed_contract_identity(
@@ -41186,11 +41205,40 @@ def _runtime_context_rejoin_worker_write_baseline(
     except (ContractRuntimeError, sqlite3.Error):
         contract_execution_id = ""
         contract_lines = []
+        contract_source_valid = False
+
+    return {
+        "runtime_context_id": runtime_context_id,
+        "contract_execution_id": contract_execution_id,
+        "timeline_worker_writes": timeline_worker_writes,
+        "contract_runtime_completed_lines": contract_lines,
+        "timeline_source_valid": timeline_source_valid,
+        "contract_source_valid": contract_source_valid,
+    }
+
+
+def _runtime_context_rejoin_worker_write_baseline(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    timeline_events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Hash worker/protected evidence without treating observer rejoin audit as work."""
+
+    evidence = _runtime_context_rejoin_worker_write_evidence(
+        conn,
+        project_id=project_id,
+        context=context,
+        timeline_events=timeline_events,
+    )
+    timeline_worker_writes = list(evidence["timeline_worker_writes"])
+    contract_lines = list(evidence["contract_runtime_completed_lines"])
 
     baseline = {
         "schema_version": "runtime_context.rejoin_worker_write_baseline.v1",
-        "runtime_context_id": runtime_context_id,
-        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": evidence["runtime_context_id"],
+        "contract_execution_id": evidence["contract_execution_id"],
         "timeline_worker_write_count": len(timeline_worker_writes),
         "timeline_worker_write_hash": stable_sha256(timeline_worker_writes),
         "contract_runtime_completed_line_count": len(contract_lines),
@@ -41200,6 +41248,79 @@ def _runtime_context_rejoin_worker_write_baseline(
     if checkpoint:
         baseline["stage_checkpoint_id"] = checkpoint["stage_checkpoint_id"]
     return baseline
+
+
+def _runtime_context_legacy_rejoin_verified_relation(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    timeline_events: Sequence[Mapping[str, Any]],
+    prior_baseline: Mapping[str, Any],
+    current_baseline: Mapping[str, Any],
+) -> str:
+    """Prove a marker-less v1 baseline is an exact durable ordered prefix."""
+
+    evidence = _runtime_context_rejoin_worker_write_evidence(
+        conn,
+        project_id=project_id,
+        context=context,
+        timeline_events=timeline_events,
+    )
+    if (
+        evidence.get("timeline_source_valid") is not True
+        or evidence.get("contract_source_valid") is not True
+    ):
+        return "invalid"
+    prior = _runtime_context_rejoin_stage_checkpoint(prior_baseline)
+    current = _runtime_context_rejoin_stage_checkpoint(current_baseline)
+    if not prior or not current:
+        return "invalid"
+    if any(
+        prior.get(field) != current.get(field)
+        for field in ("runtime_context_id", "contract_execution_id")
+    ):
+        return "invalid"
+
+    timeline_rows = list(evidence["timeline_worker_writes"])
+    contract_lines = list(evidence["contract_runtime_completed_lines"])
+    timeline_count = int(prior["timeline_worker_write_count"])
+    contract_count = int(prior["contract_runtime_completed_line_count"])
+    if not (0 <= timeline_count <= len(timeline_rows)) or not (
+        0 <= contract_count <= len(contract_lines)
+    ):
+        return "invalid"
+    if (
+        stable_sha256(timeline_rows[:timeline_count])
+        != prior["timeline_worker_write_hash"]
+        or stable_sha256(contract_lines[:contract_count])
+        != prior["contract_runtime_completed_lines_hash"]
+    ):
+        return "invalid"
+
+    expected_current = {
+        "schema_version": "runtime_context.rejoin_worker_write_baseline.v1",
+        "runtime_context_id": evidence["runtime_context_id"],
+        "contract_execution_id": evidence["contract_execution_id"],
+        "timeline_worker_write_count": len(timeline_rows),
+        "timeline_worker_write_hash": stable_sha256(timeline_rows),
+        "contract_runtime_completed_line_count": len(contract_lines),
+        "contract_runtime_completed_lines_hash": stable_sha256(contract_lines),
+    }
+    if any(
+        current_baseline.get(field) != expected_current.get(field)
+        for field in (
+            "schema_version",
+            *_RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS,
+        )
+    ):
+        return "invalid"
+    return (
+        "advanced"
+        if timeline_count < len(timeline_rows)
+        or contract_count < len(contract_lines)
+        else "exact"
+    )
 
 
 def _runtime_context_bounded_replacement_rejoin_authority(

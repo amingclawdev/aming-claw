@@ -51196,6 +51196,95 @@ def test_legacy_v1_rejoin_audit_drift_blocks_actual_rejoin_zero_write(
     assert "\n".join(conn.iterdump()) == before_dump
 
 
+@pytest.mark.parametrize(
+    "prefix_field",
+    ["timeline_worker_write", "contract_runtime_completed_line"],
+)
+def test_legacy_v1_lower_count_forged_hash_is_not_a_durable_prefix_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    prefix_field,
+):
+    case, ordinary = _setup_legacy_v1_ordinary_rejoin_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"legacy-v1-forged-prefix-{prefix_field}",
+    )
+    row = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (int(ordinary["audit_event_id"]),),
+    ).fetchone()
+    assert row is not None
+    payload = json.loads(row["payload_json"])
+    baseline = payload["bounded_replacement_worker_write_baseline"]
+    count_field = f"{prefix_field}_count"
+    hash_field = f"{prefix_field}s_hash"
+    if prefix_field == "timeline_worker_write":
+        hash_field = "timeline_worker_write_hash"
+    assert int(baseline[count_field]) > 0
+    baseline[count_field] = int(baseline[count_field]) - 1
+    baseline[hash_field] = _fake_sha(
+        f"forged-recomputed-lower-prefix-{prefix_field}"
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (
+            json.dumps(payload, sort_keys=True),
+            int(ordinary["audit_event_id"]),
+        ),
+    )
+    conn.commit()
+    before_dump = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+    current = get_branch_context(conn, PID, case["task_id"])
+    assert current is not None
+    events = _pre_lineage_case_events(conn, case)
+    current_baseline = server._runtime_context_rejoin_worker_write_baseline(
+        conn,
+        project_id=PID,
+        context=current,
+        timeline_events=events,
+    )
+    event = next(
+        item
+        for item in events
+        if item["id"] == int(ordinary["audit_event_id"])
+    )
+    decoded = server._runtime_context_legacy_v1_rejoin_audit(
+        conn,
+        project_id=PID,
+        context=current,
+        event=event,
+        current_baseline=current_baseline,
+    )
+    assert decoded["valid"] is False
+    assert "checkpoint_relation_invalid" in decoded["errors"]
+    guide = server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=current,
+    )
+    assert guide["eligible"] is False
+    assert guide["authority"]["mode"] == "checkpoint_audit_drift"
+    with pytest.raises(GovernanceError) as rejected:
+        _pre_lineage_rejoin(
+            case,
+            body_updates={
+                "session_token_ref": runtime_context_session_token_ref(current),
+                "reason": "forged lower-count checkpoint is not a prefix",
+            },
+        )
+    assert rejected.value.code == (
+        "runtime_context_bounded_replacement_rejoin_rejected"
+    )
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["credential_rotated"] is False
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
 def test_safe_ref_reissue_accepts_current_bounded_replacement_authority(
     conn,
     monkeypatch,
@@ -52334,6 +52423,116 @@ def _freeze_rejoin_audit_as_legacy_v1(
     )
     conn.commit()
     return payload
+
+
+def _setup_legacy_v1_ordinary_rejoin_case(
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    suffix: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=suffix,
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+    )
+    special = _pre_lineage_rejoin(case)
+    receipt_hash = _fake_sha(f"{suffix}-read")
+    read = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case["context"].runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "runtime_context_id": case["context"].runtime_context_id,
+                "contract_execution_id": case["parent_task_id"],
+                "task_id": case["task_id"],
+                "parent_task_id": case["parent_task_id"],
+                "worker_id": case["worker_id"],
+                "worker_slot_id": case["worker_id"],
+                "fence_token": special["fence_token"],
+                "session_token": special["session_token"],
+                "session_token_ref": special["session_token_ref"],
+                "target_project_root": str(case["target_root"]),
+                "actor": case["worker_id"],
+                "read_receipt_hash": receipt_hash,
+                "launch_text_hash": _fake_sha(f"{suffix}-launch"),
+                **case["route_identity"],
+            },
+        )
+    )
+    context = get_branch_context(conn, PID, case["task_id"])
+    assert context is not None
+    startup = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "runtime_context_id": context.runtime_context_id,
+                "contract_execution_id": case["parent_task_id"],
+                "task_id": case["task_id"],
+                "parent_task_id": case["parent_task_id"],
+                "session_token": special["session_token"],
+                "session_token_ref": special["session_token_ref"],
+                "fence_token": special["fence_token"],
+                "target_project_root": str(case["target_root"]),
+                "agent_id": case["worker_id"],
+                "actual_host_worker_id": case["worker_id"],
+                "worker_session_id": case["worker_session_id"],
+                "host_startup_id": case["host_startup_id"],
+                "host_session_id": case["worker_session_id"],
+                "worker_transcript_ref": f"codex:{case['worker_session_id']}",
+                "harness_type": "codex",
+                "filer_principal": case["worker_session_id"],
+                "actual_cwd": str(case["target_root"]),
+                "actual_git_root": str(case["target_root"]),
+                "branch": context.branch_ref,
+                "head_commit": context.head_commit,
+                "base_commit": context.base_commit,
+                "target_head_commit": context.target_head_commit,
+                "merge_queue_id": context.merge_queue_id,
+                "owned_files": list(context.owned_files),
+                "read_receipt_hash": receipt_hash,
+                "read_receipt_event_id": str(
+                    (read.get("timeline_event") or {}).get("id") or ""
+                ),
+                "startup_source": "codex_desktop_governed_dispatch",
+                **case["route_identity"],
+            },
+        )
+    )
+    assert startup["ok"] is True
+    current = get_branch_context(conn, PID, case["task_id"])
+    assert current is not None
+    ordinary = _pre_lineage_rejoin(
+        case,
+        body_updates={
+            "session_token_ref": runtime_context_session_token_ref(current),
+            "reason": "issue one ordinary legacy stage envelope",
+        },
+    )
+    _freeze_rejoin_audit_as_legacy_v1(
+        conn,
+        event_id=int(special["audit_event_id"]),
+        kind="special_authority_rejoin",
+    )
+    _freeze_rejoin_audit_as_legacy_v1(
+        conn,
+        event_id=int(ordinary["audit_event_id"]),
+        kind="ordinary_initial_rejoin",
+    )
+    return case, ordinary
 
 
 def _pre_lineage_cutover_rows(conn, case: Mapping[str, Any]) -> list[dict[str, Any]]:
