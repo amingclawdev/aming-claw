@@ -17756,6 +17756,8 @@ def _runtime_context_service_timeline_refs(
     task_id: str,
     backlog_id: str,
     timeline_events: list[dict[str, Any]] | None = None,
+    runtime_context_id: str = "",
+    parent_task_id: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     from .parallel_branch_runtime import public_contract_revision_payload
 
@@ -18023,11 +18025,29 @@ def _runtime_context_service_timeline_refs(
         if isinstance(startup_event.get("payload"), Mapping)
         else {}
     )
+    startup_identity_available = bool(startup_event)
     expected_receipt_identity = {
-        field: _runtime_context_non_placeholder_text(
-            _timeline_first_deep_text(startup_authority_payload, field)
-        )
-        for field in ("runtime_context_id", "task_id", "parent_task_id")
+        "runtime_context_id": _runtime_context_non_placeholder_text(
+            _timeline_first_deep_text(
+                startup_authority_payload,
+                "runtime_context_id",
+            )
+            if startup_identity_available
+            else runtime_context_id
+        ),
+        "task_id": _runtime_context_non_placeholder_text(
+            _timeline_first_deep_text(startup_authority_payload, "task_id")
+            if startup_identity_available
+            else task_id
+        ),
+        "parent_task_id": _runtime_context_non_placeholder_text(
+            _timeline_first_deep_text(
+                startup_authority_payload,
+                "parent_task_id",
+            )
+            if startup_identity_available
+            else parent_task_id
+        ),
     }
     read_receipt_identity_mismatches: list[str] = []
     for event in passing_read_receipt_events:
@@ -18059,6 +18079,11 @@ def _runtime_context_service_timeline_refs(
         "candidate_event_refs": list(passing_read_receipt_refs),
         "candidate_count": len(passing_read_receipt_events),
         "identity_mismatch_fields": list(read_receipt_identity_mismatches),
+        "identity_source": (
+            "accepted_startup_event"
+            if startup_identity_available
+            else "durable_runtime_context"
+        ),
         "server_derived": True,
     }
     if len(passing_read_receipt_events) == 1 and not read_receipt_identity_mismatches:
@@ -19459,6 +19484,8 @@ def _runtime_context_projection_response(
             task_id=str(getattr(context, "task_id", "") or ""),
             backlog_id=str(getattr(context, "backlog_id", "") or ""),
             timeline_events=timeline_events,
+            runtime_context_id=runtime_context_id,
+            parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
         )
     )
     contract_runtime_qa_verification = (
@@ -29326,6 +29353,10 @@ def _runtime_context_worker_recovery_details(
                 task_id=str(getattr(context, "task_id", "") or ""),
                 backlog_id=str(getattr(context, "backlog_id", "") or ""),
                 timeline_events=timeline_events,
+                runtime_context_id=str(
+                    getattr(context, "runtime_context_id", "") or ""
+                ),
+                parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
             )
         )
         contract_runtime_sequence = (
@@ -35492,6 +35523,8 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 task_id=context.task_id,
                 backlog_id=context.backlog_id,
                 timeline_events=timeline_events,
+                runtime_context_id=context.runtime_context_id,
+                parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
             )
         )
         missing_lineage = [
@@ -42638,6 +42671,10 @@ def _runtime_context_session_rejoin_guidance_eligibility(
             task_id=str(getattr(context, "task_id", "") or ""),
             backlog_id=str(getattr(context, "backlog_id", "") or ""),
             timeline_events=timeline_events,
+            runtime_context_id=str(
+                getattr(context, "runtime_context_id", "") or ""
+            ),
+            parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
         )
     )
     contract_runtime_sequence = (
@@ -42898,6 +42935,8 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 task_id=context.task_id,
                 backlog_id=context.backlog_id,
                 timeline_events=timeline_events,
+                runtime_context_id=context.runtime_context_id,
+                parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
             )
         )
         contract_runtime_sequence = (
@@ -52244,6 +52283,8 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
                 task_id=context.task_id,
                 backlog_id=context.backlog_id,
                 timeline_events=timeline_events,
+                runtime_context_id=context.runtime_context_id,
+                parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
             )
         )
         if not timeline_refs.get("startup_event_ref"):
@@ -52906,6 +52947,8 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
                 task_id=context.task_id,
                 backlog_id=context.backlog_id,
                 timeline_events=timeline_events,
+                runtime_context_id=context.runtime_context_id,
+                parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
             )
         )
         read_receipt_event_id = str(
@@ -53416,6 +53459,8 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
                 task_id=context.task_id,
                 backlog_id=context.backlog_id,
                 timeline_events=timeline_events,
+                runtime_context_id=context.runtime_context_id,
+                parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
             )
         )
         startup_payload = (
@@ -88263,6 +88308,8 @@ def _contract_runtime_projection_for_context(
             task_id=task_id,
             backlog_id=backlog_id,
             timeline_events=timeline_events,
+            runtime_context_id=runtime_context_id,
+            parent_task_id=parent_task_id,
         )
     )
     graph_refs = _runtime_context_service_graph_trace_refs(

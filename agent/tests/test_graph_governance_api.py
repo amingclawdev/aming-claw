@@ -63541,6 +63541,25 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
     assert persisted_payload["fence_token_hash"] == _fake_sha(
         "fence-copy-safe-receipt"
     )
+    startup_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                query={
+                    "parent_task_id": "parent-copy-safe-receipt",
+                    "fence_token": "fence-copy-safe-receipt",
+                    "session_token": "copy-safe-session",
+                    "target_project_root": str(target_root),
+                    "view": "all",
+                },
+            )
+        )
+    )
+    assert startup_guide["next_legal_action"] == "record_mf_subagent_startup"
+    assert startup_guide["startup_facade_payload_skeleton"]["copy_safe_body"]
 
 
 def test_scope_insufficiency_request_is_append_only_and_returns_disposition(
