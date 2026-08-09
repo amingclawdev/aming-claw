@@ -102870,6 +102870,194 @@ def _contract_runtime_append_completed_line_correction(
     return runtime.store.get(contract_execution_id)
 
 
+def _contract_runtime_statusless_worker_finish_gate_acceptance(
+    line: Mapping[str, Any],
+    *,
+    expected_worker_identity: Mapping[str, Any],
+) -> bool:
+    """Recognize the canonical finish facade's statusless durable line.
+
+    The finish facade predates generic top-level ``status`` normalization. Its
+    payload retains the startup-time self-attestation diagnostics (which may
+    legitimately be blocked before the implementation diff exists), then
+    records a distinct finish-time PASS and close-ready checkpoint.  Only the
+    historical startup observation is excluded from the failure scan; every
+    current finish result remains closed and exact.
+    """
+
+    payload = (
+        line.get("payload")
+        if isinstance(line.get("payload"), Mapping)
+        else {}
+    )
+    nested = (
+        payload.get("mf_subagent_finish_gate")
+        if isinstance(payload.get("mf_subagent_finish_gate"), Mapping)
+        else {}
+    )
+    projection = (
+        payload.get("close_gate_projection")
+        if isinstance(payload.get("close_gate_projection"), Mapping)
+        else {}
+    )
+    self_gate = (
+        payload.get("worker_self_attestation_gate")
+        if isinstance(payload.get("worker_self_attestation_gate"), Mapping)
+        else {}
+    )
+    self_attestation = (
+        payload.get("worker_self_attestation")
+        if isinstance(payload.get("worker_self_attestation"), Mapping)
+        else {}
+    )
+    test_results = (
+        payload.get("test_results")
+        if isinstance(payload.get("test_results"), Mapping)
+        else {}
+    )
+    expected = {
+        field: str(expected_worker_identity.get(field) or "").strip()
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "merge_queue_id",
+        )
+    }
+    runtime_context_id = expected["runtime_context_id"]
+    line_instance_id = f"runtime_context:{runtime_context_id}"
+    checkpoint_id = str(payload.get("checkpoint_id") or "").strip()
+    validated_head = str(
+        payload.get("validated_head_commit") or ""
+    ).strip().lower()
+    identity_fields = (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_id",
+        "worker_slot_id",
+    )
+    if not (
+        all(expected.values())
+        and str(line.get("stage_id") or "").strip() == "worker_finish"
+        and str(line.get("line_id") or "").strip()
+        == "worker_finish_gate"
+        and str(line.get("actor_role") or "").strip() == "mf_sub"
+        and str(line.get("evidence_kind") or "").strip()
+        == "mf_subagent_finish_gate"
+        and not any(
+            str(line.get(field) or "").strip()
+            for field in ("status", "verdict", "decision")
+        )
+        and all(
+            str(line.get(field) or "").strip() == expected[field]
+            for field in identity_fields
+        )
+        and str(line.get("line_instance_id") or "").strip()
+        == line_instance_id
+        and str(payload.get("schema_version") or "")
+        == "mf_subagent_finish_gate.v1"
+        and str(nested.get("schema_version") or "")
+        == "mf_subagent_finish_gate.v1"
+        and all(
+            str(source.get(field) or "").strip() == expected[field]
+            for source in (payload, nested)
+            for field in identity_fields
+        )
+        and str(payload.get("merge_queue_id") or "").strip()
+        == expected["merge_queue_id"]
+        and str(nested.get("merge_queue_id") or "").strip()
+        == expected["merge_queue_id"]
+        and str(payload.get("line_instance_id") or "").strip()
+        == line_instance_id
+        and re.fullmatch(r"ckpt-finish-[0-9a-f]{20,64}", checkpoint_id)
+        and str(nested.get("checkpoint_id") or "").strip()
+        == checkpoint_id
+        and str(projection.get("checkpoint_id") or "").strip()
+        == checkpoint_id
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", validated_head)
+        and all(
+            str(source.get(field) or "").strip().lower()
+            == validated_head
+            for source, field in (
+                (line, "head_commit"),
+                (line, "validated_head_commit"),
+                (payload, "head_commit"),
+                (nested, "head_commit"),
+                (nested, "validated_head_commit"),
+                (projection, "head_commit"),
+            )
+        )
+        and payload.get("close_ready") is True
+        and nested.get("close_ready") is True
+        and projection.get("close_ready") is True
+        and str(projection.get("schema_version") or "")
+        == "mf_subagent_finish_gate_close_projection.v1"
+        and payload.get("waiting_merge") is True
+        and nested.get("waiting_merge") is True
+        and str(payload.get("worker_status") or "") == "waiting_merge"
+        and str(nested.get("worker_status") or "") == "waiting_merge"
+        and test_results.get("passed") is True
+        and str(test_results.get("status") or "").strip().lower()
+        == "passed"
+        and stable_sha256(test_results)
+        == stable_sha256(nested.get("test_results"))
+        and str(self_gate.get("schema_version") or "")
+        == "mf_subagent_finish_time_worker_self_attestation_gate.v1"
+        and self_gate.get("passed") is True
+        and self_gate.get("close_satisfying") is True
+        and str(self_gate.get("status") or "").strip().lower()
+        == "passed"
+        and not list(self_gate.get("blockers") or [])
+        and not list(self_gate.get("finish_time_blockers") or [])
+        and stable_sha256(self_gate)
+        == stable_sha256(nested.get("worker_self_attestation_gate"))
+        and self_attestation.get("ok") is True
+        and str(self_attestation.get("status") or "").strip().lower()
+        == "passed"
+        and self_attestation.get("finish_time_self_attesting") is True
+        and not list(self_attestation.get("blockers") or [])
+        and not list(self_attestation.get("finish_time_blockers") or [])
+        and stable_sha256(self_attestation)
+        == stable_sha256(nested.get("worker_self_attestation"))
+        and stable_sha256(projection)
+        == stable_sha256(nested.get("close_gate_projection"))
+    ):
+        return False
+
+    failure_scan = deepcopy(dict(payload))
+    nested_scan = failure_scan.get("mf_subagent_finish_gate")
+    sources = [failure_scan]
+    if isinstance(nested_scan, dict):
+        sources.append(nested_scan)
+    for source in sources:
+        for field in (
+            "startup_evidence",
+            "close_satisfying_startup_evidence",
+        ):
+            startup = source.get(field)
+            if not isinstance(startup, Mapping):
+                return False
+            startup = deepcopy(dict(startup))
+            if not (
+                str(startup.get("status") or "").strip().lower()
+                == "passed"
+                and startup.get("actual_startup_recorded") is True
+                and str(startup.get("runtime_context_id") or "").strip()
+                == runtime_context_id
+                and str(startup.get("task_id") or "").strip()
+                == expected["task_id"]
+                and str(startup.get("parent_task_id") or "").strip()
+                == expected["parent_task_id"]
+            ):
+                return False
+            startup.pop("worker_self_attestation", None)
+            source[field] = startup
+    return not _contract_runtime_value_reports_failed_qa(failure_scan)
+
+
 def _contract_runtime_completed_line_acceptance(
     conn,
     *,
@@ -102878,6 +103066,8 @@ def _contract_runtime_completed_line_acceptance(
     completed_line_index: int,
     expected_line: Mapping[str, Any],
     allow_missing_observer_merge_status: bool = False,
+    allow_statusless_worker_finish_gate: bool = False,
+    expected_worker_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve one completed line's server-written acceptance revision/time."""
 
@@ -102923,6 +103113,13 @@ def _contract_runtime_completed_line_acceptance(
             and _contract_runtime_server_derived_observer_merge_no_pass_line(
                 canonical_line,
                 allow_missing_top_level_status=True,
+            )
+        )
+        or (
+            allow_statusless_worker_finish_gate
+            and _contract_runtime_statusless_worker_finish_gate_acceptance(
+                canonical_line,
+                expected_worker_identity=(expected_worker_identity or {}),
             )
         )
     )
@@ -104043,6 +104240,78 @@ def _contract_runtime_legacy_reconcile_receipt_variants(
             )
         candidate["authority_hash"] = stable_sha256(candidate)
         variants.append(candidate)
+
+    # A later same-commit current-full may supersede the source receipt's
+    # snapshot while preserving that source reconcile as the immutable
+    # reconcile provenance.  Reconstruct the exact prior active-snapshot
+    # projection only from the verified terminal authority's own provenance;
+    # never accept a caller-shaped snapshot transition.
+    terminal = current.get("terminal_current_full_reconcile_authority")
+    if isinstance(terminal, Mapping):
+        terminal = deepcopy(dict(terminal))
+        provenance = terminal.get("current_full_reconcile_provenance")
+        reconcile_snapshot_id = str(
+            terminal.get("reconcile_snapshot_id") or ""
+        ).strip()
+        if (
+            isinstance(provenance, Mapping)
+            and str(terminal.get("reconcile_snapshot_status") or "")
+            == "superseded"
+            and reconcile_snapshot_id
+            and str(terminal.get("active_snapshot_id") or "").strip()
+            != reconcile_snapshot_id
+            and str(provenance.get("snapshot_id") or "").strip()
+            == reconcile_snapshot_id
+            and str(provenance.get("provenance_id") or "").strip()
+            and str(provenance.get("provenance_hash") or "").strip()
+        ):
+            prior = deepcopy(dict(current))
+            prior_terminal = deepcopy(terminal)
+            prior_terminal.update(
+                {
+                    "active_snapshot_id": reconcile_snapshot_id,
+                    "active_source_ref": (
+                        f"graph_snapshot:{reconcile_snapshot_id}"
+                    ),
+                    "active_snapshot_current_full_provenance_id": str(
+                        provenance.get("provenance_id") or ""
+                    ).strip(),
+                    "active_snapshot_current_full_provenance_hash": str(
+                        provenance.get("provenance_hash") or ""
+                    ).strip(),
+                    "active_snapshot_current_full_reconcile_event_id": int(
+                        terminal.get("reconcile_event_id") or 0
+                    ),
+                    "active_snapshot_current_full_reconcile_event_created_at": str(
+                        terminal.get("reconcile_event_created_at") or ""
+                    ).strip(),
+                    "active_snapshot_current_full_runtime_context_id": str(
+                        terminal.get("runtime_context_id") or ""
+                    ).strip(),
+                    "active_snapshot_current_full_task_id": str(
+                        terminal.get("task_id") or ""
+                    ).strip(),
+                    "reconcile_snapshot_status": "active",
+                }
+            )
+            prior_terminal["authority_hash"] = stable_sha256(
+                {
+                    key: value
+                    for key, value in prior_terminal.items()
+                    if key != "authority_hash"
+                }
+            )
+            prior["terminal_current_full_reconcile_authority"] = (
+                prior_terminal
+            )
+            prior["authority_hash"] = stable_sha256(
+                {
+                    key: value
+                    for key, value in prior.items()
+                    if key != "authority_hash"
+                }
+            )
+            variants.append(prior)
     return variants
 
 
@@ -104075,6 +104344,11 @@ def _contract_runtime_reconcile_receipt_correction_marker(
         if isinstance(
             terminal.get("current_full_reconcile_marker"), Mapping
         )
+        else {}
+    )
+    activation_route_evidence = (
+        activation.get("route_evidence")
+        if isinstance(activation.get("route_evidence"), Mapping)
         else {}
     )
     reconcile_event_id = int(terminal.get("reconcile_event_id") or 0)
@@ -104150,7 +104424,10 @@ def _contract_runtime_reconcile_receipt_correction_marker(
             terminal.get("reconcile_snapshot_id") or ""
         ).strip(),
         "reconcile_run_id": str(
-            activation.get("run_id") or provenance.get("run_id") or ""
+            activation.get("run_id")
+            or activation_route_evidence.get("reconcile_run_id")
+            or provenance.get("run_id")
+            or ""
         ).strip(),
         "reconcile_request_id": str(
             activation.get("request_id")
@@ -129701,6 +129978,10 @@ def _contract_runtime_close_ready_worker_set_authority(
                 allow_missing_observer_merge_status=(
                     line_id == "observer_merge"
                 ),
+                allow_statusless_worker_finish_gate=(
+                    line_id == "worker_finish_gate"
+                ),
+                expected_worker_identity=identity,
             )
             if acceptance.get("db_verified") is not True:
                 return {}

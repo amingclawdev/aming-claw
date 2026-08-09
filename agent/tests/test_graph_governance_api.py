@@ -73328,6 +73328,112 @@ def _install_contract_runtime_handler_passthrough(monkeypatch, runtime) -> None:
     )
 
 
+def _statusless_worker_finish_gate_line(worker: Mapping[str, Any]) -> dict[str, Any]:
+    runtime_context_id = worker["runtime_context_id"]
+    line_instance_id = f"runtime_context:{runtime_context_id}"
+    checkpoint_id = (
+        "ckpt-finish-"
+        + hashlib.sha256(runtime_context_id.encode("utf-8")).hexdigest()[:20]
+    )
+    head_commit = "2" * 40
+    identity = {
+        field: worker[field]
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "merge_queue_id",
+        )
+    }
+    startup = {
+        "status": "passed",
+        "actual_startup_recorded": True,
+        "runtime_context_id": identity["runtime_context_id"],
+        "task_id": identity["task_id"],
+        "parent_task_id": identity["parent_task_id"],
+        # This is a retained startup-time observation, not the current
+        # finish verdict.  The real R8 payload preserves it as blocked.
+        "worker_self_attestation": {
+            "status": "blocked",
+            "blockers": ["implementation_not_recorded_at_startup"],
+        },
+    }
+    test_results = {"status": "passed", "passed": True}
+    self_attestation = {
+        "status": "passed",
+        "ok": True,
+        "finish_time_self_attesting": True,
+        "blockers": [],
+        "finish_time_blockers": [],
+    }
+    self_gate = {
+        "schema_version": (
+            "mf_subagent_finish_time_worker_self_attestation_gate.v1"
+        ),
+        "status": "passed",
+        "passed": True,
+        "close_satisfying": True,
+        "blockers": [],
+        "finish_time_blockers": [],
+    }
+    projection = {
+        "schema_version": "mf_subagent_finish_gate_close_projection.v1",
+        "checkpoint_id": checkpoint_id,
+        "head_commit": head_commit,
+        "close_ready": True,
+    }
+    nested = {
+        "schema_version": "mf_subagent_finish_gate.v1",
+        **identity,
+        "checkpoint_id": checkpoint_id,
+        "head_commit": head_commit,
+        "validated_head_commit": head_commit,
+        "close_ready": True,
+        "waiting_merge": True,
+        "worker_status": "waiting_merge",
+        "test_results": copy.deepcopy(test_results),
+        "worker_self_attestation": copy.deepcopy(self_attestation),
+        "worker_self_attestation_gate": copy.deepcopy(self_gate),
+        "close_gate_projection": copy.deepcopy(projection),
+        "startup_evidence": copy.deepcopy(startup),
+        "close_satisfying_startup_evidence": copy.deepcopy(startup),
+    }
+    return {
+        "stage_id": "worker_finish",
+        "line_id": "worker_finish_gate",
+        "actor_role": "mf_sub",
+        "evidence_kind": "mf_subagent_finish_gate",
+        "runtime_context_id": identity["runtime_context_id"],
+        "task_id": identity["task_id"],
+        "parent_task_id": identity["parent_task_id"],
+        "worker_id": identity["worker_id"],
+        "worker_slot_id": identity["worker_slot_id"],
+        "line_instance_id": line_instance_id,
+        "head_commit": head_commit,
+        "validated_head_commit": head_commit,
+        "payload": {
+            "schema_version": "mf_subagent_finish_gate.v1",
+            **identity,
+            "line_instance_id": line_instance_id,
+            "checkpoint_id": checkpoint_id,
+            "head_commit": head_commit,
+            "validated_head_commit": head_commit,
+            "close_ready": True,
+            "waiting_merge": True,
+            "worker_status": "waiting_merge",
+            "test_results": test_results,
+            "worker_self_attestation": self_attestation,
+            "worker_self_attestation_gate": self_gate,
+            "close_gate_projection": projection,
+            "startup_evidence": copy.deepcopy(startup),
+            "close_satisfying_startup_evidence": copy.deepcopy(startup),
+            "mf_subagent_finish_gate": nested,
+        },
+    }
+
+
 def _standalone_close_ready_worker_set_fixture() -> tuple[dict[str, Any], dict[str, Any]]:
     record = _rev8_postmerge_qa_binding_record()
     dispatch = record["completed_lines"][0]
@@ -73341,6 +73447,9 @@ def _standalone_close_ready_worker_set_fixture() -> tuple[dict[str, Any], dict[s
             ("worker_finish_gate", "mf_subagent_finish_gate", "mf_sub"),
             ("observer_merge", "merge", "observer"),
         ):
+            if line_id == "worker_finish_gate":
+                completed.append(_statusless_worker_finish_gate_line(worker))
+                continue
             completed.append(
                 {
                     "stage_id": line_id,
@@ -73390,8 +73499,16 @@ def _accept_close_ready_worker_set_line(
     *,
     record,
     completed_line_index,
-    **_kwargs,
+    expected_line,
+    **kwargs,
 ):
+    if expected_line["line_id"] == "worker_finish_gate":
+        assert kwargs["allow_statusless_worker_finish_gate"] is True
+        identity = kwargs["expected_worker_identity"]
+        assert server._contract_runtime_statusless_worker_finish_gate_acceptance(
+            expected_line,
+            expected_worker_identity=identity,
+        ) is True
     execution_id = record["contract_execution_id"]
     return {
         "db_verified": True,
@@ -73405,6 +73522,79 @@ def _accept_close_ready_worker_set_line(
         ),
         "execution_state_revision": completed_line_index + 2,
     }
+
+
+@pytest.mark.parametrize(
+    ("case", "mutator"),
+    [
+        (
+            "failed_finish_attestation",
+            lambda line: line["payload"]["worker_self_attestation"].update(
+                {"status": "failed"}
+            ),
+        ),
+        (
+            "failed_finish_test",
+            lambda line: line["payload"]["test_results"].update(
+                {"passed": False}
+            ),
+        ),
+        (
+            "checkpoint_drift",
+            lambda line: line["payload"]["mf_subagent_finish_gate"].update(
+                {"checkpoint_id": "ckpt-finish-" + "f" * 20}
+            ),
+        ),
+        (
+            "close_projection_drift",
+            lambda line: line["payload"]["close_gate_projection"].update(
+                {"close_ready": False}
+            ),
+        ),
+        (
+            "startup_not_accepted",
+            lambda line: line["payload"]["startup_evidence"].update(
+                {"actual_startup_recorded": False}
+            ),
+        ),
+        (
+            "queue_identity_drift",
+            lambda line: line["payload"].update(
+                {"merge_queue_id": "mq-sibling"}
+            ),
+        ),
+    ],
+)
+def test_statusless_worker_finish_gate_accepts_only_exact_current_finish(
+    case,
+    mutator,
+):
+    record, _write = _standalone_close_ready_worker_set_fixture()
+    worker = record["completed_lines"][0]["payload"]["bounded_workers"][0]
+    line = _statusless_worker_finish_gate_line(worker)
+    identity = {
+        field: worker[field]
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "merge_queue_id",
+        )
+    }
+    assert server._contract_runtime_value_reports_failed_qa(line["payload"])
+    assert server._contract_runtime_statusless_worker_finish_gate_acceptance(
+        line,
+        expected_worker_identity=identity,
+    ) is True
+
+    tampered = copy.deepcopy(line)
+    mutator(tampered)
+    assert server._contract_runtime_statusless_worker_finish_gate_acceptance(
+        tampered,
+        expected_worker_identity=identity,
+    ) is False, case
 
 
 @pytest.mark.parametrize(
@@ -114724,6 +114914,189 @@ def test_legacy_observer_reconcile_receipt_correction_is_append_only_and_exact(
         )["status"] == "invalid"
 
 
+def _postmerge_superseded_reconcile_receipt_world() -> tuple[
+    dict[str, Any], dict[str, Any]
+]:
+    """Clone the live Planner history: one receipt, later active snapshot."""
+
+    source = _postmerge_reconcile_receipt_correction_authority()
+    terminal = source["terminal_current_full_reconcile_authority"]
+    old_snapshot_id = terminal["reconcile_snapshot_id"]
+    provenance = terminal["current_full_reconcile_provenance"]
+    provenance.update(
+        {
+            "snapshot_id": old_snapshot_id,
+            "run_id": "current-full-daily-planner-old",
+            "request_id": "req-daily-planner-old",
+        }
+    )
+    terminal["current_full_reconcile_marker"] = {
+        "request_id": "req-daily-planner-old",
+        "route_evidence": {
+            "reconcile_run_id": "current-full-daily-planner-old"
+        },
+    }
+    terminal.update(
+        {
+            "active_snapshot_id": old_snapshot_id,
+            "active_source_ref": f"graph_snapshot:{old_snapshot_id}",
+            "active_snapshot_current_full_provenance_id": provenance[
+                "provenance_id"
+            ],
+            "active_snapshot_current_full_provenance_hash": provenance[
+                "provenance_hash"
+            ],
+            "active_snapshot_current_full_reconcile_event_id": terminal[
+                "reconcile_event_id"
+            ],
+            "active_snapshot_current_full_reconcile_event_created_at": terminal[
+                "reconcile_event_created_at"
+            ],
+            "active_snapshot_current_full_runtime_context_id": terminal[
+                "runtime_context_id"
+            ],
+            "active_snapshot_current_full_task_id": terminal["task_id"],
+            "reconcile_snapshot_status": "active",
+        }
+    )
+    terminal["authority_hash"] = server.stable_sha256(
+        {key: value for key, value in terminal.items() if key != "authority_hash"}
+    )
+    source["authority_hash"] = server.stable_sha256(
+        {key: value for key, value in source.items() if key != "authority_hash"}
+    )
+
+    current = copy.deepcopy(source)
+    current_terminal = current["terminal_current_full_reconcile_authority"]
+    current_terminal.update(
+        {
+            "active_snapshot_id": "full-daily-planner-later-current",
+            "active_source_ref": (
+                "graph_snapshot:full-daily-planner-later-current"
+            ),
+            "active_snapshot_current_full_provenance_id": (
+                "gcfp-daily-planner-later"
+            ),
+            "active_snapshot_current_full_provenance_hash": (
+                "sha256:" + "a" * 64
+            ),
+            "active_snapshot_current_full_reconcile_event_id": 904,
+            "active_snapshot_current_full_reconcile_event_created_at": (
+                "2026-08-09T03:20:00Z"
+            ),
+            "active_snapshot_current_full_runtime_context_id": (
+                "mfrctx-daily-planner-sibling-current-full"
+            ),
+            "active_snapshot_current_full_task_id": (
+                "daily-planner-sibling-current-full"
+            ),
+            "reconcile_snapshot_status": "superseded",
+        }
+    )
+    current_terminal["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in current_terminal.items()
+            if key != "authority_hash"
+        }
+    )
+    current["authority_hash"] = server.stable_sha256(
+        {key: value for key, value in current.items() if key != "authority_hash"}
+    )
+    return current, source
+
+
+def test_legacy_reconcile_accepts_only_exact_superseded_provenance_history(
+    monkeypatch,
+):
+    authority, source_receipt = (
+        _postmerge_superseded_reconcile_receipt_world()
+    )
+    variants = server._contract_runtime_legacy_reconcile_receipt_variants(
+        authority
+    )
+    assert any(
+        server.stable_sha256(candidate)
+        == server.stable_sha256(source_receipt)
+        for candidate in variants
+    )
+    source_line = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_reconcile",
+        "actor_role": "observer",
+        "evidence_kind": "reconcile",
+        "status": "passed",
+        "commit_sha": authority["merged_commit_sha"],
+        "runtime_context_id": authority["runtime_context_id"],
+        "task_id": authority["task_id"],
+        "parent_task_id": authority["parent_task_id"],
+        "merge_queue_id": authority["merge_queue_id"],
+        "payload": {"reconcile_authority": source_receipt},
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": authority["backlog_id"],
+        "contract_execution_id": authority["contract_execution_id"],
+        "completed_lines": [source_line],
+        "runtime_guide": {
+            "next_legal_action": {"line_id": "qa_graph_context"}
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_line_acceptance",
+        lambda *_args, **_kwargs: {"db_verified": True},
+    )
+    resolution = server._contract_runtime_reconcile_receipt_resolution(
+        object(), project_id=PID, record=record, authority=authority
+    )
+    assert resolution["status"] == "legacy_pending"
+    marker = server._contract_runtime_reconcile_receipt_correction_marker(
+        record=record,
+        source_line=source_line,
+        source_line_index=0,
+        authority=authority,
+    )
+    assert marker["reconcile_run_id"] == (
+        "current-full-daily-planner-old"
+    )
+    assert marker["active_snapshot_id"] == (
+        "full-daily-planner-later-current"
+    )
+    assert marker["reconcile_snapshot_id"] == (
+        source_receipt["terminal_current_full_reconcile_authority"][
+            "reconcile_snapshot_id"
+        ]
+    )
+
+    tampered_record = copy.deepcopy(record)
+    tampered = tampered_record["completed_lines"][0]["payload"][
+        "reconcile_authority"
+    ]
+    tampered_terminal = tampered[
+        "terminal_current_full_reconcile_authority"
+    ]
+    tampered_terminal["active_snapshot_current_full_provenance_hash"] = (
+        "sha256:" + "f" * 64
+    )
+    tampered_terminal["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in tampered_terminal.items()
+            if key != "authority_hash"
+        }
+    )
+    tampered["authority_hash"] = server.stable_sha256(
+        {key: value for key, value in tampered.items() if key != "authority_hash"}
+    )
+    before = server.stable_sha256(tampered_record)
+    rejected = server._contract_runtime_reconcile_receipt_resolution(
+        object(), project_id=PID, record=tampered_record, authority=authority
+    )
+    assert rejected == {"status": "invalid", "reason": "source_identity"}
+    assert server.stable_sha256(tampered_record) == before
+
+
 def test_observer_reconcile_rejects_before_current_full_without_mutation(
     monkeypatch,
 ):
@@ -114769,10 +115142,7 @@ def test_legacy_observer_reconcile_actual_facade_appends_one_correction(
     conn,
     monkeypatch,
 ):
-    authority = _postmerge_reconcile_receipt_correction_authority()
-    legacy = server._contract_runtime_legacy_reconcile_receipt_variants(
-        authority
-    )[0]
+    authority, legacy = _postmerge_superseded_reconcile_receipt_world()
     execution_id = authority["contract_execution_id"]
     source_line = {
         "stage_id": "observer_integration",
