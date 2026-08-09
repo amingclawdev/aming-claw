@@ -33519,24 +33519,24 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             ).strip(),
             expected_actual_host_worker_id,
         ),
-        "worker_session_id": (
-            str(body.get("worker_session_id") or "").strip(),
-            expected_host_session_id,
-        ),
-        "host_session_id": (
-            str(body.get("host_session_id") or "").strip(),
-            expected_host_session_id,
-        ),
         "session_token_ref": (
             presented_session_ref,
             runtime_context_session_token_ref(context),
         ),
     }
-    if expected_host_startup_id:
-        exact_fields["host_startup_id"] = (
-            str(body.get("host_startup_id") or "").strip(),
-            expected_host_startup_id,
-        )
+    # The public guide intentionally leaves opaque host adapter identities
+    # empty when a historical context predates their projection.  They are not
+    # caller-selected authority on the safe-ref path: the server binds the
+    # durable context values into the proof passed to the runtime primitive.
+    # A non-empty caller claim must still match exactly.
+    for field, expected in (
+        ("worker_session_id", expected_host_session_id),
+        ("host_session_id", expected_host_session_id),
+        ("host_startup_id", expected_host_startup_id),
+    ):
+        supplied = str(body.get(field) or "").strip()
+        if supplied and supplied != expected:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if (
         not presented_contract_execution_id
         or any(not actual or actual != expected for actual, expected in exact_fields.values())
@@ -33670,18 +33670,34 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
                 or expected_host_session_id
             ).strip()
             == expected_host_session_id
-            and _runtime_context_rejoin_checkpoint_relation(
-                payload.get("bounded_replacement_worker_write_baseline"),
-                checkpoint_baseline,
-            )
-            in {"exact", "advanced"}
         ):
-            matching_session_authorities.append(
-                (
-                    event,
-                    str(payload.get("bounded_rejoin_kind") or "").strip(),
-                )
+            legacy_audit = _runtime_context_legacy_v1_rejoin_audit(
+                conn,
+                project_id=project_id,
+                context=context,
+                event=event,
+                current_baseline=checkpoint_baseline,
             )
+            relation = str(legacy_audit.get("relation") or "").strip()
+            if legacy_audit.get("applicable") is not True:
+                relation = _runtime_context_rejoin_checkpoint_relation(
+                    payload.get("bounded_replacement_worker_write_baseline"),
+                    checkpoint_baseline,
+                )
+            legacy_audit_accepted = bool(
+                legacy_audit.get("applicable") is not True
+                or legacy_audit.get("valid") is True
+            )
+            if legacy_audit_accepted and relation in {
+                "exact",
+                "advanced",
+            }:
+                matching_session_authorities.append(
+                    (
+                        event,
+                        str(payload.get("bounded_rejoin_kind") or "").strip(),
+                    )
+                )
     if len(matching_initial_joins) != 1:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if len(matching_session_authorities) != 1:
@@ -33694,18 +33710,30 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         "supplied"
     ]
     route_token_ref = str(supplied_route_identity.get("route_token_ref") or "").strip()
-    try:
-        from . import observer_route_context
+    from . import observer_route_context
 
-        resolved_route_ref = observer_route_context.resolve_route_token_ref(
-            conn,
-            project_id=project_id,
-            route_token_ref=route_token_ref,
-            backlog_id=str(context.backlog_id or "").strip(),
-            task_id=presented_contract_execution_id,
-        )
-    except observer_route_context.RouteTokenRefError as exc:
-        raise BranchRuntimeFenceError("fence_invalidated_or_unknown") from exc
+    resolved_route_candidates: list[Mapping[str, Any]] = []
+    for route_task_id in dict.fromkeys(
+        (presented_contract_execution_id, expected_task_id)
+    ):
+        try:
+            candidate = observer_route_context.resolve_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=route_token_ref,
+                backlog_id=str(context.backlog_id or "").strip(),
+                task_id=route_task_id,
+            )
+        except observer_route_context.RouteTokenRefError:
+            continue
+        if candidate and not any(
+            dict(candidate) == dict(item)
+            for item in resolved_route_candidates
+        ):
+            resolved_route_candidates.append(candidate)
+    if len(resolved_route_candidates) != 1:
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    resolved_route_ref = resolved_route_candidates[0]
     expected_route_identity = {
         field: str((resolved_route_ref or {}).get(field) or "").strip()
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
@@ -33805,32 +33833,78 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
                 conn,
                 project_id=project_id,
                 runtime_context_id=runtime_context_id,
-                task_id=str(body.get("task_id") or "").strip(),
-                parent_task_id=str(body.get("parent_task_id") or "").strip(),
+                task_id=(
+                    safe_ref_authority.task_id
+                    if safe_ref_authority is not None
+                    else str(body.get("task_id") or "").strip()
+                ),
+                parent_task_id=(
+                    safe_ref_authority.parent_task_id
+                    if safe_ref_authority is not None
+                    else str(body.get("parent_task_id") or "").strip()
+                ),
                 fence_token=raw_fence_token,
                 session_token=raw_session_token,
                 session_token_ref=session_token_ref,
-                contract_execution_id=str(
-                    body.get("contract_execution_id") or ""
-                ).strip(),
-                target_project_root=str(
-                    body.get("target_project_root")
-                    or body.get("project_root")
-                    or body.get("repo_root")
-                    or ""
-                ).strip(),
-                worker_id=str(body.get("worker_id") or "").strip(),
-                worker_slot_id=str(body.get("worker_slot_id") or "").strip(),
-                agent_id=str(body.get("agent_id") or "").strip(),
-                allocation_owner=str(body.get("allocation_owner") or "").strip(),
-                actual_host_worker_id=str(
-                    body.get("actual_host_worker_id")
-                    or body.get("host_worker_id")
-                    or ""
-                ).strip(),
-                worker_session_id=str(body.get("worker_session_id") or "").strip(),
-                host_startup_id=str(body.get("host_startup_id") or "").strip(),
-                host_session_id=str(body.get("host_session_id") or "").strip(),
+                contract_execution_id=(
+                    safe_ref_authority.contract_execution_id
+                    if safe_ref_authority is not None
+                    else str(body.get("contract_execution_id") or "").strip()
+                ),
+                target_project_root=(
+                    safe_ref_authority.target_project_root
+                    if safe_ref_authority is not None
+                    else str(
+                        body.get("target_project_root")
+                        or body.get("project_root")
+                        or body.get("repo_root")
+                        or ""
+                    ).strip()
+                ),
+                worker_id=(
+                    safe_ref_authority.worker_id
+                    if safe_ref_authority is not None
+                    else str(body.get("worker_id") or "").strip()
+                ),
+                worker_slot_id=(
+                    safe_ref_authority.worker_slot_id
+                    if safe_ref_authority is not None
+                    else str(body.get("worker_slot_id") or "").strip()
+                ),
+                agent_id=(
+                    safe_ref_authority.agent_id
+                    if safe_ref_authority is not None
+                    else str(body.get("agent_id") or "").strip()
+                ),
+                allocation_owner=(
+                    safe_ref_authority.allocation_owner
+                    if safe_ref_authority is not None
+                    else str(body.get("allocation_owner") or "").strip()
+                ),
+                actual_host_worker_id=(
+                    safe_ref_authority.actual_host_worker_id
+                    if safe_ref_authority is not None
+                    else str(
+                        body.get("actual_host_worker_id")
+                        or body.get("host_worker_id")
+                        or ""
+                    ).strip()
+                ),
+                worker_session_id=(
+                    safe_ref_authority.worker_session_id
+                    if safe_ref_authority is not None
+                    else str(body.get("worker_session_id") or "").strip()
+                ),
+                host_startup_id=(
+                    safe_ref_authority.host_startup_id
+                    if safe_ref_authority is not None
+                    else str(body.get("host_startup_id") or "").strip()
+                ),
+                host_session_id=(
+                    safe_ref_authority.host_session_id
+                    if safe_ref_authority is not None
+                    else str(body.get("host_session_id") or "").strip()
+                ),
                 safe_ref_authority=safe_ref_authority,
                 ttl_seconds=body.get("ttl_seconds"),
                 now_iso=(
@@ -40407,6 +40481,145 @@ _RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS = (
     "contract_runtime_completed_line_count",
     "contract_runtime_completed_lines_hash",
 )
+_RUNTIME_CONTEXT_LEGACY_REJOIN_BASELINE_KEYS = frozenset(
+    {
+        "schema_version",
+        *_RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS,
+    }
+)
+_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS = frozenset(
+    {
+        "schema_version",
+        "has_lease",
+        "lease_id",
+        "lease_expires_at",
+        "lease_remaining_ttl_seconds",
+        "expired",
+        "status",
+        "authorization_valid",
+        "canonical_no_lease",
+        "lease_record_valid",
+        "expiry_valid",
+        "clock_valid",
+        "invalid_reason",
+        "renewal_supported",
+        "renewal_max_ttl_seconds",
+        "renewal_default_ttl_seconds",
+        "renewal_endpoint",
+        "session_token_ref",
+        "session_token_ref_available",
+        "raw_session_token_exposed",
+        "raw_session_token_persisted",
+        "now",
+    }
+)
+_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS = frozenset(
+    {
+        "schema_version",
+        "server_derived",
+        "caller_claims_trusted",
+        "applicable",
+        "eligible",
+        "mode",
+        "replacement_generation",
+        "last_recovery_action",
+        "errors",
+        "identity_mismatches",
+    }
+)
+_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS = frozenset(
+    {
+        "schema_version",
+        "server_derived",
+        "caller_claims_trusted",
+        "applicable",
+        "eligible",
+        "mode",
+        "replacement_generation",
+        "last_recovery_action",
+        "errors",
+        "identity_mismatches",
+        "source_event_ref",
+        "expected_worker_write_baseline",
+        "actual_worker_write_baseline",
+        "current_session_token_ref",
+    }
+)
+_RUNTIME_CONTEXT_LEGACY_REJOIN_PAYLOAD_KEYS = frozenset(
+    {
+        "action",
+        "attempt",
+        "backlog_id",
+        "bounded_rejoin_kind",
+        "bounded_replacement_generation",
+        "bounded_replacement_rejoin",
+        "bounded_replacement_rejoin_authority",
+        "bounded_replacement_worker_write_baseline",
+        "caller_role",
+        "contract_runtime_failed_qa_revision",
+        "contract_runtime_worker_sequence",
+        "current_status",
+        "delivery",
+        "effective_read_receipt_ref",
+        "effective_startup_ref",
+        "expires_at",
+        "failed_qa_running_revision_rejoin_authority",
+        "fence_token_hash",
+        "host_envelope_env_keys",
+        "host_envelope_returned",
+        "last_recovery_action",
+        "meta_contract_gate",
+        "ok",
+        "operator_session_role",
+        "parent_task_id",
+        "post_qa_merge_conflict_rejoin_authority",
+        "post_qa_merge_conflict_rejoin_diagnostics",
+        "post_qa_rejoin_retarget_authority",
+        "post_qa_rejoin_retarget_diagnostics",
+        "post_qa_rejoin_retarget_result",
+        "previous_route_identity",
+        "previous_status",
+        "principal_id",
+        "project_id",
+        "raw_fence_token_persisted_to_timeline",
+        "raw_fence_token_returned_for_host_envelope",
+        "raw_session_token_persisted",
+        "read_receipt_event_ref",
+        "reason",
+        "reopen_for_failed_qa_revision",
+        "reopen_for_post_qa_merge_conflict",
+        "reopen_for_post_qa_target_retarget",
+        "reopen_for_revision",
+        "retry_round",
+        "revision_rejoin_applied",
+        "route_identity",
+        "route_identity_rebound",
+        "route_identity_source",
+        "route_identity_verified",
+        "route_lineage",
+        "runtime_context_id",
+        "schema_version",
+        "session_token_lease",
+        "session_token_persisted",
+        "session_token_ref",
+        "startup_event_ref",
+        "status",
+        "task_id",
+        "timeline_reopen_for_revision",
+        "ttl_seconds",
+        "validated_missing_finish_rejoin_authority",
+        "worker_evidence_synthesized",
+        "worker_id",
+        "worker_role",
+        "worker_slot_id",
+    }
+)
+_RUNTIME_CONTEXT_LEGACY_REJOIN_PRE_LINEAGE_PAYLOAD_KEYS = frozenset(
+    {
+        "pre_lineage_auth_only_rejoin",
+        "pre_lineage_rejoin_authority",
+    }
+)
 
 
 def _runtime_context_rejoin_stage_checkpoint(
@@ -40493,6 +40706,365 @@ def _runtime_context_rejoin_checkpoint_relation(
         else:
             advanced = True
     return "advanced" if advanced else "exact"
+
+
+def _runtime_context_legacy_v1_rejoin_audit(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    event: Mapping[str, Any],
+    current_baseline: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Decode a marker-less v1 rejoin audit without promoting it to new state.
+
+    The old response schema predates ``stage_checkpoint_id``.  Its closed
+    baseline and independently registered route/lease identities are enough to
+    derive the same checkpoint, but the immutable event is never rewritten.
+    """
+
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    baseline = (
+        payload.get("bounded_replacement_worker_write_baseline")
+        if isinstance(
+            payload.get("bounded_replacement_worker_write_baseline"),
+            Mapping,
+        )
+        else {}
+    )
+    applicable = bool(
+        payload.get("schema_version")
+        == "mf_subagent_session_token_rejoin_response.v1"
+        and "stage_checkpoint_id" not in baseline
+    )
+    projection: dict[str, Any] = {
+        "schema_version": "runtime_context.legacy_v1_rejoin_audit_reader.v1",
+        "applicable": applicable,
+        "valid": False,
+        "mode": "not_legacy_v1",
+        "relation": "invalid",
+        "source_event_ref": f"timeline:{event.get('id', '')}",
+    }
+    if not applicable:
+        return projection
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    event_session_ref = str(payload.get("session_token_ref") or "").strip()
+    errors: list[str] = []
+    if not (
+        str(event.get("event_type") or "").strip()
+        == "observer.runtime_context_session_token_rejoin"
+        and str(event.get("event_kind") or "").strip() == "observer_command"
+        and str(event.get("phase") or "").strip()
+        == "runtime_context_recovery"
+        and str(event.get("status") or "").strip().lower() == "accepted"
+        and str(event.get("task_id") or "").strip() == task_id
+        and str(event.get("backlog_id") or "").strip() == backlog_id
+    ):
+        errors.append("event_envelope_mismatch")
+    expected_payload_identity = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+    }
+    if str(payload.get("action") or "").strip() != (
+        "runtime_context_session_token_rejoin"
+    ):
+        errors.append("action_mismatch")
+    for field, expected in expected_payload_identity.items():
+        if not expected or str(payload.get(field) or "").strip() != expected:
+            errors.append(f"{field}_mismatch")
+    if (
+        payload.get("raw_session_token_persisted") is not False
+        or payload.get("session_token_persisted") is not False
+        or payload.get("raw_fence_token_persisted_to_timeline") is not False
+        or payload.get("host_envelope_returned") is not True
+        or str(payload.get("delivery") or "").strip()
+        != "worker_host_envelope"
+    ):
+        errors.append("privacy_or_delivery_mismatch")
+
+    if set(baseline) != _RUNTIME_CONTEXT_LEGACY_REJOIN_BASELINE_KEYS:
+        errors.append("baseline_closed_schema_mismatch")
+    baseline_checkpoint = _runtime_context_rejoin_stage_checkpoint(baseline)
+    if not baseline_checkpoint:
+        errors.append("baseline_core_invalid")
+
+    route_identity = (
+        payload.get("route_identity")
+        if isinstance(payload.get("route_identity"), Mapping)
+        else {}
+    )
+    if set(route_identity) != set(_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS):
+        errors.append("route_identity_closed_schema_mismatch")
+    latest_route_identity = _runtime_context_latest_route_identity(conn, context)
+    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+        if (
+            not str(route_identity.get(field) or "").strip()
+            or str(route_identity.get(field) or "").strip()
+            != str(latest_route_identity.get(field) or "").strip()
+        ):
+            errors.append(f"route_identity_{field}_mismatch")
+    from . import observer_route_context
+
+    registered_routes: list[Mapping[str, Any]] = []
+    for route_task_id in dict.fromkeys((parent_task_id, task_id)):
+        try:
+            candidate = observer_route_context.resolve_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=str(
+                    route_identity.get("route_token_ref") or ""
+                ).strip(),
+                backlog_id=backlog_id,
+                task_id=route_task_id,
+            )
+        except observer_route_context.RouteTokenRefError:
+            continue
+        if candidate and not any(dict(candidate) == dict(item) for item in registered_routes):
+            registered_routes.append(candidate)
+    registered_route = registered_routes[0] if len(registered_routes) == 1 else {}
+    if (
+        str((registered_route or {}).get("status") or "").strip()
+        != "active"
+        or any(
+            str((registered_route or {}).get(field) or "").strip()
+            != str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
+    ):
+        errors.append("route_registry_mismatch")
+
+    lease = (
+        payload.get("session_token_lease")
+        if isinstance(payload.get("session_token_lease"), Mapping)
+        else {}
+    )
+    if set(lease) != _RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS:
+        errors.append("lease_closed_schema_mismatch")
+    if not (
+        event_session_ref
+        and str(lease.get("session_token_ref") or "").strip()
+        == event_session_ref
+        and str(lease.get("schema_version") or "").strip()
+        == "mf_subagent_runtime_session_token_lease.v1"
+        and str(lease.get("status") or "").strip() == "active"
+        and lease.get("has_lease") is True
+        and lease.get("authorization_valid") is True
+        and lease.get("expired") is False
+        and lease.get("lease_record_valid") is True
+        and lease.get("raw_session_token_exposed") is False
+        and lease.get("raw_session_token_persisted") is False
+        and str(lease.get("lease_id") or "").strip()
+        and str(lease.get("lease_expires_at") or "").strip()
+    ):
+        errors.append("lease_binding_mismatch")
+    from .parallel_branch_runtime import runtime_context_session_token_ref
+
+    if event_session_ref == runtime_context_session_token_ref(context):
+        if (
+            str(lease.get("lease_id") or "").strip()
+            != str(getattr(context, "lease_id", "") or "").strip()
+            or str(lease.get("lease_expires_at") or "").strip()
+            != str(getattr(context, "lease_expires_at", "") or "").strip()
+        ):
+            errors.append("current_lease_registry_mismatch")
+
+    sequence = (
+        payload.get("contract_runtime_worker_sequence")
+        if isinstance(payload.get("contract_runtime_worker_sequence"), Mapping)
+        else {}
+    )
+    if sequence and any(
+        str(sequence.get(field) or "").strip() != expected
+        for field, expected in (
+            ("contract_execution_id", parent_task_id),
+            ("parent_task_id", parent_task_id),
+            ("runtime_context_id", runtime_context_id),
+            ("task_id", task_id),
+        )
+    ):
+        errors.append("contract_runtime_source_identity_mismatch")
+
+    kind = str(payload.get("bounded_rejoin_kind") or "").strip()
+    base_payload_keys = set(_RUNTIME_CONTEXT_LEGACY_REJOIN_PAYLOAD_KEYS)
+    pre_lineage_payload_keys = base_payload_keys | set(
+        _RUNTIME_CONTEXT_LEGACY_REJOIN_PRE_LINEAGE_PAYLOAD_KEYS
+    )
+    if set(payload) not in {
+        frozenset(base_payload_keys),
+        frozenset(pre_lineage_payload_keys),
+    }:
+        errors.append("payload_closed_schema_mismatch")
+    authority = (
+        payload.get("bounded_replacement_rejoin_authority")
+        if isinstance(payload.get("bounded_replacement_rejoin_authority"), Mapping)
+        else None
+    )
+    replacement_authority_valid = bool(
+        isinstance(authority, Mapping)
+        and set(authority)
+        == _RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS
+        and authority.get("schema_version")
+        == "runtime_context.bounded_replacement_rejoin_authority.v1"
+        and authority.get("server_derived") is True
+        and authority.get("caller_claims_trusted") is False
+        and authority.get("applicable") is True
+        and authority.get("eligible") is True
+        and authority.get("mode")
+        == "bounded_post_lineage_replacement_auth_only"
+        and authority.get("replacement_generation") == 1
+        and authority.get("errors") == []
+        and authority.get("identity_mismatches") == []
+        and dict(authority.get("expected_worker_write_baseline") or {})
+        == dict(baseline)
+        and dict(authority.get("actual_worker_write_baseline") or {})
+        == dict(baseline)
+        and re.fullmatch(
+            r"timeline:[1-9][0-9]*",
+            str(authority.get("source_event_ref") or ""),
+        )
+    )
+    if kind == "bounded_replacement_rejoin" and replacement_authority_valid:
+        from . import task_timeline
+
+        source_event_ref = str(authority.get("source_event_ref") or "")
+        source_event_id = int(source_event_ref.removeprefix("timeline:"))
+        source_events = [
+            item
+            for item in task_timeline.list_events(
+                conn,
+                project_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+            )
+            if int(item.get("id") or 0) == source_event_id
+        ]
+        source_event = source_events[0] if len(source_events) == 1 else {}
+        source_payload = (
+            source_event.get("payload")
+            if isinstance(source_event.get("payload"), Mapping)
+            else {}
+        )
+        source_read = (
+            _runtime_context_legacy_v1_rejoin_audit(
+                conn,
+                project_id=project_id,
+                context=context,
+                event=source_event,
+                current_baseline=current_baseline,
+            )
+            if source_event
+            and int(source_event.get("id") or 0) < int(event.get("id") or 0)
+            and str(source_payload.get("bounded_rejoin_kind") or "").strip()
+            in {"special_authority_rejoin", "ordinary_initial_rejoin"}
+            else {}
+        )
+        if not (
+            source_read.get("valid") is True
+            and dict(
+                source_payload.get("bounded_replacement_worker_write_baseline")
+                or {}
+            )
+            == dict(baseline)
+            and str(source_payload.get("session_token_ref") or "").strip()
+            == str(authority.get("current_session_token_ref") or "").strip()
+            and str(source_payload.get("last_recovery_action") or "").strip()
+            == str(authority.get("last_recovery_action") or "").strip()
+        ):
+            replacement_authority_valid = False
+            errors.append("replacement_source_authority_mismatch")
+    pre_source_baseline = bool(
+        str(baseline.get("contract_execution_id") or "").strip() == ""
+        and baseline.get("contract_runtime_completed_line_count") == 0
+        and baseline.get("timeline_worker_write_count") == 0
+        and str(baseline.get("contract_runtime_completed_lines_hash") or "")
+        == stable_sha256([])
+        and str(baseline.get("timeline_worker_write_hash") or "")
+        == stable_sha256([])
+    )
+    pre_checkpoint_bootstrap = bool(
+        pre_source_baseline
+        and (
+            (
+                kind == "special_authority_rejoin"
+                and payload.get("pre_lineage_auth_only_rejoin") is True
+                and authority == {}
+            )
+            or (
+                kind == "bounded_replacement_rejoin"
+                and payload.get("bounded_replacement_rejoin") is True
+                and replacement_authority_valid
+            )
+        )
+    )
+    if pre_checkpoint_bootstrap:
+        relation = "pre_checkpoint_bootstrap"
+    else:
+        if str(baseline.get("contract_execution_id") or "").strip() != parent_task_id:
+            errors.append("baseline_contract_execution_id_mismatch")
+        relation = _runtime_context_rejoin_checkpoint_relation(
+            baseline,
+            current_baseline,
+        )
+        if relation == "invalid":
+            errors.append("checkpoint_relation_invalid")
+        if kind == "bounded_replacement_rejoin":
+            if not replacement_authority_valid:
+                errors.append("replacement_authority_mismatch")
+        elif kind == "ordinary_initial_rejoin":
+            if (
+                not isinstance(authority, Mapping)
+                or set(authority)
+                != _RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS
+                or authority.get("schema_version")
+                != "runtime_context.bounded_replacement_rejoin_authority.v1"
+                or authority.get("server_derived") is not True
+                or authority.get("caller_claims_trusted") is not False
+                or authority.get("applicable") is not False
+                or authority.get("eligible") is not False
+                or authority.get("mode") != "not_applicable"
+                or authority.get("replacement_generation") != 0
+                or authority.get("errors") != []
+                or authority.get("identity_mismatches") != []
+            ):
+                errors.append("ordinary_authority_mismatch")
+        elif kind == "special_authority_rejoin":
+            if (
+                payload.get("pre_lineage_auth_only_rejoin") is not True
+                or authority != {}
+            ):
+                errors.append("special_authority_mismatch")
+        else:
+            errors.append("bounded_rejoin_kind_invalid")
+
+    projection.update(
+        {
+            "valid": not errors,
+            "mode": (
+                "legacy_pre_checkpoint_bootstrap"
+                if pre_checkpoint_bootstrap
+                else "legacy_stage_checkpoint"
+            ),
+            "relation": relation if not errors else "invalid",
+            "stage_checkpoint": dict(baseline_checkpoint),
+            "errors": errors,
+        }
+    )
+    return projection
 
 
 def _runtime_context_rejoin_worker_write_baseline(
@@ -40700,6 +41272,7 @@ def _runtime_context_bounded_replacement_rejoin_authority(
     current_special_events: list[Mapping[str, Any]] = []
     advanced_checkpoint_events: list[Mapping[str, Any]] = []
     invalid_checkpoint_events: list[Mapping[str, Any]] = []
+    legacy_precheckpoint_events: list[Mapping[str, Any]] = []
     for event in timeline_events:
         payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
         bounded_rejoin_kind = str(
@@ -40724,10 +41297,26 @@ def _runtime_context_bounded_replacement_rejoin_authority(
                 and payload.get("pre_lineage_auth_only_rejoin") is not True
             ):
                 continue
-            relation = _runtime_context_rejoin_checkpoint_relation(
-                payload.get("bounded_replacement_worker_write_baseline"),
-                current_baseline,
+            legacy_audit = _runtime_context_legacy_v1_rejoin_audit(
+                conn,
+                project_id=project_id,
+                context=context,
+                event=event,
+                current_baseline=current_baseline,
             )
+            if legacy_audit.get("applicable") is True:
+                if legacy_audit.get("valid") is not True:
+                    invalid_checkpoint_events.append(event)
+                    continue
+                relation = str(legacy_audit.get("relation") or "").strip()
+                if relation == "pre_checkpoint_bootstrap":
+                    legacy_precheckpoint_events.append(event)
+                    continue
+            else:
+                relation = _runtime_context_rejoin_checkpoint_relation(
+                    payload.get("bounded_replacement_worker_write_baseline"),
+                    current_baseline,
+                )
             if relation == "invalid":
                 invalid_checkpoint_events.append(event)
             elif relation == "advanced":
@@ -40742,6 +41331,10 @@ def _runtime_context_bounded_replacement_rejoin_authority(
     projection["historical_advanced_checkpoint_event_refs"] = [
         f"timeline:{event.get('id', '')}"
         for event in advanced_checkpoint_events
+    ]
+    projection["historical_legacy_precheckpoint_event_refs"] = [
+        f"timeline:{event.get('id', '')}"
+        for event in legacy_precheckpoint_events
     ]
     if invalid_checkpoint_events:
         projection.update(
