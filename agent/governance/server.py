@@ -40346,6 +40346,48 @@ def _runtime_context_rotate_validated_missing_finish_auth(
     }
 
 
+def _runtime_context_closed_canonical_owned_file_set(
+    values: Any,
+) -> tuple[str, ...]:
+    """Return one strict order-independent repo-relative file set.
+
+    Empty, duplicate, absolute, traversal, placeholder, and non-canonical path
+    spellings are invalid.  Returning an empty tuple is therefore a fail-closed
+    result, not an empty file fence.
+    """
+
+    if not isinstance(values, (list, tuple)) or not values:
+        return ()
+    canonical_files: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            return ()
+        path = value.strip()
+        if (
+            not path
+            or path != value
+            or path.startswith("<")
+            or "\\" in path
+            or "\x00" in path
+            or Path(path).is_absolute()
+            or re.match(r"^[A-Za-z]:/", path)
+        ):
+            return ()
+        normalized = os.path.normpath(path).replace(os.sep, "/")
+        if (
+            normalized != path
+            or normalized in {"", ".", ".."}
+            or normalized.startswith("../")
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or normalized in seen
+        ):
+            return ()
+        seen.add(normalized)
+        canonical_files.append(normalized)
+    return tuple(sorted(canonical_files))
+
+
 def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
     conn,
     *,
@@ -40505,7 +40547,7 @@ def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
         }
         if durable_values != {identity[field]}:
             return {}
-    expected_owned_files = list(
+    expected_owned_files = _runtime_context_closed_canonical_owned_file_set(
         getattr(context, "owned_files", ())
         or getattr(context, "target_files", ())
         or ()
@@ -40518,7 +40560,11 @@ def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
     if (
         not expected_owned_files
         or not dispatch_owned_files
-        or any(files != expected_owned_files for files in dispatch_owned_files)
+        or any(
+            _runtime_context_closed_canonical_owned_file_set(files)
+            != expected_owned_files
+            for files in dispatch_owned_files
+        )
     ):
         return {}
     agent_candidates = {
@@ -40551,7 +40597,7 @@ def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
         ).strip().lower(),
         **identity,
         "route_identity": dict(dispatch_route_identities[0]),
-        "owned_files": expected_owned_files,
+        "owned_files": list(expected_owned_files),
         "agent_id": dispatch_agent_id,
         "raw_credentials_persisted": False,
     }

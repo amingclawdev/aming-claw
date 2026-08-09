@@ -52206,6 +52206,9 @@ def _setup_pre_lineage_rejoin_recovery_case(
     initial_join_omit_identity_field: str = "",
     pre_initial_join_dispatch_drift_field: str = "",
     dispatch_status: str = "",
+    context_owned_files: tuple[str, ...] = ("agent/governance/server.py",),
+    dispatch_owned_files: tuple[str, ...] | None = None,
+    pre_initial_join_snapshot: dict[str, Any] | None = None,
 ):
     """Create one accepted initial join with no read/startup lineage."""
 
@@ -52233,7 +52236,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
                 target_project_root=str(target_root),
                 contract_execution_id=parent_task_id,
                 base_commit="a" * 40,
-                owned_files=("agent/governance/server.py",),
+                owned_files=context_owned_files,
                 parent_task_is_contract_execution=True,
             )
         )
@@ -52258,8 +52261,8 @@ def _setup_pre_lineage_rejoin_recovery_case(
             target_project_id=PID,
             target_project_root=str(target_root),
             worktree_path=str(target_root),
-            target_files=("agent/governance/server.py",),
-            owned_files=("agent/governance/server.py",),
+            target_files=context_owned_files,
+            owned_files=context_owned_files,
             task_id=task_id,
             batch_id=batch_id,
             parent_task_id=parent_task_id,
@@ -52316,7 +52319,11 @@ def _setup_pre_lineage_rejoin_recovery_case(
                 "base_commit": context.base_commit,
                 "target_head_commit": context.target_head_commit,
                 "merge_queue_id": context.merge_queue_id,
-                "owned_files": list(context.owned_files),
+                "owned_files": list(
+                    dispatch_owned_files
+                    if dispatch_owned_files is not None
+                    else context.owned_files
+                ),
             }
         ]
         dispatch["payload"] = dispatch_payload
@@ -52416,7 +52423,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
         conn,
         backlog_id=backlog_id,
         task_id=task_id,
-        target_files=["agent/governance/server.py"],
+        target_files=list(context_owned_files),
         **route_identity,
     )
     append_branch_contract_revision(
@@ -52482,6 +52489,18 @@ def _setup_pre_lineage_rejoin_recovery_case(
             body=initial_join_body,
         )
     )
+    if pre_initial_join_snapshot is not None:
+        pre_initial_join_snapshot.update(
+            {
+                "database_dump": "\n".join(conn.iterdump()),
+                "total_changes": conn.total_changes,
+                "task_id": task_id,
+                "backlog_id": backlog_id,
+                "runtime_context_id": context.runtime_context_id,
+                "worker_session_id": worker_session_id,
+                "fence_token": context.fence_token,
+            }
+        )
     initial_join = (
         server.handle_graph_governance_runtime_context_session_token_initial_join(
             initial_join_ctx
@@ -53833,6 +53852,198 @@ def test_runtime_context_initial_join_accepts_canonical_passed_dispatch_line(
         )
     )
     assert anchor["payload"]["caller_role"] == "observer"
+
+
+def test_runtime_context_initial_join_accepts_reordered_same_closed_owned_file_set(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    requested_owned_files = (
+        "agent/governance/server.py",
+        "agent/mcp/tools.py",
+        "agent/governance/mcp_server.py",
+        "agent/tests/test_graph_governance_api.py",
+        "agent/tests/test_mcp_tools.py",
+    )
+    canonical_dispatch_owned_files = tuple(sorted(requested_owned_files))
+    assert canonical_dispatch_owned_files != requested_owned_files
+
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="reordered-same-closed-owned-file-set",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+        context_owned_files=requested_owned_files,
+        dispatch_owned_files=canonical_dispatch_owned_files,
+    )
+
+    assert case["initial_join"]["ok"] is True
+    anchor = case["initial_join"]["canonical_identity_binding"][
+        "contract_dispatch_identity_anchor"
+    ]
+    assert anchor["owned_files"] == list(canonical_dispatch_owned_files)
+    serialized_events = json.dumps(
+        _pre_lineage_case_events(conn, case),
+        sort_keys=True,
+    )
+    assert case["initial_join"]["session_token"] not in serialized_events
+    assert case["initial_join"]["fence_token"] not in serialized_events
+
+
+@pytest.mark.parametrize(
+    ("case_name", "dispatch_owned_files", "worker_identity_drift"),
+    [
+        (
+            "missing",
+            (
+                "agent/governance/mcp_server.py",
+                "agent/governance/server.py",
+                "agent/mcp/tools.py",
+                "agent/tests/test_graph_governance_api.py",
+            ),
+            None,
+        ),
+        (
+            "extra",
+            (
+                "agent/governance/mcp_server.py",
+                "agent/governance/server.py",
+                "agent/mcp/tools.py",
+                "agent/tests/test_graph_governance_api.py",
+                "agent/tests/test_mcp_tools.py",
+                "agent/tests/test_parallel_branch_runtime.py",
+            ),
+            None,
+        ),
+        (
+            "duplicate",
+            (
+                "agent/governance/mcp_server.py",
+                "agent/governance/server.py",
+                "agent/governance/server.py",
+                "agent/mcp/tools.py",
+                "agent/tests/test_graph_governance_api.py",
+                "agent/tests/test_mcp_tools.py",
+            ),
+            None,
+        ),
+        (
+            "empty",
+            (
+                "",
+                "agent/governance/mcp_server.py",
+                "agent/governance/server.py",
+                "agent/mcp/tools.py",
+                "agent/tests/test_graph_governance_api.py",
+                "agent/tests/test_mcp_tools.py",
+            ),
+            None,
+        ),
+        (
+            "path-drift",
+            (
+                "agent/governance/mcp_server.py",
+                "agent/governance/./server.py",
+                "agent/mcp/tools.py",
+                "agent/tests/test_graph_governance_api.py",
+                "agent/tests/test_mcp_tools.py",
+            ),
+            None,
+        ),
+        (
+            "identity-drift",
+            (
+                "agent/governance/mcp_server.py",
+                "agent/governance/server.py",
+                "agent/mcp/tools.py",
+                "agent/tests/test_graph_governance_api.py",
+                "agent/tests/test_mcp_tools.py",
+            ),
+            {
+                "worker_id": "forged-owned-file-equivalence-worker",
+                "worker_slot_id": "forged-owned-file-equivalence-worker",
+                "agent_id": "forged-owned-file-equivalence-worker",
+                "allocation_owner": "forged-owned-file-equivalence-worker",
+            },
+        ),
+    ],
+)
+def test_runtime_context_initial_join_owned_file_equivalence_drift_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    case_name,
+    dispatch_owned_files,
+    worker_identity_drift,
+):
+    requested_owned_files = (
+        "agent/governance/server.py",
+        "agent/mcp/tools.py",
+        "agent/governance/mcp_server.py",
+        "agent/tests/test_graph_governance_api.py",
+        "agent/tests/test_mcp_tools.py",
+    )
+    snapshot: dict[str, Any] = {}
+
+    with pytest.raises(GovernanceError) as rejected:
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=f"owned-file-equivalence-{case_name}",
+            source_backed_contract_runtime=True,
+            dispatch_status="passed",
+            context_owned_files=requested_owned_files,
+            dispatch_owned_files=dispatch_owned_files,
+            pre_initial_join_worker_identity=worker_identity_drift,
+            pre_initial_join_snapshot=snapshot,
+        )
+
+    assert rejected.value.code == (
+        "runtime_context_initial_join_dispatch_identity_mismatch"
+    )
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["timeline_event_persisted"] is False
+    assert rejected.value.details["credential_rotated"] is False
+    assert "\n".join(conn.iterdump()) == snapshot["database_dump"]
+    assert conn.total_changes == snapshot["total_changes"]
+    context = get_branch_context(conn, PID, snapshot["task_id"])
+    assert context is not None
+    assert context.actual_host_worker_id == ""
+    assert context.lease_id == ""
+    assert context.session_token_hash == ""
+    assert context.last_recovery_action == ""
+    assert not [
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            task_id=snapshot["task_id"],
+            backlog_id=snapshot["backlog_id"],
+        )
+        if (event.get("payload") or {}).get("action")
+        in {
+            "runtime_context_session_token_initial_join",
+            (
+                "runtime_context_session_token_initial_join_"
+                "identity_binding_anchor"
+            ),
+        }
+    ]
+    serialized_rejection = json.dumps(
+        {
+            "code": rejected.value.code,
+            "details": rejected.value.details,
+        },
+        sort_keys=True,
+    )
+    assert snapshot["worker_session_id"] not in serialized_rejection
+    assert snapshot["fence_token"] not in serialized_rejection
+    assert "session_token" not in serialized_rejection
+    assert "fence_token" not in serialized_rejection
 
 
 def test_pre_lineage_rejoin_guide_advertises_one_bounded_replacement(
