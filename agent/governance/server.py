@@ -126279,6 +126279,113 @@ def _contract_runtime_close_authority_explicit_commit(
     return ""
 
 
+def _contract_runtime_mf_parallel_close_ready_server_commit_bridge(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    close_ready_line: Mapping[str, Any],
+    qa_line: Mapping[str, Any],
+    reconcile_line: Mapping[str, Any],
+    reconcile_diagnostic: Mapping[str, Any],
+    close_commit: str,
+) -> dict[str, Any]:
+    """Resolve a missing close-ready commit from closed server authority.
+
+    Early rev8/9 multi-lane close-ready writes retained the exact, server-
+    derived worker set but did not copy the final commit onto the completed
+    line.  Do not rewrite that history and do not trust a caller-supplied
+    replacement.  A bridge is available only when the retained worker set can
+    be recomputed exactly and the independently accepted reconcile and QA
+    lines both bind the requested closing commit.
+    """
+
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    normalized_close_commit = str(close_commit or "").strip()
+    if not (
+        conn is not None
+        and execution_id
+        and normalized_close_commit
+        and _is_mf_parallel_postmerge_revision(record)
+        and str(close_ready_line.get("line_id") or "").strip()
+        == "observer_close_ready"
+        and str(close_ready_line.get("evidence_kind") or "").strip()
+        == "close_ready"
+        and str(close_ready_line.get("actor_role") or "").strip()
+        == "observer"
+        and _contract_runtime_line_status_passes(close_ready_line)
+        and not _contract_runtime_close_authority_explicit_commit(
+            close_ready_line
+        )
+        and reconcile_diagnostic.get("passed") is True
+    ):
+        return {}
+    payload = _contract_runtime_close_authority_line_payload(
+        close_ready_line
+    )
+    if not (
+        str(close_ready_line.get("task_id") or "").strip()
+        == execution_id
+        and str(close_ready_line.get("line_instance_id") or "").strip()
+        == f"task:{execution_id}"
+        and str(payload.get("contract_execution_id") or "").strip()
+        == execution_id
+    ):
+        return {}
+    retained = (
+        payload.get("retained_contract_envelope")
+        if isinstance(
+            payload.get("retained_contract_envelope"), Mapping
+        )
+        else {}
+    )
+    expected = _contract_runtime_close_ready_worker_set_authority(
+        conn,
+        project_id=(
+            project_id or str(record.get("project_id") or "").strip()
+        ),
+        record=record,
+    )
+    if not (
+        retained
+        and expected
+        and stable_sha256(retained) == stable_sha256(expected)
+        and _contract_runtime_authority_commit_matches(
+            normalized_close_commit,
+            _contract_runtime_close_authority_explicit_commit(
+                reconcile_line
+            ),
+        )
+        and _contract_runtime_authority_commit_matches(
+            normalized_close_commit,
+            _contract_runtime_close_authority_explicit_commit(qa_line),
+        )
+    ):
+        return {}
+    return {
+        "schema_version": (
+            "contract_runtime.observer_close_ready_server_commit_bridge.v1"
+        ),
+        "bridge": "db_verified_close_ready_worker_set_and_final_qa",
+        "requirement_id": "observer_close_ready",
+        "line_id": "observer_close_ready",
+        "close_commit": normalized_close_commit,
+        "contract_execution_id": execution_id,
+        "close_ready_source_ref": str(
+            close_ready_line.get("_source_ref") or ""
+        ),
+        "reconcile_source_ref": str(
+            reconcile_line.get("_source_ref") or ""
+        ),
+        "qa_source_ref": str(qa_line.get("_source_ref") or ""),
+        "retained_worker_set_hash": stable_sha256(retained),
+        "historical_line_rewritten": False,
+        "caller_commit_inference_used": False,
+        "server_derived": True,
+        "db_verified": True,
+    }
+
+
 def _contract_runtime_formal_no_pass_bypass_authorities(
     conn,
     *,
@@ -129573,6 +129680,28 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             actual_commit = _contract_runtime_close_authority_explicit_commit(line)
             close_commit_id = str(required_specs[requirement_id]["close_commit_id"])
             if not actual_commit:
+                if requirement_id == "observer_close_ready":
+                    server_commit_bridge = (
+                        _contract_runtime_mf_parallel_close_ready_server_commit_bridge(
+                            conn,
+                            project_id=project_id,
+                            record=record,
+                            close_ready_line=line,
+                            qa_line=found.get(
+                                "qa_independent_verification", {}
+                            ),
+                            reconcile_line=reconcile_authority_line,
+                            reconcile_diagnostic=(
+                                bypass_reconcile_diagnostic
+                            ),
+                            close_commit=close_commit,
+                        )
+                    )
+                    if server_commit_bridge:
+                        commit_bridge_diagnostics.append(
+                            server_commit_bridge
+                        )
+                        continue
                 missing.append(close_commit_id)
                 commit_mismatches.append({
                     "requirement_id": requirement_id,
@@ -129964,6 +130093,15 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                         "immutable_observer_close_ready_to_active_"
                         "descendant_close_head"
                     )
+                    for item in commit_bridge_diagnostics
+                )
+            ),
+            "observer_close_ready_server_commit_bridged": bool(
+                any(
+                    item.get("requirement_id")
+                    == "observer_close_ready"
+                    and item.get("bridge")
+                    == "db_verified_close_ready_worker_set_and_final_qa"
                     for item in commit_bridge_diagnostics
                 )
             ),

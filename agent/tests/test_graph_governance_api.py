@@ -72088,6 +72088,143 @@ def _mf_parallel_close_authority_v2_record(
     return record
 
 
+def test_statusless_close_ready_commit_bridge_requires_closed_server_authority(
+    monkeypatch,
+):
+    close_commit = "a" * 40
+    execution_id = "cex-statusless-close-ready-commit"
+    retained = {
+        "schema_version": (
+            "contract_runtime.observer_close_ready_retained_worker_set.v1"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "contract_execution_id": execution_id,
+        "workers": [{"runtime_context_id": "mfrctx-one"}],
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-STATUSLESS-CLOSE-READY-COMMIT",
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev8",
+    }
+    close_ready = {
+        "stage_id": "observer_close",
+        "line_id": "observer_close_ready",
+        "actor_role": "observer",
+        "evidence_kind": "close_ready",
+        "status": "passed",
+        "task_id": execution_id,
+        "line_instance_id": f"task:{execution_id}",
+        "payload": {
+            "contract_execution_id": execution_id,
+            "retained_contract_envelope": retained,
+        },
+        "_source_ref": f"contract_runtime:{execution_id}:completed_lines:21",
+    }
+    reconcile = {
+        "line_id": "observer_reconcile",
+        "commit_sha": close_commit,
+        "_source_ref": f"contract_runtime:{execution_id}:completed_lines:18",
+    }
+    qa = {
+        "line_id": "qa_independent_verification",
+        "commit_sha": close_commit,
+        "_source_ref": f"contract_runtime:{execution_id}:completed_lines:20",
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_close_ready_worker_set_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(retained),
+    )
+
+    def resolve(**overrides):
+        return server._contract_runtime_mf_parallel_close_ready_server_commit_bridge(
+            object(),
+            project_id=PID,
+            record=overrides.get("record", record),
+            close_ready_line=overrides.get("close_ready", close_ready),
+            qa_line=overrides.get("qa", qa),
+            reconcile_line=overrides.get("reconcile", reconcile),
+            reconcile_diagnostic=overrides.get(
+                "diagnostic", {"passed": True}
+            ),
+            close_commit=overrides.get("close_commit", close_commit),
+        )
+
+    accepted = resolve()
+    assert accepted["close_commit"] == close_commit
+    assert accepted["server_derived"] is True
+    assert accepted["db_verified"] is True
+    assert accepted["historical_line_rewritten"] is False
+    assert accepted["caller_commit_inference_used"] is False
+
+    wrong_envelope = copy.deepcopy(close_ready)
+    wrong_envelope["payload"]["retained_contract_envelope"]["workers"] = []
+    wrong_identity = copy.deepcopy(close_ready)
+    wrong_identity["line_instance_id"] = "task:cex-sibling"
+    explicit_caller_commit = copy.deepcopy(close_ready)
+    explicit_caller_commit["commit_sha"] = close_commit
+    for label, overrides in (
+        ("envelope", {"close_ready": wrong_envelope}),
+        ("identity", {"close_ready": wrong_identity}),
+        ("caller_commit", {"close_ready": explicit_caller_commit}),
+        ("qa_commit", {"qa": {**qa, "commit_sha": "b" * 40}}),
+        (
+            "reconcile_commit",
+            {"reconcile": {**reconcile, "commit_sha": "b" * 40}},
+        ),
+        ("diagnostic", {"diagnostic": {"passed": False}}),
+    ):
+        assert resolve(**overrides) == {}, label
+
+
+def test_close_authority_consumes_statusless_close_ready_server_commit_bridge(
+    monkeypatch,
+):
+    close_commit = "c" * 40
+    execution_id = "cex-statusless-close-ready-gate"
+    record = _mf_parallel_close_authority_v2_record(
+        execution_id,
+        close_commit=close_commit,
+        worker_commit=close_commit,
+        complete=True,
+    )
+    close_ready = next(
+        line
+        for line in record["completed_lines"]
+        if line["line_id"] == "observer_close_ready"
+    )
+    close_ready["commit_sha"] = ""
+    close_ready["payload"].pop("merge_commit", None)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_close_ready_server_commit_bridge",
+        lambda *_args, **_kwargs: {
+            "requirement_id": "observer_close_ready",
+            "bridge": "db_verified_close_ready_worker_set_and_final_qa",
+            "close_commit": close_commit,
+            "server_derived": True,
+            "db_verified": True,
+        },
+    )
+    gate = server._contract_runtime_mf_parallel_close_authority_gate(
+        [record],
+        chain_projection=_mf_parallel_close_authority_chain_projection(
+            execution_id
+        ),
+        close_commit=close_commit,
+    )
+    assert gate["passed"] is True, gate
+    assert gate["commit_mismatches"] == []
+    assert gate["checks"][
+        "observer_close_ready_server_commit_bridged"
+    ] is True
+    assert gate["commit_bridge_diagnostics"][-1]["server_derived"] is True
+
+
 def _record_formal_no_pass_close_bypass(
     conn,
     *,
