@@ -12595,10 +12595,27 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
         body["repo_root"] = target_root
     body["query_source"] = "mf_subagent"
     body["run_id"] = str(body.get("run_id") or "") or f"mf_subagent:{context.task_id}:fence:{fence_hash}"
-    canonical_route_identity = _runtime_context_latest_route_identity(
-        conn,
-        context,
+    setattr(ctx, "_validated_mf_sub_graph_query_context", context)
+    setattr(ctx, "_validated_mf_sub_graph_query_route_identity", route_identity)
+    return session
+
+
+def _bind_trusted_mf_sub_graph_query_authority(
+    ctx: RequestContext,
+    conn,
+    body: Mapping[str, Any],
+) -> None:
+    """Bind persistence authority after all earlier query gates succeed."""
+
+    context = getattr(ctx, "_validated_mf_sub_graph_query_context", None)
+    route_identity = getattr(
+        ctx,
+        "_validated_mf_sub_graph_query_route_identity",
+        {},
     )
+    if context is None or not isinstance(route_identity, Mapping):
+        return
+    canonical_route_identity = _runtime_context_latest_route_identity(conn, context)
     trusted_route_identity = {
         field: str(canonical_route_identity.get(field) or "").strip()
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
@@ -12643,7 +12660,6 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                 "raw_route_token_persisted": False,
             },
         )
-    return session
 
 
 def _require_graph_query_trace_capability(ctx: RequestContext, conn, trace: dict, action: str) -> dict:
@@ -65033,6 +65049,7 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_query_capability(ctx, conn, body, "graph-governance.query-trace.start")
+        _bind_trusted_mf_sub_graph_query_authority(ctx, conn, body)
         qa_proof = getattr(ctx, "_trusted_qa_graph_query_authority", {})
         qa_proof = qa_proof if isinstance(qa_proof, Mapping) else {}
         observer_proof = getattr(ctx, "_trusted_observer_graph_query_authority", {})
@@ -65531,15 +65548,16 @@ def handle_graph_governance_query(ctx: RequestContext):
         qa_proof = qa_proof if isinstance(qa_proof, Mapping) else {}
         observer_proof = getattr(ctx, "_trusted_observer_graph_query_authority", {})
         observer_proof = observer_proof if isinstance(observer_proof, Mapping) else {}
-        mf_sub_proof = getattr(ctx, "_trusted_mf_sub_graph_query_authority", {})
-        mf_sub_proof = mf_sub_proof if isinstance(mf_sub_proof, Mapping) else {}
-        route_proof = mf_sub_proof or observer_proof
         cross_project_contract_line = (
             _runtime_context_cross_project_graph_contract_preflight(
                 target_project_id=project_id,
                 body=body,
             )
         )
+        _bind_trusted_mf_sub_graph_query_authority(ctx, conn, body)
+        mf_sub_proof = getattr(ctx, "_trusted_mf_sub_graph_query_authority", {})
+        mf_sub_proof = mf_sub_proof if isinstance(mf_sub_proof, Mapping) else {}
+        route_proof = mf_sub_proof or observer_proof
         if root is None and (
             body.get("project_root")
             or body.get("target_project_root")
