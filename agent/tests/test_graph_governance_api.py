@@ -100695,6 +100695,273 @@ def test_hotfix_enter_source_backed_returns_successor_runtime_shape(conn):
     assert "cannot write line" in forged_qa["decision"]["errors"][0]
 
 
+def _completed_hotfix_attempt_action(
+    conn,
+    *,
+    backlog_id: str,
+    task_id: str,
+    route_token_ref: str,
+) -> tuple[dict, dict]:
+    predecessor = _start_source_backed_hotfix_successor(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=route_token_ref,
+    )
+    completed = _complete_source_backed_hotfix_successor(
+        conn,
+        predecessor["contract_execution_id"],
+    )
+    completed_state = server._runtime_current_state_from_record(completed)
+    conn.commit()
+    before = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+
+    with pytest.raises(ValidationError) as rejected:
+        server.handle_project_hotfix_enter(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "actor": "operator",
+                    "reason": "A new repair attempt is required.",
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "parent_contract_execution_id": predecessor[
+                        "parent_contract_execution_id"
+                    ],
+                    "route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before
+    details = rejected.value.details
+    assert details["blocker_id"] == "observer_hotfix_successor_already_complete"
+    assert details["next_legal_action"] == (
+        "start_attempt_scoped_observer_hotfix_successor"
+    )
+    action = details["canonical_executable_action"]
+    assert action["action"] == "start_attempt_scoped_observer_hotfix_successor"
+    assert action["facade"] == "observer_hotfix_enter"
+    assert action["mcp_tool"] == "observer_hotfix_enter"
+    assert action["path"] == "/api/projects/{project_id}/hotfix/enter"
+    assert action["body_source"] == "copy_safe_body"
+    assert action["copy_safe_body"] == details["action_input"]
+    assert details["copy_safe_body"] == details["action_input"]
+    assert action["copy_safe_body"]["project_id"] == PID
+    assert action["copy_safe_body"]["predecessor_contract_execution_id"] == (
+        predecessor["contract_execution_id"]
+    )
+    assert action["copy_safe_body"]["predecessor_execution_state_revision"] == (
+        completed_state["execution_state_revision"]
+    )
+    assert action["copy_safe_body"]["predecessor_execution_state_hash"] == (
+        completed_state["execution_state_hash"]
+    )
+    assert action["host_realization"]["required_replacement_paths"] == [
+        "copy_safe_body.task_id",
+        "copy_safe_body.successor_attempt_id",
+        "copy_safe_body.reason",
+    ]
+    assert details["writes_performed"] is False
+    assert details["mutation_performed"] is False
+    assert details["raw_route_token_exposed"] is False
+    return predecessor, action
+
+
+def _realize_hotfix_attempt_action(
+    action: dict,
+    *,
+    task_id: str,
+    successor_attempt_id: str,
+) -> dict:
+    body = dict(action["copy_safe_body"])
+    body.update(
+        {
+            "task_id": task_id,
+            "successor_attempt_id": successor_attempt_id,
+            "reason": f"Execute bounded observer hotfix attempt {successor_attempt_id}.",
+        }
+    )
+    return body
+
+
+def test_hotfix_enter_attempt_facade_succeeds_and_replays_without_write(conn):
+    backlog_id = "AC-HOTFIX-ATTEMPT-SUCCESS-REPLAY"
+    route_token_ref = "rtok-hotfix-attempt-success-replay"
+    predecessor, action = _completed_hotfix_attempt_action(
+        conn,
+        backlog_id=backlog_id,
+        task_id="hotfix-predecessor-success-replay",
+        route_token_ref=route_token_ref,
+    )
+    body = _realize_hotfix_attempt_action(
+        action,
+        task_id="hotfix-attempt-success-replay-2",
+        successor_attempt_id="attempt-success-replay-2",
+    )
+
+    entered = server.handle_project_hotfix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=body,
+        )
+    )
+
+    assert entered["ok"] is True
+    assert entered["attempt_scoped"] is True
+    assert entered["successor_attempt_id"] == "attempt-success-replay-2"
+    assert entered["predecessor_contract_execution_id"] == predecessor[
+        "contract_execution_id"
+    ]
+    assert entered["parent_contract_execution_id"] == predecessor[
+        "parent_contract_execution_id"
+    ]
+    assert entered["contract_execution_id"] != predecessor["contract_execution_id"]
+    assert entered["replayed"] is False
+    attempt_record = server._contract_runtime_store(conn).get(
+        entered["contract_execution_id"]
+    )
+    assert attempt_record["parent_contract_execution_id"] == predecessor[
+        "parent_contract_execution_id"
+    ]
+    assert attempt_record["metadata"]["attempt_scope"][
+        "predecessor_contract_execution_id"
+    ] == predecessor["contract_execution_id"]
+    before = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+
+    replayed = server.handle_project_hotfix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=body,
+        )
+    )
+
+    assert replayed["ok"] is True
+    assert replayed["replayed"] is True
+    assert replayed["contract_execution_id"] == entered["contract_execution_id"]
+    assert replayed["event"]["id"] == entered["event"]["id"]
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before
+
+
+def test_hotfix_enter_attempt_facade_creates_distinct_parent_siblings(conn):
+    backlog_id = "AC-HOTFIX-ATTEMPT-SIBLINGS"
+    route_token_ref = "rtok-hotfix-attempt-siblings"
+    predecessor, action = _completed_hotfix_attempt_action(
+        conn,
+        backlog_id=backlog_id,
+        task_id="hotfix-predecessor-siblings",
+        route_token_ref=route_token_ref,
+    )
+    entered = []
+    for suffix in ("a", "b"):
+        entered.append(
+            server.handle_project_hotfix_enter(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body=_realize_hotfix_attempt_action(
+                        action,
+                        task_id=f"hotfix-attempt-sibling-{suffix}",
+                        successor_attempt_id=f"attempt-sibling-{suffix}",
+                    ),
+                )
+            )
+        )
+
+    assert entered[0]["contract_execution_id"] != entered[1][
+        "contract_execution_id"
+    ]
+    assert {
+        item["parent_contract_execution_id"] for item in entered
+    } == {predecessor["parent_contract_execution_id"]}
+    assert {
+        item["predecessor_contract_execution_id"] for item in entered
+    } == {predecessor["contract_execution_id"]}
+    assert all(item["replayed"] is False for item in entered)
+
+
+def test_hotfix_enter_attempt_facade_rejects_stale_sibling_placeholder_and_widening(
+    conn,
+):
+    backlog_id = "AC-HOTFIX-ATTEMPT-INVALID"
+    route_token_ref = "rtok-hotfix-attempt-invalid"
+    predecessor, action = _completed_hotfix_attempt_action(
+        conn,
+        backlog_id=backlog_id,
+        task_id="hotfix-predecessor-invalid",
+        route_token_ref=route_token_ref,
+    )
+    sibling = server.handle_project_hotfix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=_realize_hotfix_attempt_action(
+                action,
+                task_id="hotfix-attempt-invalid-sibling",
+                successor_attempt_id="attempt-invalid-sibling",
+            ),
+        )
+    )
+    base = _realize_hotfix_attempt_action(
+        action,
+        task_id="hotfix-attempt-invalid-next",
+        successor_attempt_id="attempt-invalid-next",
+    )
+    invalid_bodies = []
+    stale = dict(base)
+    stale["predecessor_execution_state_revision"] += 1
+    invalid_bodies.append((stale, "predecessor_execution_state_revision"))
+    sibling_predecessor = dict(base)
+    sibling_predecessor["predecessor_contract_execution_id"] = sibling[
+        "contract_execution_id"
+    ]
+    invalid_bodies.append(
+        (sibling_predecessor, "predecessor_contract_execution_id")
+    )
+    placeholder = dict(base)
+    placeholder["successor_attempt_id"] = "<new unique attempt id>"
+    invalid_bodies.append((placeholder, "successor_attempt_id"))
+    widened = dict(base)
+    widened["owned_files"] = ["agent/governance/server.py"]
+    invalid_bodies.append((widened, "attempt_scope"))
+    predecessor_task = dict(base)
+    predecessor_task["task_id"] = "hotfix-predecessor-invalid"
+    invalid_bodies.append((predecessor_task, "task_id"))
+
+    for body, expected_field in invalid_bodies:
+        before = "\n".join(conn.iterdump())
+        before_changes = conn.total_changes
+        with pytest.raises(ValidationError) as rejected:
+            server.handle_project_hotfix_enter(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body=body,
+                )
+            )
+        assert rejected.value.details["blocker_id"] == (
+            "observer_hotfix_attempt_identity_invalid"
+        )
+        assert rejected.value.details["field"] == expected_field
+        assert rejected.value.details["writes_performed"] is False
+        assert rejected.value.details["mutation_performed"] is False
+        assert conn.total_changes == before_changes
+        assert "\n".join(conn.iterdump()) == before
+
+
 def test_hotfix_enter_accepts_verified_observer_route_ref(conn):
     backlog_id = "AC-HOTFIX-OBSERVER-REF"
     task_id = "hotfix-observer-ref-task"
@@ -127083,6 +127350,8 @@ def _complete_source_backed_hotfix_successor(
             line_id=line_id,
             evidence_kind=evidence_kind,
         )
+        if evidence_kind == "independent_verification":
+            write["status"] = "passed"
         if evidence_kind == "close_ready" and close_commit_sha:
             write["commit_sha"] = close_commit_sha
         result = runtime.submit_line_write(

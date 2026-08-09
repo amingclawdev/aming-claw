@@ -117636,6 +117636,373 @@ def _observer_hotfix_successor_execution_id(
     )
 
 
+def _observer_hotfix_attempt_successor_execution_id(
+    project_id: str,
+    backlog_id: str,
+    parent_execution_id: str,
+    successor_attempt_id: str,
+) -> str:
+    return _contract_runtime_stable_id(
+        "cex-hotfix-attempt",
+        project_id,
+        backlog_id,
+        parent_execution_id,
+        successor_attempt_id,
+    )
+
+
+_OBSERVER_HOTFIX_ATTEMPT_WIDENING_FIELDS = (
+    "changed_files",
+    "contract_chain_id",
+    "contract_execution_id",
+    "metadata",
+    "onboard_service_waiver",
+    "owned_files",
+    "root_contract_execution_id",
+    "successor_contract_execution_id",
+    "target_files",
+)
+
+
+def _observer_hotfix_attempt_action(
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_record: Mapping[str, Any],
+    predecessor_record: Mapping[str, Any],
+    route_token_ref: str,
+) -> dict[str, Any]:
+    parent_execution_id = str(
+        parent_record.get("contract_execution_id") or ""
+    ).strip()
+    predecessor_execution_id = str(
+        predecessor_record.get("contract_execution_id") or ""
+    ).strip()
+    predecessor_state = _runtime_current_state_from_record(predecessor_record)
+    body = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": "<new attempt-scoped task_id>",
+        "parent_contract_execution_id": parent_execution_id,
+        "predecessor_contract_execution_id": predecessor_execution_id,
+        "predecessor_execution_state_revision": predecessor_state[
+            "execution_state_revision"
+        ],
+        "predecessor_execution_state_hash": predecessor_state[
+            "execution_state_hash"
+        ],
+        "successor_attempt_id": "<new unique observer_hotfix attempt id>",
+        "actor": "operator",
+        "reason": "<human reason for the new observer_hotfix attempt>",
+        "route_token_ref": route_token_ref,
+    }
+    action = _guide_canonical_executable_action(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=parent_execution_id,
+        parent_contract_execution_id=parent_execution_id,
+        action="start_attempt_scoped_observer_hotfix_successor",
+        facade="observer_hotfix_enter",
+        mcp_tool="observer_hotfix_enter",
+        method="POST",
+        path="/api/projects/{project_id}/hotfix/enter",
+        stage_id="observer_hotfix_successor",
+        body=body,
+    )
+    action["host_realization"].update(
+        {
+            "required_replacement_paths": [
+                "copy_safe_body.task_id",
+                "copy_safe_body.successor_attempt_id",
+                "copy_safe_body.reason",
+            ],
+            "predecessor_fields_are_immutable": True,
+            "attempt_must_be_a_sibling_under_parent": True,
+        }
+    )
+    return action
+
+
+def _observer_hotfix_attempt_identity_mismatches(
+    *,
+    attempt_request: Mapping[str, Any],
+    task_id: str,
+    reason: str,
+    predecessor_record: Mapping[str, Any],
+    predecessor_execution_id: str,
+) -> list[dict[str, Any]]:
+    """Validate attempt identity without compiling or persisting runtime state."""
+
+    predecessor_state = _runtime_current_state_from_record(predecessor_record)
+    expected_predecessor_id = str(
+        attempt_request.get("predecessor_contract_execution_id") or ""
+    ).strip()
+    expected_predecessor_hash = str(
+        attempt_request.get("predecessor_execution_state_hash") or ""
+    ).strip()
+    try:
+        expected_predecessor_revision = int(
+            attempt_request.get("predecessor_execution_state_revision")
+        )
+    except (TypeError, ValueError):
+        expected_predecessor_revision = -1
+    successor_attempt_id = str(
+        attempt_request.get("successor_attempt_id") or ""
+    ).strip()
+    predecessor_task_id = str(
+        (predecessor_record.get("backlog_lineage") or {}).get("task_id")
+        if isinstance(predecessor_record.get("backlog_lineage"), Mapping)
+        else ""
+    ).strip()
+    invalid_fields: list[dict[str, Any]] = []
+    for field, expected, actual in (
+        (
+            "predecessor_contract_execution_id",
+            predecessor_execution_id,
+            expected_predecessor_id,
+        ),
+        (
+            "predecessor_execution_state_revision",
+            predecessor_state["execution_state_revision"],
+            expected_predecessor_revision,
+        ),
+        (
+            "predecessor_execution_state_hash",
+            predecessor_state["execution_state_hash"],
+            expected_predecessor_hash,
+        ),
+    ):
+        if actual != expected:
+            invalid_fields.append(
+                {"field": field, "expected": expected, "actual": actual}
+            )
+    if not _runtime_context_non_placeholder_text(successor_attempt_id):
+        invalid_fields.append(
+            {
+                "field": "successor_attempt_id",
+                "expected": "concrete non-placeholder attempt id",
+                "actual": successor_attempt_id,
+            }
+        )
+    if not _runtime_context_non_placeholder_text(task_id):
+        invalid_fields.append(
+            {
+                "field": "task_id",
+                "expected": "concrete new attempt-scoped task id",
+                "actual": task_id,
+            }
+        )
+    elif predecessor_task_id and task_id == predecessor_task_id:
+        invalid_fields.append(
+            {
+                "field": "task_id",
+                "expected": "new sibling task id",
+                "actual": task_id,
+            }
+        )
+    if not _runtime_context_non_placeholder_text(reason):
+        invalid_fields.append(
+            {
+                "field": "reason",
+                "expected": "concrete human reason",
+                "actual": reason,
+            }
+        )
+    widened_fields = [
+        field
+        for field in _OBSERVER_HOTFIX_ATTEMPT_WIDENING_FIELDS
+        if attempt_request.get(field) not in (None, "", [], {})
+    ]
+    if widened_fields:
+        invalid_fields.append(
+            {
+                "field": "attempt_scope",
+                "expected": "guide-projected identity-only body",
+                "actual": sorted(widened_fields),
+            }
+        )
+    return invalid_fields
+
+
+def _raise_observer_hotfix_attempt_identity_invalid(
+    invalid_fields: Sequence[Mapping[str, Any]],
+) -> None:
+    if not invalid_fields:
+        return
+    first = invalid_fields[0]
+    raise ValidationError(
+        "attempt-scoped observer_hotfix successor identity is invalid",
+        {
+            "blocker_id": "observer_hotfix_attempt_identity_invalid",
+            "field": first["field"],
+            "expected": first["expected"],
+            "actual": first["actual"],
+            "field_mismatches": [dict(item) for item in invalid_fields],
+            "writes_performed": False,
+            "mutation_performed": False,
+            "fail_closed": True,
+        },
+    )
+
+
+def _observer_hotfix_attempt_replay_matches(
+    record: Mapping[str, Any],
+    *,
+    successor_attempt_id: str,
+    task_id: str,
+    parent_execution_id: str,
+    predecessor_execution_id: str,
+) -> list[str]:
+    attempt_scope = (
+        record.get("metadata", {}).get("attempt_scope")
+        if isinstance(record.get("metadata"), Mapping)
+        and isinstance(record.get("metadata", {}).get("attempt_scope"), Mapping)
+        else {}
+    )
+    return [
+        field
+        for field, expected in {
+            "successor_attempt_id": successor_attempt_id,
+            "task_id": task_id,
+            "parent_contract_execution_id": parent_execution_id,
+            "predecessor_contract_execution_id": predecessor_execution_id,
+        }.items()
+        if str(attempt_scope.get(field) or "").strip()
+        != str(expected or "").strip()
+    ]
+
+
+def _observer_hotfix_attempt_prewrite_gate(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    parent_execution_id: str,
+    route_token_ref: str,
+    reason: str,
+    attempt_request: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reject or replay completed-predecessor attempts before any projection write."""
+
+    if not parent_execution_id:
+        return {}
+    runtime = _contract_runtime(conn)
+    try:
+        parent_record = runtime.store.get(parent_execution_id)
+    except ContractRuntimeError:
+        return {}
+    if (
+        str(parent_record.get("project_id") or "") != project_id
+        or str(parent_record.get("backlog_id") or "") != backlog_id
+    ):
+        return {}
+    predecessor_execution_id = _observer_hotfix_successor_execution_id(
+        project_id,
+        backlog_id,
+        parent_execution_id,
+    )
+    try:
+        predecessor_record = runtime.store.get(predecessor_execution_id)
+    except ContractRuntimeError:
+        return {}
+    if not _runtime_record_is_complete(predecessor_record):
+        return {}
+
+    successor_attempt_id = str(
+        attempt_request.get("successor_attempt_id") or ""
+    ).strip()
+    if not successor_attempt_id:
+        action = _observer_hotfix_attempt_action(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_record=parent_record,
+            predecessor_record=predecessor_record,
+            route_token_ref=route_token_ref,
+        )
+        raise ValidationError(
+            "observer_hotfix successor runtime is already complete",
+            {
+                "blocker_id": "observer_hotfix_successor_already_complete",
+                "recoverable": True,
+                "next_legal_action": (
+                    "start_attempt_scoped_observer_hotfix_successor"
+                ),
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "successor_contract_execution_id": predecessor_execution_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "root_contract_execution_id": str(
+                    parent_record.get("root_contract_execution_id")
+                    or parent_execution_id
+                ),
+                "contract_chain_id": str(
+                    parent_record.get("contract_chain_id") or ""
+                ),
+                "route_token_ref": route_token_ref,
+                "facade": action["facade"],
+                "mcp_tool": action["mcp_tool"],
+                "method": action["method"],
+                "path": action["path"],
+                "body_source": action["body_source"],
+                "copy_safe_body": dict(action["copy_safe_body"]),
+                "action_input": dict(action["copy_safe_body"]),
+                "canonical_executable_action": action,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "raw_route_token_required": False,
+                "raw_route_token_exposed": False,
+            },
+        )
+
+    _raise_observer_hotfix_attempt_identity_invalid(
+        _observer_hotfix_attempt_identity_mismatches(
+            attempt_request=attempt_request,
+            task_id=task_id,
+            reason=reason,
+            predecessor_record=predecessor_record,
+            predecessor_execution_id=predecessor_execution_id,
+        )
+    )
+    successor_execution_id = _observer_hotfix_attempt_successor_execution_id(
+        project_id,
+        backlog_id,
+        parent_execution_id,
+        successor_attempt_id,
+    )
+    try:
+        successor = runtime.store.get(successor_execution_id)
+    except ContractRuntimeError:
+        return {
+            "status": "validated_new_attempt",
+            "parent_record": parent_record,
+            "predecessor_record": predecessor_record,
+        }
+    replay_mismatches = _observer_hotfix_attempt_replay_matches(
+        successor,
+        successor_attempt_id=successor_attempt_id,
+        task_id=task_id,
+        parent_execution_id=parent_execution_id,
+        predecessor_execution_id=predecessor_execution_id,
+    )
+    if replay_mismatches:
+        raise ValidationError(
+            "observer_hotfix attempt replay conflicts with existing sibling",
+            {
+                "blocker_id": "observer_hotfix_attempt_replay_mismatch",
+                "mismatched_fields": replay_mismatches,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "fail_closed": True,
+            },
+        )
+    return {
+        "status": "replayed",
+        "parent_record": parent_record,
+    }
+
+
 def _direct_fix_successor_execution_id(
     project_id: str,
     backlog_id: str,
@@ -120711,6 +121078,7 @@ def _observer_hotfix_successor_runtime_enter(
     actor_role: str,
     route_token_ref: str,
     reason: str,
+    attempt_request: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime = _contract_runtime(conn)
     store = runtime.store
@@ -120719,9 +121087,104 @@ def _observer_hotfix_successor_runtime_enter(
         parent_record.get("root_contract_execution_id") or parent_execution_id
     )
     chain_id = str(parent_record.get("contract_chain_id") or "")
-    successor_execution_id = _observer_hotfix_successor_execution_id(
+    canonical_successor_execution_id = _observer_hotfix_successor_execution_id(
         project_id, backlog_id, parent_execution_id
     )
+    attempt_request = attempt_request or {}
+    successor_attempt_id = str(
+        attempt_request.get("successor_attempt_id") or ""
+    ).strip()
+    attempt_scoped = False
+    predecessor_record: dict[str, Any] = {}
+    try:
+        canonical_successor = store.get(canonical_successor_execution_id)
+    except ContractRuntimeError:
+        canonical_successor = {}
+    if canonical_successor:
+        if not _runtime_record_is_complete(canonical_successor):
+            canonical_successor = runtime.current_record(
+                canonical_successor_execution_id,
+                actor_role=actor_role,
+            )
+        if _runtime_record_is_complete(canonical_successor):
+            predecessor_record = dict(canonical_successor)
+            if not successor_attempt_id:
+                action = _observer_hotfix_attempt_action(
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    parent_record=parent_record,
+                    predecessor_record=predecessor_record,
+                    route_token_ref=route_token_ref,
+                )
+                raise ValidationError(
+                    "observer_hotfix successor runtime is already complete",
+                    {
+                        "blocker_id": "observer_hotfix_successor_already_complete",
+                        "recoverable": True,
+                        "next_legal_action": (
+                            "start_attempt_scoped_observer_hotfix_successor"
+                        ),
+                        "project_id": project_id,
+                        "backlog_id": backlog_id,
+                        "task_id": task_id,
+                        "successor_contract_execution_id": (
+                            canonical_successor_execution_id
+                        ),
+                        "parent_contract_execution_id": parent_execution_id,
+                        "root_contract_execution_id": root_execution_id,
+                        "contract_chain_id": chain_id,
+                        "route_token_ref": route_token_ref,
+                        "facade": action["facade"],
+                        "mcp_tool": action["mcp_tool"],
+                        "method": action["method"],
+                        "path": action["path"],
+                        "body_source": action["body_source"],
+                        "copy_safe_body": dict(action["copy_safe_body"]),
+                        "action_input": dict(action["copy_safe_body"]),
+                        "canonical_executable_action": action,
+                        "writes_performed": False,
+                        "mutation_performed": False,
+                        "raw_route_token_required": False,
+                        "raw_route_token_exposed": False,
+                    },
+                )
+            attempt_scoped = True
+
+    if successor_attempt_id and not attempt_scoped:
+        raise ValidationError(
+            "attempt-scoped observer_hotfix requires one completed canonical predecessor",
+            {
+                "blocker_id": "observer_hotfix_attempt_predecessor_not_complete",
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "predecessor_contract_execution_id": (
+                    canonical_successor_execution_id
+                ),
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+
+    if attempt_scoped:
+        predecessor_state = _runtime_current_state_from_record(predecessor_record)
+        _raise_observer_hotfix_attempt_identity_invalid(
+            _observer_hotfix_attempt_identity_mismatches(
+                attempt_request=attempt_request,
+                task_id=task_id,
+                reason=reason,
+                predecessor_record=predecessor_record,
+                predecessor_execution_id=canonical_successor_execution_id,
+            )
+        )
+        successor_execution_id = _observer_hotfix_attempt_successor_execution_id(
+            project_id,
+            backlog_id,
+            parent_execution_id,
+            successor_attempt_id,
+        )
+    else:
+        successor_execution_id = canonical_successor_execution_id
     handoff_event_id = _contract_runtime_stable_id(
         "handoff", project_id, backlog_id, parent_execution_id, successor_execution_id
     )
@@ -120748,15 +121211,67 @@ def _observer_hotfix_successor_runtime_enter(
                 "project_id": project_id,
                 "backlog_id": backlog_id,
                 "task_id": task_id,
+                **(
+                    {
+                        "predecessor_contract_execution_id": (
+                            canonical_successor_execution_id
+                        ),
+                        "successor_attempt_id": successor_attempt_id,
+                    }
+                    if attempt_scoped
+                    else {}
+                ),
             },
             metadata={
                 "handoff_reason": reason,
                 "handoff_event_id": handoff_event_id,
+                **(
+                    {
+                        "attempt_scope": {
+                            "schema_version": (
+                                "observer_hotfix.attempt_scope.v1"
+                            ),
+                            "successor_attempt_id": successor_attempt_id,
+                            "task_id": task_id,
+                            "parent_contract_execution_id": parent_execution_id,
+                            "predecessor_contract_execution_id": (
+                                canonical_successor_execution_id
+                            ),
+                            "predecessor_execution_state_revision": (
+                                predecessor_state["execution_state_revision"]
+                            ),
+                            "predecessor_execution_state_hash": (
+                                predecessor_state["execution_state_hash"]
+                            ),
+                        }
+                    }
+                    if attempt_scoped
+                    else {}
+                ),
             },
         )
     else:
         successor_existed = True
-        if route_token_ref and not str(successor.get("route_token_ref") or ""):
+        if attempt_scoped:
+            replay_mismatches = _observer_hotfix_attempt_replay_matches(
+                successor,
+                successor_attempt_id=successor_attempt_id,
+                task_id=task_id,
+                parent_execution_id=parent_execution_id,
+                predecessor_execution_id=canonical_successor_execution_id,
+            )
+            if replay_mismatches:
+                raise ValidationError(
+                    "observer_hotfix attempt replay conflicts with existing sibling",
+                    {
+                        "blocker_id": "observer_hotfix_attempt_replay_mismatch",
+                        "mismatched_fields": replay_mismatches,
+                        "writes_performed": False,
+                        "mutation_performed": False,
+                        "fail_closed": True,
+                    },
+                )
+        elif route_token_ref and not str(successor.get("route_token_ref") or ""):
             successor["route_token_ref"] = route_token_ref
             store.update(successor_execution_id, successor)
     successor_contract = {
@@ -120767,6 +121282,11 @@ def _observer_hotfix_successor_runtime_enter(
         "handoff_event_id": handoff_event_id,
         "handoff_reason": reason,
         "successor_contract_id": "observer_hotfix",
+        "attempt_scoped": attempt_scoped,
+        "successor_attempt_id": successor_attempt_id,
+        "predecessor_contract_execution_id": (
+            canonical_successor_execution_id if attempt_scoped else ""
+        ),
         "root_contract_execution_id": root_execution_id,
         "role_binding": {
             "observer": actor_role,
@@ -120779,27 +121299,11 @@ def _observer_hotfix_successor_runtime_enter(
             "task_id": task_id,
         },
     }
-    successor = runtime.current_record(
-        successor_execution_id,
-        actor_role=actor_role,
-    )
-    if successor_existed and _runtime_record_is_complete(successor):
-        raise ValidationError(
-            "observer_hotfix successor runtime is already complete",
-            {
-                "blocker_id": "observer_hotfix_successor_already_complete",
-                "recoverable": True,
-                "next_legal_action": "start_attempt_scoped_observer_hotfix_successor",
-                "project_id": project_id,
-                "backlog_id": backlog_id,
-                "task_id": task_id,
-                "successor_contract_execution_id": successor_execution_id,
-                "parent_contract_execution_id": parent_execution_id,
-                "root_contract_execution_id": root_execution_id,
-                "contract_chain_id": chain_id,
-                "route_token_ref": route_token_ref,
-                "raw_route_token_required": False,
-            },
+    replayed = bool(attempt_scoped and successor_existed)
+    if not replayed:
+        successor = runtime.current_record(
+            successor_execution_id,
+            actor_role=actor_role,
         )
     next_line = (
         successor.get("runtime_guide", {}).get("next_legal_action")
@@ -120808,7 +121312,8 @@ def _observer_hotfix_successor_runtime_enter(
     )
     write_result: dict[str, Any] | None = None
     if (
-        isinstance(next_line, Mapping)
+        not replayed
+        and isinstance(next_line, Mapping)
         and str(next_line.get("stage_id") or "") == "pre_mutation"
         and str(next_line.get("line_id") or "") == "hotfix_pre_reason"
     ):
@@ -120824,10 +121329,11 @@ def _observer_hotfix_successor_runtime_enter(
             actor_role=actor_role,
         )
         successor = write_result["record"]
-    successor = runtime.current_record(
-        successor_execution_id,
-        actor_role=actor_role,
-    )
+    if not replayed:
+        successor = runtime.current_record(
+            successor_execution_id,
+            actor_role=actor_role,
+        )
     current_state = _runtime_current_state_from_record(successor)
     runtime_guide = successor.get("runtime_guide") or {}
     return {
@@ -120838,6 +121344,12 @@ def _observer_hotfix_successor_runtime_enter(
         "parent_contract_execution_id": parent_execution_id,
         "root_contract_execution_id": root_execution_id,
         "contract_chain_id": chain_id,
+        "attempt_scoped": attempt_scoped,
+        "successor_attempt_id": successor_attempt_id,
+        "predecessor_contract_execution_id": (
+            canonical_successor_execution_id if attempt_scoped else ""
+        ),
+        "replayed": replayed,
         "runtime_guide": runtime_guide,
         "current_state": current_state,
         "next_legal_action": _runtime_next_action_from_guide(runtime_guide),
@@ -148035,7 +148547,21 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                         "role_source": "contract_runtime_effective_actor_role",
                     },
                 )
-            if explicit_parent_execution_id:
+            attempt_preflight = _observer_hotfix_attempt_prewrite_gate(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                parent_execution_id=explicit_parent_execution_id,
+                route_token_ref=route_token_ref,
+                reason=reason,
+                attempt_request=body,
+            )
+            if attempt_preflight.get("status") == "replayed":
+                parent_record = dict(
+                    attempt_preflight.get("parent_record") or {}
+                )
+            elif explicit_parent_execution_id:
                 try:
                     parent_record = _contract_runtime_parent_for_successor(
                         conn,
@@ -148105,16 +148631,18 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                             or {},
                         },
                     )
-            successor_runtime = _observer_hotfix_successor_runtime_enter(
-                conn,
-                project_id=project_id,
-                backlog_id=backlog_id,
-                task_id=task_id,
-                parent_record=parent_record,
-                actor_role=derived_actor_role,
-                route_token_ref=route_token_ref,
-                reason=reason,
-            )
+            if not successor_runtime:
+                successor_runtime = _observer_hotfix_successor_runtime_enter(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                    parent_record=parent_record,
+                    actor_role=derived_actor_role,
+                    route_token_ref=route_token_ref,
+                    reason=reason,
+                    attempt_request=body,
+                )
         payload = {
             "schema_version": "hotfix_entered.v1",
             "profile": "HOTFIX",
@@ -148133,6 +148661,15 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                         "successor_contract"
                     )
                     or {},
+                    "attempt_scoped": bool(
+                        successor_runtime.get("attempt_scoped")
+                    ),
+                    "successor_attempt_id": successor_runtime.get(
+                        "successor_attempt_id", ""
+                    ),
+                    "predecessor_contract_execution_id": successor_runtime.get(
+                        "predecessor_contract_execution_id", ""
+                    ),
                     "legacy_onboard_contract_waived": onboard_service_waiver,
                     "onboard_service": (
                         ONBOARD_ROUTE_GUIDE_SERVICE_ID if onboard_service_waiver else ""
@@ -148155,27 +148692,65 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                 "task_id": task_id,
             }
         )
-        event = task_timeline.record_event(
-            conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            task_id=task_id,
-            event_type="hotfix.entered",
-            phase="hotfix",
-            event_kind="hotfix_entered",
-            actor=actor,
-            status="accepted",
-            payload=payload,
-            artifact_refs={
-                "profile": "HOTFIX",
-                "backlog_id": backlog_id,
-                "task_id": task_id,
-                "successor_contract_execution_id": successor_runtime.get(
-                    "successor_contract_execution_id", ""
+        if successor_runtime.get("replayed"):
+            successor_execution_id = str(
+                successor_runtime.get("successor_contract_execution_id") or ""
+            ).strip()
+            event = next(
+                (
+                    item
+                    for item in task_timeline.list_events(
+                        conn,
+                        project_id,
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                        event_kind="hotfix_entered",
+                        limit=1000,
+                    )
+                    if str(
+                        (item.get("artifact_refs") or {}).get(
+                            "successor_contract_execution_id"
+                        )
+                        if isinstance(item.get("artifact_refs"), Mapping)
+                        else ""
+                    ).strip()
+                    == successor_execution_id
                 ),
-            },
-        )
-        conn.commit()
+                {},
+            )
+            if not event:
+                raise ValidationError(
+                    "observer_hotfix attempt replay lacks its accepted entry event",
+                    {
+                        "blocker_id": "observer_hotfix_attempt_replay_event_missing",
+                        "successor_contract_execution_id": successor_execution_id,
+                        "writes_performed": False,
+                        "mutation_performed": False,
+                        "fail_closed": True,
+                    },
+                )
+        else:
+            event = task_timeline.record_event(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                event_type="hotfix.entered",
+                phase="hotfix",
+                event_kind="hotfix_entered",
+                actor=actor,
+                status="accepted",
+                payload=payload,
+                artifact_refs={
+                    "profile": "HOTFIX",
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "successor_contract_execution_id": successor_runtime.get(
+                        "successor_contract_execution_id", ""
+                    ),
+                },
+            )
+            conn.commit()
     response = {
         "ok": True,
         "project_id": project_id,
@@ -148202,6 +148777,16 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                 "contract_chain_id": successor_runtime.get(
                     "contract_chain_id", ""
                 ),
+                "attempt_scoped": bool(
+                    successor_runtime.get("attempt_scoped")
+                ),
+                "successor_attempt_id": successor_runtime.get(
+                    "successor_attempt_id", ""
+                ),
+                "predecessor_contract_execution_id": successor_runtime.get(
+                    "predecessor_contract_execution_id", ""
+                ),
+                "replayed": bool(successor_runtime.get("replayed")),
                 "runtime_guide": successor_runtime.get("runtime_guide") or {},
                 "contract_runtime_current_state": successor_runtime.get(
                     "current_state"
