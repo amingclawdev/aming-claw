@@ -50985,7 +50985,69 @@ def test_legacy_v1_replacement_expired_latest_ref_reissues_then_starts(
         projected["session_token_reissue_submission"]["copy_safe_body"]
     )
     assert body["worker_session_id"] == body["host_session_id"] == ""
+    # The live guide did not project this redundant identifier.  The server
+    # must bind the one source-backed ContractRuntime identity instead of
+    # requiring a caller to reconstruct it.
+    body.pop("contract_execution_id")
     body["reason"] = "recover exact expired legacy latest ref"
+    wrong_contract_body = {
+        **body,
+        "contract_execution_id": "cex-mf-parallel-foreign-live-shape",
+    }
+    before_wrong_contract_dump = "\n".join(conn.iterdump())
+    before_wrong_contract_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as wrong_contract:
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=wrong_contract_body,
+            )
+        )
+    assert wrong_contract.value.code == "fence_invalidated_or_unknown"
+    assert "\n".join(conn.iterdump()) == before_wrong_contract_dump
+    assert conn.total_changes == before_wrong_contract_changes
+    original_contract_resolution = (
+        server._runtime_context_resolve_contract_execution_identity
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_resolve_contract_execution_identity",
+        lambda *_args, **_kwargs: (
+            {},
+            {
+                "status": "ambiguous_active_source_backed_worker_lineage",
+                "candidate_count": 2,
+                "fail_closed": True,
+            },
+        ),
+    )
+    before_ambiguous_dump = "\n".join(conn.iterdump())
+    before_ambiguous_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as ambiguous_contract:
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=body,
+            )
+        )
+    assert ambiguous_contract.value.code == "fence_invalidated_or_unknown"
+    assert "\n".join(conn.iterdump()) == before_ambiguous_dump
+    assert conn.total_changes == before_ambiguous_changes
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_resolve_contract_execution_identity",
+        original_contract_resolution,
+    )
     reissued = server.handle_graph_governance_runtime_context_session_token_reissue(
         _ctx_with_role(
             {
@@ -52533,6 +52595,380 @@ def _setup_legacy_v1_ordinary_rejoin_case(
         kind="ordinary_initial_rejoin",
     )
     return case, ordinary
+
+
+def _freeze_legacy_startup_template_world(
+    conn,
+    case: Mapping[str, Any],
+    ordinary: Mapping[str, Any],
+) -> None:
+    """Clone the pre-startup-preflight persisted parallel live shape."""
+
+    legacy_host_session = "<host session id>"
+    legacy_host_startup = "<host startup event/thread id>"
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(case["parent_task_id"])
+    revision = int(record["execution_state_revision"])
+
+    def poison_startup_line(line: dict[str, Any]) -> None:
+        if (
+            line.get("line_id") != "worker_startup"
+            or line.get("runtime_context_id")
+            != case["context"].runtime_context_id
+        ):
+            return
+        line["host_session_id"] = legacy_host_session
+        line["host_startup_id"] = legacy_host_startup
+        line["worker_session_id"] = case["worker_id"]
+        line["filer_principal"] = case["worker_id"]
+        payload = dict(line.get("payload") or {})
+        payload["host_session_id"] = legacy_host_session
+        payload["host_startup_id"] = legacy_host_startup
+        payload["worker_session_id"] = case["worker_id"]
+        payload["filer_principal"] = case["worker_id"]
+        line["payload"] = payload
+
+    completed_lines = copy.deepcopy(record.get("completed_lines") or [])
+    for line in completed_lines:
+        poison_startup_line(line)
+    runtime_guide = copy.deepcopy(record.get("runtime_guide") or {})
+    guide_lines = copy.deepcopy(runtime_guide.get("completed_lines") or [])
+    for line in guide_lines:
+        poison_startup_line(line)
+    runtime_guide["completed_lines"] = guide_lines
+    record["completed_lines"] = completed_lines
+    record["runtime_guide"] = runtime_guide
+    record["execution_state_revision"] = revision + 1
+    runtime.store.update(
+        case["parent_task_id"],
+        record,
+        expected_revision=revision,
+    )
+
+    startup_event = next(
+        event
+        for event in _pre_lineage_case_events(conn, case)
+        if event.get("event_kind") == "mf_subagent_startup"
+    )
+    startup_payload = copy.deepcopy(startup_event.get("payload") or {})
+    startup_payload["host_session_id"] = legacy_host_session
+    startup_payload["host_startup_id"] = legacy_host_startup
+    startup_payload["worker_session_id"] = case["worker_id"]
+    startup_payload["filer_principal"] = case["worker_id"]
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(startup_payload, sort_keys=True), startup_event["id"]),
+    )
+    current = get_branch_context(conn, PID, case["task_id"])
+    assert current is not None
+    upsert_branch_context(
+        conn,
+        replace(
+            current,
+            host_session_id=legacy_host_session,
+            host_startup_id=legacy_host_startup,
+        ),
+        now_iso="2026-08-08T20:30:00Z",
+    )
+    conn.commit()
+
+    frozen_context = get_branch_context(conn, PID, case["task_id"])
+    assert frozen_context is not None
+    literal_baseline = server._runtime_context_rejoin_worker_write_baseline(
+        conn,
+        project_id=PID,
+        context=frozen_context,
+        timeline_events=_pre_lineage_case_events(conn, case),
+    )
+    _freeze_rejoin_audit_as_legacy_v1(
+        conn,
+        event_id=int(ordinary["audit_event_id"]),
+        kind="ordinary_initial_rejoin",
+        baseline_override=literal_baseline,
+    )
+
+
+def _legacy_startup_template_repair_body(
+    case: Mapping[str, Any],
+    context,
+) -> dict[str, Any]:
+    return {
+        **_pre_lineage_rejoin_body(case),
+        "worker_session_id": case["worker_id"],
+        "host_session_id": case["worker_id"],
+        "host_startup_id": f"multi_agent:{case['worker_id']}",
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "reason": "recover the exact persisted legacy startup template tuple",
+    }
+
+
+def test_legacy_startup_template_world_repairs_atomically_through_actual_rejoin(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case, ordinary = _setup_legacy_v1_ordinary_rejoin_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="literal-legacy-startup-template",
+    )
+    _freeze_legacy_startup_template_world(conn, case, ordinary)
+    poisoned = get_branch_context(conn, PID, case["task_id"])
+    assert poisoned is not None
+    assert poisoned.host_session_id == "<host session id>"
+    assert poisoned.host_startup_id == "<host startup event/thread id>"
+    body = _legacy_startup_template_repair_body(case, poisoned)
+
+    eligibility = server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=poisoned,
+    )
+    assert eligibility["eligible"] is True, eligibility
+    original_repair_authority = (
+        server._runtime_context_legacy_startup_template_repair_authority
+    )
+    repair_authority_calls = 0
+
+    def drift_repair_authority_inside_lock(*args, **kwargs):
+        nonlocal repair_authority_calls
+        repair_authority_calls += 1
+        authority = original_repair_authority(*args, **kwargs)
+        return {} if repair_authority_calls >= 2 else authority
+
+    before_toctou_dump = "\n".join(conn.iterdump())
+    before_toctou_changes = conn.total_changes
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_legacy_startup_template_repair_authority",
+        drift_repair_authority_inside_lock,
+    )
+    with pytest.raises(GovernanceError) as toctou_rejected:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": poisoned.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body=body,
+            )
+        )
+    assert toctou_rejected.value.code == (
+        "runtime_context_legacy_startup_template_authority_changed"
+    )
+    assert "\n".join(conn.iterdump()) == before_toctou_dump
+    assert conn.total_changes == before_toctou_changes
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_legacy_startup_template_repair_authority",
+        original_repair_authority,
+    )
+    original_record_event = task_timeline.record_event
+
+    def fail_repair_audit(*args, **kwargs):
+        if kwargs.get("event_type") == (
+            "observer.runtime_context_session_token_rejoin"
+        ):
+            raise RuntimeError("forced legacy template repair audit failure")
+        return original_record_event(*args, **kwargs)
+
+    before_rollback_dump = "\n".join(conn.iterdump())
+    monkeypatch.setattr(task_timeline, "record_event", fail_repair_audit)
+    with pytest.raises(
+        RuntimeError,
+        match="forced legacy template repair audit failure",
+    ):
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": poisoned.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body=body,
+            )
+        )
+    assert "\n".join(conn.iterdump()) == before_rollback_dump
+    monkeypatch.setattr(task_timeline, "record_event", original_record_event)
+
+    repaired = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": poisoned.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body=body,
+        )
+    )
+    authority = repaired["legacy_startup_template_repair_authority"]
+    assert authority["schema_version"] == (
+        "runtime_context.legacy_startup_template_repair_authority.v1"
+    )
+    assert authority["canonical_worker_session_id"] == case["worker_id"]
+    assert authority["canonical_host_startup_id"] == (
+        f"multi_agent:{case['worker_id']}"
+    )
+    assert authority["server_derived"] is True
+    assert authority["caller_claims_trusted"] is False
+    assert authority["raw_credentials_persisted"] is False
+    assert authority["authority_hash"] == server.stable_sha256(
+        {key: value for key, value in authority.items() if key != "authority_hash"}
+    )
+    saved = get_branch_context(conn, PID, case["task_id"])
+    assert saved is not None
+    assert saved.host_session_id == case["worker_id"]
+    assert saved.host_startup_id == f"multi_agent:{case['worker_id']}"
+    audit = next(
+        event
+        for event in _pre_lineage_case_events(conn, case)
+        if int(event.get("id") or 0) == int(repaired["audit_event_id"])
+    )
+    assert audit["payload"]["legacy_startup_template_repair_authority"] == (
+        authority
+    )
+    serialized_audit = json.dumps(audit, sort_keys=True)
+    assert repaired["session_token"] not in serialized_audit
+    assert repaired["fence_token"] not in serialized_audit
+
+    before_replay_dump = "\n".join(conn.iterdump())
+    before_replay_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as replay:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": saved.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body=body,
+            )
+        )
+    assert replay.value.code == "runtime_context_rejoin_identity_mismatch"
+    assert "\n".join(conn.iterdump()) == before_replay_dump
+    assert conn.total_changes == before_replay_changes
+
+
+@pytest.mark.parametrize(
+    "drift_case",
+    [
+        "partial_context",
+        "source_principal",
+        "route_identity",
+        "worker_identity",
+        "raw_startup_identity",
+    ],
+)
+def test_legacy_startup_template_repair_drift_is_prewrite_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    drift_case,
+):
+    case, ordinary = _setup_legacy_v1_ordinary_rejoin_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"legacy-template-drift-{drift_case.replace('_', '-')}",
+    )
+    _freeze_legacy_startup_template_world(conn, case, ordinary)
+    context = get_branch_context(conn, PID, case["task_id"])
+    assert context is not None
+    body = _legacy_startup_template_repair_body(case, context)
+    secret_sentinel = "RAW-SECRET-DO-NOT-EXPOSE"
+    if drift_case == "partial_context":
+        upsert_branch_context(
+            conn,
+            replace(context, host_session_id=case["worker_id"]),
+            now_iso="2026-08-08T20:31:00Z",
+        )
+        conn.commit()
+    elif drift_case == "source_principal":
+        runtime = server._contract_runtime(conn)
+        record = runtime.store.get(case["parent_task_id"])
+        revision = int(record["execution_state_revision"])
+        lines = copy.deepcopy(record["completed_lines"])
+        for startup in lines:
+            if (
+                startup.get("line_id") != "worker_startup"
+                or startup.get("runtime_context_id")
+                != case["context"].runtime_context_id
+            ):
+                continue
+            startup_payload = dict(startup.get("payload") or {})
+            startup_payload["worker_session_id"] = (
+                "foreign-startup-principal"
+            )
+            startup_payload["filer_principal"] = (
+                "foreign-startup-principal"
+            )
+            startup["payload"] = startup_payload
+        record["completed_lines"] = lines
+        runtime_guide = copy.deepcopy(record.get("runtime_guide") or {})
+        guide_lines = copy.deepcopy(
+            runtime_guide.get("completed_lines") or []
+        )
+        for startup in guide_lines:
+            if (
+                startup.get("line_id") != "worker_startup"
+                or startup.get("runtime_context_id")
+                != case["context"].runtime_context_id
+            ):
+                continue
+            startup_payload = dict(startup.get("payload") or {})
+            startup_payload["worker_session_id"] = (
+                "foreign-startup-principal"
+            )
+            startup_payload["filer_principal"] = (
+                "foreign-startup-principal"
+            )
+            startup["payload"] = startup_payload
+        runtime_guide["completed_lines"] = guide_lines
+        record["runtime_guide"] = runtime_guide
+        record["execution_state_revision"] = revision + 1
+        runtime.store.update(
+            case["parent_task_id"],
+            record,
+            expected_revision=revision,
+        )
+        conn.commit()
+    elif drift_case == "route_identity":
+        body["route_id"] = "route-foreign-legacy-template"
+    elif drift_case == "worker_identity":
+        body["worker_session_id"] = "foreign-worker-session"
+    else:
+        body["host_startup_id"] = (
+            f"session_token={secret_sentinel}"
+        )
+
+    before_dump = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body=body,
+            )
+        )
+    assert rejected.value.code == (
+        "runtime_context_legacy_startup_template_repair_required"
+    )
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["credential_rotated"] is False
+    assert "\n".join(conn.iterdump()) == before_dump
+    assert conn.total_changes == before_changes
+    assert secret_sentinel not in json.dumps(rejected.value.details)
 
 
 def _pre_lineage_cutover_rows(conn, case: Mapping[str, Any]) -> list[dict[str, Any]]:

@@ -29894,6 +29894,212 @@ def _runtime_context_rejoin_request_identity_mismatches(
     return mismatches
 
 
+def _runtime_context_legacy_startup_template_repair_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    body: Mapping[str, Any],
+    contract_runtime_sequence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authorize one exact correction for a pre-startup-check legacy tuple."""
+
+    legacy_host_session = str(
+        getattr(context, "host_session_id", "") or ""
+    ).strip()
+    legacy_host_startup = str(
+        getattr(context, "host_startup_id", "") or ""
+    ).strip()
+    if (
+        legacy_host_session != "<host session id>"
+        or legacy_host_startup != "<host startup event/thread id>"
+    ):
+        return {}
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    actual_host_worker_id = str(
+        getattr(context, "actual_host_worker_id", "") or ""
+    ).strip()
+    agent_id = str(getattr(context, "agent_id", "") or "").strip()
+    allocation_owner = str(
+        getattr(context, "allocation_owner", "") or ""
+    ).strip()
+    startup_principal = (
+        contract_runtime_sequence.get("startup_principal")
+        if isinstance(
+            contract_runtime_sequence.get("startup_principal"), Mapping
+        )
+        else {}
+    )
+    canonical_session_id = str(
+        startup_principal.get("worker_session_id") or ""
+    ).strip()
+    filer_principal = str(
+        startup_principal.get("filer_principal") or ""
+    ).strip()
+    contract_execution_id = str(
+        contract_runtime_sequence.get("contract_execution_id") or ""
+    ).strip()
+    startup_source_ref = str(
+        contract_runtime_sequence.get("startup_ref") or ""
+    ).strip()
+    read_source_ref = str(
+        contract_runtime_sequence.get("read_receipt_ref") or ""
+    ).strip()
+    supplied_worker_session = str(
+        body.get("worker_session_id") or ""
+    ).strip()
+    supplied_host_session = str(
+        body.get("host_session_id") or ""
+    ).strip()
+    supplied_host_startup = str(
+        body.get("host_startup_id") or ""
+    ).strip()
+    expected_route_identity = _runtime_context_latest_route_identity(
+        conn,
+        context,
+    )
+    route_identity = {
+        field: str(expected_route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    dispatch_identity_anchor = (
+        _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            contract_execution_id=contract_execution_id,
+        )
+        if contract_execution_id
+        else {}
+    )
+    from .parallel_branch_runtime import (
+        runtime_context_startup_identity_preflight,
+    )
+
+    copy_safe_identity = runtime_context_startup_identity_preflight(
+        {
+            "host_startup_id": supplied_host_startup,
+            "host_session_id": supplied_host_session,
+            "worker_session_id": supplied_worker_session,
+            "worker_transcript_ref": f"multi_agent:{canonical_session_id}",
+        }
+    )
+    credential_shaped_identity = any(
+        re.search(
+            r"(?i)(?:session|fence|route)[_-]?token\s*[:=]",
+            value,
+        )
+        for value in (
+            supplied_worker_session,
+            supplied_host_session,
+            supplied_host_startup,
+        )
+    )
+    if not (
+        runtime_context_id
+        and task_id
+        and backlog_id
+        and parent_task_id
+        and worker_id
+        and worker_slot_id
+        and actual_host_worker_id == worker_id == worker_slot_id
+        and agent_id == allocation_owner == worker_id
+        and dispatch_identity_anchor
+        and str(dispatch_identity_anchor.get("worker_id") or "").strip()
+        == worker_id
+        and str(
+            dispatch_identity_anchor.get("worker_slot_id") or ""
+        ).strip()
+        == worker_slot_id
+        and str(dispatch_identity_anchor.get("agent_id") or "").strip()
+        == agent_id
+        and dispatch_identity_anchor.get("route_identity") == route_identity
+        and canonical_session_id == filer_principal == worker_id
+        and supplied_worker_session == canonical_session_id
+        and supplied_host_session == canonical_session_id
+        and supplied_host_startup
+        and copy_safe_identity.get("accepted") is True
+        and not credential_shaped_identity
+        and contract_execution_id
+        and startup_source_ref.startswith(
+            f"contract_runtime:{contract_execution_id}:completed_lines:"
+        )
+        and read_source_ref.startswith(
+            f"contract_runtime:{contract_execution_id}:completed_lines:"
+        )
+        and contract_runtime_sequence.get("ordered") is True
+        and all(route_identity.values())
+        and all(
+            str(body.get(field) or "").strip() == value
+            for field, value in route_identity.items()
+        )
+    ):
+        return {}
+
+    core = {
+        "schema_version": (
+            "runtime_context.legacy_startup_template_repair_authority.v1"
+        ),
+        "source": "contract_runtime_worker_sequence",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "actual_host_worker_id": actual_host_worker_id,
+        "canonical_worker_session_id": canonical_session_id,
+        "canonical_host_session_id": canonical_session_id,
+        "canonical_host_startup_id": supplied_host_startup,
+        "read_receipt_source_ref": read_source_ref,
+        "startup_source_ref": startup_source_ref,
+        "dispatch_source_ref": str(
+            dispatch_identity_anchor.get("source_ref") or ""
+        ).strip(),
+        "dispatch_identity_anchor_hash": str(
+            dispatch_identity_anchor.get("anchor_hash") or ""
+        ).strip(),
+        "route_identity_hash": stable_sha256(route_identity),
+        "corrected_fields": [
+            "worker_session_id",
+            "host_session_id",
+            "host_startup_id",
+        ],
+        "legacy_template_values_persisted": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "raw_credentials_persisted": False,
+    }
+    return {**core, "authority_hash": stable_sha256(core)}
+
+
+def _runtime_context_legacy_startup_template_fields(context: Any) -> list[str]:
+    """Return only the two exact pre-preflight template fields."""
+
+    legacy_values = {
+        "host_session_id": "<host session id>",
+        "host_startup_id": "<host startup event/thread id>",
+    }
+    return [
+        field
+        for field, legacy_value in legacy_values.items()
+        if str(getattr(context, field, "") or "").strip() == legacy_value
+    ]
+
+
 def _runtime_context_raise_child_route_lineage_error(
     *,
     code: str,
@@ -33472,7 +33678,7 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
     ).strip()
     expected_host_session_id = str(context.host_session_id or "").strip()
     expected_host_startup_id = str(context.host_startup_id or "").strip()
-    presented_contract_execution_id = str(
+    requested_contract_execution_id = str(
         body.get("contract_execution_id") or ""
     ).strip()
     presented_session_ref = str(body.get("session_token_ref") or "").strip()
@@ -33538,8 +33744,7 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         if supplied and supplied != expected:
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if (
-        not presented_contract_execution_id
-        or any(not actual or actual != expected for actual, expected in exact_fields.values())
+        any(not actual or actual != expected for actual, expected in exact_fields.values())
     ):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
@@ -33560,10 +33765,21 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
     )
     if (
         resolution.get("fail_closed")
-        or str(resolved_identity.get("contract_execution_id") or "").strip()
-        != presented_contract_execution_id
+        or not str(
+            resolved_identity.get("contract_execution_id") or ""
+        ).strip()
+        or (
+            requested_contract_execution_id
+            and str(
+                resolved_identity.get("contract_execution_id") or ""
+            ).strip()
+            != requested_contract_execution_id
+        )
     ):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    presented_contract_execution_id = str(
+        resolved_identity.get("contract_execution_id") or ""
+    ).strip()
     try:
         record = _contract_runtime_store(conn).get(presented_contract_execution_id)
     except (ContractRuntimeError, sqlite3.Error) as exc:
@@ -41905,6 +42121,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
     authoritative_now_iso = _utc_now()
 
     conn = get_connection(project_id)
+    legacy_template_repair_transaction = ""
     try:
         from .parallel_branch_runtime import (
             BranchRuntimeFenceError,
@@ -41964,6 +42181,43 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 context=context,
             )
         )
+        legacy_startup_template_repair_authority = (
+            _runtime_context_legacy_startup_template_repair_authority(
+                conn,
+                project_id=project_id,
+                context=context,
+                body=body,
+                contract_runtime_sequence=contract_runtime_sequence,
+            )
+        )
+        legacy_startup_template_fields = (
+            _runtime_context_legacy_startup_template_fields(context)
+        )
+        if (
+            legacy_startup_template_fields
+            and not legacy_startup_template_repair_authority
+        ):
+            raise GovernanceError(
+                "runtime_context_legacy_startup_template_repair_required",
+                (
+                    "legacy startup template identity requires exact "
+                    "server-derived worker/startup/route authority"
+                ),
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "invalid_fields": legacy_startup_template_fields,
+                    "source": "runtime_context.contract_runtime_worker_sequence",
+                    "next_legal_action": (
+                        "refresh_the_worker_guide_and_retry_only_with_the_"
+                        "canonical_source_backed_worker_identity"
+                    ),
+                    "credential_rotated": False,
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                },
+            )
         rejoin_worker_write_baseline = (
             _runtime_context_rejoin_worker_write_baseline(
                 conn,
@@ -41997,6 +42251,18 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 context=context,
             )
         )
+        if legacy_startup_template_repair_authority:
+            corrected_fields = set(
+                legacy_startup_template_repair_authority.get(
+                    "corrected_fields"
+                )
+                or []
+            )
+            request_identity_mismatches = [
+                mismatch
+                for mismatch in request_identity_mismatches
+                if str(mismatch.get("field") or "") not in corrected_fields
+            ]
         pre_lineage_rejoin_already_consumed = bool(
             missing_lineage
             and str(getattr(context, "last_recovery_action", "") or "").strip()
@@ -42560,6 +42826,104 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     )
                 bounded_replacement_rejoin = True
         try:
+            if legacy_startup_template_repair_authority:
+                if conn.in_transaction:
+                    conn.execute(
+                        "SAVEPOINT runtime_context_legacy_startup_template_repair"
+                    )
+                    legacy_template_repair_transaction = "savepoint"
+                else:
+                    conn.execute("BEGIN IMMEDIATE")
+                    legacy_template_repair_transaction = "transaction"
+                locked_context = get_branch_context_by_runtime_context_id(
+                    conn,
+                    project_id,
+                    runtime_context_id,
+                )
+                locked_expected_route_identity = (
+                    _runtime_context_latest_route_identity(
+                        conn,
+                        locked_context,
+                    )
+                    if locked_context is not None
+                    else {}
+                )
+                if (
+                    locked_context is None
+                    or locked_expected_route_identity
+                    != expected_route_identity
+                ):
+                    raise GovernanceError(
+                        "runtime_context_legacy_startup_template_authority_changed",
+                        (
+                            "legacy startup template authority changed before "
+                            "the atomic repair"
+                        ),
+                        409,
+                        {
+                            "runtime_context_id": runtime_context_id,
+                            "mutation_performed": False,
+                            "fail_closed": True,
+                        },
+                    )
+                locked_resolved_route_identity, _locked_route_lineage = (
+                    _runtime_context_rejoin_resolved_ref_route_identity(
+                        conn,
+                        body,
+                        supplied_route_identity,
+                        project_id=project_id,
+                        runtime_context_id=runtime_context_id,
+                        context=locked_context,
+                        expected_route_identity=(
+                            locked_expected_route_identity
+                        ),
+                        contract_execution_id=(
+                            resolved_contract_execution_id
+                        ),
+                        pre_lineage_recovery=bool(missing_lineage),
+                    )
+                )
+                locked_selected_route_identity = (
+                    locked_resolved_route_identity
+                    or locked_expected_route_identity
+                )
+                locked_contract_runtime_sequence = (
+                    _runtime_context_contract_runtime_worker_sequence_evidence(
+                        conn,
+                        project_id=project_id,
+                        context=locked_context,
+                    )
+                )
+                locked_repair_authority = (
+                    _runtime_context_legacy_startup_template_repair_authority(
+                        conn,
+                        project_id=project_id,
+                        context=locked_context,
+                        body=body,
+                        contract_runtime_sequence=(
+                            locked_contract_runtime_sequence
+                        ),
+                    )
+                )
+                if (
+                    locked_selected_route_identity != selected_route_identity
+                    or locked_repair_authority
+                    != legacy_startup_template_repair_authority
+                ):
+                    raise GovernanceError(
+                        "runtime_context_legacy_startup_template_authority_changed",
+                        (
+                            "legacy startup template authority changed before "
+                            "the atomic repair"
+                        ),
+                        409,
+                        {
+                            "runtime_context_id": runtime_context_id,
+                            "mutation_performed": False,
+                            "fail_closed": True,
+                        },
+                    )
+                context = locked_context
             if validated_missing_finish_rejoin_authority.get("eligible") is True:
                 result = _runtime_context_rotate_validated_missing_finish_auth(
                     conn,
@@ -42594,6 +42958,40 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     bounded_replacement_rejoin=(
                         bounded_replacement_rejoin
                     ),
+                )
+            if legacy_startup_template_repair_authority:
+                rotated_context = get_branch_context_by_runtime_context_id(
+                    conn,
+                    project_id,
+                    runtime_context_id,
+                )
+                if rotated_context is None:
+                    raise GovernanceError(
+                        "runtime_context_not_found",
+                        "runtime context disappeared during template repair",
+                        409,
+                        {
+                            "runtime_context_id": runtime_context_id,
+                            "mutation_performed": False,
+                            "fail_closed": True,
+                        },
+                    )
+                context = upsert_branch_context(
+                    conn,
+                    replace(
+                        rotated_context,
+                        host_session_id=str(
+                            legacy_startup_template_repair_authority[
+                                "canonical_host_session_id"
+                            ]
+                        ),
+                        host_startup_id=str(
+                            legacy_startup_template_repair_authority[
+                                "canonical_host_startup_id"
+                            ]
+                        ),
+                    ),
+                    now_iso=authoritative_now_iso,
                 )
         except BranchRuntimeFenceError as exc:
             raise GovernanceError(
@@ -42722,6 +43120,10 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         result["revision_rejoin_applied"] = bool(
             result.get("revision_rejoin_applied")
         )
+        if legacy_startup_template_repair_authority:
+            result["legacy_startup_template_repair_authority"] = dict(
+                legacy_startup_template_repair_authority
+            )
         result["reopen_for_revision"] = reopen_for_revision
         result["reopen_for_failed_qa_revision"] = (
             failed_qa_reopen_for_revision
@@ -42988,11 +43390,27 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             payload=audit_payload,
         )
         conn.commit()
+        legacy_template_repair_transaction = ""
         result["audit_event_ref"] = f"timeline:{audit_event.get('id', '')}"
         result["audit_event_id"] = audit_event.get("id", "")
         result["raw_tokens_persisted_to_timeline"] = False
         return result
     finally:
+        if legacy_template_repair_transaction and conn.in_transaction:
+            try:
+                if legacy_template_repair_transaction == "savepoint":
+                    conn.execute(
+                        "ROLLBACK TO "
+                        "runtime_context_legacy_startup_template_repair"
+                    )
+                    conn.execute(
+                        "RELEASE "
+                        "runtime_context_legacy_startup_template_repair"
+                    )
+                else:
+                    conn.rollback()
+            except sqlite3.Error:
+                conn.rollback()
         conn.close()
 
 
