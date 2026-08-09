@@ -115006,6 +115006,127 @@ def _postmerge_superseded_reconcile_receipt_world() -> tuple[
     return current, source
 
 
+def test_postmerge_canonical_root_comes_only_from_exact_linked_context(
+    conn,
+    tmp_path,
+):
+    canonical_root = tmp_path / "daily-planner-canonical"
+    canonical_root.mkdir()
+    subprocess.run(
+        ["git", "init", "-q"], cwd=canonical_root, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=canonical_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=canonical_root,
+        check=True,
+    )
+    (canonical_root / "README.md").write_text("daily planner\n")
+    subprocess.run(
+        ["git", "add", "README.md"], cwd=canonical_root, check=True
+    )
+    subprocess.run(
+        ["git", "commit", "-qm", "initial"],
+        cwd=canonical_root,
+        check=True,
+    )
+    worker_root = canonical_root / ".worktrees" / "worker"
+    worker_root.parent.mkdir()
+    subprocess.run(
+        ["git", "worktree", "add", "-qb", "worker", str(worker_root)],
+        cwd=canonical_root,
+        check=True,
+    )
+    backlog_id = "AC-POSTMERGE-CANONICAL-ROOT"
+    execution_id = "cex-postmerge-canonical-root"
+    runtime_context_id = "mfrctx-postmerge-canonical-root"
+    task_id = "worker-postmerge-canonical-root"
+    merge_queue_id = "mq-postmerge-canonical-root"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=backlog_id,
+            parent_task_id=execution_id,
+            target_project_root=str(worker_root),
+            worktree_path=str(worker_root),
+            branch_ref="refs/heads/worker",
+            merge_queue_id=merge_queue_id,
+            status="merged",
+        ),
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev8",
+    }
+    merge = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": execution_id,
+        "merge_queue_id": merge_queue_id,
+        "timeline_verified": True,
+        "dispatch_lineage_verified": True,
+        "contract_runtime_dispatch_source_ref": (
+            f"contract_runtime:{execution_id}:completed_lines:0"
+        ),
+    }
+    assert server._contract_runtime_postmerge_canonical_project_root(
+        conn,
+        project_id=PID,
+        record=record,
+        merge=merge,
+    ) == str(canonical_root.resolve())
+
+    context = get_branch_context(conn, PID, task_id)
+    assert context is not None
+    sibling_root = tmp_path / "sibling-repository"
+    sibling_root.mkdir()
+    subprocess.run(
+        ["git", "init", "-q"], cwd=sibling_root, check=True
+    )
+    upsert_branch_context(
+        conn,
+        replace(context, target_project_root=str(sibling_root)),
+    )
+    assert server._contract_runtime_postmerge_canonical_project_root(
+        conn,
+        project_id=PID,
+        record=record,
+        merge=merge,
+    ) == ""
+
+    upsert_branch_context(
+        conn,
+        replace(
+            context,
+            target_project_root=str(worker_root),
+            status="running",
+        ),
+    )
+    assert server._contract_runtime_postmerge_canonical_project_root(
+        conn,
+        project_id=PID,
+        record=record,
+        merge=merge,
+    ) == ""
+    wrong_scope = {**merge, "merge_queue_id": "mq-sibling"}
+    assert server._contract_runtime_postmerge_canonical_project_root(
+        conn,
+        project_id=PID,
+        record=record,
+        merge=wrong_scope,
+    ) == ""
+
+
 def test_legacy_reconcile_accepts_only_exact_superseded_provenance_history(
     monkeypatch,
 ):

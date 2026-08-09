@@ -103560,11 +103560,18 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
     if root:
         root = str(Path(root).resolve())
     else:
-        root = project_service.resolve_project_root(
-            project_id,
-            None,
-            fallback_self=True,
+        root = _contract_runtime_postmerge_canonical_project_root(
+            conn,
+            project_id=project_id,
+            record=record,
+            merge=merge,
         )
+        if not root:
+            root = project_service.resolve_project_root(
+                project_id,
+                None,
+                fallback_self=True,
+            )
     target_project_root = str(Path(root).resolve()) if root else ""
     canonical_head_commit = (
         _git_head_commit(Path(root)).strip().lower() if root else ""
@@ -103772,6 +103779,131 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
     }
     authority["authority_hash"] = stable_sha256(authority)
     return authority
+
+
+def _contract_runtime_postmerge_canonical_project_root(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    merge: Mapping[str, Any],
+) -> str:
+    """Resolve one canonical Git root from a sealed postmerge worker tuple.
+
+    External governed projects are not necessarily registered in this server
+    process's in-memory project catalog.  Their exact RuntimeContext still
+    carries a server-written linked-worktree identity.  For rev8/rev9 only,
+    bind that row to the ContractRuntime merge tuple and independently derive
+    the canonical repository through Git's common directory.  Caller paths,
+    path-string ancestry, and best-effort project fallbacks are never used.
+    """
+
+    if not _is_mf_parallel_postmerge_revision(record):
+        return ""
+    scope = {
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(record.get("backlog_id") or "").strip(),
+        "runtime_context_id": str(
+            merge.get("runtime_context_id") or ""
+        ).strip(),
+        "task_id": str(merge.get("task_id") or "").strip(),
+        "parent_task_id": str(
+            merge.get("parent_task_id") or ""
+        ).strip(),
+        "merge_queue_id": str(
+            merge.get("merge_queue_id") or ""
+        ).strip(),
+    }
+    execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    if not (
+        all(scope.values())
+        and scope["parent_task_id"] == execution_id
+        and merge.get("timeline_verified") is True
+        and merge.get("dispatch_lineage_verified") is True
+        and str(
+            merge.get("contract_runtime_dispatch_source_ref") or ""
+        ).strip().startswith(f"contract_runtime:{execution_id}:")
+    ):
+        return ""
+    try:
+        rows = conn.execute(
+            """
+            SELECT target_project_root, worktree_path, status
+            FROM parallel_branch_runtime_contexts
+            WHERE project_id = ? AND backlog_id = ?
+              AND runtime_context_id = ? AND task_id = ?
+              AND parent_task_id = ? AND merge_queue_id = ?
+            ORDER BY runtime_context_id
+            """,
+            tuple(scope.values()),
+        ).fetchall()
+    except (AttributeError, sqlite3.Error):
+        return ""
+    if len(rows) != 1:
+        return ""
+    row = dict(rows[0])
+    if str(row.get("status") or "").strip() != "merged":
+        return ""
+    linked_roots = {
+        str(Path(str(row.get(field) or "")).resolve())
+        for field in ("target_project_root", "worktree_path")
+        if str(row.get(field) or "").strip()
+    }
+    if not linked_roots:
+        return ""
+    common_dirs: set[str] = set()
+    for linked_root_text in linked_roots:
+        linked_root = Path(linked_root_text)
+        if not linked_root.is_dir():
+            return ""
+        shown_root = _git_output(linked_root, ["rev-parse", "--show-toplevel"])
+        common_dir = _git_output(
+            linked_root,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        if not shown_root or not common_dir:
+            return ""
+        try:
+            if not os.path.samefile(shown_root, linked_root):
+                return ""
+        except OSError:
+            return ""
+        common_dirs.add(str(Path(common_dir).resolve()))
+    if len(common_dirs) != 1:
+        return ""
+    common_dir = Path(next(iter(common_dirs)))
+    if common_dir.name != ".git" or not common_dir.is_dir():
+        return ""
+    canonical_root = common_dir.parent.resolve()
+    canonical_shown_root = _git_output(
+        canonical_root,
+        ["rev-parse", "--show-toplevel"],
+    )
+    canonical_common_dir = _git_output(
+        canonical_root,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    try:
+        root_exact = bool(
+            canonical_shown_root
+            and os.path.samefile(canonical_shown_root, canonical_root)
+        )
+        common_exact = bool(
+            canonical_common_dir
+            and os.path.samefile(canonical_common_dir, common_dir)
+        )
+    except OSError:
+        return ""
+    head_commit = _git_head_commit(canonical_root).strip().lower()
+    if not (
+        root_exact
+        and common_exact
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head_commit)
+    ):
+        return ""
+    return str(canonical_root)
 
 
 def _contract_runtime_shared_batch_reconcile_activation_verified(
