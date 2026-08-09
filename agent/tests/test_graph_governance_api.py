@@ -63538,6 +63538,38 @@ def test_runtime_context_read_receipt_accepts_worker_guide_copy_safe_body(
         )
     monkeypatch.setattr(task_timeline, "record_event", original_record_event)
     assert "\n".join(conn.iterdump()) == before_forced_failure
+    before_projection_failure_changes = conn.total_changes
+    original_response_authority = (
+        server._runtime_context_read_receipt_response_authority
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_read_receipt_response_authority",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("forced-read-receipt-authority-failure")
+        ),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="forced-read-receipt-authority-failure",
+    ):
+        server.handle_graph_governance_runtime_context_read_receipt(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                method="POST",
+                body=submitted_body,
+            )
+        )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_read_receipt_response_authority",
+        original_response_authority,
+    )
+    assert "\n".join(conn.iterdump()) == before_forced_failure
+    assert conn.total_changes == before_projection_failure_changes
 
     response = server.handle_graph_governance_runtime_context_read_receipt(
         _ctx(

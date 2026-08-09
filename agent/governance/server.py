@@ -14,6 +14,7 @@ import uuid
 import hashlib
 import traceback
 from collections import OrderedDict
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -45536,66 +45537,163 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
         parent_route_identity=route_identity,
         parent_task_id=parent_task_id,
     )
-    result = handle_task_timeline_append(
-        _runtime_context_forward_request(
-            ctx,
-            body=event_body,
-            trusted_route_gate=trusted_route_gate,
-            trusted_runtime_context_worker_proof=bool(worker_provenance),
+    forwarded_request = _runtime_context_forward_request(
+        ctx,
+        body=event_body,
+        trusted_route_gate=trusted_route_gate,
+        trusted_runtime_context_worker_proof=bool(worker_provenance),
+    )
+    from . import task_timeline
+
+    try:
+        (
+            prospective_event_kind,
+            prospective_status,
+            prospective_payload,
+        ) = task_timeline.validate_and_normalize_mf_read_receipt_append(
+            event_type=event_body["event_type"],
+            event_kind=event_body["event_kind"],
+            actor=event_body["actor"],
+            status=event_body["status"],
+            payload=payload,
         )
+    except ValueError as exc:
+        raise GovernanceError(
+            "mf_read_receipt_validation_failed",
+            str(exc),
+            422,
+            {
+                "error": str(exc),
+                "code": "mf_read_receipt_validation_failed",
+            },
+        )
+    write_conn = get_connection(project_id)
+    setattr(
+        forwarded_request,
+        "_trusted_runtime_context_timeline_connection",
+        write_conn,
     )
-    response = _runtime_context_write_response(
-        action="read_receipt",
-        project_id=project_id,
-        runtime_context_id=runtime_context_id,
-        context=context,
-        legacy_endpoint="/api/task/{project_id}/timeline",
-        result={"ok": True},
-        event=result,
-    )
-    response["read_receipt"] = {
-        "read_receipt_hash": str(payload.get("read_receipt_hash") or ""),
-        "launch_text_hash": str(payload.get("launch_text_hash") or ""),
-    }
-    read_receipt_authority = _runtime_context_read_receipt_response_authority(
-        result,
-        context=context,
-        parent_task_id=parent_task_id,
-        expected_payload=payload,
-        route_identity=route_identity,
-    )
-    response["read_receipt_event_id"] = read_receipt_authority["event_id"]
-    response["read_receipt_event_ref"] = read_receipt_authority["event_ref"]
-    response["read_receipt_hash"] = read_receipt_authority[
-        "read_receipt_hash"
-    ]
-    response["read_receipt_authority"] = read_receipt_authority
-    response["same_context_startup_resume"] = {
-        "schema_version": "runtime_context.read_receipt_startup_resume.v1",
-        "source": "read_receipt_authority",
-        "server_derived": True,
-        "runtime_context_id": runtime_context_id,
-        "task_id": context.task_id,
-        "parent_task_id": parent_task_id,
-        "read_receipt_event_id": read_receipt_authority["event_id"],
-        "read_receipt_event_ref": read_receipt_authority["event_ref"],
-        "read_receipt_hash": read_receipt_authority["read_receipt_hash"],
-        "next_legal_action": "record_mf_subagent_startup",
-        "same_runtime_context_only": True,
-        "caller_inferred_authority_allowed": False,
-    }
-    response["read_receipt"].update(
-        {
+    try:
+        if not write_conn.in_transaction:
+            write_conn.execute("BEGIN IMMEDIATE")
+        sequence_row = write_conn.execute(
+            """SELECT seq
+                 FROM sqlite_sequence
+                WHERE name = 'task_timeline_events'"""
+        ).fetchone()
+        prospective_event_id = int(sequence_row[0] or 0) + 1 if sequence_row else 1
+        prospective_event = {
+            "id": prospective_event_id,
+            "project_id": project_id,
+            "backlog_id": context.backlog_id,
+            "task_id": context.task_id,
+            "event_type": event_body["event_type"],
+            "event_kind": prospective_event_kind,
+            "status": prospective_status,
+            "payload": prospective_payload,
+        }
+        # Response projection is deliberately validated before any domain or
+        # timeline write.  The immediate transaction makes the AUTOINCREMENT
+        # identity stable until the append below commits.
+        read_receipt_authority = (
+            _runtime_context_read_receipt_response_authority(
+                prospective_event,
+                context=context,
+                parent_task_id=parent_task_id,
+                expected_payload=payload,
+                route_identity=route_identity,
+            )
+        )
+        result = handle_task_timeline_append(forwarded_request)
+        persisted_read_receipt_authority = (
+            _runtime_context_read_receipt_response_authority(
+                result,
+                context=context,
+                parent_task_id=parent_task_id,
+                expected_payload=payload,
+                route_identity=route_identity,
+            )
+        )
+        if persisted_read_receipt_authority != read_receipt_authority:
+            raise GovernanceError(
+                "runtime_context_read_receipt_response_authority_changed",
+                (
+                    "persisted read receipt identity changed after its "
+                    "server-derived authority was validated"
+                ),
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                    "raw_session_token_exposed": False,
+                    "raw_fence_token_exposed": False,
+                    "raw_route_token_exposed": False,
+                },
+            )
+        response = _runtime_context_write_response(
+            action="read_receipt",
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            context=context,
+            legacy_endpoint="/api/task/{project_id}/timeline",
+            result={"ok": True},
+            event=result,
+        )
+        response["read_receipt"] = {
+            "read_receipt_hash": str(payload.get("read_receipt_hash") or ""),
+            "launch_text_hash": str(payload.get("launch_text_hash") or ""),
+        }
+        response["read_receipt_event_id"] = read_receipt_authority[
+            "event_id"
+        ]
+        response["read_receipt_event_ref"] = read_receipt_authority[
+            "event_ref"
+        ]
+        response["read_receipt_hash"] = read_receipt_authority[
+            "read_receipt_hash"
+        ]
+        response["read_receipt_authority"] = read_receipt_authority
+        response["same_context_startup_resume"] = {
+            "schema_version": (
+                "runtime_context.read_receipt_startup_resume.v1"
+            ),
+            "source": "read_receipt_authority",
+            "server_derived": True,
+            "runtime_context_id": runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
             "read_receipt_event_id": read_receipt_authority["event_id"],
             "read_receipt_event_ref": read_receipt_authority["event_ref"],
-            "authority": read_receipt_authority,
+            "read_receipt_hash": read_receipt_authority[
+                "read_receipt_hash"
+            ],
+            "next_legal_action": "record_mf_subagent_startup",
+            "same_runtime_context_only": True,
+            "caller_inferred_authority_allowed": False,
         }
-    )
-    if isinstance(result.get("contract_runtime_canonical_line"), Mapping):
-        response["contract_runtime_canonical_line"] = result.get(
-            "contract_runtime_canonical_line"
+        response["read_receipt"].update(
+            {
+                "read_receipt_event_id": read_receipt_authority["event_id"],
+                "read_receipt_event_ref": read_receipt_authority["event_ref"],
+                "authority": read_receipt_authority,
+            }
         )
-    return response
+        if isinstance(
+            result.get("contract_runtime_canonical_line"),
+            Mapping,
+        ):
+            response["contract_runtime_canonical_line"] = result.get(
+                "contract_runtime_canonical_line"
+            )
+        write_conn.commit()
+        return response
+    except Exception:
+        write_conn.rollback()
+        raise
+    finally:
+        write_conn.close()
 
 
 def _runtime_context_read_receipt_response_authority(
@@ -133093,7 +133191,17 @@ def handle_task_timeline_append(ctx: RequestContext):
     )
     trusted_qa_verification_authority: dict[str, Any] = {}
 
-    with DBContext(project_id) as conn:
+    trusted_timeline_connection = getattr(
+        ctx,
+        "_trusted_runtime_context_timeline_connection",
+        None,
+    )
+    connection_scope = (
+        nullcontext(trusted_timeline_connection)
+        if trusted_timeline_connection is not None
+        else DBContext(project_id)
+    )
+    with connection_scope as conn:
         legacy_route_gate = _legacy_contract_route_gate(ctx.body or {})
         if legacy_route_gate.get("blocked"):
             raise GovernanceError(
