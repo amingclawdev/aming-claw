@@ -51072,6 +51072,143 @@ def test_legacy_v1_replacement_expired_latest_ref_reissues_then_starts(
 
     context = get_branch_context(conn, PID, case["task_id"])
     assert context is not None
+    replacement_projection = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=case["task_id"],
+        parent_task_id=case["parent_task_id"],
+        worker_id=case["worker_id"],
+        worker_slot_id=case["worker_id"],
+        target_project_root=str(case["target_root"]),
+        backlog_id=case["backlog_id"],
+        agent_id=case["worker_id"],
+        allocation_owner=case["worker_id"],
+        actual_host_worker_id=case["worker_id"],
+        worker_session_id=case["worker_session_id"],
+        host_startup_id="",
+        host_session_id=case["worker_session_id"],
+        route_identity=case["route_identity"],
+        session_token_ref=reissued["session_token_ref"],
+        contract_execution_id=case["parent_task_id"],
+    )
+    replacement_body = copy.deepcopy(
+        replacement_projection["session_token_reissue_submission"][
+            "copy_safe_body"
+        ]
+    )
+    replacement_body["reason"] = (
+        "replace the one safe-ref envelope lost before startup"
+    )
+    prior_row = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (int(reissued["audit_event_id"]),),
+    ).fetchone()
+    assert prior_row is not None
+    prior_payload_json = str(prior_row["payload_json"])
+    drifted_prior_payload = json.loads(prior_payload_json)
+    drifted_prior_payload["route_identity"]["route_token_ref"] = (
+        "rtok-foreign-safe-ref-loss-replacement"
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (
+            json.dumps(drifted_prior_payload, sort_keys=True),
+            int(reissued["audit_event_id"]),
+        ),
+    )
+    conn.commit()
+    before_drift_dump = "\n".join(conn.iterdump())
+    before_drift_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as drifted_prior:
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=replacement_body,
+            )
+        )
+    assert drifted_prior.value.code == "fence_invalidated_or_unknown"
+    assert "\n".join(conn.iterdump()) == before_drift_dump
+    assert conn.total_changes == before_drift_changes
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (prior_payload_json, int(reissued["audit_event_id"])),
+    )
+    conn.commit()
+
+    original_record_event = task_timeline.record_event
+
+    def fail_loss_replacement_audit(*args, **kwargs):
+        if kwargs.get("event_kind") == "mf_subagent_session_token_reissue":
+            raise RuntimeError("forced safe-ref loss replacement audit failure")
+        return original_record_event(*args, **kwargs)
+
+    before_rollback_dump = "\n".join(conn.iterdump())
+    monkeypatch.setattr(task_timeline, "record_event", fail_loss_replacement_audit)
+    with pytest.raises(
+        RuntimeError,
+        match="forced safe-ref loss replacement audit failure",
+    ):
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=replacement_body,
+            )
+        )
+    assert "\n".join(conn.iterdump()) == before_rollback_dump
+    monkeypatch.setattr(task_timeline, "record_event", original_record_event)
+
+    replaced = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=replacement_body,
+        )
+    )
+    loss_authority = replaced["safe_ref_loss_replacement_authority"]
+    assert loss_authority["prior_reissue_event_ref"] == reissued[
+        "audit_event_ref"
+    ]
+    assert loss_authority["prior_stage_reissue_count"] == 1
+    assert loss_authority["max_loss_replacements"] == 1
+    exhausted_body = {
+        **replacement_body,
+        "session_token_ref": replaced["session_token_ref"],
+        "reason": "a second loss replacement is forbidden",
+    }
+    before_exhausted_dump = "\n".join(conn.iterdump())
+    before_exhausted_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as exhausted:
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=exhausted_body,
+            )
+        )
+    assert exhausted.value.code == "fence_invalidated_or_unknown"
+    assert "\n".join(conn.iterdump()) == before_exhausted_dump
+    assert conn.total_changes == before_exhausted_changes
+
+    context = get_branch_context(conn, PID, case["task_id"])
+    assert context is not None
     startup = server.handle_graph_governance_runtime_context_startup(
         _ctx_with_role(
             {
@@ -51085,9 +51222,9 @@ def test_legacy_v1_replacement_expired_latest_ref_reissues_then_starts(
                 "contract_execution_id": case["parent_task_id"],
                 "task_id": case["task_id"],
                 "parent_task_id": case["parent_task_id"],
-                "session_token": reissued["session_token"],
-                "session_token_ref": reissued["session_token_ref"],
-                "fence_token": reissued["fence_token"],
+                "session_token": replaced["session_token"],
+                "session_token_ref": replaced["session_token_ref"],
+                "fence_token": replaced["fence_token"],
                 "target_project_root": str(case["target_root"]),
                 "agent_id": case["worker_id"],
                 "actual_host_worker_id": case["worker_id"],
@@ -51121,6 +51258,8 @@ def test_legacy_v1_replacement_expired_latest_ref_reissues_then_starts(
         replacement["fence_token"],
         reissued["session_token"],
         reissued["fence_token"],
+        replaced["session_token"],
+        replaced["fence_token"],
     ):
         assert raw_value not in serialized
 
@@ -52853,6 +52992,111 @@ def test_legacy_startup_template_world_repairs_atomically_through_actual_rejoin(
     assert replay.value.code == "runtime_context_rejoin_identity_mismatch"
     assert "\n".join(conn.iterdump()) == before_replay_dump
     assert conn.total_changes == before_replay_changes
+
+    graph_snapshot_id = "scope-literal-legacy-startup-template-implementation"
+    _activate_basic_graph(
+        conn,
+        graph_snapshot_id,
+        commit_sha=saved.target_head_commit,
+    )
+    graph_trace_id = "gqt-literal-legacy-startup-template-implementation"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        parent_task_id=case["parent_task_id"],
+        snapshot_id=graph_snapshot_id,
+        runtime_context_id=saved.runtime_context_id,
+        task_id=case["task_id"],
+        worker_role="mf_sub",
+        fence_token=repaired["fence_token"],
+        run_id=_mf_sub_run_id(case["task_id"], repaired["fence_token"]),
+        created_at="2099-08-02T02:02:00Z",
+    )
+    conn.commit()
+    guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": saved.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "task_id": case["task_id"],
+                    "parent_task_id": case["parent_task_id"],
+                    "worker_id": case["worker_id"],
+                    "worker_slot_id": case["worker_id"],
+                    "session_token": repaired["session_token"],
+                    "session_token_ref": repaired["session_token_ref"],
+                    "fence_token": repaired["fence_token"],
+                    "target_project_root": str(case["target_root"]),
+                    **case["route_identity"],
+                },
+            )
+        )
+    )
+    skeleton = guide["implementation_evidence_facade_payload_skeleton"]
+    implementation_body = copy.deepcopy(skeleton["copy_safe_body"])
+    ordered_tests = [
+        {"command": "python -m pytest -q focused", "status": "passed"}
+    ]
+    implementation_body.update(
+        {
+            "session_token": repaired["session_token"],
+            "session_token_ref": repaired["session_token_ref"],
+            "fence_token": repaired["fence_token"],
+            "changed_files": ["agent/governance/server.py"],
+            "tests": ordered_tests,
+            "test_results": {
+                "status": "passed",
+                "passed": True,
+                "commands": ordered_tests,
+            },
+            "graph_trace_ids": [graph_trace_id],
+        }
+    )
+    implementation_body["payload"]["graph_trace_ids"] = [graph_trace_id]
+    missing_results_body = copy.deepcopy(implementation_body)
+    missing_results_body.pop("test_results")
+    original_get_connection = server.get_connection
+
+    def fail_if_db_reached(*_args, **_kwargs):
+        raise AssertionError("invalid guide body reached the database")
+
+    monkeypatch.setattr(server, "get_connection", fail_if_db_reached)
+    with pytest.raises(GovernanceError) as prior_guide_rejection:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": saved.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=missing_results_body,
+            )
+        )
+    assert prior_guide_rejection.value.code == (
+        "worker_implementation_test_results_not_finish_compatible"
+    )
+    monkeypatch.setattr(server, "get_connection", original_get_connection)
+    implementation = (
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": saved.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=implementation_body,
+            )
+        )
+    )
+    assert implementation["ok"] is True
+    assert implementation["contract_runtime_canonical_line"]["line_id"] == (
+        "worker_implementation"
+    )
 
 
 @pytest.mark.parametrize(
@@ -116227,6 +116471,15 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
 
     assert contract_refs["route_token_ref"] == "rtok-contract-runtime-guide-scope"
     assert implementation_body["lane_id"] == "worker-guide-scope"
+    assert implementation_body["test_results"] == {
+        "status": "passed",
+        "passed": True,
+        "commands": implementation_body["tests"],
+    }
+    assert "test_results" in implementation_skeleton["required_fields"]
+    assert implementation_skeleton["field_pointers"]["test_results"] == (
+        "copy_safe_body.test_results"
+    )
     assert "lane_id" in implementation_skeleton["required_fields"]
     assert implementation_skeleton["field_pointers"]["lane_id"] == (
         "copy_safe_body.lane_id"

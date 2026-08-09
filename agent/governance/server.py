@@ -27295,6 +27295,14 @@ def _runtime_context_worker_recovery_payloads(
         **implementation_writer_binding,
         **implementation_route_reference,
     }
+    implementation_evidence_tests = [
+        {"command": "<worker test command>", "status": "passed"}
+    ]
+    implementation_evidence_test_results = {
+        "status": "passed",
+        "passed": True,
+        "commands": [dict(item) for item in implementation_evidence_tests],
+    }
     implementation_evidence_body = {
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
@@ -27313,7 +27321,8 @@ def _runtime_context_worker_recovery_payloads(
         "implementation_diff_submission_guidance": dict(
             implementation_diff_submission_guidance
         ),
-        "tests": [{"command": "<worker test command>", "status": "passed"}],
+        "tests": [dict(item) for item in implementation_evidence_tests],
+        "test_results": dict(implementation_evidence_test_results),
         "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
         "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
         "write_authorization_policy": dict(write_authorization_policy),
@@ -27366,6 +27375,7 @@ def _runtime_context_worker_recovery_payloads(
         "fence_token": "copy_safe_body.fence_token",
         "changed_files": "copy_safe_body.changed_files",
         "tests": "copy_safe_body.tests",
+        "test_results": "copy_safe_body.test_results",
         "route_token_ref": "copy_safe_body.route_token_ref",
         **{
             field: f"copy_safe_body.{field}"
@@ -28043,6 +28053,7 @@ def _runtime_context_worker_recovery_payloads(
                 "target_project_root",
                 "changed_files",
                 "tests",
+                "test_results",
                 "route_token_ref",
                 *_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS,
             ],
@@ -33645,6 +33656,7 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         build_safe_ref_prestartup_reissue_authority,
         get_branch_context_by_runtime_context_id,
         runtime_context_id_for_branch_context,
+        runtime_context_session_token_lease_view,
         runtime_context_session_token_ref,
     )
 
@@ -33829,8 +33841,16 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
     )
     if not stage_checkpoint:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    stage_checkpoint_id = str(
+        stage_checkpoint.get("stage_checkpoint_id") or ""
+    ).strip()
     matching_initial_joins = []
     matching_session_authorities: list[tuple[Mapping[str, Any], str]] = []
+    validated_session_authorities: dict[
+        str, list[tuple[Mapping[str, Any], str]]
+    ] = {}
+    stage_reissue_events: list[Mapping[str, Any]] = []
+    matching_stage_reissue_events: list[Mapping[str, Any]] = []
     for event in timeline_events:
         payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
         common_identity_matches = (
@@ -33850,6 +33870,17 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             continue
         action = str(payload.get("action") or "").strip()
         event_session_ref = str(payload.get("session_token_ref") or "").strip()
+        if action == "runtime_context_session_token_reissue":
+            prior_authority = payload.get("safe_ref_reissue_authority")
+            if (
+                isinstance(prior_authority, Mapping)
+                and str(prior_authority.get("stage_checkpoint_id") or "").strip()
+                == stage_checkpoint_id
+            ):
+                stage_reissue_events.append(event)
+                if event_session_ref == presented_session_ref:
+                    matching_stage_reissue_events.append(event)
+            continue
         if (
             action == "runtime_context_session_token_initial_join"
             and str(payload.get("actual_host_worker_id") or "").strip()
@@ -33858,6 +33889,9 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             == expected_host_session_id
         ):
             matching_initial_joins.append(event)
+            validated_session_authorities.setdefault(
+                f"timeline:{event.get('id', '')}", []
+            ).append((event, "initial_join"))
             if event_session_ref == presented_session_ref:
                 matching_session_authorities.append((event, "initial_join"))
         elif (
@@ -33869,7 +33903,6 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
                 != "bounded_replacement_rejoin"
                 or payload.get("bounded_replacement_rejoin") is True
             )
-            and event_session_ref == presented_session_ref
             and str(payload.get("worker_id") or "").strip()
             == expected_worker_id
             and str(
@@ -33908,12 +33941,47 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
                 "exact",
                 "advanced",
             }:
-                matching_session_authorities.append(
-                    (
-                        event,
-                        str(payload.get("bounded_rejoin_kind") or "").strip(),
-                    )
-                )
+                authority_kind = str(
+                    payload.get("bounded_rejoin_kind") or ""
+                ).strip()
+                validated_session_authorities.setdefault(
+                    f"timeline:{event.get('id', '')}", []
+                ).append((event, authority_kind))
+                if event_session_ref == presented_session_ref:
+                    matching_session_authorities.append((event, authority_kind))
+    prior_safe_ref_reissue_event: Mapping[str, Any] | None = None
+    if (
+        not matching_session_authorities
+        and len(stage_reissue_events) == 1
+        and len(matching_stage_reissue_events) == 1
+    ):
+        candidate_event = matching_stage_reissue_events[0]
+        candidate_payload = (
+            candidate_event.get("payload")
+            if isinstance(candidate_event.get("payload"), Mapping)
+            else {}
+        )
+        candidate_authority = candidate_payload.get(
+            "safe_ref_reissue_authority"
+        )
+        source_ref = str(
+            (candidate_authority or {}).get("session_authority_event_ref")
+            if isinstance(candidate_authority, Mapping)
+            else ""
+        ).strip()
+        source_kind = str(
+            (candidate_authority or {}).get("session_authority_kind")
+            if isinstance(candidate_authority, Mapping)
+            else ""
+        ).strip()
+        source_matches = [
+            item
+            for item in validated_session_authorities.get(source_ref, [])
+            if item[1] == source_kind
+        ]
+        if len(source_matches) == 1:
+            prior_safe_ref_reissue_event = candidate_event
+            matching_session_authorities = source_matches
     if len(matching_initial_joins) != 1:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if len(matching_session_authorities) != 1:
@@ -33983,7 +34051,160 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
         }
     )
-    return build_safe_ref_prestartup_reissue_authority(
+    safe_ref_loss_replacement_authority: dict[str, Any] = {}
+    if prior_safe_ref_reissue_event is not None:
+        prior_payload = (
+            prior_safe_ref_reissue_event.get("payload")
+            if isinstance(prior_safe_ref_reissue_event.get("payload"), Mapping)
+            else {}
+        )
+        prior_authority = (
+            prior_payload.get("safe_ref_reissue_authority")
+            if isinstance(prior_payload.get("safe_ref_reissue_authority"), Mapping)
+            else {}
+        )
+        prior_lease = (
+            prior_payload.get("session_token_lease")
+            if isinstance(prior_payload.get("session_token_lease"), Mapping)
+            else {}
+        )
+        current_lease = runtime_context_session_token_lease_view(
+            context,
+            now_iso=now_iso,
+        )
+        expected_principal = str(
+            context.actual_host_worker_id
+            or context.worker_slot_id
+            or context.worker_id
+            or context.agent_id
+            or ""
+        ).strip()
+        prior_identity = {
+            "project_id": str(prior_payload.get("project_id") or "").strip(),
+            "backlog_id": str(prior_payload.get("backlog_id") or "").strip(),
+            "contract_execution_id": str(
+                prior_payload.get("contract_execution_id") or ""
+            ).strip(),
+            "runtime_context_id": str(
+                prior_payload.get("runtime_context_id") or ""
+            ).strip(),
+            "task_id": str(prior_payload.get("task_id") or "").strip(),
+            "parent_task_id": str(
+                prior_payload.get("parent_task_id") or ""
+            ).strip(),
+            "worker_id": str(prior_payload.get("worker_id") or "").strip(),
+            "worker_slot_id": str(
+                prior_payload.get("worker_slot_id") or ""
+            ).strip(),
+            "principal_id": str(
+                prior_payload.get("principal_id") or ""
+            ).strip(),
+            "session_token_ref": str(
+                prior_payload.get("session_token_ref") or ""
+            ).strip(),
+        }
+        expected_prior_identity = {
+            "project_id": project_id,
+            "backlog_id": str(context.backlog_id or "").strip(),
+            "contract_execution_id": presented_contract_execution_id,
+            "runtime_context_id": expected_runtime_id,
+            "task_id": expected_task_id,
+            "parent_task_id": expected_parent_task_id,
+            "worker_id": expected_worker_id,
+            "worker_slot_id": expected_worker_slot_id,
+            "principal_id": expected_principal,
+            "session_token_ref": presented_session_ref,
+        }
+        prior_lease_expected = {
+            "lease_id": str(context.lease_id or "").strip(),
+            "lease_expires_at": str(context.lease_expires_at or "").strip(),
+            "session_token_ref": presented_session_ref,
+            "status": "active",
+            "authorization_valid": True,
+            "lease_record_valid": True,
+            "expired": False,
+        }
+        if (
+            prior_identity != expected_prior_identity
+            or prior_payload.get("ok") is not True
+            or str(prior_payload.get("schema_version") or "").strip()
+            != "mf_subagent_session_token_reissue_response.v1"
+            or str(prior_payload.get("status") or "").strip()
+            != "session_token_reissued"
+            or str(prior_payload.get("action") or "").strip()
+            != "runtime_context_session_token_reissue"
+            or str(prior_payload.get("authorization_source") or "").strip()
+            != "safe_ref_prestartup_reissue_authority"
+            or str(prior_payload.get("delivery") or "").strip()
+            != "worker_host_envelope"
+            or str(prior_payload.get("expires_at") or "").strip()
+            != str(context.lease_expires_at or "").strip()
+            or str(prior_payload.get("session_token_hash") or "").strip()
+            != str(context.session_token_hash or "").strip()
+            or str(prior_payload.get("fence_token_hash") or "").strip()
+            != str(context.fence_token_verifier or "").strip()
+            or prior_payload.get("session_token_persisted") is not False
+            or prior_payload.get("raw_session_token_persisted") is not False
+            or prior_payload.get("raw_fence_token_persisted") is not False
+            or prior_payload.get("raw_fence_token_persisted_to_timeline")
+            is not False
+            or dict(prior_payload.get("route_identity") or {})
+            != expected_route_identity
+            or any(
+                prior_lease.get(field) != expected
+                for field, expected in prior_lease_expected.items()
+            )
+            or str(current_lease.get("status") or "").strip() != "active"
+            or current_lease.get("authorization_valid") is not True
+            or current_lease.get("lease_record_valid") is not True
+            or current_lease.get("expired") is not False
+            or str(prior_authority.get("schema_version") or "").strip()
+            != "runtime_context.safe_ref_prestartup_reissue_authority.v2"
+            or prior_authority.get("server_derived") is not True
+            or prior_authority.get("caller_claims_trusted") is not False
+            or str(prior_authority.get("read_receipt_ref") or "").strip()
+            != str(sequence.get("read_receipt_ref") or "").strip()
+            or str(prior_authority.get("initial_join_event_ref") or "").strip()
+            != f"timeline:{matching_initial_joins[0].get('id', '')}"
+            or str(
+                prior_authority.get("session_authority_event_ref") or ""
+            ).strip()
+            != f"timeline:{session_authority_event.get('id', '')}"
+            or str(prior_authority.get("session_authority_kind") or "").strip()
+            != session_authority_kind
+            or str(prior_authority.get("route_identity_hash") or "").strip()
+            != route_identity_hash
+            or str(prior_authority.get("stage_checkpoint_id") or "").strip()
+            != stage_checkpoint_id
+            or prior_authority.get("stage_checkpoint_server_verified") is not True
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                str(prior_authority.get("authority_hash") or ""),
+            )
+        ):
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        replacement_core = {
+            "schema_version": (
+                "runtime_context.safe_ref_loss_replacement_authority.v1"
+            ),
+            "server_derived": True,
+            "caller_claims_trusted": False,
+            "prior_reissue_event_ref": (
+                f"timeline:{prior_safe_ref_reissue_event.get('id', '')}"
+            ),
+            "stage_checkpoint_id": stage_checkpoint_id,
+            "prior_stage_reissue_count": 1,
+            "max_loss_replacements": 1,
+            "session_token_ref": presented_session_ref,
+            "lease_id": str(context.lease_id or "").strip(),
+            "route_identity_hash": route_identity_hash,
+            "raw_credentials_persisted": False,
+        }
+        safe_ref_loss_replacement_authority = {
+            **replacement_core,
+            "authority_hash": _stable_public_hash(replacement_core),
+        }
+    authority = build_safe_ref_prestartup_reissue_authority(
         context,
         contract_execution_id=presented_contract_execution_id,
         read_receipt_ref=str(sequence["read_receipt_ref"]),
@@ -33993,11 +34214,10 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         ),
         session_authority_kind=session_authority_kind,
         route_identity_hash=route_identity_hash,
-        stage_checkpoint_id=str(
-            stage_checkpoint.get("stage_checkpoint_id") or ""
-        ),
+        stage_checkpoint_id=stage_checkpoint_id,
         now_iso=now_iso,
     )
+    return authority, safe_ref_loss_replacement_authority
 
 
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/reissue")
@@ -34034,8 +34254,12 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
             raw_fence_token = str(body.get("fence_token") or "").strip()
             raw_session_token = str(body.get("session_token") or "").strip()
             safe_ref_authority = None
+            safe_ref_loss_replacement_authority: dict[str, Any] = {}
             if session_token_ref and not (raw_fence_token and raw_session_token):
-                safe_ref_authority = (
+                (
+                    safe_ref_authority,
+                    safe_ref_loss_replacement_authority,
+                ) = (
                     _runtime_context_safe_ref_prestartup_reissue_authority(
                         ctx,
                         conn,
@@ -34162,6 +34386,10 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
                     "server_derived": True,
                     "caller_claims_trusted": False,
                 }
+                if safe_ref_loss_replacement_authority:
+                    result["safe_ref_loss_replacement_authority"] = dict(
+                        safe_ref_loss_replacement_authority
+                    )
                 expected_route_identity = {
                     field: str(value or "").strip()
                     for field, value in _runtime_context_request_route_identity_shapes(
