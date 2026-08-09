@@ -6662,17 +6662,22 @@ def _insert_mf_sub_graph_query_trace(
     worker_role: str = "",
     fence_token: str = "",
     run_id: str = "",
+    route_identity: Mapping[str, Any] | None = None,
     created_at: str = "2026-06-06T10:00:00Z",
 ) -> None:
     graph_query_trace.ensure_schema(conn)
+    route_identity = dict(route_identity or {})
     conn.execute(
         """
         INSERT INTO graph_query_traces
           (trace_id, project_id, snapshot_id, actor, query_source, query_purpose,
            run_id, parent_task_id, runtime_context_id, task_id, worker_role,
-           fence_token, status, budget_json, usage_json, artifact_path,
-           created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           fence_token, route_id, route_context_hash, prompt_contract_id,
+           prompt_contract_hash, route_token_ref,
+           visible_injection_manifest_hash, status, budget_json, usage_json,
+           artifact_path, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?)
         """,
         (
             trace_id,
@@ -6687,6 +6692,12 @@ def _insert_mf_sub_graph_query_trace(
             task_id,
             worker_role,
             fence_token,
+            str(route_identity.get("route_id") or ""),
+            str(route_identity.get("route_context_hash") or ""),
+            str(route_identity.get("prompt_contract_id") or ""),
+            str(route_identity.get("prompt_contract_hash") or ""),
+            str(route_identity.get("route_token_ref") or ""),
+            str(route_identity.get("visible_injection_manifest_hash") or ""),
             "complete",
             "{}",
             "{}",
@@ -49119,7 +49130,7 @@ def test_mf_sub_graph_query_resolves_runtime_context_and_route_identity(
         "fence_token": "fence-runtime-context",
         "session_token": "session-runtime-context",
         "target_project_root": str(target_root),
-        **route_identity,
+        "route_identity": dict(route_identity),
     }
     with pytest.raises(GovernanceError) as missing_read_receipt:
         server.handle_graph_governance_query(
@@ -49265,6 +49276,45 @@ def test_mf_sub_graph_query_resolves_runtime_context_and_route_identity(
         },
     )
     conn.commit()
+    worker_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": "parent-runtime-context",
+                    "fence_token": "fence-runtime-context",
+                    "session_token": "session-runtime-context",
+                    "target_project_root": str(target_root),
+                },
+            )
+        )
+    )
+    guide_graph_body = copy.deepcopy(
+        worker_guide["worker_guide"]["graph_query_identity"]["payload_shape"]
+    )
+    assert guide_graph_body["route_identity"] == route_identity
+    body = {
+        **guide_graph_body,
+        "snapshot_id": "active",
+        "tool": "query_schema",
+        "args": {},
+        "fence_token": "fence-runtime-context",
+        "session_token": "session-runtime-context",
+    }
+    started = server.handle_graph_governance_query_trace_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=body,
+        )
+    )
+    for field, value in route_identity.items():
+        assert started["trace"][field] == value
     queried = server.handle_graph_governance_query(
         _ctx_with_role(
             {"project_id": PID},
@@ -49287,6 +49337,8 @@ def test_mf_sub_graph_query_resolves_runtime_context_and_route_identity(
     assert trace["task_id"] == "worker-runtime-context"
     assert trace["parent_task_id"] == "parent-runtime-context"
     assert trace["worker_role"] == "mf_sub"
+    for field, value in route_identity.items():
+        assert trace[field] == value
     assert trace["graph_query_identity"]["fence_token_redacted"] is True
     assert "session-runtime-context" not in json.dumps(trace, sort_keys=True)
 
@@ -49308,7 +49360,13 @@ def test_mf_sub_graph_query_resolves_runtime_context_and_route_identity(
                 {"project_id": PID},
                 "mf_sub",
                 method="POST",
-                body={**body, "route_context_hash": "sha256:wrong-route"},
+                body={
+                    **body,
+                    "route_identity": {
+                        **route_identity,
+                        "route_context_hash": "sha256:wrong-route",
+                    },
+                },
             )
         )
     assert mismatched_route.value.code == "fence_invalidated_or_unknown"
@@ -108995,6 +109053,167 @@ def test_r12s16_source_backed_worker_results_drive_guide_and_finish_facade(
     ) == []
 
 
+def test_eabf_current_worker_guide_projects_executable_finish_alias_chain(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    candidate_server, candidate_server_path = _preload_candidate_server_module()
+    assert Path(candidate_server.__file__).resolve() == candidate_server_path
+    monkeypatch.setattr(
+        candidate_server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(conn),
+    )
+    backlog_id = "AC-EABF-FINISH-FACADE-DISCOVERABILITY"
+    worker_task_id = "eabf-finish-facade-worker"
+    worker_token = "eabf-finish-facade-worker-token"
+    worker_fence = "fence-eabf-finish-facade-worker"
+    graph_trace_id = "gqt-eabf-finish-facade-worker"
+    owned_file = "agent/governance/server.py"
+    worker_root = tmp_path / worker_task_id
+    base_commit, worker_commit = _source_backed_worker_git_fixture(
+        worker_root,
+        owned_file,
+    )
+    test_results = {
+        "status": "passed",
+        "passed": True,
+        "commands": [
+            "python -m pytest -q agent/tests/test_graph_governance_api.py"
+        ],
+    }
+    (
+        contract_execution_id,
+        runtime_context,
+        _runtime,
+        _worker_session_id,
+    ) = _record_source_backed_worker_authority(
+        candidate_server,
+        conn,
+        backlog_id=backlog_id,
+        worker_task_id=worker_task_id,
+        worker_token=worker_token,
+        worker_fence=worker_fence,
+        graph_trace_id=graph_trace_id,
+        owned_file=owned_file,
+        worker_root=worker_root,
+        base_commit=base_commit,
+        worker_commit=worker_commit,
+        test_results=test_results,
+    )
+    query = {
+        "parent_task_id": contract_execution_id,
+        "fence_token": worker_fence,
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(runtime_context),
+        "target_project_root": str(worker_root),
+    }
+
+    def worker_guide() -> dict[str, Any]:
+        return candidate_server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                query=query,
+            )
+        )
+
+    guide = worker_guide()
+    aliases = [
+        guide[name]
+        for name in (
+            "finish_time_worker_attestation_facade_payload_skeleton",
+            "finish_time_worker_self_attestation_facade_payload_skeleton",
+            "finish_time_attestation_facade_payload_skeleton",
+        )
+    ]
+    assert aliases[0] == aliases[1] == aliases[2]
+    attestation_skeleton = aliases[0]
+    assert attestation_skeleton
+    assert attestation_skeleton["action_input"] == attestation_skeleton[
+        "copy_safe_body"
+    ]
+    assert attestation_skeleton == guide["worker_guide"][
+        "finish_time_worker_attestation_facade_payload_skeleton"
+    ]
+    assert attestation_skeleton == guide["actionable_payloads"][
+        "finish_time_worker_attestation_facade_payload_skeleton"
+    ]
+    route_identity = {
+        field: attestation_skeleton["action_input"][field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    changes_before_recovery = conn.total_changes
+    recovery = candidate_server._runtime_context_worker_recovery_details(
+        _ctx({"project_id": PID}),
+        conn,
+        project_id=PID,
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        parent_task_id=contract_execution_id,
+        fence_token=worker_fence,
+        session_token=worker_token,
+        session_token_ref=runtime_context_session_token_ref(runtime_context),
+        target_project_root=str(worker_root),
+        route_identity=route_identity,
+        reason="test_finish_alias_recovery_projection",
+        context=runtime_context,
+    )
+    assert recovery[
+        "finish_time_worker_attestation_facade_payload_skeleton"
+    ] == attestation_skeleton
+    assert conn.total_changes == changes_before_recovery
+    body = copy.deepcopy(attestation_skeleton["action_input"])
+    body.update({"session_token": worker_token, "fence_token": worker_fence})
+    attestation = candidate_server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=body,
+        )
+    )
+    assert attestation["ok"] is True
+
+    gate_guide = worker_guide()
+    gate_skeleton = gate_guide["finish_gate_facade_payload_skeleton"]
+    assert gate_skeleton
+    assert gate_skeleton == gate_guide["worker_guide"][
+        "finish_gate_facade_payload_skeleton"
+    ]
+    assert gate_skeleton == gate_guide["actionable_payloads"][
+        "finish_gate_facade_payload_skeleton"
+    ]
+    assert gate_skeleton["action_input"][
+        "finish_time_worker_self_attestation"
+    ] == attestation["finish_time_worker_self_attestation"]
+    assert gate_skeleton["action_input"]["head_commit"] == attestation[
+        "finish_gate_submission"
+    ]["body"]["head_commit"]
+    gate_body = copy.deepcopy(gate_skeleton["action_input"])
+    gate_body.update({"session_token": worker_token, "fence_token": worker_fence})
+    finished = candidate_server.handle_graph_governance_runtime_context_finish_gate(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=gate_body,
+        )
+    )
+    assert finished["ok"] is True
+    assert finished["context"]["status"] == "validated"
+
+
 def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage(
     conn,
     tmp_path,
@@ -131261,6 +131480,7 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
         worker_role="mf_sub",
         fence_token=inactive_fence,
         run_id=_mf_sub_run_id(inactive_context.task_id, inactive_fence),
+        route_identity=route_identity,
     )
     graph_line = server._runtime_context_submit_canonical_contract_line(
         conn,
@@ -131514,6 +131734,9 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
         )
     )
     assert worker_commit["ok"] is True
+    assert worker_commit["worker_commit"]["graph_trace_db_evidence"][
+        "verified_trace_ids"
+    ] == [graph_trace_id]
 
     finish_attestation = (
         server.handle_graph_governance_runtime_context_finish_time_worker_attestation(

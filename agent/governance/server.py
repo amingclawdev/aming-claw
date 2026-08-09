@@ -12595,6 +12595,54 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
         body["repo_root"] = target_root
     body["query_source"] = "mf_subagent"
     body["run_id"] = str(body.get("run_id") or "") or f"mf_subagent:{context.task_id}:fence:{fence_hash}"
+    canonical_route_identity = _runtime_context_latest_route_identity(
+        conn,
+        context,
+    )
+    trusted_route_identity = {
+        field: str(canonical_route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    route_authority_required = any(trusted_route_identity.values()) or any(
+        str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    )
+    if route_authority_required and any(
+        not trusted_route_identity[field]
+        or trusted_route_identity[field]
+        != str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    ):
+        raise GovernanceError(
+            "mf_subagent_graph_query_route_authority_changed",
+            "mf_subagent graph query route authority changed after validation",
+            409,
+            {
+                "runtime_context_id": body["runtime_context_id"],
+                "task_id": body["task_id"],
+                "parent_task_id": body["parent_task_id"],
+                "fail_closed": True,
+                "writes_performed": False,
+            },
+        )
+    if route_authority_required:
+        setattr(
+            ctx,
+            "_trusted_mf_sub_graph_query_authority",
+            {
+                "schema_version": "runtime_context.mf_sub_graph_query_authority.v1",
+                "source": "validated_runtime_context_route_identity",
+                "runtime_context_id": body["runtime_context_id"],
+                "task_id": body["task_id"],
+                "parent_task_id": body["parent_task_id"],
+                "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+                "worker_role": "mf_sub",
+                **trusted_route_identity,
+                "server_derived": True,
+                "caller_route_identity_persisted_directly": False,
+                "raw_route_token_persisted": False,
+            },
+        )
     return session
 
 
@@ -18143,6 +18191,9 @@ def _runtime_context_service_timeline_refs(
         "finish_time_attestation_event_ref": str(
             finish_attestation.get("attestation_event_ref") or ""
         ),
+        "finish_time_worker_self_attestation": dict(
+            finish_attestation.get("worker_self_attestation") or {}
+        ),
         "read_receipt_event_ref": str(refs.get("read_receipt_event_ref") or ""),
         "observer_command_id": str(refs.get("observer_command_id") or ""),
         "read_receipt_hash": str(refs.get("read_receipt_hash") or ""),
@@ -19265,6 +19316,7 @@ def _runtime_context_projection_response(
     context,
     role: str,
     session: Mapping[str, Any],
+    record_access_audit: bool = True,
 ) -> dict[str, Any]:
     from .parallel_branch_runtime import (
         branch_contract_revision_to_dict,
@@ -19537,23 +19589,33 @@ def _runtime_context_projection_response(
         worker_slot_id=worker_summary_slot_id,
         route_identity=_runtime_context_latest_route_identity(conn, context),
     )
-    audit = record_runtime_context_access_audit(
-        conn,
-        project_id=context_project_id,
-        runtime_context_id=runtime_context_id,
-        task_id=str(getattr(context, "task_id", "") or ""),
-        session=session,
-        role=role,
-        view_name=view_name,
-        projection_hash=str(content_address.get("projection_hash") or ""),
-        nodes_read=nodes_read,
-        metadata={
-            "endpoint": "parallel-branches.runtime-context.current-state",
-            "role_scope": role_scope,
-            "target_project_id": getattr(context, "target_project_id", "") or project_id,
-        },
-    )
-    conn.commit()
+    if record_access_audit:
+        audit = record_runtime_context_access_audit(
+            conn,
+            project_id=context_project_id,
+            runtime_context_id=runtime_context_id,
+            task_id=str(getattr(context, "task_id", "") or ""),
+            session=session,
+            role=role,
+            view_name=view_name,
+            projection_hash=str(content_address.get("projection_hash") or ""),
+            nodes_read=nodes_read,
+            metadata={
+                "endpoint": "parallel-branches.runtime-context.current-state",
+                "role_scope": role_scope,
+                "target_project_id": (
+                    getattr(context, "target_project_id", "") or project_id
+                ),
+            },
+        )
+        conn.commit()
+    else:
+        audit = {
+            "schema_version": "runtime_context.access_audit.not_recorded.v1",
+            "audit_id": "",
+            "projection_hash": str(content_address.get("projection_hash") or ""),
+            "nodes_read": list(nodes_read),
+        }
     response = {
         "ok": True,
         "schema_version": "runtime_context.current_state_response.v1",
@@ -23586,6 +23648,156 @@ def _runtime_context_qa_verification_guide(
     }
 
 
+_RUNTIME_CONTEXT_FINISH_FACADE_ALIASES = (
+    "finish_time_worker_attestation_facade_payload_skeleton",
+    "finish_time_worker_self_attestation_facade_payload_skeleton",
+    "finish_time_attestation_facade_payload_skeleton",
+    "finish_gate_facade_payload_skeleton",
+)
+
+
+def _runtime_context_finish_facade_alias_projection(
+    actionable_payloads: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        alias: deepcopy(actionable_payloads.get(alias) or {})
+        for alias in _RUNTIME_CONTEXT_FINISH_FACADE_ALIASES
+    }
+
+
+def _runtime_context_finish_facade_line_is_exact(
+    *,
+    contract_runtime_next_legal_action: Mapping[str, Any],
+    expected_line_id: str,
+    expected_action: str,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    task_id: str,
+) -> bool:
+    """Close facade discoverability over the canonical ContractRuntime writer."""
+
+    next_action = (
+        contract_runtime_next_legal_action
+        if isinstance(contract_runtime_next_legal_action, Mapping)
+        else {}
+    )
+    writer = next_action.get("writer_role_safe_copy_payload")
+    writer = writer if isinstance(writer, Mapping) else {}
+    copy_payload = writer.get("copy_payload")
+    copy_payload = copy_payload if isinstance(copy_payload, Mapping) else {}
+    if not writer or not copy_payload:
+        return False
+    next_exact_fields = {
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "line_id": expected_line_id,
+    }
+    if any(
+        not expected
+        or str(next_action.get(field) or "").strip() != expected
+        for field, expected in next_exact_fields.items()
+    ):
+        return False
+    for field in ("contract_execution_id", "line_id"):
+        if str(copy_payload.get(field) or "").strip() != next_exact_fields[field]:
+            return False
+    if str(next_action.get("action") or "").strip() != expected_action:
+        return False
+    if str(next_action.get("owner_role") or "").strip() != "mf_sub":
+        return False
+    allowed_writer_roles = {
+        str(value or "").strip()
+        for value in next_action.get("allowed_writer_roles") or []
+    }
+    if "mf_sub" not in allowed_writer_roles:
+        return False
+    expected_revision = next_action.get("execution_state_revision")
+    if expected_revision is not None and copy_payload.get(
+        "execution_state_revision"
+    ) != expected_revision:
+        return False
+    guidance = next_action.get("submit_line_guidance")
+    guidance = guidance if isinstance(guidance, Mapping) else {}
+    expected_guide_hash = str(
+        guidance.get("current_required_runtime_guide_hash") or ""
+    ).strip()
+    if expected_guide_hash and str(
+        copy_payload.get("runtime_guide_hash") or ""
+    ).strip() != expected_guide_hash:
+        return False
+    return True
+
+
+def _runtime_context_finish_facade_payload_skeleton(
+    submission: Mapping[str, Any],
+    *,
+    schema_version: str,
+) -> dict[str, Any]:
+    body = submission.get("copy_safe_body")
+    body = dict(body) if isinstance(body, Mapping) else {}
+    if not body:
+        return {}
+    return {
+        **deepcopy(dict(submission)),
+        "schema_version": schema_version,
+        "canonical_submission_schema_version": str(
+            submission.get("schema_version") or ""
+        ),
+        "actionable": True,
+        "body": dict(body),
+        "copy_safe_body": dict(body),
+        "post_body": dict(body),
+        "action_input": dict(body),
+        "body_source": "copy_safe_body",
+        "server_derived": True,
+        "caller_hand_built_body_allowed": False,
+    }
+
+
+def _runtime_context_materialized_finish_gate_submission(
+    template: Mapping[str, Any],
+    *,
+    finish_attestation_hint: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Materialize the post-attestation gate from its accepted durable event."""
+
+    hint = (
+        finish_attestation_hint
+        if isinstance(finish_attestation_hint, Mapping)
+        else {}
+    )
+    attestation = hint.get("finish_time_worker_self_attestation")
+    if not isinstance(attestation, Mapping) or not attestation:
+        return {}
+    attestation_event_ref = str(
+        hint.get("finish_time_attestation_event_ref") or ""
+    ).strip()
+    if not attestation_event_ref:
+        return {}
+    result = deepcopy(dict(template))
+    body = result.get("copy_safe_body")
+    body = dict(body) if isinstance(body, Mapping) else {}
+    if not body:
+        return {}
+    head_commit = str(body.get("head_commit") or "").strip()
+    if not head_commit:
+        return {}
+    checkpoint_seed = re.sub(r"[^A-Za-z0-9_.-]+", "-", head_commit).strip("-")
+    durable_fields = {
+        "checkpoint_id": f"ckpt-finish-{checkpoint_seed[:24] or 'worker'}",
+        "finish_time_worker_self_attestation": dict(attestation),
+    }
+    body.update(durable_fields)
+    result.update(durable_fields)
+    result["attestation_event_ref"] = attestation_event_ref
+    result["body"] = dict(body)
+    result["copy_safe_body"] = dict(body)
+    result["post_body"] = dict(body)
+    result["body_source"] = "copy_safe_body"
+    return result
+
+
 def _runtime_context_worker_guide_response(
     current_state_response: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -24686,6 +24898,16 @@ def _runtime_context_worker_guide_response(
         }.items()
         if not value
     ]
+    if _runtime_context_non_placeholder_text(
+        finish_attestation_body.get("worker_transcript_ref")
+    ) or _runtime_context_non_placeholder_text(
+        finish_attestation_body.get("worker_transcript_path")
+    ):
+        finish_attestation_missing = [
+            field
+            for field in finish_attestation_missing
+            if field != "worker_transcript_ref_or_path"
+        ]
     qa_verification_guide = _runtime_context_qa_verification_guide(
         project_id=project_id,
         runtime_context_id=runtime_context_id,
@@ -25485,6 +25707,58 @@ def _runtime_context_worker_guide_response(
     actionable_payloads["row_scoped_finish_head_projection"] = (
         row_scoped_finish_head_projection
     )
+    resolved_contract_execution_id = str(
+        contract_execution_identity.get("contract_execution_id")
+        or contract_runtime_execution_resolution.get("contract_execution_id")
+        or contract_runtime_current_state.get("contract_execution_id")
+        or ""
+    ).strip()
+    attestation_line_exact = _runtime_context_finish_facade_line_is_exact(
+        contract_runtime_next_legal_action=contract_runtime_next_legal_action,
+        expected_line_id="worker_finish_time_attestation",
+        expected_action="record_finish_time_worker_attestation",
+        contract_execution_id=resolved_contract_execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    if (
+        attestation_line_exact
+        and not finish_hint_source_backed_blocked
+        and not finish_attestation_missing
+        and finish_attestation_submission.get("actionable") is True
+    ):
+        attestation_skeleton = _runtime_context_finish_facade_payload_skeleton(
+            finish_attestation_submission,
+            schema_version=(
+                "runtime_context.finish_time_worker_attestation_facade_payload_skeleton.v1"
+            ),
+        )
+        if attestation_skeleton:
+            for alias in _RUNTIME_CONTEXT_FINISH_FACADE_ALIASES[:3]:
+                actionable_payloads[alias] = deepcopy(attestation_skeleton)
+    finish_gate_line_exact = _runtime_context_finish_facade_line_is_exact(
+        contract_runtime_next_legal_action=contract_runtime_next_legal_action,
+        expected_line_id="worker_finish_gate",
+        expected_action="record_mf_subagent_finish_gate",
+        contract_execution_id=resolved_contract_execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    if finish_gate_line_exact and not finish_hint_source_backed_blocked:
+        materialized_finish_gate = _runtime_context_materialized_finish_gate_submission(
+            finish_gate_submission_template,
+            finish_attestation_hint=finish_attestation_hint,
+        )
+        finish_gate_skeleton = _runtime_context_finish_facade_payload_skeleton(
+            materialized_finish_gate,
+            schema_version=(
+                "runtime_context.finish_gate_facade_payload_skeleton.v1"
+            ),
+        )
+        if finish_gate_skeleton:
+            actionable_payloads["finish_gate_facade_payload_skeleton"] = (
+                finish_gate_skeleton
+            )
     _runtime_context_patch_actionable_payload_worker_scope(
         actionable_payloads,
         worker_scope_files,
@@ -25537,6 +25811,9 @@ def _runtime_context_worker_guide_response(
         actionable_payloads=actionable_payloads,
         effective_next_legal_action=next_legal_action,
         effective_next_required_evidence=next_required_evidence,
+    )
+    finish_facade_aliases = _runtime_context_finish_facade_alias_projection(
+        actionable_payloads
     )
     response = {
         "ok": True,
@@ -25634,6 +25911,7 @@ def _runtime_context_worker_guide_response(
             "implementation_evidence_facade_payload_skeleton",
             {},
         ),
+        **finish_facade_aliases,
         "scope_insufficiency_request_facade_payload_skeleton": actionable_payloads.get(
             "scope_insufficiency_request_facade_payload_skeleton",
             {},
@@ -25747,6 +26025,7 @@ def _runtime_context_worker_guide_response(
                 "implementation_evidence_facade_payload_skeleton",
                 {},
             ),
+            **finish_facade_aliases,
             "scope_insufficiency_request_facade_payload_skeleton": (
                 actionable_payloads.get(
                     "scope_insufficiency_request_facade_payload_skeleton",
@@ -29276,6 +29555,64 @@ def _runtime_context_worker_recovery_details(
             )
             if isinstance(session_renewal_hints, dict):
                 session_renewal_hints["rejoin"] = session_token_rejoin_submission
+        try:
+            projection_query = dict(ctx.query or {})
+            projection_query["view"] = "all"
+            projection_ctx = RequestContext(
+                ctx.handler,
+                "GET",
+                {
+                    "project_id": project_id,
+                    "runtime_context_id": expected_runtime_context_id,
+                },
+                projection_query,
+                {},
+                ctx.request_id,
+                "",
+                "",
+            )
+            durable_current = _runtime_context_projection_response(
+                projection_ctx,
+                conn,
+                project_id=project_id,
+                context=context,
+                role="observer",
+                session={
+                    "session_id": "server-derived-recovery-projection",
+                    "principal_id": "runtime_context_service",
+                    "project_id": project_id,
+                    "role": "observer",
+                },
+                record_access_audit=False,
+            )
+            durable_guide = _runtime_context_worker_guide_response(
+                durable_current
+            )
+            for alias in _RUNTIME_CONTEXT_FINISH_FACADE_ALIASES:
+                projected = durable_guide.get(alias)
+                if isinstance(projected, Mapping) and projected:
+                    actionable_payloads[alias] = deepcopy(dict(projected))
+            diagnostics["finish_facade_projection"] = {
+                "status": (
+                    "available"
+                    if any(
+                        actionable_payloads.get(alias)
+                        for alias in (
+                            "finish_time_worker_attestation_facade_payload_skeleton",
+                            "finish_gate_facade_payload_skeleton",
+                        )
+                    )
+                    else "not_currently_actionable"
+                ),
+                "source": "durable_runtime_context_worker_guide",
+                "access_audit_recorded": False,
+            }
+        except (GovernanceError, ValidationError, sqlite3.Error, ValueError):
+            diagnostics["finish_facade_projection"] = {
+                "status": "fail_closed_unavailable",
+                "source": "durable_runtime_context_worker_guide",
+                "access_audit_recorded": False,
+            }
     recovery_actions = [
         {
             "id": recovery_action_id,
@@ -29334,6 +29671,7 @@ def _runtime_context_worker_recovery_details(
             {},
         ),
         "implementation_evidence_facade_payload_skeleton": implementation_skeleton,
+        **_runtime_context_finish_facade_alias_projection(actionable_payloads),
         "retry_implementation_evidence_top_level_body": dict(
             implementation_copy_safe_body
         ),
@@ -64699,6 +65037,9 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
         qa_proof = qa_proof if isinstance(qa_proof, Mapping) else {}
         observer_proof = getattr(ctx, "_trusted_observer_graph_query_authority", {})
         observer_proof = observer_proof if isinstance(observer_proof, Mapping) else {}
+        mf_sub_proof = getattr(ctx, "_trusted_mf_sub_graph_query_authority", {})
+        mf_sub_proof = mf_sub_proof if isinstance(mf_sub_proof, Mapping) else {}
+        route_proof = mf_sub_proof or observer_proof
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, str(body.get("snapshot_id") or "active"))
         try:
             with sqlite_write_lock():
@@ -64714,29 +65055,29 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
                     runtime_context_id=str(body.get("runtime_context_id") or ""),
                     task_id=str(
                         qa_proof.get("task_id")
-                        or observer_proof.get("task_id")
+                        or route_proof.get("task_id")
                         or body.get("task_id")
                         or ""
                     ),
                     backlog_id=str(
                         qa_proof.get("backlog_id")
-                        or observer_proof.get("backlog_id")
+                        or route_proof.get("backlog_id")
                         or ""
                     ),
-                    route_id=str(observer_proof.get("route_id") or ""),
+                    route_id=str(route_proof.get("route_id") or ""),
                     route_context_hash=str(
-                        observer_proof.get("route_context_hash") or ""
+                        route_proof.get("route_context_hash") or ""
                     ),
                     prompt_contract_id=str(
-                        observer_proof.get("prompt_contract_id") or ""
+                        route_proof.get("prompt_contract_id") or ""
                     ),
                     prompt_contract_hash=str(
-                        observer_proof.get("prompt_contract_hash") or ""
+                        route_proof.get("prompt_contract_hash") or ""
                     ),
                     visible_injection_manifest_hash=str(
-                        observer_proof.get("visible_injection_manifest_hash") or ""
+                        route_proof.get("visible_injection_manifest_hash") or ""
                     ),
-                    route_token_ref=str(observer_proof.get("route_token_ref") or ""),
+                    route_token_ref=str(route_proof.get("route_token_ref") or ""),
                     commit_sha=str(qa_proof.get("commit_sha") or ""),
                     graph_basis=str(qa_proof.get("graph_basis") or ""),
                     graph_basis_decision=(
@@ -65190,6 +65531,9 @@ def handle_graph_governance_query(ctx: RequestContext):
         qa_proof = qa_proof if isinstance(qa_proof, Mapping) else {}
         observer_proof = getattr(ctx, "_trusted_observer_graph_query_authority", {})
         observer_proof = observer_proof if isinstance(observer_proof, Mapping) else {}
+        mf_sub_proof = getattr(ctx, "_trusted_mf_sub_graph_query_authority", {})
+        mf_sub_proof = mf_sub_proof if isinstance(mf_sub_proof, Mapping) else {}
+        route_proof = mf_sub_proof or observer_proof
         cross_project_contract_line = (
             _runtime_context_cross_project_graph_contract_preflight(
                 target_project_id=project_id,
@@ -65232,29 +65576,29 @@ def handle_graph_governance_query(ctx: RequestContext):
                     runtime_context_id=str(body.get("runtime_context_id") or ""),
                     task_id=str(
                         qa_proof.get("task_id")
-                        or observer_proof.get("task_id")
+                        or route_proof.get("task_id")
                         or body.get("task_id")
                         or ""
                     ),
                     backlog_id=str(
                         qa_proof.get("backlog_id")
-                        or observer_proof.get("backlog_id")
+                        or route_proof.get("backlog_id")
                         or ""
                     ),
-                    route_id=str(observer_proof.get("route_id") or ""),
+                    route_id=str(route_proof.get("route_id") or ""),
                     route_context_hash=str(
-                        observer_proof.get("route_context_hash") or ""
+                        route_proof.get("route_context_hash") or ""
                     ),
                     prompt_contract_id=str(
-                        observer_proof.get("prompt_contract_id") or ""
+                        route_proof.get("prompt_contract_id") or ""
                     ),
                     prompt_contract_hash=str(
-                        observer_proof.get("prompt_contract_hash") or ""
+                        route_proof.get("prompt_contract_hash") or ""
                     ),
                     visible_injection_manifest_hash=str(
-                        observer_proof.get("visible_injection_manifest_hash") or ""
+                        route_proof.get("visible_injection_manifest_hash") or ""
                     ),
-                    route_token_ref=str(observer_proof.get("route_token_ref") or ""),
+                    route_token_ref=str(route_proof.get("route_token_ref") or ""),
                     commit_sha=str(qa_proof.get("commit_sha") or ""),
                     graph_basis=str(qa_proof.get("graph_basis") or ""),
                     graph_basis_decision=(
