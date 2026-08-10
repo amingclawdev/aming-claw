@@ -12012,12 +12012,29 @@ def test_current_full_reconcile_reuses_generated_snapshot_id_for_metric_lifecycl
             query={"include_resolved": "true"},
         )
     )
+    run_id_sha256 = "sha256:" + hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+    snapshot_id_sha256 = (
+        "sha256:" + hashlib.sha256(snapshot_id.encode("utf-8")).hexdigest()
+    )
+    safe_run_id = "run-" + run_id_sha256[7:23]
+    safe_snapshot_id = "snapshot-" + snapshot_id_sha256[7:23]
     matching_operations = [
-        item for item in queue["operations"] if item.get("run_id") == run_id
+        item
+        for item in queue["operations"]
+        if item.get("operation_type") == "current_full_reconcile"
+        and item.get("run_id_sha256") == run_id_sha256
+        and item.get("snapshot_id_sha256") == snapshot_id_sha256
     ]
     assert len(matching_operations) == 1
-    assert matching_operations[0]["snapshot_id"] == snapshot_id
-    assert matching_operations[0]["status"] == "complete"
+    operation = matching_operations[0]
+    assert operation["run_id"] == safe_run_id
+    assert operation["run_id_sha256"] == run_id_sha256
+    assert operation["snapshot_id"] == safe_snapshot_id
+    assert operation["snapshot_id_sha256"] == snapshot_id_sha256
+    assert operation["status"] == "complete"
+    serialized_operation = json.dumps(operation, sort_keys=True)
+    assert run_id not in serialized_operation
+    assert snapshot_id not in serialized_operation
     assert store.summarize_reconcile_run_metrics(conn, PID)["sample_count"] == 1
 
 
