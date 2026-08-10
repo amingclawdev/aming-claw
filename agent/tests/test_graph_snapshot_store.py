@@ -477,6 +477,19 @@ def test_terminalization_append_accepts_generation_quiesced_source_without_repla
         snapshot_id=fixture["source_snapshot_id"],
     )["effective_status"] == "terminalized_stale"
 
+    _add_terminalization_candidate(
+        conn,
+        suffix="generation-quiesced-later",
+        commit_sha=fixture["commit_sha"],
+        scope=fixture["source_scope"],
+    )
+    assert store.reconcile_run_terminalization_overlay(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+    )["replacement_count"] == 0
+
     store.record_manager_generation_certificate(
         conn,
         PID,
