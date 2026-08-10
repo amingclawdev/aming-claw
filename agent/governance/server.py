@@ -1018,20 +1018,25 @@ def _strict_prior_pid_death(
 ) -> tuple[str, str]:
     """Return only when a non-destructive kill(pid, 0) proves ESRCH."""
 
-    del timeout_seconds, poll_interval_seconds
     if int(pid) == os.getpid():
         raise GovernanceSingletonError("governance_pidfile_points_to_current_process")
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return expected_process_start_identity, _utc_now()
-    except PermissionError as exc:
-        raise GovernanceSingletonError("prior_governance_pid_unverifiable") from exc
-    except OSError as exc:
-        if exc.errno == errno.ESRCH:
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    poll_interval = max(0.001, min(float(poll_interval_seconds), 0.05))
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
             return expected_process_start_identity, _utc_now()
-        raise GovernanceSingletonError("prior_governance_pid_probe_failed") from exc
-    raise GovernanceSingletonError("prior_governance_pid_alive")
+        except PermissionError as exc:
+            raise GovernanceSingletonError("prior_governance_pid_unverifiable") from exc
+        except OSError as exc:
+            if exc.errno == errno.ESRCH:
+                return expected_process_start_identity, _utc_now()
+            raise GovernanceSingletonError("prior_governance_pid_probe_failed") from exc
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GovernanceSingletonError("prior_governance_pid_timeout")
+        time.sleep(min(poll_interval, remaining))
 
 
 def _acquire_pid_lock(

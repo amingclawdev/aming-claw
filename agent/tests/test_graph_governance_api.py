@@ -18,7 +18,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from threading import Event, get_ident
+from threading import Event, Thread, get_ident
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -259,7 +259,7 @@ def test_governance_singleton_live_prior_is_never_signaled_and_fails_closed(tmp_
 
         with pytest.raises(
             server.GovernanceSingletonError,
-            match="prior_governance_pid_alive",
+            match="prior_governance_pid_timeout",
         ):
             server._acquire_pid_lock(
                 lock_dir=state_dir,
@@ -272,6 +272,91 @@ def test_governance_singleton_live_prior_is_never_signaled_and_fails_closed(tmp_
     finally:
         prior.kill()
         prior.wait(timeout=2)
+
+
+def test_governance_singleton_polls_until_transient_prior_exits(tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    prior = subprocess.Popen(
+        [sys.executable, "-c", "import os,time; print(os.getpid(), flush=True); time.sleep(0.08)"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    prior_pid = int(prior.stdout.readline().strip())
+    reaper = Thread(target=prior.wait, daemon=True)
+    reaper.start()
+    pid_path = state_dir / "governance.pid"
+    pid_path.write_text(str(prior_pid), encoding="utf-8")
+
+    lease = server._acquire_pid_lock(
+        lock_dir=state_dir,
+        lock_timeout_seconds=0.05,
+        prior_pid_timeout_seconds=1.0,
+        poll_interval_seconds=0.005,
+    )
+    try:
+        reaper.join(timeout=1)
+        assert prior.poll() is not None
+        assert lease.public_receipt()["prior_manager_pid"] == prior_pid
+        assert lease.public_receipt()["prior_pid_death_method"] == "esrch"
+    finally:
+        lease.release()
+
+
+def test_governance_singleton_prior_exits_after_deadline_fails_without_overwrite(
+    tmp_path,
+):
+    prior = _sleeping_process()
+    try:
+        prior_pid = int(prior.stdout.readline().strip())
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        pid_path = state_dir / "governance.pid"
+        pid_path.write_text(str(prior_pid), encoding="utf-8")
+        original = pid_path.read_bytes()
+
+        with pytest.raises(
+            server.GovernanceSingletonError,
+            match="prior_governance_pid_timeout",
+        ):
+            server._acquire_pid_lock(
+                lock_dir=state_dir,
+                lock_timeout_seconds=0.05,
+                prior_pid_timeout_seconds=0.02,
+                poll_interval_seconds=0.005,
+            )
+        assert prior.poll() is None
+        assert pid_path.read_bytes() == original
+    finally:
+        prior.kill()
+        prior.wait(timeout=2)
+
+
+@pytest.mark.parametrize("timeout_seconds", [0.0, -1.0])
+def test_prior_pid_zero_or_negative_timeout_is_deterministic(
+    monkeypatch,
+    timeout_seconds,
+):
+    calls = []
+
+    def alive_probe(pid, sig):
+        calls.append((pid, sig))
+
+    monkeypatch.setattr(server.os, "kill", alive_probe)
+    started = time.monotonic()
+    with pytest.raises(
+        server.GovernanceSingletonError,
+        match="prior_governance_pid_timeout",
+    ):
+        server._strict_prior_pid_death(
+            987654,
+            expected_process_start_identity="",
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=1.0,
+        )
+    assert time.monotonic() - started < 0.05
+    assert calls == [(987654, 0)]
 
 
 def test_governance_singleton_proves_only_already_dead_prior_esrch(tmp_path):
