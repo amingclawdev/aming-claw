@@ -2165,6 +2165,79 @@ class TestCliLauncher:
 
 
 class TestCliStart:
+    @pytest.mark.parametrize("explicit_workspace", [False, True])
+    def test_start_refuses_wrong_package_root_before_health_probe(
+        self, monkeypatch, tmp_path, explicit_workspace
+    ):
+        import agent.cli as cli
+
+        runner = CliRunner()
+        installed_root = tmp_path / "installed-release"
+        (installed_root / "agent").mkdir(parents=True)
+        health_probes = []
+        monkeypatch.setattr(cli, "_default_runtime_workspace", lambda: installed_root)
+        monkeypatch.setattr(
+            cli,
+            "_probe_governance",
+            lambda port: health_probes.append(port)
+            or {"status": "ok", "service": "governance", "version": "old"},
+        )
+
+        source_root = tmp_path / "source-checkout"
+        (source_root / ".git").mkdir(parents=True)
+        (source_root / "agent").mkdir()
+        (source_root / "agent/cli.py").write_text(
+            "# source checkout\n", encoding="utf-8"
+        )
+        (source_root / "start_governance.py").write_text(
+            "# source checkout\n", encoding="utf-8"
+        )
+        (source_root / "pyproject.toml").write_text(
+            "[project]\nname='aming-claw'\n", encoding="utf-8"
+        )
+        source_root = source_root.resolve()
+        invocation_root = source_root if not explicit_workspace else tmp_path / "elsewhere"
+        invocation_root.mkdir(exist_ok=True)
+        with runner.isolated_filesystem(temp_dir=invocation_root):
+            args = ["start", "--port", "45555"]
+            if explicit_workspace:
+                args.extend(["--workspace", str(source_root)])
+            result = runner.invoke(main, args)
+
+        assert result.exit_code != 0
+        assert "source checkout does not match the loaded package root" in result.output
+        assert str(source_root) in result.output
+        assert str(installed_root.resolve()) in result.output
+        assert '"source_cli_sha256": "sha256:' in result.output
+        assert '"loaded_cli_sha256": "sha256:' in result.output
+        assert '"zero_write_rejection": true' in result.output
+        assert health_probes == []
+
+    def test_start_allows_matching_source_checkout(self, monkeypatch, tmp_path):
+        import agent.cli as cli
+
+        runner = CliRunner()
+        health_probes = []
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            Path(".git").mkdir()
+            Path("agent").mkdir()
+            Path("agent/cli.py").write_text("# source checkout\n", encoding="utf-8")
+            Path("start_governance.py").write_text("# source checkout\n", encoding="utf-8")
+            Path("pyproject.toml").write_text("[project]\nname='aming-claw'\n", encoding="utf-8")
+            source_root = Path.cwd().resolve()
+            monkeypatch.setattr(cli, "_default_runtime_workspace", lambda: source_root)
+            monkeypatch.setattr(
+                cli,
+                "_probe_governance",
+                lambda port: health_probes.append(port)
+                or {"status": "ok", "service": "governance", "version": "current"},
+            )
+            result = runner.invoke(main, ["start", "--port", "45555"])
+
+        assert result.exit_code == 0
+        assert "already running" in result.output
+        assert health_probes == [45555]
+
     def test_start_without_workspace_uses_plugin_runtime_root_not_cwd(self, monkeypatch, tmp_path):
         import agent.cli as cli
 

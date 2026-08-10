@@ -126,6 +126,22 @@ aming-claw open
 
 `aming-claw start` is a long-running service command. Keep it in a dedicated
 background terminal; run `aming-claw open` separately after health is ready.
+When developing or releasing from an Aming Claw source checkout, bind the
+interpreter to that checkout explicitly and start through the module entrypoint:
+
+```bash
+python -m pip install -e .
+python -m agent.cli start --workspace "$PWD"
+```
+
+Do not trust a healthy port alone. Before using graph, backlog, QA, or release
+evidence, verify `runtime_status` reports the intended full Git HEAD and that
+`governance.loaded_runtime_identity.loaded_source_path` is inside this checkout;
+its loaded source hash must match the checkout file hash. Startup now refuses a
+source-checkout/package-root mismatch before probing health or mutating runtime
+state, and plugin install/update refuses to repoint a virtualenv owned by a
+different Git checkout.
+
 For a detached local runtime, use the platform-appropriate launcher:
 
 ```bash

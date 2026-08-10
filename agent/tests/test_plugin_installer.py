@@ -171,6 +171,17 @@ def _write_plugin_fixture(root: Path) -> None:
     server_path.write_text("# test runtime entrypoint\n", encoding="utf-8")
 
 
+def _repo_owned_python(root: Path) -> Path:
+    (root / ".git").mkdir(parents=True, exist_ok=True)
+    python = root / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("", encoding="utf-8")
+    (python.parent.parent / "pyvenv.cfg").write_text(
+        "home = /usr/local/bin\n", encoding="utf-8"
+    )
+    return python
+
+
 def _git(args: list[str], cwd: Path) -> str:
     proc = subprocess.run(
         ["git", *args],
@@ -948,6 +959,135 @@ def test_install_from_git_rejects_unsupported_python_before_pip(tmp_path, monkey
             python_executable="old-python",
             install_package=True,
         )
+
+
+def test_install_from_git_rejects_foreign_repo_owned_venv_before_pip(
+    tmp_path, monkeypatch
+):
+    repo_url = "https://github.com/amingclawdev/aming-claw.git"
+    plugin_root = plugin_root_for(repo_url, tmp_path / "install")
+    _write_plugin_fixture(plugin_root)
+
+    python = _repo_owned_python(tmp_path / "source-checkout")
+
+    subprocess_calls = []
+    monkeypatch.setattr(
+        "agent.plugin_installer._ensure_supported_python",
+        lambda executable: subprocess_calls.append(("version", executable)),
+    )
+    monkeypatch.setattr(
+        "agent.plugin_installer._run",
+        lambda args, **kwargs: subprocess_calls.append(("run", args)),
+    )
+    monkeypatch.setattr(
+        "agent.plugin_installer.validate_plugin_root", lambda root: []
+    )
+
+    with pytest.raises(PluginInstallError, match="foreign repository-owned virtualenv"):
+        install_from_git(
+            repo_url,
+            install_root=tmp_path / "install",
+            validate_only=True,
+            python_executable=str(python),
+            install_package=True,
+            install_codex_plugin=False,
+        )
+
+    assert subprocess_calls == []
+
+
+def test_install_from_git_rejects_nested_target_in_python_owner_checkout(
+    tmp_path, monkeypatch
+):
+    repo_url = "https://github.com/amingclawdev/aming-claw.git"
+    owner_root = tmp_path / "source-checkout"
+    python = _repo_owned_python(owner_root)
+    plugin_root = plugin_root_for(repo_url, owner_root)
+    _write_plugin_fixture(plugin_root)
+    monkeypatch.setattr(
+        "agent.plugin_installer._ensure_supported_python",
+        lambda executable: pytest.fail("version probe must not run"),
+    )
+
+    with pytest.raises(PluginInstallError, match="foreign repository-owned virtualenv"):
+        install_from_git(
+            repo_url,
+            install_root=owner_root,
+            validate_only=True,
+            python_executable=str(python),
+            install_package=True,
+            install_codex_plugin=False,
+        )
+
+
+def test_install_from_git_allows_plugin_owned_venv(tmp_path, monkeypatch):
+    repo_url = "https://github.com/amingclawdev/aming-claw.git"
+    install_root = tmp_path / "install"
+    plugin_root = plugin_root_for(repo_url, install_root)
+    _write_plugin_fixture(plugin_root)
+    python = _repo_owned_python(plugin_root)
+    subprocess_calls = []
+    monkeypatch.setattr(
+        "agent.plugin_installer._ensure_supported_python",
+        lambda executable: subprocess_calls.append(("version", executable)),
+    )
+    monkeypatch.setattr(
+        "agent.plugin_installer._run",
+        lambda args, **kwargs: subprocess_calls.append(("run", args)),
+    )
+    monkeypatch.setattr(
+        "agent.plugin_installer.validate_plugin_root", lambda root: []
+    )
+
+    result = install_from_git(
+        repo_url,
+        install_root=install_root,
+        validate_only=True,
+        python_executable=str(python),
+        install_package=True,
+        install_codex_plugin=False,
+    )
+
+    assert result.installed_package is True
+    assert subprocess_calls == [
+        ("version", str(python)),
+        ("run", [str(python), "-m", "pip", "install", "-e", str(plugin_root)]),
+    ]
+
+
+def test_plugin_update_rejects_foreign_repo_owned_venv_before_checkout_change(
+    tmp_path,
+):
+    remote, source = _make_remote_plugin_repo(tmp_path)
+    install_root = tmp_path / "install"
+    plugin_root = _clone_plugin_repo(remote, install_root)
+    installed_commit = _git(["rev-parse", "HEAD"], plugin_root)
+    server = source / "agent" / "mcp" / "server.py"
+    server.write_text(
+        server.read_text(encoding="utf-8") + "\n# update\n", encoding="utf-8"
+    )
+    _git_commit_all(source, "update runtime")
+    _git(["push", "origin", "main"], source)
+    python = _repo_owned_python(tmp_path / "foreign-source")
+
+    result = update_plugin_from_git(
+        str(remote),
+        install_root=install_root,
+        apply_update=True,
+        python_executable=str(python),
+        install_package=True,
+        install_codex_plugin=False,
+        state_path=tmp_path / "update-state.json",
+    )
+
+    assert result.ok is False
+    assert result.status == "failed"
+    assert "foreign repository-owned virtualenv" in result.error
+    assert _git(["rev-parse", "HEAD"], plugin_root) == installed_commit
+    assert not any(
+        record.args[1:4] == ["-m", "pip", "install"]
+        for record in result.commands
+    )
 
 
 def test_check_claude_marketplace_passes_on_valid_manifest(tmp_path):

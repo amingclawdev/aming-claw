@@ -1312,6 +1312,9 @@ def update_plugin_from_git(
                 next_steps=["Run `aming-claw plugin update --apply` to fast-forward the local plugin checkout."],
             )
 
+        if install_package:
+            _require_safe_editable_install_target(python, plugin_root)
+
         _apply_plugin_commit(
             plugin_root,
             remote_commit,
@@ -1477,6 +1480,45 @@ def _ensure_supported_python(python_executable: str) -> None:
     check = _python_version_check(python_executable)
     if check.status != "ok":
         raise PluginInstallError(check.detail)
+
+
+def _git_checkout_root(path: Path) -> Optional[Path]:
+    candidate = path if path.is_dir() else path.parent
+    for root in (candidate, *candidate.parents):
+        if (root / ".git").exists():
+            return root.resolve()
+    return None
+
+
+def _python_virtualenv_root(python_executable: str) -> Optional[Path]:
+    candidate = Path(python_executable).expanduser()
+    if not candidate.is_absolute():
+        located = shutil.which(python_executable)
+        if not located:
+            return None
+        candidate = Path(located)
+    candidate = Path(os.path.abspath(candidate))
+    for root in (candidate.parent, *candidate.parent.parents):
+        if (root / "pyvenv.cfg").is_file():
+            return root
+    return None
+
+
+def _require_safe_editable_install_target(
+    python_executable: str, plugin_root: Path
+) -> None:
+    venv_root = _python_virtualenv_root(python_executable)
+    owner_root = _git_checkout_root(venv_root) if venv_root else None
+    if owner_root is None:
+        return
+    target_root = plugin_root.expanduser().resolve()
+    if target_root == owner_root:
+        return
+    raise PluginInstallError(
+        "refusing to repoint a foreign repository-owned virtualenv: "
+        f"Python environment owner is {owner_root}, but plugin root is {target_root}. "
+        "Use --no-pip or a standalone/plugin-owned Python environment."
+    )
 
 
 def _check_codex_manifest(plugin_root: Path) -> DoctorCheck:
@@ -2280,6 +2322,9 @@ def install_from_git(
     plugin_root = plugin_root_for(repo_url, root)
     python = python_executable or sys.executable
     commands: list[CommandRecord] = []
+
+    if install_package and not dry_run:
+        _require_safe_editable_install_target(python, plugin_root)
 
     if not validate_only:
         clone_or_update(

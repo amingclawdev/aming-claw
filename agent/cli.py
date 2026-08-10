@@ -25,6 +25,7 @@ import os
 import sys
 import logging
 import json
+import hashlib
 import time
 import webbrowser
 import socket
@@ -190,6 +191,56 @@ def _dashboard_url(governance_url: str) -> str:
 def _default_runtime_workspace() -> Path:
     """Return the plugin/runtime root used for local governance state."""
     return Path(__file__).resolve().parents[1]
+
+
+def _aming_claw_source_checkout(start: Path) -> Optional[Path]:
+    candidate = start.resolve()
+    for root in (candidate, *candidate.parents):
+        if all(
+            (root / rel).exists()
+            for rel in (".git", "agent/cli.py", "start_governance.py", "pyproject.toml")
+        ):
+            return root
+    return None
+
+
+def _file_sha256(path: Path) -> str:
+    try:
+        return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _require_source_checkout_matches_loaded_package(workspace: str = "") -> None:
+    package_root = _default_runtime_workspace().resolve()
+    candidates = [Path.cwd()]
+    if workspace:
+        candidates.insert(0, Path(workspace).expanduser())
+    source_roots = list(
+        dict.fromkeys(
+            root
+            for candidate in candidates
+            if (root := _aming_claw_source_checkout(candidate)) is not None
+        )
+    )
+    source_root = next((root for root in source_roots if root != package_root), None)
+    if source_root is None:
+        return
+    diagnostic = {
+        "schema_version": "governance_startup_source_identity.v1",
+        "source_checkout": str(source_root),
+        "source_cli_sha256": _file_sha256(source_root / "agent" / "cli.py"),
+        "loaded_package_root": str(package_root),
+        "loaded_cli_sha256": _file_sha256(Path(__file__).resolve()),
+        "zero_write_rejection": True,
+    }
+    raise click.ClickException(
+        "Aming Claw source checkout does not match the loaded package root; "
+        "refusing startup before health or runtime mutation. "
+        + json.dumps(diagnostic, sort_keys=True)
+        + ". Run the source checkout interpreter with `python -m agent.cli start`, "
+        "or repair that checkout with `python -m pip install -e .`."
+    )
 
 
 def _probe_governance(port: int, *, timeout: float = 2.0) -> Optional[dict]:
@@ -409,6 +460,7 @@ def _launcher_html(governance_url: str) -> str:
 @click.option("--port", default=40000, type=int, help="Governance HTTP port.")
 def start(workspace, port):
     """Start governance in the foreground without spawning plugin-owned workers."""
+    _require_source_checkout_matches_loaded_package(workspace)
     health = _probe_governance(port)
     if health and health.get("status") == "ok" and health.get("service") == "governance":
         dashboard = _dashboard_url(f"http://localhost:{port}")
