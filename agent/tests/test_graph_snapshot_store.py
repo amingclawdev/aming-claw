@@ -23,6 +23,23 @@ def conn(tmp_path, monkeypatch):
     c.close()
 
 
+def _claim_owner(suffix: str = "one") -> dict[str, object]:
+    return {
+        "manager_epoch": f"epoch-{suffix}",
+        "manager_pid": 4242,
+        "manager_started_at": "2026-08-10T00:00:00Z",
+        "manager_start_identity": f"manager-start-{suffix}",
+    }
+
+
+def _file_connection(path) -> sqlite3.Connection:
+    connection = sqlite3.connect(path, timeout=0.2)
+    connection.row_factory = sqlite3.Row
+    store.ensure_schema(connection)
+    connection.commit()
+    return connection
+
+
 def test_schema_migration_is_idempotent(conn):
     _ensure_schema(conn)
     _ensure_schema(conn)
@@ -40,6 +57,7 @@ def test_schema_migration_is_idempotent(conn):
         "graph_drift_ledger",
         "pending_scope_reconcile",
         "reconcile_run_metrics",
+        "graph_current_full_build_claim_history",
     }.issubset(table_names)
     snapshot_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(graph_snapshots)").fetchall()
@@ -454,6 +472,225 @@ def test_reconcile_run_metrics_record_and_summarize(conn):
     assert summary["by_strategy"]["full_rebuild_fallback"]["avg_elapsed_ms"] == 36000
     assert summary["speedup"]["speedup_x"] == pytest.approx(7.66, rel=0.01)
     assert summary["speedup"]["elapsed_reduction_pct"] == pytest.approx(86.9, rel=0.01)
+
+
+def test_current_full_build_claim_fences_two_connections_before_materialization(
+    tmp_path,
+):
+    db_path = tmp_path / "claim-fence.sqlite"
+    first = _file_connection(db_path)
+    second = _file_connection(db_path)
+    materialized: list[str] = []
+    try:
+        store.acquire_current_full_build_claim(
+            first,
+            PID,
+            run_id="run-one",
+            snapshot_id="full-same-snapshot",
+            commit_sha="a" * 40,
+            **_claim_owner("first"),
+        )
+        materialized.append("run-one")
+        with pytest.raises(
+            store.GraphSnapshotBuildClaimConflictError,
+            match="current_full_snapshot_build_claimed",
+        ):
+            store.acquire_current_full_build_claim(
+                second,
+                PID,
+                run_id="run-two",
+                snapshot_id="full-same-snapshot",
+                commit_sha="a" * 40,
+                **_claim_owner("second"),
+            )
+        assert materialized == ["run-one"]
+        assert first.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history "
+            "WHERE project_id = ? AND snapshot_id = ? AND status = 'active'",
+            (PID, "full-same-snapshot"),
+        ).fetchone()[0] == 1
+        rows = first.execute(
+            "SELECT run_id, status FROM reconcile_run_metrics "
+            "WHERE project_id = ? AND snapshot_id = ?",
+            (PID, "full-same-snapshot"),
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [("run-one", "running")]
+    finally:
+        first.close()
+        second.close()
+
+
+def test_current_full_build_claim_and_running_metric_rollback_together(
+    tmp_path, monkeypatch
+):
+    connection = _file_connection(tmp_path / "claim-rollback.sqlite")
+
+    def fail_metric(*_args, **_kwargs):
+        raise RuntimeError("metric write failed")
+
+    monkeypatch.setattr(store, "record_reconcile_run_metric", fail_metric)
+    try:
+        with pytest.raises(RuntimeError, match="metric write failed"):
+            store.acquire_current_full_build_claim(
+                connection,
+                PID,
+                run_id="run-rollback",
+                snapshot_id="full-rollback",
+                commit_sha="b" * 40,
+                **_claim_owner("rollback"),
+            )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics"
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_unreleased_current_full_build_claim_survives_owner_connection_crash(
+    tmp_path,
+):
+    db_path = tmp_path / "claim-crash.sqlite"
+    owner = _file_connection(db_path)
+    store.acquire_current_full_build_claim(
+        owner,
+        PID,
+        run_id="run-crashed-owner",
+        snapshot_id="full-crash",
+        commit_sha="c" * 40,
+        **_claim_owner("crashed"),
+    )
+    owner.close()
+
+    foreign = _file_connection(db_path)
+    try:
+        with pytest.raises(
+            store.GraphSnapshotBuildClaimConflictError,
+            match="current_full_snapshot_build_claimed",
+        ):
+            store.acquire_current_full_build_claim(
+                foreign,
+                PID,
+                run_id="run-foreign-retry",
+                snapshot_id="full-crash",
+                commit_sha="c" * 40,
+                **_claim_owner("foreign"),
+            )
+        claim = foreign.execute(
+            "SELECT status, manager_start_identity "
+            "FROM graph_current_full_build_claim_history"
+        ).fetchone()
+        assert dict(claim) == {
+            "status": "active",
+            "manager_start_identity": "manager-start-crashed",
+        }
+    finally:
+        foreign.close()
+
+
+def test_terminalized_current_full_build_identity_cannot_reacquire(conn):
+    owner = _claim_owner("terminal")
+    claim = store.acquire_current_full_build_claim(
+        conn,
+        PID,
+        run_id="run-terminal",
+        snapshot_id="full-terminal",
+        commit_sha="d" * 40,
+        **owner,
+    )
+    store.terminalize_current_full_build_claim(
+        conn,
+        PID,
+        claim_id=claim["claim_id"],
+        run_id="run-terminal",
+        snapshot_id="full-terminal",
+        commit_sha="d" * 40,
+        terminal_status="candidate_ready",
+        manager_start_identity=owner["manager_start_identity"],
+    )
+
+    with pytest.raises(
+        store.GraphSnapshotBuildClaimConflictError,
+        match="current_full_build_identity_terminalized",
+    ):
+        store.acquire_current_full_build_claim(
+            conn,
+            PID,
+            run_id="run-terminal",
+            snapshot_id="full-terminal",
+            commit_sha="d" * 40,
+            **owner,
+        )
+    history = conn.execute(
+        "SELECT status, terminal_status FROM graph_current_full_build_claim_history"
+    ).fetchall()
+    assert [tuple(row) for row in history] == [("released", "candidate_ready")]
+
+
+def test_existing_metric_identity_cannot_be_reacquired_or_reset(conn):
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="run-existing-metric",
+        snapshot_id="full-existing-metric",
+        commit_sha="e" * 40,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="failed",
+    )
+    conn.commit()
+
+    with pytest.raises(
+        store.GraphSnapshotBuildClaimConflictError,
+        match="current_full_build_metric_identity_exists",
+    ):
+        store.acquire_current_full_build_claim(
+            conn,
+            PID,
+            run_id="run-existing-metric",
+            snapshot_id="full-existing-metric",
+            commit_sha="e" * 40,
+            **_claim_owner("existing-metric"),
+        )
+    assert conn.execute(
+        "SELECT status FROM reconcile_run_metrics WHERE project_id = ? "
+        "AND run_id = ? AND snapshot_id = ?",
+        (PID, "run-existing-metric", "full-existing-metric"),
+    ).fetchone()[0] == "failed"
+
+
+def test_current_full_build_terminalization_rejects_commit_mismatch(conn):
+    owner = _claim_owner("commit")
+    claim = store.acquire_current_full_build_claim(
+        conn,
+        PID,
+        run_id="run-commit",
+        snapshot_id="full-commit",
+        commit_sha="f" * 40,
+        **owner,
+    )
+    with pytest.raises(
+        store.GraphSnapshotBuildClaimConflictError,
+        match="current_full_build_claim_commit_mismatch",
+    ):
+        store.terminalize_current_full_build_claim(
+            conn,
+            PID,
+            claim_id=claim["claim_id"],
+            run_id="run-commit",
+            snapshot_id="full-commit",
+            commit_sha="0" * 40,
+            terminal_status="failed",
+            manager_start_identity=owner["manager_start_identity"],
+        )
+    assert conn.execute(
+        "SELECT status FROM graph_current_full_build_claim_history "
+        "WHERE claim_id = ?",
+        (claim["claim_id"],),
+    ).fetchone()[0] == "active"
 
 
 def test_reconcile_run_metrics_backfills_from_snapshot_notes(conn, tmp_path):

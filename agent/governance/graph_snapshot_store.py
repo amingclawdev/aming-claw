@@ -205,6 +205,29 @@ CREATE INDEX IF NOT EXISTS idx_reconcile_run_metrics_project_created
 
 CREATE INDEX IF NOT EXISTS idx_reconcile_run_metrics_strategy
   ON reconcile_run_metrics(project_id, strategy, graph_delta_mode);
+
+CREATE TABLE IF NOT EXISTS graph_current_full_build_claim_history (
+  claim_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  commit_sha TEXT NOT NULL,
+  status TEXT NOT NULL,
+  manager_epoch TEXT NOT NULL,
+  manager_pid INTEGER NOT NULL,
+  manager_started_at TEXT NOT NULL,
+  manager_start_identity TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  released_at TEXT NOT NULL DEFAULT '',
+  terminal_status TEXT NOT NULL DEFAULT ''
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_current_full_build_claim_active_snapshot
+  ON graph_current_full_build_claim_history(project_id, snapshot_id)
+  WHERE status = 'active';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_current_full_build_claim_identity
+  ON graph_current_full_build_claim_history(project_id, run_id, snapshot_id);
 """
 
 SNAPSHOT_STATUS_CANDIDATE = "candidate"
@@ -248,6 +271,15 @@ GRAPH_REF_OPERATION_TYPES = {
 
 class GraphSnapshotConflictError(RuntimeError):
     """Raised when snapshot activation loses its compare-and-swap race."""
+
+
+class GraphSnapshotBuildClaimConflictError(RuntimeError):
+    """Raised when a durable current-full build claim cannot be acquired."""
+
+    def __init__(self, reason: str, claim: Mapping[str, Any] | None = None):
+        super().__init__(reason)
+        self.reason = str(reason or "current_full_build_claim_conflict")
+        self.claim = dict(claim or {})
 
 
 def utc_now() -> str:
@@ -4631,6 +4663,212 @@ def _int_value(value: Any, default: int = 0) -> int:
         return default
 
 
+def acquire_current_full_build_claim(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    run_id: str,
+    snapshot_id: str,
+    commit_sha: str,
+    manager_epoch: str,
+    manager_pid: int,
+    manager_started_at: str,
+    manager_start_identity: str,
+    metric_evidence: dict[str, Any] | None = None,
+    created_at: str = "",
+) -> dict[str, Any]:
+    """Durably fence one current-full materialization before it touches state."""
+
+    if conn.in_transaction:
+        raise RuntimeError("current-full build claim requires a clean transaction boundary")
+    ensure_schema(conn)
+    conn.commit()
+    values = {
+        "project_id": str(project_id or "").strip(),
+        "run_id": str(run_id or "").strip(),
+        "snapshot_id": str(snapshot_id or "").strip(),
+        "commit_sha": str(commit_sha or "").strip(),
+        "manager_epoch": str(manager_epoch or "").strip(),
+        "manager_pid": int(manager_pid or 0),
+        "manager_started_at": str(manager_started_at or "").strip(),
+        "manager_start_identity": str(manager_start_identity or "").strip(),
+    }
+    if not all(values.values()):
+        raise ValueError("current-full build claim requires complete server owner identity")
+    now = created_at or utc_now()
+    claim_id = f"gcfclaim-{uuid.uuid4().hex[:20]}"
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        prior_identity = conn.execute(
+            """
+            SELECT * FROM graph_current_full_build_claim_history
+            WHERE project_id = ? AND run_id = ? AND snapshot_id = ?
+            """,
+            (values["project_id"], values["run_id"], values["snapshot_id"]),
+        ).fetchone()
+        if prior_identity:
+            prior = dict(prior_identity)
+            reason = (
+                "current_full_build_identity_terminalized"
+                if str(prior.get("status") or "") != "active"
+                else "current_full_build_identity_already_claimed"
+            )
+            raise GraphSnapshotBuildClaimConflictError(reason, prior)
+        prior_metric = conn.execute(
+            """
+            SELECT * FROM reconcile_run_metrics
+            WHERE project_id = ? AND run_id = ? AND snapshot_id = ?
+            """,
+            (values["project_id"], values["run_id"], values["snapshot_id"]),
+        ).fetchone()
+        if prior_metric:
+            raise GraphSnapshotBuildClaimConflictError(
+                "current_full_build_metric_identity_exists", dict(prior_metric)
+            )
+        active = conn.execute(
+            """
+            SELECT * FROM graph_current_full_build_claim_history
+            WHERE project_id = ? AND snapshot_id = ? AND status = 'active'
+            """,
+            (values["project_id"], values["snapshot_id"]),
+        ).fetchone()
+        if active:
+            raise GraphSnapshotBuildClaimConflictError(
+                "current_full_snapshot_build_claimed", dict(active)
+            )
+        conn.execute(
+            """
+            INSERT INTO graph_current_full_build_claim_history (
+              claim_id, project_id, snapshot_id, run_id, commit_sha, status,
+              manager_epoch, manager_pid, manager_started_at,
+              manager_start_identity, acquired_at
+            ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+            """,
+            (
+                claim_id,
+                values["project_id"],
+                values["snapshot_id"],
+                values["run_id"],
+                values["commit_sha"],
+                values["manager_epoch"],
+                values["manager_pid"],
+                values["manager_started_at"],
+                values["manager_start_identity"],
+                now,
+            ),
+        )
+        record_reconcile_run_metric(
+            conn,
+            values["project_id"],
+            run_id=values["run_id"],
+            snapshot_id=values["snapshot_id"],
+            commit_sha=values["commit_sha"],
+            snapshot_kind="full",
+            strategy="current_full_reconcile",
+            graph_delta_mode="full_rebuild",
+            status="running",
+            evidence=metric_evidence or {},
+            created_at=now,
+            schema_ready=True,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    row = conn.execute(
+        "SELECT * FROM graph_current_full_build_claim_history WHERE claim_id = ?",
+        (claim_id,),
+    ).fetchone()
+    return dict(row)
+
+
+def terminalize_current_full_build_claim(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    claim_id: str,
+    run_id: str,
+    snapshot_id: str,
+    commit_sha: str,
+    terminal_status: str,
+    manager_start_identity: str,
+    elapsed_ms: int = 0,
+    trace_summary_path: str = "",
+    metric_evidence: dict[str, Any] | None = None,
+    created_at: str = "",
+) -> dict[str, Any]:
+    """Atomically persist the build outcome and release its durable fence."""
+
+    status = str(terminal_status or "").strip()
+    if status not in {"candidate_ready", "failed"}:
+        raise ValueError("build claim terminal_status must be candidate_ready or failed")
+    if conn.in_transaction:
+        raise RuntimeError("current-full build terminalization requires a clean transaction boundary")
+    now = utc_now()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        claim_row = conn.execute(
+            """
+            SELECT * FROM graph_current_full_build_claim_history
+            WHERE claim_id = ? AND project_id = ? AND run_id = ?
+              AND snapshot_id = ? AND status = 'active'
+            """,
+            (claim_id, project_id, run_id, snapshot_id),
+        ).fetchone()
+        if not claim_row:
+            raise GraphSnapshotBuildClaimConflictError(
+                "current_full_build_claim_not_active"
+            )
+        claim = dict(claim_row)
+        if str(claim.get("manager_start_identity") or "") != str(
+            manager_start_identity or ""
+        ):
+            raise GraphSnapshotBuildClaimConflictError(
+                "current_full_build_claim_foreign_owner", claim
+            )
+        if str(claim.get("commit_sha") or "") != str(commit_sha or ""):
+            raise GraphSnapshotBuildClaimConflictError(
+                "current_full_build_claim_commit_mismatch", claim
+            )
+        record_reconcile_run_metric(
+            conn,
+            project_id,
+            run_id=run_id,
+            snapshot_id=snapshot_id,
+            commit_sha=commit_sha,
+            snapshot_kind="full",
+            strategy="current_full_reconcile",
+            graph_delta_mode="full_rebuild",
+            status=status,
+            elapsed_ms=elapsed_ms,
+            trace_summary_path=trace_summary_path,
+            evidence=metric_evidence or {},
+            created_at=created_at,
+            schema_ready=True,
+        )
+        updated = conn.execute(
+            """
+            UPDATE graph_current_full_build_claim_history
+            SET status = 'released', released_at = ?, terminal_status = ?
+            WHERE claim_id = ? AND status = 'active'
+            """,
+            (now, status, claim_id),
+        )
+        if updated.rowcount != 1:
+            raise GraphSnapshotBuildClaimConflictError(
+                "current_full_build_claim_release_race", claim
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    row = conn.execute(
+        "SELECT * FROM graph_current_full_build_claim_history WHERE claim_id = ?",
+        (claim_id,),
+    ).fetchone()
+    return dict(row)
+
+
 def record_reconcile_run_metric(
     conn: sqlite3.Connection,
     project_id: str,
@@ -5582,7 +5820,9 @@ __all__ = [
     "ALLOWED_PENDING_STATUSES",
     "ALLOWED_SNAPSHOT_STATUSES",
     "GRAPH_SNAPSHOT_SCHEMA_SQL",
+    "GraphSnapshotBuildClaimConflictError",
     "GraphSnapshotConflictError",
+    "acquire_current_full_build_claim",
     "activate_graph_snapshot",
     "backfill_reconcile_run_metrics_from_snapshots",
     "build_graph_rollback_epoch_state",
@@ -5624,6 +5864,7 @@ __all__ = [
     "strict_graph_ready",
     "summarize_reconcile_run_metrics",
     "summarize_file_inventory_rows",
+    "terminalize_current_full_build_claim",
     "update_graph_drift_status",
     "waive_pending_scope_reconcile",
     "write_companion_files",
