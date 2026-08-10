@@ -116129,6 +116129,117 @@ def _onboard_worker_read_runtime_facade_projection(
     }
 
 
+def _onboard_legacy_operator_recovery_dependency_backlogs(
+    conn,
+    backlog_id: str,
+) -> list[str]:
+    """Return only structured verification dependencies of one recovery row."""
+
+    criteria, _ = _backlog_acceptance_scope_authority(conn, backlog_id)
+    dependencies: list[str] = []
+    for criterion in criteria:
+        if not isinstance(criterion, Mapping):
+            continue
+        scope = criterion.get("required_scope")
+        if not isinstance(scope, Mapping) or str(scope.get("kind") or "") != (
+            "verification_only_external_dependency"
+        ):
+            continue
+        dependency_id = str(scope.get("dependency_id") or "").strip()
+        if (
+            dependency_id
+            and dependency_id != backlog_id
+            and dependency_id not in dependencies
+        ):
+            dependencies.append(dependency_id)
+    return dependencies
+
+
+def _onboard_completed_hotfix_predecessor_anchors(
+    conn,
+    *,
+    project_id: str,
+    backlog_ids: Sequence[str],
+) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
+    """Find exact deterministic completed hotfix predecessors without guessing."""
+
+    runtime = _contract_runtime_store(conn)
+    anchors: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    for candidate_backlog_id in backlog_ids:
+        try:
+            rows = conn.execute(
+                """
+                SELECT contract_execution_id, parent_contract_execution_id
+                  FROM contract_runtime_executions
+                 WHERE project_id = ?
+                   AND backlog_id = ?
+                   AND contract_id = ?
+                 ORDER BY created_at, contract_execution_id
+                """,
+                (project_id, candidate_backlog_id, "observer_hotfix"),
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        for row in rows:
+            execution_id = str(_row_get(row, "contract_execution_id", "")).strip()
+            parent_execution_id = str(
+                _row_get(row, "parent_contract_execution_id", "")
+            ).strip()
+            if not parent_execution_id or execution_id != (
+                _observer_hotfix_successor_execution_id(
+                    project_id,
+                    candidate_backlog_id,
+                    parent_execution_id,
+                )
+            ):
+                continue
+            try:
+                predecessor_record = runtime.get(execution_id)
+                parent_record = runtime.get(parent_execution_id)
+            except ContractRuntimeError:
+                continue
+            if (
+                not _runtime_record_is_complete(predecessor_record)
+                or str(parent_record.get("project_id") or "") != project_id
+                or str(parent_record.get("backlog_id") or "")
+                != candidate_backlog_id
+                or str(predecessor_record.get("parent_contract_execution_id") or "")
+                != parent_execution_id
+            ):
+                continue
+            anchors.append(
+                (candidate_backlog_id, parent_record, predecessor_record)
+            )
+    return anchors
+
+
+def _onboard_legacy_operator_recovery_blocker(
+    blocker_id: str,
+    *,
+    source_backlog_id: str,
+    source_parent_execution_id: str,
+    details: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "onboard_route_guide.legacy_operator_recovery_blocker.v1",
+        "id": "legacy_operator_recovery_unavailable",
+        "action": "stop_and_report_legacy_operator_recovery_blocker",
+        "actionable": False,
+        "action_input_ready": False,
+        "owner_role": "observer",
+        "source": "managed_observer_hotfix_recovery",
+        "source_of_authority": "durable_contract_and_RuntimeContext_lineage",
+        "blocker_ids": [blocker_id],
+        "reason": blocker_id,
+        "source_backlog_id": source_backlog_id,
+        "source_parent_contract_execution_id": source_parent_execution_id,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "fail_closed": True,
+        "details": dict(details or {}),
+    }
+
+
 def _onboard_legacy_operator_hotfix_attempt_projection(
     conn,
     *,
@@ -116146,44 +116257,42 @@ def _onboard_legacy_operator_hotfix_attempt_projection(
     if not (
         str(role or "").strip() == "observer"
         and str(work_type or "").strip() == "legacy_operator_recovery"
-        and str(route_token_ref or "").strip()
     ):
         return {}
-    parent_execution_id = _onboard_route_guide_target_contract_execution_id(
+    source_parent_execution_id = _onboard_route_guide_target_contract_execution_id(
         next_action=next_action,
         current_projection=current_projection,
         runtime_resume=runtime_resume,
     )
-    if not parent_execution_id:
-        return {}
+    if not source_parent_execution_id:
+        return _onboard_legacy_operator_recovery_blocker(
+            "legacy_recovery_parent_execution_missing",
+            source_backlog_id=backlog_id,
+            source_parent_execution_id="",
+        )
     try:
-        parent_record = _contract_runtime_store(conn).get(
-            parent_execution_id
+        source_parent_record = _contract_runtime_store(conn).get(
+            source_parent_execution_id
         )
     except ContractRuntimeError:
-        return {}
+        return _onboard_legacy_operator_recovery_blocker(
+            "legacy_recovery_parent_execution_unknown",
+            source_backlog_id=backlog_id,
+            source_parent_execution_id=source_parent_execution_id,
+        )
     if (
-        str(parent_record.get("project_id") or "") != project_id
-        or str(parent_record.get("backlog_id") or "") != backlog_id
+        str(source_parent_record.get("project_id") or "") != project_id
+        or str(source_parent_record.get("backlog_id") or "") != backlog_id
         or not _is_mf_parallel_record_contract_id(
-            str(parent_record.get("contract_id") or "")
+            str(source_parent_record.get("contract_id") or "")
         )
-        or _runtime_record_is_complete(parent_record)
+        or _runtime_record_is_complete(source_parent_record)
     ):
-        return {}
-    predecessor_execution_id = _observer_hotfix_successor_execution_id(
-        project_id,
-        backlog_id,
-        parent_execution_id,
-    )
-    try:
-        predecessor_record = _contract_runtime_store(conn).get(
-            predecessor_execution_id
+        return _onboard_legacy_operator_recovery_blocker(
+            "legacy_recovery_parent_execution_ineligible",
+            source_backlog_id=backlog_id,
+            source_parent_execution_id=source_parent_execution_id,
         )
-    except ContractRuntimeError:
-        return {}
-    if not _runtime_record_is_complete(predecessor_record):
-        return {}
 
     from .parallel_branch_runtime import list_branch_contexts
 
@@ -116193,7 +116302,7 @@ def _onboard_legacy_operator_hotfix_attempt_projection(
         if str(getattr(context, "backlog_id", "") or "").strip()
         == backlog_id
         and _runtime_context_mf_sub_parent_task_id(context)
-        == parent_execution_id
+        == source_parent_execution_id
     ]
     exhausted = []
     for context in candidates:
@@ -116207,37 +116316,102 @@ def _onboard_legacy_operator_hotfix_attempt_projection(
         ):
             exhausted.append((context, eligibility))
     if len(exhausted) != 1:
-        return {}
+        return _onboard_legacy_operator_recovery_blocker(
+            "replacement_exhausted_runtime_context_not_unique",
+            source_backlog_id=backlog_id,
+            source_parent_execution_id=source_parent_execution_id,
+            details={"candidate_count": len(exhausted)},
+        )
+
+    local_anchor = _onboard_completed_hotfix_predecessor_anchors(
+        conn,
+        project_id=project_id,
+        backlog_ids=[backlog_id],
+    )
+    anchors = local_anchor or _onboard_completed_hotfix_predecessor_anchors(
+        conn,
+        project_id=project_id,
+        backlog_ids=_onboard_legacy_operator_recovery_dependency_backlogs(
+            conn,
+            backlog_id,
+        ),
+    )
+    if len(anchors) != 1:
+        return _onboard_legacy_operator_recovery_blocker(
+            "completed_hotfix_predecessor_not_unique",
+            source_backlog_id=backlog_id,
+            source_parent_execution_id=source_parent_execution_id,
+            details={"candidate_count": len(anchors)},
+        )
+    target_backlog_id, parent_record, predecessor_record = anchors[0]
+    target_parent_execution_id = str(
+        parent_record.get("contract_execution_id") or ""
+    ).strip()
 
     from . import observer_route_context
 
-    try:
-        route = observer_route_context.resolve_route_token_ref(
-            conn,
-            project_id=project_id,
-            route_token_ref=route_token_ref,
-            backlog_id=backlog_id,
-            task_id=parent_execution_id,
-        )
-    except observer_route_context.RouteTokenRefError:
-        return {}
+    route = {}
+    route_error = ""
+    if str(route_token_ref or "").strip():
+        try:
+            route = observer_route_context.resolve_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=route_token_ref,
+                backlog_id=target_backlog_id,
+                task_id=target_parent_execution_id,
+            )
+        except observer_route_context.RouteTokenRefError as exc:
+            route_error = str(exc)
     allowed = {
         _normalized_contract_runtime_action(item)
         for item in (route or {}).get("allowed_actions") or []
     }
-    if (
-        str((route or {}).get("caller_role") or "").strip() != "observer"
-        or _normalized_contract_runtime_action("hotfix_enter") not in allowed
-    ):
-        return {}
+    hotfix_route_actions = {
+        _normalized_contract_runtime_action("hotfix_enter"),
+        _normalized_contract_runtime_action("observer_hotfix_enter"),
+    }
+    route_ready = bool(route) and (
+        str((route or {}).get("caller_role") or "").strip() == "observer"
+        and bool(allowed.intersection(hotfix_route_actions))
+    )
+    if str(route_token_ref or "").strip() and not route_ready:
+        return _onboard_legacy_operator_recovery_blocker(
+            "observer_hotfix_route_scope_invalid",
+            source_backlog_id=backlog_id,
+            source_parent_execution_id=source_parent_execution_id,
+            details={"route_resolution_error": route_error},
+        )
 
     context, eligibility = exhausted[0]
+    route_issue_body = {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": target_backlog_id,
+        "task_id": target_parent_execution_id,
+        "target_files": _backlog_declared_direct_file_scope(
+            conn,
+            target_backlog_id,
+        ),
+        "allowed_actions": ["observer_hotfix_enter"],
+        "evidence_refs": [
+            f"backlog:{backlog_id}",
+            f"backlog:{target_backlog_id}",
+            f"contract_runtime:{source_parent_execution_id}",
+            f"contract_runtime:{predecessor_record.get('contract_execution_id')}",
+        ],
+    }
+    action_route_token_ref = (
+        str(route_token_ref or "").strip()
+        if route_ready
+        else "<copy route_issue response.route_token_ref>"
+    )
     action = _observer_hotfix_attempt_action(
         project_id=project_id,
-        backlog_id=backlog_id,
+        backlog_id=target_backlog_id,
         parent_record=parent_record,
         predecessor_record=predecessor_record,
-        route_token_ref=route_token_ref,
+        route_token_ref=action_route_token_ref,
     )
     managed_session = {
         "schema_version": "observer.managed_session_realization.v1",
@@ -116260,18 +116434,39 @@ def _onboard_legacy_operator_hotfix_attempt_projection(
     action["host_realization"].update(
         {
             "managed_observer_session": managed_session,
+            "observer_route_context_issue": {
+                "mcp_tool": "observer_route_context_issue",
+                "copy_safe_body": dict(route_issue_body),
+                "bind_response_field": "route_token_ref",
+                "replacement_path": "copy_safe_body.route_token_ref",
+                "required": not route_ready,
+                "raw_route_token_required": False,
+                "raw_route_token_exposed": False,
+            },
             "required_prerequisites": [
                 "register_or_heartbeat_one_active managed observer session",
-                "preserve the exact route_token_ref and 11-field domain body",
+                "issue or preserve the exact observer_hotfix route_token_ref",
+                "preserve the exact 11-field domain body",
             ],
         }
     )
+    if not route_ready:
+        action["host_realization"]["required_replacement_paths"] = [
+            *list(
+                action["host_realization"].get("required_replacement_paths")
+                or []
+            ),
+            "copy_safe_body.route_token_ref",
+        ]
     return {
         **action,
         "id": action["action"],
         "interface": action["facade"],
         "action_input": dict(action["copy_safe_body"]),
-        "action_input_ready": True,
+        "action_input_ready": route_ready,
+        "action_input_missing_fields": (
+            [] if route_ready else ["route_token_ref_from_route_issue"]
+        ),
         "actionable": True,
         "requires_active_observer_session": True,
         "requires_route_token_ref": True,
@@ -116281,6 +116476,33 @@ def _onboard_legacy_operator_hotfix_attempt_projection(
         "source_of_authority": (
             "completed_hotfix_predecessor+replacement_exhausted_RuntimeContext"
         ),
+        "action_scope": {
+            "project_id": project_id,
+            "backlog_id": target_backlog_id,
+            "contract_execution_id": target_parent_execution_id,
+            "source_backlog_id": backlog_id,
+            "source_contract_execution_id": source_parent_execution_id,
+        },
+        "explicit_cross_contract_transition": {
+            "schema_version": "onboard_route_guide.legacy_recovery_handoff.v1",
+            "source_backlog_id": backlog_id,
+            "source_contract_execution_id": source_parent_execution_id,
+            "target_backlog_id": target_backlog_id,
+            "target_parent_contract_execution_id": target_parent_execution_id,
+            "predecessor_contract_execution_id": str(
+                predecessor_record.get("contract_execution_id") or ""
+            ),
+            "dependency_authority_source": (
+                "backlog.acceptance_criteria.required_scope.dependency_id"
+            ),
+            "caller_claims_trusted": False,
+        },
+        "observer_route_context_issue": {
+            "required": not route_ready,
+            "mcp_tool": "observer_route_context_issue",
+            "copy_safe_body": dict(route_issue_body),
+            "bind_response_field": "route_token_ref",
+        },
         "runtime_context_recovery_authority": {
             "runtime_context_id": str(
                 getattr(context, "runtime_context_id", "") or ""
@@ -116290,6 +116512,8 @@ def _onboard_legacy_operator_hotfix_attempt_projection(
             "server_derived": True,
             "caller_claims_trusted": False,
             "eligibility": dict(eligibility),
+            "source_backlog_id": backlog_id,
+            "source_contract_execution_id": source_parent_execution_id,
         },
     }
 
@@ -116406,13 +116630,24 @@ def _onboard_route_guide_compact_service_response(
         next_action.get("stage_id") and next_action.get("line_id")
     )):
         canonical_mcp_tool = "contract_runtime_submit_line"
+    action_scope = (
+        next_action.get("action_scope")
+        if isinstance(next_action.get("action_scope"), Mapping)
+        else {}
+    )
+    action_backlog_id = str(
+        action_scope.get("backlog_id") or backlog_id
+    ).strip()
+    action_contract_execution_id = str(
+        action_scope.get("contract_execution_id")
+        or identity.get("contract_execution_id")
+        or ""
+    ).strip()
     canonical_executable_action = (
         _guide_canonical_executable_action(
             project_id=project_id,
-            backlog_id=backlog_id,
-            contract_execution_id=str(
-                identity.get("contract_execution_id") or ""
-            ),
+            backlog_id=action_backlog_id,
+            contract_execution_id=action_contract_execution_id,
             parent_contract_execution_id=str(
                 next_action.get("parent_contract_execution_id") or ""
             ),
@@ -116611,6 +116846,14 @@ def _onboard_route_guide_compact_service_response(
             "runtime_context_recovery_authority": dict(
                 runtime_context_recovery_authority
             ),
+            "observer_route_context_issue": (
+                dict(next_action.get("observer_route_context_issue"))
+                if isinstance(
+                    next_action.get("observer_route_context_issue"), Mapping
+                )
+                else {}
+            ),
+            "action_scope": dict(action_scope),
             "explicit_cross_contract_transition": (
                 dict(next_action.get("explicit_cross_contract_transition"))
                 if isinstance(

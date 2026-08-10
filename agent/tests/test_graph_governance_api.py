@@ -54264,6 +54264,235 @@ def test_compact_legacy_recovery_projects_managed_observer_hotfix_attempt(
     assert wrong_scope["canonical_executable_action"] == {}
 
 
+def test_compact_legacy_recovery_projects_dependency_hotfix_route_then_attempt(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="dependency-managed-observer-hotfix-recovery",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+    )
+    first = _pre_lineage_rejoin(case)
+    _pre_lineage_rejoin(
+        case,
+        body_updates={
+            "session_token_ref": first["session_token_ref"],
+            "reason": "consume the bounded replacement before dependency recovery",
+        },
+    )
+    context = get_branch_context(conn, PID, case["task_id"])
+    assert context is not None
+    assert server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=context,
+    )["mode"] == "replacement_exhausted"
+
+    dependency_backlog_id = f"{case['backlog_id']}-PARENT"
+    predecessor = _start_source_backed_hotfix_successor(
+        conn,
+        backlog_id=dependency_backlog_id,
+        task_id="dependency-hotfix-predecessor",
+        route_token_ref="rtok-dependency-hotfix-predecessor",
+    )
+    dependency_parent_id = predecessor["parent_contract_execution_id"]
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = '[]'
+         WHERE bug_id = ?
+        """,
+        (json.dumps(["agent/governance/server.py"]), dependency_backlog_id),
+    )
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(
+                [
+                    {
+                        "id": "AC-DEPENDENCY-HOTFIX",
+                        "required_scope": {
+                            "kind": "verification_only_external_dependency",
+                            "dependency_id": dependency_backlog_id,
+                        },
+                    }
+                ]
+            ),
+            case["backlog_id"],
+        ),
+    )
+    conn.commit()
+    completed = _complete_source_backed_hotfix_successor(
+        conn,
+        predecessor["contract_execution_id"],
+    )
+    completed_state = server._runtime_current_state_from_record(completed)
+
+    missing_route = server._onboard_route_guide_service_response(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        route_token_ref="",
+        role="observer",
+        work_type="legacy_operator_recovery",
+        response_view="compact",
+        request_body={},
+    )
+    assert missing_route["ok"] is True, missing_route
+    assert missing_route["actionable"] is True, missing_route
+    assert missing_route["next_legal_action"]["action_input_ready"] is False
+    transition = missing_route["next_legal_action"][
+        "explicit_cross_contract_transition"
+    ]
+    assert transition["source_backlog_id"] == case["backlog_id"]
+    assert transition["target_backlog_id"] == dependency_backlog_id
+    assert transition["target_parent_contract_execution_id"] == (
+        dependency_parent_id
+    )
+    route_issue = missing_route["next_legal_action"][
+        "observer_route_context_issue"
+    ]
+    assert route_issue["required"] is True
+    assert route_issue["copy_safe_body"] == {
+        "project_id": PID,
+        "caller_role": "observer",
+        "backlog_id": dependency_backlog_id,
+        "task_id": dependency_parent_id,
+        "target_files": ["agent/governance/server.py"],
+        "allowed_actions": ["observer_hotfix_enter"],
+        "evidence_refs": [
+            f"backlog:{case['backlog_id']}",
+            f"backlog:{dependency_backlog_id}",
+            f"contract_runtime:{case['parent_task_id']}",
+            f"contract_runtime:{predecessor['contract_execution_id']}",
+        ],
+    }
+    missing_body = missing_route["canonical_executable_action"][
+        "copy_safe_body"
+    ]
+    assert set(missing_body) == server._OBSERVER_HOTFIX_ATTEMPT_ALLOWED_FIELDS
+    assert missing_body["backlog_id"] == dependency_backlog_id
+    assert missing_body["parent_contract_execution_id"] == dependency_parent_id
+    assert missing_body["predecessor_contract_execution_id"] == predecessor[
+        "contract_execution_id"
+    ]
+    assert missing_body["predecessor_execution_state_revision"] == (
+        completed_state["execution_state_revision"]
+    )
+    assert missing_body["route_token_ref"].startswith("<copy route_issue")
+    host_route_issue = missing_route["canonical_executable_action"][
+        "host_realization"
+    ]["observer_route_context_issue"]
+    assert host_route_issue["copy_safe_body"] == route_issue["copy_safe_body"]
+    assert host_route_issue["required"] is True
+    assert host_route_issue["raw_route_token_required"] is False
+    assert host_route_issue["raw_route_token_exposed"] is False
+    assert missing_route["serialized_bytes"] <= missing_route[
+        "max_serialized_bytes"
+    ]
+    missing_route_text = json.dumps(missing_route, sort_keys=True)
+    assert first["session_token"] not in missing_route_text
+    assert first["fence_token"] not in missing_route_text
+
+    recovery_ref = "rtok-dependency-hotfix-recovery"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=dependency_backlog_id,
+        contract_execution_id=dependency_parent_id,
+        route_token_ref=recovery_ref,
+        allowed_actions=["observer_hotfix_enter"],
+        target_files=["agent/governance/server.py"],
+    )
+    ready = server._onboard_route_guide_service_response(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        route_token_ref=recovery_ref,
+        role="observer",
+        work_type="legacy_operator_recovery",
+        response_view="compact",
+        request_body={},
+    )
+    assert ready["actionable"] is True, ready
+    assert ready["next_legal_action"]["action_input_ready"] is True
+    body = dict(ready["canonical_executable_action"]["copy_safe_body"])
+    body.update(
+        {
+            "task_id": "dependency-hotfix-attempt-r2",
+            "successor_attempt_id": "dependency-hotfix-attempt-r2",
+            "reason": "Execute the exact dependency-bound recovery attempt.",
+        }
+    )
+    entered = server.handle_project_hotfix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=body,
+        )
+    )
+    assert entered["ok"] is True
+    assert entered["attempt_scoped"] is True
+    assert entered["parent_contract_execution_id"] == dependency_parent_id
+    assert entered["predecessor_contract_execution_id"] == predecessor[
+        "contract_execution_id"
+    ]
+    assert ready["runtime_context_recovery_authority"][
+        "runtime_context_id"
+    ] == context.runtime_context_id
+
+
+def test_compact_legacy_recovery_without_exact_predecessor_is_explicitly_blocked(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="managed-observer-hotfix-missing-predecessor",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+    )
+    first = _pre_lineage_rejoin(case)
+    _pre_lineage_rejoin(
+        case,
+        body_updates={
+            "session_token_ref": first["session_token_ref"],
+            "reason": "consume the only replacement before blocked recovery",
+        },
+    )
+    guide = server._onboard_route_guide_service_response(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        route_token_ref="",
+        role="observer",
+        work_type="legacy_operator_recovery",
+        response_view="compact",
+        request_body={},
+    )
+
+    assert guide["actionable"] is False
+    assert guide["canonical_executable_action"] == {}
+    assert guide["next_legal_action"]["action"] == (
+        "stop_and_report_legacy_operator_recovery_blocker"
+    )
+    assert guide["next_legal_action"]["blocker_ids"] == [
+        "completed_hotfix_predecessor_not_unique"
+    ]
+
+
 @pytest.mark.parametrize("persisted_prelineage_cex", ["exact", "legacy_empty"])
 def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drift(
     conn,
