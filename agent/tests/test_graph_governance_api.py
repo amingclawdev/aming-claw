@@ -12928,6 +12928,102 @@ def test_graph_operations_queue_exposes_current_full_run_id_status(conn):
     assert operation["last_result"] == "running"
 
 
+def test_graph_operations_queue_projects_validated_terminalization_status_safely(
+    conn,
+    monkeypatch,
+):
+    head = "d" * 40
+    _activate_basic_graph(
+        conn,
+        "full-current-operations-terminalization",
+        commit_sha=head,
+    )
+    rows = [
+        {
+            "project_id": PID,
+            "run_id": "current-full-ddddddd",
+            "snapshot_id": "full-ddddddd-d00d",
+            "commit_sha": head,
+            "snapshot_kind": "full",
+            "strategy": "current_full_reconcile",
+            "graph_delta_mode": "full_rebuild",
+            "status": "running",
+            "effective_status": "terminalized_stale",
+            "is_terminal": True,
+            "status_reason_code": "terminalization_overlay_valid",
+            "created_at": "2026-08-10T00:00:01Z",
+            "ledger_hash": "must-not-project-ledger-proof",
+        },
+        {
+            "project_id": PID,
+            "run_id": "current-full-eeeeeee",
+            "snapshot_id": "full-eeeeeee-e00e",
+            "commit_sha": head,
+            "snapshot_kind": "full",
+            "strategy": "current_full_reconcile",
+            "graph_delta_mode": "full_rebuild",
+            "status": "running",
+            "effective_status": "running",
+            "is_terminal": False,
+            "status_reason_code": "terminalization_overlay_invalid",
+            "created_at": "2026-08-10T00:00:00Z",
+            "proof_sha256": "must-not-project-overlay-proof",
+        },
+    ]
+
+    def projected_window(*_args, **_kwargs):
+        return {
+            "schema_version": "reconcile_run_metrics.window.v1",
+            "semantics": "latest_sample_plus_effective_nonterminal_page",
+            "rows": rows,
+            "returned_count": 2,
+            "latest_sample_limit": 100,
+            "latest_sample_count": 2,
+            "latest_sample_truncated": False,
+            "nonterminal_page_limit": 1000,
+            "nonterminal_page_count": 1,
+            "has_more": False,
+            "truncated": False,
+            "next_cursor": "",
+            "cursor_applied": False,
+            "remaining_count_claimed": False,
+            "effective_nonterminal_completeness": "complete",
+            "continuation_scope": "effective_nonterminal_only",
+            "latest_sample_repeated_on_continuation": True,
+            "terminal_history_semantics": "latest_sample_only",
+        }
+
+    monkeypatch.setattr(
+        store,
+        "list_reconcile_run_metrics_window",
+        projected_window,
+    )
+    result = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={"include_resolved": "true"},
+        )
+    )
+
+    operations = {
+        item["run_id"]: item
+        for item in result["operations"]
+        if item.get("operation_type") == "current_full_reconcile"
+    }
+    terminalized = operations["current-full-ddddddd"]
+    assert terminalized["status"] == "terminalized_stale"
+    assert terminalized["is_terminal"] is True
+    assert terminalized["status_reason_code"] == "terminalization_overlay_valid"
+    invalid = operations["current-full-eeeeeee"]
+    assert invalid["status"] == "running"
+    assert invalid["is_terminal"] is False
+    assert invalid["status_reason_code"] == "terminalization_overlay_invalid"
+    serialized = json.dumps(result, sort_keys=True)
+    assert "must-not-project-ledger-proof" not in serialized
+    assert "must-not-project-overlay-proof" not in serialized
+
+
 def test_graph_operations_queue_keeps_same_run_snapshots_and_scrubs_evidence(conn):
     head = "e" * 40
     shared_run_id = "current-full-eeeeeee"

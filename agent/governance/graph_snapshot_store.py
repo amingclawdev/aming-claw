@@ -7460,6 +7460,8 @@ _RECONCILE_METRIC_TERMINAL_STATUSES = frozenset(
 )
 _RECONCILE_METRIC_NONTERMINAL_STATUSES = frozenset({"running", "finalizing"})
 _RECONCILE_METRIC_WINDOW_MAX = 1000
+_RECONCILE_METRIC_OVERLAY_SCAN_MIN = 64
+_RECONCILE_METRIC_OVERLAY_SCAN_MAX = 2000
 _RECONCILE_METRIC_CURSOR_RE = re.compile(
     r"rrm1\.([1-9][0-9]{0,18})\.([0-9a-f]{64})\.([0-9a-f]{64})"
 )
@@ -7606,9 +7608,9 @@ def project_reconcile_run_metric_status(
 ) -> dict[str, Any]:
     """Project the append-only metric status used by queue visibility.
 
-    C2B can extend this single projection with an append-only terminalization
-    overlay. Until then, unknown or malformed raw values stay visible as
-    unresolved work and are never interpreted as terminal.
+    This raw fallback never trusts ledger presence. Window readers replace it
+    only with a fully validated append-only terminalization overlay; unknown
+    or malformed values remain visible as unresolved work.
     """
     raw_status = str(row.get("status") or "").strip().lower()
     known_statuses = (
@@ -7632,6 +7634,29 @@ def project_reconcile_run_metric_status(
     }
 
 
+def _project_reconcile_run_metric_with_overlay(
+    conn: sqlite3.Connection,
+    project_id: str,
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    projected = dict(row)
+    has_overlay = bool(projected.pop("_has_terminalization_overlay", 0))
+    projected.pop("_reconcile_metric_rowid", None)
+    status = project_reconcile_run_metric_status(projected)
+    if has_overlay:
+        overlay = reconcile_run_terminalization_overlay(
+            conn,
+            project_id,
+            run_id=str(projected.get("run_id") or ""),
+            snapshot_id=str(projected.get("snapshot_id") or ""),
+        )
+        status = {
+            key: overlay[key]
+            for key in ("effective_status", "is_terminal", "status_reason_code")
+        }
+    return {**projected, **status}
+
+
 def list_reconcile_run_metrics_window(
     conn: sqlite3.Connection,
     project_id: str,
@@ -7650,20 +7675,28 @@ def list_reconcile_run_metrics_window(
     """
     ensure_schema(conn)
     params: list[Any] = [project_id]
-    where_sql = "project_id=?"
+    where_sql = "m.project_id=?"
     if strategy:
-        where_sql += " AND strategy=?"
+        where_sql += " AND m.strategy=?"
         params.append(strategy)
     sample_limit = max(1, min(int(limit or 50), 1000))
     page_limit = max(
         1,
         min(int(nonterminal_limit or _RECONCILE_METRIC_WINDOW_MAX), 1000),
     )
-    order_sql = " ORDER BY created_at DESC, run_id DESC, snapshot_id DESC"
+    order_sql = " ORDER BY m.created_at DESC, m.run_id DESC, m.snapshot_id DESC"
+    overlay_sql = """
+        EXISTS (
+          SELECT 1 FROM graph_reconcile_run_terminalizations AS t
+          WHERE t.project_id=m.project_id
+            AND t.source_run_id=m.run_id
+            AND t.source_snapshot_id=m.snapshot_id
+        ) AS _has_terminalization_overlay
+    """
     latest_rows = conn.execute(
         f"""
-        SELECT rowid AS _reconcile_metric_rowid, *
-        FROM reconcile_run_metrics
+        SELECT m.rowid AS _reconcile_metric_rowid, m.*, {overlay_sql}
+        FROM reconcile_run_metrics AS m
         WHERE {where_sql}{order_sql} LIMIT ?
         """,
         [*params, sample_limit + 1],
@@ -7682,43 +7715,76 @@ def list_reconcile_run_metrics_window(
     if cursor_position is not None:
         created_at, run_id, snapshot_id = cursor_position
         nonterminal_where_sql += (
-            " AND (created_at < ?"
-            " OR (created_at = ? AND run_id < ?)"
-            " OR (created_at = ? AND run_id = ? AND snapshot_id < ?))"
+            " AND (m.created_at < ?"
+            " OR (m.created_at = ? AND m.run_id < ?)"
+            " OR (m.created_at = ? AND m.run_id = ? AND m.snapshot_id < ?))"
         )
         nonterminal_params.extend(
             [created_at, created_at, run_id, created_at, run_id, snapshot_id]
         )
-    effective_nonterminal_rows = conn.execute(
+    scan_limit = min(
+        max(page_limit + 1, _RECONCILE_METRIC_OVERLAY_SCAN_MIN),
+        _RECONCILE_METRIC_OVERLAY_SCAN_MAX,
+    )
+    raw_nonterminal_rows = conn.execute(
         f"""
-        SELECT rowid AS _reconcile_metric_rowid, *
-        FROM reconcile_run_metrics
+        SELECT m.rowid AS _reconcile_metric_rowid, m.*, {overlay_sql}
+        FROM reconcile_run_metrics AS m
         WHERE {nonterminal_where_sql}
-          AND LOWER(TRIM(status)) NOT IN (
+          AND LOWER(TRIM(m.status)) NOT IN (
             'candidate_ready', 'complete', 'failed', 'terminalized_stale'
           )
         {order_sql}
         LIMIT ?
         """,
-        [*nonterminal_params, page_limit + 1],
+        [*nonterminal_params, scan_limit + 1],
     ).fetchall()
-    has_more = len(effective_nonterminal_rows) > page_limit
-    effective_nonterminal_rows = effective_nonterminal_rows[:page_limit]
+    projection_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def project(row: Mapping[str, Any]) -> dict[str, Any]:
+        identity = (
+            str(row.get("project_id") or ""),
+            str(row.get("run_id") or ""),
+            str(row.get("snapshot_id") or ""),
+        )
+        if identity not in projection_cache:
+            projection_cache[identity] = _project_reconcile_run_metric_with_overlay(
+                conn, project_id, row
+            )
+        return projection_cache[identity]
+
+    effective_nonterminal_rows: list[dict[str, Any]] = []
+    cursor_anchor: Mapping[str, Any] | None = None
+    has_more = False
+    for raw_row in raw_nonterminal_rows[:scan_limit]:
+        projected = project(dict(raw_row))
+        if not projected["is_terminal"]:
+            if len(effective_nonterminal_rows) >= page_limit:
+                has_more = True
+                break
+            effective_nonterminal_rows.append(projected)
+        cursor_anchor = dict(raw_row)
+    else:
+        has_more = len(raw_nonterminal_rows) > scan_limit
     next_cursor = (
         _reconcile_metric_next_cursor(
-            dict(effective_nonterminal_rows[-1]),
+            cursor_anchor,
             project_id=project_id,
             strategy=strategy,
         )
-        if has_more and effective_nonterminal_rows
+        if has_more and cursor_anchor is not None
         else ""
     )
     selected: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for row in (*latest_rows, *effective_nonterminal_rows):
-        row = dict(row)
-        row.pop("_reconcile_metric_rowid", None)
-        projection = project_reconcile_run_metric_status(row)
-        projected = {**row, **projection}
+    for row in latest_rows:
+        projected = project(dict(row))
+        identity = (
+            str(projected.get("project_id") or ""),
+            str(projected.get("run_id") or ""),
+            str(projected.get("snapshot_id") or ""),
+        )
+        selected.setdefault(identity, projected)
+    for projected in effective_nonterminal_rows:
         identity = (
             str(projected.get("project_id") or ""),
             str(projected.get("run_id") or ""),

@@ -2961,6 +2961,296 @@ def test_reconcile_run_metric_status_projection_has_exact_terminal_set(status):
     }
 
 
+def test_reconcile_metric_window_uses_only_valid_terminalization_overlays(conn):
+    valid = _terminalization_proof_fixture(conn, suffix="window-valid-z")
+    _insert_terminalization_overlay(conn, valid, suffix="window-valid-z")
+    invalid = _terminalization_proof_fixture(conn, suffix="window-invalid-y")
+    _insert_terminalization_overlay(
+        conn,
+        invalid,
+        suffix="window-invalid-y",
+        ledger_overrides={"source_fingerprint": "sha256:" + "0" * 64},
+    )
+
+    window = store.list_reconcile_run_metrics_window(
+        conn,
+        PID,
+        limit=10,
+        strategy="current_full_reconcile",
+        nonterminal_limit=10,
+    )
+    rows = {
+        (row["run_id"], row["snapshot_id"]): row for row in window["rows"]
+    }
+
+    valid_row = rows[(valid["source_run_id"], valid["source_snapshot_id"])]
+    assert valid_row["status"] == "running"
+    assert valid_row["effective_status"] == "terminalized_stale"
+    assert valid_row["is_terminal"] is True
+    assert valid_row["status_reason_code"] == "terminalization_overlay_valid"
+    invalid_row = rows[(
+        invalid["source_run_id"], invalid["source_snapshot_id"]
+    )]
+    assert invalid_row["status"] == "running"
+    assert invalid_row["effective_status"] == "running"
+    assert invalid_row["is_terminal"] is False
+    assert invalid_row["status_reason_code"] == "terminalization_overlay_invalid"
+    assert window["nonterminal_page_count"] == 1
+
+
+def test_reconcile_metric_window_scans_valid_overlays_before_pending_work(conn):
+    for suffix in ("window-scan-z", "window-scan-y"):
+        fixture = _terminalization_proof_fixture(conn, suffix=suffix)
+        _insert_terminalization_overlay(conn, fixture, suffix=suffix)
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="stale-source-window-scan-x",
+        snapshot_id="full-stale-source-window-scan-x",
+        commit_sha="a" * 40,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="running",
+        evidence={"phase": "build"},
+        created_at="2026-08-10T00:00:00Z",
+    )
+    conn.commit()
+
+    window = store.list_reconcile_run_metrics_window(
+        conn,
+        PID,
+        limit=1,
+        strategy="current_full_reconcile",
+        nonterminal_limit=1,
+    )
+
+    assert window["nonterminal_page_count"] == 1
+    assert window["has_more"] is False
+    assert window["next_cursor"] == ""
+    pending = [
+        row for row in window["rows"]
+        if row["run_id"] == "stale-source-window-scan-x"
+    ]
+    assert len(pending) == 1
+    assert pending[0]["effective_status"] == "running"
+
+
+def test_reconcile_metric_cursor_remains_valid_after_source_is_terminalized(conn):
+    fixture = _terminalization_proof_fixture(conn, suffix="window-cursor-z")
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="stale-source-window-cursor-y",
+        snapshot_id="full-stale-source-window-cursor-y",
+        commit_sha="b" * 40,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="running",
+        evidence={"phase": "build"},
+        created_at="2026-08-10T00:00:00Z",
+    )
+    conn.commit()
+    first = store.list_reconcile_run_metrics_window(
+        conn,
+        PID,
+        limit=1,
+        strategy="current_full_reconcile",
+        nonterminal_limit=1,
+    )
+    assert first["has_more"] is True
+    assert first["next_cursor"].startswith("rrm1.")
+
+    _insert_terminalization_overlay(conn, fixture, suffix="window-cursor-z")
+    second = store.list_reconcile_run_metrics_window(
+        conn,
+        PID,
+        limit=1,
+        strategy="current_full_reconcile",
+        nonterminal_limit=1,
+        cursor=first["next_cursor"],
+    )
+
+    assert second["cursor_applied"] is True
+    assert second["has_more"] is False
+    pending = [
+        row for row in second["rows"]
+        if row["run_id"] == "stale-source-window-cursor-y"
+    ]
+    assert len(pending) == 1
+    assert pending[0]["effective_status"] == "running"
+
+
+def test_reconcile_metric_window_keeps_same_run_snapshot_identities_exact(conn):
+    fixture = _terminalization_proof_fixture(conn, suffix="window-same-run")
+    _insert_terminalization_overlay(conn, fixture, suffix="window-same-run")
+    sibling_snapshot_id = fixture["source_snapshot_id"] + "-sibling"
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=sibling_snapshot_id,
+        commit_sha="c" * 40,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="finalizing",
+        evidence={"phase": "finalizing"},
+        created_at="2026-08-10T00:00:00Z",
+    )
+    conn.commit()
+
+    window = store.list_reconcile_run_metrics_window(
+        conn,
+        PID,
+        limit=10,
+        strategy="current_full_reconcile",
+        nonterminal_limit=10,
+    )
+    same_run = {
+        row["snapshot_id"]: row
+        for row in window["rows"]
+        if row["run_id"] == fixture["source_run_id"]
+    }
+
+    assert set(same_run) == {fixture["source_snapshot_id"], sibling_snapshot_id}
+    assert same_run[fixture["source_snapshot_id"]]["effective_status"] == (
+        "terminalized_stale"
+    )
+    assert same_run[sibling_snapshot_id]["effective_status"] == "finalizing"
+    assert window["nonterminal_page_count"] == 1
+
+
+def test_reconcile_metric_window_overlay_projection_is_physical_zero_write(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path)
+    db_path = tmp_path / "terminalization-window-read.sqlite"
+    setup = _file_connection(db_path)
+    fixture = _terminalization_proof_fixture(setup, suffix="window-physical")
+    _insert_terminalization_overlay(setup, fixture, suffix="window-physical")
+    setup.close()
+
+    reader = sqlite3.connect(db_path)
+    reader.row_factory = sqlite3.Row
+    before_bytes = db_path.read_bytes()
+    before_changes = reader.total_changes
+    before_schema = tuple(reader.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall())
+    before_pragmas = tuple(
+        reader.execute(f"PRAGMA {name}").fetchone()[0]
+        for name in ("schema_version", "page_count", "freelist_count")
+    )
+    statements = []
+    reader.set_trace_callback(statements.append)
+
+    window = store.list_reconcile_run_metrics_window(
+        reader,
+        PID,
+        limit=10,
+        strategy="current_full_reconcile",
+        nonterminal_limit=10,
+    )
+    reader.set_trace_callback(None)
+
+    source = next(
+        row for row in window["rows"]
+        if row["run_id"] == fixture["source_run_id"]
+    )
+    assert source["effective_status"] == "terminalized_stale"
+    assert reader.total_changes == before_changes
+    assert reader.in_transaction is False
+    assert statements
+    assert not any(
+        statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE", "ALTER", "DROP", "BEGIN")
+        )
+        for statement in statements
+    )
+    assert tuple(reader.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall()) == before_schema
+    assert tuple(
+        reader.execute(f"PRAGMA {name}").fetchone()[0]
+        for name in ("schema_version", "page_count", "freelist_count")
+    ) == before_pragmas
+    reader.close()
+    assert db_path.read_bytes() == before_bytes
+
+
+def test_reconcile_metric_window_dense_overlay_scan_continues_without_loop(
+    conn,
+    monkeypatch,
+):
+    _ensure_schema(conn)
+    conn.executemany(
+        """
+        INSERT INTO reconcile_run_metrics (
+          project_id, run_id, snapshot_id, snapshot_kind, strategy,
+          graph_delta_mode, status, created_at
+        ) VALUES (?, ?, ?, 'full', 'current_full_reconcile',
+                  'full_rebuild', 'running', ?)
+        """,
+        [
+            (
+                PID,
+                f"overlay-scan-{index:03d}",
+                f"full-overlay-scan-{index:03d}",
+                f"2026-08-10T00:00:00.{index:06d}Z",
+            )
+            for index in range(64, -1, -1)
+        ],
+    )
+    conn.commit()
+    original = store._project_reconcile_run_metric_with_overlay
+
+    def project(_conn, project_id, row):
+        projected = original(_conn, project_id, row)
+        if int(str(projected["run_id"]).rsplit("-", 1)[1]) > 0:
+            projected.update({
+                "effective_status": "terminalized_stale",
+                "is_terminal": True,
+                "status_reason_code": "terminalization_overlay_valid",
+            })
+        return projected
+
+    monkeypatch.setattr(
+        store,
+        "_project_reconcile_run_metric_with_overlay",
+        project,
+    )
+
+    first = store.list_reconcile_run_metrics_window(
+        conn,
+        PID,
+        limit=1,
+        strategy="current_full_reconcile",
+        nonterminal_limit=1,
+    )
+    assert first["nonterminal_page_count"] == 0
+    assert first["has_more"] is True
+    assert first["next_cursor"].startswith("rrm1.")
+
+    second = store.list_reconcile_run_metrics_window(
+        conn,
+        PID,
+        limit=1,
+        strategy="current_full_reconcile",
+        nonterminal_limit=1,
+        cursor=first["next_cursor"],
+    )
+    assert second["nonterminal_page_count"] == 1
+    assert second["has_more"] is False
+    pending = [
+        row for row in second["rows"] if row["run_id"] == "overlay-scan-000"
+    ]
+    assert len(pending) == 1
+    assert pending[0]["effective_status"] == "running"
+
+
 def test_current_full_build_claim_fences_two_connections_before_materialization(
     tmp_path,
 ):
