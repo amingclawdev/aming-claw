@@ -11,6 +11,7 @@ import tracemalloc
 import pytest
 
 from agent.governance import graph_snapshot_store as store
+from agent.governance import task_timeline
 from agent.governance import db
 from agent.governance.baseline_service import create_baseline
 from agent.governance.db import _ensure_schema
@@ -251,6 +252,92 @@ def _add_terminalization_candidate(
     return {"run_id": replacement_run_id, "snapshot_id": replacement_snapshot_id}
 
 
+def _insert_terminalization_overlay(
+    conn,
+    fixture,
+    *,
+    suffix="one",
+    ledger_overrides=None,
+    timeline_overrides=None,
+):
+    task_timeline.ensure_schema(conn)
+    conn.commit()
+    proof = store.reconcile_run_terminalization_proof(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+        manager_certificate=fixture["certificate"],
+    )
+    receipt = store.reconcile_run_terminalization_safe_receipt(proof)
+    sealed = json.loads(proof._canonical)
+    terminalization_id = f"terminalization-{suffix}"
+    terminalization_id_sha256 = store._stable_sha256(
+        ["terminalization_id", terminalization_id]
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    event = task_timeline.record_reconcile_run_terminalization_event(
+        conn,
+        project_id=PID,
+        backlog_id=f"terminalization-backlog-{suffix}",
+        task_id=f"terminalization-task-{suffix}",
+        commit_sha=fixture["commit_sha"],
+        terminalization_id_sha256=terminalization_id_sha256,
+        source_identity_sha256=receipt["source_identity_sha256"],
+        source_fingerprint=receipt["source_fingerprint"],
+        replacement_identity_sha256=receipt["replacement_identity_sha256"],
+        replacement_fingerprint=receipt["replacement_fingerprint"],
+        manager_certificate_hash=receipt["manager_certificate_hash"],
+        proof_sha256=receipt["proof_sha256"],
+    )
+    for field, value in (timeline_overrides or {}).items():
+        assert field in {"actor", "status", "created_at", "payload_json"}
+        conn.execute(
+            f"UPDATE task_timeline_events SET {field}=? WHERE id=?",
+            (value, event["id"]),
+        )
+    timeline = dict(conn.execute(
+        "SELECT * FROM task_timeline_events WHERE id=?", (event["id"],)
+    ).fetchone())
+    source = sealed["source"]
+    replacement = sealed["replacement"]
+    ledger = {
+        "terminalization_id": terminalization_id,
+        "project_id": PID,
+        "source_run_id": source["run_id"],
+        "source_snapshot_id": source["snapshot_id"],
+        "source_metric_identity_sequence": source["metric_identity_sequence"],
+        "source_raw_status": source["raw_status"],
+        "source_fingerprint": source["fingerprint"],
+        "replacement_run_id": replacement["run_id"],
+        "replacement_snapshot_id": replacement["snapshot_id"],
+        "replacement_metric_identity_sequence": replacement[
+            "metric_identity_sequence"
+        ],
+        "replacement_raw_status": replacement["raw_status"],
+        "replacement_fingerprint": replacement["fingerprint"],
+        "manager_certificate_id": sealed["manager_certificate"]["certificate_id"],
+        "manager_certificate_hash": sealed["manager_certificate"][
+            "certificate_hash"
+        ],
+        "timeline_event_id": event["id"],
+        "timeline_event_hash": store._terminalization_timeline_hash(timeline),
+        "terminal_status": "terminalized_stale",
+        "created_at": timeline["created_at"],
+        "ledger_hash": "",
+    }
+    ledger.update(ledger_overrides or {})
+    ledger["ledger_hash"] = store._terminalization_ledger_hash(ledger)
+    columns = list(ledger)
+    conn.execute(
+        "INSERT INTO graph_reconcile_run_terminalizations "
+        f"({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+        [ledger[column] for column in columns],
+    )
+    conn.commit()
+    return {"event": event, "ledger": ledger, "receipt": receipt}
+
+
 def test_terminalization_proof_kernel_seals_exact_candidate_and_safe_receipt(conn):
     fixture = _terminalization_proof_fixture(conn)
 
@@ -363,6 +450,368 @@ def test_terminalization_ledger_schema_is_exact_pk_and_append_only(conn):
     with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
         conn.execute(sql, [malformed[key] for key in columns])
     conn.rollback()
+
+
+def test_terminalization_overlay_reader_missing_is_safe_and_read_only(conn):
+    store.ensure_schema(conn)
+    conn.commit()
+    before_changes = conn.total_changes
+
+    result = store.reconcile_run_terminalization_overlay(
+        conn,
+        PID,
+        run_id="missing-run",
+        snapshot_id="missing-snapshot",
+    )
+
+    assert result == {
+        "schema_version": "reconcile_run_terminalization.overlay.v1",
+        "valid": False,
+        "effective_status": "unknown",
+        "is_terminal": False,
+        "status_reason_code": "terminalization_overlay_missing",
+    }
+    assert conn.total_changes == before_changes
+    assert conn.in_transaction is False
+
+
+def test_terminalization_overlay_reader_missing_keeps_running_source_visible(conn):
+    fixture = _terminalization_proof_fixture(conn, suffix="overlay-missing-running")
+
+    result = store.reconcile_run_terminalization_overlay(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+    )
+
+    assert result == {
+        "schema_version": "reconcile_run_terminalization.overlay.v1",
+        "valid": False,
+        "effective_status": "running",
+        "is_terminal": False,
+        "status_reason_code": "terminalization_overlay_missing",
+    }
+
+
+def test_terminalization_overlay_reader_revalidates_historical_proof_and_timeline(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path)
+    db_path = tmp_path / "terminalization-overlay.sqlite"
+    setup = _file_connection(db_path)
+    fixture = _terminalization_proof_fixture(setup, suffix="overlay-valid")
+    inserted = _insert_terminalization_overlay(
+        setup, fixture, suffix="overlay-valid"
+    )
+    store.record_manager_generation_certificate(
+        setup,
+        PID,
+        **_generation(
+            "2",
+            manager_pid=5202,
+            prior_manager_pid=5101,
+            prior_process_start_identity="process-start-terminal-overlay-valid",
+            observed_prior_generation_id="generation-terminal-overlay-valid",
+        ),
+    )
+    setup.close()
+
+    reader = sqlite3.connect(db_path)
+    reader.row_factory = sqlite3.Row
+    before_bytes = db_path.read_bytes()
+    before_changes = reader.total_changes
+    before_schema = tuple(reader.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall())
+    before_pragmas = tuple(
+        reader.execute(f"PRAGMA {name}").fetchone()[0]
+        for name in ("schema_version", "page_count", "freelist_count")
+    )
+    statements = []
+    reader.set_trace_callback(statements.append)
+
+    result = store.reconcile_run_terminalization_overlay(
+        reader,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+    )
+    reader.set_trace_callback(None)
+
+    assert result["valid"] is True
+    assert result["effective_status"] == "terminalized_stale"
+    assert result["is_terminal"] is True
+    assert result["status_reason_code"] == "terminalization_overlay_valid"
+    assert result["ledger_hash"] == inserted["ledger"]["ledger_hash"]
+    serialized = json.dumps(result, sort_keys=True)
+    for raw in (
+        fixture["source_run_id"],
+        fixture["source_snapshot_id"],
+        fixture["replacement_run_id"],
+        fixture["replacement_snapshot_id"],
+        inserted["ledger"]["terminalization_id"],
+        inserted["event"]["backlog_id"],
+        inserted["event"]["task_id"],
+    ):
+        assert raw not in serialized
+    assert statements
+    assert all(
+        statement.lstrip().upper().startswith(("SELECT", "PRAGMA DATA_VERSION"))
+        for statement in statements
+    )
+    assert reader.total_changes == before_changes
+    assert reader.in_transaction is False
+    assert tuple(reader.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall()) == before_schema
+    assert tuple(
+        reader.execute(f"PRAGMA {name}").fetchone()[0]
+        for name in ("schema_version", "page_count", "freelist_count")
+    ) == before_pragmas
+    reader.close()
+    assert db_path.read_bytes() == before_bytes
+
+
+def test_terminalization_overlay_reader_accepts_exact_active_replacement(conn):
+    fixture = _terminalization_proof_fixture(
+        conn,
+        suffix="overlay-active",
+        replacement_status="complete",
+    )
+    _insert_terminalization_overlay(conn, fixture, suffix="overlay-active")
+
+    result = store.reconcile_run_terminalization_overlay(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+    )
+
+    assert result["valid"] is True
+    assert result["effective_status"] == "terminalized_stale"
+
+
+def test_terminalization_overlay_reader_detects_concurrent_database_change(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path)
+    db_path = tmp_path / "terminalization-overlay-race.sqlite"
+    setup = _file_connection(db_path)
+    setup.execute("PRAGMA journal_mode=WAL")
+    fixture = _terminalization_proof_fixture(setup, suffix="overlay-race")
+    inserted = _insert_terminalization_overlay(setup, fixture, suffix="overlay-race")
+    setup.close()
+    reader = sqlite3.connect(db_path)
+    reader.row_factory = sqlite3.Row
+    baseline = store.reconcile_run_terminalization_overlay(
+        reader,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+    )
+    assert baseline["valid"] is True, baseline
+    writer = sqlite3.connect(db_path)
+    writer.row_factory = sqlite3.Row
+    before_injection = store.reconcile_run_terminalization_overlay(
+        reader,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+    )
+    assert before_injection["valid"] is True, before_injection
+    original = store._terminalization_validate_timeline
+    injected = False
+
+    def inject_change(*args, **kwargs):
+        nonlocal injected
+        original(*args, **kwargs)
+        if not injected:
+            try:
+                writer.execute(
+                    "UPDATE task_timeline_events SET severity='external-change' "
+                    "WHERE id=?",
+                    (inserted["event"]["id"],),
+                )
+                writer.commit()
+                injected = True
+            except Exception as exc:
+                raise AssertionError(f"concurrent writer failed: {exc}") from exc
+
+    monkeypatch.setattr(store, "_terminalization_validate_timeline", inject_change)
+    result = store.reconcile_run_terminalization_overlay(
+        reader,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+    )
+
+    assert injected is True, result
+    assert result["valid"] is False
+    assert result["effective_status"] == "running"
+    assert result["status_reason_code"] == "terminalization_overlay_invalid"
+    reader.close()
+    writer.close()
+
+
+@pytest.mark.parametrize(
+    "timeline_overrides",
+    [
+        {"status": "accepted"},
+        {"actor": "observer"},
+        {"created_at": "2026-08-10 00:00:00Z"},
+    ],
+)
+def test_terminalization_overlay_reader_rejects_exactly_hashed_non_neutral_timeline(
+    conn, timeline_overrides
+):
+    suffix = f"overlay-timeline-{next(iter(timeline_overrides))}"
+    fixture = _terminalization_proof_fixture(conn, suffix=suffix)
+    _insert_terminalization_overlay(
+        conn,
+        fixture,
+        suffix=suffix,
+        timeline_overrides=timeline_overrides,
+    )
+
+    result = store.reconcile_run_terminalization_overlay(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+    )
+
+    assert result == {
+        "schema_version": "reconcile_run_terminalization.overlay.v1",
+        "valid": False,
+        "effective_status": "running",
+        "is_terminal": False,
+        "status_reason_code": "terminalization_overlay_invalid",
+    }
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "source_metric",
+        "replacement_metric",
+        "replacement_companion",
+        "timeline_payload",
+        "source_materialized",
+        "replacement_ambiguous",
+    ],
+)
+def test_terminalization_overlay_reader_keeps_drifted_source_visible(
+    conn, drift
+):
+    fixture = _terminalization_proof_fixture(conn, suffix=f"overlay-{drift}")
+    inserted = _insert_terminalization_overlay(
+        conn, fixture, suffix=f"overlay-{drift}"
+    )
+    if drift == "source_metric":
+        conn.execute(
+            "UPDATE reconcile_run_metrics SET evidence_json=? "
+            "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+            (
+                json.dumps({
+                    "phase": "build-drifted",
+                    "idempotency_scope": fixture["source_scope"],
+                }),
+                PID,
+                fixture["source_run_id"],
+                fixture["source_snapshot_id"],
+            ),
+        )
+    elif drift == "replacement_metric":
+        conn.execute(
+            "UPDATE reconcile_run_metrics SET elapsed_ms=elapsed_ms+1 "
+            "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+            (PID, fixture["replacement_run_id"], fixture["replacement_snapshot_id"]),
+        )
+    elif drift == "replacement_companion":
+        store.snapshot_graph_path(
+            PID, fixture["replacement_snapshot_id"]
+        ).unlink()
+    elif drift == "timeline_payload":
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json='{}' WHERE id=?",
+            (inserted["event"]["id"],),
+        )
+    elif drift == "source_materialized":
+        store.create_graph_snapshot(
+            conn,
+            PID,
+            snapshot_id=fixture["source_snapshot_id"],
+            commit_sha=fixture["commit_sha"],
+            snapshot_kind="full",
+            graph_json={"deps_graph": {"nodes": []}},
+        )
+    else:
+        _add_terminalization_candidate(
+            conn,
+            suffix=f"overlay-{drift}-second",
+            commit_sha=fixture["commit_sha"],
+            scope=fixture["source_scope"],
+        )
+    conn.commit()
+
+    result = store.reconcile_run_terminalization_overlay(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+    )
+
+    assert result == {
+        "schema_version": "reconcile_run_terminalization.overlay.v1",
+        "valid": False,
+        "effective_status": "running",
+        "is_terminal": False,
+        "status_reason_code": "terminalization_overlay_invalid",
+    }
+
+
+@pytest.mark.parametrize(
+    ("override", "expected_status"),
+    [
+        ({"source_fingerprint": "sha256:" + "0" * 64}, "running"),
+        ({"replacement_fingerprint": "sha256:" + "1" * 64}, "running"),
+        ({"manager_certificate_hash": "sha256:" + "2" * 64}, "running"),
+        ({"timeline_event_hash": "sha256:" + "3" * 64}, "finalizing"),
+    ],
+)
+def test_terminalization_overlay_reader_rejects_forged_ledger_without_throwing(
+    conn, override, expected_status
+):
+    fixture = _terminalization_proof_fixture(
+        conn,
+        suffix=f"overlay-forged-{override[next(iter(override))][-1]}",
+    )
+    if expected_status == "finalizing":
+        conn.execute(
+            "UPDATE reconcile_run_metrics SET status='finalizing' "
+            "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+            (PID, fixture["source_run_id"], fixture["source_snapshot_id"]),
+        )
+        conn.commit()
+    _insert_terminalization_overlay(
+        conn,
+        fixture,
+        suffix=f"overlay-forged-{override[next(iter(override))][-1]}",
+        ledger_overrides=override,
+    )
+
+    result = store.reconcile_run_terminalization_overlay(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+    )
+
+    assert result["valid"] is False
+    assert result["effective_status"] == expected_status
+    assert result["is_terminal"] is False
+    assert result["status_reason_code"] == "terminalization_overlay_invalid"
 
 
 @pytest.mark.parametrize("raw_status", [" running ", "RUNNING", "candidate_ready"])

@@ -4138,6 +4138,83 @@ def _terminalization_manager_certificate(
     return expected
 
 
+def _terminalization_replacements(
+    conn: sqlite3.Connection,
+    project_id: str,
+    source: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], bool]:
+    source_row = source["row"]
+    rows = conn.execute(
+        "SELECT run_id,snapshot_id FROM reconcile_run_metrics "
+        "WHERE project_id=? AND commit_sha=? "
+        "AND strategy='current_full_reconcile' "
+        "AND status IN ('candidate_ready','complete') "
+        "ORDER BY created_at,run_id,snapshot_id",
+        (project_id, source_row["commit_sha"]),
+    ).fetchall()
+    replacements: list[dict[str, Any]] = []
+    invalid_seen = False
+    for replacement_key in rows:
+        try:
+            replacement = _terminalization_metric_proof(
+                conn,
+                project_id,
+                str(replacement_key["run_id"]),
+                str(replacement_key["snapshot_id"]),
+                allowed_statuses=frozenset({"candidate_ready", "complete"}),
+            )
+        except ReconcileRunTerminalizationProofError:
+            invalid_seen = True
+            continue
+        replacement_row = replacement["row"]
+        if replacement["created_at_dt"] <= source["created_at_dt"]:
+            continue
+        if _terminalization_typed_value(replacement["scope"]) != (
+            _terminalization_typed_value(source["scope"])
+        ):
+            continue
+        if conn.execute(
+            "SELECT 1 FROM graph_current_full_build_claim_history "
+            "WHERE project_id=? AND snapshot_id=? AND status='active' LIMIT 1",
+            (project_id, replacement_row["snapshot_id"]),
+        ).fetchone():
+            invalid_seen = True
+            continue
+        if replacement_row["status"] == "candidate_ready":
+            c1_proof = current_full_candidate_tuple_from_db(
+                conn,
+                project_id=project_id,
+                run_id=replacement_row["run_id"],
+                target_commit_sha=source_row["commit_sha"],
+                snapshot_id=replacement_row["snapshot_id"],
+            )
+        else:
+            c1_proof = current_full_active_terminal_tuple(
+                conn,
+                project_id=project_id,
+                run_id=replacement_row["run_id"],
+                target_commit_sha=source_row["commit_sha"],
+                expected_scope=source["scope"],
+                snapshot_id=replacement_row["snapshot_id"],
+            )
+        if not c1_proof.get("valid"):
+            invalid_seen = True
+            continue
+        replacements.append(replacement)
+    return replacements, invalid_seen
+
+
+def _terminalization_source_is_stale(
+    conn: sqlite3.Connection, project_id: str, snapshot_id: str
+) -> bool:
+    return not conn.execute(
+        "SELECT 1 FROM graph_snapshots WHERE project_id=? AND snapshot_id=? "
+        "UNION ALL SELECT 1 FROM graph_current_full_build_claim_history "
+        "WHERE project_id=? AND snapshot_id=? AND status='active' LIMIT 1",
+        (project_id, snapshot_id, project_id, snapshot_id),
+    ).fetchone() and not snapshot_companion_dir(project_id, snapshot_id).exists()
+
+
 def reconcile_run_terminalization_proof(
     conn: sqlite3.Connection,
     project_id: str,
@@ -4160,75 +4237,17 @@ def reconcile_run_terminalization_proof(
     )
     source_row = source["row"]
     _terminalization_require(
-        not conn.execute(
-            "SELECT 1 FROM graph_snapshots WHERE project_id=? AND snapshot_id=? "
-            "UNION ALL SELECT 1 FROM graph_current_full_build_claim_history "
-            "WHERE project_id=? AND snapshot_id=? AND status='active' LIMIT 1",
-            (project, source_row["snapshot_id"], project, source_row["snapshot_id"]),
-        ).fetchone()
-        and not snapshot_companion_dir(project, source_row["snapshot_id"]).exists(),
+        _terminalization_source_is_stale(
+            conn, project, source_row["snapshot_id"]
+        ),
         "terminalization_source_not_stale",
     )
     certificate = _terminalization_manager_certificate(
         conn, project, manager_certificate
     )
-    rows = conn.execute(
-        "SELECT run_id,snapshot_id FROM reconcile_run_metrics "
-        "WHERE project_id=? AND commit_sha=? "
-        "AND strategy='current_full_reconcile' "
-        "AND status IN ('candidate_ready','complete') "
-        "ORDER BY created_at,run_id,snapshot_id",
-        (project, source_row["commit_sha"]),
-    ).fetchall()
-    replacements: list[dict[str, Any]] = []
-    invalid_replacement_seen = False
-    for replacement_key in rows:
-        try:
-            replacement = _terminalization_metric_proof(
-                conn,
-                project,
-                str(replacement_key["run_id"]),
-                str(replacement_key["snapshot_id"]),
-                allowed_statuses=frozenset({"candidate_ready", "complete"}),
-            )
-        except ReconcileRunTerminalizationProofError:
-            invalid_replacement_seen = True
-            continue
-        replacement_row = replacement["row"]
-        if replacement["created_at_dt"] <= source["created_at_dt"]:
-            continue
-        if _terminalization_typed_value(replacement["scope"]) != (
-            _terminalization_typed_value(source["scope"])
-        ):
-            continue
-        if conn.execute(
-            "SELECT 1 FROM graph_current_full_build_claim_history "
-            "WHERE project_id=? AND snapshot_id=? AND status='active' LIMIT 1",
-            (project, replacement_row["snapshot_id"]),
-        ).fetchone():
-            invalid_replacement_seen = True
-            continue
-        if replacement_row["status"] == "candidate_ready":
-            c1_proof = current_full_candidate_tuple_from_db(
-                conn,
-                project_id=project,
-                run_id=replacement_row["run_id"],
-                target_commit_sha=source_row["commit_sha"],
-                snapshot_id=replacement_row["snapshot_id"],
-            )
-        else:
-            c1_proof = current_full_active_terminal_tuple(
-                conn,
-                project_id=project,
-                run_id=replacement_row["run_id"],
-                target_commit_sha=source_row["commit_sha"],
-                expected_scope=source["scope"],
-                snapshot_id=replacement_row["snapshot_id"],
-            )
-        if not c1_proof.get("valid"):
-            invalid_replacement_seen = True
-            continue
-        replacements.append(replacement)
+    replacements, invalid_replacement_seen = _terminalization_replacements(
+        conn, project, source
+    )
     _terminalization_require(
         replacements,
         (
@@ -4279,6 +4298,280 @@ def reconcile_run_terminalization_safe_receipt(
         "proof_sha256": proof._seal,
         "replacement_count": 1,
         "server_derived": True,
+    }
+
+
+_RECONCILE_TERMINALIZATION_LEDGER_FIELDS = (
+    "terminalization_id", "project_id", "source_run_id", "source_snapshot_id",
+    "source_metric_identity_sequence", "source_raw_status", "source_fingerprint",
+    "replacement_run_id", "replacement_snapshot_id",
+    "replacement_metric_identity_sequence", "replacement_raw_status",
+    "replacement_fingerprint", "manager_certificate_id",
+    "manager_certificate_hash", "timeline_event_id", "timeline_event_hash",
+    "terminal_status", "created_at", "ledger_hash",
+)
+
+
+def _terminalization_ledger_hash(row: Mapping[str, Any]) -> str:
+    payload = {
+        field: row.get(field)
+        for field in _RECONCILE_TERMINALIZATION_LEDGER_FIELDS
+        if field != "ledger_hash"
+    }
+    return _stable_sha256(_terminalization_typed_value(payload))
+
+
+def _terminalization_timeline_hash(row: Mapping[str, Any]) -> str:
+    return _stable_sha256(_terminalization_typed_value(dict(row)))
+
+
+def _terminalization_historical_certificate(
+    conn: sqlite3.Connection,
+    project_id: str,
+    certificate_id: str,
+    certificate_hash: str,
+) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM graph_reconcile_manager_generations "
+        "WHERE project_id=? AND certificate_id=?",
+        (project_id, certificate_id),
+    ).fetchone()
+    _terminalization_require(row, "terminalization_manager_certificate_missing")
+    certificate = dict(row)
+    try:
+        _validate_manager_generation_certificate_row(conn, certificate)
+    except ManagerGenerationCertificateConflictError as exc:
+        raise ReconcileRunTerminalizationProofError(
+            "terminalization_manager_certificate_history_invalid"
+        ) from exc
+    receipt = manager_generation_certificate_public_receipt(certificate)
+    _terminalization_require(
+        hmac.compare_digest(receipt["certificate_hash"], certificate_hash),
+        "terminalization_manager_certificate_mismatch",
+    )
+    return receipt
+
+
+def _terminalization_validate_timeline(
+    row: Mapping[str, Any],
+    ledger: Mapping[str, Any],
+    source: Mapping[str, Any],
+    safe_receipt: Mapping[str, Any],
+) -> None:
+    _terminalization_utc(row.get("created_at"))
+    _terminalization_utc(ledger.get("created_at"))
+    expected_payload = {
+        "schema_version": "graph.reconcile_run_terminalized.timeline.v1",
+        "terminalization_id_sha256": _stable_sha256(
+            ["terminalization_id", ledger["terminalization_id"]]
+        ),
+        "source_identity_sha256": safe_receipt["source_identity_sha256"],
+        "source_fingerprint": safe_receipt["source_fingerprint"],
+        "replacement_identity_sha256": safe_receipt["replacement_identity_sha256"],
+        "replacement_fingerprint": safe_receipt["replacement_fingerprint"],
+        "manager_certificate_hash": safe_receipt["manager_certificate_hash"],
+        "proof_sha256": safe_receipt["proof_sha256"],
+        "close_satisfying": False,
+        "synthesizes_pass": False,
+        "authoritative_pass_synthesized": False,
+        "graph_reconciled": False,
+        "server_derived": True,
+    }
+    expected = {
+        "project_id": ledger["project_id"], "mf_id": "", "attempt_num": 0,
+        "event_type": "graph.reconcile_run_terminalized",
+        "phase": "reconcile_terminalization",
+        "event_kind": "reconcile_terminalization", "scenario_id": "",
+        "parent_event_id": 0,
+        "correlation_id": expected_payload["terminalization_id_sha256"],
+        "severity": "", "decision": "", "schema_version": 2,
+        "actor": "governance_store", "status": "recorded",
+        "payload_json": _json(expected_payload),
+        "verification_json": _json(
+            {"audit_only": True, "protected_close_evidence": False}
+        ),
+        "artifact_refs_json": "{}", "trace_id": "",
+        "commit_sha": source["row"]["commit_sha"],
+    }
+    _terminalization_require(
+        all(row.get(field) == value for field, value in expected.items())
+        and isinstance(row.get("backlog_id"), str) and bool(row["backlog_id"])
+        and isinstance(row.get("task_id"), str) and bool(row["task_id"])
+        and row.get("created_at") == ledger["created_at"],
+        "terminalization_timeline_invalid",
+    )
+
+
+def _terminalization_overlay_projection(raw_status: Any, reason: str) -> dict[str, Any]:
+    status = str(raw_status or "").strip().lower()
+    effective = status if status in {
+        "running", "finalizing", "candidate_ready", "complete", "failed"
+    } else "unknown"
+    return {
+        "schema_version": "reconcile_run_terminalization.overlay.v1",
+        "valid": False,
+        "effective_status": effective,
+        "is_terminal": effective in {"candidate_ready", "complete", "failed"},
+        "status_reason_code": reason,
+    }
+
+
+def reconcile_run_terminalization_overlay(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    run_id: str,
+    snapshot_id: str,
+) -> dict[str, Any]:
+    """Validate one historical terminalization overlay without writing state."""
+
+    try:
+        data_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
+        metric = conn.execute(
+            "SELECT status FROM reconcile_run_metrics "
+            "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+            (project_id, run_id, snapshot_id),
+        ).fetchone()
+        raw_status = metric["status"] if metric else ""
+        rows = conn.execute(
+            "SELECT * FROM graph_reconcile_run_terminalizations "
+            "WHERE project_id=? AND source_run_id=? AND source_snapshot_id=?",
+            (project_id, run_id, snapshot_id),
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return _terminalization_overlay_projection(
+            "", "terminalization_overlay_invalid"
+        )
+    if not rows:
+        return _terminalization_overlay_projection(
+            raw_status, "terminalization_overlay_missing"
+        )
+    if len(rows) != 1:
+        return _terminalization_overlay_projection(
+            raw_status, "terminalization_overlay_invalid"
+        )
+    try:
+        ledger = dict(rows[0])
+        _terminalization_require(
+            set(ledger) == set(_RECONCILE_TERMINALIZATION_LEDGER_FIELDS)
+            and ledger["terminal_status"] == "terminalized_stale"
+            and hmac.compare_digest(
+                str(ledger["ledger_hash"]), _terminalization_ledger_hash(ledger)
+            ),
+            "terminalization_ledger_invalid",
+        )
+        source = _terminalization_metric_proof(
+            conn, project_id, run_id, snapshot_id,
+            allowed_statuses=frozenset({"running", "finalizing"}),
+        )
+        _terminalization_require(
+            ledger["source_metric_identity_sequence"]
+            == source["sealed"]["metric_identity_sequence"]
+            and ledger["source_raw_status"] == source["sealed"]["raw_status"]
+            and hmac.compare_digest(
+                ledger["source_fingerprint"], source["sealed"]["fingerprint"]
+            ),
+            "terminalization_source_drift",
+        )
+        _terminalization_require(
+            _terminalization_source_is_stale(conn, project_id, snapshot_id),
+            "terminalization_source_not_stale",
+        )
+        replacements, invalid_seen = _terminalization_replacements(
+            conn, project_id, source
+        )
+        _terminalization_require(
+            not invalid_seen and len(replacements) == 1,
+            "terminalization_replacement_invalid",
+        )
+        replacement = replacements[0]
+        _terminalization_require(
+            ledger["replacement_run_id"] == replacement["sealed"]["run_id"]
+            and ledger["replacement_snapshot_id"]
+            == replacement["sealed"]["snapshot_id"]
+            and ledger["replacement_metric_identity_sequence"]
+            == replacement["sealed"]["metric_identity_sequence"]
+            and ledger["replacement_raw_status"]
+            == replacement["sealed"]["raw_status"]
+            and hmac.compare_digest(
+                ledger["replacement_fingerprint"],
+                replacement["sealed"]["fingerprint"],
+            ),
+            "terminalization_replacement_drift",
+        )
+        certificate = _terminalization_historical_certificate(
+            conn, project_id, ledger["manager_certificate_id"],
+            ledger["manager_certificate_hash"],
+        )
+        proof = _ReconcileRunTerminalizationProof({
+            "schema_version": "reconcile_run_terminalization.proof.v1",
+            "project_id": project_id,
+            "source": source["sealed"],
+            "replacement": replacement["sealed"],
+            "manager_certificate": certificate,
+        })
+        safe_receipt = reconcile_run_terminalization_safe_receipt(proof)
+        timeline_row = conn.execute(
+            "SELECT * FROM task_timeline_events WHERE id=?",
+            (ledger["timeline_event_id"],),
+        ).fetchone()
+        _terminalization_require(
+            timeline_row, "terminalization_timeline_missing"
+        )
+        timeline = dict(timeline_row)
+        _terminalization_require(
+            hmac.compare_digest(
+                ledger["timeline_event_hash"],
+                _terminalization_timeline_hash(timeline),
+            ),
+            "terminalization_timeline_hash_invalid",
+        )
+        _terminalization_validate_timeline(
+            timeline, ledger, source, safe_receipt
+        )
+        source_after = _terminalization_metric_proof(
+            conn, project_id, run_id, snapshot_id,
+            allowed_statuses=frozenset({"running", "finalizing"}),
+        )
+        replacements_after, invalid_after = _terminalization_replacements(
+            conn, project_id, source_after
+        )
+        _terminalization_require(
+            source_after["sealed"] == source["sealed"]
+            and _terminalization_source_is_stale(conn, project_id, snapshot_id)
+            and not invalid_after
+            and len(replacements_after) == 1
+            and replacements_after[0]["sealed"] == replacement["sealed"]
+            and int(conn.execute("PRAGMA data_version").fetchone()[0])
+            == data_version,
+            "terminalization_overlay_state_changed",
+        )
+    except (
+        ReconcileRunTerminalizationProofError,
+        ManagerGenerationCertificateConflictError,
+        sqlite3.DatabaseError,
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        return _terminalization_overlay_projection(
+            raw_status, "terminalization_overlay_invalid"
+        )
+    return {
+        "schema_version": "reconcile_run_terminalization.overlay.v1",
+        "valid": True,
+        "effective_status": "terminalized_stale",
+        "is_terminal": True,
+        "status_reason_code": "terminalization_overlay_valid",
+        "terminalization_id_sha256": _stable_sha256(
+            ["terminalization_id", ledger["terminalization_id"]]
+        ),
+        "source_identity_sha256": safe_receipt["source_identity_sha256"],
+        "replacement_identity_sha256": safe_receipt["replacement_identity_sha256"],
+        "ledger_hash": ledger["ledger_hash"],
+        "timeline_event_hash": ledger["timeline_event_hash"],
+        "manager_certificate_hash": ledger["manager_certificate_hash"],
     }
 
 
@@ -8010,6 +8303,7 @@ __all__ = [
     "mark_pending_scope_reconcile_failed",
     "queue_pending_scope_reconcile",
     "record_reconcile_run_metric",
+    "reconcile_run_terminalization_overlay",
     "reconcile_run_terminalization_proof",
     "reconcile_run_terminalization_safe_receipt",
     "record_manager_generation_certificate",
