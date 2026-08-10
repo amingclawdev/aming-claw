@@ -480,6 +480,172 @@ def test_governance_manager_generation_public_receipt_is_fixed_and_safe(monkeypa
     assert "secret-exception-sentinel" not in serialized
 
 
+def test_private_terminalization_facade_uses_live_server_authority(monkeypatch):
+    certificate = _test_manager_certificate()
+    lease_receipt = {
+        key: certificate[key]
+        for key in (
+            "generation_id",
+            "manager_pid",
+            "manager_started_at",
+            "process_start_identity",
+            "manager_start_identity",
+            "lock_identity",
+            "prior_manager_pid",
+            "observed_prior_generation_id",
+            "prior_process_start_identity",
+            "prior_pid_death_method",
+            "prior_pid_death_verified_at",
+        )
+    }
+    lease_receipt["lock_acquired_at"] = certificate["certified_at"]
+
+    class LiveLease:
+        _released = False
+
+        class Handle:
+            closed = False
+
+        _lock_handle = Handle()
+
+        def public_receipt(self):
+            return {
+                "schema_version": "governance_singleton_lease.v1",
+                **lease_receipt,
+                "server_derived": True,
+            }
+
+    monkeypatch.setattr(
+        server, "_GOVERNANCE_MANAGER_CERTIFICATES", {PID: certificate}
+    )
+    monkeypatch.setattr(server, "_GOVERNANCE_SINGLETON_LEASE", LiveLease())
+    monkeypatch.setattr(
+        server, "_process_start_identity", lambda _pid: certificate["process_start_identity"]
+    )
+    class Connection:
+        def commit(self):
+            return None
+
+        def close(self):
+            return None
+
+    connection = Connection()
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: connection)
+    observed = {}
+
+    def fake_proof(_conn, project_id, **kwargs):
+        observed["proof"] = (project_id, kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        server,
+        "_prewarm_reconcile_terminalization_schemas",
+        lambda _conn, _store, _timeline: None,
+    )
+    monkeypatch.setattr(store, "reconcile_run_terminalization_proof", fake_proof)
+    monkeypatch.setattr(
+        store,
+        "_terminalization_proof_snapshot_ids",
+        lambda _proof: ("source-snapshot", "replacement-snapshot"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        store,
+        "record_reconcile_run_terminalization",
+        lambda _conn, project_id, **kwargs: (
+            {
+                "schema_version": "reconcile_run_terminalization.append.v1",
+                "project_id_seen": project_id,
+                "manager_certificate_seen": kwargs["manager_certificate"],
+                "writes_performed": True,
+            }
+            if server._CURRENT_FULL_BUILD_KEYS_LOCK._is_owned()
+            and server._GOVERNANCE_MANAGER_CERTIFICATES_LOCK._is_owned()
+            else (_ for _ in ()).throw(AssertionError("server authority locks not held"))
+        ),
+        raising=False,
+    )
+
+    result = server._record_reconcile_run_terminalization(
+        PID,
+        run_id="source-run",
+        snapshot_id="source-snapshot",
+        backlog_id="terminalization-backlog",
+        task_id="terminalization-task",
+    )
+
+    assert result["writes_performed"] is True
+    assert result["project_id_seen"] == PID
+    assert result["manager_certificate_seen"]["certificate_id"] == certificate[
+        "certificate_id"
+    ]
+    assert observed["proof"][1]["manager_certificate"]["certificate_id"] == certificate[
+        "certificate_id"
+    ]
+    for blocked_snapshot in ("source-snapshot", "replacement-snapshot"):
+        with server._CURRENT_FULL_BUILD_KEYS_LOCK:
+            server._CURRENT_FULL_BUILD_KEYS.add((PID, blocked_snapshot))
+        try:
+            with pytest.raises(
+                RuntimeError, match="terminalization_snapshot_build_active"
+            ):
+                server._record_reconcile_run_terminalization(
+                    PID,
+                    run_id="source-run",
+                    snapshot_id="source-snapshot",
+                    backlog_id="terminalization-backlog",
+                    task_id="terminalization-task",
+                )
+        finally:
+            with server._CURRENT_FULL_BUILD_KEYS_LOCK:
+                server._CURRENT_FULL_BUILD_KEYS.discard((PID, blocked_snapshot))
+    server._GOVERNANCE_SINGLETON_LEASE._released = True
+    with pytest.raises(RuntimeError, match="terminalization_manager_lease_not_live"):
+        server._record_reconcile_run_terminalization(
+            PID,
+            run_id="source-run",
+            snapshot_id="source-snapshot",
+            backlog_id="terminalization-backlog",
+            task_id="terminalization-task",
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        server._record_reconcile_run_terminalization(
+            PID,
+            run_id="source-run",
+            snapshot_id="source-snapshot",
+            backlog_id="terminalization-backlog",
+            task_id="terminalization-task",
+            manager_certificate=certificate,
+        )
+
+
+def test_terminalization_schema_prewarm_is_read_only_after_ready():
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        server._prewarm_reconcile_terminalization_schemas(
+            connection, store, task_timeline
+        )
+        before_changes = connection.total_changes
+        statements = []
+        connection.set_trace_callback(statements.append)
+
+        server._prewarm_reconcile_terminalization_schemas(
+            connection, store, task_timeline
+        )
+
+        connection.set_trace_callback(None)
+        assert connection.total_changes == before_changes
+        assert connection.in_transaction is False
+        assert statements
+        assert all(
+            statement.lstrip().upper().startswith(("SELECT", "PRAGMA"))
+            for statement in statements
+        )
+    finally:
+        connection.close()
+
+
 def test_main_never_starts_components_or_binds_before_generation_certificate(
     monkeypatch,
 ):

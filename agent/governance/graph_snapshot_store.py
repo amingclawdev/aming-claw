@@ -4301,6 +4301,19 @@ def reconcile_run_terminalization_safe_receipt(
     }
 
 
+def _terminalization_proof_snapshot_ids(
+    proof: _ReconcileRunTerminalizationProof,
+) -> tuple[str, str]:
+    """Return the two process-fence identities from one sealed store proof."""
+
+    reconcile_run_terminalization_safe_receipt(proof)
+    payload = json.loads(proof._canonical)
+    return (
+        str(payload["source"]["snapshot_id"]),
+        str(payload["replacement"]["snapshot_id"]),
+    )
+
+
 _RECONCILE_TERMINALIZATION_LEDGER_FIELDS = (
     "terminalization_id", "project_id", "source_run_id", "source_snapshot_id",
     "source_metric_identity_sequence", "source_raw_status", "source_fingerprint",
@@ -4573,6 +4586,237 @@ def reconcile_run_terminalization_overlay(
         "timeline_event_hash": ledger["timeline_event_hash"],
         "manager_certificate_hash": ledger["manager_certificate_hash"],
     }
+
+
+def _reconcile_run_terminalization_append_fault(
+    _stage: str, _conn: sqlite3.Connection
+) -> None:
+    """Internal fault-injection seam for the two-row atomic append."""
+
+
+def _terminalization_append_receipt(
+    overlay: Mapping[str, Any], *, writes_performed: bool, replayed: bool
+) -> dict[str, Any]:
+    return {
+        "schema_version": "reconcile_run_terminalization.append.v1",
+        "terminalization_id_sha256": overlay["terminalization_id_sha256"],
+        "source_identity_sha256": overlay["source_identity_sha256"],
+        "replacement_identity_sha256": overlay["replacement_identity_sha256"],
+        "manager_certificate_hash": overlay["manager_certificate_hash"],
+        "ledger_hash": overlay["ledger_hash"],
+        "timeline_event_hash": overlay["timeline_event_hash"],
+        "writes_performed": bool(writes_performed),
+        "replayed": bool(replayed),
+        "server_derived": True,
+    }
+
+
+def _terminalization_require_replay_scope(
+    conn: sqlite3.Connection,
+    project_id: str,
+    run_id: str,
+    snapshot_id: str,
+    backlog_id: str,
+    task_id: str,
+) -> None:
+    row = conn.execute(
+        "SELECT event.backlog_id,event.task_id "
+        "FROM graph_reconcile_run_terminalizations AS ledger "
+        "JOIN task_timeline_events AS event ON event.id=ledger.timeline_event_id "
+        "WHERE ledger.project_id=? AND ledger.source_run_id=? "
+        "AND ledger.source_snapshot_id=?",
+        (project_id, run_id, snapshot_id),
+    ).fetchone()
+    _terminalization_require(
+        row is not None
+        and row["backlog_id"] == backlog_id
+        and row["task_id"] == task_id,
+        "terminalization_replay_scope_mismatch",
+    )
+
+
+def record_reconcile_run_terminalization(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    run_id: str,
+    snapshot_id: str,
+    backlog_id: str,
+    task_id: str,
+    manager_certificate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Append one neutral timeline fact and overlay after caller prewarm."""
+
+    from . import task_timeline
+    from .db import sqlite_write_lock
+
+    if conn.in_transaction:
+        raise RuntimeError("terminalization append requires a clean transaction")
+    project = str(project_id or "")
+    source_run = str(run_id or "")
+    source_snapshot = str(snapshot_id or "")
+    _terminalization_manager_certificate(conn, project, manager_certificate)
+    existing = reconcile_run_terminalization_overlay(
+        conn, project, run_id=source_run, snapshot_id=source_snapshot
+    )
+    if existing.get("valid") is True:
+        _terminalization_require_replay_scope(
+            conn,
+            project,
+            source_run,
+            source_snapshot,
+            str(backlog_id or ""),
+            str(task_id or ""),
+        )
+        return _terminalization_append_receipt(
+            existing, writes_performed=False, replayed=True
+        )
+    if conn.execute(
+        "SELECT 1 FROM graph_reconcile_run_terminalizations "
+        "WHERE project_id=? AND source_run_id=? AND source_snapshot_id=?",
+        (project, source_run, source_snapshot),
+    ).fetchone():
+        raise ReconcileRunTerminalizationProofError(
+            "terminalization_existing_overlay_invalid"
+        )
+
+    inserted_event: dict[str, Any] | None = None
+    with sqlite_write_lock():
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _terminalization_manager_certificate(
+                conn, project, manager_certificate
+            )
+            existing = reconcile_run_terminalization_overlay(
+                conn, project, run_id=source_run, snapshot_id=source_snapshot
+            )
+            if existing.get("valid") is True:
+                _terminalization_require_replay_scope(
+                    conn,
+                    project,
+                    source_run,
+                    source_snapshot,
+                    str(backlog_id or ""),
+                    str(task_id or ""),
+                )
+                conn.rollback()
+                return _terminalization_append_receipt(
+                    existing, writes_performed=False, replayed=True
+                )
+            if conn.execute(
+                "SELECT 1 FROM graph_reconcile_run_terminalizations "
+                "WHERE project_id=? AND source_run_id=? AND source_snapshot_id=?",
+                (project, source_run, source_snapshot),
+            ).fetchone():
+                raise ReconcileRunTerminalizationProofError(
+                    "terminalization_existing_overlay_invalid"
+                )
+            proof = reconcile_run_terminalization_proof(
+                conn,
+                project,
+                run_id=source_run,
+                snapshot_id=source_snapshot,
+                manager_certificate=manager_certificate,
+            )
+            safe = reconcile_run_terminalization_safe_receipt(proof)
+            payload = json.loads(proof._canonical)
+            source = payload["source"]
+            replacement = payload["replacement"]
+            certificate = payload["manager_certificate"]
+            source_metric = conn.execute(
+                "SELECT commit_sha FROM reconcile_run_metrics "
+                "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+                (project, source_run, source_snapshot),
+            ).fetchone()
+            _terminalization_require(
+                source_metric is not None, "terminalization_metric_missing"
+            )
+            terminalization_id = "terminalization-" + hashlib.sha256(
+                f"{project}\0{source_run}\0{source_snapshot}".encode("utf-8")
+            ).hexdigest()
+            terminalization_id_sha256 = _stable_sha256(
+                ["terminalization_id", terminalization_id]
+            )
+            inserted_event = task_timeline.record_reconcile_run_terminalization_event(
+                conn,
+                project_id=project,
+                backlog_id=str(backlog_id or ""),
+                task_id=str(task_id or ""),
+                commit_sha=str(source_metric["commit_sha"]),
+                terminalization_id_sha256=terminalization_id_sha256,
+                source_identity_sha256=safe["source_identity_sha256"],
+                source_fingerprint=safe["source_fingerprint"],
+                replacement_identity_sha256=safe["replacement_identity_sha256"],
+                replacement_fingerprint=safe["replacement_fingerprint"],
+                manager_certificate_hash=safe["manager_certificate_hash"],
+                proof_sha256=safe["proof_sha256"],
+            )
+            _reconcile_run_terminalization_append_fault("after_timeline", conn)
+            timeline = dict(conn.execute(
+                "SELECT * FROM task_timeline_events WHERE id=?",
+                (inserted_event["id"],),
+            ).fetchone())
+            ledger = {
+                "terminalization_id": terminalization_id,
+                "project_id": project,
+                "source_run_id": source["run_id"],
+                "source_snapshot_id": source["snapshot_id"],
+                "source_metric_identity_sequence": source["metric_identity_sequence"],
+                "source_raw_status": source["raw_status"],
+                "source_fingerprint": source["fingerprint"],
+                "replacement_run_id": replacement["run_id"],
+                "replacement_snapshot_id": replacement["snapshot_id"],
+                "replacement_metric_identity_sequence": replacement[
+                    "metric_identity_sequence"
+                ],
+                "replacement_raw_status": replacement["raw_status"],
+                "replacement_fingerprint": replacement["fingerprint"],
+                "manager_certificate_id": certificate["certificate_id"],
+                "manager_certificate_hash": certificate["certificate_hash"],
+                "timeline_event_id": inserted_event["id"],
+                "timeline_event_hash": _terminalization_timeline_hash(timeline),
+                "terminal_status": "terminalized_stale",
+                "created_at": timeline["created_at"],
+                "ledger_hash": "",
+            }
+            ledger["ledger_hash"] = _terminalization_ledger_hash(ledger)
+            columns = list(ledger)
+            conn.execute(
+                "INSERT INTO graph_reconcile_run_terminalizations "
+                f"({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                [ledger[column] for column in columns],
+            )
+            _reconcile_run_terminalization_append_fault("after_ledger", conn)
+            proof_after = reconcile_run_terminalization_proof(
+                conn,
+                project,
+                run_id=source_run,
+                snapshot_id=source_snapshot,
+                manager_certificate=manager_certificate,
+            )
+            _terminalization_require(
+                proof_after._canonical == proof._canonical
+                and hmac.compare_digest(proof_after._seal, proof._seal),
+                "terminalization_state_changed",
+            )
+            overlay = reconcile_run_terminalization_overlay(
+                conn, project, run_id=source_run, snapshot_id=source_snapshot
+            )
+            _terminalization_require(
+                overlay.get("valid") is True,
+                "terminalization_precommit_overlay_invalid",
+            )
+            _reconcile_run_terminalization_append_fault("before_commit", conn)
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+    if inserted_event is not None:
+        task_timeline.run_post_commit_hooks(conn, inserted_event)
+    return _terminalization_append_receipt(
+        overlay, writes_performed=True, replayed=False
+    )
 
 
 def current_full_reconcile_state(
@@ -8303,6 +8547,7 @@ __all__ = [
     "mark_pending_scope_reconcile_failed",
     "queue_pending_scope_reconcile",
     "record_reconcile_run_metric",
+    "record_reconcile_run_terminalization",
     "reconcile_run_terminalization_overlay",
     "reconcile_run_terminalization_proof",
     "reconcile_run_terminalization_safe_receipt",

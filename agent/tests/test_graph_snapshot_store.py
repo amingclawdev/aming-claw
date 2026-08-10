@@ -338,6 +338,327 @@ def _insert_terminalization_overlay(
     return {"event": event, "ledger": ledger, "receipt": receipt}
 
 
+def test_terminalization_append_is_atomic_safe_and_replay_zero_write(conn):
+    fixture = _terminalization_proof_fixture(conn, suffix="atomic-append")
+    task_timeline.ensure_schema(conn)
+    conn.commit()
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    first = store.record_reconcile_run_terminalization(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+        backlog_id="terminalization-backlog-atomic",
+        task_id="terminalization-task-atomic",
+        manager_certificate=fixture["certificate"],
+    )
+    conn.set_trace_callback(None)
+
+    assert first["writes_performed"] is True
+    assert first["replayed"] is False
+    assert set(first) == {
+        "schema_version",
+        "terminalization_id_sha256",
+        "source_identity_sha256",
+        "replacement_identity_sha256",
+        "manager_certificate_hash",
+        "ledger_hash",
+        "timeline_event_hash",
+        "writes_performed",
+        "replayed",
+        "server_derived",
+    }
+    serialized = json.dumps(first, sort_keys=True)
+    for raw in (
+        fixture["source_run_id"],
+        fixture["source_snapshot_id"],
+        fixture["replacement_run_id"],
+        fixture["replacement_snapshot_id"],
+        "trace-atomic-append.json",
+        "terminalization-backlog-atomic",
+        "terminalization-task-atomic",
+    ):
+        assert raw not in serialized
+    assert conn.execute(
+        "SELECT status FROM reconcile_run_metrics WHERE project_id=? AND run_id=? "
+        "AND snapshot_id=?",
+        (PID, fixture["source_run_id"], fixture["source_snapshot_id"]),
+    ).fetchone()["status"] == "running"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_run_terminalizations"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events "
+        "WHERE event_type='graph.reconcile_run_terminalized'"
+    ).fetchone()[0] == 1
+    event = task_timeline.list_events(
+        conn,
+        PID,
+        event_kind="reconcile_terminalization",
+        limit=10,
+    )[0]
+    assert event["status"] == "recorded"
+    assert task_timeline.is_protected_close_evidence(event) is False
+    begin_index = statements.index("BEGIN IMMEDIATE")
+    commit_index = statements.index("COMMIT", begin_index)
+    assert not any(
+        statement.lstrip().upper().startswith(("CREATE ", "ALTER ", "DROP "))
+        for statement in statements[begin_index:commit_index]
+    )
+
+    before_changes = conn.total_changes
+    before_rows = tuple(conn.execute(
+        "SELECT * FROM graph_reconcile_run_terminalizations"
+    ).fetchall())
+    before_events = tuple(conn.execute(
+        "SELECT * FROM task_timeline_events "
+        "WHERE event_type='graph.reconcile_run_terminalized'"
+    ).fetchall())
+    replay = store.record_reconcile_run_terminalization(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+        backlog_id="terminalization-backlog-atomic",
+        task_id="terminalization-task-atomic",
+        manager_certificate=fixture["certificate"],
+    )
+
+    assert replay == {**first, "writes_performed": False, "replayed": True}
+    assert conn.total_changes == before_changes
+    assert tuple(conn.execute(
+        "SELECT * FROM graph_reconcile_run_terminalizations"
+    ).fetchall()) == before_rows
+    assert tuple(conn.execute(
+        "SELECT * FROM task_timeline_events "
+        "WHERE event_type='graph.reconcile_run_terminalized'"
+    ).fetchall()) == before_events
+    assert conn.in_transaction is False
+
+
+@pytest.mark.parametrize("fault_stage", ["after_timeline", "after_ledger", "before_commit"])
+def test_terminalization_append_fault_rolls_back_both_rows(
+    conn, monkeypatch, fault_stage
+):
+    fixture = _terminalization_proof_fixture(
+        conn, suffix=f"atomic-fault-{fault_stage}"
+    )
+    task_timeline.ensure_schema(conn)
+    conn.commit()
+    source_before = dict(conn.execute(
+        "SELECT * FROM reconcile_run_metrics WHERE project_id=? AND run_id=? "
+        "AND snapshot_id=?",
+        (PID, fixture["source_run_id"], fixture["source_snapshot_id"]),
+    ).fetchone())
+
+    def injected(stage, connection):
+        if stage == fault_stage:
+            if stage == "before_commit":
+                connection.execute(
+                    "UPDATE reconcile_run_metrics SET evidence_json='{}' "
+                    "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+                    (PID, fixture["source_run_id"], fixture["source_snapshot_id"]),
+                )
+            raise RuntimeError(f"injected-{stage}")
+
+    monkeypatch.setattr(store, "_reconcile_run_terminalization_append_fault", injected)
+    with pytest.raises(RuntimeError, match=f"injected-{fault_stage}"):
+        store.record_reconcile_run_terminalization(
+            conn,
+            PID,
+            run_id=fixture["source_run_id"],
+            snapshot_id=fixture["source_snapshot_id"],
+            backlog_id="terminalization-backlog-fault",
+            task_id="terminalization-task-fault",
+            manager_certificate=fixture["certificate"],
+        )
+
+    assert conn.in_transaction is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_run_terminalizations"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events "
+        "WHERE event_type='graph.reconcile_run_terminalized'"
+    ).fetchone()[0] == 0
+    assert dict(conn.execute(
+        "SELECT * FROM reconcile_run_metrics WHERE project_id=? AND run_id=? "
+        "AND snapshot_id=?",
+        (PID, fixture["source_run_id"], fixture["source_snapshot_id"]),
+    ).fetchone()) == source_before
+
+
+def test_terminalization_replay_accepts_new_live_generation_and_keeps_old_author(
+    conn,
+):
+    fixture = _terminalization_proof_fixture(conn, suffix="atomic-restart")
+    task_timeline.ensure_schema(conn)
+    conn.commit()
+    first = store.record_reconcile_run_terminalization(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+        backlog_id="terminalization-backlog-restart",
+        task_id="terminalization-task-restart",
+        manager_certificate=fixture["certificate"],
+    )
+    original = dict(conn.execute(
+        "SELECT * FROM graph_reconcile_run_terminalizations"
+    ).fetchone())
+    prior = fixture["certificate"]
+    store.record_manager_generation_certificate(
+        conn,
+        PID,
+        **_generation(
+            "terminal-restart-2",
+            manager_pid=5202,
+            prior_manager_pid=int(prior["manager_pid"]),
+            prior_process_start_identity=str(prior["process_start_identity"]),
+            observed_prior_generation_id=str(prior["generation_id"]),
+        ),
+    )
+    conn.commit()
+    newer = store.current_manager_generation_certificate(conn, PID)
+    before_changes = conn.total_changes
+
+    replay = store.record_reconcile_run_terminalization(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+        backlog_id="terminalization-backlog-restart",
+        task_id="terminalization-task-restart",
+        manager_certificate=newer,
+    )
+
+    assert replay == {**first, "writes_performed": False, "replayed": True}
+    assert conn.total_changes == before_changes
+    assert dict(conn.execute(
+        "SELECT * FROM graph_reconcile_run_terminalizations"
+    ).fetchone()) == original
+    with pytest.raises(
+        store.ReconcileRunTerminalizationProofError,
+        match="terminalization_replay_scope_mismatch",
+    ):
+        store.record_reconcile_run_terminalization(
+            conn,
+            PID,
+            run_id=fixture["source_run_id"],
+            snapshot_id=fixture["source_snapshot_id"],
+            backlog_id="foreign-backlog",
+            task_id="terminalization-task-restart",
+            manager_certificate=newer,
+        )
+    assert conn.total_changes == before_changes
+
+
+def test_terminalization_two_connections_converge_on_one_append(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path)
+    db_path = tmp_path / "terminalization-converge.sqlite"
+    setup = _file_connection(db_path)
+    fixture = _terminalization_proof_fixture(setup, suffix="atomic-converge")
+    task_timeline.ensure_schema(setup)
+    setup.commit()
+    setup.close()
+    barrier = threading.Barrier(2)
+
+    def append_once():
+        connection = sqlite3.connect(db_path, timeout=3)
+        connection.row_factory = sqlite3.Row
+        try:
+            barrier.wait(timeout=2)
+            return store.record_reconcile_run_terminalization(
+                connection,
+                PID,
+                run_id=fixture["source_run_id"],
+                snapshot_id=fixture["source_snapshot_id"],
+                backlog_id="terminalization-backlog-converge",
+                task_id="terminalization-task-converge",
+                manager_certificate=fixture["certificate"],
+            )
+        finally:
+            connection.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: append_once(), range(2)))
+
+    assert sorted(result["writes_performed"] for result in results) == [False, True]
+    assert sorted(result["replayed"] for result in results) == [False, True]
+    before_bytes = db_path.read_bytes()
+    check = sqlite3.connect(db_path)
+    check.row_factory = sqlite3.Row
+    try:
+        assert check.execute(
+            "SELECT COUNT(*) FROM graph_reconcile_run_terminalizations"
+        ).fetchone()[0] == 1
+        assert check.execute(
+            "SELECT COUNT(*) FROM task_timeline_events "
+            "WHERE event_type='graph.reconcile_run_terminalized'"
+        ).fetchone()[0] == 1
+        before_changes = check.total_changes
+        replay = store.record_reconcile_run_terminalization(
+            check,
+            PID,
+            run_id=fixture["source_run_id"],
+            snapshot_id=fixture["source_snapshot_id"],
+            backlog_id="terminalization-backlog-converge",
+            task_id="terminalization-task-converge",
+            manager_certificate=fixture["certificate"],
+        )
+        assert replay["writes_performed"] is False
+        assert replay["replayed"] is True
+        assert check.total_changes == before_changes
+    finally:
+        check.close()
+    assert db_path.read_bytes() == before_bytes
+
+
+def test_terminalization_precommit_state_drift_rolls_back(conn, monkeypatch):
+    fixture = _terminalization_proof_fixture(conn, suffix="atomic-drift")
+    task_timeline.ensure_schema(conn)
+    conn.commit()
+
+    def mutate_after_ledger(stage, connection):
+        if stage == "after_ledger":
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET elapsed_ms=elapsed_ms+1 "
+                "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+                (PID, fixture["source_run_id"], fixture["source_snapshot_id"]),
+            )
+
+    monkeypatch.setattr(
+        store, "_reconcile_run_terminalization_append_fault", mutate_after_ledger
+    )
+    with pytest.raises(
+        store.ReconcileRunTerminalizationProofError,
+        match="terminalization_state_changed",
+    ):
+        store.record_reconcile_run_terminalization(
+            conn,
+            PID,
+            run_id=fixture["source_run_id"],
+            snapshot_id=fixture["source_snapshot_id"],
+            backlog_id="terminalization-backlog-drift",
+            task_id="terminalization-task-drift",
+            manager_certificate=fixture["certificate"],
+        )
+    assert conn.execute(
+        "SELECT elapsed_ms FROM reconcile_run_metrics WHERE project_id=? "
+        "AND run_id=? AND snapshot_id=?",
+        (PID, fixture["source_run_id"], fixture["source_snapshot_id"]),
+    ).fetchone()[0] == 6
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_run_terminalizations"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events "
+        "WHERE event_type='graph.reconcile_run_terminalized'"
+    ).fetchone()[0] == 0
+
+
 def test_terminalization_proof_kernel_seals_exact_candidate_and_safe_receipt(conn):
     fixture = _terminalization_proof_fixture(conn)
 

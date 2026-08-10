@@ -359,6 +359,139 @@ def _release_current_full_process_build_key(key: tuple[str, str]) -> None:
         _CURRENT_FULL_BUILD_KEYS.discard(key)
 
 
+def _current_terminalization_manager_identity(project_id: str) -> dict[str, Any]:
+    """Prove that the published certificate is still backed by this live lease."""
+
+    lease = _GOVERNANCE_SINGLETON_LEASE
+    certificate = dict(_GOVERNANCE_MANAGER_CERTIFICATES.get(project_id) or {})
+    if (
+        lease is None
+        or getattr(lease, "_released", True)
+        or getattr(getattr(lease, "_lock_handle", None), "closed", True)
+        or not certificate
+    ):
+        raise RuntimeError("terminalization_manager_lease_not_live")
+    lease_receipt = lease.public_receipt()
+    bindings = (
+        "generation_id",
+        "manager_pid",
+        "manager_started_at",
+        "process_start_identity",
+        "manager_start_identity",
+        "lock_identity",
+        "prior_manager_pid",
+        "observed_prior_generation_id",
+        "prior_process_start_identity",
+        "prior_pid_death_method",
+        "prior_pid_death_verified_at",
+    )
+    if (
+        any(lease_receipt.get(key) != certificate.get(key) for key in bindings)
+        or lease_receipt.get("lock_acquired_at") != certificate.get("certified_at")
+        or int(certificate.get("manager_pid") or 0) != os.getpid()
+        or _process_start_identity(os.getpid())
+        != str(certificate.get("process_start_identity") or "")
+    ):
+        raise RuntimeError("terminalization_manager_lease_mismatch")
+    return _current_full_build_manager_identity(project_id)
+
+
+def _prewarm_reconcile_terminalization_schemas(
+    conn: sqlite3.Connection, store: Any, task_timeline: Any
+) -> None:
+    required = {
+        ("table", "graph_reconcile_run_terminalizations"),
+        ("table", "graph_reconcile_metric_identity_schema_state"),
+        ("table", "task_timeline_events"),
+        ("trigger", "trg_reconcile_run_terminalization_insert_conflict"),
+        ("trigger", "trg_reconcile_run_terminalization_no_update"),
+        ("trigger", "trg_reconcile_run_terminalization_no_delete"),
+    }
+    present = {
+        (str(row[0]), str(row[1]))
+        for row in conn.execute(
+            "SELECT type,name FROM sqlite_master WHERE name IN "
+            f"({','.join('?' for _ in required)})",
+            tuple(name for _kind, name in sorted(required)),
+        ).fetchall()
+    }
+    ledger_columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(graph_reconcile_run_terminalizations)"
+        ).fetchall()
+    }
+    timeline_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(task_timeline_events)").fetchall()
+    }
+    if (
+        present != required
+        or not set(store._RECONCILE_TERMINALIZATION_LEDGER_FIELDS).issubset(
+            ledger_columns
+        )
+        or not {
+            "project_id", "backlog_id", "task_id", "event_type", "phase",
+            "event_kind", "actor", "status", "payload_json", "verification_json",
+            "commit_sha", "created_at",
+        }.issubset(timeline_columns)
+    ):
+        store.ensure_schema(conn)
+        task_timeline.ensure_schema(conn)
+        conn.commit()
+    store.ensure_reconcile_metric_physical_identity_migration(conn)
+
+
+def _record_reconcile_run_terminalization(
+    project_id: str,
+    *,
+    run_id: str,
+    snapshot_id: str,
+    backlog_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """Private server-authorized terminalization append; no public action yet."""
+
+    from . import graph_snapshot_store as store
+    from . import task_timeline
+
+    project = str(project_id or "")
+    with _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
+        with _CURRENT_FULL_BUILD_KEYS_LOCK:
+            manager_certificate = _current_terminalization_manager_identity(project)
+            conn = get_connection(project)
+            try:
+                _prewarm_reconcile_terminalization_schemas(
+                    conn, store, task_timeline
+                )
+                proof = store.reconcile_run_terminalization_proof(
+                    conn,
+                    project,
+                    run_id=str(run_id or ""),
+                    snapshot_id=str(snapshot_id or ""),
+                    manager_certificate=manager_certificate,
+                )
+                fenced_snapshots = set(store._terminalization_proof_snapshot_ids(proof))
+                if any(
+                    key_project == project and key_snapshot in fenced_snapshots
+                    for key_project, key_snapshot in _CURRENT_FULL_BUILD_KEYS
+                ):
+                    raise RuntimeError("terminalization_snapshot_build_active")
+                return store.record_reconcile_run_terminalization(
+                    conn,
+                    project,
+                    run_id=str(run_id or ""),
+                    snapshot_id=str(snapshot_id or ""),
+                    backlog_id=str(backlog_id or ""),
+                    task_id=str(task_id or ""),
+                    manager_certificate=manager_certificate,
+                )
+            finally:
+                close = getattr(conn, "close", None)
+                if callable(close):
+                    close()
+
+
 def _clamped_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
     try:
         parsed = float(value)
