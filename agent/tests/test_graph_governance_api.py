@@ -73354,8 +73354,18 @@ def test_operations_queue_unifies_jobs_and_edge_not_queued(conn, monkeypatch):
         _ctx({"project_id": PID}, query={"require_current_semantic": "true"})
     )
 
+    expected_public_snapshot_id = (
+        "snapshot-"
+        + hashlib.sha256(snapshot["snapshot_id"].encode("utf-8")).hexdigest()[:16]
+    )
     assert queue["ok"] is True
-    assert queue["snapshot_id"] == "ops-active"
+    assert queue["snapshot_id"] == expected_public_snapshot_id
+    assert queue["active_snapshot_id"] == expected_public_snapshot_id
+    assert snapshot["snapshot_id"] not in json.dumps(
+        queue,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
     assert queue["summary"]["node_semantic_jobs"]["by_status"] == {"ai_pending": 1}
     assert queue["summary"]["feedback_queue"]["visible_item_count"] == 0
     operations = {row["operation_id"]: row for row in queue["operations"]}
