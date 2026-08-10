@@ -13,7 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from threading import Event
+from threading import Event, get_ident
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -7862,12 +7862,25 @@ def _graph(node_id: str = "L7.1") -> dict:
     }
 
 
-def _stub_current_full_reconcile(monkeypatch, tmp_path):
+def _stub_current_full_reconcile(
+    monkeypatch,
+    tmp_path,
+    *,
+    fixed_snapshot_id: str | None = "full-current",
+):
     head = "a" * 40
     calls: list[dict] = []
-    monkeypatch.setattr(
-        store, "snapshot_id_for", lambda *_args, **_kwargs: "full-current"
-    )
+    if fixed_snapshot_id is not None:
+        monkeypatch.setattr(
+            store,
+            "snapshot_id_for",
+            lambda *_args, **_kwargs: fixed_snapshot_id,
+        )
+        monkeypatch.setattr(
+            server,
+            "_current_full_deterministic_snapshot_id",
+            lambda _commit_sha: fixed_snapshot_id,
+        )
     monkeypatch.setattr(
         server,
         "_graph_governance_project_root",
@@ -10131,7 +10144,9 @@ def test_fresh_run_reuses_existing_deterministic_snapshot_without_build_or_overw
     tmp_path,
     first_activate,
 ):
-    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    head, calls = _stub_current_full_reconcile(
+        monkeypatch, tmp_path, fixed_snapshot_id=None
+    )
     db_path = tmp_path / f"deterministic-existing-{first_activate}.sqlite"
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
@@ -10213,7 +10228,7 @@ def test_fresh_run_reuses_existing_deterministic_snapshot_without_build_or_overw
             )
         )
 
-        assert fresh_status == 200
+        assert fresh_status == 200, fresh
         assert fresh["rebuild_skipped"] is True
         if first_activate:
             assert fresh["fresh_run_snapshot_resume"] is True
@@ -10239,6 +10254,578 @@ def test_fresh_run_reuses_existing_deterministic_snapshot_without_build_or_overw
             name: hashlib.sha256(payload).hexdigest()
             for name, payload in companion_after.items()
         } == companion_hashes_before
+    finally:
+        connection.close()
+
+
+def test_default_current_full_identity_converges_across_two_connections(
+    monkeypatch,
+    tmp_path,
+):
+    head, _stub_calls = _stub_current_full_reconcile(
+        monkeypatch, tmp_path, fixed_snapshot_id=None
+    )
+    db_path = tmp_path / "deterministic-concurrent.sqlite"
+    setup = sqlite3.connect(db_path)
+    setup.row_factory = sqlite3.Row
+    _ensure_schema(setup)
+    store.ensure_schema(setup)
+    setup.commit()
+    setup.close()
+    entered = Event()
+    release = Event()
+    build_calls: list[str] = []
+
+    def connection_factory(_project_id):
+        connection = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def builder(conn_arg, project_id, _root, **kwargs):
+        build_calls.append(str(kwargs["snapshot_id"]))
+        if len(build_calls) > 1:
+            raise AssertionError("default concurrent requests must not both build")
+        entered.set()
+        assert release.wait(10)
+        store.create_graph_snapshot(
+            conn_arg,
+            project_id,
+            snapshot_id=str(kwargs["snapshot_id"]),
+            commit_sha=head,
+            snapshot_kind="full",
+            graph_json=_graph(),
+            notes=json.dumps({"run_id": kwargs["run_id"]}),
+        )
+        conn_arg.commit()
+        return {
+            "ok": True,
+            "snapshot_id": str(kwargs["snapshot_id"]),
+            "snapshot_status": "candidate",
+            "run_id": kwargs["run_id"],
+        }
+
+    monkeypatch.setattr(server, "get_connection", connection_factory)
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    monkeypatch.setattr(state_reconcile, "run_state_only_full_reconcile", builder)
+    monkeypatch.setattr(
+        server,
+        "_acquire_current_full_process_build_key",
+        lambda project_id, snapshot_id: (project_id, snapshot_id, get_ident()),
+    )
+
+    def invoke(run_id):
+        return server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "run_id": run_id,
+                    "activate": False,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        winner = pool.submit(invoke, "deterministic-concurrent-winner")
+        assert entered.wait(5)
+        loser = pool.submit(invoke, "deterministic-concurrent-loser")
+        loser_status, loser_result = loser.result(timeout=10)
+        release.set()
+        winner_status, winner_result = winner.result(timeout=10)
+
+    assert winner_status == 201
+    assert loser_status == 409
+    assert loser_result["rebuild_started"] is False
+    retry_status, retry = invoke("deterministic-concurrent-retry")
+    assert retry_status == 200
+    assert retry["resumed_candidate"] is True
+    assert retry["rebuild_skipped"] is True
+    expected_id = server._current_full_deterministic_snapshot_id(head)
+    assert expected_id == (
+        f"full-{head[:12]}-"
+        f"{hashlib.sha256(f'full:{head}'.encode('utf-8')).hexdigest()[:12]}"
+    )
+    assert "/" not in expected_id and "\\" not in expected_id
+    assert winner_result["candidate_snapshot_id"] == expected_id
+    assert build_calls == [expected_id]
+    verifier = sqlite3.connect(db_path)
+    try:
+        assert verifier.execute(
+            "SELECT COUNT(*) FROM graph_snapshots WHERE project_id = ?",
+            (PID,),
+        ).fetchone()[0] == 1
+    finally:
+        verifier.close()
+
+
+def test_default_current_full_rejects_ambiguous_legacy_commit_snapshots(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(
+        monkeypatch, tmp_path, fixed_snapshot_id=None
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    for snapshot_id in ("full-legacy-random-a", "full-legacy-random-b"):
+        store.create_graph_snapshot(
+            conn,
+            PID,
+            snapshot_id=snapshot_id,
+            commit_sha=head,
+            snapshot_kind="full",
+            graph_json=_graph(),
+            notes=json.dumps({"run_id": snapshot_id}),
+        )
+    conn.commit()
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "run_id": "default-ambiguous-legacy",
+                "activate": False,
+                "semantic_enrich": False,
+            },
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == "current_full_commit_snapshot_identity_ambiguous"
+    assert result["rebuild_started"] is False
+    assert result["existing_snapshot_ids"] == [
+        "full-legacy-random-a",
+        "full-legacy-random-b",
+    ]
+    assert calls == []
+
+
+def test_explicit_current_full_candidates_remain_distinct_without_third_build(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(
+        monkeypatch, tmp_path, fixed_snapshot_id=None
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+
+    for index in (1, 2):
+        status, result = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "snapshot_id": f"full-explicit-candidate-{index}",
+                    "run_id": f"explicit-candidate-build-{index}",
+                    "activate": False,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+        assert status == 201
+        assert result["candidate_snapshot_id"] == f"full-explicit-candidate-{index}"
+
+    activation_status, activation = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "snapshot_id": "full-explicit-candidate-2",
+                    "run_id": "explicit-candidate-activate",
+                    "activate": True,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+    )
+
+    assert activation_status == 200
+    assert activation["active_snapshot_id"] == "full-explicit-candidate-2"
+    assert len(calls) == 2
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_snapshots WHERE project_id = ? AND commit_sha = ?",
+        (PID, head),
+    ).fetchone()[0] == 2
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "malformed_json",
+        "extra_evidence_key",
+        "wrong_phase",
+        "wrong_snapshot_kind",
+        "wrong_delta_mode",
+        "foreign_route_refs",
+    ],
+)
+def test_operator_active_terminal_replay_rejects_malformed_history_read_only(
+    monkeypatch,
+    tmp_path,
+    mutation,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    db_path = tmp_path / f"operator-terminal-{mutation}.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.commit()
+    wrapped = _CountingNoCloseConn(connection)
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root", lambda: tmp_path / "state"
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: wrapped)
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    origin_run = f"operator-terminal-origin-{mutation}"
+    try:
+        first_status, first = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "run_id": origin_run,
+                    "activate": True,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+        assert first_status == 201
+        metric = dict(
+            connection.execute(
+                "SELECT * FROM reconcile_run_metrics "
+                "WHERE project_id = ? AND run_id = ?",
+                (PID, origin_run),
+            ).fetchone()
+        )
+        evidence = json.loads(metric["evidence_json"])
+        if mutation == "malformed_json":
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET evidence_json = '{' "
+                "WHERE project_id = ? AND run_id = ?",
+                (PID, origin_run),
+            )
+        elif mutation == "wrong_snapshot_kind":
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET snapshot_kind = 'scope' "
+                "WHERE project_id = ? AND run_id = ?",
+                (PID, origin_run),
+            )
+        elif mutation == "wrong_delta_mode":
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET graph_delta_mode = 'incremental_graph_delta' "
+                "WHERE project_id = ? AND run_id = ?",
+                (PID, origin_run),
+            )
+        else:
+            if mutation == "extra_evidence_key":
+                evidence["legacy_complete"] = True
+            elif mutation == "wrong_phase":
+                evidence["phase"] = "complete"
+            else:
+                evidence["reconcile_event_id"] = 99
+                evidence["provenance_id"] = "foreign-provenance"
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET evidence_json = ? "
+                "WHERE project_id = ? AND run_id = ?",
+                (store._json(evidence), PID, origin_run),
+            )
+        connection.commit()
+        monkeypatch.setattr(server, "_git_head_commit", lambda _root: "c" * 40)
+        monkeypatch.setattr(
+            server,
+            "_git_dirty_paths",
+            lambda _root: ["agent/governance/server.py"],
+        )
+        before_changes = connection.total_changes
+        before_commits = wrapped.commit_calls
+        before_bytes = db_path.read_bytes()
+
+        status, result = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "run_id": f"operator-terminal-replay-{mutation}",
+                    "activate": True,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+
+        assert status == 409
+        assert result["error"] == "current_full_snapshot_identity_exists_not_resumable"
+        assert result["rebuild_started"] is False
+        assert str(tmp_path) not in json.dumps(result, ensure_ascii=False)
+        assert connection.total_changes == before_changes
+        assert wrapped.commit_calls == before_commits
+        assert db_path.read_bytes() == before_bytes
+        assert len(calls) == 1
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "extra_evidence_key",
+        "foreign_metric_refs",
+        "foreign_timeline_run",
+        "foreign_provenance_scope",
+    ],
+)
+def test_route_active_terminal_replay_requires_exact_linked_history_read_only(
+    monkeypatch,
+    tmp_path,
+    mutation,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    db_path = tmp_path / f"route-terminal-{mutation}.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.commit()
+    wrapped = _CountingNoCloseConn(connection)
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root", lambda: tmp_path / "state"
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: wrapped)
+    backlog_id = f"AC-ROUTE-TERMINAL-{mutation.upper()}"
+    route_ref = f"rtok-route-terminal-{mutation}"
+    task_id, observer_session_id = _current_full_direct_main_route_fixture(
+        connection,
+        backlog_id=backlog_id,
+        observer_session_id=f"obs-route-terminal-{mutation}",
+        route_token_ref=route_ref,
+    )
+    origin_run = f"route-terminal-origin-{mutation}"
+    body = {
+        "target_commit_sha": head,
+        "activate": True,
+        "semantic_enrich": False,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": route_ref,
+    }
+    try:
+        first_status, first = server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={**body, "run_id": origin_run},
+            )
+        )
+        assert first_status == 201
+        valid_changes = connection.total_changes
+        valid_commits = wrapped.commit_calls
+        valid_bytes = db_path.read_bytes()
+        valid_status, valid = server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={**body, "run_id": f"route-terminal-valid-{mutation}"},
+            )
+        )
+        assert valid_status == 200
+        assert valid["fresh_run_snapshot_resume"] is True
+        assert connection.total_changes == valid_changes
+        assert wrapped.commit_calls == valid_commits
+        assert db_path.read_bytes() == valid_bytes
+
+        metric = dict(
+            connection.execute(
+                "SELECT * FROM reconcile_run_metrics "
+                "WHERE project_id = ? AND run_id = ?",
+                (PID, origin_run),
+            ).fetchone()
+        )
+        evidence = json.loads(metric["evidence_json"])
+        if mutation in {"extra_evidence_key", "foreign_metric_refs"}:
+            if mutation == "extra_evidence_key":
+                evidence["legacy_complete"] = True
+            else:
+                evidence["reconcile_event_id"] += 1000
+                evidence["provenance_id"] = "foreign-provenance"
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET evidence_json = ? "
+                "WHERE project_id = ? AND run_id = ?",
+                (store._json(evidence), PID, origin_run),
+            )
+        elif mutation == "foreign_timeline_run":
+            event_id = int(evidence["reconcile_event_id"])
+            event_row = connection.execute(
+                "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            payload = json.loads(event_row["payload_json"])
+            payload["graph_reconcile_result"]["operation_trace"]["run_id"] = (
+                "foreign-run"
+            )
+            connection.execute(
+                "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+                (json.dumps(payload, sort_keys=True), event_id),
+            )
+        else:
+            provenance_id = str(evidence["provenance_id"])
+            row = connection.execute(
+                "SELECT route_evidence_json FROM graph_current_full_reconcile_provenance "
+                "WHERE provenance_id = ?",
+                (provenance_id,),
+            ).fetchone()
+            route_payload = json.loads(row["route_evidence_json"])
+            route_payload["idempotency_scope"]["backlog_id"] = "foreign-backlog"
+            connection.execute(
+                "UPDATE graph_current_full_reconcile_provenance "
+                "SET route_evidence_json = ? WHERE provenance_id = ?",
+                (json.dumps(route_payload, sort_keys=True), provenance_id),
+            )
+        connection.commit()
+        monkeypatch.setattr(server, "_git_head_commit", lambda _root: "c" * 40)
+        monkeypatch.setattr(
+            server,
+            "_git_dirty_paths",
+            lambda _root: ["agent/governance/server.py"],
+        )
+        before_changes = connection.total_changes
+        before_commits = wrapped.commit_calls
+        before_bytes = db_path.read_bytes()
+        status, result = server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={**body, "run_id": f"route-terminal-invalid-{mutation}"},
+            )
+        )
+
+        assert status == 409
+        assert result["error"] == "current_full_snapshot_identity_exists_not_resumable"
+        assert result["rebuild_started"] is False
+        assert str(tmp_path) not in json.dumps(result, ensure_ascii=False)
+        assert connection.total_changes == before_changes
+        assert wrapped.commit_calls == before_commits
+        assert db_path.read_bytes() == before_bytes
+        assert len(calls) == 1
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("route_bound", [False, True])
+def test_advanced_head_active_terminal_replay_precedes_dirty_and_build_gates(
+    monkeypatch,
+    tmp_path,
+    route_bound,
+):
+    reconciled_head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    db_path = tmp_path / f"advanced-terminal-{route_bound}.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.commit()
+    wrapped = _CountingNoCloseConn(connection)
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root", lambda: tmp_path / "state"
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: wrapped)
+    body: dict[str, Any] = {
+        "target_commit_sha": reconciled_head,
+        "activate": True,
+        "semantic_enrich": False,
+    }
+    if route_bound:
+        backlog_id = "AC-ADVANCED-TERMINAL-ROUTE"
+        route_ref = "rtok-advanced-terminal-route"
+        task_id, observer_session_id = _current_full_direct_main_route_fixture(
+            connection,
+            backlog_id=backlog_id,
+            observer_session_id="obs-advanced-terminal-route",
+            route_token_ref=route_ref,
+        )
+        body.update(
+            {
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_ref,
+            }
+        )
+    else:
+        monkeypatch.setattr(
+            server,
+            "_require_current_full_reconcile_auth",
+            lambda *_args, **_kwargs: {"role_source": "operator_token"},
+        )
+    try:
+        first_status, first = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={**body, "run_id": f"advanced-origin-{route_bound}"},
+            )
+        )
+        assert first_status == 201
+        monkeypatch.setattr(server, "_git_head_commit", lambda _root: "c" * 40)
+        monkeypatch.setattr(
+            server,
+            "_git_dirty_paths",
+            lambda _root: ["agent/governance/server.py"],
+        )
+        before_changes = connection.total_changes
+        before_commits = wrapped.commit_calls
+        before_bytes = db_path.read_bytes()
+        status, result = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={**body, "run_id": f"advanced-replay-{route_bound}"},
+            )
+        )
+
+        assert status == 200
+        assert result["fresh_run_snapshot_resume"] is True
+        assert result["historical_terminal_projection_replay"] is True
+        assert result["target_commit_sha"] == reconciled_head
+        assert result["head_commit"] == "c" * 40
+        assert connection.total_changes == before_changes
+        assert wrapped.commit_calls == before_commits
+        assert db_path.read_bytes() == before_bytes
+        assert len(calls) == 1
     finally:
         connection.close()
 
@@ -11397,7 +11984,7 @@ def test_current_full_reconcile_reuses_generated_snapshot_id_for_metric_lifecycl
 
     assert first_status == 201
     assert first["activated"] is True
-    assert replay_status == 200
+    assert replay_status == 200, replay
     assert replay["idempotent_replay"] is True
     assert replay["rebuild_skipped"] is True
     assert len(reconcile_calls) == 1
@@ -11897,7 +12484,7 @@ def test_current_full_reconcile_idempotent_replay_repairs_epoch_projection(
         )
     )
 
-    assert replay_status == 200
+    assert replay_status == 200, replay
     assert replay["idempotent_replay"] is True
     assert replay["rebuild_skipped"] is True
     assert replay["merge_queue_graph_epoch_auto_record"]["status"] == "recorded"
@@ -12305,7 +12892,7 @@ def test_server_authored_current_full_checkpoint_drives_advanced_head_standalone
     assert epoch.snapshot_id == reconcile["snapshot_id"]
 
 
-def test_current_full_reconcile_terminal_replay_repairs_epoch_after_head_advances(
+def test_current_full_reconcile_terminal_replay_is_read_only_after_head_advances(
     conn,
     monkeypatch,
     tmp_path,
@@ -12365,9 +12952,6 @@ def test_current_full_reconcile_terminal_replay_repairs_epoch_after_head_advance
     )
     conn.commit()
 
-    real_auto_record = (
-        parallel_branch_runtime.record_merge_queue_graph_epoch_after_reconcile
-    )
     monkeypatch.setattr(
         parallel_branch_runtime,
         "record_merge_queue_graph_epoch_after_reconcile",
@@ -12416,11 +13000,15 @@ def test_current_full_reconcile_terminal_replay_repairs_epoch_after_head_advance
         "_git_dirty_paths",
         lambda _root: ["agent/governance/server.py"],
     )
+    def unexpected_epoch_repair(*_args, **_kwargs):
+        raise AssertionError("historical terminal replay must be read-only")
+
     monkeypatch.setattr(
         parallel_branch_runtime,
         "record_merge_queue_graph_epoch_after_reconcile",
-        real_auto_record,
+        unexpected_epoch_repair,
     )
+    changes_before = conn.total_changes
     replay_status, replay = server.handle_graph_governance_current_full_reconcile(
         _ctx(
             {"project_id": PID},
@@ -12438,26 +13026,17 @@ def test_current_full_reconcile_terminal_replay_repairs_epoch_after_head_advance
     assert replay["historical_terminal_projection_replay"] is True
     assert replay["target_commit_sha"] == reconciled_head
     assert replay["head_commit"] == repair_head
-    assert (
-        replay["merge_queue_graph_epoch_auto_record"][
-            "epoch_projection_recorded"
-        ]
-        is True
-    )
+    assert "merge_queue_graph_epoch_auto_record" not in replay
+    assert conn.total_changes == changes_before
     active_epoch = parallel_branch_runtime.get_active_integration_epoch(
         conn,
         PID,
         merge_queue_id=merge_queue_id,
     )
-    assert active_epoch is None
-    closed_epoch = parallel_branch_runtime.get_integration_epoch(
-        conn,
-        PID,
-        "batch-current-full-epoch-advanced-head-replay",
+    assert active_epoch is not None
+    assert active_epoch.status == (
+        parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILE_PENDING
     )
-    assert closed_epoch is not None
-    assert closed_epoch.status == parallel_branch_runtime.INTEGRATION_EPOCH_CLOSED
-    assert closed_epoch.snapshot_id == first["snapshot_id"]
     assert len(calls) == 1
     assert conn.execute(
         """

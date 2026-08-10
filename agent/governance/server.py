@@ -69911,6 +69911,62 @@ def _current_full_reconcile_idempotency_scope(
     }
 
 
+def _current_full_deterministic_snapshot_id(commit_sha: str) -> str:
+    """Return the canonical path-safe identity for one default full commit."""
+
+    commit = str(commit_sha or "").strip().lower()
+    digest = hashlib.sha256(f"full:{commit}".encode("utf-8")).hexdigest()
+    return f"full-{commit[:12]}-{digest[:12]}"
+
+
+def _current_full_requested_snapshot_identity(
+    conn,
+    *,
+    project_id: str,
+    target_commit_sha: str,
+    explicit_snapshot_id: str = "",
+) -> dict[str, Any]:
+    """Select one default identity without silently choosing legacy duplicates."""
+
+    explicit = str(explicit_snapshot_id or "").strip()
+    if explicit:
+        return {
+            "status": "explicit",
+            "snapshot_id": explicit,
+            "canonical_snapshot_id": "",
+        }
+    canonical = _current_full_deterministic_snapshot_id(target_commit_sha)
+    rows = conn.execute(
+        """
+        SELECT snapshot_id, status FROM graph_snapshots
+        WHERE project_id = ? AND commit_sha = ? AND snapshot_kind = 'full'
+        ORDER BY created_at ASC, snapshot_id ASC
+        """,
+        (project_id, target_commit_sha),
+    ).fetchall()
+    if len(rows) > 1:
+        return {
+            "status": "conflict",
+            "reason": "current_full_commit_snapshot_identity_ambiguous",
+            "snapshot_id": canonical,
+            "canonical_snapshot_id": canonical,
+            "existing_snapshot_ids": [str(row["snapshot_id"] or "") for row in rows],
+        }
+    if rows:
+        return {
+            "status": "existing",
+            "snapshot_id": str(rows[0]["snapshot_id"] or ""),
+            "canonical_snapshot_id": canonical,
+            "legacy_identity_selected": str(rows[0]["snapshot_id"] or "") != canonical,
+        }
+    return {
+        "status": "missing",
+        "snapshot_id": canonical,
+        "canonical_snapshot_id": canonical,
+        "legacy_identity_selected": False,
+    }
+
+
 def _current_full_candidate_resume_tuple(
     conn,
     *,
@@ -70118,6 +70174,296 @@ def _current_full_candidate_tuple_from_db(
     )
 
 
+_CURRENT_FULL_COMPLETE_EVIDENCE_KEYS = {
+    "phase",
+    "activate_requested",
+    "idempotency_scope",
+    "request_id",
+    "reconcile_event_id",
+    "provenance_id",
+}
+
+
+def _current_full_active_terminal_tuple(
+    conn,
+    store,
+    *,
+    project_id: str,
+    run_id: str,
+    target_commit_sha: str,
+    route_evidence: Mapping[str, Any],
+    snapshot_id: str,
+) -> dict[str, Any]:
+    """Pure-read proof of one exact server-authored active completion."""
+
+    expected_scope = _current_full_reconcile_idempotency_scope(route_evidence)
+    route_bound = bool(
+        expected_scope.get("backlog_id") and expected_scope.get("task_id")
+    )
+    snapshot_row = conn.execute(
+        "SELECT * FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
+        (project_id, snapshot_id),
+    ).fetchone()
+    snapshot = dict(snapshot_row) if snapshot_row else {}
+    ref_row = conn.execute(
+        """
+        SELECT snapshot_id, commit_sha FROM graph_snapshot_refs
+        WHERE project_id = ? AND ref_name = 'active'
+        """,
+        (project_id,),
+    ).fetchone()
+    active_ref = dict(ref_row) if ref_row else {}
+    metric_row = conn.execute(
+        """
+        SELECT * FROM reconcile_run_metrics
+        WHERE project_id = ? AND run_id = ? AND snapshot_id = ?
+        """,
+        (project_id, run_id, snapshot_id),
+    ).fetchone()
+    metric = dict(metric_row) if metric_row else {}
+    evidence_raw = metric.get("evidence_json")
+    evidence_value = _json_loads(evidence_raw, None)
+    evidence = dict(evidence_value) if isinstance(evidence_value, Mapping) else {}
+    evidence_canonical = bool(
+        isinstance(evidence_raw, str)
+        and isinstance(evidence_value, Mapping)
+        and evidence_raw == store._json(dict(evidence_value))
+    )
+    try:
+        reconcile_event_id = int(evidence.get("reconcile_event_id") or 0)
+    except (TypeError, ValueError):
+        reconcile_event_id = 0
+    provenance_id = str(evidence.get("provenance_id") or "").strip()
+    request_id = str(evidence.get("request_id") or "").strip()
+    stored_scope = (
+        dict(evidence.get("idempotency_scope"))
+        if isinstance(evidence.get("idempotency_scope"), Mapping)
+        else None
+    )
+    try:
+        companion_integrity = store.validate_snapshot_companion_integrity(snapshot)
+    except Exception as exc:
+        companion_integrity = {
+            "valid": False,
+            "error": "current_full_terminal_companion_integrity_unreadable",
+            "error_type": type(exc).__name__,
+        }
+
+    provenance = {}
+    provenance_route_evidence: Mapping[str, Any] = {}
+    provenance_binding: Mapping[str, Any] = {}
+    if provenance_id:
+        row = conn.execute(
+            """
+            SELECT * FROM graph_current_full_reconcile_provenance
+            WHERE provenance_id = ? AND project_id = ?
+              AND snapshot_id = ? AND target_commit_sha = ?
+            """,
+            (provenance_id, project_id, snapshot_id, target_commit_sha),
+        ).fetchone()
+        provenance = dict(row) if row else {}
+        decoded_route = _json_loads(provenance.get("route_evidence_json"), {})
+        provenance_route_evidence = (
+            dict(decoded_route) if isinstance(decoded_route, Mapping) else {}
+        )
+        provenance_binding = store._current_full_snapshot_provenance_binding(
+            conn, project_id, snapshot
+        )
+
+    timeline_event = {}
+    timeline_payload: Mapping[str, Any] = {}
+    if reconcile_event_id > 0:
+        row = conn.execute(
+            "SELECT * FROM task_timeline_events WHERE project_id = ? AND id = ?",
+            (project_id, reconcile_event_id),
+        ).fetchone()
+        timeline_event = dict(row) if row else {}
+        decoded_payload = _json_loads(timeline_event.get("payload_json"), {})
+        timeline_payload = (
+            dict(decoded_payload) if isinstance(decoded_payload, Mapping) else {}
+        )
+    event_result = (
+        timeline_payload.get("graph_reconcile_result")
+        if isinstance(timeline_payload.get("graph_reconcile_result"), Mapping)
+        else {}
+    )
+    event_trace = (
+        event_result.get("operation_trace")
+        if isinstance(event_result.get("operation_trace"), Mapping)
+        else {}
+    )
+    event_runtime_scope = (
+        timeline_payload.get("runtime_context_scope")
+        if isinstance(timeline_payload.get("runtime_context_scope"), Mapping)
+        else {}
+    )
+    timeline_scope_mismatch_fields: list[str] = []
+
+    errors: list[str] = []
+    if not snapshot:
+        errors.append("terminal_snapshot_missing")
+    else:
+        if str(snapshot.get("status") or "") != "active":
+            errors.append("terminal_snapshot_not_active")
+        if str(snapshot.get("commit_sha") or "") != target_commit_sha:
+            errors.append("terminal_snapshot_commit_mismatch")
+        if str(snapshot.get("snapshot_kind") or "") != "full":
+            errors.append("terminal_snapshot_kind_mismatch")
+    if (
+        str(active_ref.get("snapshot_id") or "") != snapshot_id
+        or str(active_ref.get("commit_sha") or "") != target_commit_sha
+    ):
+        errors.append("terminal_active_ref_mismatch")
+    if not companion_integrity.get("valid"):
+        errors.append(
+            str(
+                companion_integrity.get("error")
+                or "current_full_terminal_companion_integrity_invalid"
+            )
+        )
+    if not metric:
+        errors.append("terminal_metric_missing")
+    else:
+        for field, expected in (
+            ("status", "complete"),
+            ("commit_sha", target_commit_sha),
+            ("snapshot_kind", "full"),
+            ("strategy", "current_full_reconcile"),
+            ("graph_delta_mode", "full_rebuild"),
+        ):
+            if str(metric.get(field) or "") != expected:
+                errors.append(f"terminal_metric_{field}_mismatch")
+    if not isinstance(evidence_value, Mapping):
+        errors.append("terminal_metric_evidence_malformed")
+    else:
+        if set(evidence) != _CURRENT_FULL_COMPLETE_EVIDENCE_KEYS:
+            errors.append("terminal_metric_evidence_schema_mismatch")
+        if not evidence_canonical:
+            errors.append("terminal_metric_evidence_not_canonical")
+        if str(evidence.get("phase") or "") != "atomic_finalize_complete":
+            errors.append("terminal_metric_phase_mismatch")
+        if evidence.get("activate_requested") is not True:
+            errors.append("terminal_metric_activate_mismatch")
+        if stored_scope != expected_scope:
+            errors.append("terminal_metric_scope_mismatch")
+        if not request_id:
+            errors.append("terminal_metric_request_id_missing")
+        if route_bound != (reconcile_event_id > 0):
+            errors.append("terminal_metric_event_route_mode_mismatch")
+        if route_bound != bool(provenance_id):
+            errors.append("terminal_metric_provenance_route_mode_mismatch")
+
+    if route_bound:
+        if not provenance:
+            errors.append("terminal_provenance_missing")
+        else:
+            if provenance_binding.get("verified") is not True:
+                errors.append("terminal_provenance_binding_invalid")
+            if str(provenance_binding.get("provenance_id") or "") != provenance_id:
+                errors.append("terminal_provenance_id_mismatch")
+            if str(provenance.get("request_id") or "") != request_id:
+                errors.append("terminal_provenance_request_mismatch")
+            if int(provenance.get("reconcile_event_id") or 0) != reconcile_event_id:
+                errors.append("terminal_provenance_event_mismatch")
+            if (
+                str(provenance_route_evidence.get("reconcile_run_id") or "")
+                != run_id
+            ):
+                errors.append("terminal_provenance_run_mismatch")
+            if _current_full_reconcile_idempotency_scope(
+                provenance_route_evidence
+            ) != expected_scope:
+                errors.append("terminal_provenance_scope_mismatch")
+        if not timeline_event:
+            errors.append("terminal_timeline_missing")
+        else:
+            if (
+                str(timeline_event.get("event_type") or "") != "graph.reconcile"
+                or str(timeline_event.get("event_kind") or "") != "reconcile"
+                or str(timeline_event.get("phase") or "") != "reconcile"
+                or str(timeline_event.get("status") or "") != "passed"
+                or str(timeline_event.get("backlog_id") or "")
+                != expected_scope.get("backlog_id")
+                or str(timeline_event.get("task_id") or "")
+                != expected_scope.get("task_id")
+                or str(timeline_event.get("commit_sha") or "")
+                != target_commit_sha
+            ):
+                errors.append("terminal_timeline_identity_mismatch")
+            if (
+                str(timeline_payload.get("target_commit_sha") or "")
+                != target_commit_sha
+                or str(timeline_payload.get("snapshot_id") or "") != snapshot_id
+                or str(timeline_payload.get("active_snapshot_id") or "")
+                != snapshot_id
+                or timeline_payload.get("current_full_reconcile") is not True
+                or timeline_payload.get("graph_reconciled") is not True
+                or str(event_trace.get("run_id") or "") != run_id
+            ):
+                errors.append("terminal_timeline_payload_mismatch")
+            for key, value in expected_scope.items():
+                if key in {"project_id", "backlog_id", "task_id"}:
+                    continue
+                if str(timeline_payload.get(key) or "") != value:
+                    timeline_scope_mismatch_fields.append(key)
+                    errors.append("terminal_timeline_scope_mismatch")
+                    break
+                if event_runtime_scope and str(
+                    event_runtime_scope.get(key) or ""
+                ) != value:
+                    timeline_scope_mismatch_fields.append(
+                        f"runtime_context_scope.{key}"
+                    )
+                    errors.append("terminal_timeline_runtime_scope_mismatch")
+                    break
+
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "route_bound": route_bound,
+        "run_id": run_id,
+        "snapshot_id": snapshot_id,
+        "metric_evidence_canonical": evidence_canonical,
+        "metric_evidence_keys": sorted(evidence),
+        "timeline_scope_mismatch_fields": timeline_scope_mismatch_fields,
+        "request_id": request_id,
+        "reconcile_event_id": reconcile_event_id,
+        "provenance_id": provenance_id,
+        "companion_integrity": companion_integrity,
+        "snapshot": snapshot,
+        "metric": metric,
+        "metric_evidence": evidence,
+        "provenance": provenance,
+        "timeline_event": timeline_event,
+    }
+
+
+def _current_full_safe_terminal_tuple(
+    terminal_tuple: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Project terminal refusal details without DB rows or physical paths."""
+
+    value = terminal_tuple if isinstance(terminal_tuple, Mapping) else {}
+    return {
+        key: value.get(key)
+        for key in (
+            "valid",
+            "errors",
+            "route_bound",
+            "run_id",
+            "snapshot_id",
+            "metric_evidence_canonical",
+            "metric_evidence_keys",
+            "timeline_scope_mismatch_fields",
+            "request_id",
+            "reconcile_event_id",
+            "provenance_id",
+            "companion_integrity",
+        )
+        if key in value
+    }
+
+
 def _current_full_reconcile_existing_run(
     conn,
     store,
@@ -70276,102 +70622,58 @@ def _current_full_reconcile_existing_run(
             "actual_scope": expected_scope,
         }
 
-    active = store.get_active_graph_snapshot(conn, project_id) or {}
-    active_snapshot_id = str(active.get("snapshot_id") or "").strip()
     metric_status = str(metric.get("status") or "").strip().lower()
-    notes = snapshot.get("notes_payload") if isinstance(snapshot, Mapping) else {}
-    marker = notes.get("current_full_reconcile") if isinstance(notes, Mapping) else {}
-    marker = dict(marker) if isinstance(marker, Mapping) else {}
-    provenance_id = str(
-        metric_evidence.get("provenance_id") or marker.get("provenance_id") or ""
-    ).strip()
-    provenance = {}
-    if provenance_id:
-        row = conn.execute(
-            """
-            SELECT * FROM graph_current_full_reconcile_provenance
-            WHERE provenance_id = ? AND project_id = ?
-              AND snapshot_id = ? AND target_commit_sha = ?
-            """,
-            (provenance_id, project_id, snapshot_id, target_commit_sha),
-        ).fetchone()
-        provenance = dict(row) if row else {}
-    try:
-        reconcile_event_id = int(
-            provenance.get("reconcile_event_id")
-            or metric_evidence.get("reconcile_event_id")
-            or 0
-        )
-    except (TypeError, ValueError):
-        reconcile_event_id = 0
-    timeline_event = {}
-    if reconcile_event_id:
-        row = conn.execute(
-            """
-            SELECT * FROM task_timeline_events
-            WHERE project_id = ? AND id = ?
-            """,
-            (project_id, reconcile_event_id),
-        ).fetchone()
-        timeline_event = dict(row) if row else {}
-
     if (
         snapshot_id
-        and active_snapshot_id == snapshot_id
-        and metric_status == "complete"
+        and str(snapshot.get("status") or "") == "active"
+        and metric
     ):
-        route_bound = bool(expected_scope.get("backlog_id") and expected_scope.get("task_id"))
-        if route_bound and not provenance:
+        terminal_tuple = _current_full_active_terminal_tuple(
+            conn,
+            store,
+            project_id=project_id,
+            run_id=run_id,
+            target_commit_sha=target_commit_sha,
+            route_evidence=route_evidence,
+            snapshot_id=snapshot_id,
+        )
+        if terminal_tuple["valid"]:
             return {
-                "status": "incomplete_active",
-                "reason": "reconcile_terminal_provenance_missing",
+                "status": "complete",
                 "run_id": run_id,
+                "snapshot": terminal_tuple["snapshot"],
                 "snapshot_id": snapshot_id,
+                "metric": terminal_tuple["metric"],
+                "metric_evidence": terminal_tuple["metric_evidence"],
+                "provenance": terminal_tuple["provenance"],
+                "timeline_event": terminal_tuple["timeline_event"],
+                "terminal_tuple": terminal_tuple,
             }
-        if route_bound and not timeline_event:
-            return {
-                "status": "incomplete_active",
-                "reason": "reconcile_terminal_timeline_missing",
-                "run_id": run_id,
-                "snapshot_id": snapshot_id,
-                "reconcile_event_id": reconcile_event_id,
-            }
-        if route_bound and (
-            str(timeline_event.get("event_type") or "") != "graph.reconcile"
-            or str(timeline_event.get("event_kind") or "") != "reconcile"
-            or str(timeline_event.get("phase") or "") != "reconcile"
-            or str(timeline_event.get("status") or "") != "passed"
-            or str(timeline_event.get("backlog_id") or "")
-            != expected_scope.get("backlog_id")
-            or str(timeline_event.get("task_id") or "")
-            != expected_scope.get("task_id")
-        ):
-            return {
-                "status": "incomplete_active",
-                "reason": "reconcile_terminal_timeline_scope_mismatch",
-                "run_id": run_id,
-                "snapshot_id": snapshot_id,
-                "reconcile_event_id": reconcile_event_id,
-            }
-        return {
-            "status": "complete",
-            "run_id": run_id,
-            "snapshot": snapshot,
-            "snapshot_id": snapshot_id,
-            "metric": metric,
-            "metric_evidence": metric_evidence,
-            "provenance": provenance,
-            "timeline_event": timeline_event,
-        }
-
-    if snapshot_id and active_snapshot_id == snapshot_id:
+        terminal_errors = set(terminal_tuple["errors"])
+        reason = "reconcile_active_terminal_tuple_invalid"
+        if metric_status != "complete":
+            reason = "reconcile_active_without_atomic_terminal_evidence"
+        elif "terminal_provenance_missing" in terminal_errors:
+            reason = "reconcile_terminal_provenance_missing"
+        elif "terminal_timeline_missing" in terminal_errors:
+            reason = "reconcile_terminal_timeline_missing"
+        elif terminal_errors & {
+            "terminal_timeline_identity_mismatch",
+            "terminal_timeline_payload_mismatch",
+            "terminal_timeline_scope_mismatch",
+            "terminal_timeline_runtime_scope_mismatch",
+        }:
+            reason = "reconcile_terminal_timeline_scope_mismatch"
         return {
             "status": "incomplete_active",
-            "reason": "reconcile_active_without_atomic_terminal_evidence",
+            "reason": reason,
             "run_id": run_id,
             "snapshot_id": snapshot_id,
             "metric_status": metric_status,
+            "terminal_tuple": terminal_tuple,
         }
+    if snapshot_id and str(snapshot.get("status") or "") == "active":
+        return {"status": "missing", "run_id": run_id}
     if snapshot_id:
         resume_tuple = _current_full_candidate_resume_tuple(
             conn,
@@ -70466,34 +70768,8 @@ def _current_full_reconcile_existing_snapshot_identity(
             "snapshot_id": snapshot_id,
             "resume_tuple": resume_tuple,
         }
-    active = store.get_active_graph_snapshot(conn, project_id) or {}
-    try:
-        companion_integrity = store.validate_snapshot_companion_integrity(snapshot)
-    except Exception as exc:
-        companion_integrity = {
-            "valid": False,
-            "error": "current_full_candidate_companion_integrity_unreadable",
-            "error_type": type(exc).__name__,
-        }
-    notes = _json_loads(snapshot.get("notes"), {})
-    origin_run_id = str(
-        notes.get("run_id") if isinstance(notes, Mapping) else ""
-    ).strip()
-    origin_claim = conn.execute(
-        """
-        SELECT * FROM graph_current_full_build_claim_history
-        WHERE project_id = ? AND snapshot_id = ? AND run_id = ?
-          AND commit_sha = ? AND status = 'released'
-          AND terminal_status = 'candidate_ready'
-        """,
-        (project_id, snapshot_id, origin_run_id, target_commit_sha),
-    ).fetchone()
-    if (
-        status == "active"
-        and str(active.get("snapshot_id") or "") == snapshot_id
-        and companion_integrity.get("valid")
-        and origin_claim
-    ):
+    last_terminal_tuple: Mapping[str, Any] = {}
+    if status == "active":
         complete_rows = conn.execute(
             """
             SELECT run_id FROM reconcile_run_metrics
@@ -70504,31 +70780,49 @@ def _current_full_reconcile_existing_snapshot_identity(
             (project_id, snapshot_id, target_commit_sha),
         ).fetchall()
         for complete_row in complete_rows:
-            terminal = _current_full_reconcile_existing_run(
+            origin_run_id = str(complete_row["run_id"] or "")
+            terminal_tuple = _current_full_active_terminal_tuple(
                 conn,
                 store,
                 project_id=project_id,
-                run_id=str(complete_row["run_id"] or ""),
+                run_id=origin_run_id,
                 target_commit_sha=target_commit_sha,
                 route_evidence=route_evidence,
-                requested_snapshot_id=snapshot_id,
+                snapshot_id=snapshot_id,
             )
-            if terminal.get("status") == "complete":
+            last_terminal_tuple = _current_full_safe_terminal_tuple(
+                terminal_tuple
+            )
+            if terminal_tuple.get("valid"):
                 return {
                     "status": "complete",
                     "run_id": run_id,
                     "snapshot_id": snapshot_id,
-                    "terminal": terminal,
+                    "terminal": {
+                        "status": "complete",
+                        "run_id": origin_run_id,
+                        "snapshot": terminal_tuple["snapshot"],
+                        "snapshot_id": snapshot_id,
+                        "metric": terminal_tuple["metric"],
+                        "metric_evidence": terminal_tuple["metric_evidence"],
+                        "provenance": terminal_tuple["provenance"],
+                        "timeline_event": terminal_tuple["timeline_event"],
+                        "terminal_tuple": terminal_tuple,
+                    },
                 }
+    active_ref = conn.execute(
+        "SELECT snapshot_id FROM graph_snapshot_refs "
+        "WHERE project_id = ? AND ref_name = 'active'",
+        (project_id,),
+    ).fetchone()
     return {
         "status": "conflict",
         "reason": "current_full_snapshot_identity_exists_not_resumable",
         "run_id": run_id,
         "snapshot_id": snapshot_id,
         "snapshot_status": status,
-        "active_snapshot_id": str(active.get("snapshot_id") or ""),
-        "companion_integrity": companion_integrity,
-        "origin_claim_ready": bool(origin_claim),
+        "active_snapshot_id": str(active_ref["snapshot_id"] if active_ref else ""),
+        "terminal_tuple": last_terminal_tuple,
     }
 
 
@@ -70676,6 +70970,30 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             "idempotency_scope": idempotency_scope,
         }
         explicit_snapshot_id = str(body.get("snapshot_id") or "").strip()
+        snapshot_identity = _current_full_requested_snapshot_identity(
+            conn,
+            project_id=project_id,
+            target_commit_sha=target_commit,
+            explicit_snapshot_id=explicit_snapshot_id,
+        )
+        if snapshot_identity.get("status") == "conflict":
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": snapshot_identity.get("reason"),
+                "run_id": run_id,
+                "target_commit_sha": target_commit,
+                "rebuild_started": False,
+                "fail_closed": True,
+                **{
+                    key: value
+                    for key, value in snapshot_identity.items()
+                    if key not in {"status", "reason"}
+                },
+            }
+        requested_snapshot_id = str(
+            snapshot_identity.get("snapshot_id") or ""
+        ).strip()
         existing = _current_full_reconcile_existing_run(
             conn,
             store,
@@ -70683,7 +71001,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             run_id=run_id,
             target_commit_sha=target_commit,
             route_evidence=route_evidence,
-            requested_snapshot_id=explicit_snapshot_id,
+            requested_snapshot_id=requested_snapshot_id,
         )
         if existing.get("status") == "conflict":
             return 409, {
@@ -70707,6 +71025,22 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 ),
                 "run_id": run_id,
                 "snapshot_id": existing.get("snapshot_id") or "",
+                "terminal_tuple_errors": list(
+                    (
+                        existing.get("terminal_tuple")
+                        if isinstance(existing.get("terminal_tuple"), Mapping)
+                        else {}
+                    ).get("errors")
+                    or []
+                ),
+                "terminal_tuple_scope_mismatch_fields": list(
+                    (
+                        existing.get("terminal_tuple")
+                        if isinstance(existing.get("terminal_tuple"), Mapping)
+                        else {}
+                    ).get("timeline_scope_mismatch_fields")
+                    or []
+                ),
                 "fail_closed": True,
                 "next_legal_action": "file_or_resume_audited_system_repair",
             }
@@ -70717,7 +71051,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 target_commit_sha=target_commit,
                 head_commit=head_commit,
             )
-            if activate_requested:
+            if activate_requested and target_commit == head_commit:
                 existing_snapshot_id = str(
                     existing.get("snapshot_id") or ""
                 ).strip()
@@ -70769,6 +71103,61 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     "retry_allowed": False,
                 },
             }
+        snapshot_existing = (
+            existing
+            if existing.get("status") == "candidate_ready"
+            else _current_full_reconcile_existing_snapshot_identity(
+                conn,
+                store,
+                project_id=project_id,
+                run_id=run_id,
+                target_commit_sha=target_commit,
+                route_evidence=route_evidence,
+                snapshot_id=requested_snapshot_id,
+            )
+        )
+        if snapshot_existing.get("status") == "conflict":
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": snapshot_existing.get("reason"),
+                "run_id": run_id,
+                "snapshot_id": requested_snapshot_id,
+                "rebuild_started": False,
+                "fail_closed": True,
+                **{
+                    key: value
+                    for key, value in snapshot_existing.items()
+                    if key not in {"status", "reason", "run_id", "snapshot_id"}
+                },
+            }
+        if snapshot_existing.get("status") == "complete":
+            response = _current_full_reconcile_idempotent_response(
+                snapshot_existing["terminal"],
+                project_id=project_id,
+                target_commit_sha=target_commit,
+                head_commit=head_commit,
+            )
+            response["requested_run_id"] = run_id
+            response["fresh_run_snapshot_resume"] = True
+            response["historical_terminal_projection_replay"] = bool(
+                target_commit != head_commit
+            )
+            return 200, response
+        resumed_candidate = snapshot_existing.get("status") == "candidate_ready"
+        if resumed_candidate:
+            existing = snapshot_existing
+            if target_commit != head_commit:
+                return 409, {
+                    "ok": False,
+                    "project_id": project_id,
+                    "error": "current_full_historical_candidate_not_terminal",
+                    "run_id": run_id,
+                    "snapshot_id": requested_snapshot_id,
+                    "rebuild_started": False,
+                    "fail_closed": True,
+                }
+
         # Only a terminal idempotent replay may target a commit that is no
         # longer the worktree HEAD.  That replay consumes the already-active
         # exact full snapshot plus its durable terminal provenance above; it
@@ -70804,51 +71193,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             else {}
         )
         notes_extra.pop("current_full_reconcile", None)
-        resumed_candidate = existing.get("status") == "candidate_ready"
-        requested_snapshot_id = str(
-            explicit_snapshot_id or store.snapshot_id_for("full", target_commit)
-        ).strip()
-        if not resumed_candidate:
-            snapshot_existing = _current_full_reconcile_existing_snapshot_identity(
-                conn,
-                store,
-                project_id=project_id,
-                run_id=run_id,
-                target_commit_sha=target_commit,
-                route_evidence=route_evidence,
-                snapshot_id=requested_snapshot_id,
-            )
-            if snapshot_existing.get("status") == "conflict":
-                return 409, {
-                    "ok": False,
-                    "project_id": project_id,
-                    "error": snapshot_existing.get("reason"),
-                    "run_id": run_id,
-                    "snapshot_id": requested_snapshot_id,
-                    "rebuild_started": False,
-                    "fail_closed": True,
-                    **{
-                        key: value
-                        for key, value in snapshot_existing.items()
-                        if key not in {"status", "reason", "run_id", "snapshot_id"}
-                    },
-                }
-            if snapshot_existing.get("status") == "complete":
-                response = _current_full_reconcile_idempotent_response(
-                    snapshot_existing["terminal"],
-                    project_id=project_id,
-                    target_commit_sha=target_commit,
-                    head_commit=head_commit,
-                )
-                response["requested_run_id"] = run_id
-                response["fresh_run_snapshot_resume"] = True
-                response["historical_terminal_projection_replay"] = bool(
-                    target_commit != head_commit
-                )
-                return 200, response
-            if snapshot_existing.get("status") == "candidate_ready":
-                existing = snapshot_existing
-                resumed_candidate = True
         build_claim: dict[str, Any] = {}
         build_manager = _current_full_build_manager_identity()
         if resumed_candidate:
