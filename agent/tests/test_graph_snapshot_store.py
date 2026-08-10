@@ -2979,3 +2979,246 @@ def test_current_full_state_projects_later_canonical_commit_after_merge(conn):
     )
     assert forged_target["db_verified"] is False
     assert forged_target["provenance_verified"] is False
+
+
+def test_current_full_proof_leaf_apis_are_physical_read_only(conn):
+    _ensure_schema(conn)
+    store.ensure_schema(conn)
+    conn.commit()
+    before_changes = conn.total_changes
+    before_schema = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "ORDER BY type, name"
+        ).fetchall()
+    ]
+
+    candidate = store.current_full_candidate_tuple_from_db(
+        conn,
+        project_id=PID,
+        run_id="missing-candidate-run",
+        target_commit_sha="a" * 40,
+        snapshot_id="missing-candidate-snapshot",
+    )
+    active = store.current_full_active_terminal_tuple(
+        conn,
+        project_id=PID,
+        run_id="missing-active-run",
+        target_commit_sha="a" * 40,
+        expected_scope={},
+        snapshot_id="missing-active-snapshot",
+    )
+
+    assert candidate["valid"] is False
+    assert "candidate_build_claim_missing" in candidate["errors"]
+    assert active["valid"] is False
+    assert "terminal_snapshot_missing" in active["errors"]
+    assert conn.in_transaction is False
+    assert conn.total_changes == before_changes
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "ORDER BY type, name"
+        ).fetchall()
+    ] == before_schema
+
+
+def test_current_full_proof_leaf_apis_preserve_valid_and_malformed_file_db_bytes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path)
+    db_path = tmp_path / "proof-leaf-read-only.sqlite"
+    setup = sqlite3.connect(db_path)
+    setup.row_factory = sqlite3.Row
+    _ensure_schema(setup)
+    store.ensure_schema(setup)
+    setup.commit()
+
+    def ready_candidate(suffix):
+        owner = _claim_owner(f"proof-{suffix}")
+        run_id = f"proof-run-{suffix}"
+        snapshot_id = f"proof-snapshot-{suffix}"
+        claim = store.acquire_current_full_build_claim(
+            setup,
+            PID,
+            run_id=run_id,
+            snapshot_id=snapshot_id,
+            commit_sha="9" * 40,
+            metric_evidence={"idempotency_scope": {}},
+            **owner,
+        )
+        store.create_graph_snapshot(
+            setup,
+            PID,
+            snapshot_id=snapshot_id,
+            commit_sha="9" * 40,
+            snapshot_kind="full",
+            graph_json={"deps_graph": {"nodes": []}},
+            notes=json.dumps({"run_id": run_id}),
+        )
+        setup.commit()
+        store.terminalize_current_full_build_claim(
+            setup,
+            PID,
+            claim_id=claim["claim_id"],
+            run_id=run_id,
+            snapshot_id=snapshot_id,
+            commit_sha="9" * 40,
+            terminal_status="candidate_ready",
+            manager_start_identity=owner["manager_start_identity"],
+            metric_evidence={
+                "phase": "candidate_ready",
+                "claim_id": claim["claim_id"],
+                "idempotency_scope": {},
+            },
+        )
+        return run_id, snapshot_id
+
+    candidate_run, candidate_snapshot = ready_candidate("candidate")
+    active_run, active_snapshot = ready_candidate("active")
+    setup.execute("BEGIN IMMEDIATE")
+    store.activate_graph_snapshot(
+        setup,
+        PID,
+        active_snapshot,
+        auto_rebuild_projection=False,
+        schema_ready=True,
+        post_commit_hooks=False,
+    )
+    store.record_reconcile_run_metric(
+        setup,
+        PID,
+        run_id=active_run,
+        snapshot_id=active_snapshot,
+        commit_sha="9" * 40,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="complete",
+        evidence={
+            "phase": "atomic_finalize_complete",
+            "activate_requested": True,
+            "idempotency_scope": {},
+            "request_id": "proof-active-request",
+            "reconcile_event_id": 0,
+            "provenance_id": "",
+        },
+        schema_ready=True,
+    )
+    setup.commit()
+    setup.close()
+
+    class CountingConnection(sqlite3.Connection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.commit_calls = 0
+            self.rollback_calls = 0
+
+        def commit(self):
+            self.commit_calls += 1
+            return super().commit()
+
+        def rollback(self):
+            self.rollback_calls += 1
+            return super().rollback()
+
+    conn = sqlite3.connect(db_path, factory=CountingConnection)
+    conn.row_factory = sqlite3.Row
+    before_bytes = db_path.read_bytes()
+    before_hash = hashlib.sha256(before_bytes).hexdigest()
+    before_size = db_path.stat().st_size
+    before_changes = conn.total_changes
+    before_commits = conn.commit_calls
+    before_rollbacks = conn.rollback_calls
+    before_pragmas = tuple(
+        conn.execute(f"PRAGMA {name}").fetchone()[0]
+        for name in ("schema_version", "page_count", "freelist_count")
+    )
+    before_schema = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "ORDER BY type, name"
+        ).fetchall()
+    ]
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    candidate = store.current_full_candidate_tuple_from_db(
+        conn,
+        project_id=PID,
+        run_id=candidate_run,
+        target_commit_sha="9" * 40,
+        snapshot_id=candidate_snapshot,
+    )
+    candidate_snapshot_row = dict(
+        conn.execute(
+            "SELECT * FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            (PID, candidate_snapshot),
+        ).fetchone()
+    )
+    candidate_snapshot_row["notes_payload"] = json.loads(
+        candidate_snapshot_row["notes"]
+    )
+    candidate_metric_row = dict(
+        conn.execute(
+            "SELECT * FROM reconcile_run_metrics WHERE project_id=? "
+            "AND run_id=? AND snapshot_id=?",
+            (PID, candidate_run, candidate_snapshot),
+        ).fetchone()
+    )
+    candidate_malformed = store.current_full_candidate_resume_tuple(
+        conn,
+        project_id=PID,
+        run_id=candidate_run,
+        target_commit_sha="9" * 40,
+        snapshot={**candidate_snapshot_row, "status": "forged"},
+        request_metric=candidate_metric_row,
+    )
+    active = store.current_full_active_terminal_tuple(
+        conn,
+        project_id=PID,
+        run_id=active_run,
+        target_commit_sha="9" * 40,
+        expected_scope={},
+        snapshot_id=active_snapshot,
+    )
+    active_malformed = store.current_full_active_terminal_tuple(
+        conn,
+        project_id=PID,
+        run_id=active_run,
+        target_commit_sha="9" * 40,
+        expected_scope={"task_id": "wrong"},
+        snapshot_id=active_snapshot,
+    )
+    conn.set_trace_callback(None)
+
+    assert candidate["valid"] is True
+    assert candidate_malformed["valid"] is False
+    assert "snapshot_not_candidate" in candidate_malformed["errors"]
+    assert active["valid"] is True
+    assert active_malformed["valid"] is False
+    assert "terminal_metric_scope_mismatch" in active_malformed["errors"]
+    assert statements
+    assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    assert conn.total_changes == before_changes
+    assert conn.commit_calls == before_commits
+    assert conn.rollback_calls == before_rollbacks
+    assert tuple(
+        conn.execute(f"PRAGMA {name}").fetchone()[0]
+        for name in ("schema_version", "page_count", "freelist_count")
+    ) == before_pragmas
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "ORDER BY type, name"
+        ).fetchall()
+    ] == before_schema
+    conn.close()
+    after_bytes = db_path.read_bytes()
+    assert db_path.stat().st_size == before_size
+    assert hashlib.sha256(after_bytes).hexdigest() == before_hash
+    assert after_bytes == before_bytes

@@ -144196,3 +144196,46 @@ def test_worker_host_handoff_and_revise_are_direct_mcp_bodies():
     )["copy_safe_body"]
     assert revised["required_worker_count"] == 2
     assert "metadata" not in revised
+
+
+def test_current_full_proof_validators_are_store_owned_without_server_cycle():
+    store_source = Path(store.__file__).read_text(encoding="utf-8")
+
+    assert hasattr(store, "current_full_candidate_resume_tuple")
+    assert hasattr(store, "current_full_candidate_tuple_from_db")
+    assert hasattr(store, "current_full_active_terminal_tuple")
+    assert "from . import server" not in store_source
+    assert "from agent.governance import server" not in store_source
+    assert not hasattr(server, "_current_full_candidate_resume_tuple")
+    assert not hasattr(server, "_current_full_candidate_tuple_from_db")
+    assert not hasattr(server, "_current_full_active_terminal_tuple")
+
+
+@pytest.mark.parametrize(
+    "imports",
+    [
+        (
+            "from agent.governance import graph_snapshot_store as store\n"
+            "from agent.governance import server\n"
+        ),
+        (
+            "from agent.governance import server\n"
+            "from agent.governance import graph_snapshot_store as store\n"
+        ),
+    ],
+)
+def test_current_full_proof_leaf_import_order_has_no_cycle(imports):
+    script = imports + (
+        "assert callable(store.current_full_candidate_resume_tuple)\n"
+        "assert callable(store.current_full_candidate_tuple_from_db)\n"
+        "assert callable(store.current_full_active_terminal_tuple)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
