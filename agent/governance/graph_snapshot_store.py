@@ -403,6 +403,53 @@ BEGIN SELECT RAISE(ABORT, 'reconcile_metric_identity_marker_append_only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_reconcile_metric_identity_marker_no_delete
 BEFORE DELETE ON graph_reconcile_metric_identity_schema_state
 BEGIN SELECT RAISE(ABORT, 'reconcile_metric_identity_marker_append_only'); END;
+
+CREATE TABLE IF NOT EXISTS graph_reconcile_run_terminalizations (
+  terminalization_id TEXT NOT NULL UNIQUE,
+  project_id TEXT NOT NULL,
+  source_run_id TEXT NOT NULL,
+  source_snapshot_id TEXT NOT NULL,
+  source_metric_identity_sequence INTEGER NOT NULL CHECK(source_metric_identity_sequence > 0),
+  source_raw_status TEXT NOT NULL CHECK(source_raw_status IN ('running','finalizing')),
+  source_fingerprint TEXT NOT NULL,
+  replacement_run_id TEXT NOT NULL,
+  replacement_snapshot_id TEXT NOT NULL,
+  replacement_metric_identity_sequence INTEGER NOT NULL CHECK(replacement_metric_identity_sequence > 0),
+  replacement_raw_status TEXT NOT NULL CHECK(replacement_raw_status IN ('candidate_ready','complete')),
+  replacement_fingerprint TEXT NOT NULL,
+  manager_certificate_id TEXT NOT NULL,
+  manager_certificate_hash TEXT NOT NULL,
+  timeline_event_id INTEGER NOT NULL CHECK(timeline_event_id > 0),
+  timeline_event_hash TEXT NOT NULL,
+  terminal_status TEXT NOT NULL CHECK(terminal_status = 'terminalized_stale'),
+  created_at TEXT NOT NULL,
+  ledger_hash TEXT NOT NULL,
+  PRIMARY KEY(project_id, source_run_id, source_snapshot_id),
+  CHECK(length(source_fingerprint)=71 AND substr(source_fingerprint,1,7)='sha256:' AND substr(source_fingerprint,8) NOT GLOB '*[^0-9a-f]*'),
+  CHECK(length(replacement_fingerprint)=71 AND substr(replacement_fingerprint,1,7)='sha256:' AND substr(replacement_fingerprint,8) NOT GLOB '*[^0-9a-f]*'),
+  CHECK(length(manager_certificate_hash)=71 AND substr(manager_certificate_hash,1,7)='sha256:' AND substr(manager_certificate_hash,8) NOT GLOB '*[^0-9a-f]*'),
+  CHECK(length(timeline_event_hash)=71 AND substr(timeline_event_hash,1,7)='sha256:' AND substr(timeline_event_hash,8) NOT GLOB '*[^0-9a-f]*'),
+  CHECK(length(ledger_hash)=71 AND substr(ledger_hash,1,7)='sha256:' AND substr(ledger_hash,8) NOT GLOB '*[^0-9a-f]*')
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_run_terminalization_insert_conflict
+BEFORE INSERT ON graph_reconcile_run_terminalizations
+WHEN EXISTS (
+  SELECT 1 FROM graph_reconcile_run_terminalizations
+  WHERE terminalization_id=NEW.terminalization_id OR (
+    project_id=NEW.project_id AND source_run_id=NEW.source_run_id
+    AND source_snapshot_id=NEW.source_snapshot_id
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'reconcile_run_terminalization_identity_conflict'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_run_terminalization_no_update
+BEFORE UPDATE ON graph_reconcile_run_terminalizations
+BEGIN SELECT RAISE(ABORT, 'reconcile_run_terminalization_append_only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_run_terminalization_no_delete
+BEFORE DELETE ON graph_reconcile_run_terminalizations
+BEGIN SELECT RAISE(ABORT, 'reconcile_run_terminalization_append_only'); END;
 """
 
 SNAPSHOT_STATUS_CANDIDATE = "candidate"
@@ -464,6 +511,12 @@ class ManagerGenerationCertificateConflictError(RuntimeError):
         super().__init__(reason)
         self.reason = str(reason or "manager_generation_certificate_conflict")
         self.certificate = dict(certificate or {})
+
+
+class ReconcileRunTerminalizationProofError(RuntimeError):
+    def __init__(self, reason_code: str):
+        self.reason_code = str(reason_code or "terminalization_proof_invalid")
+        super().__init__(self.reason_code)
 
 
 def utc_now() -> str:
@@ -3885,6 +3938,347 @@ def current_full_active_terminal_tuple(
         "metric_evidence": evidence,
         "provenance": provenance,
         "timeline_event": timeline_event,
+    }
+
+
+_RECONCILE_TERMINALIZATION_METRIC_FIELDS = (
+    "project_id", "run_id", "snapshot_id", "commit_sha",
+    "parent_commit_sha", "snapshot_kind", "strategy", "graph_delta_mode",
+    "status", "changed_file_count", "impacted_file_count", "event_count",
+    "node_count", "edge_count", "elapsed_ms", "trace_summary_path",
+    "fallback_reason", "created_at", "evidence_json",
+)
+_RECONCILE_TERMINALIZATION_UTC_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z"
+)
+
+
+class _ReconcileRunTerminalizationProof:
+    __slots__ = ("_canonical", "_seal")
+
+    def __init__(self, payload: Mapping[str, Any]):
+        self._canonical = _json(dict(payload))
+        self._seal = "sha256:" + hashlib.sha256(
+            self._canonical.encode("utf-8")
+        ).hexdigest()
+
+
+def _terminalization_require(condition: Any, reason: str) -> None:
+    if not condition:
+        raise ReconcileRunTerminalizationProofError(reason)
+
+
+def _terminalization_typed_value(value: Any) -> Any:
+    scalar_types = {type(None): "null", bool: "boolean", int: "integer", float: "number"}
+    if type(value) in scalar_types:
+        return [scalar_types[type(value)], value]
+    if isinstance(value, str):
+        return ["string", value]
+    if isinstance(value, list):
+        return ["array", [_terminalization_typed_value(item) for item in value]]
+    if isinstance(value, Mapping):
+        _terminalization_require(
+            all(isinstance(key, str) for key in value),
+            "terminalization_json_type_invalid",
+        )
+        return [
+            "object",
+            [[key, _terminalization_typed_value(value[key])] for key in sorted(value)],
+        ]
+    _terminalization_require(False, "terminalization_json_type_invalid")
+
+
+def _terminalization_exact_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate_json_key")
+    return result
+
+
+def _terminalization_reject_constant(_value: str) -> None:
+    raise ValueError("non_json_number")
+
+
+def _terminalization_strict_json_object(raw: Any) -> dict[str, Any]:
+    _terminalization_require(
+        isinstance(raw, str), "terminalization_metric_evidence_not_text"
+    )
+    try:
+        decoded = json.loads(
+            raw,
+            object_pairs_hook=_terminalization_exact_object,
+            parse_constant=_terminalization_reject_constant,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ReconcileRunTerminalizationProofError(
+            "terminalization_metric_evidence_invalid"
+        ) from exc
+    _terminalization_require(
+        isinstance(decoded, dict), "terminalization_metric_evidence_not_object"
+    )
+    return decoded
+
+
+def _terminalization_utc(value: Any) -> datetime:
+    raw = str(value or "")
+    _terminalization_require(
+        _RECONCILE_TERMINALIZATION_UTC_RE.fullmatch(raw) is not None,
+        "terminalization_metric_created_at_invalid",
+    )
+    try:
+        return datetime.strptime(
+            raw,
+            "%Y-%m-%dT%H:%M:%S.%fZ" if "." in raw else "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise ReconcileRunTerminalizationProofError(
+            "terminalization_metric_created_at_invalid"
+        ) from exc
+
+
+def _terminalization_metric_proof(
+    conn: sqlite3.Connection,
+    project_id: str,
+    run_id: str,
+    snapshot_id: str,
+    *,
+    allowed_statuses: frozenset[str],
+) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT rowid AS _metric_rowid, * FROM reconcile_run_metrics "
+        "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+        (project_id, run_id, snapshot_id),
+    ).fetchone()
+    _terminalization_require(row, "terminalization_metric_missing")
+    metric = dict(row)
+    identity_row = conn.execute(
+        "SELECT * FROM graph_reconcile_metric_physical_identities "
+        "WHERE project_id=? AND run_id=? AND snapshot_id=? "
+        "ORDER BY identity_sequence DESC LIMIT 1",
+        (project_id, run_id, snapshot_id),
+    ).fetchone()
+    identity = dict(identity_row) if identity_row else {}
+    _terminalization_require(identity, "terminalization_metric_identity_missing")
+    _terminalization_require(
+        int(identity.get("metric_rowid") or 0) == int(metric["_metric_rowid"]),
+        "terminalization_metric_identity_stale",
+    )
+    _terminalization_require(
+        metric.get("status") in allowed_statuses,
+        "terminalization_metric_status_invalid",
+    )
+    _terminalization_require(not (
+        metric.get("snapshot_kind") != "full"
+        or metric.get("strategy") != "current_full_reconcile"
+        or metric.get("graph_delta_mode") != "full_rebuild"
+        or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(metric.get("commit_sha") or "")) is None
+    ), "terminalization_metric_identity_invalid")
+    created_at_dt = _terminalization_utc(metric.get("created_at"))
+    evidence = _terminalization_strict_json_object(metric.get("evidence_json"))
+    scope = evidence.get("idempotency_scope")
+    _terminalization_require(
+        isinstance(scope, Mapping), "terminalization_metric_scope_invalid"
+    )
+    exact_metric = {
+        field: metric.get(field) for field in _RECONCILE_TERMINALIZATION_METRIC_FIELDS
+    }
+    exact_metric.update(
+        {
+            "metric_rowid": int(metric["_metric_rowid"]),
+            "metric_identity_sequence": int(identity["identity_sequence"]),
+        }
+    )
+    scope_sha256 = _stable_sha256(_terminalization_typed_value(dict(scope)))
+    fingerprint = _stable_sha256(_terminalization_typed_value(exact_metric))
+    return {
+        "row": metric,
+        "scope": dict(scope),
+        "scope_sha256": scope_sha256,
+        "fingerprint": fingerprint,
+        "created_at_dt": created_at_dt,
+        "sealed": {
+            "run_id": metric["run_id"], "snapshot_id": metric["snapshot_id"],
+            "raw_status": metric["status"], "created_at": metric["created_at"],
+            "metric_rowid": int(metric["_metric_rowid"]),
+            "metric_identity_sequence": int(identity["identity_sequence"]),
+            "scope_sha256": scope_sha256, "fingerprint": fingerprint,
+        },
+    }
+
+
+def _terminalization_manager_certificate(
+    conn: sqlite3.Connection,
+    project_id: str,
+    supplied: Mapping[str, Any],
+) -> dict[str, Any]:
+    _terminalization_require(
+        isinstance(supplied, Mapping),
+        "terminalization_manager_certificate_invalid",
+    )
+    row = conn.execute(
+        "SELECT * FROM graph_reconcile_manager_generations "
+        "WHERE project_id=? ORDER BY sequence DESC LIMIT 1",
+        (project_id,),
+    ).fetchone()
+    _terminalization_require(row, "terminalization_manager_certificate_missing")
+    certificate = dict(row)
+    try:
+        _validate_manager_generation_certificate_row(conn, certificate)
+    except ManagerGenerationCertificateConflictError as exc:
+        raise ReconcileRunTerminalizationProofError(
+            "terminalization_manager_certificate_history_invalid"
+        ) from exc
+    expected = manager_generation_certificate_public_receipt(certificate)
+    _terminalization_require(
+        set(supplied) == set(expected)
+        and _terminalization_typed_value(dict(supplied))
+        == _terminalization_typed_value(expected),
+        "terminalization_manager_certificate_mismatch",
+    )
+    return expected
+
+
+def reconcile_run_terminalization_proof(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    run_id: str,
+    snapshot_id: str,
+    manager_certificate: Mapping[str, Any],
+) -> _ReconcileRunTerminalizationProof:
+    project = str(project_id or "")
+    _terminalization_require(
+        conn.execute("SELECT 1 FROM graph_reconcile_metric_identity_schema_state").fetchone(),
+        "terminalization_metric_identity_migration_incomplete",
+    )
+    source = _terminalization_metric_proof(
+        conn,
+        project,
+        str(run_id or ""),
+        str(snapshot_id or ""),
+        allowed_statuses=frozenset({"running", "finalizing"}),
+    )
+    source_row = source["row"]
+    _terminalization_require(
+        not conn.execute(
+            "SELECT 1 FROM graph_snapshots WHERE project_id=? AND snapshot_id=? "
+            "UNION ALL SELECT 1 FROM graph_current_full_build_claim_history "
+            "WHERE project_id=? AND snapshot_id=? AND status='active' LIMIT 1",
+            (project, source_row["snapshot_id"], project, source_row["snapshot_id"]),
+        ).fetchone()
+        and not snapshot_companion_dir(project, source_row["snapshot_id"]).exists(),
+        "terminalization_source_not_stale",
+    )
+    certificate = _terminalization_manager_certificate(
+        conn, project, manager_certificate
+    )
+    rows = conn.execute(
+        "SELECT run_id,snapshot_id FROM reconcile_run_metrics "
+        "WHERE project_id=? AND commit_sha=? "
+        "AND strategy='current_full_reconcile' "
+        "AND status IN ('candidate_ready','complete') "
+        "ORDER BY created_at,run_id,snapshot_id",
+        (project, source_row["commit_sha"]),
+    ).fetchall()
+    replacements: list[dict[str, Any]] = []
+    invalid_replacement_seen = False
+    for replacement_key in rows:
+        try:
+            replacement = _terminalization_metric_proof(
+                conn,
+                project,
+                str(replacement_key["run_id"]),
+                str(replacement_key["snapshot_id"]),
+                allowed_statuses=frozenset({"candidate_ready", "complete"}),
+            )
+        except ReconcileRunTerminalizationProofError:
+            invalid_replacement_seen = True
+            continue
+        replacement_row = replacement["row"]
+        if replacement["created_at_dt"] <= source["created_at_dt"]:
+            continue
+        if _terminalization_typed_value(replacement["scope"]) != (
+            _terminalization_typed_value(source["scope"])
+        ):
+            continue
+        if conn.execute(
+            "SELECT 1 FROM graph_current_full_build_claim_history "
+            "WHERE project_id=? AND snapshot_id=? AND status='active' LIMIT 1",
+            (project, replacement_row["snapshot_id"]),
+        ).fetchone():
+            invalid_replacement_seen = True
+            continue
+        if replacement_row["status"] == "candidate_ready":
+            c1_proof = current_full_candidate_tuple_from_db(
+                conn,
+                project_id=project,
+                run_id=replacement_row["run_id"],
+                target_commit_sha=source_row["commit_sha"],
+                snapshot_id=replacement_row["snapshot_id"],
+            )
+        else:
+            c1_proof = current_full_active_terminal_tuple(
+                conn,
+                project_id=project,
+                run_id=replacement_row["run_id"],
+                target_commit_sha=source_row["commit_sha"],
+                expected_scope=source["scope"],
+                snapshot_id=replacement_row["snapshot_id"],
+            )
+        if not c1_proof.get("valid"):
+            invalid_replacement_seen = True
+            continue
+        replacements.append(replacement)
+    _terminalization_require(
+        replacements,
+        (
+            "terminalization_replacement_invalid"
+            if invalid_replacement_seen
+            else "terminalization_replacement_missing"
+        ),
+    )
+    _terminalization_require(
+        len(replacements) == 1, "terminalization_replacement_ambiguous"
+    )
+    replacement = replacements[0]
+    payload = {
+        "schema_version": "reconcile_run_terminalization.proof.v1",
+        "project_id": project,
+        "source": source["sealed"],
+        "replacement": replacement["sealed"],
+        "manager_certificate": certificate,
+    }
+    return _ReconcileRunTerminalizationProof(payload)
+
+
+def reconcile_run_terminalization_safe_receipt(
+    proof: _ReconcileRunTerminalizationProof,
+) -> dict[str, Any]:
+    if not isinstance(proof, _ReconcileRunTerminalizationProof):
+        raise TypeError("sealed terminalization proof required")
+    expected_seal = "sha256:" + hashlib.sha256(
+        proof._canonical.encode("utf-8")
+    ).hexdigest()
+    if not hmac.compare_digest(proof._seal, expected_seal):
+        raise TypeError("sealed terminalization proof invalid")
+    payload = json.loads(proof._canonical)
+    source = payload["source"]
+    replacement = payload["replacement"]
+    certificate = payload["manager_certificate"]
+    return {
+        "schema_version": "reconcile_run_terminalization.safe_receipt.v1",
+        "source_identity_sha256": _stable_sha256(
+            ["terminalization", payload["project_id"], source["run_id"], source["snapshot_id"]]
+        ),
+        "source_fingerprint": source["fingerprint"],
+        "replacement_identity_sha256": _stable_sha256(
+            ["terminalization", payload["project_id"], replacement["run_id"], replacement["snapshot_id"]]
+        ),
+        "replacement_fingerprint": replacement["fingerprint"],
+        "manager_certificate_hash": certificate["certificate_hash"],
+        "proof_sha256": proof._seal,
+        "replacement_count": 1,
+        "server_derived": True,
     }
 
 
@@ -7576,6 +7970,7 @@ __all__ = [
     "GraphSnapshotBuildClaimConflictError",
     "GraphSnapshotConflictError",
     "ManagerGenerationCertificateConflictError",
+    "ReconcileRunTerminalizationProofError",
     "InvalidReconcileMetricCursor",
     "ReconcileMetricWindowOverflow",
     "acquire_current_full_build_claim",
@@ -7615,6 +8010,8 @@ __all__ = [
     "mark_pending_scope_reconcile_failed",
     "queue_pending_scope_reconcile",
     "record_reconcile_run_metric",
+    "reconcile_run_terminalization_proof",
+    "reconcile_run_terminalization_safe_receipt",
     "record_manager_generation_certificate",
     "record_graph_ref_event",
     "recover_stale_pending_scope_reconcile",
