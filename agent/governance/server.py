@@ -28302,6 +28302,284 @@ def _runtime_context_git_head_commit(*paths: str) -> str:
     return ""
 
 
+def _runtime_context_worker_worktree_liveness(
+    project_id: str,
+    context: Any,
+) -> dict[str, Any]:
+    """Prove the assigned worker root is the exact clean linked worktree."""
+
+    projection: dict[str, Any] = {
+        "schema_version": "runtime_context.worker_worktree_liveness.v1",
+        "status": "blocked",
+        "valid": False,
+        "reason_code": "runtime_context_worktree_unverified",
+        "runtime_context_id": str(
+            getattr(context, "runtime_context_id", "") or ""
+        ).strip(),
+        "task_id": str(getattr(context, "task_id", "") or "").strip(),
+        "zero_write_projection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+
+    def blocked(reason_code: str, **details: Any) -> dict[str, Any]:
+        return {**projection, "reason_code": reason_code, **details}
+
+    worktree_text = str(getattr(context, "worktree_path", "") or "").strip()
+    target_text = _runtime_context_effective_target_project_root(context)
+    if not worktree_text or not target_text:
+        return blocked("assigned_worktree_identity_missing")
+    worktree = Path(worktree_text).expanduser().resolve()
+    target = Path(target_text).expanduser().resolve()
+    if worktree != target:
+        return blocked("target_worktree_identity_mismatch")
+    if str(getattr(context, "status", "") or "").strip() != "worktree_ready":
+        return blocked("runtime_context_not_worktree_ready")
+
+    try:
+        repository_root = _parallel_branch_allocate_precheck_registered_repository(
+            project_id
+        )
+    except GovernanceError:
+        return blocked("registered_repository_unavailable")
+    allowed_root = (repository_root / ".worktrees").resolve()
+    if worktree == allowed_root or allowed_root not in worktree.parents:
+        return blocked("assigned_worktree_outside_registered_repository")
+    if not worktree.is_dir():
+        return blocked("assigned_worktree_missing")
+
+    def git_output(*args: str, cwd: Path = worktree) -> str:
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=str(cwd),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    actual_root_text = git_output("rev-parse", "--show-toplevel")
+    if not actual_root_text or Path(actual_root_text).resolve() != worktree:
+        return blocked("assigned_root_not_exact_git_worktree")
+    common_dir_text = git_output(
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    registered_common_dir_text = git_output(
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+        cwd=repository_root,
+    )
+    if (
+        not common_dir_text
+        or not registered_common_dir_text
+        or Path(common_dir_text).resolve()
+        != Path(registered_common_dir_text).resolve()
+    ):
+        return blocked("worktree_not_linked_to_registered_repository")
+
+    worktree_listing = git_output("worktree", "list", "--porcelain", cwd=repository_root)
+    registered_worktree = False
+    for block in worktree_listing.split("\n\n"):
+        fields = {
+            line.split(" ", 1)[0]: line.split(" ", 1)[1]
+            for line in block.splitlines()
+            if " " in line
+        }
+        listed = str(fields.get("worktree") or "").strip()
+        if listed and Path(listed).resolve() == worktree:
+            registered_worktree = True
+            break
+    if not registered_worktree:
+        return blocked("worktree_not_registered_with_repository")
+
+    expected_branch = str(getattr(context, "branch_ref", "") or "").strip()
+    actual_branch = git_output("symbolic-ref", "-q", "HEAD")
+    if not expected_branch or actual_branch != expected_branch:
+        return blocked("worktree_branch_mismatch")
+    expected_head = str(
+        getattr(context, "head_commit", "")
+        or getattr(context, "target_head_commit", "")
+        or ""
+    ).strip().lower()
+    actual_head = git_output("rev-parse", "HEAD").lower()
+    if not expected_head or actual_head != expected_head:
+        return blocked(
+            "worktree_head_mismatch",
+            expected_head_commit=expected_head,
+            actual_head_commit=actual_head,
+        )
+    try:
+        dirty_files = _runtime_context_git_dirty_files(str(worktree))
+    except ValidationError:
+        return blocked("worktree_status_probe_failed")
+    if dirty_files:
+        return blocked("worktree_dirty", dirty_file_count=len(dirty_files))
+    return {
+        **projection,
+        "status": "ready",
+        "valid": True,
+        "reason_code": "worktree_ready",
+        "expected_head_commit": expected_head,
+        "actual_head_commit": actual_head,
+        "linked_worktree_verified": True,
+        "registered_worktree_verified": True,
+        "clean_worktree_verified": True,
+    }
+
+
+def _runtime_context_worker_worktree_rematerialization_action(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    context: Any,
+    route_identity: Mapping[str, Any],
+    liveness: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one existing-facade recovery for an exactly missing worktree."""
+
+    if str(liveness.get("reason_code") or "") != "assigned_worktree_missing":
+        return {}
+    branch_ref = str(getattr(context, "branch_ref", "") or "").strip()
+    branch_name = _parallel_branch_allocate_branch_name(branch_ref)
+    task_slug = _parallel_branch_allocate_slug(getattr(context, "task_id", ""))
+    attempt = max(1, int(getattr(context, "attempt", 1) or 1))
+    suffix = f"-attempt-{attempt}" if attempt > 1 else ""
+    expected_leaf = f"{task_slug}{suffix}"
+    if not branch_name.endswith(f"/{expected_leaf}"):
+        return {}
+    branch_prefix = branch_name[: -(len(expected_leaf) + 1)]
+    owned_files = list(getattr(context, "owned_files", ()) or ())
+    worker_id = str(
+        getattr(context, "worker_id", "")
+        or getattr(context, "worker_slot_id", "")
+        or ""
+    ).strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    lane = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "task_id": str(getattr(context, "task_id", "") or "").strip(),
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": str(getattr(context, "agent_id", "") or worker_slot_id),
+        "stage_type": "mf_sub",
+        "attempt": attempt,
+        "branch_prefix": branch_prefix,
+        "ref_name": str(getattr(context, "ref_name", "") or "main"),
+        "base_commit": str(getattr(context, "base_commit", "") or ""),
+        "target_head_commit": str(
+            getattr(context, "target_head_commit", "") or ""
+        ),
+        "merge_queue_id": str(getattr(context, "merge_queue_id", "") or ""),
+        "owned_files": owned_files,
+        "target_files": owned_files,
+        "route_token_ref": str(route_identity.get("route_token_ref") or ""),
+        "route_identity": dict(route_identity),
+        "profile_requirements": dict(_MF_PARALLEL_DEFAULT_PROFILE_REQUIREMENTS),
+        "retry_policy": dict(_MF_PARALLEL_DEFAULT_RETRY_POLICY),
+    }
+    try:
+        repository_root = _parallel_branch_allocate_precheck_registered_repository(
+            project_id
+        )
+        body, precheck = _parallel_branch_allocate_precheck_copy_safe_body(
+            conn,
+            project_id=project_id,
+            lane=lane,
+            repository_root=repository_root,
+            default_base_commit=str(getattr(context, "base_commit", "") or ""),
+            default_target_head_commit=str(
+                getattr(context, "target_head_commit", "") or ""
+            ),
+        )
+    except (GovernanceError, ValidationError, ValueError):
+        return {}
+    expected = {
+        "worktree_path": str(getattr(context, "worktree_path", "") or ""),
+        "target_project_root": _runtime_context_effective_target_project_root(
+            context
+        ),
+        "branch_ref": branch_ref,
+        "base_commit": str(getattr(context, "base_commit", "") or ""),
+        "target_head_commit": str(
+            getattr(context, "target_head_commit", "") or ""
+        ),
+        "merge_queue_id": str(getattr(context, "merge_queue_id", "") or ""),
+    }
+    if any(str(body.get(field) or "") != value for field, value in expected.items()):
+        return {}
+    if precheck.get("commit_verification", {}).get("verified") is not True:
+        return {}
+    body = {
+        key: body[key]
+        for key in (
+            "project_id",
+            "backlog_id",
+            "contract_execution_id",
+            "parent_task_id",
+            "task_id",
+            "worker_id",
+            "worker_slot_id",
+            "agent_id",
+            "stage_type",
+            "attempt",
+            "branch_prefix",
+            "ref_name",
+            "worktree_path",
+            "base_commit",
+            "target_head_commit",
+            "merge_queue_id",
+            "owned_files",
+            "profile_requirements",
+            "retry_policy",
+            "route_token_ref",
+            "create_worktree",
+        )
+        if key in body
+    }
+    for secret_field in ("fence_token", "session_token", "session_token_ref"):
+        body.pop(secret_field, None)
+    return {
+        "schema_version": "runtime_context.worker_worktree_recovery_action.v1",
+        "status": "ready",
+        "owner_role": "observer",
+        "action": "parallel_branch_allocate",
+        "interface": "parallel_branch.allocate",
+        "mcp_tool": "parallel_branch_allocate",
+        "method": "POST",
+        "path": (
+            f"/api/graph-governance/{project_id}/parallel-branches/allocate"
+        ),
+        "body_source": "copy_safe_body",
+        "copy_safe_body": body,
+        "action_input": body,
+        "actionable": True,
+        "worker_actionable": False,
+        "observer_recovery_actionable": True,
+        "rotates_worker_fence": True,
+        "rotates_worker_session_ref": True,
+        "stale_worker_authority_reused": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+
+
 def _runtime_context_row_scoped_finish_head_projection(
     *,
     row_scoped_implementation_head_commit: str = "",
@@ -118217,6 +118495,83 @@ def _onboard_worker_read_runtime_facade_projection(
             "runtime_context_or_fresh_worker_identity_incomplete",
             list(dict.fromkeys([*identity_mismatches, *missing])),
         )
+
+    worktree_liveness = _runtime_context_worker_worktree_liveness(
+        project_id,
+        context,
+    )
+    if worktree_liveness.get("valid") is not True:
+        recovery = _runtime_context_worker_worktree_rematerialization_action(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            context=context,
+            route_identity=route_identity,
+            liveness=worktree_liveness,
+        )
+        projection = {
+            "schema_version": (
+                "onboard_route_guide.worker_read_runtime_facade_projection.v1"
+            ),
+            "status": (
+                "recovery_required" if recovery else "blocked"
+            ),
+            "blocker_id": "runtime_context_worktree_not_live",
+            "reason": str(
+                worktree_liveness.get("reason_code")
+                or "runtime_context_worktree_unverified"
+            ),
+            "reason_code": str(
+                worktree_liveness.get("reason_code")
+                or "runtime_context_worktree_unverified"
+            ),
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "selected_contract_line": "worker_read_runtime_guide",
+            "worker_actionable": False,
+            "observer_recovery_actionable": bool(recovery),
+            "fail_closed": True,
+            "zero_write_projection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "worktree_liveness": {
+                key: worktree_liveness[key]
+                for key in (
+                    "schema_version",
+                    "status",
+                    "valid",
+                    "reason_code",
+                    "zero_write_projection",
+                    "writes_performed",
+                )
+                if key in worktree_liveness
+            },
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        }
+        if not recovery:
+            return {
+                **projected,
+                "actionable": False,
+                "worker_read_runtime_facade_projection": projection,
+            }
+        return {
+            **projected,
+            "id": "observer_rematerialize_worker_worktree",
+            "line_id": "",
+            "stage_id": "",
+            **recovery,
+            "worker_read_runtime_facade_projection": projection,
+            "runtime_context_recovery_authority": {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "mode": "rematerialize_missing_worktree",
+                "server_derived": True,
+                "caller_claims_trusted": False,
+            },
+        }
 
     actionable = _runtime_context_worker_recovery_payloads(
         project_id=project_id,

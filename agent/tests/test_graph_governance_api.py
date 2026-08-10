@@ -7037,6 +7037,7 @@ def _persist_append_route_token_ref(
     visible_injection_manifest_hash: str,
     route_token_ref: str,
     target_files: list[str] | None = None,
+    allowed_actions: list[str] | None = None,
 ) -> None:
     files = list(target_files or [])
     observer_route_context.persist_route_token_ref(
@@ -7051,7 +7052,9 @@ def _persist_append_route_token_ref(
             "visible_injection_manifest_hash": visible_injection_manifest_hash,
             "route_token_ref": route_token_ref,
             "caller_role": "observer",
-            "allowed_actions": ["task_timeline_append"],
+            "allowed_actions": list(
+                allowed_actions or ["task_timeline_append"]
+            ),
             "target_files": files,
             "owned_files": files,
             "scope": {
@@ -107412,6 +107415,7 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     owned_files: tuple[str, ...] = ("agent/governance/server.py",),
     parent_task_is_contract_execution: bool = False,
     required_worker_count: int | None = None,
+    dispatch_route_allowed_actions: list[str] | None = None,
 ) -> tuple[dict[str, Any], BranchTaskRuntimeContext]:
     _insert_simple_mf_close_backlog(conn, backlog_id)
     started = server.handle_project_onboard_contract_start(
@@ -107538,6 +107542,7 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
         conn,
         backlog_id=backlog_id,
         task_id=successor["contract_execution_id"],
+        allowed_actions=dispatch_route_allowed_actions,
         **route_identity,
     )
     if not submit_dispatch:
@@ -107628,7 +107633,10 @@ def _compact_worker_read_guide(
     )
 
 
-def test_compact_worker_read_projects_current_runtime_context_receipt_facade(conn):
+def test_compact_worker_read_projects_current_runtime_context_receipt_facade(
+    conn,
+    monkeypatch,
+):
     backlog_id = "AC-GUIDE-WORKER-READ-RUNTIME-FACADE"
     successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
         conn,
@@ -107639,6 +107647,16 @@ def test_compact_worker_read_projects_current_runtime_context_receipt_facade(con
         token="session-guide-worker-read",
         pinned_revision="",
         required_worker_count=1,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_worktree_liveness",
+        lambda *_args, **_kwargs: {
+            "schema_version": "runtime_context.worker_worktree_liveness.v1",
+            "status": "ready",
+            "valid": True,
+            "reason_code": "worktree_ready",
+        },
     )
     guide = _compact_worker_read_guide(
         conn,
@@ -107785,6 +107803,218 @@ def test_compact_worker_read_fails_closed_without_active_session_safe_ref(conn):
     assert guide["facade"] == ""
     assert guide["mcp_tool"] == ""
     assert guide["actionable"] is False
+
+
+def test_compact_worker_read_rematerializes_missing_exact_linked_worktree(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    head = _init_test_git_repo(repo)
+    backlog_id = "AC-GUIDE-WORKER-READ-MISSING-WORKTREE"
+    worker_task_id = "guide-worker-read-missing-worktree"
+    worker_id = f"worker-{worker_task_id}"
+    worktree = (
+        repo
+        / ".worktrees"
+        / server._parallel_branch_allocate_slug(
+            f"{worker_task_id}-{worker_id}"
+        )
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repo,
+    )
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="guide-worker-read-missing-worktree-parent",
+        worker_task_id=worker_task_id,
+        fence_token="fence-guide-worker-read-missing-worktree",
+        token="session-guide-worker-read-missing-worktree",
+        worktree_path=str(worktree),
+        target_project_root=str(worktree),
+        base_commit=head,
+        owned_files=("agent/governance/server.py",),
+        pinned_revision="",
+        parent_task_is_contract_execution=True,
+        required_worker_count=1,
+        dispatch_route_allowed_actions=[
+            "task_timeline_append",
+            "parallel_branch_allocate",
+        ],
+    )
+    conn.commit()
+    before_changes = conn.total_changes
+    before_db = "\n".join(conn.iterdump())
+
+    guide = _compact_worker_read_guide(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=successor["contract_execution_id"],
+    )
+
+    assert not worktree.exists()
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_db
+    assert "worker_read_runtime_facade_projection" in guide, json.dumps(
+        guide,
+        sort_keys=True,
+    )
+    projection = guide["worker_read_runtime_facade_projection"]
+    assert projection["status"] == "recovery_required"
+    assert projection["reason_code"] == "assigned_worktree_missing"
+    assert projection["worker_actionable"] is False
+    assert projection["observer_recovery_actionable"] is True
+    action = guide["canonical_executable_action"]
+    assert action["action"] == "parallel_branch_allocate"
+    assert action["mcp_tool"] == "parallel_branch_allocate"
+    assert guide["next_legal_action"]["owner_role"] == "observer"
+    body = action["copy_safe_body"]
+    assert body == guide["copy_safe_body"] == guide["action_input"]
+    assert body["project_id"] == PID
+    assert body["task_id"] == worker_task_id
+    assert body["contract_execution_id"] == successor["contract_execution_id"]
+    assert body["worktree_path"] == str(worktree)
+    assert "target_project_root" not in body
+    assert body["base_commit"] == head
+    assert body["target_head_commit"] == head
+    assert body["create_worktree"] is True
+    assert "issue_same_owner_session_token" not in body
+    serialized = json.dumps(guide, sort_keys=True)
+    assert "fence-guide-worker-read-missing-worktree" not in serialized
+    assert "session-guide-worker-read-missing-worktree" not in serialized
+
+    recovered = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=dict(body),
+        )
+    )
+    if isinstance(recovered, tuple):
+        status_code, recovered = recovered
+        assert status_code in {200, 201}, recovered
+    assert recovered["ok"] is True, recovered
+    assert worktree.is_dir()
+    assert batch_jobs.git_commit(worktree) == head
+
+    ready = _compact_worker_read_guide(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=successor["contract_execution_id"],
+    )
+    assert ready["worker_read_runtime_facade_projection"]["status"] == "ready", (
+        json.dumps(
+            ready["worker_read_runtime_facade_projection"],
+            sort_keys=True,
+        )
+    )
+    assert ready["canonical_executable_action"]["action"] == (
+        "record_runtime_context_read_receipt"
+    )
+    refreshed = get_branch_context(conn, PID, worker_task_id)
+    assert refreshed is not None
+    assert refreshed.runtime_context_id == runtime_context.runtime_context_id
+    assert refreshed.fence_token != runtime_context.fence_token
+    assert refreshed.session_token_hash != runtime_context.session_token_hash
+
+
+def test_runtime_context_worker_worktree_liveness_rejects_physical_drift(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    head = _init_test_git_repo(repo)
+    task_id = "worker-liveness-matrix"
+    branch = f"codex/{task_id}"
+    worktree = repo / ".worktrees" / task_id
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", branch, str(worktree), head],
+        cwd=repo,
+        check=True,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repo,
+    )
+    context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id="AC-WORKTREE-LIVENESS-MATRIX",
+        task_id=task_id,
+        worktree_path=str(worktree),
+        target_project_root=str(worktree),
+        base_commit=head,
+        target_head_commit=head,
+    )
+    context = replace(context, branch_ref=f"refs/heads/{branch}")
+
+    ready = server._runtime_context_worker_worktree_liveness(PID, context)
+    assert ready["valid"] is True
+    assert ready["status"] == "ready"
+
+    cases = [
+        (
+            replace(context, target_project_root=str(repo)),
+            "target_worktree_identity_mismatch",
+        ),
+        (
+            replace(context, branch_ref="refs/heads/codex/foreign"),
+            "worktree_branch_mismatch",
+        ),
+        (
+            replace(context, head_commit="f" * 40),
+            "worktree_head_mismatch",
+        ),
+        (
+            replace(context, status="retired"),
+            "runtime_context_not_worktree_ready",
+        ),
+    ]
+    for candidate, reason in cases:
+        result = server._runtime_context_worker_worktree_liveness(PID, candidate)
+        assert result["valid"] is False
+        assert result["reason_code"] == reason
+
+    (worktree / "candidate.txt").write_text("dirty\n", encoding="utf-8")
+    dirty = server._runtime_context_worker_worktree_liveness(PID, context)
+    assert dirty["valid"] is False
+    assert dirty["reason_code"] == "worktree_dirty"
+    subprocess.run(
+        ["git", "checkout", "--", "candidate.txt"],
+        cwd=worktree,
+        check=True,
+    )
+
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(worktree)],
+        cwd=repo,
+        check=True,
+    )
+    missing = server._runtime_context_worker_worktree_liveness(PID, context)
+    assert missing["valid"] is False
+    assert missing["reason_code"] == "assigned_worktree_missing"
+
+    unrelated = repo / ".worktrees" / "unrelated"
+    _init_test_git_repo(unrelated)
+    unrelated_context = replace(
+        context,
+        worktree_path=str(unrelated),
+        target_project_root=str(unrelated),
+        branch_ref="refs/heads/master",
+        head_commit=batch_jobs.git_commit(unrelated),
+    )
+    foreign = server._runtime_context_worker_worktree_liveness(
+        PID,
+        unrelated_context,
+    )
+    assert foreign["valid"] is False
+    assert foreign["reason_code"] == "worktree_not_linked_to_registered_repository"
 
 
 def test_recent_timeline_projects_runtime_newer_current_stream(conn):
@@ -135896,6 +136126,16 @@ def test_compact_worker_read_bridges_outer_atomic_ticket_to_exact_lane_zero_writ
     conn,
     monkeypatch,
 ):
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_worktree_liveness",
+        lambda *_args, **_kwargs: {
+            "schema_version": "runtime_context.worker_worktree_liveness.v1",
+            "status": "ready",
+            "valid": True,
+            "reason_code": "worktree_ready",
+        },
+    )
     server_file = "agent/governance/server.py"
     test_file = "agent/tests/test_graph_governance_api.py"
     record, write = _rev8_atomic_dispatch_binding_fixture(
