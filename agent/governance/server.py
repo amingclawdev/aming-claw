@@ -6,6 +6,7 @@ Provides routing, middleware (auth, idempotency, request_id, audit), and JSON ha
 from __future__ import annotations
 
 import ast
+import hmac
 import json
 import mimetypes
 import re
@@ -490,6 +491,168 @@ def _record_reconcile_run_terminalization(
                 close = getattr(conn, "close", None)
                 if callable(close):
                     close()
+
+
+_RECONCILE_TERMINALIZATION_ACTION = "graph_reconcile_run_terminalize_stale"
+_RECONCILE_TERMINALIZATION_CANDIDATE_RE = re.compile(
+    r"rterm1\.([1-9][0-9]{0,18})\.([0-9a-f]{64})"
+)
+
+
+def _raise_reconcile_terminalization_rejection(
+    code: str, message: str, status: int = 409
+) -> None:
+    raise GovernanceError(
+        code,
+        message,
+        status,
+        {
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "public_safe": True,
+            "secret_safe": True,
+        },
+    )
+
+
+def _reconcile_terminalization_candidate_projection(
+    conn: sqlite3.Connection,
+    store: Any,
+    project_id: str,
+    metric: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one opaque, server-recomputable terminalization selector."""
+
+    raw_status = str(metric.get("status") or "")
+    if raw_status not in {"running", "finalizing"}:
+        return {}
+    row = conn.execute(
+        "SELECT rowid AS metric_rowid FROM reconcile_run_metrics "
+        "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+        (
+            str(project_id or ""),
+            str(metric.get("run_id") or ""),
+            str(metric.get("snapshot_id") or ""),
+        ),
+    ).fetchone()
+    if row is None:
+        return {}
+    try:
+        with _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
+            with _CURRENT_FULL_BUILD_KEYS_LOCK:
+                manager_certificate = _current_terminalization_manager_identity(
+                    str(project_id or "")
+                )
+                proof = store.reconcile_run_terminalization_proof(
+                    conn,
+                    str(project_id or ""),
+                    run_id=str(metric.get("run_id") or ""),
+                    snapshot_id=str(metric.get("snapshot_id") or ""),
+                    manager_certificate=manager_certificate,
+                )
+                fenced_snapshots = set(
+                    store._terminalization_proof_snapshot_ids(proof)
+                )
+                if any(
+                    key_project == str(project_id or "")
+                    and key_snapshot in fenced_snapshots
+                    for key_project, key_snapshot in _CURRENT_FULL_BUILD_KEYS
+                ):
+                    return {}
+                receipt = store.reconcile_run_terminalization_safe_receipt(proof)
+    except (RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error):
+        return {}
+    payload = {
+        "metric_rowid": int(row["metric_rowid"]),
+        "source_identity_sha256": receipt["source_identity_sha256"],
+        "source_fingerprint": receipt["source_fingerprint"],
+        "replacement_identity_sha256": receipt["replacement_identity_sha256"],
+        "replacement_fingerprint": receipt["replacement_fingerprint"],
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {"candidate_id": f"rterm1.{payload['metric_rowid']}.{digest}"}
+
+
+def _resolve_reconcile_terminalization_candidate(
+    conn: sqlite3.Connection,
+    store: Any,
+    project_id: str,
+    candidate_id: str,
+) -> dict[str, str]:
+    """Resolve one selector by recomputing all authoritative proof inputs."""
+
+    match = _RECONCILE_TERMINALIZATION_CANDIDATE_RE.fullmatch(
+        str(candidate_id or "")
+    )
+    if not match or int(match.group(1)) > 9_223_372_036_854_775_807:
+        _raise_reconcile_terminalization_rejection(
+            "reconcile_terminalization_candidate_invalid",
+            "terminalization candidate selector is invalid",
+        )
+    metric = conn.execute(
+        "SELECT * FROM reconcile_run_metrics WHERE rowid=? AND project_id=?",
+        (int(match.group(1)), str(project_id or "")),
+    ).fetchone()
+    projection = (
+        _reconcile_terminalization_candidate_projection(
+            conn, store, str(project_id or ""), dict(metric)
+        )
+        if metric is not None
+        else {}
+    )
+    if not projection or not hmac.compare_digest(
+        str(projection.get("candidate_id") or ""), str(candidate_id or "")
+    ):
+        _raise_reconcile_terminalization_rejection(
+            "reconcile_terminalization_candidate_stale",
+            "terminalization candidate no longer matches authoritative state",
+        )
+    return {
+        "run_id": str(metric["run_id"]),
+        "snapshot_id": str(metric["snapshot_id"]),
+    }
+
+
+def _consume_reconcile_terminalization_action(
+    body: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, str] | None]:
+    """Remove the reserved manager selector before any normal build path."""
+
+    projected = dict(body)
+    raw_notes = projected.get("notes_extra")
+    if not isinstance(raw_notes, Mapping) or "_manager_action" not in raw_notes:
+        return projected, None
+    notes = dict(raw_notes)
+    raw_action = notes.pop("_manager_action", None)
+    projected["notes_extra"] = notes
+    valid = (
+        isinstance(raw_action, Mapping)
+        and set(raw_action) == {"action", "candidate_id"}
+        and str(raw_action.get("action") or "")
+        == _RECONCILE_TERMINALIZATION_ACTION
+        and bool(
+            _RECONCILE_TERMINALIZATION_CANDIDATE_RE.fullmatch(
+                str(raw_action.get("candidate_id") or "")
+            )
+        )
+    )
+    if not valid:
+        _raise_reconcile_terminalization_rejection(
+            "reconcile_terminalization_manager_action_invalid",
+            "reserved reconcile manager action is invalid",
+            422,
+        )
+    return projected, {
+        "action": _RECONCILE_TERMINALIZATION_ACTION,
+        "candidate_id": str(raw_action["candidate_id"]),
+    }
 
 
 def _clamped_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
@@ -8040,19 +8203,29 @@ def _current_full_route_proof_requested(ctx: RequestContext) -> bool:
 
 def _current_full_route_action_allowed(
     allowed_actions: Sequence[Any],
+    *,
+    accepted_actions: Sequence[str] | None = None,
 ) -> tuple[bool, list[str]]:
     allowed = {
         str(item or "").strip().lower().replace("-", "_").replace(".", "_")
         for item in allowed_actions
         if str(item or "").strip()
     }
-    accepted = {
-        "graph_current_full_reconcile",
-        "graph_governance_reconcile_current_full",
-        # Compatibility for already-issued guide tokens. New tokens issued by
-        # this server also carry graph_current_full_reconcile explicitly.
-        "reconcile",
-    }
+    accepted = (
+        {
+            str(item or "").strip().lower().replace("-", "_").replace(".", "_")
+            for item in accepted_actions
+            if str(item or "").strip()
+        }
+        if accepted_actions is not None
+        else {
+            "graph_current_full_reconcile",
+            "graph_governance_reconcile_current_full",
+            # Compatibility for already-issued guide tokens. New tokens issued by
+            # this server also carry graph_current_full_reconcile explicitly.
+            "reconcile",
+        }
+    )
     return bool(allowed & accepted), sorted(allowed)
 
 
@@ -8253,7 +8426,14 @@ def _raise_current_full_route_proof(
     )
 
 
-def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str) -> dict:
+def _require_current_full_reconcile_auth(
+    ctx: RequestContext,
+    conn,
+    action: str,
+    *,
+    accepted_route_actions: Sequence[str] | None = None,
+    route_ref_renew_within_seconds: int | None = None,
+) -> dict:
     """Allow the normal operator gate or a scoped observer route-token proof."""
     if str(ctx.token or "").strip() or not _current_full_route_proof_requested(ctx):
         return _require_graph_governance_operator(ctx, conn, action)
@@ -8326,7 +8506,11 @@ def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str)
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=task_id,
-            renew_within_seconds=_orc.ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS,
+            renew_within_seconds=(
+                _orc.ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS
+                if route_ref_renew_within_seconds is None
+                else max(0, int(route_ref_renew_within_seconds))
+            ),
         )
     except _orc.RouteTokenRefError as exc:
         renewal_details = _route_token_ref_error_details(
@@ -8384,19 +8568,24 @@ def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str)
         )
 
     allowed, normalized_allowed = _current_full_route_action_allowed(
-        resolved.get("allowed_actions") or []
+        resolved.get("allowed_actions") or [],
+        accepted_actions=accepted_route_actions,
     )
     if not allowed:
+        accepted_actions = list(
+            accepted_route_actions
+            or (
+                "graph_current_full_reconcile",
+                "graph-governance.reconcile.current-full",
+                "reconcile",
+            )
+        )
         _raise_current_full_route_proof(
             "route_token_ref_action_not_allowed",
             "current-full reconcile route_token_ref does not allow graph_current_full_reconcile",
             route_token_ref=route_token_ref,
             allowed_actions=normalized_allowed,
-            accepted_actions=[
-                "graph_current_full_reconcile",
-                "graph-governance.reconcile.current-full",
-                "reconcile",
-            ],
+            accepted_actions=accepted_actions,
         )
 
     return {
@@ -8407,6 +8596,46 @@ def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str)
         "route_token_scope": expected_scope,
         "route_token_allowed_actions": normalized_allowed,
     }
+
+
+def _require_reconcile_terminalization_auth(
+    ctx: RequestContext, conn
+) -> dict[str, Any]:
+    """Require the exact managed-observer route; operator tokens are invalid."""
+
+    if str(ctx.token or "").strip() or not _current_full_route_proof_requested(ctx):
+        raise GovernanceError(
+            "reconcile_terminalization_observer_route_required",
+            "terminalization requires an exact managed observer route proof",
+            403,
+            {
+                "required_role": "observer",
+                "required_action": _RECONCILE_TERMINALIZATION_ACTION,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "public_safe": True,
+                "secret_safe": True,
+                "raw_route_token_required": False,
+            },
+        )
+    try:
+        return _require_current_full_reconcile_auth(
+            ctx,
+            conn,
+            _RECONCILE_TERMINALIZATION_ACTION,
+            accepted_route_actions=[_RECONCILE_TERMINALIZATION_ACTION],
+            route_ref_renew_within_seconds=0,
+        )
+    except GovernanceError as exc:
+        exc.details.update(
+            required_action=_RECONCILE_TERMINALIZATION_ACTION,
+            zero_write_rejection=True,
+            writes_performed=False,
+            public_safe=True,
+            secret_safe=True,
+            raw_route_token_required=False,
+        )
+        raise
 
 
 def _current_full_reconcile_route_evidence(
@@ -64982,41 +65211,72 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 progress = {"done": 1, "total": 2}
             else:
                 progress = {"done": 0, "total": 2}
-            operations.append(
-                {
-                    "operation_id": (
-                        f"current-full:{run_id}:snapshot:{snapshot_disambiguator}"
-                    ),
-                    "legacy_operation_id": f"current-full:{run_id}",
-                    "operation_type": "current_full_reconcile",
-                    "target_scope": "snapshot",
-                    "target_id": commit_sha,
-                    "target_label": run_id,
-                    "project_id": safe_project_id,
-                    "run_id": run_id,
-                    "run_id_sha256": run_id_digest,
-                    "snapshot_id": metric_snapshot_id,
-                    "snapshot_id_sha256": metric_snapshot_id_digest,
-                    "commit_sha256": commit_sha_digest,
-                    "status": status_value,
-                    "status_reason_code": str(
-                        metric.get("status_reason_code") or ""
-                    ),
-                    "is_terminal": bool(metric.get("is_terminal")),
-                    "progress": progress,
-                    "created_at": created_at,
-                    "updated_at": created_at,
-                    "claimed_by": "",
-                    "worker_id": "governance_current_full_reconcile",
-                    "lease_expires_at": "",
-                    "last_error": "",
-                    "last_result": str(
-                        metric.get("status_reason_code") or status_value
-                    ),
-                    "elapsed_ms": int(metric.get("elapsed_ms") or 0),
-                    "supported_actions": ["view_trace", "file_backlog"],
-                }
+            terminalization_candidate = (
+                _reconcile_terminalization_candidate_projection(
+                    conn, store, project_id, metric
+                )
+                if status_value in {"running", "finalizing"}
+                else {}
             )
+            supported_actions = ["view_trace", "file_backlog"]
+            operation = {
+                "operation_id": (
+                    f"current-full:{run_id}:snapshot:{snapshot_disambiguator}"
+                ),
+                "legacy_operation_id": f"current-full:{run_id}",
+                "operation_type": "current_full_reconcile",
+                "target_scope": "snapshot",
+                "target_id": commit_sha,
+                "target_label": run_id,
+                "project_id": safe_project_id,
+                "run_id": run_id,
+                "run_id_sha256": run_id_digest,
+                "snapshot_id": metric_snapshot_id,
+                "snapshot_id_sha256": metric_snapshot_id_digest,
+                "commit_sha256": commit_sha_digest,
+                "status": status_value,
+                "status_reason_code": str(
+                    metric.get("status_reason_code") or ""
+                ),
+                "is_terminal": bool(metric.get("is_terminal")),
+                "progress": progress,
+                "created_at": created_at,
+                "updated_at": created_at,
+                "claimed_by": "",
+                "worker_id": "governance_current_full_reconcile",
+                "lease_expires_at": "",
+                "last_error": "",
+                "last_result": str(
+                    metric.get("status_reason_code") or status_value
+                ),
+                "elapsed_ms": int(metric.get("elapsed_ms") or 0),
+                "supported_actions": supported_actions,
+            }
+            candidate_id = str(
+                terminalization_candidate.get("candidate_id") or ""
+            )
+            if candidate_id:
+                supported_actions.insert(0, _RECONCILE_TERMINALIZATION_ACTION)
+                operation["next_action"] = {
+                    "schema_version": (
+                        "graph_reconcile_run_terminalization.next_action.v1"
+                    ),
+                    "action": _RECONCILE_TERMINALIZATION_ACTION,
+                    "mcp_tool": "graph_current_full_reconcile",
+                    "terminalization_only": True,
+                    "required_route_action": (
+                        _RECONCILE_TERMINALIZATION_ACTION
+                    ),
+                    "copy_safe_body": {
+                        "notes_extra": {
+                            "_manager_action": {
+                                "action": _RECONCILE_TERMINALIZATION_ACTION,
+                                "candidate_id": candidate_id,
+                            }
+                        }
+                    },
+                }
+            operations.append(operation)
 
         if stale_operation:
             operations.append(stale_operation)
@@ -71500,7 +71760,78 @@ def _current_full_reconcile_idempotent_response(
 def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
     """Build a candidate, then atomically activate it with route evidence."""
     project_id = ctx.get_project_id()
-    body = ctx.body
+    body, manager_action = _consume_reconcile_terminalization_action(
+        ctx.body if isinstance(ctx.body, Mapping) else {}
+    )
+    if manager_action is not None:
+        from . import graph_snapshot_store as terminalization_store
+
+        terminalization_conn = get_connection(project_id)
+        try:
+            terminalization_auth = _require_reconcile_terminalization_auth(
+                ctx, terminalization_conn
+            )
+            candidate = _resolve_reconcile_terminalization_candidate(
+                terminalization_conn,
+                terminalization_store,
+                project_id,
+                manager_action["candidate_id"],
+            )
+        finally:
+            close = getattr(terminalization_conn, "close", None)
+            if callable(close):
+                close()
+        route_scope = terminalization_auth.get("route_token_scope")
+        route_scope = dict(route_scope) if isinstance(route_scope, Mapping) else {}
+        append_receipt = _record_reconcile_run_terminalization(
+            project_id,
+            run_id=candidate["run_id"],
+            snapshot_id=candidate["snapshot_id"],
+            backlog_id=str(route_scope.get("backlog_id") or ""),
+            task_id=str(route_scope.get("task_id") or ""),
+        )
+        receipt_fields = (
+            "schema_version",
+            "terminalization_id_sha256",
+            "source_identity_sha256",
+            "replacement_identity_sha256",
+            "manager_certificate_hash",
+            "ledger_hash",
+            "timeline_event_hash",
+            "writes_performed",
+            "replayed",
+            "server_derived",
+        )
+        safe_receipt = {
+            key: append_receipt.get(key)
+            for key in receipt_fields
+            if key in append_receipt
+        }
+        writes_performed = safe_receipt.get("writes_performed") is True
+        return (201 if writes_performed else 200), {
+            "ok": True,
+            "project_id": project_id,
+            "action": _RECONCILE_TERMINALIZATION_ACTION,
+            "candidate_id": manager_action["candidate_id"],
+            "terminalization_only": True,
+            "rebuild_started": False,
+            "snapshot_materialized": False,
+            "graph_reconciled": False,
+            "receipt": safe_receipt,
+            "route_proof": {
+                "observer_session_id": str(
+                    terminalization_auth.get("observer_session_id") or ""
+                ),
+                "route_token_ref": str(
+                    terminalization_auth.get("route_token_ref") or ""
+                ),
+                "scope": route_scope,
+                "allowed_actions": list(
+                    terminalization_auth.get("route_token_allowed_actions") or []
+                ),
+                "raw_route_token_persisted": False,
+            },
+        }
     root = _graph_governance_project_root(project_id, body)
     from .state_reconcile import run_state_only_full_reconcile
     from . import graph_snapshot_store as store

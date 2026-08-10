@@ -619,6 +619,337 @@ def test_private_terminalization_facade_uses_live_server_authority(monkeypatch):
         )
 
 
+def test_terminalization_manager_action_dispatches_before_root_head_or_build(
+    conn,
+    monkeypatch,
+):
+    candidate_id = "rterm1.7." + "a" * 64
+    backlog_id = "AC-TERMINALIZATION-EARLY-DISPATCH"
+    task_id = "terminalization-early-dispatch"
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("project root must not be resolved")
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_reconcile_terminalization_auth",
+        lambda *_args, **_kwargs: {
+            "role": "observer",
+            "observer_session_id": "obs-terminalization",
+            "route_token_ref": "rtok-terminalization",
+            "route_token_scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "route_token_allowed_actions": [
+                "graph_reconcile_run_terminalize_stale"
+            ],
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_resolve_reconcile_terminalization_candidate",
+        lambda *_args, **_kwargs: {
+            "run_id": "raw-source-run-must-not-project",
+            "snapshot_id": "raw-source-snapshot-must-not-project",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_record_reconcile_run_terminalization",
+        lambda *_args, **_kwargs: {
+            "schema_version": "reconcile_run_terminalization.append.v1",
+            "terminalization_id_sha256": "sha256:" + "b" * 64,
+            "source_identity_sha256": "sha256:" + "c" * 64,
+            "replacement_identity_sha256": "sha256:" + "d" * 64,
+            "manager_certificate_hash": "sha256:" + "e" * 64,
+            "ledger_hash": "sha256:" + "f" * 64,
+            "timeline_event_hash": "sha256:" + "1" * 64,
+            "writes_performed": True,
+            "replayed": False,
+            "server_derived": True,
+        },
+    )
+    monkeypatch.setattr(
+        state_reconcile,
+        "run_state_only_full_reconcile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("current-full build must not run")
+        ),
+    )
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "observer_session_id": "obs-terminalization",
+                "observer_route_token_ref": "rtok-terminalization",
+                "target_commit_sha": "not-a-head-and-must-not-be-read",
+                "notes_extra": {
+                    "_manager_action": {
+                        "action": "graph_reconcile_run_terminalize_stale",
+                        "candidate_id": candidate_id,
+                    },
+                    "must-not-persist": "ordinary-note",
+                },
+            },
+        )
+    )
+
+    assert status == 201
+    assert result["action"] == "graph_reconcile_run_terminalize_stale"
+    assert result["candidate_id"] == candidate_id
+    assert result["terminalization_only"] is True
+    assert result["rebuild_started"] is False
+    assert result["snapshot_materialized"] is False
+    assert result["graph_reconciled"] is False
+    serialized = json.dumps(result, sort_keys=True)
+    assert "raw-source-run-must-not-project" not in serialized
+    assert "raw-source-snapshot-must-not-project" not in serialized
+    assert "ordinary-note" not in serialized
+
+    monkeypatch.setattr(
+        server,
+        "_record_reconcile_run_terminalization",
+        lambda *_args, **_kwargs: {
+            **result["receipt"],
+            "writes_performed": False,
+            "replayed": True,
+        },
+    )
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "observer_session_id": "obs-terminalization",
+                "observer_route_token_ref": "rtok-terminalization",
+                "notes_extra": {
+                    "_manager_action": {
+                        "action": "graph_reconcile_run_terminalize_stale",
+                        "candidate_id": candidate_id,
+                    }
+                },
+            },
+        )
+    )
+    assert replay_status == 200
+    assert replay["receipt"]["writes_performed"] is False
+    assert replay["receipt"]["replayed"] is True
+
+
+def test_terminalization_auth_requires_exact_managed_observer_route_action(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-TERMINALIZATION-EXACT-ROUTE"
+    task_id = "terminalization-exact-route"
+    renewal_windows = []
+    original_resolve = observer_route_context.resolve_route_token_ref
+
+    def observe_resolve(*args, **kwargs):
+        renewal_windows.append(kwargs.get("renew_within_seconds"))
+        return original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(
+        observer_route_context, "resolve_route_token_ref", observe_resolve
+    )
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-terminalization-exact-route",
+    )
+    broad_ref = "rtok-terminalization-broad-route"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=broad_ref,
+        allowed_actions=["reconcile"],
+    )
+    broad_ctx = _ctx(
+        {"project_id": PID},
+        method="POST",
+        body={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "observer_session_id": observer_session_id,
+            "observer_route_token_ref": broad_ref,
+        },
+    )
+
+    before_broad = conn.total_changes
+    with pytest.raises(GovernanceError) as broad:
+        server._require_reconcile_terminalization_auth(broad_ctx, conn)
+    assert broad.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == before_broad
+
+    exact_ref = "rtok-terminalization-exact-route"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=exact_ref,
+        allowed_actions=["graph_reconcile_run_terminalize_stale"],
+    )
+    before_exact = conn.total_changes
+    exact = server._require_reconcile_terminalization_auth(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": exact_ref,
+            },
+        ),
+        conn,
+    )
+    assert exact["role"] == "observer"
+    assert exact["route_token_allowed_actions"] == [
+        "graph_reconcile_run_terminalize_stale"
+    ]
+    assert renewal_windows and set(renewal_windows) == {0}
+    assert conn.total_changes == before_exact
+
+    with pytest.raises(GovernanceError) as operator:
+        server._require_reconcile_terminalization_auth(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+            ),
+            conn,
+        )
+    assert operator.value.details["zero_write_rejection"] is True
+
+
+def test_terminalization_candidate_recomputes_state_and_rejects_drift(
+    conn,
+    monkeypatch,
+):
+    run_id = "current-full-abcdef0"
+    snapshot_id = "full-abcdef0-abcd"
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id=run_id,
+        snapshot_id=snapshot_id,
+        commit_sha="a" * 40,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="running",
+        evidence={"phase": "initial-proof"},
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        server,
+        "_current_terminalization_manager_identity",
+        lambda _project_id: {"server_derived": True},
+    )
+
+    def fake_proof(connection, project_id, **kwargs):
+        row = connection.execute(
+            "SELECT status,evidence_json FROM reconcile_run_metrics "
+            "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+            (project_id, kwargs["run_id"], kwargs["snapshot_id"]),
+        ).fetchone()
+        return {"status": row["status"], "evidence": row["evidence_json"]}
+
+    def fake_receipt(proof):
+        fingerprint = "sha256:" + hashlib.sha256(
+            json.dumps(proof, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return {
+            "source_identity_sha256": "sha256:" + "1" * 64,
+            "source_fingerprint": fingerprint,
+            "replacement_identity_sha256": "sha256:" + "2" * 64,
+            "replacement_fingerprint": "sha256:" + "3" * 64,
+        }
+
+    monkeypatch.setattr(store, "reconcile_run_terminalization_proof", fake_proof)
+    monkeypatch.setattr(
+        store,
+        "_terminalization_proof_snapshot_ids",
+        lambda _proof: (snapshot_id, "full-replacement-abcd"),
+    )
+    monkeypatch.setattr(
+        store, "reconcile_run_terminalization_safe_receipt", fake_receipt
+    )
+    metric = dict(
+        conn.execute(
+            "SELECT * FROM reconcile_run_metrics WHERE project_id=? AND run_id=?",
+            (PID, run_id),
+        ).fetchone()
+    )
+    projected = server._reconcile_terminalization_candidate_projection(
+        conn, store, PID, metric
+    )
+    candidate_id = projected["candidate_id"]
+    assert candidate_id.startswith("rterm1.")
+    assert run_id not in candidate_id
+    assert snapshot_id not in candidate_id
+    assert server._resolve_reconcile_terminalization_candidate(
+        conn, store, PID, candidate_id
+    ) == {"run_id": run_id, "snapshot_id": snapshot_id}
+
+    conn.execute(
+        "UPDATE reconcile_run_metrics SET evidence_json=? "
+        "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+        (json.dumps({"phase": "drifted-proof"}), PID, run_id, snapshot_id),
+    )
+    conn.commit()
+    before_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as stale:
+        server._resolve_reconcile_terminalization_candidate(
+            conn, store, PID, candidate_id
+        )
+    assert stale.value.code == "reconcile_terminalization_candidate_stale"
+    assert stale.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == before_changes
+
+
+def test_terminalization_reserved_action_rejects_malformed_before_root(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("malformed manager action must reject before root")
+        ),
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "notes_extra": {
+                        "_manager_action": {
+                            "action": "reconcile",
+                            "candidate_id": "raw-source-identity",
+                        }
+                    }
+                },
+            )
+        )
+    assert rejected.value.code == "reconcile_terminalization_manager_action_invalid"
+    assert rejected.value.details["zero_write_rejection"] is True
+
+
 def test_terminalization_schema_prewarm_is_read_only_after_ready():
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
@@ -12926,6 +13257,80 @@ def test_graph_operations_queue_exposes_current_full_run_id_status(conn):
     assert operation["status"] == "running"
     assert operation["progress"] == {"done": 0, "total": 2}
     assert operation["last_result"] == "running"
+
+
+def test_graph_operations_queue_projects_copy_safe_terminalization_action(
+    conn,
+    monkeypatch,
+):
+    head = "d" * 40
+    run_id = "current-full-ddddddd"
+    snapshot_id = "full-ddddddd-d00d"
+    candidate_id = "rterm1.17." + "f" * 64
+    _activate_basic_graph(
+        conn,
+        "full-current-operations-terminalization-action",
+        commit_sha=head,
+    )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id=run_id,
+        snapshot_id=snapshot_id,
+        commit_sha=head,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="running",
+        evidence={
+            "phase": "must-not-project-terminalization-candidate",
+            "error": "/Users/private/terminalization-candidate-secret",
+        },
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        server,
+        "_reconcile_terminalization_candidate_projection",
+        lambda *_args, **_kwargs: {"candidate_id": candidate_id},
+        raising=False,
+    )
+
+    result = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={"include_resolved": "false"},
+        )
+    )
+
+    operation = next(
+        item for item in result["operations"]
+        if item.get("operation_type") == "current_full_reconcile"
+        and item.get("run_id") == run_id
+    )
+    assert operation["supported_actions"] == [
+        "graph_reconcile_run_terminalize_stale",
+        "view_trace",
+        "file_backlog",
+    ]
+    assert operation["next_action"] == {
+        "schema_version": "graph_reconcile_run_terminalization.next_action.v1",
+        "action": "graph_reconcile_run_terminalize_stale",
+        "mcp_tool": "graph_current_full_reconcile",
+        "terminalization_only": True,
+        "required_route_action": "graph_reconcile_run_terminalize_stale",
+        "copy_safe_body": {
+            "notes_extra": {
+                "_manager_action": {
+                    "action": "graph_reconcile_run_terminalize_stale",
+                    "candidate_id": candidate_id,
+                }
+            }
+        },
+    }
+    serialized = json.dumps(operation, sort_keys=True)
+    assert "must-not-project-terminalization-candidate" not in serialized
+    assert "/Users/private/terminalization-candidate-secret" not in serialized
 
 
 def test_graph_operations_queue_projects_validated_terminalization_status_safely(
