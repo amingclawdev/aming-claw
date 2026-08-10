@@ -6614,6 +6614,16 @@ class _NoCloseConn:
         pass
 
 
+class _CountingNoCloseConn(_NoCloseConn):
+    def __init__(self, conn: sqlite3.Connection):
+        super().__init__(conn)
+        self.commit_calls = 0
+
+    def commit(self):
+        self.commit_calls += 1
+        return self._conn.commit()
+
+
 def _ctx(path_params: dict, *, method: str = "GET", query: dict | None = None, body: dict | None = None):
     return server.RequestContext(
         None,
@@ -9716,14 +9726,7 @@ def test_current_full_cross_run_resume_is_physically_read_only(
     store.ensure_schema(connection)
     connection.commit()
 
-    class CountingConnection(_NoCloseConn):
-        commit_calls = 0
-
-        def commit(self):
-            self.commit_calls += 1
-            return self._conn.commit()
-
-    wrapped = CountingConnection(connection)
+    wrapped = _CountingNoCloseConn(connection)
     monkeypatch.setattr(
         "agent.governance.db._governance_root", lambda: tmp_path / "state"
     )
@@ -9801,6 +9804,136 @@ def test_current_full_cross_run_resume_is_physically_read_only(
             "AND run_id = ? AND snapshot_id = ?",
             (PID, origin_run_id, snapshot_id),
         ).fetchone()[0] == "candidate_ready"
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("delete_graph", "current_full_candidate_graph_companion_missing"),
+        (
+            "corrupt_inventory",
+            "current_full_candidate_inventory_companion_hash_mismatch",
+        ),
+        ("delete_drift", "current_full_candidate_drift_companion_missing"),
+        ("corrupt_manifest", "current_full_candidate_manifest_invalid"),
+        (
+            "drift_db_hash",
+            "current_full_candidate_graph_companion_hash_mismatch",
+        ),
+    ],
+)
+def test_current_full_cross_run_resume_rejects_physical_companion_drift_read_only(
+    monkeypatch,
+    tmp_path,
+    mutation,
+    expected_error,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    snapshot_id = f"full-resume-integrity-{mutation}"
+    origin_run_id = f"run-resume-integrity-origin-{mutation}"
+    consumer_run_id = f"run-resume-integrity-consumer-{mutation}"
+    connection = sqlite3.connect(tmp_path / f"resume-integrity-{mutation}.sqlite")
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.commit()
+    wrapped = _CountingNoCloseConn(connection)
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root", lambda: tmp_path / "state"
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: wrapped)
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    try:
+        first_status, _first = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "snapshot_id": snapshot_id,
+                    "run_id": origin_run_id,
+                    "activate": False,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+        assert first_status == 201
+        companion_dir = store.snapshot_companion_dir(PID, snapshot_id)
+        if mutation == "delete_graph":
+            (companion_dir / "graph.json").unlink()
+        elif mutation == "corrupt_inventory":
+            (companion_dir / "file_inventory.json").write_bytes(b"corrupt")
+        elif mutation == "delete_drift":
+            (companion_dir / "drift_ledger.json").unlink()
+        elif mutation == "corrupt_manifest":
+            (companion_dir / "manifest.json").write_bytes(b"not-json")
+        elif mutation == "drift_db_hash":
+            connection.execute(
+                "UPDATE graph_snapshots SET graph_sha256 = ? "
+                "WHERE project_id = ? AND snapshot_id = ?",
+                ("0" * 64, PID, snapshot_id),
+            )
+            connection.commit()
+        else:
+            raise AssertionError(f"unhandled mutation: {mutation}")
+
+        before_changes = connection.total_changes
+        before_commit_calls = wrapped.commit_calls
+        before_claims = connection.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
+        ).fetchone()[0]
+        before_metrics = connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics"
+        ).fetchone()[0]
+        status, result = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "snapshot_id": snapshot_id,
+                    "run_id": consumer_run_id,
+                    "activate": False,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+
+        assert status == 409
+        assert result["error"] == "current_full_candidate_resume_tuple_invalid"
+        assert result["rebuild_started"] is False
+        assert expected_error in result["resume_tuple"]["errors"]
+        assert result["resume_tuple"]["companion_integrity"]["valid"] is False
+        assert result["resume_tuple"]["companion_integrity"]["error"] == (
+            expected_error
+        )
+        assert len(calls) == 1
+        assert connection.total_changes == before_changes
+        assert wrapped.commit_calls == before_commit_calls
+        assert connection.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
+        ).fetchone()[0] == before_claims
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics"
+        ).fetchone()[0] == before_metrics
+        assert connection.execute(
+            "SELECT status FROM reconcile_run_metrics WHERE project_id = ? "
+            "AND run_id = ? AND snapshot_id = ?",
+            (PID, origin_run_id, snapshot_id),
+        ).fetchone()[0] == "candidate_ready"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics WHERE project_id = ? "
+            "AND run_id = ? AND snapshot_id = ?",
+            (PID, consumer_run_id, snapshot_id),
+        ).fetchone()[0] == 0
     finally:
         connection.close()
 

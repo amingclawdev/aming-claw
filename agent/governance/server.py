@@ -69890,6 +69890,8 @@ def _current_full_candidate_resume_tuple(
     snapshot: Mapping[str, Any],
     request_metric: Mapping[str, Any],
 ) -> dict[str, Any]:
+    from . import graph_snapshot_store as snapshot_store
+
     snapshot_id = str(snapshot.get("snapshot_id") or "").strip()
     notes = (
         snapshot.get("notes_payload")
@@ -69922,6 +69924,16 @@ def _current_full_candidate_resume_tuple(
             (project_id, snapshot_id),
         ).fetchone()[0]
     )
+    try:
+        companion_integrity = snapshot_store.validate_snapshot_companion_integrity(
+            snapshot
+        )
+    except Exception as exc:
+        companion_integrity = {
+            "valid": False,
+            "error": "current_full_candidate_companion_integrity_unreadable",
+            "error_type": type(exc).__name__,
+        }
     errors: list[str] = []
     if str(snapshot.get("status") or "") != "candidate":
         errors.append("snapshot_not_candidate")
@@ -69934,6 +69946,13 @@ def _current_full_candidate_resume_tuple(
         for field in ("graph_sha256", "inventory_sha256", "drift_sha256")
     ):
         errors.append("snapshot_materialization_incomplete")
+    if not companion_integrity.get("valid"):
+        errors.append(
+            str(
+                companion_integrity.get("error")
+                or "current_full_candidate_companion_integrity_invalid"
+            )
+        )
     if not origin_run_id:
         errors.append("candidate_origin_run_missing")
     if active_claim_count:
@@ -69978,6 +69997,7 @@ def _current_full_candidate_resume_tuple(
         ),
         "origin_metric_status": str(origin_metric.get("status") or ""),
         "request_metric_status": request_metric_status,
+        "companion_integrity": companion_integrity,
     }
 
 
