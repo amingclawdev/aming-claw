@@ -63730,29 +63730,66 @@ def _dashboard_current_state(
     }
 
 
-_RECONCILE_QUEUE_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
-_RECONCILE_QUEUE_CREDENTIAL_SHAPE_RE = re.compile(
-    r"(?:^|[-_.:])(?:"
-    r"r(?:oute)?[-_.:]?tok(?:en)?|"
-    r"w(?:orker)?s(?:ession)?[-_.:]?tok(?:en)?|"
-    r"(?:worker[-_.:]?)?session[-_.:]?token|"
-    r"bearer(?:[-_.:]?token)?|"
-    r"authorization[-_.:]?bearer"
-    r")(?:[-_.:]|$)",
-    re.IGNORECASE,
+_RECONCILE_QUEUE_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}")
+_RECONCILE_QUEUE_CREDENTIAL_MARKERS = (
+    "rtok",
+    "routetok",
+    "routetoken",
+    "wstok",
+    "workerstok",
+    "workersessiontok",
+    "workersessiontoken",
+    "sessiontok",
+    "sessiontoken",
+    "bearer",
+    "bearertoken",
+    "authorizationbearer",
 )
+_RECONCILE_QUEUE_IDENTIFIER_KIND_RE = {
+    "project": re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}"),
+    # Public run/snapshot identities must be readable structured IDs. Opaque
+    # single-segment values fail closed even when they are short.
+    "run": re.compile(r"[A-Za-z0-9]{1,24}(?:[-_.:][A-Za-z0-9]{1,24}){1,7}"),
+    "snapshot": re.compile(r"[A-Za-z0-9]{1,24}(?:[-_.:][A-Za-z0-9]{1,24}){1,7}"),
+}
 _RECONCILE_QUEUE_TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z"
+)
+
+_PUBLIC_RECONCILE_METRIC_STRATEGIES = (
+    "incremental_graph_delta",
+    "full_rebuild_fallback",
+    "legacy_full_like",
+    "full",
+    "current_full_reconcile",
+    "unknown",
+    "other",
+)
+_PUBLIC_RECONCILE_FALLBACK_REASONS = (
+    "source_function_identity_changed",
+    "ruleset_change_requires_rule_aware_reconcile",
+    "inventory_status_change_requires_full_rebuild",
+    "source_typed_relation_asset_unknown",
+    "other",
+)
+_PUBLIC_RECONCILE_GRAPH_DELTA_MODES = frozenset(
+    {"incremental_graph_delta", "incremental", "full_rebuild", "full", "unknown"}
 )
 
 
 def _safe_reconcile_queue_identifier(value: Any, *, kind: str) -> tuple[str, str]:
     raw = str(value or "").strip()
     digest = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    compact = re.sub(r"[^a-z0-9]+", "", raw.casefold())
+    parts = [part for part in re.split(r"[-_.:]+", raw) if part]
+    kind_pattern = _RECONCILE_QUEUE_IDENTIFIER_KIND_RE.get(kind)
     if (
         raw
         and _RECONCILE_QUEUE_IDENTIFIER_RE.fullmatch(raw)
-        and not _RECONCILE_QUEUE_CREDENTIAL_SHAPE_RE.search(raw)
+        and not any(marker in compact for marker in _RECONCILE_QUEUE_CREDENTIAL_MARKERS)
+        and not any(len(part) > 24 for part in parts)
+        and kind_pattern is not None
+        and kind_pattern.fullmatch(raw)
     ):
         return raw, digest
     return f"{kind}-{digest[7:23]}", digest
@@ -63764,6 +63801,170 @@ def _safe_reconcile_queue_commit(value: Any) -> tuple[str, str]:
     if re.fullmatch(r"[0-9a-f]{40,64}", raw):
         return raw, digest
     return "", digest
+
+
+def _public_reconcile_metric_int(
+    value: Any,
+    *,
+    maximum: int = 1_000_000_000_000,
+) -> int:
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return min(max(number, 0), maximum)
+
+
+def _public_reconcile_metric_float(
+    value: Any,
+    *,
+    minimum: float = 0.0,
+    maximum: float = 1_000_000_000_000.0,
+) -> float:
+    return round(
+        _clamped_float(
+            value,
+            default=0.0,
+            minimum=minimum,
+            maximum=maximum,
+        ),
+        2,
+    )
+
+
+def _public_reconcile_metric_buckets(
+    value: Any,
+    *,
+    allowed_names: Sequence[str],
+) -> dict[str, dict[str, int | float]]:
+    """Aggregate arbitrary metric keys into fixed names plus `other`."""
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, dict[str, int | float]] = {}
+    for raw_name, raw_value in value.items():
+        name = str(raw_name or "")
+        safe_name = name if name in allowed_names else "other"
+        source = raw_value if isinstance(raw_value, Mapping) else {}
+        target = result.setdefault(
+            safe_name,
+            {
+                "count": 0,
+                "total_elapsed_ms": 0,
+                "min_elapsed_ms": 0,
+                "max_elapsed_ms": 0,
+                "avg_elapsed_ms": 0.0,
+            },
+        )
+        source_count = _public_reconcile_metric_int(
+            source.get("count"), maximum=1000
+        )
+        source_total = _public_reconcile_metric_int(source.get("total_elapsed_ms"))
+        source_min = _public_reconcile_metric_int(source.get("min_elapsed_ms"))
+        source_max = _public_reconcile_metric_int(source.get("max_elapsed_ms"))
+        target["count"] = min(int(target["count"]) + source_count, 1000)
+        target["total_elapsed_ms"] = min(
+            int(target["total_elapsed_ms"]) + source_total,
+            1_000_000_000_000,
+        )
+        target_min = int(target["min_elapsed_ms"])
+        target["min_elapsed_ms"] = (
+            min(target_min, source_min)
+            if target_min and source_min
+            else target_min or source_min
+        )
+        target["max_elapsed_ms"] = max(int(target["max_elapsed_ms"]), source_max)
+    for bucket in result.values():
+        count = int(bucket["count"])
+        bucket["avg_elapsed_ms"] = (
+            round(float(bucket["total_elapsed_ms"]) / count, 2) if count else 0.0
+        )
+    return result
+
+
+def _public_reconcile_metrics_summary(value: Any) -> dict[str, Any]:
+    """Project persisted/caller-derived metrics to a fixed public schema."""
+    summary = value if isinstance(value, Mapping) else {}
+
+    safe_strategies = _public_reconcile_metric_buckets(
+        summary.get("by_strategy"),
+        allowed_names=_PUBLIC_RECONCILE_METRIC_STRATEGIES[:-1],
+    )
+    safe_reasons = _public_reconcile_metric_buckets(
+        summary.get("fallback_reasons"),
+        allowed_names=_PUBLIC_RECONCILE_FALLBACK_REASONS[:-1],
+    )
+
+    raw_latest = summary.get("latest_full_rebuild_fallback")
+    safe_latest: dict[str, Any] = {}
+    if isinstance(raw_latest, Mapping) and raw_latest:
+        strategy = str(raw_latest.get("strategy") or "")
+        graph_delta_mode = str(raw_latest.get("graph_delta_mode") or "")
+        fallback_reason = str(raw_latest.get("fallback_reason") or "")
+        safe_latest = {
+            **{
+                public_name: "sha256:"
+                + hashlib.sha256(
+                    str(raw_latest.get(field) or "").encode("utf-8")
+                ).hexdigest()
+                for field, public_name in (
+                    ("run_id", "run_id_sha256"),
+                    ("snapshot_id", "snapshot_id_sha256"),
+                    ("commit_sha", "commit_sha256"),
+                )
+            },
+            "strategy": (
+                strategy
+                if strategy in _PUBLIC_RECONCILE_METRIC_STRATEGIES[:-1]
+                else "other"
+            ),
+            "graph_delta_mode": (
+                graph_delta_mode
+                if graph_delta_mode in _PUBLIC_RECONCILE_GRAPH_DELTA_MODES
+                else "unknown"
+            ),
+            "fallback_reason_code": (
+                fallback_reason
+                if fallback_reason in _PUBLIC_RECONCILE_FALLBACK_REASONS[:-1]
+                else "other"
+            ),
+            "elapsed_ms": _public_reconcile_metric_int(
+                raw_latest.get("elapsed_ms")
+            ),
+        }
+
+    raw_speedup = summary.get("speedup")
+    speedup = raw_speedup if isinstance(raw_speedup, Mapping) else {}
+    return {
+        "schema_version": "reconcile_metrics.public_summary.v1",
+        "sample_count": _public_reconcile_metric_int(
+            summary.get("sample_count"), maximum=1000
+        ),
+        "by_strategy": safe_strategies,
+        "fallback_reasons": safe_reasons,
+        "latest_full_rebuild_fallback": safe_latest,
+        "speedup": {
+            "incremental_avg_ms": _public_reconcile_metric_float(
+                speedup.get("incremental_avg_ms")
+            ),
+            "full_avg_ms": _public_reconcile_metric_float(
+                speedup.get("full_avg_ms")
+            ),
+            "speedup_x": _public_reconcile_metric_float(
+                speedup.get("speedup_x"), maximum=1_000_000.0
+            ),
+            "elapsed_reduction_pct": _public_reconcile_metric_float(
+                speedup.get("elapsed_reduction_pct"),
+                minimum=-1_000_000.0,
+                maximum=100.0,
+            ),
+            "full_sample_count": _public_reconcile_metric_int(
+                speedup.get("full_sample_count"), maximum=1000
+            ),
+            "incremental_sample_count": _public_reconcile_metric_int(
+                speedup.get("incremental_sample_count"), maximum=1000
+            ),
+        },
+    }
 
 
 @route("GET", "/api/graph-governance/{project_id}/operations/queue")
@@ -64253,10 +64454,12 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
             snapshot_summary=snapshot_summary,
         )
         current_state["graph_stale"] = graph_stale_summary
-        reconcile_metrics = store.summarize_reconcile_run_metrics(
-            conn,
-            project_id,
-            limit=_query_int(ctx.query, "reconcile_metric_limit", 100),
+        reconcile_metrics = _public_reconcile_metrics_summary(
+            store.summarize_reconcile_run_metrics(
+                conn,
+                project_id,
+                limit=_query_int(ctx.query, "reconcile_metric_limit", 100),
+            )
         )
         operations.sort(key=lambda item: (str(item.get("updated_at") or item.get("created_at") or ""), str(item.get("operation_id") or "")), reverse=True)
         return {

@@ -12164,6 +12164,9 @@ def test_graph_operations_queue_exposes_current_full_run_id_status(conn):
         for item in result["operations"]
         if item.get("run_id") == "current-full-visible-running"
     )
+    assert operation["project_id"] == PID
+    assert operation["run_id"] == "current-full-visible-running"
+    assert operation["snapshot_id"] == "full-current-visible-running"
     assert operation["operation_id"].startswith(
         "current-full:current-full-visible-running:snapshot:"
     )
@@ -12274,22 +12277,33 @@ def test_graph_operations_queue_keeps_same_run_snapshots_and_scrubs_evidence(con
 
 
 @pytest.mark.parametrize(
-    "credential_identity",
+    ("credential_identity", "forbidden_fragment"),
     [
-        "rtok-PublicQueueSecret9",
-        "RTOK:PublicQueueSecret9",
-        "wstok_PublicQueueSecret9",
-        "session-token-PublicQueueSecret9",
-        "session.token.PublicQueueSecret9",
-        "Bearer:PublicQueueSecret9",
-        "bearer.token.PublicQueueSecret9",
-        "route_token_PublicQueueSecret9",
-        "worker-session-token-PublicQueueSecret9",
+        ("rtok-PublicQueueSecret9", "PublicQueueSecret9"),
+        ("RTOK:PublicQueueSecret9", "PublicQueueSecret9"),
+        ("rtokPublicQueueCompactSecret9", "PublicQueueCompactSecret9"),
+        ("wstok_PublicQueueSecret9", "PublicQueueSecret9"),
+        ("wstokPublicQueueCompactSecret9", "PublicQueueCompactSecret9"),
+        ("session-token-PublicQueueSecret9", "PublicQueueSecret9"),
+        ("session.token.PublicQueueSecret9", "PublicQueueSecret9"),
+        ("sessionTokenPublicQueueCompactSecret9", "PublicQueueCompactSecret9"),
+        ("SeSsIoN / ToKeN / PublicQueueSpacedSecret9", "PublicQueueSpacedSecret9"),
+        ("Bearer:PublicQueueSecret9", "PublicQueueSecret9"),
+        ("bearer.token.PublicQueueSecret9", "PublicQueueSecret9"),
+        ("BearerTokenPublicQueueCompactSecret9", "PublicQueueCompactSecret9"),
+        ("BeArEr---ToKeN...PublicQueuePunctSecret9", "PublicQueuePunctSecret9"),
+        ("route_token_PublicQueueSecret9", "PublicQueueSecret9"),
+        ("worker-session-token-PublicQueueSecret9", "PublicQueueSecret9"),
+        ("aZ9K2mQ7vB4xN8cR3sT6uW1yE5gH0jLp", "aZ9K2mQ7vB4xN8cR3sT6uW1yE5gH0jLp"),
+        ("Q7" * 24, "Q7" * 12),
+        ("R8" * 48, "R8" * 12),
+        ("S9" * 64, "S9" * 12),
     ],
 )
 def test_graph_operations_queue_redacts_credential_shaped_identifiers(
     conn,
     credential_identity,
+    forbidden_fragment,
 ):
     head = "f" * 40
     _activate_basic_graph(
@@ -12331,7 +12345,104 @@ def test_graph_operations_queue_redacts_credential_shaped_identifiers(
     assert operation["operation_id"].startswith(
         f"current-full:{operation['run_id']}:snapshot:"
     )
-    assert credential_identity not in json.dumps(result, sort_keys=True)
+    serialized = json.dumps(result, sort_keys=True)
+    assert credential_identity not in serialized
+    assert forbidden_fragment not in serialized
+
+
+def test_graph_operations_queue_projects_reconcile_metrics_fail_closed(
+    conn,
+):
+    head = "a" * 40
+    _activate_basic_graph(
+        conn,
+        "full-current-operations-metric-projection",
+        commit_sha=head,
+    )
+    secret_fragments = [
+        "PublicStrategySecret9",
+        "PublicFallbackSecret9",
+        "PublicRunSecret9",
+        "PublicSnapshotSecret9",
+        "PublicMetricErrorSecret9",
+        "/Users/private/PublicMetricPathSecret9",
+        "PublicOpaqueMetricTokenSecret9",
+    ]
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="run-PublicStrategySecret9",
+        snapshot_id="full-PublicStrategySecret9",
+        commit_sha=head,
+        snapshot_kind="full",
+        strategy="PublicStrategySecret9",
+        graph_delta_mode="PublicOpaqueMetricTokenSecret9",
+        status="failed",
+        elapsed_ms=21,
+        trace_summary_path="/Users/private/PublicMetricPathSecret9",
+        evidence={"error": "PublicMetricErrorSecret9"},
+        created_at="2026-08-10T00:00:01Z",
+    )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="wstokPublicRunSecret9",
+        snapshot_id="sessionTokenPublicSnapshotSecret9",
+        commit_sha="PublicOpaqueMetricTokenSecret9",
+        snapshot_kind="full",
+        strategy="full_rebuild_fallback",
+        graph_delta_mode="PublicOpaqueMetricTokenSecret9",
+        status="failed",
+        elapsed_ms=99,
+        trace_summary_path="/Users/private/PublicMetricPathSecret9",
+        fallback_reason="PublicFallbackSecret9",
+        evidence={"error": "PublicMetricErrorSecret9"},
+        created_at="2026-08-10T00:00:02Z",
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={"include_resolved": "false"},
+        )
+    )
+
+    metrics = result["summary"]["reconcile_metrics"]
+    assert metrics["schema_version"] == "reconcile_metrics.public_summary.v1"
+    assert metrics["sample_count"] == 2
+    assert set(metrics["by_strategy"]) == {"full_rebuild_fallback", "other"}
+    assert metrics["by_strategy"]["other"]["count"] == 1
+    assert metrics["fallback_reasons"] == {
+        "other": {
+            "count": 1,
+            "total_elapsed_ms": 99,
+            "min_elapsed_ms": 0,
+            "max_elapsed_ms": 0,
+            "avg_elapsed_ms": 99.0,
+        }
+    }
+    latest = metrics["latest_full_rebuild_fallback"]
+    assert set(latest) == {
+        "run_id_sha256",
+        "snapshot_id_sha256",
+        "commit_sha256",
+        "strategy",
+        "graph_delta_mode",
+        "fallback_reason_code",
+        "elapsed_ms",
+    }
+    assert latest["strategy"] == "full_rebuild_fallback"
+    assert latest["graph_delta_mode"] == "unknown"
+    assert latest["fallback_reason_code"] == "other"
+    assert all(
+        latest[key].startswith("sha256:")
+        for key in ("run_id_sha256", "snapshot_id_sha256", "commit_sha256")
+    )
+    serialized = json.dumps(result, sort_keys=True)
+    for forbidden in secret_fragments:
+        assert forbidden not in serialized
 
 
 @pytest.mark.parametrize(
