@@ -337,6 +337,72 @@ BEFORE DELETE ON graph_reconcile_manager_generations
 BEGIN
   SELECT RAISE(ABORT, 'manager_generation_append_only');
 END;
+
+CREATE TABLE IF NOT EXISTS graph_reconcile_metric_physical_identities (
+  identity_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  metric_rowid INTEGER NOT NULL CHECK(metric_rowid > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reconcile_metric_physical_identity_latest
+  ON graph_reconcile_metric_physical_identities(
+    project_id, run_id, snapshot_id, identity_sequence DESC
+  );
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_metric_identity_after_insert
+AFTER INSERT ON reconcile_run_metrics
+BEGIN
+  INSERT INTO graph_reconcile_metric_physical_identities
+    (project_id, run_id, snapshot_id, metric_rowid)
+  VALUES (NEW.project_id, NEW.run_id, NEW.snapshot_id, NEW.rowid);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_metric_identity_insert_conflict
+BEFORE INSERT ON graph_reconcile_metric_physical_identities
+WHEN EXISTS (
+  SELECT 1 FROM graph_reconcile_metric_physical_identities
+  WHERE identity_sequence = NEW.identity_sequence
+)
+BEGIN SELECT RAISE(ABORT, 'reconcile_metric_identity_conflict'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_metric_identity_no_update
+BEFORE UPDATE ON graph_reconcile_metric_physical_identities
+BEGIN SELECT RAISE(ABORT, 'reconcile_metric_identity_append_only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_metric_identity_no_delete
+BEFORE DELETE ON graph_reconcile_metric_physical_identities
+BEGIN SELECT RAISE(ABORT, 'reconcile_metric_identity_append_only'); END;
+
+CREATE TABLE IF NOT EXISTS graph_reconcile_metric_identity_schema_state (
+  marker TEXT PRIMARY KEY
+    CHECK(marker = 'physical_identity_backfill_v1')
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_metric_identity_marker_complete
+BEFORE INSERT ON graph_reconcile_metric_identity_schema_state
+WHEN EXISTS (
+  SELECT 1 FROM reconcile_run_metrics AS metric WHERE NOT EXISTS (
+    SELECT 1 FROM graph_reconcile_metric_physical_identities AS identity
+    WHERE identity.project_id=metric.project_id AND identity.run_id=metric.run_id
+      AND identity.snapshot_id=metric.snapshot_id AND identity.metric_rowid=metric.rowid
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'reconcile_metric_identity_marker_incomplete'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_metric_identity_marker_insert_conflict
+BEFORE INSERT ON graph_reconcile_metric_identity_schema_state
+WHEN EXISTS (SELECT 1 FROM graph_reconcile_metric_identity_schema_state)
+BEGIN SELECT RAISE(ABORT, 'reconcile_metric_identity_marker_conflict'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_metric_identity_marker_no_update
+BEFORE UPDATE ON graph_reconcile_metric_identity_schema_state
+BEGIN SELECT RAISE(ABORT, 'reconcile_metric_identity_marker_append_only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_metric_identity_marker_no_delete
+BEFORE DELETE ON graph_reconcile_metric_identity_schema_state
+BEGIN SELECT RAISE(ABORT, 'reconcile_metric_identity_marker_append_only'); END;
 """
 
 SNAPSHOT_STATUS_CANDIDATE = "candidate"
@@ -408,6 +474,85 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(GRAPH_SNAPSHOT_SCHEMA_SQL)
     _ensure_graph_snapshot_ref_columns(conn)
     _migrate_pending_scope_reconcile_branch_identity(conn)
+
+
+RECONCILE_METRIC_PHYSICAL_IDENTITY_SCHEMA = (
+    "graph_reconcile_metric_physical_identity.v1"
+)
+_RECONCILE_METRIC_PHYSICAL_IDENTITY_MARKER = "physical_identity_backfill_v1"
+
+
+def _reconcile_metric_identity_before_marker_hook(
+    _conn: sqlite3.Connection,
+) -> None:
+    """Internal fault-injection seam after backfill and before its marker."""
+
+
+def _reconcile_metric_identity_migration_receipt(
+    *, backfilled: int, writes_performed: bool
+) -> dict[str, Any]:
+    return {
+        "schema_version": RECONCILE_METRIC_PHYSICAL_IDENTITY_SCHEMA,
+        "migration_complete": True,
+        "backfilled": int(backfilled),
+        "writes_performed": bool(writes_performed),
+    }
+
+
+def ensure_reconcile_metric_physical_identity_migration(
+    conn: sqlite3.Connection,
+) -> dict[str, Any]:
+    """Recoverably backfill immutable metric identities after schema prewarm."""
+
+    marker = conn.execute(
+        "SELECT 1 FROM graph_reconcile_metric_identity_schema_state "
+        "WHERE marker = ?",
+        (_RECONCILE_METRIC_PHYSICAL_IDENTITY_MARKER,),
+    ).fetchone()
+    if marker:
+        return _reconcile_metric_identity_migration_receipt(
+            backfilled=0, writes_performed=False
+        )
+    if conn.in_transaction:
+        raise RuntimeError("metric identity migration requires a clean transaction")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        marker = conn.execute(
+            "SELECT 1 FROM graph_reconcile_metric_identity_schema_state "
+            "WHERE marker = ?",
+            (_RECONCILE_METRIC_PHYSICAL_IDENTITY_MARKER,),
+        ).fetchone()
+        if marker:
+            conn.rollback()
+            return _reconcile_metric_identity_migration_receipt(
+                backfilled=0, writes_performed=False
+            )
+        before_changes = conn.total_changes
+        conn.execute(
+            "INSERT INTO graph_reconcile_metric_physical_identities "
+            "(project_id,run_id,snapshot_id,metric_rowid) "
+            "SELECT metric.project_id,metric.run_id,metric.snapshot_id,metric.rowid "
+            "FROM reconcile_run_metrics AS metric WHERE NOT EXISTS ("
+            "SELECT 1 FROM graph_reconcile_metric_physical_identities AS identity "
+            "WHERE identity.project_id=metric.project_id "
+            "AND identity.run_id=metric.run_id "
+            "AND identity.snapshot_id=metric.snapshot_id "
+            "AND identity.metric_rowid=metric.rowid) ORDER BY metric.rowid"
+        )
+        backfilled = conn.total_changes - before_changes
+        _reconcile_metric_identity_before_marker_hook(conn)
+        conn.execute(
+            "INSERT INTO graph_reconcile_metric_identity_schema_state(marker) "
+            "VALUES (?)",
+            (_RECONCILE_METRIC_PHYSICAL_IDENTITY_MARKER,),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return _reconcile_metric_identity_migration_receipt(
+        backfilled=backfilled, writes_performed=True
+    )
 
 
 MANAGER_GENERATION_CERTIFICATE_SCHEMA = (
@@ -7442,6 +7587,7 @@ __all__ = [
     "current_full_candidate_resume_tuple",
     "current_full_candidate_tuple_from_db",
     "ensure_schema",
+    "ensure_reconcile_metric_physical_identity_migration",
     "export_graph_snapshot_cache",
     "finalize_graph_snapshot",
     "get_active_graph_snapshot",

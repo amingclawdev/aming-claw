@@ -3222,3 +3222,383 @@ def test_current_full_proof_leaf_apis_preserve_valid_and_malformed_file_db_bytes
     assert db_path.stat().st_size == before_size
     assert hashlib.sha256(after_bytes).hexdigest() == before_hash
     assert after_bytes == before_bytes
+
+
+def test_b1am_migration_helper_is_explicit_and_clean_transaction(conn):
+    _ensure_schema(conn)
+    store.ensure_schema(conn)
+    conn.commit()
+
+    receipt = store.ensure_reconcile_metric_physical_identity_migration(conn)
+
+    assert receipt == {
+        "schema_version": "graph_reconcile_metric_physical_identity.v1",
+        "migration_complete": True,
+        "backfilled": 0,
+        "writes_performed": True,
+    }
+    assert conn.in_transaction is False
+    assert store.ensure_reconcile_metric_physical_identity_migration(conn)[
+        "writes_performed"
+    ] is False
+
+
+def _b1am_legacy_metrics(connection, count=3):
+    connection.execute(
+        "CREATE TABLE reconcile_run_metrics (project_id TEXT NOT NULL, run_id TEXT NOT NULL, "
+        "snapshot_id TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '', "
+        "parent_commit_sha TEXT NOT NULL DEFAULT '', snapshot_kind TEXT NOT NULL DEFAULT '', "
+        "strategy TEXT NOT NULL DEFAULT '', graph_delta_mode TEXT NOT NULL DEFAULT '', "
+        "status TEXT NOT NULL DEFAULT '', changed_file_count INTEGER NOT NULL DEFAULT 0, "
+        "impacted_file_count INTEGER NOT NULL DEFAULT 0, event_count INTEGER NOT NULL DEFAULT 0, "
+        "node_count INTEGER NOT NULL DEFAULT 0, edge_count INTEGER NOT NULL DEFAULT 0, "
+        "elapsed_ms INTEGER NOT NULL DEFAULT 0, trace_summary_path TEXT NOT NULL DEFAULT '', "
+        "fallback_reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, "
+        "evidence_json TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(project_id,run_id,snapshot_id))"
+    )
+    connection.executemany(
+        "INSERT INTO reconcile_run_metrics (project_id,run_id,snapshot_id,status,created_at) "
+        "VALUES (?,?,?,?,?)",
+        [
+            ("legacy-project", f"legacy-run-{index}", f"legacy-snapshot-{index}",
+             "running", f"2026-08-10T00:00:{index:02d}Z")
+            for index in range(count)
+        ],
+    )
+    connection.commit()
+
+
+def test_b1am_schema_only_crash_reopens_and_backfills_once(tmp_path):
+    db_path = tmp_path / "b1am-schema-crash.sqlite3"
+    setup = sqlite3.connect(db_path)
+    _b1am_legacy_metrics(setup)
+    setup.executescript(store.GRAPH_SNAPSHOT_SCHEMA_SQL)
+    assert setup.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_metric_physical_identities"
+    ).fetchone()[0] == 0
+    assert setup.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_metric_identity_schema_state"
+    ).fetchone()[0] == 0
+    setup.close()
+
+    recovered = sqlite3.connect(db_path)
+    recovered.row_factory = sqlite3.Row
+    store.ensure_schema(recovered)
+    store.ensure_reconcile_metric_physical_identity_migration(recovered)
+    identities = [dict(row) for row in recovered.execute(
+        "SELECT * FROM graph_reconcile_metric_physical_identities ORDER BY identity_sequence"
+    )]
+    assert [row["metric_rowid"] for row in identities] == [1, 2, 3]
+    assert recovered.execute(
+        "SELECT marker FROM graph_reconcile_metric_identity_schema_state"
+    ).fetchone()[0] == "physical_identity_backfill_v1"
+    before_changes = recovered.total_changes
+    store.ensure_schema(recovered)
+    store.ensure_reconcile_metric_physical_identity_migration(recovered)
+    assert recovered.total_changes == before_changes
+    assert [dict(row) for row in recovered.execute(
+        "SELECT * FROM graph_reconcile_metric_physical_identities ORDER BY identity_sequence"
+    )] == identities
+    recovered.close()
+
+
+def test_b1am_partial_backfill_heals_only_missing_in_rowid_order(conn):
+    conn.close()
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    _b1am_legacy_metrics(connection)
+    connection.executescript(store.GRAPH_SNAPSHOT_SCHEMA_SQL)
+    connection.execute(
+        "INSERT INTO graph_reconcile_metric_physical_identities "
+        "(project_id,run_id,snapshot_id,metric_rowid) "
+        "VALUES ('legacy-project','legacy-run-1','legacy-snapshot-1',2)"
+    )
+    connection.commit()
+
+    receipt = store.ensure_reconcile_metric_physical_identity_migration(connection)
+
+    rows = [dict(row) for row in connection.execute(
+        "SELECT * FROM graph_reconcile_metric_physical_identities ORDER BY identity_sequence"
+    )]
+    assert receipt["backfilled"] == 2
+    assert [(row["run_id"], row["metric_rowid"]) for row in rows] == [
+        ("legacy-run-1", 2), ("legacy-run-0", 1), ("legacy-run-2", 3)
+    ]
+    assert connection.in_transaction is False
+    connection.close()
+
+
+def test_b1am_direct_marker_cannot_forge_completion_before_backfill(conn):
+    conn.close()
+    connection = sqlite3.connect(":memory:")
+    _b1am_legacy_metrics(connection, count=1)
+    connection.executescript(store.GRAPH_SNAPSHOT_SCHEMA_SQL)
+    with pytest.raises(sqlite3.IntegrityError, match="marker_incomplete"):
+        connection.execute(
+            "INSERT INTO graph_reconcile_metric_identity_schema_state(marker) "
+            "VALUES ('physical_identity_backfill_v1')"
+        )
+    connection.rollback()
+    receipt = store.ensure_reconcile_metric_physical_identity_migration(connection)
+    assert receipt["backfilled"] == 1
+    assert connection.execute(
+        "SELECT metric_rowid FROM graph_reconcile_metric_physical_identities"
+    ).fetchone()[0] == 1
+    connection.close()
+
+
+def test_b1am_same_key_wrong_rowid_identity_does_not_satisfy_marker(conn):
+    conn.close()
+    connection = sqlite3.connect(":memory:")
+    _b1am_legacy_metrics(connection, count=1)
+    connection.executescript(store.GRAPH_SNAPSHOT_SCHEMA_SQL)
+    connection.execute(
+        "INSERT INTO graph_reconcile_metric_physical_identities "
+        "(project_id,run_id,snapshot_id,metric_rowid) "
+        "VALUES ('legacy-project','legacy-run-0','legacy-snapshot-0',999)"
+    )
+    connection.commit()
+    receipt = store.ensure_reconcile_metric_physical_identity_migration(connection)
+    assert receipt["backfilled"] == 1
+    assert [row[0] for row in connection.execute(
+        "SELECT metric_rowid FROM graph_reconcile_metric_physical_identities "
+        "ORDER BY identity_sequence"
+    )] == [999, 1]
+    connection.close()
+
+
+def test_b1am_fault_before_marker_rolls_back_then_reopen_heals(tmp_path, monkeypatch):
+    db_path = tmp_path / "b1am-fault.sqlite3"
+    connection = sqlite3.connect(db_path)
+    _b1am_legacy_metrics(connection, count=2)
+    connection.executescript(store.GRAPH_SNAPSHOT_SCHEMA_SQL)
+
+    def fail(_connection):
+        raise RuntimeError("marker-write-fault")
+
+    monkeypatch.setattr(store, "_reconcile_metric_identity_before_marker_hook", fail)
+    with pytest.raises(RuntimeError, match="marker-write-fault"):
+        store.ensure_reconcile_metric_physical_identity_migration(connection)
+    assert connection.in_transaction is False
+    assert connection.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_metric_physical_identities"
+    ).fetchone()[0] == 0
+    assert connection.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_metric_identity_schema_state"
+    ).fetchone()[0] == 0
+    connection.close()
+    monkeypatch.setattr(
+        store, "_reconcile_metric_identity_before_marker_hook", lambda _connection: None
+    )
+    recovered = sqlite3.connect(db_path)
+    store.ensure_schema(recovered)
+    receipt = store.ensure_reconcile_metric_physical_identity_migration(recovered)
+    assert receipt["backfilled"] == 2
+    assert receipt["writes_performed"] is True
+    assert recovered.in_transaction is False
+    assert recovered.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_metric_physical_identities"
+    ).fetchone()[0] == 2
+    assert recovered.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_metric_identity_schema_state"
+    ).fetchone()[0] == 1
+    recovered.close()
+
+
+def test_b1am_concurrent_first_ensure_serializes(tmp_path):
+    db_path = tmp_path / "b1am-concurrent.sqlite3"
+    setup = sqlite3.connect(db_path)
+    _b1am_legacy_metrics(setup, count=20)
+    setup.close()
+    barrier = threading.Barrier(2)
+
+    def migrate():
+        connection = sqlite3.connect(db_path, timeout=5)
+        barrier.wait(timeout=5)
+        store.ensure_schema(connection)
+        receipt = store.ensure_reconcile_metric_physical_identity_migration(connection)
+        connection.close()
+        return receipt
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(migrate) for _ in range(2)]
+        receipts = [future.result(timeout=10) for future in futures]
+    assert sorted(
+        (receipt["writes_performed"], receipt["backfilled"]) for receipt in receipts
+    ) == [(False, 0), (True, 20)]
+    verify = sqlite3.connect(db_path)
+    assert verify.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_metric_physical_identities"
+    ).fetchone()[0] == 20
+    assert verify.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_metric_identity_schema_state"
+    ).fetchone()[0] == 1
+    verify.close()
+
+
+def test_b1am_identity_and_marker_are_immutable_against_replace_and_upsert(conn):
+    _ensure_schema(conn)
+    store.ensure_schema(conn)
+    store.ensure_reconcile_metric_physical_identity_migration(conn)
+    conn.execute(
+        "INSERT INTO reconcile_run_metrics (project_id,run_id,snapshot_id,status,created_at) "
+        "VALUES (?,?,?,?,?)", (PID, "b1am-run", "b1am-snapshot", "running", "2026-08-10T00:00:00Z")
+    )
+    identity = dict(conn.execute(
+        "SELECT * FROM graph_reconcile_metric_physical_identities"
+    ).fetchone())
+    for table, where in (
+        ("graph_reconcile_metric_physical_identities", "identity_sequence=:identity_sequence"),
+        ("graph_reconcile_metric_identity_schema_state", "marker='physical_identity_backfill_v1'"),
+    ):
+        with pytest.raises(sqlite3.IntegrityError, match="append_only"):
+            conn.execute(f"UPDATE {table} SET marker=marker WHERE {where}" if "schema_state" in table else f"UPDATE {table} SET metric_rowid=metric_rowid WHERE {where}", identity)
+        with pytest.raises(sqlite3.IntegrityError, match="append_only"):
+            conn.execute(f"DELETE FROM {table} WHERE {where}", identity)
+    with pytest.raises(sqlite3.IntegrityError, match="identity_conflict"):
+        conn.execute(
+            "INSERT OR REPLACE INTO graph_reconcile_metric_physical_identities "
+            "(identity_sequence,project_id,run_id,snapshot_id,metric_rowid) "
+            "VALUES (:identity_sequence,:project_id,:run_id,:snapshot_id,:metric_rowid)", identity,
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="identity_conflict"):
+        conn.execute(
+            "INSERT INTO graph_reconcile_metric_physical_identities "
+            "(identity_sequence,project_id,run_id,snapshot_id,metric_rowid) "
+            "VALUES (:identity_sequence,:project_id,:run_id,:snapshot_id,:metric_rowid) "
+            "ON CONFLICT(identity_sequence) DO UPDATE SET metric_rowid=excluded.metric_rowid", identity,
+        )
+    for prefix in ("INSERT OR REPLACE", "INSERT"):
+        suffix = (
+            " ON CONFLICT(marker) DO UPDATE SET marker=excluded.marker"
+            if prefix == "INSERT" else ""
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="marker_conflict"):
+            conn.execute(
+                f"{prefix} INTO graph_reconcile_metric_identity_schema_state(marker) "
+                f"VALUES ('physical_identity_backfill_v1'){suffix}"
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        conn.execute(
+            "INSERT INTO graph_reconcile_metric_physical_identities "
+            "(project_id,run_id,snapshot_id,metric_rowid) VALUES ('p','r','s',0)"
+        )
+
+
+def test_b1am_autoincrement_identity_survives_max_rowid_reuse(conn):
+    _ensure_schema(conn)
+    store.ensure_schema(conn)
+    store.ensure_reconcile_metric_physical_identity_migration(conn)
+    values = (PID, "reuse-run", "reuse-snapshot", "running", "2026-08-10T00:00:00Z")
+    conn.execute(
+        "INSERT INTO reconcile_run_metrics (project_id,run_id,snapshot_id,status,created_at) "
+        "VALUES (?,?,?,?,?)", values,
+    )
+    first_rowid = conn.execute(
+        "SELECT rowid FROM reconcile_run_metrics WHERE run_id='reuse-run'"
+    ).fetchone()[0]
+    first_identity = conn.execute(
+        "SELECT MAX(identity_sequence) FROM graph_reconcile_metric_physical_identities"
+    ).fetchone()[0]
+    conn.execute("DELETE FROM reconcile_run_metrics WHERE run_id='reuse-run'")
+    conn.execute(
+        "INSERT INTO reconcile_run_metrics (project_id,run_id,snapshot_id,status,created_at) "
+        "VALUES (?,?,?,?,?)", values,
+    )
+    assert conn.execute(
+        "SELECT rowid FROM reconcile_run_metrics WHERE run_id='reuse-run'"
+    ).fetchone()[0] == first_rowid
+    identities = conn.execute(
+        "SELECT identity_sequence FROM graph_reconcile_metric_physical_identities "
+        "WHERE run_id='reuse-run' ORDER BY identity_sequence"
+    ).fetchall()
+    assert [row[0] for row in identities] == [first_identity, first_identity + 1]
+
+
+def test_b1am_healthy_ensure_is_file_physically_zero_write(tmp_path):
+    db_path = tmp_path / "b1am-zero-write.sqlite3"
+    setup = _file_connection(db_path)
+    setup.execute("PRAGMA journal_mode=WAL")
+    store.ensure_reconcile_metric_physical_identity_migration(setup)
+    setup.execute(
+        "INSERT INTO reconcile_run_metrics (project_id,run_id,snapshot_id,status,created_at) "
+        "VALUES ('wal-project','wal-run','wal-snapshot','running','2026-08-10T00:00:00Z')"
+    )
+    setup.commit()
+
+    class CountingConnection(sqlite3.Connection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.commit_calls = 0
+            self.rollback_calls = 0
+
+        def commit(self):
+            self.commit_calls += 1
+            return super().commit()
+
+        def rollback(self):
+            self.rollback_calls += 1
+            return super().rollback()
+
+    wal_path = db_path.with_name(db_path.name + "-wal")
+    before_bytes = db_path.read_bytes()
+    before_wal_bytes = wal_path.read_bytes()
+    connection = sqlite3.connect(db_path, factory=CountingConnection)
+    connection.row_factory = sqlite3.Row
+    before_pragmas = tuple(
+        connection.execute(f"PRAGMA {name}").fetchone()[0]
+        for name in ("schema_version", "page_count", "freelist_count")
+    )
+    before_schema = list(connection.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ))
+    statements = []
+    connection.set_trace_callback(statements.append)
+
+    store.ensure_schema(connection)
+    store.ensure_reconcile_metric_physical_identity_migration(connection)
+
+    connection.set_trace_callback(None)
+    assert not any(statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "BEGIN")) for statement in statements)
+    assert connection.total_changes == 0
+    assert connection.commit_calls == 0
+    assert connection.rollback_calls == 0
+    assert connection.in_transaction is False
+    assert tuple(
+        connection.execute(f"PRAGMA {name}").fetchone()[0]
+        for name in ("schema_version", "page_count", "freelist_count")
+    ) == before_pragmas
+    assert list(connection.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    )) == before_schema
+    connection.close()
+    assert db_path.read_bytes() == before_bytes
+    assert wal_path.read_bytes() == before_wal_bytes
+    setup.close()
+
+
+def test_b1am_healthy_ensure_vm_steps_are_constant_at_50k(conn):
+    _ensure_schema(conn)
+    store.ensure_schema(conn)
+    store.ensure_reconcile_metric_physical_identity_migration(conn)
+    conn.executemany(
+        "INSERT INTO reconcile_run_metrics (project_id,run_id,snapshot_id,status,created_at) "
+        "VALUES (?,?,?,?,?)",
+        [(PID, f"scale-run-{index}", f"scale-snapshot-{index}", "running", "2026-08-10T00:00:00Z") for index in range(50_000)],
+    )
+    conn.commit()
+    approximate_steps = 0
+
+    def count_steps():
+        nonlocal approximate_steps
+        approximate_steps += 100
+        return 0
+
+    conn.set_progress_handler(count_steps, 100)
+    try:
+        store.ensure_schema(conn)
+        store.ensure_reconcile_metric_physical_identity_migration(conn)
+    finally:
+        conn.set_progress_handler(None, 0)
+    assert approximate_steps < 5_000
+    assert conn.in_transaction is False
