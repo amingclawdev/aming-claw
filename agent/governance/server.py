@@ -69846,6 +69846,36 @@ def _current_full_reconcile_projection_id(
     return str(projection.get("projection_id") or "").strip()
 
 
+def _current_full_existing_projection_id_read_only(
+    conn,
+    *,
+    project_id: str,
+    snapshot_id: str,
+) -> str:
+    """Read an existing projection without invoking any schema guard or DDL."""
+
+    if not snapshot_id:
+        return ""
+    try:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'graph_semantic_projections'"
+        ).fetchone()
+        if not table:
+            return ""
+        row = conn.execute(
+            """
+            SELECT projection_id FROM graph_semantic_projections
+            WHERE project_id = ? AND snapshot_id = ?
+            ORDER BY event_watermark DESC, created_at DESC LIMIT 1
+            """,
+            (project_id, snapshot_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return ""
+    return str(row["projection_id"] if row else "").strip()
+
+
 def _current_full_reconcile_idempotency_scope(
     route_evidence: Mapping[str, Any],
 ) -> dict[str, str]:
@@ -69915,6 +69945,14 @@ def _current_full_candidate_resume_tuple(
         (project_id, origin_run_id, snapshot_id),
     ).fetchone()
     origin_metric = dict(origin_metric_row) if origin_metric_row else {}
+    origin_metric_evidence_value = _json_loads(
+        origin_metric.get("evidence_json"), None
+    )
+    origin_metric_evidence = (
+        dict(origin_metric_evidence_value)
+        if isinstance(origin_metric_evidence_value, Mapping)
+        else {}
+    )
     active_claim_count = int(
         conn.execute(
             """
@@ -69977,6 +70015,19 @@ def _current_full_candidate_resume_tuple(
             errors.append("candidate_metric_kind_mismatch")
         if str(origin_metric.get("strategy") or "") != "current_full_reconcile":
             errors.append("candidate_metric_strategy_mismatch")
+        if str(origin_metric.get("graph_delta_mode") or "") != "full_rebuild":
+            errors.append("candidate_metric_delta_mode_mismatch")
+        if not isinstance(origin_metric_evidence_value, Mapping):
+            errors.append("candidate_metric_evidence_malformed")
+        elif not origin_metric_evidence:
+            errors.append("candidate_metric_evidence_missing")
+        else:
+            if str(origin_metric_evidence.get("phase") or "") != "candidate_ready":
+                errors.append("candidate_metric_phase_mismatch")
+            if str(origin_metric_evidence.get("claim_id") or "") != str(
+                origin_claim.get("claim_id") or ""
+            ):
+                errors.append("candidate_metric_claim_mismatch")
     request_metric_status = str(request_metric.get("status") or "").strip()
     if (
         request_metric
@@ -69996,6 +70047,21 @@ def _current_full_candidate_resume_tuple(
             origin_claim.get("terminal_status") or ""
         ),
         "origin_metric_status": str(origin_metric.get("status") or ""),
+        "origin_metric_graph_delta_mode": str(
+            origin_metric.get("graph_delta_mode") or ""
+        ),
+        "origin_metric_evidence_valid": bool(
+            isinstance(origin_metric_evidence_value, Mapping)
+            and origin_metric_evidence
+            and str(origin_metric_evidence.get("phase") or "")
+            == "candidate_ready"
+            and str(origin_metric_evidence.get("claim_id") or "")
+            == str(origin_claim.get("claim_id") or "")
+        ),
+        "origin_metric_phase": str(origin_metric_evidence.get("phase") or ""),
+        "origin_metric_claim_id": str(
+            origin_metric_evidence.get("claim_id") or ""
+        ),
         "request_metric_status": request_metric_status,
         "companion_integrity": companion_integrity,
     }
@@ -70557,11 +70623,10 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "commit_sha": target_commit,
                 "snapshot_id": snapshot_id,
                 "snapshot_status": "candidate",
-                "projection_id": _current_full_reconcile_projection_id(
+                "projection_id": _current_full_existing_projection_id_read_only(
                     conn,
                     project_id=project_id,
                     snapshot_id=snapshot_id,
-                    result={},
                 ),
                 "resumed_candidate": True,
                 "candidate_origin_run_id": str(

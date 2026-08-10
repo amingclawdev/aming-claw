@@ -9754,6 +9754,20 @@ def test_current_full_cross_run_resume_is_physically_read_only(
             )
         )
         assert first_status == 201
+        origin_claim = connection.execute(
+            "SELECT claim_id FROM graph_current_full_build_claim_history "
+            "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+            (PID, origin_run_id, snapshot_id),
+        ).fetchone()
+        origin_metric = connection.execute(
+            "SELECT graph_delta_mode, evidence_json FROM reconcile_run_metrics "
+            "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+            (PID, origin_run_id, snapshot_id),
+        ).fetchone()
+        origin_evidence = json.loads(origin_metric["evidence_json"])
+        assert origin_metric["graph_delta_mode"] == "full_rebuild"
+        assert origin_evidence["phase"] == "candidate_ready"
+        assert origin_evidence["claim_id"] == origin_claim["claim_id"]
         before_changes = connection.total_changes
         before_commit_calls = wrapped.commit_calls
         before_claims = connection.execute(
@@ -9762,6 +9776,15 @@ def test_current_full_cross_run_resume_is_physically_read_only(
         before_metrics = connection.execute(
             "SELECT COUNT(*) FROM reconcile_run_metrics"
         ).fetchone()[0]
+        before_page_count = connection.execute("PRAGMA page_count").fetchone()[0]
+        before_schema = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "ORDER BY type, name"
+        ).fetchall()
+        before_schema = [tuple(row) for row in before_schema]
+        before_db_bytes = db_path.read_bytes()
+        before_db_size = db_path.stat().st_size
+        before_db_hash = hashlib.sha256(before_db_bytes).hexdigest()
 
         resumed_status, resumed = (
             server.handle_graph_governance_current_full_reconcile(
@@ -9788,6 +9811,18 @@ def test_current_full_cross_run_resume_is_physically_read_only(
         assert len(calls) == 1
         assert connection.total_changes == before_changes
         assert wrapped.commit_calls == before_commit_calls
+        assert connection.execute("PRAGMA page_count").fetchone()[0] == (
+            before_page_count
+        )
+        after_schema = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "ORDER BY type, name"
+        ).fetchall()
+        assert [tuple(row) for row in after_schema] == before_schema
+        after_db_bytes = db_path.read_bytes()
+        assert db_path.stat().st_size == before_db_size
+        assert hashlib.sha256(after_db_bytes).hexdigest() == before_db_hash
+        assert after_db_bytes == before_db_bytes
         assert connection.execute(
             "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
         ).fetchone()[0] == before_claims
@@ -9834,7 +9869,8 @@ def test_current_full_cross_run_resume_rejects_physical_companion_drift_read_onl
     snapshot_id = f"full-resume-integrity-{mutation}"
     origin_run_id = f"run-resume-integrity-origin-{mutation}"
     consumer_run_id = f"run-resume-integrity-consumer-{mutation}"
-    connection = sqlite3.connect(tmp_path / f"resume-integrity-{mutation}.sqlite")
+    db_path = tmp_path / f"resume-integrity-{mutation}.sqlite"
+    connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     _ensure_schema(connection)
     store.ensure_schema(connection)
@@ -9892,6 +9928,17 @@ def test_current_full_cross_run_resume_rejects_physical_companion_drift_read_onl
         before_metrics = connection.execute(
             "SELECT COUNT(*) FROM reconcile_run_metrics"
         ).fetchone()[0]
+        before_page_count = connection.execute("PRAGMA page_count").fetchone()[0]
+        before_schema = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+        ]
+        before_db_bytes = db_path.read_bytes()
+        before_db_size = db_path.stat().st_size
+        before_db_hash = hashlib.sha256(before_db_bytes).hexdigest()
         status, result = server.handle_graph_governance_current_full_reconcile(
             _ctx_with_role(
                 {"project_id": PID},
@@ -9918,6 +9965,20 @@ def test_current_full_cross_run_resume_rejects_physical_companion_drift_read_onl
         assert len(calls) == 1
         assert connection.total_changes == before_changes
         assert wrapped.commit_calls == before_commit_calls
+        assert connection.execute("PRAGMA page_count").fetchone()[0] == (
+            before_page_count
+        )
+        assert [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+        ] == before_schema
+        after_db_bytes = db_path.read_bytes()
+        assert db_path.stat().st_size == before_db_size
+        assert hashlib.sha256(after_db_bytes).hexdigest() == before_db_hash
+        assert after_db_bytes == before_db_bytes
         assert connection.execute(
             "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
         ).fetchone()[0] == before_claims
@@ -9929,6 +9990,170 @@ def test_current_full_cross_run_resume_rejects_physical_companion_drift_read_onl
             "AND run_id = ? AND snapshot_id = ?",
             (PID, origin_run_id, snapshot_id),
         ).fetchone()[0] == "candidate_ready"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics WHERE project_id = ? "
+            "AND run_id = ? AND snapshot_id = ?",
+            (PID, consumer_run_id, snapshot_id),
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("delta_mode", "candidate_metric_delta_mode_mismatch"),
+        ("foreign_claim", "candidate_metric_claim_mismatch"),
+        ("wrong_phase", "candidate_metric_phase_mismatch"),
+        ("missing_evidence", "candidate_metric_evidence_missing"),
+        ("malformed_evidence", "candidate_metric_evidence_malformed"),
+    ],
+)
+def test_current_full_cross_run_resume_rejects_unbound_origin_metric_read_only(
+    monkeypatch,
+    tmp_path,
+    mutation,
+    expected_error,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    snapshot_id = f"full-resume-metric-{mutation}"
+    origin_run_id = f"run-resume-metric-origin-{mutation}"
+    consumer_run_id = f"run-resume-metric-consumer-{mutation}"
+    db_path = tmp_path / f"resume-metric-{mutation}.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.commit()
+    wrapped = _CountingNoCloseConn(connection)
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root", lambda: tmp_path / "state"
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: wrapped)
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    try:
+        first_status, _first = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "snapshot_id": snapshot_id,
+                    "run_id": origin_run_id,
+                    "activate": False,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+        assert first_status == 201
+        metric = connection.execute(
+            "SELECT evidence_json FROM reconcile_run_metrics WHERE project_id = ? "
+            "AND run_id = ? AND snapshot_id = ?",
+            (PID, origin_run_id, snapshot_id),
+        ).fetchone()
+        evidence = json.loads(metric["evidence_json"])
+        if mutation == "delta_mode":
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET graph_delta_mode = ? "
+                "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+                ("incremental_graph_delta", PID, origin_run_id, snapshot_id),
+            )
+        elif mutation == "foreign_claim":
+            evidence["claim_id"] = "gcfclaim-foreign"
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET evidence_json = ? "
+                "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+                (json.dumps(evidence), PID, origin_run_id, snapshot_id),
+            )
+        elif mutation == "wrong_phase":
+            evidence["phase"] = "running"
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET evidence_json = ? "
+                "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+                (json.dumps(evidence), PID, origin_run_id, snapshot_id),
+            )
+        elif mutation == "missing_evidence":
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET evidence_json = '{}' "
+                "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+                (PID, origin_run_id, snapshot_id),
+            )
+        elif mutation == "malformed_evidence":
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET evidence_json = 'not-json' "
+                "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+                (PID, origin_run_id, snapshot_id),
+            )
+        else:
+            raise AssertionError(f"unhandled mutation: {mutation}")
+        connection.commit()
+
+        before_changes = connection.total_changes
+        before_commit_calls = wrapped.commit_calls
+        before_claims = connection.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
+        ).fetchone()[0]
+        before_metrics = connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics"
+        ).fetchone()[0]
+        before_page_count = connection.execute("PRAGMA page_count").fetchone()[0]
+        before_schema = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+        ]
+        before_db_bytes = db_path.read_bytes()
+        before_db_size = db_path.stat().st_size
+        before_db_hash = hashlib.sha256(before_db_bytes).hexdigest()
+        status, result = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "snapshot_id": snapshot_id,
+                    "run_id": consumer_run_id,
+                    "activate": False,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+
+        assert status == 409
+        assert result["error"] == "current_full_candidate_resume_tuple_invalid"
+        assert result["rebuild_started"] is False
+        assert expected_error in result["resume_tuple"]["errors"]
+        assert len(calls) == 1
+        assert connection.total_changes == before_changes
+        assert wrapped.commit_calls == before_commit_calls
+        assert connection.execute("PRAGMA page_count").fetchone()[0] == (
+            before_page_count
+        )
+        assert [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+        ] == before_schema
+        after_db_bytes = db_path.read_bytes()
+        assert db_path.stat().st_size == before_db_size
+        assert hashlib.sha256(after_db_bytes).hexdigest() == before_db_hash
+        assert after_db_bytes == before_db_bytes
+        assert connection.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
+        ).fetchone()[0] == before_claims
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics"
+        ).fetchone()[0] == before_metrics
         assert connection.execute(
             "SELECT COUNT(*) FROM reconcile_run_metrics WHERE project_id = ? "
             "AND run_id = ? AND snapshot_id = ?",
