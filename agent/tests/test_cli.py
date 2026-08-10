@@ -2176,6 +2176,14 @@ class TestCliStart:
         monkeypatch.setitem(sys.modules, "start_governance", fake_start_governance)
         monkeypatch.setattr(cli, "_probe_governance", lambda port: None)
         monkeypatch.setattr(cli, "_port_is_open", lambda port: False)
+        monkeypatch.setattr(
+            cli,
+            "_governance_start_resource_preflight",
+            lambda: {
+                "schema_version": "governance_startup_resource_preflight.v1",
+                "status": "already_sufficient",
+            },
+        )
         monkeypatch.delenv("AMING_CLAW_HOME", raising=False)
         monkeypatch.delenv("SHARED_VOLUME_PATH", raising=False)
 
@@ -2218,6 +2226,146 @@ class TestCliStart:
         assert result.exit_code != 0
         assert "Port 45555 is already in use PID=1234" in result.output
         assert "not Aming Claw governance" in result.output
+
+    def test_resource_preflight_raises_256_soft_limit_to_release_minimum(self, monkeypatch):
+        import agent.cli as cli
+
+        class FakeResource:
+            RLIMIT_NOFILE = 7
+            RLIM_INFINITY = -1
+
+            def __init__(self):
+                self.limit = (256, 8192)
+                self.set_calls = []
+
+            def getrlimit(self, resource_id):
+                assert resource_id == self.RLIMIT_NOFILE
+                return self.limit
+
+            def setrlimit(self, resource_id, limits):
+                assert resource_id == self.RLIMIT_NOFILE
+                self.set_calls.append(limits)
+                self.limit = limits
+
+        fake_resource = FakeResource()
+        monkeypatch.setitem(sys.modules, "resource", fake_resource)
+
+        diagnostic = cli._governance_start_resource_preflight()
+
+        assert fake_resource.set_calls == [(cli._GOVERNANCE_MIN_NOFILE, 8192)]
+        assert diagnostic == {
+            "schema_version": "governance_startup_resource_preflight.v1",
+            "resource": "RLIMIT_NOFILE",
+            "required_soft_limit": cli._GOVERNANCE_MIN_NOFILE,
+            "process_scope_only": True,
+            "global_host_mutation": False,
+            "supported": True,
+            "original_soft_limit": 256,
+            "hard_limit": 8192,
+            "hard_limit_sufficient": True,
+            "status": "raised",
+            "policy": "raise_process_soft_limit_to_release_minimum",
+            "effective_soft_limit": cli._GOVERNANCE_MIN_NOFILE,
+            "effective_hard_limit": 8192,
+        }
+
+    def test_resource_preflight_never_lowers_existing_higher_limit(self, monkeypatch):
+        import agent.cli as cli
+
+        fake_resource = types.SimpleNamespace(
+            RLIMIT_NOFILE=7,
+            RLIM_INFINITY=-1,
+            getrlimit=lambda resource_id: (8192, 16384),
+            setrlimit=lambda resource_id, limits: pytest.fail("must not lower limit"),
+        )
+        monkeypatch.setitem(sys.modules, "resource", fake_resource)
+
+        diagnostic = cli._governance_start_resource_preflight()
+
+        assert diagnostic["status"] == "already_sufficient"
+        assert diagnostic["policy"] == "preserve_higher_existing_limit"
+        assert diagnostic["original_soft_limit"] == 8192
+        assert diagnostic["effective_soft_limit"] == 8192
+
+    def test_resource_preflight_fails_closed_when_finite_hard_limit_is_too_low(
+        self, monkeypatch
+    ):
+        import agent.cli as cli
+
+        fake_resource = types.SimpleNamespace(
+            RLIMIT_NOFILE=7,
+            RLIM_INFINITY=-1,
+            getrlimit=lambda resource_id: (256, 2048),
+            setrlimit=lambda resource_id, limits: pytest.fail("must not attempt raise"),
+        )
+        monkeypatch.setitem(sys.modules, "resource", fake_resource)
+
+        with pytest.raises(cli.click.ClickException, match="finite hard limit is 2048"):
+            cli._governance_start_resource_preflight()
+
+    def test_resource_preflight_documents_unavailable_cross_platform_policy(
+        self, monkeypatch
+    ):
+        import agent.cli as cli
+
+        monkeypatch.setitem(sys.modules, "resource", None)
+
+        diagnostic = cli._governance_start_resource_preflight()
+
+        assert diagnostic == {
+            "schema_version": "governance_startup_resource_preflight.v1",
+            "resource": "RLIMIT_NOFILE",
+            "required_soft_limit": cli._GOVERNANCE_MIN_NOFILE,
+            "process_scope_only": True,
+            "global_host_mutation": False,
+            "supported": False,
+            "status": "unavailable",
+            "policy": "continue_when_resource_api_unavailable",
+        }
+
+    def test_start_runs_resource_preflight_before_importing_governance(
+        self, monkeypatch, tmp_path
+    ):
+        import agent.cli as cli
+
+        runner = CliRunner()
+        events = []
+
+        class StartGovernanceModule(types.ModuleType):
+            def __getattribute__(self, name):
+                if name == "main":
+                    events.append("import_start_governance")
+                return super().__getattribute__(name)
+
+        fake_start_governance = StartGovernanceModule("start_governance")
+        fake_start_governance.main = lambda workspace_root=None: events.append(
+            "start_governance.main"
+        )
+        monkeypatch.setitem(sys.modules, "start_governance", fake_start_governance)
+        monkeypatch.setattr(cli, "_probe_governance", lambda port: None)
+        monkeypatch.setattr(cli, "_port_is_open", lambda port: False)
+        monkeypatch.setattr(
+            cli,
+            "_governance_start_resource_preflight",
+            lambda: events.append("resource_preflight")
+            or {
+                "schema_version": "governance_startup_resource_preflight.v1",
+                "status": "raised",
+            },
+        )
+
+        result = runner.invoke(
+            main,
+            ["start", "--workspace", str(tmp_path), "--port", "45555"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert events == [
+            "resource_preflight",
+            "import_start_governance",
+            "start_governance.main",
+        ]
+        assert "Governance startup resource preflight:" in result.output
 
 
 class TestCliPlugin:

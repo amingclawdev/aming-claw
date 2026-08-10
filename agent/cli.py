@@ -46,6 +46,12 @@ log = logging.getLogger(__name__)
 
 DEFAULT_GOVERNANCE_URL = "http://localhost:40000"
 
+# Governance keeps bounded SQLite state open for each registered project. 4096
+# leaves release-scale descriptor headroom while remaining below ordinary POSIX
+# hard limits. This changes only the current foreground process; it never edits
+# launchd, systemd, shell, or host-wide resource configuration.
+_GOVERNANCE_MIN_NOFILE = 4096
+
 _YAML_TEMPLATE = """\
 # aming-claw project configuration
 project_id: ""
@@ -259,6 +265,105 @@ def _port_owner_hint(port: int) -> str:
     return f" PID={pid}" if pid else ""
 
 
+def _governance_start_resource_preflight() -> dict[str, Any]:
+    """Ensure this process has release-safe file-descriptor headroom.
+
+    Platforms without the POSIX ``resource`` API continue with an explicit
+    unavailable diagnostic because there is no portable per-process limit to
+    inspect or change there. When the API is present, unreadable limits,
+    mutation failures, or a finite hard limit below the release minimum fail
+    closed before governance imports and opens project databases.
+    """
+    diagnostic: dict[str, Any] = {
+        "schema_version": "governance_startup_resource_preflight.v1",
+        "resource": "RLIMIT_NOFILE",
+        "required_soft_limit": _GOVERNANCE_MIN_NOFILE,
+        "process_scope_only": True,
+        "global_host_mutation": False,
+    }
+    try:
+        import resource as resource_module
+    except ImportError:
+        return {
+            **diagnostic,
+            "supported": False,
+            "status": "unavailable",
+            "policy": "continue_when_resource_api_unavailable",
+        }
+
+    required_api = ("RLIMIT_NOFILE", "RLIM_INFINITY", "getrlimit", "setrlimit")
+    if any(not hasattr(resource_module, name) for name in required_api):
+        return {
+            **diagnostic,
+            "supported": False,
+            "status": "unavailable",
+            "policy": "continue_when_resource_api_unavailable",
+        }
+
+    try:
+        soft_limit, hard_limit = resource_module.getrlimit(resource_module.RLIMIT_NOFILE)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(
+            "Governance startup resource preflight could not read RLIMIT_NOFILE; "
+            "refusing to start without verified descriptor headroom."
+        ) from exc
+
+    infinity = resource_module.RLIM_INFINITY
+    hard_is_infinite = hard_limit == infinity
+    limit_display = lambda value: "infinity" if value == infinity else int(value)
+    diagnostic.update(
+        {
+            "supported": True,
+            "original_soft_limit": limit_display(soft_limit),
+            "hard_limit": limit_display(hard_limit),
+            "hard_limit_sufficient": hard_is_infinite
+            or hard_limit >= _GOVERNANCE_MIN_NOFILE,
+        }
+    )
+
+    if not hard_is_infinite and hard_limit < _GOVERNANCE_MIN_NOFILE:
+        raise click.ClickException(
+            "Governance startup requires RLIMIT_NOFILE soft headroom of at least "
+            f"{_GOVERNANCE_MIN_NOFILE}, but the finite hard limit is {hard_limit}. "
+            "Raise the launcher/service hard limit before starting governance."
+        )
+
+    if soft_limit >= _GOVERNANCE_MIN_NOFILE or soft_limit == infinity:
+        return {
+            **diagnostic,
+            "status": "already_sufficient",
+            "policy": "preserve_higher_existing_limit",
+            "effective_soft_limit": limit_display(soft_limit),
+        }
+
+    try:
+        resource_module.setrlimit(
+            resource_module.RLIMIT_NOFILE,
+            (_GOVERNANCE_MIN_NOFILE, hard_limit),
+        )
+        effective_soft, effective_hard = resource_module.getrlimit(
+            resource_module.RLIMIT_NOFILE
+        )
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(
+            "Governance startup could not raise the process RLIMIT_NOFILE soft "
+            f"limit to {_GOVERNANCE_MIN_NOFILE}; refusing to start."
+        ) from exc
+    if effective_soft < _GOVERNANCE_MIN_NOFILE:
+        raise click.ClickException(
+            "Governance startup RLIMIT_NOFILE verification failed after the "
+            f"raise attempt (effective soft limit {effective_soft})."
+        )
+
+    return {
+        **diagnostic,
+        "status": "raised",
+        "policy": "raise_process_soft_limit_to_release_minimum",
+        "effective_soft_limit": limit_display(effective_soft),
+        "effective_hard_limit": limit_display(effective_hard),
+    }
+
+
 def _launcher_html(governance_url: str) -> str:
     dashboard_url = _dashboard_url(governance_url)
     return f"""<!doctype html>
@@ -321,6 +426,12 @@ def start(workspace, port):
     runtime_workspace = Path(workspace).resolve() if workspace else _default_runtime_workspace()
     os.environ["AMING_CLAW_HOME"] = str(runtime_workspace)
     os.environ.setdefault("SHARED_VOLUME_PATH", str(runtime_workspace / "shared-volume"))
+    resource_preflight = _governance_start_resource_preflight()
+    click.echo(
+        "Governance startup resource preflight: "
+        + json.dumps(resource_preflight, sort_keys=True),
+        err=True,
+    )
     import start_governance
 
     start_governance.main(workspace_root=runtime_workspace)
