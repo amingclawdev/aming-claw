@@ -54087,6 +54087,9 @@ def test_pre_lineage_rejoin_guide_advertises_one_bounded_replacement(
     assert eligibility["authority"]["actual_worker_write_baseline"][
         "timeline_worker_write_count"
     ] == 0
+    assert eligibility["authority"]["actual_worker_write_baseline"][
+        "contract_execution_id"
+    ] == case["parent_task_id"]
     assert eligibility["authority"]["current_session_token_ref"] == (
         runtime_context_session_token_ref(context)
     )
@@ -54111,6 +54114,265 @@ def test_pre_lineage_rejoin_guide_advertises_one_bounded_replacement(
     )
     assert exhausted["eligible"] is False
     assert exhausted["mode"] == "replacement_exhausted"
+
+
+def test_compact_legacy_recovery_projects_managed_observer_hotfix_attempt(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="managed-observer-hotfix-recovery",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+    )
+    first = _pre_lineage_rejoin(case)
+    replacement = _pre_lineage_rejoin(
+        case,
+        body_updates={
+            "session_token_ref": first["session_token_ref"],
+            "reason": "consume the only bounded replacement before recovery",
+        },
+    )
+    context = get_branch_context(conn, PID, case["task_id"])
+    assert context is not None
+    eligibility = server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=context,
+    )
+    assert eligibility["eligible"] is False
+    assert eligibility["mode"] == "replacement_exhausted"
+
+    runtime = server._contract_runtime(conn)
+    parent_record = runtime.store.get(case["parent_task_id"])
+    predecessor = server._observer_hotfix_successor_runtime_enter(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        task_id="managed-observer-hotfix-predecessor",
+        parent_record=parent_record,
+        actor_role="observer",
+        route_token_ref=case["route_identity"]["route_token_ref"],
+        reason="record the immutable predecessor before the next attempt",
+    )
+    completed = _complete_source_backed_hotfix_successor(
+        conn,
+        predecessor["contract_execution_id"],
+    )
+    completed_state = server._runtime_current_state_from_record(completed)
+
+    recovery_ref = "rtok-managed-observer-hotfix-recovery"
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=recovery_ref,
+        token={
+            "route_id": "route-managed-observer-hotfix-recovery",
+            "route_context_hash": _fake_sha("managed-hotfix:context"),
+            "prompt_contract_id": "prompt-managed-observer-hotfix-recovery",
+            "prompt_contract_hash": _fake_sha("managed-hotfix:prompt"),
+            "visible_injection_manifest_hash": _fake_sha(
+                "managed-hotfix:manifest"
+            ),
+            "route_token_ref": recovery_ref,
+            "caller_role": "observer",
+            "allowed_actions": ["hotfix_enter"],
+            "target_files": ["agent/governance/server.py"],
+            "owned_files": ["agent/governance/server.py"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": case["backlog_id"],
+                "task_id": case["parent_task_id"],
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": ["test:managed-observer-hotfix-recovery"],
+        },
+    )
+    conn.commit()
+
+    guide = server._onboard_route_guide_service_response(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        route_token_ref=recovery_ref,
+        role="observer",
+        work_type="legacy_operator_recovery",
+        response_view="compact",
+        request_body={},
+    )
+
+    assert guide["ok"] is True, guide
+    assert guide["actionable"] is True, guide
+    assert guide["next_legal_action"]["action"] == (
+        "start_attempt_scoped_observer_hotfix_successor"
+    )
+    action = guide["canonical_executable_action"]
+    assert action["action"] == (
+        "start_attempt_scoped_observer_hotfix_successor"
+    )
+    assert action["facade"] == "observer_hotfix_enter"
+    assert action["mcp_tool"] == "observer_hotfix_enter"
+    body = action["copy_safe_body"]
+    assert set(body) == server._OBSERVER_HOTFIX_ATTEMPT_ALLOWED_FIELDS
+    assert body["parent_contract_execution_id"] == case["parent_task_id"]
+    assert body["predecessor_contract_execution_id"] == predecessor[
+        "contract_execution_id"
+    ]
+    assert body["predecessor_execution_state_revision"] == completed_state[
+        "execution_state_revision"
+    ]
+    assert body["predecessor_execution_state_hash"] == completed_state[
+        "execution_state_hash"
+    ]
+    managed = action["host_realization"]["managed_observer_session"]
+    assert managed["register_mcp_tool"] == "observer_session_register"
+    assert managed["heartbeat_mcp_tool"] == "observer_session_heartbeat"
+    assert managed["hotfix_mcp_token_ref_field"] == (
+        "observer_session_token_ref"
+    )
+    assert managed["observer_session_id_transport"] == "query_parameter"
+    assert managed["raw_session_token_process_local_only"] is True
+    assert managed["raw_session_token_exposed"] is False
+    assert guide["runtime_context_recovery_authority"]["runtime_context_id"] == (
+        context.runtime_context_id
+    )
+    assert guide["runtime_context_recovery_authority"]["mode"] == (
+        "replacement_exhausted"
+    )
+    assert guide["serialized_bytes"] <= guide["max_serialized_bytes"]
+    serialized = json.dumps(guide, sort_keys=True)
+    assert first["session_token"] not in serialized
+    assert replacement["session_token"] not in serialized
+    assert first["fence_token"] not in serialized
+    assert replacement["fence_token"] not in serialized
+
+    wrong_scope = server._onboard_route_guide_service_response(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        route_token_ref=case["route_identity"]["route_token_ref"],
+        role="observer",
+        work_type="legacy_operator_recovery",
+        response_view="compact",
+        request_body={},
+    )
+    assert wrong_scope["actionable"] is False
+    assert wrong_scope["canonical_executable_action"] == {}
+
+
+@pytest.mark.parametrize("persisted_prelineage_cex", ["exact", "legacy_empty"])
+def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drift(
+    conn,
+    monkeypatch,
+    tmp_path,
+    persisted_prelineage_cex,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="receipt-advances-rejoin-checkpoint",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+    )
+    first = _pre_lineage_rejoin(case)
+    replacement = _pre_lineage_rejoin(
+        case,
+        body_updates={
+            "session_token_ref": first["session_token_ref"],
+            "reason": "replace the lost pre-receipt envelope once",
+        },
+    )
+    for result in (first, replacement):
+        assert result["bounded_replacement_worker_write_baseline"][
+            "contract_execution_id"
+        ] == case["parent_task_id"]
+    if persisted_prelineage_cex == "legacy_empty":
+        for event_id in (first["audit_event_id"], replacement["audit_event_id"]):
+            event = next(
+                item
+                for item in _pre_lineage_case_events(conn, case)
+                if int(item["id"]) == int(event_id)
+            )
+            payload = copy.deepcopy(event["payload"])
+            baseline = dict(
+                payload["bounded_replacement_worker_write_baseline"]
+            )
+            baseline["contract_execution_id"] = ""
+            baseline.pop("stage_checkpoint_id", None)
+            checkpoint = server._runtime_context_rejoin_stage_checkpoint(
+                baseline
+            )
+            baseline["stage_checkpoint_id"] = checkpoint["stage_checkpoint_id"]
+            payload["bounded_replacement_worker_write_baseline"] = baseline
+            payload["rejoin_stage_checkpoint_id"] = checkpoint[
+                "stage_checkpoint_id"
+            ]
+            authority = payload.get("bounded_replacement_rejoin_authority")
+            if isinstance(authority, dict) and authority:
+                for key in (
+                    "current_worker_write_baseline",
+                    "expected_worker_write_baseline",
+                    "actual_worker_write_baseline",
+                ):
+                    if key in authority:
+                        authority[key] = dict(baseline)
+                authority["current_stage_checkpoint"] = dict(checkpoint)
+                authority["current_stage_checkpoint_id"] = checkpoint[
+                    "stage_checkpoint_id"
+                ]
+            conn.execute(
+                "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+                (json.dumps(payload, sort_keys=True), event_id),
+            )
+        conn.commit()
+
+    receipt_hash = _fake_sha("receipt-advances-rejoin-checkpoint")
+    receipt = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case["context"].runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "runtime_context_id": case["context"].runtime_context_id,
+                "contract_execution_id": case["parent_task_id"],
+                "task_id": case["task_id"],
+                "parent_task_id": case["parent_task_id"],
+                "worker_id": case["worker_id"],
+                "worker_slot_id": case["worker_id"],
+                "fence_token": replacement["fence_token"],
+                "session_token": replacement["session_token"],
+                "session_token_ref": replacement["session_token_ref"],
+                "target_project_root": str(case["target_root"]),
+                "actor": case["worker_id"],
+                "read_receipt_hash": receipt_hash,
+                "launch_text_hash": receipt_hash,
+                **case["route_identity"],
+            },
+        )
+    )
+    assert receipt["ok"] is True
+    context = get_branch_context(conn, PID, case["task_id"])
+    assert context is not None
+    guidance = server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=context,
+    )
+    assert guidance["eligible"] is True, guidance
+    assert guidance["mode"] == "active_context_auth_only"
+    assert guidance["authority"]["mode"] == "next_stage_checkpoint_issuance"
+    assert guidance["authority"]["historical_advanced_checkpoint_event_refs"] == [
+        first["audit_event_ref"],
+        replacement["audit_event_ref"],
+    ]
 
 
 @pytest.mark.parametrize(
@@ -102217,6 +102479,23 @@ def test_compact_worker_read_projects_current_runtime_context_receipt_facade(con
     assert body["session_token"].startswith("<read from env:")
     assert body["fence_token"].startswith("<read from env:")
     assert action["host_realization"]["required_replacement_paths"]
+    hash_contract = action["host_realization"]["hash_replacement_contract"]
+    assert hash_contract["schema_version"] == (
+        "runtime_context.read_receipt_hash_replacement_contract.v1"
+    )
+    assert hash_contract["algorithm"] == "sha256_utf8"
+    assert hash_contract["source_response"] == (
+        "parallel_branch_allocate_or_observer_runtime_text_prepare"
+    )
+    assert hash_contract["precomputed_hash_json_pointer"] == "/launch_text_hash"
+    assert hash_contract["raw_source_json_pointer"] == "/launch_text"
+    assert hash_contract["required_destination_json_pointer"] == (
+        "/read_receipt_hash"
+    )
+    assert "/launch_text_hash" in hash_contract[
+        "replace_if_present_json_pointers"
+    ]
+    assert hash_contract["authority_inference_allowed"] is False
     assert "session-guide-worker-read" not in json.dumps(guide, sort_keys=True)
     assert guide["actionable"] is True
 

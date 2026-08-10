@@ -3380,12 +3380,26 @@ def _dispatch_tool(name: str, args: dict) -> Any:
 
     if name == "observer_hotfix_enter":
         pid = args["project_id"]
+        observer_session_id = str(
+            args.get("observer_session_id") or ""
+        ).strip()
         body = {
             key: value
             for key, value in args.items()
-            if key != "project_id" and value is not None
+            if key not in {"project_id", "observer_session_id"}
+            and value is not None
         }
-        return _http("POST", f"/api/projects/{pid}/hotfix/enter", body)
+        query = (
+            "?"
+            + urllib.parse.urlencode(
+                {"observer_session_id": observer_session_id}
+            )
+            if observer_session_id
+            else ""
+        )
+        return _http(
+            "POST", f"/api/projects/{pid}/hotfix/enter{query}", body
+        )
 
     if name == "mf_parallel_enter":
         if not str(args.get("project_id") or "").strip():

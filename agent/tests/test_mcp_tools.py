@@ -1293,10 +1293,129 @@ def test_mcp_observer_hotfix_enter_schema_exposes_observer_route_refs():
     props = hotfix["inputSchema"]["properties"]
 
     assert props["observer_session_id"]["type"] == "string"
+    assert props["observer_session_token_ref"]["type"] == "string"
     assert props["observer_route_token_ref"]["type"] == "string"
     assert "raw route tokens are not accepted" in props["observer_route_token_ref"][
         "description"
     ]
+
+
+def test_mcp_managed_observer_session_ref_heartbeats_and_strips_hotfix_auth():
+    raw_token = "observer-secret-must-stay-process-local"
+
+    class Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, method, path, body=None):
+            self.calls.append((method, path, body))
+            if path.endswith("/observer-sessions/register"):
+                return {
+                    "ok": True,
+                    "session_id": "obs-managed-hotfix",
+                    "session_token": raw_token,
+                }
+            return {"ok": True}
+
+    recorder = Recorder()
+    dispatcher = ToolDispatcher(
+        api_fn=recorder,
+        worker_pool=None,
+        manager_api_fn=recorder,
+        workspace="/repo",
+    )
+    registered = dispatcher.dispatch(
+        "observer_session_register",
+        {
+            "project_id": "aming-claw",
+            "observer_kind": "codex",
+            "session_label": "managed-hotfix",
+        },
+    )
+    token_ref = registered["observer_session_token_ref"]
+    assert token_ref.startswith("observer-session-ref-")
+    assert registered["raw_observer_session_token_exposed"] is False
+    assert raw_token not in json.dumps(registered, sort_keys=True)
+
+    result = dispatcher.dispatch(
+        "observer_hotfix_enter",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-MANAGED-HOTFIX",
+            "task_id": "managed-hotfix-attempt-2",
+            "parent_contract_execution_id": "cex-parent",
+            "predecessor_contract_execution_id": "cex-predecessor",
+            "predecessor_execution_state_revision": 5,
+            "predecessor_execution_state_hash": "sha256:" + "a" * 64,
+            "successor_attempt_id": "attempt-2",
+            "actor": "operator",
+            "reason": "start a bounded sibling repair",
+            "route_token_ref": "rtok-managed-hotfix",
+            "observer_session_id": "obs-managed-hotfix",
+            "observer_session_token_ref": token_ref,
+        },
+    )
+    assert result["ok"] is True
+    assert recorder.calls[1] == (
+        "POST",
+        "/api/projects/aming-claw/observer-sessions/obs-managed-hotfix/heartbeat",
+        {"session_token": raw_token},
+    )
+    method, path, body = recorder.calls[2]
+    assert method == "POST"
+    assert path == (
+        "/api/projects/aming-claw/hotfix/enter?"
+        "observer_session_id=obs-managed-hotfix"
+    )
+    assert set(body) == {
+        "backlog_id",
+        "task_id",
+        "parent_contract_execution_id",
+        "predecessor_contract_execution_id",
+        "predecessor_execution_state_revision",
+        "predecessor_execution_state_hash",
+        "successor_attempt_id",
+        "actor",
+        "reason",
+        "route_token_ref",
+    }
+    serialized = json.dumps(recorder.calls[2], sort_keys=True)
+    assert token_ref not in serialized
+    assert raw_token not in serialized
+
+    wrong_scope = dispatcher.dispatch(
+        "observer_hotfix_enter",
+        {
+            "project_id": "other-project",
+            "observer_session_token_ref": token_ref,
+            "reason": "must fail closed",
+        },
+    )
+    assert wrong_scope["error"] == "observer_session_token_ref_scope_mismatch"
+
+    closed = dispatcher.dispatch(
+        "observer_session_close",
+        {
+            "project_id": "aming-claw",
+            "session_id": "obs-managed-hotfix",
+            "observer_session_token_ref": token_ref,
+        },
+    )
+    assert closed["ok"] is True
+    assert recorder.calls[-1] == (
+        "POST",
+        "/api/projects/aming-claw/observer-sessions/obs-managed-hotfix/close",
+        {"session_token": raw_token},
+    )
+    stale = dispatcher.dispatch(
+        "observer_session_heartbeat",
+        {
+            "project_id": "aming-claw",
+            "session_id": "obs-managed-hotfix",
+            "observer_session_token_ref": token_ref,
+        },
+    )
+    assert stale["error"] == "observer_session_token_ref_unknown"
 
 
 def test_active_runtime_context_tools_are_read_only_and_route_to_current_service():

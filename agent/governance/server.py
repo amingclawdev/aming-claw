@@ -20266,6 +20266,156 @@ def _runtime_context_contract_line_matches_worker(
     return True
 
 
+def _runtime_context_contract_dispatch_matches_worker(
+    conn,
+    record: Mapping[str, Any],
+    *,
+    context: Any,
+    runtime_context_id: str,
+    task_id: str,
+) -> bool:
+    """Bind a pre-read worker to the exact accepted aggregate dispatch.
+
+    Atomic mf_parallel dispatch stores the durable ticket on the aggregate
+    payload and the worker identity inside ``bounded_workers``.  A deep-text
+    lookup is not lane-safe for the second (or later) worker, so this reader
+    performs an exact closed join instead of treating the first nested worker
+    as canonical.
+    """
+
+    selected = _contract_runtime_current_dispatch_authority_line(record)
+    if selected.get("status") != "selected":
+        return False
+    aggregate = (
+        selected.get("payload")
+        if isinstance(selected.get("payload"), Mapping)
+        else {}
+    )
+    ticket = (
+        aggregate.get("dispatch_ticket_authority")
+        if isinstance(aggregate.get("dispatch_ticket_authority"), Mapping)
+        else {}
+    )
+    ticket_schema = str(ticket.get("schema_version") or "").strip()
+    if not (
+        ticket_schema
+        in {
+            "mf_parallel.dispatch_ticket_authority.v1",
+            "mf_parallel.atomic_dispatch_ticket_authority.v1",
+        }
+        and str(ticket.get("source") or "").strip()
+        == "observer_route_token_refs"
+        and ticket.get("server_resolved_child_route_identity") is True
+        and ticket.get("runtime_context_bound") is True
+        and (
+            ticket_schema != "mf_parallel.atomic_dispatch_ticket_authority.v1"
+            or (
+                ticket.get("all_workers_bound") is True
+                and ticket.get("atomic_dispatch") is True
+            )
+        )
+    ):
+        return False
+    workers = _contract_runtime_mf_parallel_bounded_workers(
+        {"payload": aggregate}
+    )
+    if not workers:
+        return False
+    matching = [
+        worker
+        for worker in workers
+        if str(worker.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(
+            worker.get("task_id") or worker.get("worker_task_id") or ""
+        ).strip()
+        == task_id
+    ]
+    if len(matching) != 1:
+        return False
+    worker = matching[0]
+    nested_route = (
+        worker.get("route_identity")
+        if isinstance(worker.get("route_identity"), Mapping)
+        else {}
+    )
+
+    def worker_text(field: str, *aliases: str) -> str:
+        values = {
+            str(source.get(key) or "").strip()
+            for source in (worker, nested_route)
+            for key in (field, *aliases)
+            if str(source.get(key) or "").strip()
+        }
+        return next(iter(values)) if len(values) == 1 else ""
+
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    expected = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": _runtime_context_effective_target_project_root(
+            context
+        ),
+        "worktree_path": str(
+            getattr(context, "worktree_path", "") or ""
+        ).strip(),
+        "branch_ref": str(getattr(context, "branch_ref", "") or "").strip(),
+        "base_commit": str(getattr(context, "base_commit", "") or "").strip(),
+        "target_head_commit": str(
+            getattr(context, "target_head_commit", "") or ""
+        ).strip(),
+        "merge_queue_id": str(
+            getattr(context, "merge_queue_id", "") or ""
+        ).strip(),
+    }
+    aliases = {
+        "task_id": ("worker_task_id",),
+        "target_project_root": ("project_root", "repo_root"),
+        "worktree_path": ("worker_worktree_path", "assigned_worktree"),
+        "branch_ref": ("branch",),
+    }
+    if any(
+        not expected_value
+        or worker_text(field, *aliases.get(field, ())) != expected_value
+        for field, expected_value in expected.items()
+    ):
+        return False
+    def closed_owned_files(values: Any) -> list[str]:
+        if not isinstance(values, (list, tuple)):
+            return []
+        normalized = [str(item).strip() for item in values]
+        if (
+            not normalized
+            or any(not item for item in normalized)
+            or len(normalized) != len(set(normalized))
+        ):
+            return []
+        return sorted(normalized)
+
+    expected_owned_files = closed_owned_files(
+        list(getattr(context, "owned_files", ()) or ())
+    )
+    actual_owned_files = closed_owned_files(
+        worker.get("owned_files") or worker.get("target_files") or []
+    )
+    if not expected_owned_files or actual_owned_files != expected_owned_files:
+        return False
+    latest_route = _runtime_context_latest_route_identity(conn, context)
+    if any(
+        not str(latest_route.get(field) or "").strip()
+        or worker_text(field) != str(latest_route.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    ):
+        return False
+    return True
+
+
 def _runtime_context_contract_next_action_is_mf_sub_owned(
     next_action: Mapping[str, Any],
 ) -> bool:
@@ -22251,6 +22401,7 @@ def _runtime_context_source_backed_contract_identity(
             "missing_execution_id": 0,
             "missing_worker_commit_definition": 0,
             "missing_exact_worker_lineage": 0,
+            "missing_exact_dispatch_lineage": 0,
             "terminal_or_nonactive": 0,
             "stale_or_unavailable": 0,
         },
@@ -22269,6 +22420,7 @@ def _runtime_context_source_backed_contract_identity(
         return {}, diagnostic
     runtime = _contract_runtime(conn)
     candidates: list[dict[str, Any]] = []
+    dispatch_candidate_ids: set[str] = set()
     for record in records:
         contract_id = str(record.get("contract_id") or "").strip()
         if not _is_mf_parallel_record_contract_id(contract_id):
@@ -22287,7 +22439,7 @@ def _runtime_context_source_backed_contract_identity(
         except ContractRuntimeError:
             diagnostic["ignored_counts"]["stale_or_unavailable"] += 1
             continue
-        if not any(
+        worker_lineage_matches = any(
             _runtime_context_contract_line_matches_worker(
                 line,
                 runtime_context_id=runtime_context_id,
@@ -22295,8 +22447,19 @@ def _runtime_context_source_backed_contract_identity(
             )
             for line in record.get("completed_lines") or []
             if isinstance(line, Mapping)
-        ):
+        )
+        dispatch_lineage_matches = (
+            _runtime_context_contract_dispatch_matches_worker(
+                conn,
+                record,
+                context=context,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+            )
+        )
+        if not worker_lineage_matches and not dispatch_lineage_matches:
             diagnostic["ignored_counts"]["missing_exact_worker_lineage"] += 1
+            diagnostic["ignored_counts"]["missing_exact_dispatch_lineage"] += 1
             continue
         try:
             refreshed = runtime.current_record(
@@ -22316,6 +22479,8 @@ def _runtime_context_source_backed_contract_identity(
             diagnostic["ignored_counts"]["terminal_or_nonactive"] += 1
             continue
         candidates.append(refreshed)
+        if dispatch_lineage_matches and not worker_lineage_matches:
+            dispatch_candidate_ids.add(execution_id)
     candidate_ids = [
         str(record.get("contract_execution_id") or "")
         for record in candidates
@@ -22324,7 +22489,16 @@ def _runtime_context_source_backed_contract_identity(
     diagnostic["candidate_count"] = len(candidate_ids)
     diagnostic["candidate_contract_execution_ids"] = candidate_ids
     if len(candidates) == 1:
-        diagnostic["status"] = "resolved_source_backed_worker_lineage"
+        diagnostic["status"] = (
+            "resolved_source_backed_dispatch_lineage"
+            if candidate_ids[0] in dispatch_candidate_ids
+            else "resolved_source_backed_worker_lineage"
+        )
+        diagnostic["source"] = (
+            "source_backed_contract_runtime_dispatch"
+            if candidate_ids[0] in dispatch_candidate_ids
+            else "source_backed_contract_runtime_worker_lineage"
+        )
         return _runtime_context_contract_identity_from_record(candidates[0]), diagnostic
     if len(candidates) > 1:
         diagnostic["status"] = "ambiguous_active_source_backed_worker_lineage"
@@ -24125,6 +24299,11 @@ def _runtime_context_guide_executable_actions(
             line_id=str(source.get("line_id") or ""),
             body=body,
             optional_omission_fields=optional_omission_fields,
+            host_realization=(
+                source.get("host_realization")
+                if isinstance(source.get("host_realization"), Mapping)
+                else None
+            ),
         )
         actions[stage] = contract
         if isinstance(source, dict):
@@ -28012,6 +28191,35 @@ def _runtime_context_worker_recovery_payloads(
         "worktree_path_as_target_project_root_for_write_facades",
         "placeholder_hash_submitted_verbatim",
     ]
+    read_receipt_hash_replacement_contract = {
+        "schema_version": (
+            "runtime_context.read_receipt_hash_replacement_contract.v1"
+        ),
+        "algorithm": "sha256_utf8",
+        "source_response": (
+            "parallel_branch_allocate_or_observer_runtime_text_prepare"
+        ),
+        "precomputed_hash_json_pointer": "/launch_text_hash",
+        "raw_source_json_pointer": "/launch_text",
+        "source_consistency_requirement": (
+            "sha256_utf8(/launch_text) must equal /launch_text_hash when both "
+            "are present"
+        ),
+        "required_destination_json_pointer": "/read_receipt_hash",
+        "replace_if_present_json_pointers": [
+            "/launch_text_hash",
+            "/contract_context_read_receipt/receipt_hash",
+            "/contract_context_read_receipt/read_receipt_hash",
+            "/payload/read_receipt_hash",
+            "/payload/launch_text_hash",
+            "/payload/contract_context_read_receipt/receipt_hash",
+            "/payload/contract_context_read_receipt/read_receipt_hash",
+        ],
+        "replacement_policy": "replace_exact_declared_json_pointers_only",
+        "placeholder_field_name_inference_allowed": False,
+        "authority_inference_allowed": False,
+        "raw_launch_text_process_local_only": True,
+    }
     startup_identity_required_fields = [
         "worker_session_id",
         "worker_transcript_ref or worker_transcript_path",
@@ -28782,6 +28990,11 @@ def _runtime_context_worker_recovery_payloads(
                 "the launch context, then replace every copied placeholder in "
                 "the top-level and nested canonical receipt copies before POST."
             ),
+            "host_realization": {
+                "hash_replacement_contract": dict(
+                    read_receipt_hash_replacement_contract
+                ),
+            },
             "contract_context_read_receipt": {
                 "schema_version": "contract_context_read_receipt.v1",
                 "event_kind": "contract_context_read_receipt",
@@ -42123,6 +42336,157 @@ def _runtime_context_rejoin_checkpoint_relation(
     return "advanced" if advanced else "exact"
 
 
+def _runtime_context_verified_prelineage_checkpoint_relation(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    event: Mapping[str, Any],
+    timeline_events: Sequence[Mapping[str, Any]],
+    prior_baseline: Mapping[str, Any] | None,
+    current_baseline: Mapping[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    """Verify an immutable pre-lineage checkpoint whose old CEX was empty.
+
+    Before the aggregate dispatch reader became lane-safe, a rejoin audit could
+    carry the exact ContractRuntime identity in its closed event envelope while
+    the nested worker-write baseline still stored an empty
+    ``contract_execution_id``.  This compatibility reader accepts only that
+    exact, empty-CEX prefix and never rewrites the durable event.
+    """
+
+    prior = _runtime_context_rejoin_stage_checkpoint(prior_baseline)
+    current = _runtime_context_rejoin_stage_checkpoint(current_baseline)
+    if not prior or not current:
+        return "invalid", {}
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    current_execution_id = str(
+        current.get("contract_execution_id") or ""
+    ).strip()
+    if not (
+        prior.get("runtime_context_id") == runtime_context_id
+        and current.get("runtime_context_id") == runtime_context_id
+        and not str(prior.get("contract_execution_id") or "").strip()
+        and current_execution_id
+        and current_execution_id == parent_task_id
+    ):
+        return "invalid", {}
+    payload = (
+        event.get("payload")
+        if isinstance(event.get("payload"), Mapping)
+        else {}
+    )
+    prelineage_authority = (
+        payload.get("pre_lineage_rejoin_authority")
+        if isinstance(payload.get("pre_lineage_rejoin_authority"), Mapping)
+        else {}
+    )
+    explicit_execution_ids = {
+        str(value or "").strip()
+        for value in (
+            payload.get("contract_execution_id"),
+            payload.get("parent_task_id"),
+            prelineage_authority.get("contract_execution_id"),
+            prelineage_authority.get("parent_task_id"),
+        )
+        if str(value or "").strip()
+    }
+    expected_identity = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+    }
+    if not (
+        str(event.get("event_type") or "").strip()
+        == "observer.runtime_context_session_token_rejoin"
+        and str(event.get("event_kind") or "").strip() == "observer_command"
+        and str(event.get("status") or "").strip().lower()
+        in {"accepted", "ok", "pass", "passed", "success", "succeeded"}
+        and str(event.get("task_id") or "").strip() == task_id
+        and str(event.get("backlog_id") or "").strip() == backlog_id
+        and str(payload.get("action") or "").strip()
+        == "runtime_context_session_token_rejoin"
+        and explicit_execution_ids == {current_execution_id}
+        and all(
+            str(payload.get(field) or "").strip() == expected
+            for field, expected in expected_identity.items()
+        )
+    ):
+        return "invalid", {}
+    latest_route = _runtime_context_latest_route_identity(conn, context)
+    event_route = (
+        payload.get("route_identity")
+        if isinstance(payload.get("route_identity"), Mapping)
+        else {}
+    )
+    if any(
+        not str(latest_route.get(field) or "").strip()
+        or str(event_route.get(field) or "").strip()
+        != str(latest_route.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    ):
+        return "invalid", {}
+    evidence = _runtime_context_rejoin_worker_write_evidence(
+        conn,
+        project_id=project_id,
+        context=context,
+        timeline_events=timeline_events,
+    )
+    if (
+        evidence.get("timeline_source_valid") is not True
+        or evidence.get("contract_source_valid") is not True
+        or str(evidence.get("contract_execution_id") or "").strip()
+        != current_execution_id
+    ):
+        return "invalid", {}
+    timeline_rows = list(evidence.get("timeline_worker_writes") or [])
+    contract_lines = list(
+        evidence.get("contract_runtime_completed_lines") or []
+    )
+    timeline_count = int(prior["timeline_worker_write_count"])
+    contract_count = int(prior["contract_runtime_completed_line_count"])
+    if not (
+        0 <= timeline_count <= len(timeline_rows)
+        and 0 <= contract_count <= len(contract_lines)
+        and stable_sha256(timeline_rows[:timeline_count])
+        == prior["timeline_worker_write_hash"]
+        and stable_sha256(contract_lines[:contract_count])
+        == prior["contract_runtime_completed_lines_hash"]
+    ):
+        return "invalid", {}
+    normalized = {
+        **dict(prior_baseline or {}),
+        "contract_execution_id": current_execution_id,
+    }
+    normalized.pop("stage_checkpoint_id", None)
+    normalized_checkpoint = _runtime_context_rejoin_stage_checkpoint(
+        normalized
+    )
+    if not normalized_checkpoint:
+        return "invalid", {}
+    normalized["stage_checkpoint_id"] = normalized_checkpoint[
+        "stage_checkpoint_id"
+    ]
+    advanced = (
+        timeline_count < len(timeline_rows)
+        or contract_count < len(contract_lines)
+    )
+    return ("advanced" if advanced else "exact"), normalized
+
+
 def _runtime_context_legacy_v1_rejoin_audit(
     conn,
     *,
@@ -42809,6 +43173,7 @@ def _runtime_context_bounded_replacement_rejoin_authority(
     advanced_checkpoint_events: list[Mapping[str, Any]] = []
     invalid_checkpoint_events: list[Mapping[str, Any]] = []
     legacy_precheckpoint_events: list[Mapping[str, Any]] = []
+    normalized_prelineage_baselines: dict[int, dict[str, Any]] = {}
     for event in timeline_events:
         payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
         bounded_rejoin_kind = str(
@@ -42853,6 +43218,24 @@ def _runtime_context_bounded_replacement_rejoin_authority(
                     payload.get("bounded_replacement_worker_write_baseline"),
                     current_baseline,
                 )
+                if relation == "invalid":
+                    relation, normalized_baseline = (
+                        _runtime_context_verified_prelineage_checkpoint_relation(
+                            conn,
+                            project_id=project_id,
+                            context=context,
+                            event=event,
+                            timeline_events=timeline_events,
+                            prior_baseline=payload.get(
+                                "bounded_replacement_worker_write_baseline"
+                            ),
+                            current_baseline=current_baseline,
+                        )
+                    )
+                    if normalized_baseline:
+                        normalized_prelineage_baselines[
+                            int(event.get("id") or 0)
+                        ] = normalized_baseline
             if relation == "invalid":
                 invalid_checkpoint_events.append(event)
             elif relation == "advanced":
@@ -42989,12 +43372,15 @@ def _runtime_context_bounded_replacement_rejoin_authority(
         else {}
     )
     expected_baseline = (
-        prior_payload.get("bounded_replacement_worker_write_baseline")
-        if isinstance(
-            prior_payload.get("bounded_replacement_worker_write_baseline"),
-            Mapping,
+        normalized_prelineage_baselines.get(int(prior_event.get("id") or 0))
+        or (
+            prior_payload.get("bounded_replacement_worker_write_baseline")
+            if isinstance(
+                prior_payload.get("bounded_replacement_worker_write_baseline"),
+                Mapping,
+            )
+            else {}
         )
-        else {}
     )
     actual_baseline = current_baseline
     projection["mode"] = "bounded_post_lineage_replacement_auth_only"
@@ -43203,6 +43589,29 @@ def _runtime_context_session_rejoin_guidance_eligibility(
                         "parse_mcp_content_text_in_same_call": True,
                         "inject_host_envelope_env_process_locally": True,
                         "if_bounded_replacement_envelope_lost": (
+                            "stop_and_report_bounded_rejoin_recovery_exhausted"
+                        ),
+                    },
+                }
+            )
+            return projection
+        if (
+            str(replacement_authority.get("mode") or "")
+            == "next_stage_checkpoint_issuance"
+            and effective_read_receipt_ref
+            and not effective_startup_ref
+        ):
+            projection.update(
+                {
+                    "eligible": True,
+                    "mode": "active_context_auth_only",
+                    "authority": replacement_authority,
+                    "post_receipt_pre_startup_recovery": True,
+                    "required_response_handling": {
+                        "parse_mcp_content_text_in_same_call": True,
+                        "inject_host_envelope_env_process_locally": True,
+                        "submit_only_server_projected_startup_body": True,
+                        "if_envelope_lost": (
                             "stop_and_report_bounded_rejoin_recovery_exhausted"
                         ),
                     },
@@ -114532,6 +114941,7 @@ def _guide_canonical_executable_action(
     contract_execution_id: str = "",
     parent_contract_execution_id: str = "",
     optional_omission_fields: Sequence[str] = (),
+    host_realization: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the single facade-executable contract for one advertised action."""
 
@@ -114608,6 +115018,39 @@ def _guide_canonical_executable_action(
         }.items()
         if value not in (None, "")
     }
+    projected_host_realization = {
+        "mode": "replace_only_declared_placeholders_then_spread_to_mcp",
+        "mcp_invocation": f"{normalized_tool}(**copy_safe_body)",
+        "adapter_fields_included": ["project_id"],
+        "required_replacement_paths": list(dict.fromkeys(replacement_paths)),
+        "optional_omission_fields": list(optional_omission_fields),
+        "authority_inference_allowed": False,
+    }
+    if isinstance(host_realization, Mapping):
+        projected_host_realization.update(deepcopy(dict(host_realization)))
+        projected_host_realization["required_replacement_paths"] = list(
+            dict.fromkeys(
+                [
+                    *replacement_paths,
+                    *list(
+                        host_realization.get("required_replacement_paths")
+                        or []
+                    ),
+                ]
+            )
+        )
+        projected_host_realization["optional_omission_fields"] = list(
+            dict.fromkeys(
+                [
+                    *optional_omission_fields,
+                    *list(
+                        host_realization.get("optional_omission_fields")
+                        or []
+                    ),
+                ]
+            )
+        )
+        projected_host_realization["authority_inference_allowed"] = False
     return {
         "schema_version": "guide.canonical_executable_action.v1",
         "action": normalized_action,
@@ -114619,14 +115062,7 @@ def _guide_canonical_executable_action(
         "line_id": str(line_id or "").strip(),
         "body_source": "copy_safe_body",
         "copy_safe_body": copy_safe_body,
-        "host_realization": {
-            "mode": "replace_only_declared_placeholders_then_spread_to_mcp",
-            "mcp_invocation": f"{normalized_tool}(**copy_safe_body)",
-            "adapter_fields_included": ["project_id"],
-            "required_replacement_paths": list(dict.fromkeys(replacement_paths)),
-            "optional_omission_fields": list(optional_omission_fields),
-            "authority_inference_allowed": False,
-        },
+        "host_realization": projected_host_realization,
         "route_identity": present_route_identity,
         "canonical_lineage": lineage,
         "safe_ref_policy": {
@@ -115688,7 +116124,173 @@ def _onboard_worker_read_runtime_facade_projection(
         "action_input": body,
         "copy_safe_body": body,
         "actionable": True,
+        "host_realization": dict(receipt.get("host_realization") or {}),
         "worker_read_runtime_facade_projection": facade_projection,
+    }
+
+
+def _onboard_legacy_operator_hotfix_attempt_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    role: str,
+    work_type: str,
+    route_token_ref: str,
+    next_action: Mapping[str, Any],
+    current_projection: Mapping[str, Any],
+    runtime_resume: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one managed sibling hotfix after worker auth is exhausted."""
+
+    if not (
+        str(role or "").strip() == "observer"
+        and str(work_type or "").strip() == "legacy_operator_recovery"
+        and str(route_token_ref or "").strip()
+    ):
+        return {}
+    parent_execution_id = _onboard_route_guide_target_contract_execution_id(
+        next_action=next_action,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+    )
+    if not parent_execution_id:
+        return {}
+    try:
+        parent_record = _contract_runtime_store(conn).get(
+            parent_execution_id
+        )
+    except ContractRuntimeError:
+        return {}
+    if (
+        str(parent_record.get("project_id") or "") != project_id
+        or str(parent_record.get("backlog_id") or "") != backlog_id
+        or not _is_mf_parallel_record_contract_id(
+            str(parent_record.get("contract_id") or "")
+        )
+        or _runtime_record_is_complete(parent_record)
+    ):
+        return {}
+    predecessor_execution_id = _observer_hotfix_successor_execution_id(
+        project_id,
+        backlog_id,
+        parent_execution_id,
+    )
+    try:
+        predecessor_record = _contract_runtime_store(conn).get(
+            predecessor_execution_id
+        )
+    except ContractRuntimeError:
+        return {}
+    if not _runtime_record_is_complete(predecessor_record):
+        return {}
+
+    from .parallel_branch_runtime import list_branch_contexts
+
+    candidates = [
+        context
+        for context in list_branch_contexts(conn, project_id)
+        if str(getattr(context, "backlog_id", "") or "").strip()
+        == backlog_id
+        and _runtime_context_mf_sub_parent_task_id(context)
+        == parent_execution_id
+    ]
+    exhausted = []
+    for context in candidates:
+        eligibility = _runtime_context_session_rejoin_guidance_eligibility(
+            conn,
+            project_id=project_id,
+            context=context,
+        )
+        if str(eligibility.get("mode") or "").strip() == (
+            "replacement_exhausted"
+        ):
+            exhausted.append((context, eligibility))
+    if len(exhausted) != 1:
+        return {}
+
+    from . import observer_route_context
+
+    try:
+        route = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return {}
+    allowed = {
+        _normalized_contract_runtime_action(item)
+        for item in (route or {}).get("allowed_actions") or []
+    }
+    if (
+        str((route or {}).get("caller_role") or "").strip() != "observer"
+        or _normalized_contract_runtime_action("hotfix_enter") not in allowed
+    ):
+        return {}
+
+    context, eligibility = exhausted[0]
+    action = _observer_hotfix_attempt_action(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        parent_record=parent_record,
+        predecessor_record=predecessor_record,
+        route_token_ref=route_token_ref,
+    )
+    managed_session = {
+        "schema_version": "observer.managed_session_realization.v1",
+        "register_mcp_tool": "observer_session_register",
+        "register_output_session_id_path": "/session_id",
+        "register_output_token_ref_path": "/observer_session_token_ref",
+        "heartbeat_before_submit": True,
+        "heartbeat_mcp_tool": "observer_session_heartbeat",
+        "hotfix_mcp_token_ref_field": "observer_session_token_ref",
+        "observer_session_id_transport": "query_parameter",
+        "strip_from_domain_body": [
+            "observer_session_id",
+            "observer_session_token_ref",
+            "session_token",
+        ],
+        "raw_session_token_process_local_only": True,
+        "raw_session_token_exposed": False,
+        "server_derived_session_id_allowed": False,
+    }
+    action["host_realization"].update(
+        {
+            "managed_observer_session": managed_session,
+            "required_prerequisites": [
+                "register_or_heartbeat_one_active managed observer session",
+                "preserve the exact route_token_ref and 11-field domain body",
+            ],
+        }
+    )
+    return {
+        **action,
+        "id": action["action"],
+        "interface": action["facade"],
+        "action_input": dict(action["copy_safe_body"]),
+        "action_input_ready": True,
+        "actionable": True,
+        "requires_active_observer_session": True,
+        "requires_route_token_ref": True,
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "source": "managed_observer_hotfix_recovery",
+        "source_of_authority": (
+            "completed_hotfix_predecessor+replacement_exhausted_RuntimeContext"
+        ),
+        "runtime_context_recovery_authority": {
+            "runtime_context_id": str(
+                getattr(context, "runtime_context_id", "") or ""
+            ),
+            "task_id": str(getattr(context, "task_id", "") or ""),
+            "mode": "replacement_exhausted",
+            "server_derived": True,
+            "caller_claims_trusted": False,
+            "eligibility": dict(eligibility),
+        },
     }
 
 
@@ -115828,6 +116430,11 @@ def _onboard_route_guide_compact_service_response(
                     next_action.get("omitted_server_authority_fields") or []
                 ),
             ],
+            host_realization=(
+                next_action.get("host_realization")
+                if isinstance(next_action.get("host_realization"), Mapping)
+                else None
+            ),
         )
         if canonical_body and action
         else {}
@@ -115841,6 +116448,24 @@ def _onboard_route_guide_compact_service_response(
         or next_action.get("source")
         or ""
     ).strip()
+    recovery_authority_source = (
+        next_action.get("runtime_context_recovery_authority")
+        if isinstance(
+            next_action.get("runtime_context_recovery_authority"), Mapping
+        )
+        else {}
+    )
+    runtime_context_recovery_authority = {
+        key: recovery_authority_source[key]
+        for key in (
+            "runtime_context_id",
+            "task_id",
+            "mode",
+            "server_derived",
+            "caller_claims_trusted",
+        )
+        if key in recovery_authority_source
+    }
     allowed_actions = [
         str(item)
         for item in (
@@ -115983,6 +116608,9 @@ def _onboard_route_guide_compact_service_response(
             "worker_read_runtime_facade_projection": dict(
                 worker_read_projection
             ),
+            "runtime_context_recovery_authority": dict(
+                runtime_context_recovery_authority
+            ),
             "explicit_cross_contract_transition": (
                 dict(next_action.get("explicit_cross_contract_transition"))
                 if isinstance(
@@ -116006,6 +116634,9 @@ def _onboard_route_guide_compact_service_response(
         "contract_execution_id": identity["contract_execution_id"],
         "execution_state_revision": identity["execution_state_revision"],
         "projection_hash": identity["projection_hash"],
+        "runtime_context_recovery_authority": dict(
+            runtime_context_recovery_authority
+        ),
         "evidence_shape_authority": {
             "source_of_authority": "ContractRuntime",
             "read_interfaces": [
@@ -116231,6 +116862,9 @@ def _onboard_route_guide_compact_service_response(
         "actionable": bool(canonical_executable_action),
         "worker_read_runtime_facade_projection": dict(
             worker_read_projection
+        ),
+        "runtime_context_recovery_authority": dict(
+            runtime_context_recovery_authority
         ),
         "allowed_action_summary": action_summary,
         "legitimate_evidence_bindings": legitimate_evidence_bindings,
@@ -116622,6 +117256,7 @@ def _onboard_route_guide_service_response(
         integration_epoch_to_dict,
     )
 
+    requested_route_token_ref = str(route_token_ref or "").strip()
     active_epoch = get_active_integration_epoch(conn, project_id)
     if active_epoch is not None:
         resume = _server_integration_epoch_resume_payload(conn, active_epoch)
@@ -116715,6 +117350,15 @@ def _onboard_route_guide_service_response(
     no_direct_fix = True
     historical_source_resume = False
     materialize_route_token_ref = route_token_ref
+    if (
+        str(role or "").strip() == "observer"
+        and str(work_type or "").strip() == "legacy_operator_recovery"
+    ):
+        # The managed recovery ref is a proof for the sibling hotfix facade,
+        # not authority to rewrite the active ContractRuntime chain binding.
+        # The dedicated projection below validates it against the exact
+        # backlog + parent CEX + hotfix action before exposing any action.
+        materialize_route_token_ref = ""
     if str(work_type or "").strip() in {
         "multi_backlog_parallel",
         "mf_batch_parallel",
@@ -117043,6 +117687,21 @@ def _onboard_route_guide_service_response(
                 target_files=target_files,
                 request_body=batch_action_request_body,
             )
+    managed_hotfix_attempt = (
+        _onboard_legacy_operator_hotfix_attempt_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            role=role,
+            work_type=work_type,
+            route_token_ref=requested_route_token_ref,
+            next_action=next_action,
+            current_projection=current_projection,
+            runtime_resume=runtime_resume,
+        )
+    )
+    if managed_hotfix_attempt:
+        next_action = managed_hotfix_attempt
     direct_main_failed_qa_state = (
         _onboard_parentless_direct_main_failed_qa_state(
             conn,

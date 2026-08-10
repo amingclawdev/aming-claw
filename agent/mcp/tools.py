@@ -1505,7 +1505,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "observer_session_register",
-        "description": "Register this AI observer session and return a one-time session token. The DB stores only a token hash.",
+        "description": "Register this AI observer session and return a process-local opaque observer_session_token_ref. Raw session auth is not exposed by managed MCP.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1528,8 +1528,16 @@ TOOLS: list[dict] = [
                 "project_id": {"type": "string"},
                 "session_id": {"type": "string"},
                 "session_token": {"type": "string"},
+                "observer_session_token_ref": {
+                    "type": "string",
+                    "description": "Process-local opaque ref returned by observer_session_register.",
+                },
             },
-            "required": ["project_id", "session_id", "session_token"],
+            "required": ["project_id", "session_id"],
+            "anyOf": [
+                {"required": ["session_token"]},
+                {"required": ["observer_session_token_ref"]},
+            ],
         },
     },
     {
@@ -1541,8 +1549,13 @@ TOOLS: list[dict] = [
                 "project_id": {"type": "string"},
                 "session_id": {"type": "string"},
                 "session_token": {"type": "string"},
+                "observer_session_token_ref": {"type": "string"},
             },
-            "required": ["project_id", "session_id", "session_token"],
+            "required": ["project_id", "session_id"],
+            "anyOf": [
+                {"required": ["session_token"]},
+                {"required": ["observer_session_token_ref"]},
+            ],
         },
     },
     {
@@ -1554,8 +1567,13 @@ TOOLS: list[dict] = [
                 "project_id": {"type": "string"},
                 "session_id": {"type": "string"},
                 "session_token": {"type": "string"},
+                "observer_session_token_ref": {"type": "string"},
             },
-            "required": ["project_id", "session_id", "session_token"],
+            "required": ["project_id", "session_id"],
+            "anyOf": [
+                {"required": ["session_token"]},
+                {"required": ["observer_session_token_ref"]},
+            ],
         },
     },
     {
@@ -2464,6 +2482,10 @@ TOOLS: list[dict] = [
                 "observer_session_id": {
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
+                "observer_session_token_ref": {
+                    "type": "string",
+                    "description": "Process-local opaque observer session auth ref; the adapter heartbeats it and strips it from the exact hotfix body.",
                 },
                 "onboard_service_waiver": {
                     "type": "object",
@@ -4543,6 +4565,13 @@ _QA_SESSION_RAW_TOKEN_FIELDS = (
     "access_token",
 )
 
+_OBSERVER_SESSION_RAW_TOKEN_FIELDS = (
+    "session_token",
+    "observer_session_token",
+    "token",
+    "raw_token",
+)
+
 
 def _qa_session_expiry(value: Any) -> datetime | None:
     text = str(value or "").strip()
@@ -4609,10 +4638,110 @@ class ToolDispatcher:
         )
         self._qa_session_refs: dict[str, dict[str, Any]] = {}
         self._qa_session_refs_lock = threading.Lock()
+        self._observer_session_refs: dict[str, dict[str, str]] = {}
+        self._observer_session_refs_lock = threading.Lock()
 
     @staticmethod
     def _qa_session_ref_error(error: str, message: str, **details: Any) -> dict:
         return {"ok": False, "error": error, "message": message, **details}
+
+    @staticmethod
+    def _observer_session_ref_error(
+        error: str, message: str, **details: Any
+    ) -> dict:
+        return {"ok": False, "error": error, "message": message, **details}
+
+    def _register_observer_session_ref(self, args: dict, result: Any) -> Any:
+        """Keep the raw observer token inside this managed MCP process."""
+
+        if not isinstance(result, dict):
+            return result
+        raw_token = next(
+            (
+                str(result.get(field) or "").strip()
+                for field in _OBSERVER_SESSION_RAW_TOKEN_FIELDS
+                if str(result.get(field) or "").strip()
+            ),
+            "",
+        )
+        public = {
+            key: value
+            for key, value in result.items()
+            if key not in _OBSERVER_SESSION_RAW_TOKEN_FIELDS
+        }
+        project_id = str(args.get("project_id") or "").strip()
+        session_id = str(result.get("session_id") or "").strip()
+        if not raw_token or result.get("error"):
+            return public
+        if not project_id or not session_id:
+            return self._observer_session_ref_error(
+                "observer_session_register_invalid_response",
+                "Observer session registration did not return a complete public identity.",
+            )
+        token_ref = "observer-session-ref-" + secrets.token_urlsafe(32)
+        with self._observer_session_refs_lock:
+            for existing_ref, entry in list(self._observer_session_refs.items()):
+                if entry.get("session_id") == session_id:
+                    self._observer_session_refs.pop(existing_ref, None)
+            self._observer_session_refs[token_ref] = {
+                "project_id": project_id,
+                "session_id": session_id,
+                "raw_token": raw_token,
+            }
+        public["observer_session_token_ref"] = token_ref
+        public["observer_session_scope_binding"] = {
+            "project_id": project_id,
+            "session_id": session_id,
+        }
+        public["raw_observer_session_token_exposed"] = False
+        public["message"] = (
+            "Observer session registered; pass observer_session_token_ref to "
+            "managed MCP observer tools."
+        )
+        return public
+
+    def _observer_session_auth_for_ref(
+        self, args: dict
+    ) -> tuple[str, str, dict | None]:
+        raw_token = str(args.get("session_token") or "").strip()
+        token_ref = str(
+            args.get("observer_session_token_ref") or ""
+        ).strip()
+        if raw_token and token_ref:
+            return "", "", self._observer_session_ref_error(
+                "observer_session_auth_ambiguous",
+                "Provide either observer_session_token_ref or raw session_token, not both.",
+            )
+        if not token_ref:
+            return (
+                str(args.get("session_id") or args.get("observer_session_id") or "").strip(),
+                raw_token,
+                None,
+            )
+        with self._observer_session_refs_lock:
+            entry = self._observer_session_refs.get(token_ref)
+            entry = dict(entry) if entry is not None else None
+        if entry is None:
+            return "", "", self._observer_session_ref_error(
+                "observer_session_token_ref_unknown",
+                "Observer session ref is unknown to this MCP process; register a fresh observer session.",
+            )
+        project_id = str(args.get("project_id") or "").strip()
+        supplied_session_id = str(
+            args.get("session_id") or args.get("observer_session_id") or ""
+        ).strip()
+        mismatches = []
+        if not project_id or project_id != entry["project_id"]:
+            mismatches.append("project_id")
+        if supplied_session_id and supplied_session_id != entry["session_id"]:
+            mismatches.append("session_id")
+        if mismatches:
+            return "", "", self._observer_session_ref_error(
+                "observer_session_token_ref_scope_mismatch",
+                "Observer session ref scope does not match this request.",
+                mismatched_fields=mismatches,
+            )
+        return entry["session_id"], entry["raw_token"], None
 
     def _register_qa_session_ref(self, args: dict, result: Any) -> Any:
         """Replace the one-time raw QA token with a process-local opaque ref."""
@@ -4860,34 +4989,66 @@ class ToolDispatcher:
                 for key in ("observer_kind", "session_label", "pid", "cwd", "capabilities")
                 if key in args and args[key] is not None
             }
-            return self._api("POST", f"/api/projects/{pid}/observer-sessions/register", body)
+            return self._register_observer_session_ref(
+                args,
+                self._api(
+                    "POST",
+                    f"/api/projects/{pid}/observer-sessions/register",
+                    body,
+                ),
+            )
 
         if name == "observer_session_heartbeat":
             pid = args["project_id"]
-            sid = urllib.parse.quote(str(args["session_id"]), safe="")
+            session_id, raw_token, error = self._observer_session_auth_for_ref(args)
+            if error:
+                return error
+            sid = urllib.parse.quote(session_id, safe="")
             return self._api(
                 "POST",
                 f"/api/projects/{pid}/observer-sessions/{sid}/heartbeat",
-                {"session_token": args["session_token"]},
+                {"session_token": raw_token},
             )
 
         if name == "observer_session_close":
             pid = args["project_id"]
-            sid = urllib.parse.quote(str(args["session_id"]), safe="")
-            return self._api(
+            session_id, raw_token, error = self._observer_session_auth_for_ref(args)
+            if error:
+                return error
+            sid = urllib.parse.quote(session_id, safe="")
+            result = self._api(
                 "POST",
                 f"/api/projects/{pid}/observer-sessions/{sid}/close",
-                {"session_token": args["session_token"]},
+                {"session_token": raw_token},
             )
+            if args.get("observer_session_token_ref") and isinstance(result, dict) and (
+                result.get("ok") is not False and not result.get("error")
+            ):
+                with self._observer_session_refs_lock:
+                    self._observer_session_refs.pop(
+                        str(args["observer_session_token_ref"]), None
+                    )
+            return result
 
         if name == "observer_session_revoke":
             pid = args["project_id"]
-            sid = urllib.parse.quote(str(args["session_id"]), safe="")
-            return self._api(
+            session_id, raw_token, error = self._observer_session_auth_for_ref(args)
+            if error:
+                return error
+            sid = urllib.parse.quote(session_id, safe="")
+            result = self._api(
                 "POST",
                 f"/api/projects/{pid}/observer-sessions/{sid}/revoke",
-                {"session_token": args["session_token"]},
+                {"session_token": raw_token},
             )
+            if args.get("observer_session_token_ref") and isinstance(result, dict) and (
+                result.get("ok") is not False and not result.get("error")
+            ):
+                with self._observer_session_refs_lock:
+                    self._observer_session_refs.pop(
+                        str(args["observer_session_token_ref"]), None
+                    )
+            return result
 
         if name == "qa_session_register":
             pid = args["project_id"]
@@ -5173,12 +5334,49 @@ class ToolDispatcher:
 
         if name == "observer_hotfix_enter":
             pid = args["project_id"]
+            observer_session_id, raw_token, auth_error = (
+                self._observer_session_auth_for_ref(args)
+            )
+            if auth_error:
+                return auth_error
+            if args.get("observer_session_token_ref"):
+                heartbeat = self._api(
+                    "POST",
+                    "/api/projects/{}/observer-sessions/{}/heartbeat".format(
+                        pid,
+                        urllib.parse.quote(observer_session_id, safe=""),
+                    ),
+                    {"session_token": raw_token},
+                )
+                if not isinstance(heartbeat, dict) or (
+                    heartbeat.get("ok") is False or heartbeat.get("error")
+                ):
+                    return self._observer_session_ref_error(
+                        "observer_session_token_ref_stale",
+                        "Observer session heartbeat failed; register a fresh observer session.",
+                    )
             body = {
                 key: value
                 for key, value in args.items()
-                if key != "project_id" and value is not None
+                if key
+                not in {
+                    "project_id",
+                    "observer_session_id",
+                    "observer_session_token_ref",
+                    "session_token",
+                }
+                and value is not None
             }
-            return self._api("POST", f"/api/projects/{pid}/hotfix/enter", body)
+            query = (
+                "?" + urllib.parse.urlencode(
+                    {"observer_session_id": observer_session_id}
+                )
+                if observer_session_id
+                else ""
+            )
+            return self._api(
+                "POST", f"/api/projects/{pid}/hotfix/enter{query}", body
+            )
 
         if name == "mf_parallel_enter":
             if not str(args.get("project_id") or "").strip():
