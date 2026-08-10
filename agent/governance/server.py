@@ -63781,7 +63781,31 @@ _PUBLIC_RECONCILE_FALLBACK_REASONS = (
     "other",
 )
 _PUBLIC_RECONCILE_GRAPH_DELTA_MODES = frozenset(
-    {"incremental_graph_delta", "incremental", "full_rebuild", "full", "unknown"}
+    {
+        "incremental_graph_delta",
+        "incremental",
+        "metadata_only",
+        "full_rebuild",
+        "full",
+        "none",
+        "pending",
+        "unknown",
+    }
+)
+_PUBLIC_RECONCILE_SNAPSHOT_KINDS = frozenset({"scope", "full"})
+_PUBLIC_RECONCILE_STATUSES = frozenset(
+    {
+        "candidate_ready",
+        "complete",
+        "failed",
+        "terminalized_stale",
+        "running",
+        "finalizing",
+        "unknown",
+    }
+)
+_PUBLIC_RECONCILE_STATUS_REASON_CODES = frozenset(
+    {"missing_reconcile_status", "unrecognized_reconcile_status"}
 )
 
 
@@ -63969,6 +63993,102 @@ def _public_reconcile_metrics_summary(value: Any) -> dict[str, Any]:
                 speedup.get("incremental_sample_count"), maximum=1000
             ),
         },
+    }
+
+
+def _public_reconcile_metric_row(value: Any) -> dict[str, Any]:
+    """Project one persisted metric row to a fixed, non-evidentiary schema."""
+    row = value if isinstance(value, Mapping) else {}
+    project_id, _project_id_digest = _safe_reconcile_queue_identifier(
+        row.get("project_id"),
+        kind="project",
+    )
+    run_id, run_id_digest = _safe_reconcile_queue_identifier(
+        row.get("run_id"),
+        kind="run",
+    )
+    snapshot_id, snapshot_id_digest = _safe_reconcile_queue_identifier(
+        row.get("snapshot_id"),
+        kind="snapshot",
+    )
+    commit_sha, commit_sha_digest = _safe_reconcile_queue_commit(
+        row.get("commit_sha")
+    )
+    parent_commit_sha, parent_commit_sha_digest = _safe_reconcile_queue_commit(
+        row.get("parent_commit_sha")
+    )
+    snapshot_kind = str(row.get("snapshot_kind") or "")
+    strategy = str(row.get("strategy") or "")
+    graph_delta_mode = str(row.get("graph_delta_mode") or "")
+    status = str(row.get("effective_status") or "unknown")
+    status_reason_code = str(row.get("status_reason_code") or "")
+    fallback_reason = str(row.get("fallback_reason") or "")
+    created_at = str(row.get("created_at") or "")
+
+    if snapshot_kind not in _PUBLIC_RECONCILE_SNAPSHOT_KINDS:
+        snapshot_kind = "unknown"
+    if strategy not in _PUBLIC_RECONCILE_METRIC_STRATEGIES[:-1]:
+        strategy = "other"
+    if graph_delta_mode not in _PUBLIC_RECONCILE_GRAPH_DELTA_MODES:
+        graph_delta_mode = "unknown"
+    if status not in _PUBLIC_RECONCILE_STATUSES:
+        status = "unknown"
+        status_reason_code = "unrecognized_reconcile_status"
+    if status_reason_code not in _PUBLIC_RECONCILE_STATUS_REASON_CODES:
+        status_reason_code = ""
+    if fallback_reason not in _PUBLIC_RECONCILE_FALLBACK_REASONS[:-1]:
+        fallback_reason = "other" if fallback_reason else ""
+    if not _RECONCILE_QUEUE_TIMESTAMP_RE.fullmatch(created_at):
+        created_at = ""
+
+    return {
+        "schema_version": "reconcile_run_metric.public_row.v1",
+        "project_id": project_id,
+        "run_id": run_id,
+        "run_id_sha256": run_id_digest,
+        "snapshot_id": snapshot_id,
+        "snapshot_id_sha256": snapshot_id_digest,
+        "commit_sha": commit_sha,
+        "commit_sha256": commit_sha_digest,
+        "parent_commit_sha": parent_commit_sha,
+        "parent_commit_sha256": parent_commit_sha_digest,
+        "snapshot_kind": snapshot_kind,
+        "strategy": strategy,
+        "graph_delta_mode": graph_delta_mode,
+        "status": status,
+        "status_reason_code": status_reason_code,
+        "is_terminal": bool(row.get("is_terminal")) and status in {
+            "candidate_ready",
+            "complete",
+            "failed",
+            "terminalized_stale",
+        },
+        "changed_file_count": _public_reconcile_metric_int(
+            row.get("changed_file_count")
+        ),
+        "impacted_file_count": _public_reconcile_metric_int(
+            row.get("impacted_file_count")
+        ),
+        "event_count": _public_reconcile_metric_int(row.get("event_count")),
+        "node_count": _public_reconcile_metric_int(row.get("node_count")),
+        "edge_count": _public_reconcile_metric_int(row.get("edge_count")),
+        "elapsed_ms": _public_reconcile_metric_int(row.get("elapsed_ms")),
+        "fallback_reason_code": fallback_reason,
+        "created_at": created_at,
+    }
+
+
+def _public_reconcile_metric_backfill(value: Any) -> dict[str, Any]:
+    """Expose only bounded counters from the internal backfill result."""
+    backfill = value if isinstance(value, Mapping) else {}
+    return {
+        "schema_version": "reconcile_run_metrics.public_backfill.v1",
+        "scanned": _public_reconcile_metric_int(
+            backfill.get("scanned"), maximum=1000
+        ),
+        "imported": _public_reconcile_metric_int(
+            backfill.get("imported"), maximum=1000
+        ),
     }
 
 
@@ -64701,6 +64821,27 @@ def handle_graph_governance_reconcile_metrics(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.metrics")
+        limit = _query_int(ctx.query, "limit", 50)
+        strategy = str(ctx.query.get("strategy") or "")
+        nonterminal_limit = _query_int(
+            ctx.query,
+            "nonterminal_limit",
+            1000,
+        )
+        cursor = str(ctx.query.get("cursor") or "")
+        # A cursor rejection advertises zero-write. Validate any submitted
+        # continuation against the prewarmed schema before snapshot backfill
+        # can upsert a metric or this handler can commit.
+        if cursor.strip():
+            _reconcile_metric_window_or_error(
+                store,
+                conn,
+                project_id,
+                limit=limit,
+                strategy=strategy,
+                nonterminal_limit=nonterminal_limit,
+                cursor=cursor,
+            )
         if _query_bool(ctx.query, "backfill", True):
             backfill = store.backfill_reconcile_run_metrics_from_snapshots(
                 conn,
@@ -64710,22 +64851,19 @@ def handle_graph_governance_reconcile_metrics(ctx: RequestContext):
             conn.commit()
         else:
             backfill = {"project_id": project_id, "scanned": 0, "imported": 0}
-        limit = _query_int(ctx.query, "limit", 50)
-        strategy = str(ctx.query.get("strategy") or "")
         window = _reconcile_metric_window_or_error(
             store,
             conn,
             project_id,
             limit=limit,
             strategy=strategy,
-            nonterminal_limit=_query_int(
-                ctx.query,
-                "nonterminal_limit",
-                1000,
-            ),
-            cursor=str(ctx.query.get("cursor") or ""),
+            nonterminal_limit=nonterminal_limit,
+            cursor=cursor,
         )
-        rows = list(window["rows"])
+        rows = [
+            _public_reconcile_metric_row(row)
+            for row in window["rows"]
+        ]
         public_window = _public_reconcile_metric_window(
             window,
             cursor_parameter="cursor",
@@ -64733,8 +64871,14 @@ def handle_graph_governance_reconcile_metrics(ctx: RequestContext):
         return {
             "ok": True,
             "project_id": project_id,
-            "backfill": backfill,
-            "summary": store.summarize_reconcile_run_metrics(conn, project_id, limit=max(limit, 100)),
+            "backfill": _public_reconcile_metric_backfill(backfill),
+            "summary": _public_reconcile_metrics_summary(
+                store.summarize_reconcile_run_metrics(
+                    conn,
+                    project_id,
+                    limit=max(limit, 100),
+                )
+            ),
             "metrics": rows,
             "count": len(rows),
             "window": public_window,

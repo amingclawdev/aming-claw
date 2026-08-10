@@ -71018,12 +71018,355 @@ def test_reconcile_metrics_endpoint_reports_speedup(conn, monkeypatch):
     assert result["ok"] is True
     assert result["summary"]["speedup"]["speedup_x"] == 8
     assert result["summary"]["speedup"]["elapsed_reduction_pct"] == 87.5
-    assert {row["run_id"] for row in result["metrics"]} == {"fast", "full"}
+    assert result["summary"]["schema_version"] == (
+        "reconcile_metrics.public_summary.v1"
+    )
+    assert all(
+        row["schema_version"] == "reconcile_run_metric.public_row.v1"
+        for row in result["metrics"]
+    )
+    assert {row["strategy"] for row in result["metrics"]} == {
+        "incremental_graph_delta",
+        "full_rebuild_fallback",
+    }
+    assert all(row["run_id"].startswith("run-") for row in result["metrics"])
+    assert all(
+        row["run_id_sha256"].startswith("sha256:")
+        for row in result["metrics"]
+    )
     assert result["window"]["remaining_count_claimed"] is False
     assert result["window"]["effective_nonterminal_completeness"] == "complete"
     assert result["has_more"] is False
     assert result["truncated"] is False
     assert result["next_cursor"] == ""
+
+
+def test_reconcile_metrics_endpoint_projects_fixed_public_schema_fail_closed(
+    conn,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    secrets = (
+        "PublicMetricRunSecret9",
+        "PublicMetricSnapshotSecret9",
+        "PublicMetricCommitSecret9",
+        "PublicMetricParentCommitSecret9",
+        "PublicMetricKindSecret9",
+        "PublicMetricStrategySecret9",
+        "PublicMetricModeSecret9",
+        "PublicMetricStatusSecret9",
+        "PublicMetricFallbackSecret9",
+        "PublicMetricDynamicKeySecret9",
+        "PublicMetricEvidenceSecret9",
+        "/Users/private/PublicMetricTraceSecret9.json",
+        "PublicMetricTimestampSecret9",
+    )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id=f"rtok-{secrets[0]}",
+        snapshot_id=f"session-token-{secrets[1]}",
+        commit_sha=secrets[2],
+        parent_commit_sha=secrets[3],
+        snapshot_kind=secrets[4],
+        strategy=secrets[5],
+        graph_delta_mode=secrets[6],
+        status=secrets[7],
+        elapsed_ms=21,
+        trace_summary_path=secrets[11],
+        fallback_reason=secrets[8],
+        evidence={secrets[9]: secrets[10]},
+        created_at=secrets[12],
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_reconcile_metrics(
+        _ctx({"project_id": PID}, query={"backfill": "false"})
+    )
+
+    assert result["summary"]["schema_version"] == (
+        "reconcile_metrics.public_summary.v1"
+    )
+    assert len(result["metrics"]) == 1
+    metric = result["metrics"][0]
+    assert set(metric) == {
+        "schema_version",
+        "project_id",
+        "run_id",
+        "run_id_sha256",
+        "snapshot_id",
+        "snapshot_id_sha256",
+        "commit_sha",
+        "commit_sha256",
+        "parent_commit_sha",
+        "parent_commit_sha256",
+        "snapshot_kind",
+        "strategy",
+        "graph_delta_mode",
+        "status",
+        "status_reason_code",
+        "is_terminal",
+        "changed_file_count",
+        "impacted_file_count",
+        "event_count",
+        "node_count",
+        "edge_count",
+        "elapsed_ms",
+        "fallback_reason_code",
+        "created_at",
+    }
+    assert metric["run_id"].startswith("run-")
+    assert metric["snapshot_id"].startswith("snapshot-")
+    assert metric["commit_sha"] == ""
+    assert metric["parent_commit_sha"] == ""
+    assert metric["snapshot_kind"] == "unknown"
+    assert metric["strategy"] == "other"
+    assert metric["graph_delta_mode"] == "unknown"
+    assert metric["status"] == "unknown"
+    assert metric["status_reason_code"] == "unrecognized_reconcile_status"
+    assert metric["is_terminal"] is False
+    assert metric["fallback_reason_code"] == "other"
+    assert metric["created_at"] == ""
+    serialized = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    for secret in secrets:
+        assert secret not in serialized
+
+
+def test_public_reconcile_metric_row_hashes_credential_project_and_invalid_commits():
+    raw_project_id = "rtok-PublicMetricProjectSecret9"
+    raw_commit = "/Users/private/PublicMetricCommitSecret9"
+    raw_parent_commit = "session-token-PublicMetricParentCommitSecret9"
+
+    metric = server._public_reconcile_metric_row(
+        {
+            "project_id": raw_project_id,
+            "run_id": "current-full-aaaaaaa",
+            "snapshot_id": "full-aaaaaaa-abcd",
+            "commit_sha": raw_commit,
+            "parent_commit_sha": raw_parent_commit,
+            "snapshot_kind": "full",
+            "strategy": "current_full_reconcile",
+            "graph_delta_mode": "full_rebuild",
+            "effective_status": "running",
+        }
+    )
+
+    expected_project_digest = "sha256:" + hashlib.sha256(
+        raw_project_id.encode("utf-8")
+    ).hexdigest()
+    assert metric["project_id"] == (
+        "project-" + expected_project_digest[7:23]
+    )
+    assert metric["commit_sha"] == ""
+    assert metric["parent_commit_sha"] == ""
+    serialized = json.dumps(metric, sort_keys=True)
+    assert raw_project_id not in serialized
+    assert raw_commit not in serialized
+    assert raw_parent_commit not in serialized
+
+
+def test_reconcile_metrics_invalid_cursor_with_pending_backfill_is_physical_zero_write(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "reconcile-metrics-invalid-cursor.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root",
+        lambda: tmp_path / "state",
+    )
+    for index in range(2):
+        store.record_reconcile_run_metric(
+            connection,
+            PID,
+            run_id=f"current-full-{index + 1:07x}",
+            snapshot_id=f"full-{index + 1:07x}-abcd",
+            commit_sha=f"{index + 1}" * 40,
+            snapshot_kind="full",
+            strategy="current_full_reconcile",
+            graph_delta_mode="full_rebuild",
+            status="running",
+            created_at=f"2026-08-10T00:00:0{index}Z",
+        )
+    window = store.list_reconcile_run_metrics_window(
+        connection,
+        PID,
+        limit=1,
+        nonterminal_limit=1,
+    )
+    assert window["has_more"] is True
+    valid_cursor = window["next_cursor"]
+    invalid_cursor = valid_cursor[:-1] + (
+        "0" if valid_cursor[-1] != "0" else "1"
+    )
+    store.create_graph_snapshot(
+        connection,
+        PID,
+        snapshot_id="full-pending-backfill",
+        commit_sha="a" * 40,
+        snapshot_kind="full",
+        notes=json.dumps({"run_id": "current-full-pending-backfill"}),
+    )
+    connection.commit()
+    assert connection.execute(
+        "SELECT COUNT(*) FROM reconcile_run_metrics "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (PID, "full-pending-backfill"),
+    ).fetchone()[0] == 0
+
+    wrapped = _CountingNoCloseConn(connection)
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: wrapped)
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    before_changes = connection.total_changes
+    before_commit_calls = wrapped.commit_calls
+    before_count = connection.execute(
+        "SELECT COUNT(*) FROM reconcile_run_metrics WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+    before_bytes = db_path.read_bytes()
+    before_hash = hashlib.sha256(before_bytes).hexdigest()
+
+    try:
+        with pytest.raises(GovernanceError) as invalid:
+            server.handle_graph_governance_reconcile_metrics(
+                _ctx(
+                    {"project_id": PID},
+                    query={
+                        "backfill": "true",
+                        "cursor": invalid_cursor,
+                        "limit": "1",
+                        "nonterminal_limit": "1",
+                    },
+                )
+            )
+
+        assert invalid.value.code == "invalid_reconcile_metric_cursor"
+        assert invalid.value.details == {
+            "reason_code": "cursor_identity_mismatch",
+            "zero_write": True,
+        }
+        after_bytes = db_path.read_bytes()
+        assert connection.total_changes == before_changes
+        assert wrapped.commit_calls == before_commit_calls
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics WHERE project_id = ?",
+            (PID,),
+        ).fetchone()[0] == before_count
+        assert after_bytes == before_bytes
+        assert hashlib.sha256(after_bytes).hexdigest() == before_hash
+    finally:
+        connection.close()
+
+
+def test_reconcile_metrics_valid_and_empty_cursor_backfill_happy_paths(
+    conn,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    for index in range(3):
+        store.record_reconcile_run_metric(
+            conn,
+            PID,
+            run_id=f"current-full-{index + 1:07x}",
+            snapshot_id=f"full-{index + 1:07x}-abcd",
+            commit_sha=f"{index + 1}" * 40,
+            snapshot_kind="full",
+            strategy="current_full_reconcile",
+            graph_delta_mode="full_rebuild",
+            status="running",
+            created_at=f"2026-08-10T00:00:0{index}Z",
+        )
+    cursor_window = store.list_reconcile_run_metrics_window(
+        conn,
+        PID,
+        limit=1,
+        strategy="current_full_reconcile",
+        nonterminal_limit=1,
+    )
+    assert cursor_window["has_more"] is True
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-valid-cursor-backfill",
+        commit_sha="a" * 40,
+        snapshot_kind="full",
+        notes=json.dumps({"run_id": "current-full-valid-cursor-backfill"}),
+    )
+    conn.commit()
+
+    valid = server.handle_graph_governance_reconcile_metrics(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "backfill": "true",
+                "cursor": cursor_window["next_cursor"],
+                "limit": "1",
+                "nonterminal_limit": "1",
+                "strategy": "current_full_reconcile",
+            },
+        )
+    )
+
+    assert valid["backfill"] == {
+        "schema_version": "reconcile_run_metrics.public_backfill.v1",
+        "scanned": 1,
+        "imported": 1,
+    }
+    assert valid["window"]["cursor_applied"] is True
+    assert all(
+        row["schema_version"] == "reconcile_run_metric.public_row.v1"
+        for row in valid["metrics"]
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM reconcile_run_metrics "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (PID, "full-valid-cursor-backfill"),
+    ).fetchone()[0] == 1
+
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-empty-cursor-backfill",
+        commit_sha="b" * 40,
+        snapshot_kind="full",
+        notes=json.dumps({"run_id": "current-full-empty-cursor-backfill"}),
+    )
+    conn.commit()
+    empty = server.handle_graph_governance_reconcile_metrics(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "backfill": "true",
+                "cursor": "",
+                "limit": "1",
+                "nonterminal_limit": "1",
+            },
+        )
+    )
+
+    assert empty["backfill"]["scanned"] == 2
+    assert empty["backfill"]["imported"] == 2
+    assert empty["window"]["cursor_applied"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM reconcile_run_metrics "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (PID, "full-empty-cursor-backfill"),
+    ).fetchone()[0] == 1
 
 
 def test_pending_scope_recover_stale_endpoint_marks_running_failed(conn, monkeypatch):
