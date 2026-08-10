@@ -566,6 +566,70 @@ def test_manager_generation_reader_bounds_history_and_rejects_cycle(conn, monkey
         store.current_manager_generation_certificate(conn, two_cycle_project)
 
 
+def test_manager_generation_prewrite_depth_gate_is_exact_and_physical_zero_write(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "manager-generation-depth.sqlite"
+    connection = _file_connection(db_path)
+    monkeypatch.setattr(store, "MANAGER_GENERATION_MAX_CHAIN_DEPTH", 2)
+    g1 = store.record_manager_generation_certificate(
+        connection, PID, **_generation("1", manager_pid=5301)
+    )
+    g2_inputs = _generation(
+        "2",
+        manager_pid=5302,
+        prior_manager_pid=5301,
+        prior_process_start_identity="process-start-1",
+        observed_prior_generation_id="generation-1",
+    )
+    g2 = store.record_manager_generation_certificate(
+        connection, PID, **g2_inputs
+    )
+    assert g1["sequence"] < g2["sequence"]
+    connection.close()
+    before_sha = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+    verify = _file_connection(db_path)
+    statements: list[str] = []
+    verify.set_trace_callback(statements.append)
+    before_changes = verify.total_changes
+    with pytest.raises(
+        store.ManagerGenerationCertificateConflictError,
+        match="manager_generation_history_too_deep",
+    ):
+        store.record_manager_generation_certificate(
+            verify,
+            PID,
+            **_generation(
+                "3",
+                manager_pid=5303,
+                prior_manager_pid=5302,
+                prior_process_start_identity="process-start-2",
+                observed_prior_generation_id="generation-2",
+            ),
+        )
+    current = store.current_manager_generation_certificate(verify, PID)
+    replay = store.record_manager_generation_certificate(
+        verify, PID, **g2_inputs
+    )
+    assert current["certificate_id"] == g2["certificate_id"]
+    assert replay["certificate_id"] == g2["certificate_id"]
+    assert replay["writes_performed"] is False
+    assert verify.total_changes == before_changes
+    assert verify.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_manager_generations "
+        "WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == 2
+    verify.close()
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before_sha
+    assert not any(
+        statement.lstrip().upper().startswith(("INSERT ", "UPDATE ", "DELETE "))
+        for statement in statements
+    )
+
+
 def test_manager_generation_schema_rejects_false_prior_death_proof(conn):
     store.ensure_schema(conn)
     first = store.record_manager_generation_certificate(

@@ -533,7 +533,7 @@ def _manager_generation_after_insert_hook() -> None:
 def _validate_manager_generation_certificate_row(
     conn: sqlite3.Connection,
     row: Mapping[str, Any],
-) -> None:
+) -> int:
     current = dict(row)
     seen: set[str] = set()
     for _depth in range(MANAGER_GENERATION_MAX_CHAIN_DEPTH):
@@ -552,7 +552,7 @@ def _validate_manager_generation_certificate_row(
             )
         predecessor_id = str(current.get("predecessor_certificate_id") or "")
         if not predecessor_id:
-            return
+            return len(seen)
         predecessor_row = conn.execute(
             "SELECT * FROM graph_reconcile_manager_generations "
             "WHERE certificate_id = ? AND project_id = ?",
@@ -683,8 +683,16 @@ def record_manager_generation_certificate(
             (project,),
         ).fetchone()
         predecessor = dict(predecessor_row) if predecessor_row else {}
+        predecessor_depth = 0
         if predecessor:
-            _validate_manager_generation_certificate_row(conn, predecessor)
+            predecessor_depth = _validate_manager_generation_certificate_row(
+                conn, predecessor
+            )
+        candidate_depth = predecessor_depth + 1
+        if candidate_depth > max(0, int(MANAGER_GENERATION_MAX_CHAIN_DEPTH)):
+            raise ManagerGenerationCertificateConflictError(
+                "manager_generation_history_too_deep", predecessor
+            )
         if predecessor:
             observed_prior_generation = str(
                 values["observed_prior_generation_id"] or ""
