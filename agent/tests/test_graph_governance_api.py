@@ -9685,6 +9685,158 @@ def test_current_full_activation_rechecks_candidate_inside_immediate_transaction
     assert len(calls) == 1
 
 
+def test_current_full_activation_rechecks_companions_after_activation_before_commit(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    old_snapshot_id = "full-current-post-activation-old"
+    _activate_basic_graph(conn, old_snapshot_id, commit_sha="b" * 40)
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    candidate_status, candidate = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "activate": False,
+                    "semantic_enrich": False,
+                    "run_id": "current-full-post-activation-build",
+                },
+            )
+        )
+    )
+    assert candidate_status == 201
+    snapshot_id = candidate["candidate_snapshot_id"]
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head,
+        parent_commit_sha="b" * 40,
+        status=store.PENDING_STATUS_QUEUED,
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        state_reconcile,
+        "_full_reconcile_pending_scope_waiver_commits",
+        lambda _root, _pending, _target: [head],
+    )
+    manifest_path = store.snapshot_companion_dir(PID, snapshot_id) / "manifest.json"
+    original_activate = store.activate_graph_snapshot
+
+    def activate_then_corrupt(*args, **kwargs):
+        activation = original_activate(*args, **kwargs)
+        manifest_path.write_bytes(b"not-json")
+        return activation
+
+    monkeypatch.setattr(store, "activate_graph_snapshot", activate_then_corrupt)
+    before_active = dict(store.get_active_graph_snapshot(conn, PID))
+    before_snapshots = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT snapshot_id, status FROM graph_snapshots "
+            "WHERE project_id = ? ORDER BY snapshot_id",
+            (PID,),
+        ).fetchall()
+    ]
+    before_metrics = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT run_id, snapshot_id, status, evidence_json "
+            "FROM reconcile_run_metrics WHERE project_id = ? "
+            "ORDER BY run_id, snapshot_id",
+            (PID,),
+        ).fetchall()
+    ]
+    before_pending = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT commit_sha, status, snapshot_id, evidence_json "
+            "FROM pending_scope_reconcile WHERE project_id = ?",
+            (PID,),
+        ).fetchall()
+    ]
+    before_timeline_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+    before_ref_events = conn.execute(
+        "SELECT COUNT(*) FROM graph_ref_events WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "activate": True,
+                "semantic_enrich": False,
+                "run_id": "current-full-post-activation-activate",
+                "snapshot_id": snapshot_id,
+                "expected_old_snapshot_id": old_snapshot_id,
+            },
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == "current_full_candidate_resume_tuple_invalid"
+    assert result["validation_phase"] == "post_activation_precommit"
+    assert result["rebuild_started"] is False
+    assert "current_full_candidate_manifest_invalid" in result["resume_tuple"][
+        "errors"
+    ]
+    assert dict(store.get_active_graph_snapshot(conn, PID)) == before_active
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT snapshot_id, status FROM graph_snapshots "
+            "WHERE project_id = ? ORDER BY snapshot_id",
+            (PID,),
+        ).fetchall()
+    ] == before_snapshots
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT run_id, snapshot_id, status, evidence_json "
+            "FROM reconcile_run_metrics WHERE project_id = ? "
+            "ORDER BY run_id, snapshot_id",
+            (PID,),
+        ).fetchall()
+    ] == before_metrics
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT commit_sha, status, snapshot_id, evidence_json "
+            "FROM pending_scope_reconcile WHERE project_id = ?",
+            (PID,),
+        ).fetchall()
+    ] == before_pending
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == before_timeline_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_ref_events WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == before_ref_events
+    assert conn.execute(
+        "SELECT COUNT(*) FROM reconcile_run_metrics WHERE project_id = ? "
+        "AND run_id = ? AND status = 'complete'",
+        (PID, "current-full-post-activation-activate"),
+    ).fetchone()[0] == 0
+    assert len(calls) == 1
+
+
 def test_current_full_reconcile_explicit_candidate_preserves_stale_cas_refusal(
     conn,
     monkeypatch,
@@ -9777,22 +9929,6 @@ def test_current_full_resumed_candidate_has_zero_claim_delta_and_zero_build(
         "_require_current_full_reconcile_auth",
         lambda *_args, **_kwargs: {"role_source": "operator_token"},
     )
-    first_status, first = server.handle_graph_governance_current_full_reconcile(
-        _ctx_with_role(
-            {"project_id": PID},
-            "coordinator",
-            method="POST",
-            body={
-                "target_commit_sha": head,
-                "snapshot_id": snapshot_id,
-                "run_id": "run-resume-origin",
-                "activate": False,
-                "semantic_enrich": False,
-            },
-        )
-    )
-    assert first_status == 201
-    assert first["candidate_snapshot_id"] == snapshot_id
     owner = server._current_full_build_manager_identity()
     unrelated_claim = store.acquire_current_full_build_claim(
         conn,
@@ -9816,6 +9952,22 @@ def test_current_full_resumed_candidate_has_zero_claim_delta_and_zero_build(
         terminal_status="failed",
         manager_start_identity=owner["manager_start_identity"],
     )
+    first_status, first = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "snapshot_id": snapshot_id,
+                "run_id": "run-resume-origin",
+                "activate": False,
+                "semantic_enrich": False,
+            },
+        )
+    )
+    assert first_status == 201
+    assert first["candidate_snapshot_id"] == snapshot_id
     claim_count_before = conn.execute(
         "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
     ).fetchone()[0]
@@ -9846,6 +9998,249 @@ def test_current_full_resumed_candidate_has_zero_claim_delta_and_zero_build(
     assert conn.execute(
         "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
     ).fetchone()[0] == claim_count_before
+
+
+def test_current_full_run_id_binds_one_snapshot_and_exact_replay_is_read_only(
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    run_id = "run-one-durable-snapshot"
+    snapshot_id = "full-run-one-durable-snapshot"
+    db_path = tmp_path / "run-one-durable-snapshot.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.commit()
+    wrapped = _CountingNoCloseConn(connection)
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root", lambda: tmp_path / "state"
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: wrapped)
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    try:
+        first_status, first = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "snapshot_id": snapshot_id,
+                    "run_id": run_id,
+                    "activate": False,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+        assert first_status == 201
+        assert first["candidate_snapshot_id"] == snapshot_id
+        before_changes = connection.total_changes
+        before_commits = wrapped.commit_calls
+        before_bytes = db_path.read_bytes()
+        before_claims = connection.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
+        ).fetchone()[0]
+        before_metrics = connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics"
+        ).fetchone()[0]
+
+        for suffix, target_commit, expected_error, expected_fields in (
+            (
+                "same-commit",
+                head,
+                "current_full_run_snapshot_identity_conflict",
+                ["snapshot_id"],
+            ),
+            (
+                "different-commit",
+                "b" * 40,
+                "reconcile_run_id_target_commit_conflict",
+                [],
+            ),
+        ):
+            status, result = server.handle_graph_governance_current_full_reconcile(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "coordinator",
+                    method="POST",
+                    body={
+                        "target_commit_sha": target_commit,
+                        "snapshot_id": f"full-run-conflict-{suffix}",
+                        "run_id": run_id,
+                        "activate": True,
+                        "semantic_enrich": False,
+                    },
+                )
+            )
+            assert status == 409
+            assert result["error"] == expected_error
+            if expected_fields:
+                assert result["conflict_fields"] == expected_fields
+            else:
+                assert result["expected_target_commit_sha"] == head
+                assert result["actual_target_commit_sha"] == target_commit
+            assert result["rebuild_started"] is False
+            assert result["fail_closed"] is True
+
+        replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "snapshot_id": snapshot_id,
+                    "run_id": run_id,
+                    "activate": False,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+
+        assert replay_status == 200
+        assert replay["resumed_candidate"] is True
+        assert replay["rebuild_skipped"] is True
+        assert len(calls) == 1
+        assert connection.total_changes == before_changes
+        assert wrapped.commit_calls == before_commits
+        assert db_path.read_bytes() == before_bytes
+        assert connection.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
+        ).fetchone()[0] == before_claims
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics"
+        ).fetchone()[0] == before_metrics
+        assert connection.execute(
+            "SELECT COUNT(*) FROM graph_snapshots WHERE project_id = ? "
+            "AND snapshot_id LIKE 'full-run-conflict-%'",
+            (PID,),
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("first_activate", [False, True])
+def test_fresh_run_reuses_existing_deterministic_snapshot_without_build_or_overwrite(
+    monkeypatch,
+    tmp_path,
+    first_activate,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    db_path = tmp_path / f"deterministic-existing-{first_activate}.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.commit()
+    wrapped = _CountingNoCloseConn(connection)
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root", lambda: tmp_path / "state"
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: wrapped)
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    try:
+        first_status, first = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "run_id": f"deterministic-origin-{first_activate}",
+                    "activate": first_activate,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+        assert first_status == 201
+        snapshot_id = str(
+            first.get("active_snapshot_id")
+            or first.get("candidate_snapshot_id")
+        )
+        companion_dir = store.snapshot_companion_dir(PID, snapshot_id)
+        companion_before = {
+            name: (companion_dir / name).read_bytes()
+            for name in (
+                "graph.json",
+                "file_inventory.json",
+                "drift_ledger.json",
+                "manifest.json",
+            )
+        }
+        companion_hashes_before = {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in companion_before.items()
+        }
+        before_changes = connection.total_changes
+        before_commits = wrapped.commit_calls
+        before_db_bytes = db_path.read_bytes()
+        before_claims = connection.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
+        ).fetchone()[0]
+        before_metrics = connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics"
+        ).fetchone()[0]
+
+        def unexpected_builder(*_args, **_kwargs):
+            raise AssertionError("existing deterministic snapshot must not rebuild")
+
+        monkeypatch.setattr(
+            state_reconcile,
+            "run_state_only_full_reconcile",
+            unexpected_builder,
+        )
+        fresh_status, fresh = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "run_id": f"deterministic-fresh-{first_activate}",
+                    "activate": first_activate,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+
+        assert fresh_status == 200
+        assert fresh["rebuild_skipped"] is True
+        if first_activate:
+            assert fresh["fresh_run_snapshot_resume"] is True
+            assert fresh["requested_run_id"] == "deterministic-fresh-True"
+        else:
+            assert fresh["resumed_candidate"] is True
+        assert len(calls) == 1
+        assert connection.total_changes == before_changes
+        assert wrapped.commit_calls == before_commits
+        assert db_path.read_bytes() == before_db_bytes
+        assert connection.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
+        ).fetchone()[0] == before_claims
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics"
+        ).fetchone()[0] == before_metrics
+        companion_after = {
+            name: (companion_dir / name).read_bytes()
+            for name in companion_before
+        }
+        assert companion_after == companion_before
+        assert {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in companion_after.items()
+        } == companion_hashes_before
+    finally:
+        connection.close()
 
 
 def test_current_full_cross_run_resume_is_physically_read_only(

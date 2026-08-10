@@ -4793,6 +4793,102 @@ def _int_value(value: Any, default: int = 0) -> int:
         return default
 
 
+def current_full_run_snapshot_identity_check(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    run_id: str,
+    snapshot_id: str = "",
+    commit_sha: str = "",
+    idempotency_scope: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Prove that one current-full run names one durable snapshot identity."""
+
+    expected_snapshot_id = str(snapshot_id or "").strip()
+    expected_commit_sha = str(commit_sha or "").strip()
+    expected_scope = (
+        dict(idempotency_scope)
+        if isinstance(idempotency_scope, Mapping)
+        else None
+    )
+    observed: list[dict[str, Any]] = []
+    for source, rows in (
+        (
+            "metric",
+            conn.execute(
+                """
+                SELECT snapshot_id, commit_sha, evidence_json
+                FROM reconcile_run_metrics
+                WHERE project_id = ? AND run_id = ?
+                """,
+                (project_id, run_id),
+            ).fetchall(),
+        ),
+        (
+            "claim",
+            conn.execute(
+                """
+                SELECT snapshot_id, commit_sha, '' AS evidence_json
+                FROM graph_current_full_build_claim_history
+                WHERE project_id = ? AND run_id = ?
+                """,
+                (project_id, run_id),
+            ).fetchall(),
+        ),
+    ):
+        for row in rows:
+            item = dict(row)
+            scope = None
+            if source == "metric":
+                evidence = _decode_json(item.get("evidence_json"), {})
+                stored_scope = (
+                    evidence.get("idempotency_scope")
+                    if isinstance(evidence, Mapping)
+                    else None
+                )
+                scope = (
+                    dict(stored_scope)
+                    if isinstance(stored_scope, Mapping)
+                    else {}
+                )
+            observed.append(
+                {
+                    "source": source,
+                    "snapshot_id": str(item.get("snapshot_id") or "").strip(),
+                    "commit_sha": str(item.get("commit_sha") or "").strip(),
+                    "idempotency_scope": scope,
+                }
+            )
+    if not expected_snapshot_id and observed:
+        expected_snapshot_id = observed[0]["snapshot_id"]
+    conflict_fields: set[str] = set()
+    for item in observed:
+        if item["snapshot_id"] != expected_snapshot_id:
+            conflict_fields.add("snapshot_id")
+        if expected_commit_sha and item["commit_sha"] != expected_commit_sha:
+            conflict_fields.add("commit_sha")
+        if (
+            item["source"] == "metric"
+            and expected_scope is not None
+            and item["idempotency_scope"] != expected_scope
+        ):
+            conflict_fields.add("idempotency_scope")
+    return {
+        "conflict": bool(conflict_fields),
+        "reason": (
+            "current_full_run_snapshot_identity_conflict"
+            if conflict_fields
+            else ""
+        ),
+        "run_id": str(run_id or "").strip(),
+        "expected_snapshot_id": expected_snapshot_id,
+        "expected_commit_sha": expected_commit_sha,
+        "expected_idempotency_scope": expected_scope,
+        "conflict_fields": sorted(conflict_fields),
+        "observed_identities": observed,
+    }
+
+
 def acquire_current_full_build_claim(
     conn: sqlite3.Connection,
     project_id: str,
@@ -4829,6 +4925,21 @@ def acquire_current_full_build_claim(
     claim_id = f"gcfclaim-{uuid.uuid4().hex[:20]}"
     try:
         conn.execute("BEGIN IMMEDIATE")
+        run_identity = current_full_run_snapshot_identity_check(
+            conn,
+            values["project_id"],
+            run_id=values["run_id"],
+            snapshot_id=values["snapshot_id"],
+            commit_sha=values["commit_sha"],
+            idempotency_scope=(metric_evidence or {}).get("idempotency_scope")
+            if isinstance((metric_evidence or {}).get("idempotency_scope"), Mapping)
+            else {},
+        )
+        if run_identity["conflict"]:
+            raise GraphSnapshotBuildClaimConflictError(
+                "current_full_run_snapshot_identity_conflict",
+                run_identity,
+            )
         prior_identity = conn.execute(
             """
             SELECT * FROM graph_current_full_build_claim_history
@@ -4854,6 +4965,18 @@ def acquire_current_full_build_claim(
         if prior_metric:
             raise GraphSnapshotBuildClaimConflictError(
                 "current_full_build_metric_identity_exists", dict(prior_metric)
+            )
+        existing_snapshot = conn.execute(
+            """
+            SELECT * FROM graph_snapshots
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (values["project_id"], values["snapshot_id"]),
+        ).fetchone()
+        if existing_snapshot:
+            raise GraphSnapshotBuildClaimConflictError(
+                "current_full_snapshot_identity_exists",
+                dict(existing_snapshot),
             )
         active = conn.execute(
             """

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sqlite3
+import time
 
 import pytest
 
@@ -670,6 +672,186 @@ def test_existing_metric_identity_cannot_be_reacquired_or_reset(conn):
         "AND run_id = ? AND snapshot_id = ?",
         (PID, "run-existing-metric", "full-existing-metric"),
     ).fetchone()[0] == "failed"
+
+
+@pytest.mark.parametrize("requested_commit", ["a" * 40, "b" * 40])
+def test_claim_admission_fences_run_to_one_snapshot_identity(
+    conn,
+    requested_commit,
+):
+    scope = {"task_id": "task-run-identity"}
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="run-one-snapshot-identity",
+        snapshot_id="full-run-identity-a",
+        commit_sha="a" * 40,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="candidate_ready",
+        evidence={"idempotency_scope": scope},
+    )
+    conn.commit()
+    before_changes = conn.total_changes
+
+    with pytest.raises(
+        store.GraphSnapshotBuildClaimConflictError,
+        match="current_full_run_snapshot_identity_conflict",
+    ):
+        store.acquire_current_full_build_claim(
+            conn,
+            PID,
+            run_id="run-one-snapshot-identity",
+            snapshot_id="full-run-identity-b",
+            commit_sha=requested_commit,
+            metric_evidence={"idempotency_scope": scope},
+            **_claim_owner("run-identity"),
+        )
+
+    assert conn.total_changes == before_changes
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_build_claim_history "
+        "WHERE project_id = ? AND run_id = ?",
+        (PID, "run-one-snapshot-identity"),
+    ).fetchone()[0] == 0
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT snapshot_id, commit_sha, status FROM reconcile_run_metrics "
+            "WHERE project_id = ? AND run_id = ?",
+            (PID, "run-one-snapshot-identity"),
+        ).fetchall()
+    ] == [("full-run-identity-a", "a" * 40, "candidate_ready")]
+
+
+def test_concurrent_activation_and_fresh_claim_complete_once_without_overwrite(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "activation-versus-fresh-claim.sqlite"
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path)
+    activation_conn = _file_connection(db_path)
+    owner = _claim_owner("activation-race-origin")
+    claim = store.acquire_current_full_build_claim(
+        activation_conn,
+        PID,
+        run_id="activation-race-origin",
+        snapshot_id="full-activation-race",
+        commit_sha="c" * 40,
+        metric_evidence={"idempotency_scope": {}},
+        **owner,
+    )
+    store.create_graph_snapshot(
+        activation_conn,
+        PID,
+        snapshot_id="full-activation-race",
+        commit_sha="c" * 40,
+        snapshot_kind="full",
+        graph_json={"deps_graph": {"nodes": []}},
+        notes=json.dumps({"run_id": "activation-race-origin"}),
+    )
+    activation_conn.commit()
+    store.terminalize_current_full_build_claim(
+        activation_conn,
+        PID,
+        claim_id=claim["claim_id"],
+        run_id="activation-race-origin",
+        snapshot_id="full-activation-race",
+        commit_sha="c" * 40,
+        terminal_status="candidate_ready",
+        manager_start_identity=owner["manager_start_identity"],
+        metric_evidence={
+            "phase": "candidate_ready",
+            "claim_id": claim["claim_id"],
+            "idempotency_scope": {},
+        },
+    )
+    companion_dir = store.snapshot_companion_dir(PID, "full-activation-race")
+    companion_before = {
+        name: (companion_dir / name).read_bytes()
+        for name in (
+            "graph.json",
+            "file_inventory.json",
+            "drift_ledger.json",
+            "manifest.json",
+        )
+    }
+
+    activation_conn.execute("BEGIN IMMEDIATE")
+    store.activate_graph_snapshot(
+        activation_conn,
+        PID,
+        "full-activation-race",
+        auto_rebuild_projection=False,
+        schema_ready=True,
+        post_commit_hooks=False,
+    )
+
+    def fresh_claim_attempt() -> str:
+        fresh = sqlite3.connect(db_path, timeout=1)
+        fresh.row_factory = sqlite3.Row
+        try:
+            store.acquire_current_full_build_claim(
+                fresh,
+                PID,
+                run_id="activation-race-fresh",
+                snapshot_id="full-activation-race",
+                commit_sha="c" * 40,
+                metric_evidence={"idempotency_scope": {}},
+                **_claim_owner("activation-race-fresh"),
+            )
+        except store.GraphSnapshotBuildClaimConflictError as exc:
+            return exc.reason
+        finally:
+            fresh.close()
+        return "unexpected_success"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(fresh_claim_attempt)
+        time.sleep(0.05)
+        store.record_reconcile_run_metric(
+            activation_conn,
+            PID,
+            run_id="activation-race-origin",
+            snapshot_id="full-activation-race",
+            commit_sha="c" * 40,
+            snapshot_kind="full",
+            strategy="current_full_reconcile",
+            graph_delta_mode="full_rebuild",
+            status="complete",
+            evidence={
+                "phase": "atomic_finalize_complete",
+                "idempotency_scope": {},
+            },
+            schema_ready=True,
+        )
+        activation_conn.commit()
+        reason = future.result(timeout=2)
+
+    assert reason == "current_full_snapshot_identity_exists"
+    assert store.get_active_graph_snapshot(activation_conn, PID)[
+        "snapshot_id"
+    ] == "full-activation-race"
+    assert activation_conn.execute(
+        "SELECT COUNT(*) FROM reconcile_run_metrics WHERE project_id = ? "
+        "AND run_id = ? AND status = 'complete'",
+        (PID, "activation-race-origin"),
+    ).fetchone()[0] == 1
+    assert activation_conn.execute(
+        "SELECT COUNT(*) FROM reconcile_run_metrics WHERE project_id = ? "
+        "AND run_id = ?",
+        (PID, "activation-race-fresh"),
+    ).fetchone()[0] == 0
+    assert activation_conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_build_claim_history "
+        "WHERE project_id = ? AND run_id = ?",
+        (PID, "activation-race-fresh"),
+    ).fetchone()[0] == 0
+    assert {
+        name: (companion_dir / name).read_bytes() for name in companion_before
+    } == companion_before
+    activation_conn.close()
 
 
 def test_current_full_build_terminalization_rejects_commit_mismatch(conn):

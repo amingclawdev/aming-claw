@@ -69919,6 +69919,7 @@ def _current_full_candidate_resume_tuple(
     target_commit_sha: str,
     snapshot: Mapping[str, Any],
     request_metric: Mapping[str, Any],
+    expected_snapshot_status: str = "candidate",
 ) -> dict[str, Any]:
     from . import graph_snapshot_store as snapshot_store
 
@@ -69978,8 +69979,8 @@ def _current_full_candidate_resume_tuple(
             "error_type": type(exc).__name__,
         }
     errors: list[str] = []
-    if str(snapshot.get("status") or "") != "candidate":
-        errors.append("snapshot_not_candidate")
+    if str(snapshot.get("status") or "") != expected_snapshot_status:
+        errors.append(f"snapshot_not_{expected_snapshot_status}")
     if str(snapshot.get("commit_sha") or "") != target_commit_sha:
         errors.append("snapshot_commit_mismatch")
     if str(snapshot.get("snapshot_kind") or "") != "full":
@@ -70076,6 +70077,47 @@ def _current_full_candidate_resume_tuple(
     }
 
 
+def _current_full_candidate_tuple_from_db(
+    conn,
+    *,
+    project_id: str,
+    run_id: str,
+    target_commit_sha: str,
+    snapshot_id: str,
+    expected_snapshot_status: str = "candidate",
+) -> dict[str, Any]:
+    """Lock-safe exact candidate tuple read with no schema or other writes."""
+
+    snapshot_row = conn.execute(
+        """
+        SELECT * FROM graph_snapshots
+        WHERE project_id = ? AND snapshot_id = ?
+        """,
+        (project_id, snapshot_id),
+    ).fetchone()
+    snapshot = dict(snapshot_row) if snapshot_row else {}
+    notes = _json_loads(snapshot.get("notes"), {})
+    snapshot["notes_payload"] = (
+        dict(notes) if isinstance(notes, Mapping) else {}
+    )
+    request_metric_row = conn.execute(
+        """
+        SELECT * FROM reconcile_run_metrics
+        WHERE project_id = ? AND run_id = ? AND snapshot_id = ?
+        """,
+        (project_id, run_id, snapshot_id),
+    ).fetchone()
+    return _current_full_candidate_resume_tuple(
+        conn,
+        project_id=project_id,
+        run_id=run_id,
+        target_commit_sha=target_commit_sha,
+        snapshot=snapshot,
+        request_metric=(dict(request_metric_row) if request_metric_row else {}),
+        expected_snapshot_status=expected_snapshot_status,
+    )
+
+
 def _current_full_reconcile_existing_run(
     conn,
     store,
@@ -70097,6 +70139,7 @@ def _current_full_reconcile_existing_run(
     """
 
     expected_scope = _current_full_reconcile_idempotency_scope(route_evidence)
+    exact_snapshot_id = str(requested_snapshot_id or "").strip()
     metric_rows = conn.execute(
         """
         SELECT * FROM reconcile_run_metrics
@@ -70123,7 +70166,6 @@ def _current_full_reconcile_existing_run(
             "actual_target_commit_sha": target_commit_sha,
             "conflicting_target_commits": conflicting_commits,
         }
-    exact_snapshot_id = str(requested_snapshot_id or "").strip()
     snapshots = []
     if exact_snapshot_id:
         row = conn.execute(
@@ -70178,6 +70220,28 @@ def _current_full_reconcile_existing_run(
                 continue
             snapshot["notes_payload"] = dict(notes)
             snapshots.append(snapshot)
+
+    # Preserve the older, more precise target-commit and explicit-snapshot
+    # refusals above.  Once those immutable identity checks pass, enforce the
+    # broader one-run/one-snapshot fence before interpreting resume state.
+    run_identity = store.current_full_run_snapshot_identity_check(
+        conn,
+        project_id,
+        run_id=run_id,
+        snapshot_id=exact_snapshot_id,
+        commit_sha=target_commit_sha,
+        idempotency_scope=expected_scope,
+    )
+    if run_identity["conflict"]:
+        return {
+            "status": "conflict",
+            "reason": "current_full_run_snapshot_identity_conflict",
+            **{
+                key: value
+                for key, value in run_identity.items()
+                if key not in {"conflict", "reason"}
+            },
+        }
 
     if len(snapshots) > 1:
         return {
@@ -70346,6 +70410,128 @@ def _current_full_reconcile_existing_run(
     return {"status": "missing", "run_id": run_id}
 
 
+def _current_full_reconcile_existing_snapshot_identity(
+    conn,
+    store,
+    *,
+    project_id: str,
+    run_id: str,
+    target_commit_sha: str,
+    route_evidence: Mapping[str, Any],
+    snapshot_id: str,
+) -> dict[str, Any]:
+    """Resolve a snapshot identity independently of the caller's fresh run id."""
+
+    row = conn.execute(
+        "SELECT * FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
+        (project_id, snapshot_id),
+    ).fetchone()
+    if not row:
+        return {"status": "missing", "run_id": run_id}
+    snapshot = dict(row)
+    if (
+        str(snapshot.get("commit_sha") or "") != target_commit_sha
+        or str(snapshot.get("snapshot_kind") or "") != "full"
+    ):
+        return {
+            "status": "conflict",
+            "reason": "current_full_snapshot_identity_exists_not_resumable",
+            "run_id": run_id,
+            "snapshot_id": snapshot_id,
+            "snapshot_commit_sha": str(snapshot.get("commit_sha") or ""),
+            "snapshot_kind": str(snapshot.get("snapshot_kind") or ""),
+        }
+    status = str(snapshot.get("status") or "")
+    if status == "candidate":
+        resume_tuple = _current_full_candidate_tuple_from_db(
+            conn,
+            project_id=project_id,
+            run_id=run_id,
+            target_commit_sha=target_commit_sha,
+            snapshot_id=snapshot_id,
+        )
+        if resume_tuple["valid"]:
+            return {
+                "status": "candidate_ready",
+                "run_id": run_id,
+                "snapshot": snapshot,
+                "snapshot_id": snapshot_id,
+                "candidate_origin_run_id": resume_tuple["origin_run_id"],
+                "resume_tuple": resume_tuple,
+            }
+        return {
+            "status": "conflict",
+            "reason": "current_full_candidate_resume_tuple_invalid",
+            "run_id": run_id,
+            "snapshot_id": snapshot_id,
+            "resume_tuple": resume_tuple,
+        }
+    active = store.get_active_graph_snapshot(conn, project_id) or {}
+    try:
+        companion_integrity = store.validate_snapshot_companion_integrity(snapshot)
+    except Exception as exc:
+        companion_integrity = {
+            "valid": False,
+            "error": "current_full_candidate_companion_integrity_unreadable",
+            "error_type": type(exc).__name__,
+        }
+    notes = _json_loads(snapshot.get("notes"), {})
+    origin_run_id = str(
+        notes.get("run_id") if isinstance(notes, Mapping) else ""
+    ).strip()
+    origin_claim = conn.execute(
+        """
+        SELECT * FROM graph_current_full_build_claim_history
+        WHERE project_id = ? AND snapshot_id = ? AND run_id = ?
+          AND commit_sha = ? AND status = 'released'
+          AND terminal_status = 'candidate_ready'
+        """,
+        (project_id, snapshot_id, origin_run_id, target_commit_sha),
+    ).fetchone()
+    if (
+        status == "active"
+        and str(active.get("snapshot_id") or "") == snapshot_id
+        and companion_integrity.get("valid")
+        and origin_claim
+    ):
+        complete_rows = conn.execute(
+            """
+            SELECT run_id FROM reconcile_run_metrics
+            WHERE project_id = ? AND snapshot_id = ? AND commit_sha = ?
+              AND status = 'complete'
+            ORDER BY created_at DESC, run_id DESC
+            """,
+            (project_id, snapshot_id, target_commit_sha),
+        ).fetchall()
+        for complete_row in complete_rows:
+            terminal = _current_full_reconcile_existing_run(
+                conn,
+                store,
+                project_id=project_id,
+                run_id=str(complete_row["run_id"] or ""),
+                target_commit_sha=target_commit_sha,
+                route_evidence=route_evidence,
+                requested_snapshot_id=snapshot_id,
+            )
+            if terminal.get("status") == "complete":
+                return {
+                    "status": "complete",
+                    "run_id": run_id,
+                    "snapshot_id": snapshot_id,
+                    "terminal": terminal,
+                }
+    return {
+        "status": "conflict",
+        "reason": "current_full_snapshot_identity_exists_not_resumable",
+        "run_id": run_id,
+        "snapshot_id": snapshot_id,
+        "snapshot_status": status,
+        "active_snapshot_id": str(active.get("snapshot_id") or ""),
+        "companion_integrity": companion_integrity,
+        "origin_claim_ready": bool(origin_claim),
+    }
+
+
 def _current_full_reconcile_idempotent_response(
     existing: Mapping[str, Any],
     *,
@@ -70506,6 +70692,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "error": existing.get("reason"),
                 "message": "current-full reconcile run_id is already bound to different durable state",
                 "run_id": run_id,
+                "rebuild_started": False,
                 "fail_closed": True,
                 **{key: value for key, value in existing.items() if key not in {"status", "reason"}},
             }
@@ -70621,6 +70808,47 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         requested_snapshot_id = str(
             explicit_snapshot_id or store.snapshot_id_for("full", target_commit)
         ).strip()
+        if not resumed_candidate:
+            snapshot_existing = _current_full_reconcile_existing_snapshot_identity(
+                conn,
+                store,
+                project_id=project_id,
+                run_id=run_id,
+                target_commit_sha=target_commit,
+                route_evidence=route_evidence,
+                snapshot_id=requested_snapshot_id,
+            )
+            if snapshot_existing.get("status") == "conflict":
+                return 409, {
+                    "ok": False,
+                    "project_id": project_id,
+                    "error": snapshot_existing.get("reason"),
+                    "run_id": run_id,
+                    "snapshot_id": requested_snapshot_id,
+                    "rebuild_started": False,
+                    "fail_closed": True,
+                    **{
+                        key: value
+                        for key, value in snapshot_existing.items()
+                        if key not in {"status", "reason", "run_id", "snapshot_id"}
+                    },
+                }
+            if snapshot_existing.get("status") == "complete":
+                response = _current_full_reconcile_idempotent_response(
+                    snapshot_existing["terminal"],
+                    project_id=project_id,
+                    target_commit_sha=target_commit,
+                    head_commit=head_commit,
+                )
+                response["requested_run_id"] = run_id
+                response["fresh_run_snapshot_resume"] = True
+                response["historical_terminal_projection_replay"] = bool(
+                    target_commit != head_commit
+                )
+                return 200, response
+            if snapshot_existing.get("status") == "candidate_ready":
+                existing = snapshot_existing
+                resumed_candidate = True
         build_claim: dict[str, Any] = {}
         build_manager = _current_full_build_manager_identity()
         if resumed_candidate:
@@ -70994,6 +71222,26 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         try:
             with sqlite_write_lock():
                 conn.execute("BEGIN IMMEDIATE")
+                locked_run_identity = store.current_full_run_snapshot_identity_check(
+                    conn,
+                    project_id,
+                    run_id=run_id,
+                    snapshot_id=graph_epoch_snapshot_id,
+                    commit_sha=target_commit,
+                    idempotency_scope=idempotency_scope,
+                )
+                if locked_run_identity["conflict"]:
+                    conn.rollback()
+                    return 409, {
+                        "ok": False,
+                        "project_id": project_id,
+                        "error": "current_full_run_snapshot_identity_conflict",
+                        "run_id": run_id,
+                        "snapshot_id": graph_epoch_snapshot_id,
+                        "run_identity": locked_run_identity,
+                        "rebuild_started": False,
+                        "fail_closed": True,
+                    }
                 # Two same-run requests may both observe candidate_ready before
                 # either acquires the SQLite writer lock.  Recheck terminal
                 # state under the lock so only the winner can append reconcile
@@ -71051,40 +71299,12 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                         target_commit_sha=target_commit,
                         head_commit=head_commit,
                     )
-                locked_snapshot_row = conn.execute(
-                    """
-                    SELECT * FROM graph_snapshots
-                    WHERE project_id = ? AND snapshot_id = ?
-                    """,
-                    (project_id, graph_epoch_snapshot_id),
-                ).fetchone()
-                locked_snapshot = (
-                    dict(locked_snapshot_row) if locked_snapshot_row else {}
-                )
-                locked_notes = _json_loads(locked_snapshot.get("notes"), {})
-                locked_snapshot["notes_payload"] = (
-                    dict(locked_notes)
-                    if isinstance(locked_notes, Mapping)
-                    else {}
-                )
-                locked_request_metric_row = conn.execute(
-                    """
-                    SELECT * FROM reconcile_run_metrics
-                    WHERE project_id = ? AND run_id = ? AND snapshot_id = ?
-                    """,
-                    (project_id, run_id, graph_epoch_snapshot_id),
-                ).fetchone()
-                locked_resume_tuple = _current_full_candidate_resume_tuple(
+                locked_resume_tuple = _current_full_candidate_tuple_from_db(
                     conn,
                     project_id=project_id,
                     run_id=run_id,
                     target_commit_sha=target_commit,
-                    snapshot=locked_snapshot,
-                    request_metric=(
-                        dict(locked_request_metric_row)
-                        if locked_request_metric_row
-                        else {}
-                    ),
+                    snapshot_id=graph_epoch_snapshot_id,
                 )
                 if not locked_resume_tuple.get("valid"):
                     conn.rollback()
@@ -71135,6 +71355,31 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                         },
                         schema_ready=True,
                     )
+                # Snapshot companions are manager-owned.  SQLite cannot fence
+                # arbitrary external filesystem writers, so paired exact
+                # checks bracket activation and fail closed before evidence is
+                # committed if manager-side materialization changes in between.
+                post_activation_tuple = _current_full_candidate_tuple_from_db(
+                    conn,
+                    project_id=project_id,
+                    run_id=run_id,
+                    target_commit_sha=target_commit,
+                    snapshot_id=graph_epoch_snapshot_id,
+                    expected_snapshot_status="active",
+                )
+                if not post_activation_tuple.get("valid"):
+                    conn.rollback()
+                    return 409, {
+                        "ok": False,
+                        "project_id": project_id,
+                        "error": "current_full_candidate_resume_tuple_invalid",
+                        "run_id": run_id,
+                        "snapshot_id": graph_epoch_snapshot_id,
+                        "validation_phase": "post_activation_precommit",
+                        "resume_tuple": post_activation_tuple,
+                        "rebuild_started": False,
+                        "fail_closed": True,
+                    }
                 result["activation"] = activation
                 result["pending_scope_waiver"] = pending_scope_waiver
                 active_row = conn.execute(
