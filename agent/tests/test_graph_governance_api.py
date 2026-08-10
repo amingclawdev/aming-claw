@@ -8035,6 +8035,50 @@ def test_current_full_terminal_metric_fault_releases_process_local_key(
     assert (PID, snapshot_id) not in server._CURRENT_FULL_BUILD_KEYS
 
 
+def test_current_full_preclaim_commit_fault_never_acquires_process_key(
+    conn, monkeypatch, tmp_path
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    snapshot_id = "full-preclaim-commit-fault"
+
+    class CommitFaultConnection(_NoCloseConn):
+        def commit(self):
+            raise RuntimeError("preclaim commit fault")
+
+    monkeypatch.setattr(
+        server, "get_connection", lambda _project_id: CommitFaultConnection(conn)
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+
+    with pytest.raises(RuntimeError, match="preclaim commit fault"):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "snapshot_id": snapshot_id,
+                    "run_id": "run-preclaim-commit-fault",
+                    "activate": False,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+
+    assert (PID, snapshot_id) not in server._CURRENT_FULL_BUILD_KEYS
+    assert calls == []
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_build_claim_history "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (PID, snapshot_id),
+    ).fetchone()[0] == 0
+
+
 def test_current_full_durable_claim_conflict_reports_rebuild_not_started(
     conn, monkeypatch, tmp_path
 ):
@@ -8601,12 +8645,21 @@ def test_protected_current_full_reconcile_records_authoritative_provenance(
     )
 
     def fake_reconcile(_conn, project_id, _root, **kwargs):
-        _activate_basic_graph(_conn, snapshot_id, commit_sha=head)
+        store.create_graph_snapshot(
+            _conn,
+            project_id,
+            snapshot_id=snapshot_id,
+            commit_sha=head,
+            snapshot_kind="full",
+            graph_json=_graph(),
+            notes=json.dumps({"run_id": kwargs.get("run_id", "")}),
+        )
+        _conn.commit()
         return {
             "ok": True,
             "snapshot_id": snapshot_id,
             "projection_id": "semproj-protected-current-full",
-            "snapshot_status": "active",
+            "snapshot_status": "candidate",
             "run_id": kwargs.get("run_id", ""),
             "elapsed_ms": 1,
         }
@@ -9461,15 +9514,11 @@ def test_current_full_reconcile_explicit_candidate_preserves_stale_cas_refusal(
 
     assert candidate_status == 201
     assert len(calls) == 1
-    assert retry_status == 200
-    assert retry["activated"] is True
-    assert retry["resumed_candidate"] is True
-    assert retry["rebuild_skipped"] is True
-    assert retry["activation"]["previous_snapshot_id"] == newer_snapshot_id
-    assert retry["current_full_target_identity"]["ref_name"] == "active"
-    assert store.get_active_graph_snapshot(conn, PID)["snapshot_id"] == (
-        candidate["candidate_snapshot_id"]
-    )
+    assert retry_status == 409
+    assert retry["error"] == "current_full_candidate_resume_tuple_invalid"
+    assert retry["rebuild_started"] is False
+    assert "request_run_metric_not_ready" in retry["resume_tuple"]["errors"]
+    assert store.get_active_graph_snapshot(conn, PID)["snapshot_id"] == newer_snapshot_id
     assert conn.execute(
         "SELECT COUNT(*) FROM graph_snapshots "
         "WHERE project_id = ? AND snapshot_id = ?",
@@ -9503,6 +9552,29 @@ def test_current_full_resumed_candidate_has_zero_claim_delta_and_zero_build(
     )
     assert first_status == 201
     assert first["candidate_snapshot_id"] == snapshot_id
+    owner = server._current_full_build_manager_identity()
+    unrelated_claim = store.acquire_current_full_build_claim(
+        conn,
+        PID,
+        run_id="run-resume-unrelated-failed",
+        snapshot_id=snapshot_id,
+        commit_sha=head,
+        created_at="2099-01-01T00:00:00Z",
+        manager_epoch=owner["manager_epoch"],
+        manager_pid=owner["manager_pid"],
+        manager_started_at=owner["manager_started_at"],
+        manager_start_identity=owner["manager_start_identity"],
+    )
+    store.terminalize_current_full_build_claim(
+        conn,
+        PID,
+        claim_id=unrelated_claim["claim_id"],
+        run_id="run-resume-unrelated-failed",
+        snapshot_id=snapshot_id,
+        commit_sha=head,
+        terminal_status="failed",
+        manager_start_identity=owner["manager_start_identity"],
+    )
     claim_count_before = conn.execute(
         "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
     ).fetchone()[0]
@@ -9533,6 +9605,169 @@ def test_current_full_resumed_candidate_has_zero_claim_delta_and_zero_build(
     assert conn.execute(
         "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
     ).fetchone()[0] == claim_count_before
+
+
+def test_current_full_snapshot_with_active_claim_cannot_resume_or_mutate(
+    conn, monkeypatch, tmp_path
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    run_id = "run-active-claim-no-resume"
+    snapshot_id = "full-active-claim-no-resume"
+    store.acquire_current_full_build_claim(
+        conn,
+        PID,
+        run_id=run_id,
+        snapshot_id=snapshot_id,
+        commit_sha=head,
+        manager_epoch="epoch-active-no-resume",
+        manager_pid=7171,
+        manager_started_at="2026-08-10T00:00:00Z",
+        manager_start_identity="manager-active-no-resume",
+    )
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=snapshot_id,
+        commit_sha=head,
+        snapshot_kind="full",
+        graph_json=_graph(),
+        notes=json.dumps({"run_id": run_id}),
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "snapshot_id": snapshot_id,
+                "run_id": run_id,
+                "activate": False,
+                "semantic_enrich": False,
+            },
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == "current_full_candidate_resume_tuple_invalid"
+    assert {"active_build_claim_present", "candidate_metric_not_ready"}.issubset(
+        result["resume_tuple"]["errors"]
+    )
+    assert calls == []
+    assert conn.execute(
+        "SELECT status FROM reconcile_run_metrics WHERE project_id = ? "
+        "AND run_id = ? AND snapshot_id = ?",
+        (PID, run_id, snapshot_id),
+    ).fetchone()[0] == "running"
+    assert conn.execute(
+        "SELECT status FROM graph_current_full_build_claim_history "
+        "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+        (PID, run_id, snapshot_id),
+    ).fetchone()[0] == "active"
+
+
+def test_current_full_snapshot_with_released_failed_claim_cannot_revive(
+    monkeypatch, tmp_path
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    run_id = "run-released-failed-no-revive"
+    snapshot_id = "full-released-failed-no-revive"
+    db_path = tmp_path / "released-failed-no-revive.sqlite"
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root", lambda: tmp_path / "state"
+    )
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.commit()
+    owner = server._current_full_build_manager_identity()
+    claim = store.acquire_current_full_build_claim(
+        connection,
+        PID,
+        run_id=run_id,
+        snapshot_id=snapshot_id,
+        commit_sha=head,
+        manager_epoch=owner["manager_epoch"],
+        manager_pid=owner["manager_pid"],
+        manager_started_at=owner["manager_started_at"],
+        manager_start_identity=owner["manager_start_identity"],
+    )
+    store.create_graph_snapshot(
+        connection,
+        PID,
+        snapshot_id=snapshot_id,
+        commit_sha=head,
+        snapshot_kind="full",
+        graph_json=_graph(),
+        notes=json.dumps({"run_id": run_id}),
+    )
+    connection.commit()
+    store.terminalize_current_full_build_claim(
+        connection,
+        PID,
+        claim_id=claim["claim_id"],
+        run_id=run_id,
+        snapshot_id=snapshot_id,
+        commit_sha=head,
+        terminal_status="failed",
+        manager_start_identity=owner["manager_start_identity"],
+    )
+    connection.close()
+    handler_connection = sqlite3.connect(db_path)
+    handler_connection.row_factory = sqlite3.Row
+    monkeypatch.setattr(
+        server, "get_connection", lambda _project_id: handler_connection
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "snapshot_id": snapshot_id,
+                "run_id": run_id,
+                "activate": False,
+                "semantic_enrich": False,
+            },
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == "current_full_candidate_resume_tuple_invalid"
+    assert {"candidate_build_claim_not_ready", "candidate_metric_not_ready"}.issubset(
+        result["resume_tuple"]["errors"]
+    )
+    assert calls == []
+    verifier = sqlite3.connect(db_path)
+    verifier.row_factory = sqlite3.Row
+    try:
+        assert verifier.execute(
+            "SELECT status FROM reconcile_run_metrics WHERE project_id = ? "
+            "AND run_id = ? AND snapshot_id = ?",
+            (PID, run_id, snapshot_id),
+        ).fetchone()[0] == "failed"
+        assert dict(verifier.execute(
+            "SELECT status, terminal_status FROM graph_current_full_build_claim_history "
+            "WHERE claim_id = ?",
+            (claim["claim_id"],),
+        ).fetchone()) == {"status": "released", "terminal_status": "failed"}
+    finally:
+        verifier.close()
 
 
 def _current_full_direct_main_route_fixture(

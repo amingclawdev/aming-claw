@@ -600,6 +600,16 @@ def test_terminalized_current_full_build_identity_cannot_reacquire(conn):
         commit_sha="d" * 40,
         **owner,
     )
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-terminal",
+        commit_sha="d" * 40,
+        snapshot_kind="full",
+        graph_json={"deps_graph": {"nodes": []}},
+        notes=json.dumps({"run_id": "run-terminal"}),
+    )
+    conn.commit()
     store.terminalize_current_full_build_claim(
         conn,
         PID,
@@ -691,6 +701,61 @@ def test_current_full_build_terminalization_rejects_commit_mismatch(conn):
         "WHERE claim_id = ?",
         (claim["claim_id"],),
     ).fetchone()[0] == "active"
+
+
+def test_candidate_ready_terminalization_atomically_fails_persisted_commit_drift(
+    conn,
+):
+    owner = _claim_owner("persisted-commit")
+    claim = store.acquire_current_full_build_claim(
+        conn,
+        PID,
+        run_id="run-persisted-commit",
+        snapshot_id="full-persisted-commit",
+        commit_sha="1" * 40,
+        **owner,
+    )
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-persisted-commit",
+        commit_sha="2" * 40,
+        snapshot_kind="full",
+        graph_json={"deps_graph": {"nodes": []}},
+        notes=json.dumps({"run_id": "run-persisted-commit"}),
+    )
+    conn.commit()
+
+    with pytest.raises(
+        store.GraphSnapshotBuildClaimConflictError,
+        match="current_full_candidate_snapshot_commit_mismatch",
+    ):
+        store.terminalize_current_full_build_claim(
+            conn,
+            PID,
+            claim_id=claim["claim_id"],
+            run_id="run-persisted-commit",
+            snapshot_id="full-persisted-commit",
+            commit_sha="1" * 40,
+            terminal_status="candidate_ready",
+            manager_start_identity=owner["manager_start_identity"],
+        )
+
+    terminal_claim = conn.execute(
+        "SELECT status, terminal_status FROM graph_current_full_build_claim_history "
+        "WHERE claim_id = ?",
+        (claim["claim_id"],),
+    ).fetchone()
+    assert dict(terminal_claim) == {"status": "released", "terminal_status": "failed"}
+    metric = conn.execute(
+        "SELECT status, evidence_json FROM reconcile_run_metrics WHERE project_id = ? "
+        "AND run_id = ? AND snapshot_id = ?",
+        (PID, "run-persisted-commit", "full-persisted-commit"),
+    ).fetchone()
+    assert metric["status"] == "failed"
+    evidence = json.loads(metric["evidence_json"])
+    assert evidence["error"] == "current_full_candidate_snapshot_commit_mismatch"
+    assert evidence["candidate_released_as_ready"] is False
 
 
 def test_reconcile_run_metrics_backfills_from_snapshot_notes(conn, tmp_path):

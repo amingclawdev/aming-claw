@@ -4805,6 +4805,8 @@ def terminalize_current_full_build_claim(
     if conn.in_transaction:
         raise RuntimeError("current-full build terminalization requires a clean transaction boundary")
     now = utc_now()
+    terminalization_error = ""
+    persisted_snapshot: dict[str, Any] = {}
     try:
         conn.execute("BEGIN IMMEDIATE")
         claim_row = conn.execute(
@@ -4830,6 +4832,54 @@ def terminalize_current_full_build_claim(
             raise GraphSnapshotBuildClaimConflictError(
                 "current_full_build_claim_commit_mismatch", claim
             )
+        if status == "candidate_ready":
+            snapshot_row = conn.execute(
+                """
+                SELECT * FROM graph_snapshots
+                WHERE project_id = ? AND snapshot_id = ?
+                """,
+                (project_id, snapshot_id),
+            ).fetchone()
+            persisted_snapshot = dict(snapshot_row) if snapshot_row else {}
+            snapshot_notes = _decode_json(persisted_snapshot.get("notes"), {})
+            snapshot_run_id = str(
+                snapshot_notes.get("run_id")
+                if isinstance(snapshot_notes, Mapping)
+                else ""
+            ).strip()
+            expected_hashes_present = all(
+                str(persisted_snapshot.get(field) or "").strip()
+                for field in (
+                    "graph_sha256",
+                    "inventory_sha256",
+                    "drift_sha256",
+                )
+            )
+            if not persisted_snapshot:
+                terminalization_error = "current_full_candidate_snapshot_missing"
+            elif str(persisted_snapshot.get("commit_sha") or "") != str(
+                commit_sha or ""
+            ):
+                terminalization_error = "current_full_candidate_snapshot_commit_mismatch"
+            elif str(persisted_snapshot.get("snapshot_kind") or "") != "full":
+                terminalization_error = "current_full_candidate_snapshot_kind_mismatch"
+            elif str(persisted_snapshot.get("status") or "") != SNAPSHOT_STATUS_CANDIDATE:
+                terminalization_error = "current_full_candidate_snapshot_status_mismatch"
+            elif snapshot_run_id != str(run_id or ""):
+                terminalization_error = "current_full_candidate_snapshot_run_mismatch"
+            elif not expected_hashes_present:
+                terminalization_error = "current_full_candidate_materialization_incomplete"
+        effective_status = "failed" if terminalization_error else status
+        effective_evidence = dict(metric_evidence or {})
+        if terminalization_error:
+            effective_evidence.update(
+                {
+                    "phase": "candidate_persistence_validation_failed",
+                    "error": terminalization_error,
+                    "requested_terminal_status": status,
+                    "candidate_released_as_ready": False,
+                }
+            )
         record_reconcile_run_metric(
             conn,
             project_id,
@@ -4839,10 +4889,10 @@ def terminalize_current_full_build_claim(
             snapshot_kind="full",
             strategy="current_full_reconcile",
             graph_delta_mode="full_rebuild",
-            status=status,
+            status=effective_status,
             elapsed_ms=elapsed_ms,
             trace_summary_path=trace_summary_path,
-            evidence=metric_evidence or {},
+            evidence=effective_evidence,
             created_at=created_at,
             schema_ready=True,
         )
@@ -4852,7 +4902,7 @@ def terminalize_current_full_build_claim(
             SET status = 'released', released_at = ?, terminal_status = ?
             WHERE claim_id = ? AND status = 'active'
             """,
-            (now, status, claim_id),
+            (now, effective_status, claim_id),
         )
         if updated.rowcount != 1:
             raise GraphSnapshotBuildClaimConflictError(
@@ -4862,6 +4912,11 @@ def terminalize_current_full_build_claim(
     except Exception:
         conn.rollback()
         raise
+    if terminalization_error:
+        raise GraphSnapshotBuildClaimConflictError(
+            terminalization_error,
+            {**claim, "persisted_snapshot": persisted_snapshot},
+        )
     row = conn.execute(
         "SELECT * FROM graph_current_full_build_claim_history WHERE claim_id = ?",
         (claim_id,),

@@ -69881,6 +69881,106 @@ def _current_full_reconcile_idempotency_scope(
     }
 
 
+def _current_full_candidate_resume_tuple(
+    conn,
+    *,
+    project_id: str,
+    run_id: str,
+    target_commit_sha: str,
+    snapshot: Mapping[str, Any],
+    request_metric: Mapping[str, Any],
+) -> dict[str, Any]:
+    snapshot_id = str(snapshot.get("snapshot_id") or "").strip()
+    notes = (
+        snapshot.get("notes_payload")
+        if isinstance(snapshot.get("notes_payload"), Mapping)
+        else {}
+    )
+    origin_run_id = str(notes.get("run_id") or "").strip()
+    origin_claim_row = conn.execute(
+        """
+        SELECT * FROM graph_current_full_build_claim_history
+        WHERE project_id = ? AND snapshot_id = ? AND run_id = ?
+        """,
+        (project_id, snapshot_id, origin_run_id),
+    ).fetchone()
+    origin_claim = dict(origin_claim_row) if origin_claim_row else {}
+    origin_metric_row = conn.execute(
+        """
+        SELECT * FROM reconcile_run_metrics
+        WHERE project_id = ? AND run_id = ? AND snapshot_id = ?
+        """,
+        (project_id, origin_run_id, snapshot_id),
+    ).fetchone()
+    origin_metric = dict(origin_metric_row) if origin_metric_row else {}
+    active_claim_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM graph_current_full_build_claim_history
+            WHERE project_id = ? AND snapshot_id = ? AND status = 'active'
+            """,
+            (project_id, snapshot_id),
+        ).fetchone()[0]
+    )
+    errors: list[str] = []
+    if str(snapshot.get("status") or "") != "candidate":
+        errors.append("snapshot_not_candidate")
+    if str(snapshot.get("commit_sha") or "") != target_commit_sha:
+        errors.append("snapshot_commit_mismatch")
+    if str(snapshot.get("snapshot_kind") or "") != "full":
+        errors.append("snapshot_kind_mismatch")
+    if not all(
+        str(snapshot.get(field) or "").strip()
+        for field in ("graph_sha256", "inventory_sha256", "drift_sha256")
+    ):
+        errors.append("snapshot_materialization_incomplete")
+    if not origin_run_id:
+        errors.append("candidate_origin_run_missing")
+    if active_claim_count:
+        errors.append("active_build_claim_present")
+    if not origin_claim:
+        errors.append("candidate_build_claim_missing")
+    else:
+        if str(origin_claim.get("commit_sha") or "") != target_commit_sha:
+            errors.append("candidate_build_claim_commit_mismatch")
+        if str(origin_claim.get("status") or "") != "released":
+            errors.append("candidate_build_claim_unreleased")
+        if str(origin_claim.get("terminal_status") or "") != "candidate_ready":
+            errors.append("candidate_build_claim_not_ready")
+    if not origin_metric:
+        errors.append("candidate_metric_missing")
+    else:
+        if str(origin_metric.get("commit_sha") or "") != target_commit_sha:
+            errors.append("candidate_metric_commit_mismatch")
+        if str(origin_metric.get("status") or "") != "candidate_ready":
+            errors.append("candidate_metric_not_ready")
+        if str(origin_metric.get("snapshot_kind") or "") != "full":
+            errors.append("candidate_metric_kind_mismatch")
+        if str(origin_metric.get("strategy") or "") != "current_full_reconcile":
+            errors.append("candidate_metric_strategy_mismatch")
+    request_metric_status = str(request_metric.get("status") or "").strip()
+    if (
+        request_metric
+        and run_id != origin_run_id
+        and request_metric_status != "candidate_ready"
+    ):
+        errors.append("request_run_metric_not_ready")
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "origin_run_id": origin_run_id,
+        "snapshot_id": snapshot_id,
+        "active_claim_count": active_claim_count,
+        "claim_id": str(origin_claim.get("claim_id") or ""),
+        "claim_status": str(origin_claim.get("status") or ""),
+        "claim_terminal_status": str(
+            origin_claim.get("terminal_status") or ""
+        ),
+        "origin_metric_status": str(origin_metric.get("status") or ""),
+        "request_metric_status": request_metric_status,
+    }
+
+
 def _current_full_reconcile_existing_run(
     conn,
     store,
@@ -70000,7 +70100,7 @@ def _current_full_reconcile_existing_run(
             for row in metrics
             if not snapshot_id or str(row.get("snapshot_id") or "") == snapshot_id
         ),
-        metrics[0] if metrics else {},
+        ({} if snapshot_id else (metrics[0] if metrics else {})),
     )
     metric_evidence = _json_loads(metric.get("evidence_json"), {})
     metric_evidence = (
@@ -70114,15 +70214,32 @@ def _current_full_reconcile_existing_run(
             "metric_status": metric_status,
         }
     if snapshot_id:
+        resume_tuple = _current_full_candidate_resume_tuple(
+            conn,
+            project_id=project_id,
+            run_id=run_id,
+            target_commit_sha=target_commit_sha,
+            snapshot=snapshot,
+            request_metric=metric,
+        )
+        if not resume_tuple["valid"]:
+            return {
+                "status": "conflict",
+                "reason": "current_full_candidate_resume_tuple_invalid",
+                "run_id": run_id,
+                "snapshot_id": snapshot_id,
+                "fail_closed": True,
+                "rebuild_started": False,
+                "resume_tuple": resume_tuple,
+            }
         return {
             "status": "candidate_ready",
             "run_id": run_id,
             "snapshot": snapshot,
             "snapshot_id": snapshot_id,
-            "candidate_origin_run_id": str(
-                (snapshot.get("notes_payload") or {}).get("run_id") or ""
-            ).strip(),
+            "candidate_origin_run_id": resume_tuple["origin_run_id"],
             "metric": metric,
+            "resume_tuple": resume_tuple,
         }
     if metric_status in {"running", "finalizing"}:
         return {
@@ -70433,6 +70550,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "rebuild_skipped": True,
             }
         else:
+            conn.commit()
             process_build_key = _acquire_current_full_process_build_key(
                 project_id, requested_snapshot_id
             )
@@ -70446,7 +70564,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     "rebuild_started": False,
                     "fail_closed": True,
                 }
-            conn.commit()
             try:
                 build_claim = store.acquire_current_full_build_claim(
                     conn,
@@ -70472,7 +70589,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     created_at=request_started_at,
                 )
             except store.GraphSnapshotBuildClaimConflictError as exc:
-                _release_current_full_process_build_key(process_build_key)
                 return 409, {
                     "ok": False,
                     "project_id": project_id,
@@ -70484,9 +70600,9 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     "rebuild_started": False,
                     "fail_closed": True,
                 }
-            except Exception:
-                _release_current_full_process_build_key(process_build_key)
-                raise
+            finally:
+                if not build_claim:
+                    _release_current_full_process_build_key(process_build_key)
             try:
                 # Candidate persistence may outlive a client connection.  The
                 # active ref is intentionally deferred to the final evidence
