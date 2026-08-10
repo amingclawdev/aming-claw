@@ -63731,6 +63731,16 @@ def _dashboard_current_state(
 
 
 _RECONCILE_QUEUE_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_RECONCILE_QUEUE_CREDENTIAL_SHAPE_RE = re.compile(
+    r"(?:^|[-_.:])(?:"
+    r"r(?:oute)?[-_.:]?tok(?:en)?|"
+    r"w(?:orker)?s(?:ession)?[-_.:]?tok(?:en)?|"
+    r"(?:worker[-_.:]?)?session[-_.:]?token|"
+    r"bearer(?:[-_.:]?token)?|"
+    r"authorization[-_.:]?bearer"
+    r")(?:[-_.:]|$)",
+    re.IGNORECASE,
+)
 _RECONCILE_QUEUE_TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z"
 )
@@ -63739,7 +63749,11 @@ _RECONCILE_QUEUE_TIMESTAMP_RE = re.compile(
 def _safe_reconcile_queue_identifier(value: Any, *, kind: str) -> tuple[str, str]:
     raw = str(value or "").strip()
     digest = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    if raw and _RECONCILE_QUEUE_IDENTIFIER_RE.fullmatch(raw):
+    if (
+        raw
+        and _RECONCILE_QUEUE_IDENTIFIER_RE.fullmatch(raw)
+        and not _RECONCILE_QUEUE_CREDENTIAL_SHAPE_RE.search(raw)
+    ):
         return raw, digest
     return f"{kind}-{digest[7:23]}", digest
 
@@ -63950,6 +63964,9 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
             "include_resolved",
             False,
         )
+        safe_project_id = _safe_reconcile_queue_identifier(
+            project_id, kind="project"
+        )[0]
         for metric in reconcile_metric_rows:
             status_value = str(metric.get("effective_status") or "unknown")
             if (
@@ -63989,7 +64006,7 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                     "target_scope": "snapshot",
                     "target_id": commit_sha,
                     "target_label": run_id,
-                    "project_id": project_id,
+                    "project_id": safe_project_id,
                     "run_id": run_id,
                     "run_id_sha256": run_id_digest,
                     "snapshot_id": snapshot_id,

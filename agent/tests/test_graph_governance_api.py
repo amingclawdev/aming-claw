@@ -12274,6 +12274,67 @@ def test_graph_operations_queue_keeps_same_run_snapshots_and_scrubs_evidence(con
 
 
 @pytest.mark.parametrize(
+    "credential_identity",
+    [
+        "rtok-PublicQueueSecret9",
+        "RTOK:PublicQueueSecret9",
+        "wstok_PublicQueueSecret9",
+        "session-token-PublicQueueSecret9",
+        "session.token.PublicQueueSecret9",
+        "Bearer:PublicQueueSecret9",
+        "bearer.token.PublicQueueSecret9",
+        "route_token_PublicQueueSecret9",
+        "worker-session-token-PublicQueueSecret9",
+    ],
+)
+def test_graph_operations_queue_redacts_credential_shaped_identifiers(
+    conn,
+    credential_identity,
+):
+    head = "f" * 40
+    _activate_basic_graph(
+        conn,
+        "full-current-operations-credential-fuzz",
+        commit_sha=head,
+    )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id=credential_identity,
+        snapshot_id=f"{credential_identity}.snapshot",
+        commit_sha=head,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="running",
+        created_at="2026-08-10T00:00:00Z",
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={"include_resolved": "false"},
+        )
+    )
+
+    operation = next(
+        item
+        for item in result["operations"]
+        if item.get("operation_type") == "current_full_reconcile"
+    )
+    assert operation["run_id"].startswith("run-")
+    assert operation["snapshot_id"].startswith("snapshot-")
+    assert operation["target_label"] == operation["run_id"]
+    assert operation["legacy_operation_id"] == f"current-full:{operation['run_id']}"
+    assert operation["operation_id"].startswith(
+        f"current-full:{operation['run_id']}:snapshot:"
+    )
+    assert credential_identity not in json.dumps(result, sort_keys=True)
+
+
+@pytest.mark.parametrize(
     ("contract_id", "merge_queue_id"),
     [
         ("mf_parallel.v2", ""),

@@ -552,6 +552,84 @@ def test_reconcile_run_metrics_keep_every_effective_nonterminal_beyond_limit(con
     )
 
 
+@pytest.mark.parametrize("strategy", ["current_full_reconcile", ""])
+def test_reconcile_run_metrics_terminal_history_vm_steps_stay_bounded(
+    conn,
+    strategy,
+):
+    _ensure_schema(conn)
+    conn.executemany(
+        """
+        INSERT INTO reconcile_run_metrics (
+          project_id, run_id, snapshot_id, snapshot_kind, strategy,
+          graph_delta_mode, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                PID,
+                f"terminal-history-{index:04d}",
+                f"full-terminal-history-{index:04d}",
+                "full",
+                "current_full_reconcile",
+                "full_rebuild",
+                "candidate_ready",
+                f"2026-08-09T{index // 3600:02d}:{(index // 60) % 60:02d}:{index % 60:02d}Z",
+            )
+            for index in range(5000)
+        ],
+    )
+    conn.execute(
+        """
+        INSERT INTO reconcile_run_metrics (
+          project_id, run_id, snapshot_id, snapshot_kind, strategy,
+          graph_delta_mode, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            PID,
+            "effective-nonterminal-newest",
+            "full-effective-nonterminal-newest",
+            "full",
+            "current_full_reconcile",
+            "full_rebuild",
+            "finalizing",
+            "2026-08-10T00:00:00Z",
+        ),
+    )
+    conn.commit()
+
+    approximate_vm_steps = 0
+
+    def count_vm_steps() -> int:
+        nonlocal approximate_vm_steps
+        approximate_vm_steps += 100
+        return 0
+
+    conn.set_progress_handler(count_vm_steps, 100)
+    try:
+        rows = store.list_reconcile_run_metrics(
+            conn,
+            PID,
+            limit=1,
+            strategy=strategy,
+        )
+    finally:
+        conn.set_progress_handler(None, 0)
+
+    assert [
+        (row["project_id"], row["run_id"], row["snapshot_id"])
+        for row in rows
+    ] == [
+        (
+            PID,
+            "effective-nonterminal-newest",
+            "full-effective-nonterminal-newest",
+        )
+    ]
+    assert approximate_vm_steps < 5000
+
+
 @pytest.mark.parametrize(
     "status",
     ["candidate_ready", "complete", "failed", "terminalized_stale"],

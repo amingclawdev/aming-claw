@@ -9,6 +9,7 @@ interface Props {
 
 // MF-2026-05-10-011: running rows cannot be cancelled (backend returns 409).
 const RUNNING_STATUSES = new Set(["running", "ai_running", "claimed", "ai_reviewing"]);
+const RECOVERY_STATUSES = new Set(["finalizing", "unknown"]);
 // Terminal statuses that can be drained via /semantic/jobs/clear-terminal.
 const TERMINAL_STATUSES = new Set([
   "cancelled",
@@ -84,9 +85,9 @@ export default function OperationsQueueView({
           <div className="ops-kpi-sub">waiting to run</div>
         </div>
         <div className={`ops-kpi${runningCount > 0 ? " ops-kpi-blue" : ""}`}>
-          <div className="ops-kpi-label">Running</div>
+          <div className="ops-kpi-label">Running / Recovery</div>
           <div className="ops-kpi-value">{runningCount}</div>
-          <div className="ops-kpi-sub">semantic lanes</div>
+          <div className="ops-kpi-sub">in flight or unresolved</div>
         </div>
       </div>
 
@@ -94,8 +95,8 @@ export default function OperationsQueueView({
           and "0 queued" at a glance — confirms the worker is idle instead of
           stuck. Empty banner is tiny (one line). */}
       <QueueSection
-        title="Running"
-        hint="in flight across governance semantic lanes; cancel disabled, will complete or fail on its own"
+        title="Running / Recovery"
+        hint="in flight, finalizing, or unresolved; cancel disabled, inspect recovery state before retrying"
         rows={runningRows}
         emptyMsg="No tasks running."
         onCancelOperation={onCancelOperation}
@@ -311,7 +312,7 @@ function Row({
 function statusBucket(status: string): "queued" | "running" | "terminal" | "other" {
   const s = (status || "").toLowerCase();
   if (s === "ai_pending" || s === "queued" || s === "pending_ai" || s === "pending") return "queued";
-  if (RUNNING_STATUSES.has(s)) return "running";
+  if (RUNNING_STATUSES.has(s) || RECOVERY_STATUSES.has(s)) return "running";
   if (TERMINAL_STATUSES.has(s)) return "terminal";
   return "other";
 }
@@ -340,6 +341,7 @@ function statusClass(s: string): string {
       return "status-badge status-pending";
     case "ai_running":
     case "running":
+    case "finalizing":
       return "status-badge status-running";
     case "complete":
     case "ai_complete":

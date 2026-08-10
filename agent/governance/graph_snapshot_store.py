@@ -206,6 +206,32 @@ CREATE INDEX IF NOT EXISTS idx_reconcile_run_metrics_project_created
 CREATE INDEX IF NOT EXISTS idx_reconcile_run_metrics_strategy
   ON reconcile_run_metrics(project_id, strategy, graph_delta_mode);
 
+CREATE INDEX IF NOT EXISTS idx_reconcile_run_metrics_queue_recent
+  ON reconcile_run_metrics(
+    project_id, created_at DESC, run_id DESC, snapshot_id DESC
+  );
+
+CREATE INDEX IF NOT EXISTS idx_reconcile_run_metrics_queue_strategy_recent
+  ON reconcile_run_metrics(
+    project_id, strategy, created_at DESC, run_id DESC, snapshot_id DESC
+  );
+
+CREATE INDEX IF NOT EXISTS idx_reconcile_run_metrics_queue_nonterminal
+  ON reconcile_run_metrics(
+    project_id, created_at DESC, run_id DESC, snapshot_id DESC
+  )
+  WHERE LOWER(TRIM(status)) NOT IN (
+    'candidate_ready', 'complete', 'failed', 'terminalized_stale'
+  );
+
+CREATE INDEX IF NOT EXISTS idx_reconcile_run_metrics_queue_strategy_nonterminal
+  ON reconcile_run_metrics(
+    project_id, strategy, created_at DESC, run_id DESC, snapshot_id DESC
+  )
+  WHERE LOWER(TRIM(status)) NOT IN (
+    'candidate_ready', 'complete', 'failed', 'terminalized_stale'
+  );
+
 CREATE TABLE IF NOT EXISTS graph_current_full_build_claim_history (
   claim_id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
@@ -5450,18 +5476,31 @@ def list_reconcile_run_metrics(
 ) -> list[dict[str, Any]]:
     ensure_schema(conn)
     params: list[Any] = [project_id]
-    sql = "SELECT * FROM reconcile_run_metrics WHERE project_id=?"
+    where_sql = "project_id=?"
     if strategy:
-        sql += " AND strategy=?"
+        where_sql += " AND strategy=?"
         params.append(strategy)
-    sql += " ORDER BY created_at DESC, run_id DESC, snapshot_id DESC"
-    rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
     sample_limit = max(1, min(int(limit or 50), 1000))
+    order_sql = " ORDER BY created_at DESC, run_id DESC, snapshot_id DESC"
+    latest_rows = conn.execute(
+        f"SELECT * FROM reconcile_run_metrics WHERE {where_sql}{order_sql} LIMIT ?",
+        [*params, sample_limit],
+    ).fetchall()
+    effective_nonterminal_rows = conn.execute(
+        f"""
+        SELECT * FROM reconcile_run_metrics
+        WHERE {where_sql}
+          AND LOWER(TRIM(status)) NOT IN (
+            'candidate_ready', 'complete', 'failed', 'terminalized_stale'
+          )
+        {order_sql}
+        """,
+        params,
+    ).fetchall()
     selected: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for position, row in enumerate(rows):
+    for row in (*latest_rows, *effective_nonterminal_rows):
+        row = dict(row)
         projection = project_reconcile_run_metric_status(row)
-        if position >= sample_limit and projection["is_terminal"]:
-            continue
         projected = {**row, **projection}
         identity = (
             str(projected.get("project_id") or ""),
