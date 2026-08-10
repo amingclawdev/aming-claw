@@ -1505,6 +1505,7 @@ def _certify_governance_manager_generation(
                 ),
                 certified_at=str(receipt["lock_acquired_at"]),
             )
+            store.ensure_reconcile_metric_physical_identity_migration(conn)
         finally:
             conn.close()
         certificates[project_id] = certificate

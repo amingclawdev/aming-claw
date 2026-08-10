@@ -1197,6 +1197,55 @@ def test_server_certification_recovers_all_projects_after_partial_fault(
     assert result["project-b"]["observed_prior_generation_id"] == "generation-1"
 
 
+def test_server_certification_completes_metric_identity_migration_before_publish(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "migration-before-publish.sqlite"
+    setup = sqlite3.connect(db_path)
+    setup.row_factory = sqlite3.Row
+    store.ensure_schema(setup)
+    store.record_reconcile_run_metric(
+        setup,
+        PID,
+        run_id="current-full-legacy-before-startup",
+        snapshot_id="full-legacy-before-startup",
+        commit_sha="a" * 40,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="running",
+        evidence={"phase": "legacy-before-startup"},
+    )
+    setup.execute(
+        "DROP TRIGGER trg_reconcile_metric_identity_no_delete"
+    )
+    setup.execute("DELETE FROM graph_reconcile_metric_physical_identities")
+    setup.commit()
+    setup.close()
+
+    def connection_for(_project_id: str):
+        connection = sqlite3.connect(db_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    monkeypatch.setattr(server, "get_connection", connection_for)
+    lease = _FakeGenerationLease(_lease_receipt("generation-migration", 5299))
+
+    server._certify_governance_manager_generation(lease, project_ids=[PID])
+
+    check = connection_for(PID)
+    try:
+        assert check.execute(
+            "SELECT COUNT(*) FROM graph_reconcile_metric_physical_identities"
+        ).fetchone()[0] == 1
+        assert check.execute(
+            "SELECT marker FROM graph_reconcile_metric_identity_schema_state"
+        ).fetchone()["marker"] == "physical_identity_backfill_v1"
+    finally:
+        check.close()
+
+
 def test_live_observer_guide_projects_signed_failure_domain_disposition(conn):
     backlog_id = "AC-FAILURE-DOMAIN-LIVE-GUIDE"
     task_id = "failure-domain-active-task"
