@@ -63730,27 +63730,35 @@ def _dashboard_current_state(
     }
 
 
-_RECONCILE_QUEUE_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}")
-_RECONCILE_QUEUE_CREDENTIAL_MARKERS = (
-    "rtok",
-    "routetok",
-    "routetoken",
-    "wstok",
-    "workerstok",
-    "workersessiontok",
-    "workersessiontoken",
-    "sessiontok",
-    "sessiontoken",
-    "bearer",
-    "bearertoken",
-    "authorizationbearer",
-)
 _RECONCILE_QUEUE_IDENTIFIER_KIND_RE = {
-    "project": re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}"),
-    # Public run/snapshot identities must be readable structured IDs. Opaque
-    # single-segment values fail closed even when they are short.
-    "run": re.compile(r"[A-Za-z0-9]{1,24}(?:[-_.:][A-Za-z0-9]{1,24}){1,7}"),
-    "snapshot": re.compile(r"[A-Za-z0-9]{1,24}(?:[-_.:][A-Za-z0-9]{1,24}){1,7}"),
+    # Project ids are normalized lowercase slugs. Keep this grammar narrower
+    # than storage accepts because this value is copied into a public queue.
+    "project": re.compile(
+        r"(?=.{1,64}\Z)[a-z][a-z0-9]{0,23}(?:-[a-z0-9]{1,24}){0,3}"
+    ),
+    # Raw run ids are limited to shapes emitted by current producers: the HTTP
+    # default (current-full + seven commit hex), the MCP wrapper (sixteen
+    # random hex), and the durable candidate/full commit identities. A bounded
+    # r1..r999 suffix is the only readable revision label. Human/operator slugs
+    # are intentionally absent: even a trusted prefix must not make an opaque
+    # suffix public.
+    "run": re.compile(
+        r"(?:"
+        r"current-full-mcp-[0-9a-f]{16}|"
+        r"(?:current-full|candidate-full|candidate|full)-"
+        r"(?:[0-9a-f]{7}|[0-9a-f]{8}|[0-9a-f]{12})"
+        r"(?:-r(?:[1-9]|[1-9][0-9]{1,2}))?"
+        r")"
+    ),
+    # snapshot_id_for emits kind-<7 commit hex>-<4 random hex>; the canonical
+    # current-full path emits full-<12 commit hex>-<12 digest hex>. Candidate
+    # and candidate-full use the same bounded identity grammar when persisted.
+    "snapshot": re.compile(
+        r"(?:candidate-full|candidate|full)-"
+        r"(?:[0-9a-f]{7}|[0-9a-f]{8}|[0-9a-f]{12})-"
+        r"(?:[0-9a-f]{4}|[0-9a-f]{12})"
+        r"(?:-r(?:[1-9]|[1-9][0-9]{1,2}))?"
+    ),
 }
 _RECONCILE_QUEUE_TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z"
@@ -63780,17 +63788,8 @@ _PUBLIC_RECONCILE_GRAPH_DELTA_MODES = frozenset(
 def _safe_reconcile_queue_identifier(value: Any, *, kind: str) -> tuple[str, str]:
     raw = str(value or "").strip()
     digest = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    compact = re.sub(r"[^a-z0-9]+", "", raw.casefold())
-    parts = [part for part in re.split(r"[-_.:]+", raw) if part]
     kind_pattern = _RECONCILE_QUEUE_IDENTIFIER_KIND_RE.get(kind)
-    if (
-        raw
-        and _RECONCILE_QUEUE_IDENTIFIER_RE.fullmatch(raw)
-        and not any(marker in compact for marker in _RECONCILE_QUEUE_CREDENTIAL_MARKERS)
-        and not any(len(part) > 24 for part in parts)
-        and kind_pattern is not None
-        and kind_pattern.fullmatch(raw)
-    ):
+    if raw and kind_pattern is not None and kind_pattern.fullmatch(raw):
         return raw, digest
     return f"{kind}-{digest[7:23]}", digest
 

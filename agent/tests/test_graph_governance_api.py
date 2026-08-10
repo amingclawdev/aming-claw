@@ -12125,6 +12125,8 @@ def test_current_full_reconcile_run_id_rejects_target_commit_drift(
 
 def test_graph_operations_queue_exposes_current_full_run_id_status(conn):
     head = "d" * 40
+    run_id = "current-full-ddddddd"
+    snapshot_id = "full-ddddddd-d00d"
     _activate_basic_graph(
         conn,
         "full-current-operations-status",
@@ -12133,8 +12135,8 @@ def test_graph_operations_queue_exposes_current_full_run_id_status(conn):
     store.record_reconcile_run_metric(
         conn,
         PID,
-        run_id="current-full-visible-running",
-        snapshot_id="full-current-visible-running",
+        run_id=run_id,
+        snapshot_id=snapshot_id,
         commit_sha=head,
         snapshot_kind="full",
         strategy="current_full_reconcile",
@@ -12162,17 +12164,15 @@ def test_graph_operations_queue_exposes_current_full_run_id_status(conn):
     operation = next(
         item
         for item in result["operations"]
-        if item.get("run_id") == "current-full-visible-running"
+        if item.get("run_id") == run_id
     )
     assert operation["project_id"] == PID
-    assert operation["run_id"] == "current-full-visible-running"
-    assert operation["snapshot_id"] == "full-current-visible-running"
+    assert operation["run_id"] == run_id
+    assert operation["snapshot_id"] == snapshot_id
     assert operation["operation_id"].startswith(
-        "current-full:current-full-visible-running:snapshot:"
+        f"current-full:{run_id}:snapshot:"
     )
-    assert operation["legacy_operation_id"] == (
-        "current-full:current-full-visible-running"
-    )
+    assert operation["legacy_operation_id"] == f"current-full:{run_id}"
     assert operation["operation_type"] == "current_full_reconcile"
     assert operation["status"] == "running"
     assert operation["progress"] == {"done": 0, "total": 2}
@@ -12181,6 +12181,8 @@ def test_graph_operations_queue_exposes_current_full_run_id_status(conn):
 
 def test_graph_operations_queue_keeps_same_run_snapshots_and_scrubs_evidence(conn):
     head = "e" * 40
+    shared_run_id = "current-full-eeeeeee"
+    snapshot_ids = {"full-eeeeeee-0000", "full-eeeeeee-0001"}
     _activate_basic_graph(
         conn,
         "full-current-operations-safe-projection",
@@ -12190,8 +12192,8 @@ def test_graph_operations_queue_keeps_same_run_snapshots_and_scrubs_evidence(con
         store.record_reconcile_run_metric(
             conn,
             PID,
-            run_id="current-full-shared-run",
-            snapshot_id=f"full-shared-snapshot-{index}",
+            run_id=shared_run_id,
+            snapshot_id=f"full-eeeeeee-000{index}",
             commit_sha=head,
             snapshot_kind="full",
             strategy="current_full_reconcile",
@@ -12208,8 +12210,8 @@ def test_graph_operations_queue_keeps_same_run_snapshots_and_scrubs_evidence(con
     store.record_reconcile_run_metric(
         conn,
         PID,
-        run_id="current-full-malformed-status",
-        snapshot_id="full-malformed-status",
+        run_id="current-full-bad5dad",
+        snapshot_id="full-bad5dad-0002",
         commit_sha=head,
         snapshot_kind="full",
         strategy="current_full_reconcile",
@@ -12235,22 +12237,19 @@ def test_graph_operations_queue_keeps_same_run_snapshots_and_scrubs_evidence(con
         item
         for item in result["operations"]
         if item.get("operation_type") == "current_full_reconcile"
-        and item.get("run_id") == "current-full-shared-run"
+        and item.get("run_id") == shared_run_id
     ]
     assert len(operations) == 2
     assert len({item["operation_id"] for item in operations}) == 2
-    assert {item["snapshot_id"] for item in operations} == {
-        "full-shared-snapshot-0",
-        "full-shared-snapshot-1",
-    }
+    assert {item["snapshot_id"] for item in operations} == snapshot_ids
     assert {
         item["legacy_operation_id"] for item in operations
-    } == {"current-full:current-full-shared-run"}
+    } == {f"current-full:{shared_run_id}"}
     assert all("evidence" not in item for item in operations)
     malformed = next(
         item
         for item in result["operations"]
-        if item.get("run_id") == "current-full-malformed-status"
+        if item.get("run_id") == "current-full-bad5dad"
     )
     assert malformed["status"] == "unknown"
     assert malformed["is_terminal"] is False
@@ -12348,6 +12347,181 @@ def test_graph_operations_queue_redacts_credential_shaped_identifiers(
     serialized = json.dumps(result, sort_keys=True)
     assert credential_identity not in serialized
     assert forbidden_fragment not in serialized
+
+
+def test_graph_operations_queue_hashes_unknown_identifier_namespaces_without_leakage(
+    conn,
+):
+    head = "1" * 40
+    _activate_basic_graph(
+        conn,
+        "full-current-operations-semantic-allowlist-attacks",
+        commit_sha=head,
+    )
+
+    def structured_entropy(length: int) -> str:
+        alphabet = "aZ9K2mQ7vB4xN8cR3sT6uW1yE5gH0jLp"
+        raw = (alphabet * ((length // len(alphabet)) + 1))[:length]
+        return "".join(
+            "-" if index and index % 16 == 0 else character
+            for index, character in enumerate(raw)
+        )
+
+    malicious_ids = [
+        "apiKey-PublicQueueSecret-A1b2C3",
+        "api-key-PublicQueueSecret-D4e5F6",
+        "sk-PublicQueueSecret-G7h8I9",
+        "xoxb-PublicQueueSecret-J1k2L3",
+        "xoxp-PublicQueueSecret-M4n5P6",
+        "xoxa-PublicQueueSecret-Q7r8S9",
+        "RTOK.PublicQueueSecret.T1u2V3",
+        "wstok-PublicQueueSecret-W4x5Y6",
+        "sessionToken-PublicQueueSecret-Z7a8B9",
+        "BeArEr---ToKeN---PublicQueueSecret-C1d2E3",
+        "current-full-apiKeySecret-A4b5C6",
+        "current-full-apikeysecret-a4b5c6",
+        f"current-full-{structured_entropy(48).casefold()}",
+        "candidate-full-skSecret-D7e8F9",
+        "candidate-full-sksecret-d7e8f9",
+        "candidate-opaque-public-queue-secret-g1h2i3",
+        "full-xoxbSecret-J4k5L6",
+        "full-xoxbsecret-j4k5l6",
+        "full-opaque-public-queue-secret-m7n8p9",
+        *[structured_entropy(length) for length in (32, 47, 48, 64, 96, 128)],
+    ]
+    for index, malicious_id in enumerate(malicious_ids):
+        store.record_reconcile_run_metric(
+            conn,
+            PID,
+            run_id=malicious_id,
+            snapshot_id=f"{malicious_id}-snapshot",
+            commit_sha=head,
+            snapshot_kind="full",
+            strategy="current_full_reconcile",
+            graph_delta_mode="full_rebuild",
+            status="running",
+            evidence={
+                "raw": {
+                    "run_id": malicious_id,
+                    "snapshot_id": f"{malicious_id}-snapshot",
+                    "credentials": {"apiKey": malicious_id},
+                }
+            },
+            created_at=f"2026-08-10T00:00:{index:02d}Z",
+        )
+    conn.commit()
+
+    result = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={"include_resolved": "false"},
+        )
+    )
+
+    operations = [
+        item
+        for item in result["operations"]
+        if item.get("operation_type") == "current_full_reconcile"
+    ]
+    assert len(operations) == len(malicious_ids)
+    expected_run_ids = {
+        "run-" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+        for value in malicious_ids
+    }
+    expected_snapshot_ids = {
+        "snapshot-"
+        + hashlib.sha256(f"{value}-snapshot".encode("utf-8")).hexdigest()[:16]
+        for value in malicious_ids
+    }
+    assert {item["run_id"] for item in operations} == expected_run_ids
+    assert {item["snapshot_id"] for item in operations} == expected_snapshot_ids
+    assert len({item["run_id"] for item in operations}) == len(malicious_ids)
+    assert len({item["snapshot_id"] for item in operations}) == len(malicious_ids)
+    assert len({item["run_id_sha256"] for item in operations}) == len(malicious_ids)
+    assert len({item["snapshot_id_sha256"] for item in operations}) == len(
+        malicious_ids
+    )
+    assert all(
+        item["target_label"] == item["run_id"] for item in operations
+    )
+    assert all(
+        item["legacy_operation_id"] == f"current-full:{item['run_id']}"
+        for item in operations
+    )
+    assert all(
+        item["operation_id"].startswith(
+            f"current-full:{item['run_id']}:snapshot:"
+        )
+        for item in operations
+    )
+    serialized = json.dumps(result, sort_keys=True)
+    for malicious_id in malicious_ids:
+        assert malicious_id not in serialized
+
+
+@pytest.mark.parametrize(
+    ("run_id", "snapshot_id"),
+    [
+        (
+            "current-full-0aa15ac",
+            "full-0aa15acc3c08-07bb07bb07bb",
+        ),
+        (
+            "current-full-mcp-0a7bcd65e0eaed2d",
+            "full-0aa15ac-07bb",
+        ),
+        (
+            "candidate-full-fc687958-r1",
+            "candidate-fc68795-a1b2",
+        ),
+        (
+            "full-fc687958-r2",
+            "candidate-full-fc687958-a1b2-r2",
+        ),
+    ],
+)
+def test_graph_operations_queue_preserves_known_semantic_identifier_namespaces(
+    conn,
+    run_id,
+    snapshot_id,
+):
+    head = "2" * 40
+    _activate_basic_graph(
+        conn,
+        "full-current-operations-semantic-allowlist-benign",
+        commit_sha=head,
+    )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id=run_id,
+        snapshot_id=snapshot_id,
+        commit_sha=head,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="running",
+        created_at="2026-08-10T00:00:00Z",
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={"include_resolved": "false"},
+        )
+    )
+
+    operation = next(
+        item
+        for item in result["operations"]
+        if item.get("operation_type") == "current_full_reconcile"
+    )
+    assert operation["run_id"] == run_id
+    assert operation["snapshot_id"] == snapshot_id
+    assert operation["target_label"] == run_id
 
 
 def test_graph_operations_queue_projects_reconcile_metrics_fail_closed(
