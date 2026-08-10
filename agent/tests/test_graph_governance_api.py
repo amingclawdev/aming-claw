@@ -71169,6 +71169,50 @@ def test_public_reconcile_metric_row_hashes_credential_project_and_invalid_commi
     assert raw_parent_commit not in serialized
 
 
+@pytest.mark.parametrize(
+    ("raw_commit", "raw_parent_commit", "expected_commit", "expected_parent"),
+    [
+        ("a" * 40, "A" * 40, "a" * 40, ""),
+        ("b" * 64, " " + "b" * 64, "b" * 64, ""),
+        ("c" * 40 + " ", "c" * 40, "", "c" * 40),
+        ("\u00c9" + "d" * 39, "\u00e9" + "d" * 39, "", ""),
+        ("e\u0301" + "e" * 39, "\u00e9" + "e" * 39, "", ""),
+        ("f" * 41, "F" * 41, "", ""),
+    ],
+)
+def test_public_reconcile_metric_row_commit_hashes_bind_exact_original_bytes(
+    raw_commit,
+    raw_parent_commit,
+    expected_commit,
+    expected_parent,
+):
+    metric = server._public_reconcile_metric_row(
+        {
+            "project_id": PID,
+            "run_id": "current-full-aaaaaaa",
+            "snapshot_id": "full-aaaaaaa-abcd",
+            "commit_sha": raw_commit,
+            "parent_commit_sha": raw_parent_commit,
+            "snapshot_kind": "full",
+            "strategy": "current_full_reconcile",
+            "graph_delta_mode": "full_rebuild",
+            "effective_status": "running",
+        }
+    )
+
+    expected_commit_digest = "sha256:" + hashlib.sha256(
+        raw_commit.encode("utf-8")
+    ).hexdigest()
+    expected_parent_digest = "sha256:" + hashlib.sha256(
+        raw_parent_commit.encode("utf-8")
+    ).hexdigest()
+    assert metric["commit_sha"] == expected_commit
+    assert metric["parent_commit_sha"] == expected_parent
+    assert metric["commit_sha256"] == expected_commit_digest
+    assert metric["parent_commit_sha256"] == expected_parent_digest
+    assert metric["commit_sha256"] != metric["parent_commit_sha256"]
+
+
 def test_reconcile_metrics_invalid_cursor_with_pending_backfill_is_physical_zero_write(
     monkeypatch,
     tmp_path,

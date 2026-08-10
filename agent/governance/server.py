@@ -63825,9 +63825,9 @@ def _safe_reconcile_queue_identifier(value: Any, *, kind: str) -> tuple[str, str
 
 
 def _safe_reconcile_queue_commit(value: Any) -> tuple[str, str]:
-    raw = str(value or "").strip().lower()
+    raw = "" if value is None else str(value)
     digest = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    if re.fullmatch(r"[0-9a-f]{40,64}", raw):
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", raw):
         return raw, digest
     return "", digest
 
