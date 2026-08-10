@@ -24,7 +24,7 @@ from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from threading import BoundedSemaphore, Event, RLock, local
 from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, NoReturn, Sequence
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
@@ -24821,6 +24821,17 @@ _RUNTIME_CONTEXT_FINISH_FACADE_ALIASES = (
     "finish_gate_facade_payload_skeleton",
 )
 
+_RUNTIME_CONTEXT_FINISH_GUIDE_HOST_AUTH_PLACEHOLDERS = {
+    "fence_token": {
+        "<same fence_token used for finish-time attestation>",
+        "<same fence_token from the worker launch envelope>",
+    },
+    "session_token": {
+        "<same runtime_context_session_token used for finish-time attestation>",
+        "<current runtime_context_session_token>",
+    },
+}
+
 
 def _runtime_context_finish_facade_alias_projection(
     actionable_payloads: Mapping[str, Any],
@@ -25022,6 +25033,204 @@ def _runtime_context_materialized_finish_gate_submission(
     return result
 
 
+def _runtime_context_finish_guide_authority_projection(
+    *,
+    finish_gate_submission: Mapping[str, Any],
+    contract_runtime_next_legal_action: Mapping[str, Any],
+    contract_execution_id: str,
+    runtime_context_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """Bind one advertised finish facade to unique durable server authority."""
+
+    submission = (
+        finish_gate_submission
+        if isinstance(finish_gate_submission, Mapping)
+        else {}
+    )
+    body = submission.get("copy_safe_body")
+    body = dict(body) if isinstance(body, Mapping) else {}
+    if not body or not _runtime_context_finish_facade_line_is_exact(
+        contract_runtime_next_legal_action=contract_runtime_next_legal_action,
+        expected_line_id="worker_finish_gate",
+        expected_action="record_mf_subagent_finish_gate",
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    ):
+        return {}
+    expected_identity = {
+        "contract_execution_id": str(contract_execution_id or "").strip(),
+        "runtime_context_id": str(runtime_context_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+    }
+    if (
+        not _runtime_context_contract_line_execution_matches(
+            body,
+            expected_identity["contract_execution_id"],
+        )
+        or any(
+            not expected
+            or str(body.get(field) or submission.get(field) or "").strip()
+            != expected
+            for field, expected in expected_identity.items()
+            if field != "contract_execution_id"
+        )
+    ):
+        return {}
+    if any(
+        str(body.get(field) or "").strip() not in accepted
+        for field, accepted in (
+            _RUNTIME_CONTEXT_FINISH_GUIDE_HOST_AUTH_PLACEHOLDERS.items()
+        )
+    ):
+        return {}
+    attestation = body.get("finish_time_worker_self_attestation")
+    if not isinstance(attestation, Mapping) or not attestation:
+        return {}
+    if dict(attestation) != dict(
+        submission.get("finish_time_worker_self_attestation") or {}
+    ):
+        return {}
+    attestation_event_ref = str(
+        submission.get("attestation_event_ref") or ""
+    ).strip()
+    if not _runtime_context_non_placeholder_text(attestation_event_ref):
+        return {}
+    read_receipt_event_id = str(body.get("read_receipt_event_id") or "").strip()
+    read_receipt_hash = str(body.get("read_receipt_hash") or "").strip()
+    receipt_authority = submission.get("read_receipt_authority")
+    receipt_authority = (
+        receipt_authority if isinstance(receipt_authority, Mapping) else {}
+    )
+    receipt_event_ref = str(receipt_authority.get("event_ref") or "").strip()
+    if (
+        receipt_authority.get("server_derived") is not True
+        or str(receipt_authority.get("source") or "")
+        != "accepted_task_timeline_read_receipt"
+        or not read_receipt_event_id
+        or _runtime_context_timeline_event_id(receipt_event_ref)
+        != read_receipt_event_id
+        or str(receipt_authority.get("event_id") or "").strip()
+        != read_receipt_event_id
+        or not _runtime_context_non_placeholder_text(read_receipt_hash)
+        or str(receipt_authority.get("read_receipt_hash") or "").strip()
+        != read_receipt_hash
+    ):
+        return {}
+    authority = {
+        "schema_version": "runtime_context.finish_guide_authority.v1",
+        "status": "unique_durable_finish_authority",
+        "available": True,
+        "candidate_count": 1,
+        "server_derived": True,
+        "source_of_authority": (
+            "ContractRuntime.next_legal_action+"
+            "accepted_task_timeline_finish_attestation+read_receipt"
+        ),
+        **expected_identity,
+        "line_id": "worker_finish_gate",
+        "action": "record_mf_subagent_finish_gate",
+        "owner_role": "mf_sub",
+        "attestation_event_ref": attestation_event_ref,
+        "read_receipt_event_ref": receipt_event_ref,
+        "read_receipt_event_id": read_receipt_event_id,
+        "read_receipt_hash": read_receipt_hash,
+        "copy_safe_body_hash": _stable_public_hash(body),
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "caller_inference_allowed": False,
+    }
+    return authority
+
+
+def _runtime_context_finish_guide_authority_is_exact(
+    source: Mapping[str, Any],
+    *,
+    contract_execution_id: str,
+) -> bool:
+    """Accept only the server-bound authority attached during guide assembly."""
+
+    if not isinstance(source, Mapping):
+        return False
+    body = source.get("copy_safe_body")
+    body = dict(body) if isinstance(body, Mapping) else {}
+    authority = source.get("durable_finish_authority")
+    authority = authority if isinstance(authority, Mapping) else {}
+    expected_contract_execution_id = str(contract_execution_id or "").strip()
+    read_receipt_event_id = str(body.get("read_receipt_event_id") or "").strip()
+    read_receipt_hash = str(body.get("read_receipt_hash") or "").strip()
+    if (
+        not body
+        or source.get("server_derived") is not True
+        or source.get("actionable") is not True
+        or str(source.get("body_source") or "") != "copy_safe_body"
+        or str(authority.get("schema_version") or "")
+        != "runtime_context.finish_guide_authority.v1"
+        or str(authority.get("source_of_authority") or "")
+        != (
+            "ContractRuntime.next_legal_action+"
+            "accepted_task_timeline_finish_attestation+read_receipt"
+        )
+        or authority.get("server_derived") is not True
+        or authority.get("available") is not True
+        or authority.get("candidate_count") != 1
+        or str(authority.get("status") or "")
+        != "unique_durable_finish_authority"
+        or str(authority.get("line_id") or "") != "worker_finish_gate"
+        or str(authority.get("action") or "")
+        != "record_mf_subagent_finish_gate"
+        or str(authority.get("owner_role") or "") != "mf_sub"
+        or authority.get("caller_inference_allowed") is not False
+        or str(authority.get("contract_execution_id") or "").strip()
+        != expected_contract_execution_id
+        or not _runtime_context_contract_line_execution_matches(
+            body,
+            expected_contract_execution_id,
+        )
+        or str(authority.get("runtime_context_id") or "").strip()
+        != str(body.get("runtime_context_id") or "").strip()
+        or str(authority.get("task_id") or "").strip()
+        != str(body.get("task_id") or "").strip()
+        or not _runtime_context_non_placeholder_text(
+            authority.get("runtime_context_id")
+        )
+        or not _runtime_context_non_placeholder_text(authority.get("task_id"))
+        or not _runtime_context_non_placeholder_text(
+            authority.get("attestation_event_ref")
+        )
+        or not _runtime_context_non_placeholder_text(
+            authority.get("read_receipt_event_ref")
+        )
+        or not _runtime_context_non_placeholder_text(
+            authority.get("read_receipt_hash")
+        )
+        or str(authority.get("read_receipt_event_id") or "").strip()
+        != read_receipt_event_id
+        or _runtime_context_timeline_event_id(
+            str(authority.get("read_receipt_event_ref") or "")
+        )
+        != read_receipt_event_id
+        or str(authority.get("read_receipt_hash") or "").strip()
+        != read_receipt_hash
+        or str(authority.get("copy_safe_body_hash") or "")
+        != _stable_public_hash(body)
+        or authority.get("raw_session_token_exposed") is not False
+        or authority.get("raw_fence_token_exposed") is not False
+        or authority.get("raw_route_token_exposed") is not False
+    ):
+        return False
+    if any(
+        str(body.get(field) or "").strip() not in accepted
+        for field, accepted in (
+            _RUNTIME_CONTEXT_FINISH_GUIDE_HOST_AUTH_PLACEHOLDERS.items()
+        )
+    ):
+        return False
+    return True
+
+
 _RUNTIME_CONTEXT_GUIDE_STAGE_FACADES = {
     "join": "runtime_context_session_token_initial_join",
     "receipt": "runtime_context_read_receipt",
@@ -25173,7 +25382,13 @@ def _runtime_context_guide_executable_actions(
         ),
     ):
         source = actionable_payloads.get(key)
-        if isinstance(source, Mapping):
+        if isinstance(source, Mapping) and (
+            stage != "finish"
+            or _runtime_context_finish_guide_authority_is_exact(
+                source,
+                contract_execution_id=contract_execution_id,
+            )
+        ):
             add(
                 stage,
                 source,
@@ -25269,11 +25484,37 @@ def _runtime_context_guide_executable_actions(
             default_tool="contract_runtime_submit_line",
         )
 
+    finish_action_count = sum(
+        action.get("mcp_tool") == "runtime_context_finish_gate"
+        for action in actions.values()
+    )
+    finish_available = "finish" in actions and finish_action_count == 1
+    stage_facade_catalog = dict(_RUNTIME_CONTEXT_GUIDE_STAGE_FACADES)
+    if not finish_available:
+        stage_facade_catalog.pop("finish", None)
+    finish_stage_availability = {
+        "stage": "finish",
+        "facade": "runtime_context_finish_gate",
+        "available": finish_available,
+        "advertised": finish_available,
+        "canonical_action_count": finish_action_count if finish_available else 0,
+        "one_canonical_facade_coverage": finish_available,
+        "status": "available" if finish_available else "unavailable",
+        "reason": (
+            "unique_canonical_executable_action"
+            if finish_available
+            else "durable_finish_authority_unavailable"
+        ),
+        "caller_inference_allowed": False,
+    }
     return {
         "schema_version": "runtime_context.guide_to_facade_coverage.v1",
-        "stage_facade_catalog": dict(_RUNTIME_CONTEXT_GUIDE_STAGE_FACADES),
-        "literal_stage_coverage": list(_RUNTIME_CONTEXT_GUIDE_STAGE_FACADES),
+        "stage_facade_catalog": stage_facade_catalog,
+        "literal_stage_coverage": list(stage_facade_catalog),
         "actions": actions,
+        "stage_availability": {"finish": deepcopy(finish_stage_availability)},
+        "finish_stage_availability": finish_stage_availability,
+        "unavailable_stages": [] if finish_available else ["finish"],
         "one_canonical_facade_per_advertised_stage": True,
         "copy_safe_body_spreads_directly_to_mcp": True,
         "raw_session_token_exposed": False,
@@ -27244,9 +27485,24 @@ def _runtime_context_worker_guide_response(
             ),
         )
         if finish_gate_skeleton:
-            actionable_payloads["finish_gate_facade_payload_skeleton"] = (
-                finish_gate_skeleton
+            durable_finish_authority = (
+                _runtime_context_finish_guide_authority_projection(
+                    finish_gate_submission=finish_gate_skeleton,
+                    contract_runtime_next_legal_action=(
+                        contract_runtime_next_legal_action
+                    ),
+                    contract_execution_id=resolved_contract_execution_id,
+                    runtime_context_id=runtime_context_id,
+                    task_id=task_id,
+                )
             )
+            if durable_finish_authority:
+                finish_gate_skeleton["durable_finish_authority"] = (
+                    durable_finish_authority
+                )
+                actionable_payloads["finish_gate_facade_payload_skeleton"] = (
+                    finish_gate_skeleton
+                )
     _runtime_context_patch_actionable_payload_worker_scope(
         actionable_payloads,
         worker_scope_files,
@@ -27325,12 +27581,18 @@ def _runtime_context_worker_guide_response(
         qa_verification_guide=qa_verification_guide,
         contract_runtime_next_action=contract_runtime_next_legal_action,
     )
+    finish_stage_availability = deepcopy(
+        guide_to_facade_coverage.get("finish_stage_availability") or {}
+    )
     if not contract_runtime_resolution_blocked:
         actionable_payloads["guide_to_facade_coverage"] = deepcopy(
             guide_to_facade_coverage
         )
         actionable_payloads["canonical_executable_actions"] = deepcopy(
             guide_to_facade_coverage.get("actions") or {}
+        )
+        actionable_payloads["finish_stage_availability"] = deepcopy(
+            finish_stage_availability
         )
     executable_contract = _runtime_context_executable_contract_envelope(
         current_state_response,
@@ -27398,6 +27660,7 @@ def _runtime_context_worker_guide_response(
             "actions",
             {},
         ),
+        "finish_stage_availability": deepcopy(finish_stage_availability),
         "actionable_payloads": actionable_payloads,
         "capacity_fallback_guidance": actionable_payloads.get(
             "capacity_fallback_guidance",
@@ -27522,6 +27785,9 @@ def _runtime_context_worker_guide_response(
             "canonical_executable_actions": guide_to_facade_coverage.get(
                 "actions",
                 {},
+            ),
+            "finish_stage_availability": deepcopy(
+                finish_stage_availability
             ),
             "actionable_payloads": actionable_payloads,
             "capacity_fallback_guidance": actionable_payloads.get(
@@ -123877,6 +124143,279 @@ def _contract_runtime_parent_for_successor(
     )
 
 
+def _onboard_service_parent_authority_error(
+    blocker_id: str,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_contract_execution_id: str,
+) -> NoReturn:
+    raise ValidationError(
+        "onboard-route-guide service parent authority is invalid",
+        {
+            "blocker_id": blocker_id,
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "parent_contract_execution_id": parent_contract_execution_id,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "fail_closed": True,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        },
+    )
+
+
+def _onboard_service_parent_for_successor(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_contract_execution_id: str,
+    require_complete: bool,
+) -> dict[str, Any]:
+    """Validate the deterministic service root shared by successor facades."""
+
+    expected_execution_id = _onboard_service_execution_id(project_id, backlog_id)
+    if parent_contract_execution_id != expected_execution_id:
+        _onboard_service_parent_authority_error(
+            "onboard_service_parent_id_mismatch",
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_contract_execution_id,
+        )
+    try:
+        record = _contract_runtime_store(conn).get(parent_contract_execution_id)
+    except ContractRuntimeError:
+        _onboard_service_parent_authority_error(
+            "onboard_service_parent_unknown",
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_contract_execution_id,
+        )
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+    lineage = (
+        record.get("backlog_lineage")
+        if isinstance(record.get("backlog_lineage"), Mapping)
+        else {}
+    )
+    expected_values = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": expected_execution_id,
+        "contract_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+        "version": "service",
+        "revision": "v1",
+        "parent_contract_execution_id": "",
+        "root_contract_execution_id": expected_execution_id,
+        "contract_chain_id": _onboard_service_chain_id(project_id, backlog_id),
+    }
+    identity_ok = all(
+        str(record.get(field) or "") == expected
+        for field, expected in expected_values.items()
+    ) and bool(
+        str(metadata.get("service_source") or "")
+        == "onboard_route_guide_service"
+        and metadata.get("legacy_onboard_contract_waived") is True
+        and metadata.get("generic_crud_exposed") is False
+        and str(lineage.get("project_id") or "") == project_id
+        and str(lineage.get("backlog_id") or "") == backlog_id
+        and lineage.get("legacy_onboard_contract_waived") is True
+    )
+    state = (
+        record.get("execution_state")
+        if isinstance(record.get("execution_state"), Mapping)
+        else {}
+    )
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    state_body = dict(state)
+    state_hash = str(state_body.pop("execution_state_hash", "") or "")
+    guide_body = dict(guide)
+    guide_hash = str(guide_body.pop("runtime_guide_hash", "") or "")
+    immutable_ok = bool(
+        state_hash
+        and state_hash == stable_sha256(state_body)
+        and guide_hash
+        and guide_hash == stable_sha256(guide_body)
+        and int(record.get("execution_state_revision") or 0)
+        == int(state.get("execution_state_revision") or 0)
+        and record.get("completed_lines") == state.get("completed_lines")
+        and record.get("completed_lines") == guide.get("completed_lines")
+    )
+    precheck = (
+        record.get("precheck_decision")
+        if isinstance(record.get("precheck_decision"), Mapping)
+        else {}
+    )
+    accepted = bool(
+        precheck.get("ok") is True
+        and str(precheck.get("decision") or "") == "allow"
+        and str(precheck.get("gate_id") or "")
+        == "onboard_route_guide:service_parent"
+        and str(precheck.get("source_of_authority") or "")
+        == "onboard_route_guide_service"
+    )
+    if not (identity_ok and immutable_ok and accepted):
+        _onboard_service_parent_authority_error(
+            "onboard_service_parent_drift",
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_contract_execution_id,
+        )
+    if require_complete and not _runtime_record_is_complete(record):
+        _onboard_service_parent_authority_error(
+            "onboard_service_parent_incomplete",
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_contract_execution_id,
+        )
+    return record
+
+
+def _observer_hotfix_onboard_service_parent_for_successor(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_contract_execution_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    """Resolve the exact guide-authored service-parent recovery handoff."""
+
+    parent = _onboard_service_parent_for_successor(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        parent_contract_execution_id=parent_contract_execution_id,
+        require_complete=True,
+    )
+    predecessor_execution_id = _observer_hotfix_successor_execution_id(
+        project_id,
+        backlog_id,
+        parent_contract_execution_id,
+    )
+    try:
+        predecessor = _contract_runtime(conn).current_record(
+            predecessor_execution_id,
+            actor_role="observer",
+        )
+    except (ContractRuntimeError, StalePinnedContractExecutionError):
+        _onboard_service_parent_authority_error(
+            "onboard_service_predecessor_unknown_or_stale",
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_contract_execution_id,
+        )
+    if not _runtime_record_is_complete(predecessor):
+        _onboard_service_parent_authority_error(
+            "onboard_service_predecessor_incomplete",
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_contract_execution_id,
+        )
+
+    from . import observer_route_context
+
+    try:
+        route = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=parent_contract_execution_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        route = None
+    declared_files = _backlog_declared_direct_file_scope(conn, backlog_id)
+    allowed = {
+        _normalized_contract_runtime_action(item)
+        for item in (route or {}).get("allowed_actions") or []
+    }
+    expected_allowed = {
+        _normalized_contract_runtime_action(item)
+        for item in _observer_route_context_issue_allowed_actions(
+            ["observer_hotfix_enter"]
+        )
+    }
+    if not (
+        route
+        and str(route.get("caller_role") or "") == "observer"
+        and allowed == expected_allowed
+        and sorted(route.get("target_files") or []) == sorted(declared_files)
+        and sorted(route.get("owned_files") or []) == sorted(declared_files)
+    ):
+        _onboard_service_parent_authority_error(
+            "onboard_service_route_scope_drift",
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_contract_execution_id,
+        )
+    refs = {str(item or "").strip() for item in route.get("evidence_refs") or []}
+    backlog_refs = {item[8:] for item in refs if item.startswith("backlog:")}
+    contract_refs = {
+        item[17:] for item in refs if item.startswith("contract_runtime:")
+    }
+    source_backlogs = backlog_refs - {backlog_id}
+    source_executions = contract_refs - {predecessor_execution_id}
+    if (
+        backlog_id not in backlog_refs
+        or predecessor_execution_id not in contract_refs
+        or len(source_backlogs) > 1
+        or len(source_executions) != 1
+    ):
+        _onboard_service_parent_authority_error(
+            "onboard_service_route_evidence_ambiguous",
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_contract_execution_id,
+        )
+    source_backlog_id = next(iter(source_backlogs), backlog_id)
+    source_execution_id = next(iter(source_executions))
+    projection = _onboard_legacy_operator_hotfix_attempt_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=source_backlog_id,
+        role="observer",
+        work_type="legacy_operator_recovery",
+        route_token_ref=route_token_ref,
+        next_action={"contract_execution_id": source_execution_id},
+        current_projection={},
+        runtime_resume={},
+    )
+    scope = (
+        projection.get("action_scope")
+        if isinstance(projection.get("action_scope"), Mapping)
+        else {}
+    )
+    transition = (
+        projection.get("explicit_cross_contract_transition")
+        if isinstance(projection.get("explicit_cross_contract_transition"), Mapping)
+        else {}
+    )
+    if not (
+        projection.get("actionable") is True
+        and projection.get("action_input_ready") is True
+        and str(scope.get("backlog_id") or "") == backlog_id
+        and str(scope.get("contract_execution_id") or "")
+        == parent_contract_execution_id
+        and str(scope.get("source_contract_execution_id") or "")
+        == source_execution_id
+        and str(transition.get("predecessor_contract_execution_id") or "")
+        == predecessor_execution_id
+    ):
+        _onboard_service_parent_authority_error(
+            "onboard_service_recovery_authority_drift",
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_contract_execution_id,
+        )
+    return parent
+
+
 def _direct_fix_blocked_successor_entry_from_body(
     body: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -123940,6 +124479,13 @@ def _direct_fix_onboard_service_parent_for_successor(
         route_token_ref=route_token_ref,
         blocked_successor_entry=blocked_entry,
         blocked_reason=reason,
+    )
+    parent_record = _onboard_service_parent_for_successor(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        parent_contract_execution_id=parent_contract_execution_id,
+        require_complete=False,
     )
     blocked_line = _contract_runtime_last_blocked_line(parent_record)
     if _contract_runtime_block_successor_id(blocked_line) != DIRECT_FIX_CONTRACT_ID:
@@ -151749,6 +152295,35 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                         "role_source": "contract_runtime_effective_actor_role",
                     },
                 )
+            onboard_service_parent_record: dict[str, Any] = {}
+            if explicit_parent_execution_id:
+                expected_service_parent_id = _onboard_service_execution_id(
+                    project_id,
+                    backlog_id,
+                )
+                explicit_parent_candidate: dict[str, Any] = {}
+                try:
+                    explicit_parent_candidate = _contract_runtime_store(conn).get(
+                        explicit_parent_execution_id
+                    )
+                except ContractRuntimeError:
+                    explicit_parent_candidate = {}
+                if (
+                    explicit_parent_execution_id == expected_service_parent_id
+                    or explicit_parent_execution_id.startswith("onboard-service-")
+                    or _onboard_service_record(explicit_parent_candidate)
+                ):
+                    onboard_service_parent_record = (
+                        _observer_hotfix_onboard_service_parent_for_successor(
+                            conn,
+                            project_id=project_id,
+                            backlog_id=backlog_id,
+                            parent_contract_execution_id=(
+                                explicit_parent_execution_id
+                            ),
+                            route_token_ref=route_token_ref,
+                        )
+                    )
             attempt_preflight = _observer_hotfix_attempt_prewrite_gate(
                 conn,
                 project_id=project_id,
@@ -151761,29 +152336,36 @@ def handle_project_hotfix_enter(ctx: RequestContext):
             )
             if attempt_preflight.get("status") == "replayed":
                 parent_record = dict(
-                    attempt_preflight.get("parent_record") or {}
+                    onboard_service_parent_record
+                    or attempt_preflight.get("parent_record")
+                    or {}
                 )
             elif explicit_parent_execution_id:
-                try:
-                    parent_record = _contract_runtime_parent_for_successor(
-                        conn,
-                        project_id=project_id,
-                        backlog_id=backlog_id,
-                        parent_contract_execution_id=explicit_parent_execution_id,
-                        successor_contract_id="observer_hotfix",
-                        actor_role=derived_actor_role,
-                    )
-                except StalePinnedContractExecutionError as exc:
-                    _raise_stale_contract_runtime_validation(
-                        exc,
-                        action="hotfix_enter",
-                        route_token_ref=route_token_ref,
-                        actor_role=derived_actor_role,
-                        message=(
-                            "parent contract execution is stale; recover it "
-                            "before hotfix successor"
-                        ),
-                    )
+                if onboard_service_parent_record:
+                    parent_record = onboard_service_parent_record
+                else:
+                    try:
+                        parent_record = _contract_runtime_parent_for_successor(
+                            conn,
+                            project_id=project_id,
+                            backlog_id=backlog_id,
+                            parent_contract_execution_id=(
+                                explicit_parent_execution_id
+                            ),
+                            successor_contract_id="observer_hotfix",
+                            actor_role=derived_actor_role,
+                        )
+                    except StalePinnedContractExecutionError as exc:
+                        _raise_stale_contract_runtime_validation(
+                            exc,
+                            action="hotfix_enter",
+                            route_token_ref=route_token_ref,
+                            actor_role=derived_actor_role,
+                            message=(
+                                "parent contract execution is stale; recover it "
+                                "before hotfix successor"
+                            ),
+                        )
             elif onboard_service_waiver:
                 parent_record = _onboard_service_materialize_parent_record(
                     conn,

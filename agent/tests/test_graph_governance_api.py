@@ -7128,6 +7128,7 @@ def _persist_contract_runtime_observer_route_ref(
     allowed_actions: list[str],
     caller_role: str = "observer",
     target_files: list[str] | None = None,
+    evidence_refs: list[str] | None = None,
 ) -> None:
     persisted_target_files = list(target_files or [])
     observer_route_context.persist_route_token_ref(
@@ -7151,7 +7152,9 @@ def _persist_contract_runtime_observer_route_ref(
                 "task_id": contract_execution_id,
             },
             "expires_at": "2999-01-01T00:00:00Z",
-            "evidence_refs": ["test:contract-runtime-observer-ref"],
+            "evidence_refs": list(
+                evidence_refs or ["test:contract-runtime-observer-ref"]
+            ),
         },
     )
 
@@ -58538,13 +58541,24 @@ def test_compact_legacy_recovery_projects_dependency_hotfix_route_then_attempt(
     )["mode"] == "replacement_exhausted"
 
     dependency_backlog_id = f"{case['backlog_id']}-PARENT"
-    predecessor = _start_source_backed_hotfix_successor(
+    _insert_simple_mf_close_backlog(conn, dependency_backlog_id)
+    dependency_parent = server._onboard_service_materialize_parent_record(
         conn,
+        project_id=PID,
         backlog_id=dependency_backlog_id,
-        task_id="dependency-hotfix-predecessor",
         route_token_ref="rtok-dependency-hotfix-predecessor",
     )
-    dependency_parent_id = predecessor["parent_contract_execution_id"]
+    dependency_parent_id = dependency_parent["contract_execution_id"]
+    predecessor = server._observer_hotfix_successor_runtime_enter(
+        conn,
+        project_id=PID,
+        backlog_id=dependency_backlog_id,
+        task_id="dependency-hotfix-predecessor",
+        parent_record=dependency_parent,
+        actor_role="observer",
+        route_token_ref="rtok-dependency-hotfix-predecessor",
+        reason="Create the immutable canonical dependency predecessor.",
+    )
     conn.execute(
         """
         UPDATE backlog_bugs
@@ -58653,8 +58667,9 @@ def test_compact_legacy_recovery_projects_dependency_hotfix_route_then_attempt(
         backlog_id=dependency_backlog_id,
         contract_execution_id=dependency_parent_id,
         route_token_ref=recovery_ref,
-        allowed_actions=["observer_hotfix_enter"],
+        allowed_actions=["observer_hotfix_enter", "hotfix_enter"],
         target_files=["agent/governance/server.py"],
+        evidence_refs=route_issue["copy_safe_body"]["evidence_refs"],
     )
     ready = server._onboard_route_guide_service_response(
         conn,
@@ -58693,6 +58708,268 @@ def test_compact_legacy_recovery_projects_dependency_hotfix_route_then_attempt(
     assert ready["runtime_context_recovery_authority"][
         "runtime_context_id"
     ] == context.runtime_context_id
+
+
+def test_onboard_service_hotfix_parent_drift_is_secret_safe_physical_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="service-parent-zero-write",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+    )
+    first = _pre_lineage_rejoin(case)
+    _pre_lineage_rejoin(
+        case,
+        body_updates={
+            "session_token_ref": first["session_token_ref"],
+            "reason": "consume the bounded replacement before service-parent checks",
+        },
+    )
+    target_backlog_id = f"{case['backlog_id']}-PARENT"
+    _insert_simple_mf_close_backlog(conn, target_backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = '[]' WHERE bug_id = ?",
+        (json.dumps(["agent/governance/server.py"]), target_backlog_id),
+    )
+    conn.execute(
+        "UPDATE backlog_bugs SET acceptance_criteria = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                [
+                    {
+                        "id": "AC-SERVICE-PARENT",
+                        "required_scope": {
+                            "kind": "verification_only_external_dependency",
+                            "dependency_id": target_backlog_id,
+                        },
+                    }
+                ]
+            ),
+            case["backlog_id"],
+        ),
+    )
+    parent = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=target_backlog_id,
+        route_token_ref="rtok-service-parent-canonical",
+    )
+    predecessor = server._observer_hotfix_successor_runtime_enter(
+        conn,
+        project_id=PID,
+        backlog_id=target_backlog_id,
+        task_id="service-parent-predecessor",
+        parent_record=parent,
+        actor_role="observer",
+        route_token_ref="rtok-service-parent-canonical",
+        reason="Create one canonical completed predecessor.",
+    )
+    completed = _complete_source_backed_hotfix_successor(
+        conn,
+        predecessor["contract_execution_id"],
+    )
+    completed_state = server._runtime_current_state_from_record(completed)
+    guide = server._onboard_route_guide_service_response(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        route_token_ref="",
+        role="observer",
+        work_type="legacy_operator_recovery",
+        response_view="compact",
+        request_body={},
+    )
+    route_issue = guide["next_legal_action"]["observer_route_context_issue"][
+        "copy_safe_body"
+    ]
+    route_ref = "rtok-service-parent-zero-write"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=target_backlog_id,
+        contract_execution_id=parent["contract_execution_id"],
+        route_token_ref=route_ref,
+        allowed_actions=["observer_hotfix_enter", "hotfix_enter"],
+        target_files=["agent/governance/server.py"],
+        evidence_refs=route_issue["evidence_refs"],
+    )
+    ready = server._onboard_route_guide_service_response(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        route_token_ref=route_ref,
+        role="observer",
+        work_type="legacy_operator_recovery",
+        response_view="compact",
+        request_body={},
+    )
+    body = dict(ready["canonical_executable_action"]["copy_safe_body"])
+    body.update(
+        {
+            "task_id": "service-parent-zero-write-attempt",
+            "successor_attempt_id": "service-parent-zero-write-attempt",
+            "reason": "Exercise exact service-parent fail-closed boundaries.",
+        }
+    )
+    parent_id = parent["contract_execution_id"]
+    parent_row = dict(
+        conn.execute(
+            "SELECT * FROM contract_runtime_executions WHERE contract_execution_id = ?",
+            (parent_id,),
+        ).fetchone()
+    )
+    canonical_parent = server._contract_runtime_store(conn).get(parent_id)
+
+    def reject_zero_write(
+        request_body: dict,
+        *,
+        blocker_id: str,
+    ) -> None:
+        before = "\n".join(conn.iterdump())
+        before_changes = conn.total_changes
+        with pytest.raises(ValidationError) as rejected:
+            server.handle_project_hotfix_enter(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body=request_body,
+                )
+            )
+        assert rejected.value.details["blocker_id"] == blocker_id
+        assert rejected.value.details["writes_performed"] is False
+        assert rejected.value.details["mutation_performed"] is False
+        assert rejected.value.details.get("raw_route_token_exposed", False) is False
+        serialized = json.dumps(rejected.value.details, sort_keys=True)
+        assert "super-secret-credential-value" not in serialized
+        assert '"raw_route_token":' not in serialized
+        assert conn.total_changes == before_changes
+        assert "\n".join(conn.iterdump()) == before
+
+    reject_zero_write(
+        {**body, "parent_contract_execution_id": "onboard-service-wrong-id"},
+        blocker_id="onboard_service_parent_id_mismatch",
+    )
+
+    conn.execute(
+        "DELETE FROM contract_runtime_executions WHERE contract_execution_id = ?",
+        (parent_id,),
+    )
+    conn.commit()
+    reject_zero_write(body, blocker_id="onboard_service_parent_unknown")
+    conn.execute(
+        """
+        INSERT INTO contract_runtime_executions (
+            contract_execution_id, project_id, backlog_id, contract_id, version,
+            revision, parent_contract_execution_id, root_contract_execution_id,
+            contract_chain_id, execution_state_revision, record_json, created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        tuple(parent_row.values()),
+    )
+    conn.commit()
+
+    for field, value in (
+        ("project_id", "wrong-project"),
+        ("backlog_id", "AC-WRONG-BACKLOG"),
+    ):
+        drifted = copy.deepcopy(canonical_parent)
+        drifted[field] = value
+        conn.execute(
+            "UPDATE contract_runtime_executions SET record_json = ? "
+            "WHERE contract_execution_id = ?",
+            (json.dumps(drifted, sort_keys=True), parent_id),
+        )
+        conn.commit()
+        reject_zero_write(body, blocker_id="onboard_service_parent_drift")
+        conn.execute(
+            "UPDATE contract_runtime_executions SET record_json = ? "
+            "WHERE contract_execution_id = ?",
+            (json.dumps(canonical_parent, sort_keys=True), parent_id),
+        )
+        conn.commit()
+
+    incomplete = copy.deepcopy(canonical_parent)
+    incomplete["runtime_guide"]["next_legal_action"] = {
+        "stage_id": "service",
+        "line_id": "still_running",
+    }
+    incomplete["runtime_guide"]["runtime_guide_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in incomplete["runtime_guide"].items()
+            if key != "runtime_guide_hash"
+        }
+    )
+    conn.execute(
+        "UPDATE contract_runtime_executions SET record_json = ? WHERE contract_execution_id = ?",
+        (json.dumps(incomplete, sort_keys=True), parent_id),
+    )
+    conn.commit()
+    reject_zero_write(body, blocker_id="onboard_service_parent_incomplete")
+    conn.execute(
+        "UPDATE contract_runtime_executions SET record_json = ? WHERE contract_execution_id = ?",
+        (json.dumps(canonical_parent, sort_keys=True), parent_id),
+    )
+    conn.commit()
+
+    drifted = copy.deepcopy(canonical_parent)
+    drifted["execution_state"]["execution_state_hash"] = _fake_sha(
+        "service-parent-drift"
+    )
+    conn.execute(
+        "UPDATE contract_runtime_executions SET record_json = ? WHERE contract_execution_id = ?",
+        (json.dumps(drifted, sort_keys=True), parent_id),
+    )
+    conn.commit()
+    reject_zero_write(body, blocker_id="onboard_service_parent_drift")
+    conn.execute(
+        "UPDATE contract_runtime_executions SET record_json = ? WHERE contract_execution_id = ?",
+        (json.dumps(canonical_parent, sort_keys=True), parent_id),
+    )
+    conn.commit()
+
+    sibling = dict(body)
+    sibling["predecessor_contract_execution_id"] = (
+        "cex-hotfix-sibling"
+    )
+    reject_zero_write(
+        sibling,
+        blocker_id="observer_hotfix_attempt_identity_invalid",
+    )
+
+    ambiguous_ref = "rtok-service-parent-ambiguous"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=target_backlog_id,
+        contract_execution_id=parent_id,
+        route_token_ref=ambiguous_ref,
+        allowed_actions=["observer_hotfix_enter", "hotfix_enter"],
+        target_files=["agent/governance/server.py"],
+        evidence_refs=[
+            *route_issue["evidence_refs"],
+            "backlog:AC-AMBIGUOUS-SIBLING",
+            "contract_runtime:super-secret-credential-value",
+        ],
+    )
+    conn.commit()
+    reject_zero_write(
+        {**body, "route_token_ref": ambiguous_ref},
+        blocker_id="onboard_service_route_evidence_ambiguous",
+    )
+
+    assert completed_state["execution_state_revision"] == body[
+        "predecessor_execution_state_revision"
+    ]
+    assert completed_state["execution_state_hash"] == body[
+        "predecessor_execution_state_hash"
+    ]
 
 
 def test_compact_legacy_recovery_without_exact_predecessor_is_explicitly_blocked(
@@ -116163,6 +116440,8 @@ def test_eabf_current_worker_guide_projects_executable_finish_alias_chain(
     tmp_path,
     monkeypatch,
 ):
+    """Replay persisted guide shapes from req-3907f709e561/req-7a91721d19f9."""
+
     candidate_server, candidate_server_path = _preload_candidate_server_module()
     assert Path(candidate_server.__file__).resolve() == candidate_server_path
     monkeypatch.setattr(
@@ -116227,7 +116506,54 @@ def test_eabf_current_worker_guide_projects_executable_finish_alias_chain(
             )
         )
 
+    def assert_finish_stage(current: dict[str, Any], *, available: bool) -> None:
+        coverage_views = [
+            current["guide_to_facade_coverage"],
+            current["worker_guide"]["guide_to_facade_coverage"],
+            current["actionable_payloads"]["guide_to_facade_coverage"],
+        ]
+        canonical_action_views = [
+            current["canonical_executable_actions"],
+            current["worker_guide"]["canonical_executable_actions"],
+            current["actionable_payloads"]["canonical_executable_actions"],
+        ]
+        availability_views = [
+            current["finish_stage_availability"],
+            current["worker_guide"]["finish_stage_availability"],
+            current["actionable_payloads"]["finish_stage_availability"],
+        ]
+        assert coverage_views[0] == coverage_views[1] == coverage_views[2]
+        assert canonical_action_views[0] == canonical_action_views[1] == (
+            canonical_action_views[2]
+        )
+        assert availability_views[0] == availability_views[1] == (
+            availability_views[2]
+        )
+        availability = availability_views[0]
+        assert availability["available"] is available
+        assert availability["advertised"] is available
+        assert availability["canonical_action_count"] == int(available)
+        assert availability["one_canonical_facade_coverage"] is available
+        for coverage, actions in zip(coverage_views, canonical_action_views):
+            assert ("finish" in coverage["stage_facade_catalog"]) is available
+            assert ("finish" in coverage["literal_stage_coverage"]) is available
+            assert ("finish" in actions) is available
+            assert sum(
+                action["mcp_tool"] == "runtime_context_finish_gate"
+                for action in actions.values()
+            ) == int(available)
+        if available:
+            finish = canonical_action_views[0]["finish"]
+            assert finish["mcp_tool"] == "runtime_context_finish_gate"
+            assert finish["host_realization"]["authority_inference_allowed"] is False
+            assert current["finish_gate_facade_payload_skeleton"][
+                "durable_finish_authority"
+            ]["candidate_count"] == 1
+        else:
+            assert current["finish_gate_facade_payload_skeleton"] == {}
+
     guide = worker_guide()
+    assert_finish_stage(guide, available=False)
     aliases = [
         guide[name]
         for name in (
@@ -116315,12 +116641,15 @@ def test_eabf_current_worker_guide_projects_executable_finish_alias_chain(
     gate_guide = worker_guide()
     gate_skeleton = gate_guide["finish_gate_facade_payload_skeleton"]
     assert gate_skeleton
+    assert_finish_stage(gate_guide, available=True)
     conn.execute(
         "UPDATE task_timeline_events SET status = 'failed' WHERE id = ?",
         (canonical_receipt["id"],),
     )
     conn.commit()
-    assert worker_guide()["finish_gate_facade_payload_skeleton"] == {}
+    missing_receipt_guide = worker_guide()
+    assert missing_receipt_guide["finish_gate_facade_payload_skeleton"] == {}
+    assert_finish_stage(missing_receipt_guide, available=False)
     conn.execute(
         "UPDATE task_timeline_events SET status = 'accepted' WHERE id = ?",
         (canonical_receipt["id"],),
@@ -116337,7 +116666,9 @@ def test_eabf_current_worker_guide_projects_executable_finish_alias_chain(
         payload=dict(canonical_receipt["payload"]),
     )
     conn.commit()
-    assert worker_guide()["finish_gate_facade_payload_skeleton"] == {}
+    duplicate_receipt_guide = worker_guide()
+    assert duplicate_receipt_guide["finish_gate_facade_payload_skeleton"] == {}
+    assert_finish_stage(duplicate_receipt_guide, available=False)
     conn.execute(
         "UPDATE task_timeline_events SET status = 'failed' WHERE id IN (?, ?)",
         (failed_receipt["id"], second_passing_receipt["id"]),
@@ -116346,6 +116677,7 @@ def test_eabf_current_worker_guide_projects_executable_finish_alias_chain(
     gate_guide = worker_guide()
     gate_skeleton = gate_guide["finish_gate_facade_payload_skeleton"]
     assert gate_skeleton
+    assert_finish_stage(gate_guide, available=True)
     assert gate_skeleton == gate_guide["worker_guide"][
         "finish_gate_facade_payload_skeleton"
     ]
@@ -144754,6 +145086,45 @@ def test_guide_canonical_executable_action_is_secret_safe_and_schema_shaped():
 
 
 def test_guide_literal_stage_facades_have_one_executable_copy_safe_body():
+    finish_body = {
+        "contract_execution_id": "cex-guide-stages",
+        "runtime_context_id": "mfrctx-guide-stages",
+        "task_id": "guide-stage-worker",
+        "fence_token": "<same fence_token from the worker launch envelope>",
+        "session_token": "<current runtime_context_session_token>",
+        "finish_time_worker_self_attestation": {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "status": "passed",
+        },
+        "read_receipt_event_id": "41",
+        "read_receipt_hash": "sha256:guide-stage-read-receipt",
+    }
+    finish_authority = {
+        "schema_version": "runtime_context.finish_guide_authority.v1",
+        "status": "unique_durable_finish_authority",
+        "available": True,
+        "candidate_count": 1,
+        "server_derived": True,
+        "source_of_authority": (
+            "ContractRuntime.next_legal_action+"
+            "accepted_task_timeline_finish_attestation+read_receipt"
+        ),
+        "contract_execution_id": "cex-guide-stages",
+        "runtime_context_id": "mfrctx-guide-stages",
+        "task_id": "guide-stage-worker",
+        "line_id": "worker_finish_gate",
+        "action": "record_mf_subagent_finish_gate",
+        "owner_role": "mf_sub",
+        "attestation_event_ref": "timeline:42",
+        "read_receipt_event_ref": "timeline:41",
+        "read_receipt_event_id": "41",
+        "read_receipt_hash": "sha256:guide-stage-read-receipt",
+        "copy_safe_body_hash": server._stable_public_hash(finish_body),
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "caller_inference_allowed": False,
+    }
     payloads = {
         "session_renewal_hints": {
             "initial_join": {
@@ -144786,7 +145157,11 @@ def test_guide_literal_stage_facades_have_one_executable_copy_safe_body():
             "copy_safe_body": {"runtime_context_id": "mfrctx-guide-stages"}
         },
         "finish_gate_facade_payload_skeleton": {
-            "copy_safe_body": {"runtime_context_id": "mfrctx-guide-stages"}
+            "server_derived": True,
+            "actionable": True,
+            "body_source": "copy_safe_body",
+            "copy_safe_body": finish_body,
+            "durable_finish_authority": finish_authority,
         },
     }
     graph_body = {
@@ -144824,7 +145199,7 @@ def test_guide_literal_stage_facades_have_one_executable_copy_safe_body():
         "qa_verification_guide": qa_guide,
     }
     observer = server._runtime_context_guide_executable_actions(
-        **common,
+        **copy.deepcopy(common),
         contract_runtime_next_action={
             "action": "observer_close_ready",
             "actor_role": "observer",
@@ -144844,7 +145219,7 @@ def test_guide_literal_stage_facades_have_one_executable_copy_safe_body():
         },
     )
     coordinator = server._runtime_context_guide_executable_actions(
-        **common,
+        **copy.deepcopy(common),
         contract_runtime_next_action={
             "action": "coordinator_close",
             "actor_role": "coordinator",
@@ -144882,6 +145257,152 @@ def test_guide_literal_stage_facades_have_one_executable_copy_safe_body():
     assert actions["observer_close"]["canonical_lineage"][
         "parent_contract_execution_id"
     ] == "cex-parent"
+    for coverage in (observer, coordinator):
+        assert coverage["finish_stage_availability"] == {
+            "stage": "finish",
+            "facade": "runtime_context_finish_gate",
+            "available": True,
+            "advertised": True,
+            "canonical_action_count": 1,
+            "one_canonical_facade_coverage": True,
+            "status": "available",
+            "reason": "unique_canonical_executable_action",
+            "caller_inference_allowed": False,
+        }
+        assert coverage["stage_facade_catalog"]["finish"] == (
+            "runtime_context_finish_gate"
+        )
+        assert coverage["literal_stage_coverage"].count("finish") == 1
+        assert sum(
+            action["mcp_tool"] == "runtime_context_finish_gate"
+            for action in coverage["actions"].values()
+        ) == 1
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "missing_authority",
+        "ambiguous_authority",
+        "duplicate_authority",
+        "contract_drift",
+        "task_drift",
+        "placeholder_identity",
+        "raw_session_secret",
+        "raw_fence_secret",
+    ],
+)
+def test_finish_guide_authority_failures_are_unavailable_and_projection_only(
+    failure_mode,
+):
+    """Dogfood req-3907f709e561/req-7a91721d19f9 fail closed."""
+
+    raw_secret = f"raw-{failure_mode}-must-not-escape"
+    body = {
+        "contract_execution_id": "cex-finish-authority-matrix",
+        "runtime_context_id": "mfrctx-finish-authority-matrix",
+        "task_id": "finish-authority-matrix-worker",
+        "fence_token": "<same fence_token from the worker launch envelope>",
+        "session_token": "<current runtime_context_session_token>",
+        "finish_time_worker_self_attestation": {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "status": "passed",
+        },
+        "read_receipt_event_id": "51",
+        "read_receipt_hash": "sha256:finish-authority-matrix-receipt",
+    }
+    authority = {
+        "schema_version": "runtime_context.finish_guide_authority.v1",
+        "status": "unique_durable_finish_authority",
+        "available": True,
+        "candidate_count": 1,
+        "server_derived": True,
+        "source_of_authority": (
+            "ContractRuntime.next_legal_action+"
+            "accepted_task_timeline_finish_attestation+read_receipt"
+        ),
+        "contract_execution_id": "cex-finish-authority-matrix",
+        "runtime_context_id": "mfrctx-finish-authority-matrix",
+        "task_id": "finish-authority-matrix-worker",
+        "line_id": "worker_finish_gate",
+        "action": "record_mf_subagent_finish_gate",
+        "owner_role": "mf_sub",
+        "attestation_event_ref": "timeline:52",
+        "read_receipt_event_ref": "timeline:51",
+        "read_receipt_event_id": "51",
+        "read_receipt_hash": "sha256:finish-authority-matrix-receipt",
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "caller_inference_allowed": False,
+    }
+    finish_source = {
+        "server_derived": True,
+        "actionable": True,
+        "body_source": "copy_safe_body",
+        "copy_safe_body": body,
+        "durable_finish_authority": authority,
+    }
+    if failure_mode == "missing_authority":
+        finish_source.pop("durable_finish_authority")
+    elif failure_mode == "ambiguous_authority":
+        authority["status"] = "ambiguous_durable_finish_authority"
+    elif failure_mode == "duplicate_authority":
+        authority["candidate_count"] = 2
+    elif failure_mode == "contract_drift":
+        authority["contract_execution_id"] = "cex-drifted-finish-authority"
+    elif failure_mode == "task_drift":
+        body["task_id"] = "drifted-finish-authority-worker"
+        authority["copy_safe_body_hash"] = server._stable_public_hash(body)
+    elif failure_mode == "placeholder_identity":
+        body["runtime_context_id"] = "<runtime-context-id>"
+        authority["runtime_context_id"] = "<runtime-context-id>"
+        authority["copy_safe_body_hash"] = server._stable_public_hash(body)
+    elif failure_mode == "raw_session_secret":
+        body["session_token"] = raw_secret
+        authority["copy_safe_body_hash"] = server._stable_public_hash(body)
+    elif failure_mode == "raw_fence_secret":
+        body["fence_token"] = raw_secret
+        authority["copy_safe_body_hash"] = server._stable_public_hash(body)
+    if "copy_safe_body_hash" not in authority:
+        authority["copy_safe_body_hash"] = server._stable_public_hash(body)
+    input_before = copy.deepcopy(finish_source)
+
+    coverage = server._runtime_context_guide_executable_actions(
+        project_id=PID,
+        backlog_id="AC-FINISH-AUTHORITY-MATRIX",
+        contract_execution_id="cex-finish-authority-matrix",
+        parent_contract_execution_id="cex-finish-authority-parent",
+        actionable_payloads={
+            "finish_gate_facade_payload_skeleton": finish_source,
+        },
+        graph_copy_safe_body={
+            "runtime_context_id": "mfrctx-finish-authority-matrix",
+            "task_id": "finish-authority-matrix-worker",
+            "tool": "function_index",
+            "args": {"query": "_runtime_context_worker_guide_response"},
+        },
+        qa_verification_guide={},
+        contract_runtime_next_action={},
+    )
+
+    assert finish_source == input_before
+    assert "finish" not in coverage["actions"]
+    assert "finish" not in coverage["stage_facade_catalog"]
+    assert "finish" not in coverage["literal_stage_coverage"]
+    assert coverage["finish_stage_availability"] == {
+        "stage": "finish",
+        "facade": "runtime_context_finish_gate",
+        "available": False,
+        "advertised": False,
+        "canonical_action_count": 0,
+        "one_canonical_facade_coverage": False,
+        "status": "unavailable",
+        "reason": "durable_finish_authority_unavailable",
+        "caller_inference_allowed": False,
+    }
+    assert "finish" in coverage["unavailable_stages"]
+    assert raw_secret not in json.dumps(coverage, sort_keys=True)
 
 
 def test_worker_host_handoff_and_revise_are_direct_mcp_bodies():
