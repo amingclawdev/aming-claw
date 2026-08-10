@@ -255,6 +255,88 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_current_full_build_claim_active_snapshot
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_current_full_build_claim_identity
   ON graph_current_full_build_claim_history(project_id, run_id, snapshot_id);
+
+CREATE TABLE IF NOT EXISTS graph_reconcile_manager_generations (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  certificate_id TEXT NOT NULL UNIQUE,
+  project_id TEXT NOT NULL,
+  generation_id TEXT NOT NULL,
+  manager_pid INTEGER NOT NULL,
+  manager_started_at TEXT NOT NULL,
+  process_start_identity TEXT NOT NULL,
+  manager_start_identity TEXT NOT NULL,
+  lock_identity TEXT NOT NULL,
+  predecessor_certificate_id TEXT NOT NULL DEFAULT '',
+  predecessor_generation_id TEXT NOT NULL DEFAULT '',
+  predecessor_sequence INTEGER NOT NULL DEFAULT 0,
+  predecessor_certificate_hash TEXT NOT NULL DEFAULT '',
+  prior_manager_pid INTEGER NOT NULL DEFAULT 0,
+  observed_prior_generation_id TEXT NOT NULL DEFAULT '',
+  prior_process_start_identity TEXT NOT NULL DEFAULT '',
+  prior_pid_death_method TEXT NOT NULL DEFAULT '',
+  prior_pid_death_verified_at TEXT NOT NULL DEFAULT '',
+  certified_at TEXT NOT NULL,
+  certificate_hash TEXT NOT NULL,
+  UNIQUE(project_id, generation_id),
+  UNIQUE(project_id, manager_start_identity),
+  UNIQUE(project_id, lock_identity),
+  CHECK(manager_pid > 0),
+  CHECK(prior_manager_pid >= 0),
+  CHECK(prior_pid_death_method IN ('', 'esrch')),
+  CHECK(
+    (prior_manager_pid = 0
+      AND prior_process_start_identity = ''
+      AND observed_prior_generation_id = ''
+      AND prior_pid_death_method = ''
+      AND prior_pid_death_verified_at = '')
+    OR
+    (prior_manager_pid > 0
+      AND prior_pid_death_method = 'esrch'
+      AND prior_pid_death_verified_at <> '')
+  ),
+  CHECK(
+    (predecessor_certificate_id = ''
+      AND predecessor_generation_id = ''
+      AND predecessor_sequence = 0
+      AND predecessor_certificate_hash = '')
+    OR
+    (predecessor_certificate_id <> ''
+      AND predecessor_generation_id <> ''
+      AND predecessor_sequence > 0
+      AND predecessor_certificate_hash <> '')
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_reconcile_manager_generation_latest
+  ON graph_reconcile_manager_generations(project_id, sequence DESC);
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_manager_generation_insert_identity
+BEFORE INSERT ON graph_reconcile_manager_generations
+WHEN EXISTS (
+  SELECT 1 FROM graph_reconcile_manager_generations
+  WHERE project_id = NEW.project_id
+    AND (
+      certificate_id = NEW.certificate_id
+      OR generation_id = NEW.generation_id
+      OR manager_start_identity = NEW.manager_start_identity
+      OR lock_identity = NEW.lock_identity
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'manager_generation_identity_conflict');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_manager_generation_no_update
+BEFORE UPDATE ON graph_reconcile_manager_generations
+BEGIN
+  SELECT RAISE(ABORT, 'manager_generation_append_only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reconcile_manager_generation_no_delete
+BEFORE DELETE ON graph_reconcile_manager_generations
+BEGIN
+  SELECT RAISE(ABORT, 'manager_generation_append_only');
+END;
 """
 
 SNAPSHOT_STATUS_CANDIDATE = "candidate"
@@ -309,6 +391,15 @@ class GraphSnapshotBuildClaimConflictError(RuntimeError):
         self.claim = dict(claim or {})
 
 
+class ManagerGenerationCertificateConflictError(RuntimeError):
+    """Raised when immutable manager-generation authority cannot be appended."""
+
+    def __init__(self, reason: str, certificate: Mapping[str, Any] | None = None):
+        super().__init__(reason)
+        self.reason = str(reason or "manager_generation_certificate_conflict")
+        self.certificate = dict(certificate or {})
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -317,6 +408,376 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(GRAPH_SNAPSHOT_SCHEMA_SQL)
     _ensure_graph_snapshot_ref_columns(conn)
     _migrate_pending_scope_reconcile_branch_identity(conn)
+
+
+MANAGER_GENERATION_CERTIFICATE_SCHEMA = (
+    "graph_reconcile_manager_generation_certificate.v1"
+)
+MANAGER_GENERATION_MAX_CHAIN_DEPTH = 10_000
+_MANAGER_GENERATION_PUBLIC_FIELDS = (
+    "certificate_id",
+    "sequence",
+    "project_id",
+    "generation_id",
+    "manager_pid",
+    "manager_started_at",
+    "process_start_identity",
+    "manager_start_identity",
+    "lock_identity",
+    "predecessor_certificate_id",
+    "predecessor_generation_id",
+    "predecessor_sequence",
+    "predecessor_certificate_hash",
+    "prior_manager_pid",
+    "observed_prior_generation_id",
+    "prior_process_start_identity",
+    "prior_pid_death_method",
+    "prior_pid_death_verified_at",
+    "certified_at",
+    "certificate_hash",
+)
+
+
+def _manager_generation_certificate_id(project_id: str, generation_id: str) -> str:
+    digest = hashlib.sha256(
+        (str(project_id) + "\0" + str(generation_id)).encode("utf-8")
+    ).hexdigest()
+    return f"gmcert-{digest[:24]}"
+
+
+def _manager_generation_certificate_hash(values: Mapping[str, Any]) -> str:
+    exact = {
+        key: values[key]
+        for key in _MANAGER_GENERATION_PUBLIC_FIELDS
+        if key != "certificate_hash"
+    }
+    encoded = json.dumps(
+        exact,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def manager_generation_certificate_public_receipt(
+    certificate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one fixed copy-safe generation receipt without private paths."""
+
+    result = {
+        "schema_version": MANAGER_GENERATION_CERTIFICATE_SCHEMA,
+        **{
+            key: certificate.get(
+                key,
+                0
+                if key in {
+                    "sequence",
+                    "manager_pid",
+                    "prior_manager_pid",
+                    "predecessor_sequence",
+                }
+                else "",
+            )
+            for key in _MANAGER_GENERATION_PUBLIC_FIELDS
+        },
+        "server_derived": True,
+    }
+    result["sequence"] = int(result["sequence"] or 0)
+    result["manager_pid"] = int(result["manager_pid"] or 0)
+    result["prior_manager_pid"] = int(result["prior_manager_pid"] or 0)
+    result["predecessor_sequence"] = int(result["predecessor_sequence"] or 0)
+    return result
+
+
+def _manager_generation_exact_replay(
+    existing: Mapping[str, Any],
+    supplied: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = {
+        key: supplied[key]
+        for key in supplied
+        if key != "certificate_hash"
+    }
+    expected["predecessor_certificate_id"] = str(
+        existing.get("predecessor_certificate_id") or ""
+    )
+    expected["predecessor_generation_id"] = str(
+        existing.get("predecessor_generation_id") or ""
+    )
+    expected["predecessor_sequence"] = int(
+        existing.get("predecessor_sequence") or 0
+    )
+    expected["predecessor_certificate_hash"] = str(
+        existing.get("predecessor_certificate_hash") or ""
+    )
+    expected["sequence"] = int(existing.get("sequence") or 0)
+    expected["certificate_hash"] = _manager_generation_certificate_hash(expected)
+    comparable = {
+        key: existing.get(key)
+        for key in expected
+    }
+    if comparable != expected:
+        raise ManagerGenerationCertificateConflictError(
+            "manager_generation_replay_conflict", existing
+        )
+    receipt = manager_generation_certificate_public_receipt(existing)
+    receipt.update({"replayed": True, "writes_performed": False})
+    return receipt
+
+
+def _manager_generation_after_insert_hook() -> None:
+    """Internal fault-injection seam; production behavior is intentionally empty."""
+
+
+def _validate_manager_generation_certificate_row(
+    conn: sqlite3.Connection,
+    row: Mapping[str, Any],
+) -> None:
+    current = dict(row)
+    seen: set[str] = set()
+    for _depth in range(MANAGER_GENERATION_MAX_CHAIN_DEPTH):
+        certificate_id = str(current.get("certificate_id") or "")
+        if not certificate_id or certificate_id in seen:
+            raise ManagerGenerationCertificateConflictError(
+                "manager_generation_predecessor_cycle", current
+            )
+        seen.add(certificate_id)
+        expected_hash = _manager_generation_certificate_hash(current)
+        if not hmac.compare_digest(
+            str(current.get("certificate_hash") or ""), expected_hash
+        ):
+            raise ManagerGenerationCertificateConflictError(
+                "manager_generation_certificate_hash_invalid", current
+            )
+        predecessor_id = str(current.get("predecessor_certificate_id") or "")
+        if not predecessor_id:
+            return
+        predecessor_row = conn.execute(
+            "SELECT * FROM graph_reconcile_manager_generations "
+            "WHERE certificate_id = ? AND project_id = ?",
+            (predecessor_id, str(current.get("project_id") or "")),
+        ).fetchone()
+        predecessor = dict(predecessor_row) if predecessor_row else {}
+        if not predecessor:
+            raise ManagerGenerationCertificateConflictError(
+                "manager_generation_predecessor_missing", current
+            )
+        expected = {
+            "predecessor_generation_id": str(
+                predecessor.get("generation_id") or ""
+            ),
+            "predecessor_sequence": int(predecessor.get("sequence") or 0),
+            "predecessor_certificate_hash": str(
+                predecessor.get("certificate_hash") or ""
+            ),
+        }
+        if (
+            int(predecessor.get("sequence") or 0)
+            >= int(current.get("sequence") or 0)
+            or any(current.get(key) != value for key, value in expected.items())
+        ):
+            raise ManagerGenerationCertificateConflictError(
+                "manager_generation_predecessor_binding_invalid", current
+            )
+        current = predecessor
+    raise ManagerGenerationCertificateConflictError(
+        "manager_generation_history_too_deep", current
+    )
+
+
+def record_manager_generation_certificate(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    generation_id: str,
+    manager_pid: int,
+    manager_started_at: str,
+    process_start_identity: str,
+    manager_start_identity: str,
+    lock_identity: str,
+    prior_manager_pid: int = 0,
+    observed_prior_generation_id: str = "",
+    prior_process_start_identity: str = "",
+    prior_pid_death_method: str = "",
+    prior_pid_death_verified_at: str = "",
+    certified_at: str,
+) -> dict[str, Any]:
+    """Append one exact, immutable, linearly chained manager certificate."""
+
+    ensure_schema(conn)
+    conn.commit()
+    project = str(project_id or "")
+    prior_pid = int(prior_manager_pid or 0)
+    values: dict[str, Any] = {
+        "certificate_id": _manager_generation_certificate_id(
+            project, str(generation_id or "")
+        ),
+        "project_id": project,
+        "generation_id": str(generation_id or ""),
+        "manager_pid": int(manager_pid or 0),
+        "manager_started_at": str(manager_started_at or ""),
+        "process_start_identity": str(process_start_identity or ""),
+        "manager_start_identity": str(manager_start_identity or ""),
+        "lock_identity": str(lock_identity or ""),
+        "prior_manager_pid": prior_pid,
+        "observed_prior_generation_id": str(observed_prior_generation_id or ""),
+        "prior_process_start_identity": str(prior_process_start_identity or ""),
+        "prior_pid_death_method": str(prior_pid_death_method or ""),
+        "prior_pid_death_verified_at": str(prior_pid_death_verified_at or ""),
+        "certified_at": str(certified_at or ""),
+    }
+    required = (
+        "project_id",
+        "generation_id",
+        "manager_started_at",
+        "process_start_identity",
+        "manager_start_identity",
+        "lock_identity",
+        "certified_at",
+    )
+    if values["manager_pid"] <= 0 or any(not str(values[key]).strip() for key in required):
+        raise ValueError("manager generation certificate requires complete exact identity")
+    if prior_pid:
+        if (
+            values["prior_pid_death_method"] != "esrch"
+            or not values["prior_pid_death_verified_at"].strip()
+        ):
+            raise ValueError("prior manager PID requires exact ESRCH death proof")
+    elif any(
+        (
+            values["prior_process_start_identity"],
+            values["observed_prior_generation_id"],
+            values["prior_pid_death_method"],
+            values["prior_pid_death_verified_at"],
+        )
+    ):
+        raise ValueError("prior death fields require a prior manager PID")
+
+    existing_row = conn.execute(
+        "SELECT * FROM graph_reconcile_manager_generations "
+        "WHERE project_id = ? AND generation_id = ?",
+        (project, values["generation_id"]),
+    ).fetchone()
+    if existing_row:
+        existing = dict(existing_row)
+        _validate_manager_generation_certificate_row(conn, existing)
+        return _manager_generation_exact_replay(existing, values)
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing_row = conn.execute(
+            "SELECT * FROM graph_reconcile_manager_generations "
+            "WHERE project_id = ? AND generation_id = ?",
+            (project, values["generation_id"]),
+        ).fetchone()
+        if existing_row:
+            conn.rollback()
+            existing = dict(existing_row)
+            _validate_manager_generation_certificate_row(conn, existing)
+            return _manager_generation_exact_replay(existing, values)
+
+        predecessor_row = conn.execute(
+            "SELECT * FROM graph_reconcile_manager_generations "
+            "WHERE project_id = ? ORDER BY sequence DESC LIMIT 1",
+            (project,),
+        ).fetchone()
+        predecessor = dict(predecessor_row) if predecessor_row else {}
+        if predecessor:
+            _validate_manager_generation_certificate_row(conn, predecessor)
+        if predecessor:
+            observed_prior_generation = str(
+                values["observed_prior_generation_id"] or ""
+            )
+            if observed_prior_generation:
+                observed_prior_certificate = conn.execute(
+                    "SELECT certificate_id FROM graph_reconcile_manager_generations "
+                    "WHERE project_id = ? AND generation_id = ?",
+                    (project, observed_prior_generation),
+                ).fetchone()
+                if (
+                    observed_prior_certificate
+                    and observed_prior_generation
+                    != str(predecessor.get("generation_id") or "")
+                ):
+                    raise ManagerGenerationCertificateConflictError(
+                        "manager_generation_predecessor_mismatch", predecessor
+                    )
+            elif prior_pid != int(predecessor.get("manager_pid") or 0):
+                raise ManagerGenerationCertificateConflictError(
+                    "manager_generation_predecessor_mismatch", predecessor
+                )
+        values["predecessor_certificate_id"] = str(
+            predecessor.get("certificate_id") or ""
+        )
+        values["predecessor_generation_id"] = str(
+            predecessor.get("generation_id") or ""
+        )
+        values["predecessor_sequence"] = int(predecessor.get("sequence") or 0)
+        values["predecessor_certificate_hash"] = str(
+            predecessor.get("certificate_hash") or ""
+        )
+        values["sequence"] = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 "
+                "FROM graph_reconcile_manager_generations"
+            ).fetchone()[0]
+        )
+        values["certificate_hash"] = _manager_generation_certificate_hash(values)
+        columns = list(values)
+        conn.execute(
+            "INSERT INTO graph_reconcile_manager_generations "
+            f"({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+            [values[column] for column in columns],
+        )
+        _manager_generation_after_insert_hook()
+        row = conn.execute(
+            "SELECT * FROM graph_reconcile_manager_generations "
+            "WHERE certificate_id = ?",
+            (values["certificate_id"],),
+        ).fetchone()
+        if not row:
+            raise RuntimeError("manager generation certificate insert was not durable")
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        if "manager_generation_identity_conflict" in str(exc):
+            raise ManagerGenerationCertificateConflictError(
+                "manager_generation_identity_conflict"
+            ) from exc
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    receipt = manager_generation_certificate_public_receipt(dict(row))
+    receipt.update({"replayed": False, "writes_performed": True})
+    return receipt
+
+
+def current_manager_generation_certificate(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    manager_start_identity: str = "",
+) -> dict[str, Any]:
+    """Read the latest immutable manager certificate for one project."""
+
+    ensure_schema(conn)
+    params: list[Any] = [str(project_id or "")]
+    identity_filter = ""
+    if manager_start_identity:
+        identity_filter = " AND manager_start_identity = ?"
+        params.append(str(manager_start_identity))
+    row = conn.execute(
+        "SELECT * FROM graph_reconcile_manager_generations "
+        f"WHERE project_id = ?{identity_filter} ORDER BY sequence DESC LIMIT 1",
+        params,
+    ).fetchone()
+    if not row:
+        return {}
+    certificate = dict(row)
+    _validate_manager_generation_certificate_row(conn, certificate)
+    return manager_generation_certificate_public_receipt(certificate)
 
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
@@ -6482,6 +6943,7 @@ __all__ = [
     "GRAPH_SNAPSHOT_SCHEMA_SQL",
     "GraphSnapshotBuildClaimConflictError",
     "GraphSnapshotConflictError",
+    "ManagerGenerationCertificateConflictError",
     "InvalidReconcileMetricCursor",
     "ReconcileMetricWindowOverflow",
     "acquire_current_full_build_claim",
@@ -6501,6 +6963,7 @@ __all__ = [
     "index_graph_snapshot",
     "list_reconcile_run_metrics",
     "list_reconcile_run_metrics_window",
+    "manager_generation_certificate_public_receipt",
     "list_graph_snapshot_edges",
     "list_graph_snapshot_files",
     "list_graph_snapshot_nodes",
@@ -6516,8 +6979,10 @@ __all__ = [
     "mark_pending_scope_reconcile_failed",
     "queue_pending_scope_reconcile",
     "record_reconcile_run_metric",
+    "record_manager_generation_certificate",
     "record_graph_ref_event",
     "recover_stale_pending_scope_reconcile",
+    "current_manager_generation_certificate",
     "record_drift",
     "select_existing_graph_source",
     "snapshot_materialization_provenance",

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import sqlite3
+import threading
 import time
 import tracemalloc
 
@@ -61,6 +63,7 @@ def test_schema_migration_is_idempotent(conn):
         "pending_scope_reconcile",
         "reconcile_run_metrics",
         "graph_current_full_build_claim_history",
+        "graph_reconcile_manager_generations",
     }.issubset(table_names)
     snapshot_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(graph_snapshots)").fetchall()
@@ -71,6 +74,536 @@ def test_schema_migration_is_idempotent(conn):
         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
     ).fetchone()
     assert version["value"] == str(db.SCHEMA_VERSION)
+
+
+def _generation(
+    suffix: str,
+    *,
+    manager_pid: int,
+    prior_manager_pid: int = 0,
+    prior_process_start_identity: str = "",
+    observed_prior_generation_id: str | None = None,
+) -> dict[str, object]:
+    timestamp_digit = suffix[-1] if suffix[-1].isdigit() else "9"
+    if observed_prior_generation_id is None and prior_manager_pid:
+        observed_prior_generation_id = (
+            f"generation-{max(1, int(timestamp_digit) - 1)}"
+        )
+    return {
+        "generation_id": f"generation-{suffix}",
+        "manager_pid": manager_pid,
+        "manager_started_at": f"2026-08-10T00:00:0{timestamp_digit}Z",
+        "process_start_identity": f"process-start-{suffix}",
+        "manager_start_identity": f"manager-start-{suffix}",
+        "lock_identity": f"lock-{suffix}",
+        "prior_manager_pid": prior_manager_pid,
+        "observed_prior_generation_id": observed_prior_generation_id or "",
+        "prior_process_start_identity": prior_process_start_identity,
+        "prior_pid_death_method": "esrch" if prior_manager_pid else "",
+        "prior_pid_death_verified_at": (
+            f"2026-08-10T00:00:1{timestamp_digit}Z" if prior_manager_pid else ""
+        ),
+        "certified_at": f"2026-08-10T00:00:2{timestamp_digit}Z",
+    }
+
+
+def test_manager_generation_certificate_append_replay_conflict_and_immutable(conn):
+    store.ensure_schema(conn)
+    first = store.record_manager_generation_certificate(
+        conn,
+        PID,
+        **_generation("1", manager_pid=4101, prior_manager_pid=4001),
+    )
+    assert first["writes_performed"] is True
+    assert first["replayed"] is False
+    assert first["sequence"] == 1
+    assert first["predecessor_certificate_id"] == ""
+    assert first["prior_manager_pid"] == 4001
+    assert first["prior_pid_death_method"] == "esrch"
+    assert first["certificate_hash"].startswith("sha256:")
+
+    before_changes = conn.total_changes
+    replay = store.record_manager_generation_certificate(
+        conn,
+        PID,
+        **_generation("1", manager_pid=4101, prior_manager_pid=4001),
+    )
+    assert replay["certificate_id"] == first["certificate_id"]
+    assert replay["writes_performed"] is False
+    assert replay["replayed"] is True
+    assert conn.total_changes == before_changes
+
+    conflict = _generation("1", manager_pid=4101, prior_manager_pid=4001)
+    conflict["lock_identity"] = "lock-altered"
+    with pytest.raises(
+        store.ManagerGenerationCertificateConflictError,
+        match="manager_generation_replay_conflict",
+    ):
+        store.record_manager_generation_certificate(conn, PID, **conflict)
+    assert conn.total_changes == before_changes
+
+    with pytest.raises(sqlite3.IntegrityError, match="append_only"):
+        conn.execute(
+            "UPDATE graph_reconcile_manager_generations SET manager_pid = 9 "
+            "WHERE certificate_id = ?",
+            (first["certificate_id"],),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="append_only"):
+        conn.execute(
+            "DELETE FROM graph_reconcile_manager_generations "
+            "WHERE certificate_id = ?",
+            (first["certificate_id"],),
+        )
+    conn.rollback()
+
+    original = dict(
+        conn.execute(
+            "SELECT * FROM graph_reconcile_manager_generations "
+            "WHERE certificate_id = ?",
+            (first["certificate_id"],),
+        ).fetchone()
+    )
+    replacement = dict(original)
+    replacement["manager_pid"] = 9999
+    columns = list(replacement)
+    with pytest.raises(sqlite3.IntegrityError, match="identity_conflict"):
+        conn.execute(
+            "INSERT OR REPLACE INTO graph_reconcile_manager_generations "
+            f"({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+            [replacement[column] for column in columns],
+        )
+    conn.rollback()
+    survived = dict(
+        conn.execute(
+            "SELECT * FROM graph_reconcile_manager_generations "
+            "WHERE certificate_id = ?",
+            (first["certificate_id"],),
+        ).fetchone()
+    )
+    assert survived == original
+
+
+def test_manager_generation_certificates_form_exact_linear_history(conn):
+    store.ensure_schema(conn)
+    g1 = store.record_manager_generation_certificate(
+        conn, PID, **_generation("1", manager_pid=4201)
+    )
+    g2 = store.record_manager_generation_certificate(
+        conn,
+        PID,
+        **_generation(
+            "2",
+            manager_pid=4202,
+            prior_manager_pid=4201,
+            prior_process_start_identity="process-start-1",
+        ),
+    )
+    assert g2["sequence"] == 2
+    assert g2["predecessor_certificate_id"] == g1["certificate_id"]
+    assert g2["predecessor_generation_id"] == "generation-1"
+    assert g2["prior_manager_pid"] == 4201
+
+    before_changes = conn.total_changes
+    with pytest.raises(
+        store.ManagerGenerationCertificateConflictError,
+        match="manager_generation_predecessor_mismatch",
+    ):
+        store.record_manager_generation_certificate(
+            conn,
+            PID,
+            **_generation(
+                "sibling",
+                manager_pid=4299,
+                prior_manager_pid=4201,
+                prior_process_start_identity="process-start-1",
+                observed_prior_generation_id="generation-1",
+            ),
+        )
+    assert conn.total_changes == before_changes
+
+    g3 = store.record_manager_generation_certificate(
+        conn,
+        PID,
+        **_generation(
+            "3",
+            manager_pid=4203,
+            prior_manager_pid=4202,
+            prior_process_start_identity="process-start-2",
+        ),
+    )
+    assert g3["sequence"] == 3
+    assert g3["predecessor_certificate_id"] == g2["certificate_id"]
+    rows = conn.execute(
+        "SELECT sequence, certificate_id, predecessor_certificate_id "
+        "FROM graph_reconcile_manager_generations "
+        "WHERE project_id = ? ORDER BY sequence",
+        (PID,),
+    ).fetchall()
+    assert [row["sequence"] for row in rows] == [1, 2, 3]
+    assert rows[1]["predecessor_certificate_id"] == rows[0]["certificate_id"]
+    assert rows[2]["predecessor_certificate_id"] == rows[1]["certificate_id"]
+
+
+def test_manager_generation_recovers_after_partial_multi_project_certification(conn):
+    store.ensure_schema(conn)
+    project_a = PID + "-a"
+    project_b = PID + "-b"
+    for project in (project_a, project_b):
+        store.record_manager_generation_certificate(
+            conn, project, **_generation("0", manager_pid=5100)
+        )
+
+    g1_a = store.record_manager_generation_certificate(
+        conn,
+        project_a,
+        **_generation(
+            "1",
+            manager_pid=5101,
+            prior_manager_pid=5100,
+            prior_process_start_identity="process-start-0",
+            observed_prior_generation_id="generation-0",
+        ),
+    )
+    assert store.current_manager_generation_certificate(
+        conn, project_b
+    )["generation_id"] == "generation-0"
+
+    g2_a = store.record_manager_generation_certificate(
+        conn,
+        project_a,
+        **_generation(
+            "2",
+            manager_pid=5102,
+            prior_manager_pid=5101,
+            prior_process_start_identity="process-start-1",
+            observed_prior_generation_id="generation-1",
+        ),
+    )
+    g2_b = store.record_manager_generation_certificate(
+        conn,
+        project_b,
+        **_generation(
+            "2",
+            manager_pid=5102,
+            prior_manager_pid=5101,
+            prior_process_start_identity="process-start-1",
+            observed_prior_generation_id="generation-1",
+        ),
+    )
+
+    assert g2_a["predecessor_certificate_id"] == g1_a["certificate_id"]
+    assert g2_b["predecessor_generation_id"] == "generation-0"
+    assert g2_b["observed_prior_generation_id"] == "generation-1"
+    assert g2_b["prior_manager_pid"] == 5101
+    assert store.current_manager_generation_certificate(
+        conn, project_a
+    )["generation_id"] == "generation-2"
+    assert store.current_manager_generation_certificate(
+        conn, project_b
+    )["generation_id"] == "generation-2"
+
+
+def test_manager_generation_replay_is_physical_zero_write_on_file_db(tmp_path):
+    db_path = tmp_path / "manager-generation.sqlite"
+    first_conn = _file_connection(db_path)
+    inputs = _generation("1", manager_pid=4401)
+    first = store.record_manager_generation_certificate(first_conn, PID, **inputs)
+    first_conn.close()
+    before_sha = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+    replay_conn = _file_connection(db_path)
+    statements: list[str] = []
+    replay_conn.set_trace_callback(statements.append)
+    before_changes = replay_conn.total_changes
+    replay = store.record_manager_generation_certificate(replay_conn, PID, **inputs)
+    replay_conn.close()
+    after_sha = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+    assert replay["certificate_id"] == first["certificate_id"]
+    assert replay["writes_performed"] is False
+    assert before_changes == 0
+    assert not any(
+        statement.lstrip().upper().startswith(("INSERT ", "UPDATE ", "DELETE "))
+        for statement in statements
+    )
+    assert after_sha == before_sha
+
+
+def test_manager_generation_insert_fault_rolls_back_without_row(conn, monkeypatch):
+    store.ensure_schema(conn)
+
+    def fail_after_insert():
+        raise RuntimeError("injected-after-insert")
+
+    monkeypatch.setattr(store, "_manager_generation_after_insert_hook", fail_after_insert)
+    with pytest.raises(RuntimeError, match="injected-after-insert"):
+        store.record_manager_generation_certificate(
+            conn, PID, **_generation("1", manager_pid=4501)
+        )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_manager_generations "
+        "WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == 0
+
+
+def test_manager_generation_concurrent_siblings_have_one_linear_winner(tmp_path):
+    db_path = tmp_path / "manager-generation-race.sqlite"
+    initial = _file_connection(db_path)
+    store.record_manager_generation_certificate(
+        initial, PID, **_generation("1", manager_pid=4601)
+    )
+    initial.close()
+    barrier = threading.Barrier(2)
+
+    def append(suffix: str, manager_pid: int) -> str:
+        connection = sqlite3.connect(db_path, timeout=2)
+        connection.row_factory = sqlite3.Row
+        store.ensure_schema(connection)
+        connection.commit()
+        barrier.wait(timeout=2)
+        try:
+            store.record_manager_generation_certificate(
+                connection,
+                PID,
+                **_generation(
+                    suffix,
+                        manager_pid=manager_pid,
+                        prior_manager_pid=4601,
+                        prior_process_start_identity="process-start-1",
+                        observed_prior_generation_id="generation-1",
+                    ),
+            )
+        except store.ManagerGenerationCertificateConflictError as exc:
+            return exc.reason
+        finally:
+            connection.close()
+        return "won"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda item: append(*item), [("2", 4602), ("3", 4603)]))
+    assert sorted(outcomes) == ["manager_generation_predecessor_mismatch", "won"]
+    verify = _file_connection(db_path)
+    assert verify.execute(
+        "SELECT COUNT(*) FROM graph_reconcile_manager_generations "
+        "WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == 2
+    verify.close()
+
+
+def test_manager_generation_hash_binds_exact_case_whitespace_and_predecessor(conn):
+    store.ensure_schema(conn)
+    g1 = store.record_manager_generation_certificate(
+        conn, PID, **_generation("1", manager_pid=4701)
+    )
+    g2 = store.record_manager_generation_certificate(
+        conn,
+        PID,
+        **_generation(
+            "2",
+            manager_pid=4702,
+            prior_manager_pid=4701,
+            prior_process_start_identity="process-start-1",
+        ),
+    )
+    row = dict(conn.execute(
+        "SELECT * FROM graph_reconcile_manager_generations WHERE certificate_id = ?",
+        (g2["certificate_id"],),
+    ).fetchone())
+    original_hash = store._manager_generation_certificate_hash(row)
+    for key, replacement in (
+        ("manager_started_at", row["manager_started_at"] + " "),
+        ("manager_start_identity", row["manager_start_identity"].upper()),
+        ("predecessor_certificate_hash", g1["certificate_hash"].upper()),
+        ("predecessor_sequence", int(g1["sequence"]) + 1),
+    ):
+        altered = dict(row)
+        altered[key] = replacement
+        assert store._manager_generation_certificate_hash(altered) != original_hash
+
+
+def test_manager_generation_identity_variants_conflict_without_write(conn):
+    store.ensure_schema(conn)
+    first = store.record_manager_generation_certificate(
+        conn, PID, **_generation("1", manager_pid=4801)
+    )
+    for key in ("manager_start_identity", "lock_identity"):
+        candidate = _generation(
+            "2",
+            manager_pid=4802,
+            prior_manager_pid=4801,
+            prior_process_start_identity="process-start-1",
+        )
+        candidate[key] = first[key]
+        before_changes = conn.total_changes
+        with pytest.raises(
+            store.ManagerGenerationCertificateConflictError,
+            match="manager_generation_identity_conflict",
+        ):
+            store.record_manager_generation_certificate(conn, PID, **candidate)
+        assert conn.total_changes == before_changes
+
+
+def test_manager_generation_reader_bounds_history_and_rejects_cycle(conn, monkeypatch):
+    store.ensure_schema(conn)
+    g1 = store.record_manager_generation_certificate(
+        conn, PID, **_generation("1", manager_pid=4901)
+    )
+    g2 = store.record_manager_generation_certificate(
+        conn,
+        PID,
+        **_generation(
+            "2",
+            manager_pid=4902,
+            prior_manager_pid=4901,
+            prior_process_start_identity="process-start-1",
+        ),
+    )
+    store.record_manager_generation_certificate(
+        conn,
+        PID,
+        **_generation(
+            "3",
+            manager_pid=4903,
+            prior_manager_pid=4902,
+            prior_process_start_identity="process-start-2",
+        ),
+    )
+    monkeypatch.setattr(store, "MANAGER_GENERATION_MAX_CHAIN_DEPTH", 2)
+    with pytest.raises(
+        store.ManagerGenerationCertificateConflictError,
+        match="manager_generation_history_too_deep",
+    ):
+        store.current_manager_generation_certificate(conn, PID)
+    monkeypatch.setattr(store, "MANAGER_GENERATION_MAX_CHAIN_DEPTH", 10_000)
+
+    cycle_project = PID + "-cycle"
+    cycle = {
+        "sequence": int(g2["sequence"]) + 10,
+        "certificate_id": "gmcert-self-cycle",
+        "project_id": cycle_project,
+        "generation_id": "generation-self-cycle",
+        "manager_pid": 4999,
+        "manager_started_at": "2026-08-10T00:00:00Z",
+        "process_start_identity": "process-self-cycle",
+        "manager_start_identity": "manager-self-cycle",
+        "lock_identity": "lock-self-cycle",
+        "predecessor_certificate_id": "gmcert-self-cycle",
+        "predecessor_generation_id": "generation-self-cycle",
+        "predecessor_sequence": int(g2["sequence"]) + 10,
+        "predecessor_certificate_hash": "sha256:" + "0" * 64,
+        "prior_manager_pid": 4999,
+        "observed_prior_generation_id": "generation-self-cycle",
+        "prior_process_start_identity": "process-self-cycle",
+        "prior_pid_death_method": "esrch",
+        "prior_pid_death_verified_at": "2026-08-10T00:00:01Z",
+        "certified_at": "2026-08-10T00:00:02Z",
+    }
+    cycle["certificate_hash"] = store._manager_generation_certificate_hash(cycle)
+    columns = list(cycle)
+    conn.execute(
+        "INSERT INTO graph_reconcile_manager_generations "
+        f"({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+        [cycle[column] for column in columns],
+    )
+    conn.commit()
+    with pytest.raises(
+        store.ManagerGenerationCertificateConflictError,
+        match="manager_generation_predecessor_binding_invalid",
+    ):
+        store.current_manager_generation_certificate(conn, cycle_project)
+
+    two_cycle_project = PID + "-two-cycle"
+    a = dict(cycle)
+    a.update(
+        {
+            "sequence": int(cycle["sequence"]) + 1,
+            "certificate_id": "gmcert-two-cycle-a",
+            "project_id": two_cycle_project,
+            "generation_id": "generation-two-cycle-a",
+            "manager_pid": 5001,
+            "manager_start_identity": "manager-two-cycle-a",
+            "lock_identity": "lock-two-cycle-a",
+            "predecessor_certificate_id": "gmcert-two-cycle-b",
+            "predecessor_generation_id": "generation-two-cycle-b",
+            "predecessor_sequence": int(cycle["sequence"]) + 2,
+            "prior_manager_pid": 5002,
+            "observed_prior_generation_id": "generation-two-cycle-b",
+        }
+    )
+    a["certificate_hash"] = store._manager_generation_certificate_hash(a)
+    b = dict(a)
+    b.update(
+        {
+            "sequence": int(cycle["sequence"]) + 2,
+            "certificate_id": "gmcert-two-cycle-b",
+            "generation_id": "generation-two-cycle-b",
+            "manager_pid": 5002,
+            "manager_start_identity": "manager-two-cycle-b",
+            "lock_identity": "lock-two-cycle-b",
+            "predecessor_certificate_id": "gmcert-two-cycle-a",
+            "predecessor_generation_id": "generation-two-cycle-a",
+            "predecessor_sequence": int(cycle["sequence"]) + 1,
+            "predecessor_certificate_hash": a["certificate_hash"],
+            "prior_manager_pid": 5001,
+            "observed_prior_generation_id": "generation-two-cycle-a",
+        }
+    )
+    b["certificate_hash"] = store._manager_generation_certificate_hash(b)
+    for item in (a, b):
+        columns = list(item)
+        conn.execute(
+            "INSERT INTO graph_reconcile_manager_generations "
+            f"({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+            [item[column] for column in columns],
+        )
+    conn.commit()
+    with pytest.raises(
+        store.ManagerGenerationCertificateConflictError,
+        match="manager_generation_predecessor_binding_invalid",
+    ):
+        store.current_manager_generation_certificate(conn, two_cycle_project)
+
+
+def test_manager_generation_schema_rejects_false_prior_death_proof(conn):
+    store.ensure_schema(conn)
+    first = store.record_manager_generation_certificate(
+        conn, PID, **_generation("1", manager_pid=5001)
+    )
+    malformed = dict(conn.execute(
+        "SELECT * FROM graph_reconcile_manager_generations WHERE certificate_id = ?",
+        (first["certificate_id"],),
+    ).fetchone())
+    malformed.update(
+        {
+            "sequence": int(first["sequence"]) + 1,
+            "certificate_id": "gmcert-false-death",
+            "project_id": PID + "-false-death",
+            "generation_id": "generation-false-death",
+            "manager_start_identity": "manager-false-death",
+            "lock_identity": "lock-false-death",
+            "predecessor_certificate_id": "",
+            "predecessor_generation_id": "",
+            "predecessor_sequence": 0,
+            "predecessor_certificate_hash": "",
+            "prior_manager_pid": 5000,
+            "observed_prior_generation_id": "",
+            "prior_process_start_identity": "",
+            "prior_pid_death_method": "",
+            "prior_pid_death_verified_at": "",
+        }
+    )
+    malformed["certificate_hash"] = store._manager_generation_certificate_hash(
+        malformed
+    )
+    columns = list(malformed)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        conn.execute(
+            "INSERT INTO graph_reconcile_manager_generations "
+            f"({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+            [malformed[column] for column in columns],
+        )
 
 
 def test_create_index_and_activate_snapshot(conn, tmp_path):
