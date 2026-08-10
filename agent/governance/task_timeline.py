@@ -224,6 +224,7 @@ MF_NON_CLOSE_COORDINATION_EVENT_KINDS = {
     "forbidden_attempt_recorded",
     "hotfix_entered",
     "no_progress_timeout",
+    "reconcile_terminalization",
     "record_blocker",
     "route_identity_cleanup",
     "worker_progress",
@@ -2057,6 +2058,96 @@ def run_post_commit_hooks(
     event = dict(inserted_event)
     _run_service_router_hook(conn, event)
     _publish_timeline_event(event, conn=conn)
+
+
+_RECONCILE_TERMINALIZATION_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_RECONCILE_TERMINALIZATION_COMMIT_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def record_reconcile_run_terminalization_event(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    commit_sha: str,
+    terminalization_id_sha256: str,
+    source_identity_sha256: str,
+    source_fingerprint: str,
+    replacement_identity_sha256: str,
+    replacement_fingerprint: str,
+    manager_certificate_hash: str,
+    proof_sha256: str,
+) -> dict[str, Any]:
+    """Append one fixed, audit-only terminalization fact in the caller transaction."""
+
+    identities = {
+        "terminalization_id_sha256": terminalization_id_sha256,
+        "source_identity_sha256": source_identity_sha256,
+        "source_fingerprint": source_fingerprint,
+        "replacement_identity_sha256": replacement_identity_sha256,
+        "replacement_fingerprint": replacement_fingerprint,
+        "manager_certificate_hash": manager_certificate_hash,
+        "proof_sha256": proof_sha256,
+    }
+    if not all(isinstance(value, str) and value for value in (
+        project_id, backlog_id, task_id, commit_sha,
+    )):
+        raise ValueError("terminalization timeline scope is required")
+    if _RECONCILE_TERMINALIZATION_COMMIT_RE.fullmatch(commit_sha) is None:
+        raise ValueError("commit_sha must be an exact lowercase commit identity")
+    for field, value in identities.items():
+        if (
+            not isinstance(value, str)
+            or _RECONCILE_TERMINALIZATION_DIGEST_RE.fullmatch(value) is None
+        ):
+            raise ValueError(f"{field} must be an exact lowercase sha256 digest")
+    if not conn.in_transaction:
+        raise ValueError("caller transaction is required for terminalization timeline")
+    payload = {
+        "schema_version": "graph.reconcile_run_terminalized.timeline.v1",
+        **identities,
+        "close_satisfying": False,
+        "synthesizes_pass": False,
+        "authoritative_pass_synthesized": False,
+        "graph_reconciled": False,
+        "server_derived": True,
+    }
+    verification = {
+        "audit_only": True,
+        "protected_close_evidence": False,
+    }
+    created_at = _utc_iso()
+    from .db import sqlite_write_lock
+
+    with sqlite_write_lock():
+        cursor = conn.execute(
+            """INSERT INTO task_timeline_events
+               (project_id, backlog_id, mf_id, task_id, attempt_num, event_type,
+                phase, event_kind, scenario_id, parent_event_id, correlation_id,
+                severity, decision, schema_version, actor, status, payload_json,
+                verification_json, artifact_refs_json, trace_id, commit_sha, created_at)
+               VALUES (?, ?, '', ?, 0, 'graph.reconcile_run_terminalized',
+                'reconcile_terminalization', 'reconcile_terminalization', '', 0, ?,
+                '', '', ?, 'governance_store', 'recorded', ?, ?, '{}', '', ?, ?)""",
+            (
+                project_id,
+                backlog_id,
+                task_id,
+                terminalization_id_sha256,
+                TIMELINE_SCHEMA_VERSION,
+                _json(payload, {}),
+                _json(verification, {}),
+                commit_sha,
+                created_at,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM task_timeline_events WHERE id=?", (cursor.lastrowid,)
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("terminalization timeline append was not persisted")
+    return _row_to_dict(row)
 
 
 def record_event(

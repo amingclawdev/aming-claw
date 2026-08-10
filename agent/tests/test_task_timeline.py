@@ -84,6 +84,170 @@ STRICT_GOVERNANCE_POLICY = {
 }
 
 
+def _terminalization_timeline_args():
+    return {
+        "project_id": "proj",
+        "backlog_id": "AC-TERMINALIZATION-NEUTRAL-EVENT",
+        "task_id": "terminalization-neutral-task",
+        "commit_sha": "a" * 40,
+        "terminalization_id_sha256": _fake_sha("terminalization-id"),
+        "source_identity_sha256": _fake_sha("source-identity"),
+        "source_fingerprint": _fake_sha("source-fingerprint"),
+        "replacement_identity_sha256": _fake_sha("replacement-identity"),
+        "replacement_fingerprint": _fake_sha("replacement-fingerprint"),
+        "manager_certificate_hash": _fake_sha("manager-certificate"),
+        "proof_sha256": _fake_sha("terminalization-proof"),
+    }
+
+
+def test_reconcile_terminalization_event_is_neutral_and_caller_transaction_owned(
+    tmp_path,
+):
+    from agent.governance import task_timeline
+    from agent.governance.db import get_connection
+
+    conn = _conn(str(tmp_path))
+    observer = get_connection("proj")
+    statements = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.set_trace_callback(statements.append)
+        with mock.patch.object(task_timeline, "_run_service_router_hook") as router:
+            with mock.patch.object(task_timeline, "_publish_timeline_event") as publish:
+                event = task_timeline.record_reconcile_run_terminalization_event(
+                    conn, **_terminalization_timeline_args()
+                )
+                assert conn.in_transaction is True
+                assert router.call_count == 0
+                assert publish.call_count == 0
+                assert observer.execute(
+                    "SELECT COUNT(*) AS c FROM task_timeline_events"
+                ).fetchone()["c"] == 0
+                helper_statements = list(statements)
+
+                conn.commit()
+                task_timeline.run_post_commit_hooks(conn, event)
+                assert router.call_count == 1
+                assert publish.call_count == 1
+
+        persisted = task_timeline._row_to_dict(observer.execute(
+            "SELECT * FROM task_timeline_events WHERE id=?", (event["id"],)
+        ).fetchone())
+        assert persisted == event
+        assert event["event_type"] == "graph.reconcile_run_terminalized"
+        assert event["phase"] == "reconcile_terminalization"
+        assert event["event_kind"] == "reconcile_terminalization"
+        assert event["status"] == "recorded"
+        assert event["actor"] == "governance_store"
+        assert task_timeline.is_protected_close_evidence(event) is False
+        assert task_timeline.is_protected_close_evidence(
+            {**event, "status": "accepted"}
+        ) is False
+        assert event["payload"] == {
+            "authoritative_pass_synthesized": False,
+            "close_satisfying": False,
+            "graph_reconciled": False,
+            "manager_certificate_hash": _fake_sha("manager-certificate"),
+            "proof_sha256": _fake_sha("terminalization-proof"),
+            "replacement_fingerprint": _fake_sha("replacement-fingerprint"),
+            "replacement_identity_sha256": _fake_sha("replacement-identity"),
+            "schema_version": "graph.reconcile_run_terminalized.timeline.v1",
+            "server_derived": True,
+            "source_fingerprint": _fake_sha("source-fingerprint"),
+            "source_identity_sha256": _fake_sha("source-identity"),
+            "synthesizes_pass": False,
+            "terminalization_id_sha256": _fake_sha("terminalization-id"),
+        }
+        assert event["verification"] == {
+            "audit_only": True,
+            "protected_close_evidence": False,
+        }
+        assert event["artifact_refs"] == {}
+        assert all(
+            not statement.lstrip().upper().startswith(("BEGIN", "COMMIT", "ROLLBACK"))
+            for statement in helper_statements
+        )
+        serialized = json.dumps(event, sort_keys=True)
+        for forbidden in (
+            "raw-source-run",
+            "raw-source-snapshot",
+            "/private/terminalization/evidence.json",
+            "session-token-secret",
+        ):
+            assert forbidden not in serialized
+    finally:
+        conn.set_trace_callback(None)
+        observer.close()
+        conn.close()
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+
+
+def test_reconcile_terminalization_event_fault_rolls_back_and_rejects_authority_fields(
+    tmp_path,
+):
+    from agent.governance import task_timeline
+
+    conn = _conn(str(tmp_path))
+    try:
+        conn.execute(
+            "CREATE TEMP TRIGGER fail_neutral_terminalization_event "
+            "AFTER INSERT ON task_timeline_events "
+            "BEGIN SELECT RAISE(ABORT, 'terminalization_timeline_fault'); END"
+        )
+        conn.commit()
+        database_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
+        wal_path = Path(f"{database_path}-wal")
+        before_bytes = database_path.read_bytes()
+        before_wal = wal_path.read_bytes() if wal_path.exists() else b""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            task_timeline.record_reconcile_run_terminalization_event(
+                conn, **_terminalization_timeline_args()
+            )
+            raise AssertionError("fault trigger must reject the append")
+        except sqlite3.IntegrityError as exc:
+            assert "terminalization_timeline_fault" in str(exc)
+        finally:
+            conn.rollback()
+        assert conn.in_transaction is False
+        assert conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events"
+        ).fetchone()["c"] == 0
+        sequence = conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='task_timeline_events'"
+        ).fetchone()
+        assert sequence is None or int(sequence["seq"] or 0) == 0
+        assert database_path.read_bytes() == before_bytes
+        assert (wal_path.read_bytes() if wal_path.exists() else b"") == before_wal
+
+        try:
+            task_timeline.record_reconcile_run_terminalization_event(
+                conn, **_terminalization_timeline_args()
+            )
+            raise AssertionError("caller transaction must be required")
+        except ValueError as exc:
+            assert "caller transaction" in str(exc)
+
+        invalid = {**_terminalization_timeline_args(), "status": "passed"}
+        try:
+            task_timeline.record_reconcile_run_terminalization_event(conn, **invalid)
+            raise AssertionError("caller-selected authority fields must be rejected")
+        except TypeError as exc:
+            assert "status" in str(exc)
+        invalid = {
+            **_terminalization_timeline_args(),
+            "terminalization_id_sha256": "/private/terminalization/evidence.json",
+        }
+        try:
+            task_timeline.record_reconcile_run_terminalization_event(conn, **invalid)
+            raise AssertionError("non-digest evidence must be rejected")
+        except ValueError as exc:
+            assert "terminalization_id_sha256" in str(exc)
+    finally:
+        conn.close()
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+
+
 def test_observer_failure_disposition_cannot_supersede_independent_qa_verdict():
     from agent.governance import task_timeline
 
